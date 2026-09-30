@@ -3,15 +3,15 @@ use crate::adapters::{
     DispatchResult, ReconcileResult, WorkerApplyGuard,
 };
 use crate::config::{
-    journal_root, BridgeProviderConfig, ConfiguredOffer, ProviderInitExtra,
+    journal_root, AdapterConfig, BridgeProviderConfig, ConfiguredOffer, ProviderInitExtra,
     MAX_RUN_EVENTS_PAGE_BYTES_LIMIT, MAX_RUN_EVENTS_PAGE_COUNT_LIMIT,
     MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT, MAX_RUN_EVENT_COUNT_LIMIT,
 };
 use crate::contract::{
-    ok_response, validate_run_id, ErrorClass, OfferSummary, OffersListRequest, ProviderFault,
-    RunError, RunEvent, RunEventsPage, RunStatus, RunsCancelRequest, RunsCreateRequest,
-    RunsEventsRequest, RunsGetRequest, RuntimeAccessBinding, MAX_EVENT_SEQUENCE, PROVIDER_ID,
-    PROVIDER_PROTOCOL_VERSION, RUN_EVENTS_SCHEMA, RUN_EVENT_SCHEMA,
+    ok_response, validate_run_id, BackendReport, ErrorClass, OfferSummary, OffersListRequest,
+    ProviderFault, RunError, RunEvent, RunEventsPage, RunStatus, RunsCancelRequest,
+    RunsCreateRequest, RunsEventsRequest, RunsGetRequest, RuntimeAccessBinding, MAX_EVENT_SEQUENCE,
+    PROVIDER_ID, PROVIDER_PROTOCOL_VERSION, RUN_EVENTS_SCHEMA, RUN_EVENT_SCHEMA,
 };
 use crate::journal::validate_run_error;
 use crate::journal::{deterministic_run_id, now_ms, request_fingerprint, RunJournal, StoredRun};
@@ -19,9 +19,131 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub struct ModelProviderState<A: AdapterExecutor> {
+    config: BridgeProviderConfig,
     journal: RunJournal,
     offers: BTreeMap<String, ConfiguredOffer>,
     adapters: A,
+}
+
+pub(crate) struct ConfigRefresh {
+    pub(crate) config: BridgeProviderConfig,
+    offers: BTreeMap<String, ConfiguredOffer>,
+    pub(crate) retire_offer: Option<String>,
+}
+
+const HOME_OWNED_HOSTED_CHAT_URLS: &[&str] = &[
+    "https://openrouter.ai/api/v1/chat/completions",
+    "https://api.venice.ai/api/v1/chat/completions",
+    "https://openrouter.ai/api/alpha/decisions",
+];
+
+fn is_home_owned_hosted_offer(offer: &ConfiguredOffer) -> bool {
+    let (AdapterConfig::OpenAiCompatibleText { api_url, .. }
+    | AdapterConfig::OpenRouterDecisions { api_url, .. }) = &offer.adapter
+    else {
+        return false;
+    };
+    HOME_OWNED_HOSTED_CHAT_URLS.contains(&api_url.as_str())
+}
+
+// Held workers retain their cloned credentials; new dispatches use the refreshed
+// key. Every execution and disclosure field must keep its exact value.
+fn hosted_key_only_replace(old: &ConfiguredOffer, proposed: &ConfiguredOffer) -> bool {
+    let mut proposed = proposed.clone();
+    match (&old.adapter, &mut proposed.adapter) {
+        (
+            AdapterConfig::OpenAiCompatibleText { api_key, .. },
+            AdapterConfig::OpenAiCompatibleText {
+                api_key: next_key, ..
+            },
+        )
+        | (
+            AdapterConfig::OpenRouterDecisions { api_key, .. },
+            AdapterConfig::OpenRouterDecisions {
+                api_key: next_key, ..
+            },
+        ) => *next_key = api_key.clone(),
+        _ => return false,
+    }
+    &proposed == old
+}
+
+fn home_owned_hosted_key_model_replace(old: &ConfiguredOffer, proposed: &ConfiguredOffer) -> bool {
+    if !is_home_owned_hosted_offer(old)
+        || !is_home_owned_hosted_offer(proposed)
+        || old.id != proposed.id
+    {
+        return false;
+    }
+    let mut proposed = proposed.clone();
+    match (&old.adapter, &mut proposed.adapter) {
+        (
+            AdapterConfig::OpenAiCompatibleText {
+                api_key,
+                model,
+                hosted,
+                ..
+            },
+            AdapterConfig::OpenAiCompatibleText {
+                api_key: next_key,
+                model: next_model,
+                hosted: next_hosted,
+                ..
+            },
+        )
+        | (
+            AdapterConfig::OpenRouterDecisions {
+                api_key,
+                model,
+                hosted,
+                ..
+            },
+            AdapterConfig::OpenRouterDecisions {
+                api_key: next_key,
+                model: next_model,
+                hosted: next_hosted,
+                ..
+            },
+        ) => {
+            *next_key = api_key.clone();
+            *next_model = model.clone();
+            next_hosted.model_privacy = hosted.model_privacy.clone();
+        }
+        _ => return false,
+    }
+    if let (
+        AdapterConfig::OpenRouterDecisions {
+            expected_response_model,
+            ..
+        },
+        AdapterConfig::OpenRouterDecisions {
+            expected_response_model: next,
+            ..
+        },
+    ) = (&old.adapter, &mut proposed.adapter)
+    {
+        *next = expected_response_model.clone();
+    }
+    proposed.title = old.title.clone();
+    &proposed == old
+}
+
+fn offer_has_unresolved_activity<A: AdapterExecutor>(
+    state: &ModelProviderState<A>,
+    offer_id: &str,
+    extra: &ProviderInitExtra,
+    retained_workers: &[String],
+) -> Result<bool, ProviderFault> {
+    let runs = state.journal.scan_runs()?;
+    Ok(runs.iter().any(|(_, run)| {
+        run.offer.id == offer_id
+            && (!run.status.is_terminal()
+                || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
+    }) || retained_workers.iter().any(|worker| {
+        runs.iter()
+            .find(|(_, run)| run.run_id == *worker)
+            .is_none_or(|(_, run)| run.offer.id == offer_id)
+    }))
 }
 
 impl<A: AdapterExecutor> ModelProviderState<A> {
@@ -29,10 +151,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         config.validate().map_err(|err| {
             ProviderFault::internal(format!("invalid model provider init config: {err}"))
         })?;
-        let extra = serde_json::from_value::<ProviderInitExtra>(config.extra).map_err(|err| {
-            ProviderFault::internal(format!("invalid model provider init config: {err}"))
-        })?;
-        extra.validate(&config.base_path).map_err(|err| {
+        let extra =
+            serde_json::from_value::<ProviderInitExtra>(config.extra.clone()).map_err(|err| {
+                ProviderFault::internal(format!("invalid model provider init config: {err}"))
+            })?;
+        extra.validate(&config).map_err(|err| {
             ProviderFault::internal(format!("invalid model provider init config: {err}"))
         })?;
         if let Some(provider_id) = extra.provider_id.as_deref() {
@@ -57,7 +180,9 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 ));
             }
         }
+        require_retained_run_bindings(&journal, &offers)?;
         Ok(Self {
+            config,
             journal,
             offers,
             adapters,
@@ -66,6 +191,192 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
 
     pub fn ready_offer_count(&self) -> usize {
         self.offers.values().filter(|offer| offer.enabled).count()
+    }
+
+    /// Validate the complete proposal before the serialized coordinator closes
+    /// any exact engine. Configuration and journal ownership remain unchanged.
+    pub(crate) fn plan_refresh(
+        &self,
+        mut config: BridgeProviderConfig,
+        execution_owned: bool,
+        retained_workers: &[String],
+    ) -> Result<ConfigRefresh, ProviderFault> {
+        if self.config.base_path != config.base_path
+            || self.config.allowed_paths != config.allowed_paths
+            || self.config.read_only != config.read_only
+            || self.config.encryption_key != config.encryption_key
+        {
+            return Err(ProviderFault::invalid_request(
+                "model configuration identity changed",
+            ));
+        }
+        let mut old_identity = self.config.extra.clone();
+        let mut new_identity = config.extra.clone();
+        if let Some(value) = old_identity.as_object_mut() {
+            let _ = value.remove("offers");
+            let _ = value.remove("runtime_admitted_offers");
+            let _ = value.remove("owner_reclaim");
+            let _ = value.remove("runtime_local_sockets");
+        }
+        if let Some(value) = new_identity.as_object_mut() {
+            let _ = value.remove("offers");
+            let _ = value.remove("runtime_admitted_offers");
+            let _ = value.remove("owner_reclaim");
+            let _ = value.remove("runtime_local_sockets");
+        }
+        if old_identity != new_identity {
+            return Err(ProviderFault::invalid_request(
+                "model configuration identity changed",
+            ));
+        }
+        config
+            .validate()
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        let extra: ProviderInitExtra = serde_json::from_value(config.extra.clone())
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        extra
+            .validate(&config)
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        let previous: ProviderInitExtra = serde_json::from_value(self.config.extra.clone())
+            .map_err(|_| ProviderFault::internal("stored model configuration unavailable"))?;
+        for (id, socket) in &previous.runtime_local_sockets {
+            if extra
+                .runtime_local_sockets
+                .get(id)
+                .is_some_and(|next| next != socket)
+            {
+                return Err(ProviderFault::invalid_request(
+                    "model Runtime socket identity changed",
+                ));
+            }
+        }
+        let old_admissions: BTreeMap<_, _> = previous
+            .runtime_admitted_offers
+            .iter()
+            .map(|a| (a.offer_id.as_str(), a))
+            .collect();
+        let admissions: BTreeMap<_, _> = extra
+            .runtime_admitted_offers
+            .iter()
+            .map(|a| (a.offer_id.as_str(), a))
+            .collect();
+        let offers: BTreeMap<_, _> = extra
+            .offers
+            .iter()
+            .map(|o| (o.id.clone(), o.clone()))
+            .collect();
+        let mut retired = Vec::new();
+        for old in &previous.offers {
+            if let Some(proposed) = offers.get(&old.id) {
+                let key_only_replace = hosted_key_only_replace(old, proposed);
+                let hosted_replace = home_owned_hosted_key_model_replace(old, proposed);
+                if (proposed != old && !hosted_replace && !key_only_replace)
+                    || admissions.get(old.id.as_str()) != old_admissions.get(old.id.as_str())
+                {
+                    return Err(ProviderFault::invalid_request(
+                        "existing model offers changed",
+                    ));
+                }
+                if hosted_replace
+                    && !key_only_replace
+                    && offer_has_unresolved_activity(self, &old.id, &extra, retained_workers)?
+                {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
+                    ));
+                }
+                // A failed close disabled this exact offer. Only the same
+                // withdrawal can reconcile it; stale Init cannot re-enable it.
+                if old.enabled && self.offers.get(&old.id).is_some_and(|o| !o.enabled) {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
+                    ));
+                }
+            } else if old_admissions.contains_key(old.id.as_str()) {
+                retired.push(old.id.clone());
+            } else if is_home_owned_hosted_offer(old) {
+                if offer_has_unresolved_activity(self, &old.id, &extra, retained_workers)? {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
+                    ));
+                }
+            } else {
+                return Err(ProviderFault::invalid_request(
+                    "existing model offers changed",
+                ));
+            }
+        }
+        let addition = offers.keys().any(|id| !self.offers.contains_key(id));
+        // A warm local engine owns its artifacts, but an independent hosted
+        // connection does not replace or consume them. Active workers and
+        // unresolved runs still keep every addition behind the activation gate.
+        let hosted_additions_only = offers
+            .values()
+            .filter(|offer| !self.offers.contains_key(&offer.id))
+            .all(is_home_owned_hosted_offer)
+            && previous
+                .offers
+                .iter()
+                .all(|old| offers.get(&old.id) == Some(old));
+        if retired.len() > 1 || (!retired.is_empty() && addition) {
+            return Err(ProviderFault::invalid_request(
+                "retire one model offer per Init",
+            ));
+        }
+        let retire_offer = retired.pop();
+        if let Some(id) = &retire_offer {
+            let runs = self.journal.scan_runs()?;
+            if runs.iter().any(|(_, run)| {
+                run.offer.id == *id
+                    && (!run.status.is_terminal()
+                        || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
+            }) || retained_workers.iter().any(|worker| {
+                runs.iter()
+                    .find(|(_, run)| run.run_id == *worker)
+                    .is_none_or(|(_, run)| run.offer.id == *id)
+            }) {
+                return Err(ProviderFault::selection_unavailable(
+                    "model retirement pending",
+                ));
+            }
+        } else if addition
+            && ((execution_owned && !hosted_additions_only)
+                || !retained_workers.is_empty()
+                || self.journal.scan_runs()?.iter().any(|(_, r)| {
+                    !r.status.is_terminal()
+                        || (r.status == RunStatus::SettlementUnknown
+                            && self.offers.contains_key(&r.offer.id))
+                }))
+        {
+            return Err(ProviderFault::selection_unavailable(
+                "model activation pending",
+            ));
+        }
+        if extra.owner_reclaim {
+            if let Some(value) = config.extra.as_object_mut() {
+                let _ = value.remove("owner_reclaim");
+            }
+        }
+        Ok(ConfigRefresh {
+            config,
+            offers,
+            retire_offer,
+        })
+    }
+
+    pub(crate) fn begin_retirement(&mut self, refresh: &ConfigRefresh) {
+        if let Some(offer) = refresh
+            .retire_offer
+            .as_ref()
+            .and_then(|id| self.offers.get_mut(id))
+        {
+            offer.enabled = false;
+        }
+    }
+
+    pub(crate) fn apply_refresh(&mut self, refresh: ConfigRefresh) {
+        self.offers = refresh.offers;
+        self.config = refresh.config;
     }
 
     pub(crate) fn adapters(&self) -> &A {
@@ -84,11 +395,19 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .filter(|offer| offer.enabled)
             .map(ConfiguredOffer::summary)
             .collect::<Vec<_>>();
+        let offer_revisions = self
+            .offers
+            .values()
+            .filter(|offer| offer.enabled)
+            .map(|offer| Ok((offer.id.clone(), offer.execution_binding_hash()?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()
+            .map_err(|_| ProviderFault::internal("model offer revision unavailable"))?;
         Ok(ok_response(json!({
             "schema": crate::contract::OFFERS_LIST_SCHEMA,
             "provider": PROVIDER_ID,
             "protocol_version": PROVIDER_PROTOCOL_VERSION,
             "offers": offers,
+            "offer_revisions": offer_revisions,
         })))
     }
 
@@ -107,6 +426,16 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .get(&request.offer_id)
             .ok_or_else(|| ProviderFault::selection_unavailable("unknown offer_id"))?
             .clone();
+        if let Some(expected) = request.expected_execution_binding_hash.as_deref() {
+            let current = offer
+                .execution_binding_hash()
+                .map_err(|_| ProviderFault::internal("model offer revision unavailable"))?;
+            if expected != current {
+                return Err(ProviderFault::selection_unavailable(
+                    "model offer revision changed",
+                ));
+            }
+        }
         if !offer.enabled {
             return Err(ProviderFault::selection_unavailable("offer is disabled"));
         }
@@ -184,9 +513,9 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 &offer,
                 &mut run,
                 RunError {
-                    class: ErrorClass::SelectionUnavailable,
-                    code: "selection_unavailable".to_string(),
-                    message: "model offer is not available".to_string(),
+                    class: ErrorClass::RateLimited,
+                    code: "model_busy".to_string(),
+                    message: "Model is busy.".to_string(),
                 },
             )?;
             self.journal.store_run(&run)?;
@@ -198,6 +527,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             &offer,
             &request.runtime_binding,
             &request.input,
+            run.deadline_ms,
         ) {
             Ok(result) => {
                 let stored_offer = run.offer.clone();
@@ -351,6 +681,28 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         apply_reconcile_result(&stored_offer, &mut run, result)?;
         self.journal.store_run(&run)?;
         Ok(())
+    }
+
+    pub(crate) fn run_deadline_expired(&self, run_id: &str) -> Result<bool, ProviderFault> {
+        Ok(self
+            .journal
+            .load_run_if_present(run_id)?
+            .map(|run| !run.status.is_terminal() && deadline_expired(now_ms(), run.deadline_ms))
+            .unwrap_or(false))
+    }
+
+    pub(crate) fn settle_local_text_run_timeout(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), ProviderFault> {
+        let Some(mut run) = self.journal.load_run_if_present(run_id)? else {
+            return Ok(());
+        };
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        transition_timeout(&mut run)?;
+        self.journal.store_run(&run)
     }
 
     pub(crate) fn settle_local_text_run_unknown(
@@ -516,19 +868,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             self.journal.store_run(run)?;
             return Ok(());
         };
-        if now_ms() > run.deadline_ms {
-            let stored_offer = run.offer.clone();
-            transition_terminal(
-                &stored_offer,
-                run,
-                RunStatus::Failed,
-                None,
-                Some(RunError {
-                    class: ErrorClass::BackendTimeout,
-                    code: "backend_timeout".to_string(),
-                    message: "model backend timed out".to_string(),
-                }),
-            )?;
+        if deadline_expired(now_ms(), run.deadline_ms) {
+            if self.adapters.has_active_local_text_worker(&run.run_id) {
+                return Ok(());
+            }
+            transition_timeout(run)?;
             self.journal.store_run(run)?;
             return Ok(());
         }
@@ -560,13 +904,16 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let Some(offer) = self.offers.get(&run.offer.id) else {
             return Ok(None);
         };
-        let current_summary = offer.summary();
+        let current_summary = offer.execution_summary();
+        let mut recorded_summary = run.offer.clone();
+        recorded_summary.input_schemas.clear();
+        recorded_summary.context = None;
         let current_hash = offer.execution_binding_hash().map_err(|err| {
             ProviderFault::internal(format!(
                 "failed to derive model execution binding hash: {err}"
             ))
         })?;
-        if current_summary != run.offer || current_hash != run.execution_binding_hash {
+        if current_summary != recorded_summary || current_hash != run.execution_binding_hash {
             return Ok(None);
         }
         Ok(Some(offer.clone()))
@@ -591,6 +938,41 @@ fn normalize_worker_result(
 
 fn reject_untrusted_binding_fields(input: &Value) -> Result<(), ProviderFault> {
     reject_untrusted_binding_fields_at(input)
+}
+
+fn require_retained_run_bindings(
+    journal: &RunJournal,
+    offers: &BTreeMap<String, ConfiguredOffer>,
+) -> Result<(), ProviderFault> {
+    for (_, run) in journal.scan_runs()? {
+        if !run.status.is_terminal() {
+            let offer = offers.get(&run.offer.id).ok_or_else(|| {
+                ProviderFault::selection_unavailable("retained model binding unavailable")
+            })?;
+            if offer
+                .execution_binding_hash()
+                .map_err(|_| ProviderFault::invalid_request("invalid model binding"))?
+                != run.execution_binding_hash
+            {
+                return Err(ProviderFault::selection_unavailable(
+                    "retained model binding changed",
+                ));
+            }
+        } else if run.status == RunStatus::SettlementUnknown {
+            if let Some(offer) = offers.get(&run.offer.id) {
+                if offer
+                    .execution_binding_hash()
+                    .map_err(|_| ProviderFault::invalid_request("invalid model binding"))?
+                    != run.execution_binding_hash
+                {
+                    return Err(ProviderFault::selection_unavailable(
+                        "retained model binding changed",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn assert_run_owner(binding: &RuntimeAccessBinding, run: &StoredRun) -> Result<(), ProviderFault> {
@@ -646,6 +1028,17 @@ fn append_event(
     data: Value,
     terminal: bool,
 ) -> Result<(), ProviderFault> {
+    append_event_with_backend_report(offer, run, kind, data, terminal, None)
+}
+
+fn append_event_with_backend_report(
+    offer: &impl OfferLimitsView,
+    run: &mut StoredRun,
+    kind: impl Into<String>,
+    data: Value,
+    terminal: bool,
+    backend_report: Option<BackendReport>,
+) -> Result<(), ProviderFault> {
     if run.next_sequence > MAX_EVENT_SEQUENCE {
         return Err(ProviderFault::internal(
             "model run event cursor exceeded provider limit",
@@ -656,6 +1049,7 @@ fn append_event(
         sequence: run.next_sequence,
         kind: kind.into(),
         data,
+        backend_report,
         terminal,
     };
     let encoded = serde_json::to_vec(&event)
@@ -778,15 +1172,47 @@ fn transition_terminal(
     output: Option<Value>,
     error: Option<RunError>,
 ) -> Result<(), ProviderFault> {
+    transition_terminal_with_backend_report(offer, run, status, output, error, None)
+}
+
+fn transition_terminal_with_backend_report(
+    offer: &impl OfferLimitsView,
+    run: &mut StoredRun,
+    status: RunStatus,
+    output: Option<Value>,
+    error: Option<RunError>,
+    backend_report: Option<BackendReport>,
+) -> Result<(), ProviderFault> {
     if run.status.is_terminal() {
         return Err(ProviderFault::internal(
             "model run attempted a second terminal transition",
         ));
     }
     let (output, error) = validate_terminal_payload(offer, &status, output, error)?;
+    let backend_report = match (run.offer.hosted.is_some(), backend_report) {
+        (true, Some(report)) => Some(report),
+        (true, None) => Some(BackendReport::unknown()),
+        (false, Some(_)) => {
+            return Err(ProviderFault::internal(
+                "local model run returned hosted backend evidence",
+            ))
+        }
+        (false, None) => None,
+    };
+    if let Some(report) = backend_report.as_ref() {
+        crate::journal::validate_backend_report(report)
+            .map_err(|_| ProviderFault::internal("invalid hosted backend report"))?;
+    }
     let (terminal_kind, terminal_data) =
         synthesize_terminal_event(status.clone(), output.as_ref(), error.as_ref())?;
-    append_event(offer, run, &terminal_kind, terminal_data, true)?;
+    append_event_with_backend_report(
+        offer,
+        run,
+        &terminal_kind,
+        terminal_data,
+        true,
+        backend_report,
+    )?;
     if run.events.last().map(|event| event.terminal) != Some(true) {
         return Err(ProviderFault::internal(
             "model run terminal transition missing terminal event",
@@ -828,6 +1254,25 @@ fn transition_error(
         _ => RunStatus::Failed,
     };
     transition_terminal(offer, run, status, None, Some(error))
+}
+
+fn transition_timeout(run: &mut StoredRun) -> Result<(), ProviderFault> {
+    let offer = run.offer.clone();
+    transition_terminal(
+        &offer,
+        run,
+        RunStatus::Failed,
+        None,
+        Some(RunError {
+            class: ErrorClass::BackendTimeout,
+            code: "backend_timeout".to_string(),
+            message: "model backend timed out".to_string(),
+        }),
+    )
+}
+
+fn deadline_expired(now_ms: u64, deadline_ms: u64) -> bool {
+    now_ms >= deadline_ms
 }
 
 fn apply_run_atomically(
@@ -896,9 +1341,17 @@ fn apply_reconcile_result(
                 status,
                 output,
                 error,
+                backend_report,
             } => {
                 collect_non_terminal_events(offer, staged, events)?;
-                transition_terminal(offer, staged, status, output, error)?;
+                transition_terminal_with_backend_report(
+                    offer,
+                    staged,
+                    status,
+                    output,
+                    error,
+                    backend_report.map(|report| *report),
+                )?;
             }
         }
         Ok(())
@@ -1184,18 +1637,24 @@ mod tests {
         cancel_results: Arc<Mutex<Vec<std::result::Result<CancelResult, AdapterFault>>>>,
         cancel_allow_send: Arc<Mutex<Vec<bool>>>,
         dispatch_calls: Arc<Mutex<u32>>,
+        dispatched_adapters: Arc<Mutex<Vec<AdapterConfig>>>,
         reconcile_calls: Arc<Mutex<u32>>,
     }
 
     impl AdapterExecutor for FakeAdapters {
         fn dispatch(
             &self,
-            _adapter: &AdapterConfig,
+            adapter: &AdapterConfig,
             _offer: &ConfiguredOffer,
             _binding: &RuntimeCreateBinding,
             _input: &Value,
+            _deadline_ms: u64,
         ) -> std::result::Result<DispatchResult, AdapterFault> {
             *self.dispatch_calls.lock().unwrap() += 1;
+            self.dispatched_adapters
+                .lock()
+                .unwrap()
+                .push(adapter.clone());
             self.dispatch_results.lock().unwrap().remove(0)
         }
 
@@ -1259,6 +1718,7 @@ mod tests {
                 api_url: "https://example.invalid/v1/chat/completions".to_string(),
                 api_key: None,
                 model: "gpt-test".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -1409,6 +1869,692 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn model_refresh_unknown_retains_binding_across_expiry_and_restart() {
+        let root = temp_root("refresh-unknown");
+        let original = offer("operator");
+        let adapters = FakeAdapters::default();
+        let state = init_state(&root, vec![original.clone()], adapters.clone());
+        let binding = create_binding(
+            "request:unknown-refresh",
+            &original.id,
+            &json!({"prompt":"x"}),
+        );
+        let mut run =
+            run_with_id_for_offer(deterministic_run_id(&binding), binding, &original, now_ms());
+        transition_terminal(
+            &original,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        expire_terminal_run(&mut run);
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&root, &run.run_id);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!state.journal.prune_expired_loaded_run(&run).unwrap());
+        state.journal.prune_expired_terminal_runs().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let same = state.config.clone();
+        state.plan_refresh(same.clone(), true, &[]).unwrap();
+        let mut addition = same.clone();
+        addition.extra["offers"] = json!([original.clone(), offer("admitted")]);
+        assert_eq!(
+            match state.plan_refresh(addition, false, &[]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("unresolved binding allowed an addition"),
+            },
+            "selection_unavailable"
+        );
+        drop(state);
+        let restarted = ModelProviderState::from_init(same.clone(), adapters.clone()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut drift = same.clone();
+        drift.extra["offers"][0]["adapter"]["model"] = json!("changed-selector");
+        assert!(ModelProviderState::from_init(drift, adapters.clone()).is_err());
+        let mut missing = same.clone();
+        missing.extra["offers"] = json!([]);
+        ModelProviderState::from_init(missing, adapters.clone()).unwrap();
+        restarted.plan_refresh(same, false, &[]).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
+    fn home_owned_hosted_offer(id: &str, api_url: &str, api_key: &str) -> ConfiguredOffer {
+        let mut hosted = offer(id);
+        hosted.title = id.to_string();
+        hosted.adapter = AdapterConfig::OpenAiCompatibleText {
+            api_url: api_url.to_string(),
+            api_key: Some(api_key.to_string()),
+            model: "fixture/model".to_string(),
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        hosted
+    }
+
+    #[test]
+    fn hosted_key_refresh_preserves_held_run_and_updates_next_dispatch() {
+        let chat = home_owned_hosted_offer(
+            "model:chat",
+            "http://127.0.0.1:61974/v1/chat/completions",
+            "fixture-key-a",
+        );
+        let mut decision = offer("model:decision");
+        decision.operation = "decision.evaluate".into();
+        decision.input_modalities = vec!["application/json".into()];
+        decision.output_modalities = vec!["application/json".into()];
+        decision.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key-a".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        for mut original in [chat, decision] {
+            original.policy.concurrency_limit = 2;
+            let root = temp_root("hosted-held-key-refresh");
+            let adapters = FakeAdapters {
+                dispatch_results: Arc::new(Mutex::new(
+                    (0..2)
+                        .map(|_| {
+                            Ok(DispatchResult::Running {
+                                events: vec![],
+                                backend_state: running_backend_state(),
+                            })
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            };
+            let mut state = init_state(&root, vec![original.clone()], adapters.clone());
+            let request = |request_id: &str| {
+                let input = json!({"prompt":"held key refresh"});
+                let mut binding = create_binding(request_id, &original.id, &input);
+                binding.operation = original.operation.clone();
+                RunsCreateRequest {
+                    expected_execution_binding_hash: None,
+                    op: "runs_create".into(),
+                    offer_id: original.id.clone(),
+                    operation: original.operation.clone(),
+                    input,
+                    runtime_binding: binding,
+                }
+            };
+            let held = state
+                .handle_runs_create(request("request:held-key-a"))
+                .unwrap();
+            assert_eq!(held["data"]["status"], "running");
+            let held_id = held["data"]["run_id"].as_str().unwrap().to_string();
+            let held_bytes = std::fs::read(run_path(&root, &held_id)).unwrap();
+            let workers = vec![held_id.clone()];
+            let mut refreshed = state.config.clone();
+            refreshed.extra["offers"][0]["adapter"]["api_key"] = json!("fixture-key-b");
+            for (pointer, value) in [
+                ("/adapter/api_url", json!("https://example.invalid/changed")),
+                ("/adapter/model", json!("changed-model")),
+                ("/adapter/hosted/model_privacy", json!("private")),
+                ("/policy/concurrency_limit", json!(3)),
+                ("/title", json!("Changed title")),
+            ] {
+                let mut changed = refreshed.clone();
+                let (parent, field) = pointer.rsplit_once('/').unwrap();
+                changed.extra["offers"][0].pointer_mut(parent).unwrap()[field] = value;
+                let extra: ProviderInitExtra =
+                    serde_json::from_value(changed.extra.clone()).unwrap();
+                extra.validate(&changed).unwrap();
+                assert!(
+                    state.plan_refresh(changed, true, &workers).is_err(),
+                    "held key refresh allowed a change at {pointer}"
+                );
+            }
+            let mut removed = refreshed.clone();
+            removed.extra["offers"] = json!([]);
+            assert!(state.plan_refresh(removed, true, &workers).is_err());
+            let refresh = state.plan_refresh(refreshed, true, &workers).unwrap();
+            state.apply_refresh(refresh);
+            assert_eq!(
+                state.config.extra["offers"][0]["adapter"]["api_key"],
+                "fixture-key-b"
+            );
+            assert_eq!(
+                std::fs::read(run_path(&root, &held_id)).unwrap(),
+                held_bytes
+            );
+            let next = state
+                .handle_runs_create(request("request:next-key-b"))
+                .unwrap();
+            assert_eq!(next["data"]["status"], "running");
+            let dispatched = adapters.dispatched_adapters.lock().unwrap();
+            assert_eq!(dispatched.len(), 2);
+            assert_eq!(dispatched[0], original.adapter);
+            assert_eq!(dispatched[1], state.offers[&original.id].adapter);
+            assert_ne!(dispatched[0], dispatched[1]);
+            assert_eq!(
+                state.offers[&original.id].execution_binding_hash().unwrap(),
+                original.execution_binding_hash().unwrap()
+            );
+            assert_eq!(
+                std::fs::read(run_path(&root, &held_id)).unwrap(),
+                held_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn home_owned_hosted_replace_and_disconnect_succeed_when_idle() {
+        let root = temp_root("hosted-home-owned");
+        let openrouter = home_owned_hosted_offer(
+            "model:openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-fixture-valid",
+        );
+        let venice = home_owned_hosted_offer(
+            "model:venice",
+            "https://api.venice.ai/api/v1/chat/completions",
+            "sk-vnz-fixture-valid",
+        );
+        let operator = offer("operator");
+        let mut state = init_state(
+            &root,
+            vec![openrouter.clone(), venice.clone(), operator.clone()],
+            FakeAdapters::default(),
+        );
+        let mut replaced_venice = venice.clone();
+        if let AdapterConfig::OpenAiCompatibleText {
+            api_key,
+            model,
+            hosted,
+            ..
+        } = &mut replaced_venice.adapter
+        {
+            *api_key = Some("sk-vnz-fixture-replaced".to_string());
+            *model = "fixture/replaced".to_string();
+            hosted.model_privacy = "private".to_string();
+        }
+        let mut replaced_config = state.config.clone();
+        replaced_config.extra["offers"] =
+            json!([openrouter.clone(), replaced_venice, operator.clone()]);
+        state
+            .plan_refresh(replaced_config, false, &[])
+            .expect("idle Venice replace");
+        let mut disconnected_venice = state.config.clone();
+        disconnected_venice.extra["offers"] = json!([openrouter.clone(), operator.clone()]);
+        state
+            .plan_refresh(disconnected_venice, false, &[])
+            .expect("idle Venice disconnect");
+        let mut replaced_openrouter = openrouter.clone();
+        if let AdapterConfig::OpenAiCompatibleText { api_key, model, .. } =
+            &mut replaced_openrouter.adapter
+        {
+            *api_key = Some("sk-or-fixture-replaced".to_string());
+            *model = "fixture/replaced".to_string();
+        }
+        let mut replaced_openrouter_config = state.config.clone();
+        replaced_openrouter_config.extra["offers"] =
+            json!([replaced_openrouter, venice.clone(), operator.clone()]);
+        state
+            .plan_refresh(replaced_openrouter_config, false, &[])
+            .expect("idle OpenRouter replace");
+        let mut disconnected_openrouter = state.config.clone();
+        disconnected_openrouter.extra["offers"] = json!([venice.clone(), operator.clone()]);
+        state
+            .plan_refresh(disconnected_openrouter, false, &[])
+            .expect("idle OpenRouter disconnect");
+        let mut mutated_operator = state.config.clone();
+        mutated_operator.extra["offers"][2]["title"] = json!("changed operator");
+        assert!(state.plan_refresh(mutated_operator, false, &[]).is_err());
+        let hosted_a = home_owned_hosted_offer(
+            "model:hosted-0123456789abcdef0123456789abcdef",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-instance-a",
+        );
+        let hosted_b = home_owned_hosted_offer(
+            "model:hosted-fedcba9876543210fedcba9876543210",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-instance-b",
+        );
+        let mut two_instances = state.config.clone();
+        two_instances.extra["offers"] = json!([
+            hosted_a.clone(),
+            hosted_b.clone(),
+            venice.clone(),
+            operator.clone()
+        ]);
+        let refresh = state
+            .plan_refresh(two_instances, false, &[])
+            .expect("idle same-provider hosted instances");
+        state.apply_refresh(refresh);
+        let mut renamed = hosted_a.clone();
+        renamed.title = "Jev".to_string();
+        let mut renamed_config = state.config.clone();
+        renamed_config.extra["offers"] = json!([
+            renamed.clone(),
+            hosted_b.clone(),
+            venice.clone(),
+            operator.clone()
+        ]);
+        state
+            .plan_refresh(renamed_config, false, &[])
+            .expect("idle hosted instance rename");
+        let mut drop_b = state.config.clone();
+        drop_b.extra["offers"] = json!([renamed, venice, operator]);
+        state
+            .plan_refresh(drop_b, false, &[])
+            .expect("idle hosted instance disconnect");
+    }
+
+    #[test]
+    fn canonical_decision_identity_replacement_preserves_unresolved_ownership() {
+        let root = temp_root("decision-canonical-refresh");
+        let mut jev = offer("model:jev");
+        jev.operation = "decision.evaluate".into();
+        jev.input_modalities = vec!["application/json".into()];
+        jev.output_modalities = vec!["application/json".into()];
+        jev.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        let state = init_state(&root, vec![jev.clone()], FakeAdapters::default());
+        let mut proposed = state.config.clone();
+        proposed.extra["offers"][0]["adapter"]["expected_response_model"] =
+            json!("typesafe/jev-1.13-20260917");
+        let mut binding = create_binding(
+            "request:canonical-refresh",
+            &jev.id,
+            &json!({"state":"fixture"}),
+        );
+        binding.operation = jev.operation.clone();
+        let prepared = prepared_run_for_offer(binding, &jev, now_ms());
+        let mut active = prepared.clone();
+        active.status = RunStatus::Running;
+        active.backend_state = Some(running_backend_state());
+        state.journal.store_run(&active).unwrap();
+        assert!(state.plan_refresh(proposed.clone(), false, &[]).is_err());
+        let mut unknown = prepared.clone();
+        transition_terminal(
+            &jev,
+            &mut unknown,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&unknown).unwrap();
+        assert!(state.plan_refresh(proposed.clone(), false, &[]).is_err());
+        let mut completed = prepared;
+        transition_terminal(
+            &jev,
+            &mut completed,
+            RunStatus::Completed,
+            Some(
+                json!({"schema":"elastos.model.output.decisions/v1", "model":"typesafe/jev-1.13",
+                "answers":{"review":{"type":"choice", "choice":"allow"}}}),
+            ),
+            None,
+        )
+        .unwrap();
+        state.journal.store_run(&completed).unwrap();
+        for worker in [completed.run_id.clone(), "missing-worker-record".into()] {
+            assert!(state
+                .plan_refresh(proposed.clone(), false, &[worker])
+                .is_err());
+        }
+        assert!(state.plan_refresh(proposed, false, &[]).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn retirement_state() -> ModelProviderState<FakeAdapters> {
+        use crate::config::{LocalArtifactConfig, LocalLlamaSettings};
+        let root = temp_root("retirement");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let (engine, model, _) = crate::test_support::write_fake_llama_server(&root, "healthy");
+        let mut local = offer("admitted");
+        local.adapter = AdapterConfig::LocalLlamaCppText {
+            engine: LocalArtifactConfig {
+                path: engine.to_string_lossy().into_owned(),
+                sha256: crate::test_support::sha256_file(&engine),
+            },
+            model: LocalArtifactConfig {
+                path: model.to_string_lossy().into_owned(),
+                sha256: crate::test_support::sha256_file(&model),
+            },
+            settings: LocalLlamaSettings {
+                context_size: 256,
+                parallel: 1,
+                threads: 1,
+                batch_threads: 1,
+                gpu_layers: 0,
+                health_timeout_ms: 1000,
+                shutdown_timeout_ms: 250,
+                enable_thinking: false,
+            },
+        };
+        ModelProviderState::from_init(BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: Vec::new(), read_only: false, encryption_key: String::new(),
+            extra: json!({"offers": [local.clone(), offer("operator")], "runtime_admitted_offers": [{"offer_id": local.id}]}),
+        }, FakeAdapters::default()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn withdrawal(state: &ModelProviderState<FakeAdapters>) -> BridgeProviderConfig {
+        let mut config = state.config.clone();
+        config.extra["offers"] = json!([state.offers["operator"].clone()]);
+        config.extra["runtime_admitted_offers"] = json!([]);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_local_engine_allows_only_idle_hosted_additions() {
+        let mut state = retirement_state();
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding("request:warm-hosted", &local.id, &json!({"prompt":"x"}));
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        let prepared = run.clone();
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::Completed,
+            Some(json!({"schema":"elastos.model.output.text/v1", "text":"fixture"})),
+            None,
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        let original_binding = local.execution_binding_hash().unwrap();
+        let mut jev = home_owned_hosted_offer(
+            "model:jev",
+            "https://openrouter.ai/api/alpha/decisions",
+            "fixture-key",
+        );
+        jev.operation = "decision.evaluate".into();
+        jev.input_modalities = vec!["application/json".into()];
+        jev.output_modalities = vec!["application/json".into()];
+        jev.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        let venice = home_owned_hosted_offer(
+            "model:venice",
+            "https://api.venice.ai/api/v1/chat/completions",
+            "fixture-key",
+        );
+        let mut proposed = state.config.clone();
+        proposed.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .extend([json!(jev), json!(venice)]);
+        state
+            .plan_refresh(proposed.clone(), true, &[])
+            .expect("warm idle engine permits hosted additions");
+        for worker in [run.run_id.clone(), "missing-worker-record".into()] {
+            assert!(state
+                .plan_refresh(proposed.clone(), true, &[worker])
+                .is_err());
+        }
+        for status in [RunStatus::Running, RunStatus::SettlementUnknown] {
+            let mut unresolved = prepared.clone();
+            if status == RunStatus::SettlementUnknown {
+                transition_terminal(
+                    &local,
+                    &mut unresolved,
+                    status,
+                    None,
+                    Some(RunError {
+                        class: ErrorClass::SettlementUnknown,
+                        code: "settlement_unknown".into(),
+                        message: "model settlement is unknown".into(),
+                    }),
+                )
+                .unwrap();
+            } else {
+                unresolved.status = status;
+                unresolved.backend_state = Some(running_backend_state());
+            }
+            state.journal.store_run(&unresolved).unwrap();
+            assert!(state.plan_refresh(proposed.clone(), true, &[]).is_err());
+        }
+        state.journal.store_run(&run).unwrap();
+        let mut new_local = local.clone();
+        new_local.id = "admitted-next".into();
+        let mut mixed = proposed.clone();
+        mixed.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(new_local.clone()));
+        mixed.extra["runtime_admitted_offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"offer_id":new_local.id}));
+        assert!(state.plan_refresh(mixed, true, &[]).is_err());
+        let mut local_only = state.config.clone();
+        local_only.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(new_local.clone()));
+        local_only.extra["runtime_admitted_offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"offer_id":new_local.id}));
+        assert!(state.plan_refresh(local_only, true, &[]).is_err());
+        let refresh = state.plan_refresh(proposed, true, &[]).unwrap();
+        assert!(refresh.retire_offer.is_none());
+        state.apply_refresh(refresh);
+        assert_eq!(
+            state.offers["admitted"].execution_binding_hash().unwrap(),
+            original_binding
+        );
+        assert_eq!(state.offers.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_validates_entire_proposal_and_preserves_operator_provenance() {
+        let state = retirement_state();
+        for (field, value) in [
+            ("/offers/0/title", json!("changed admitted offer")),
+            ("/offers/0/policy/runtime_ms_limit", json!(60_000)),
+            ("/offers/0/adapter/settings/threads", json!(2)),
+            (
+                "/offers/0/adapter/model/sha256",
+                json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+        ] {
+            let mut invalid = state.config.clone();
+            *invalid.extra.pointer_mut(field).unwrap() = value;
+            assert!(
+                state.plan_refresh(invalid, false, &[]).is_err(),
+                "admitted offer changed at {field}"
+            );
+        }
+        let mut invalid = withdrawal(&state);
+        invalid.extra["offers"][0]["title"] = json!("changed operator");
+        assert!(state.plan_refresh(invalid, false, &[]).is_err());
+        let mut invalid = withdrawal(&state);
+        invalid.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(offer("new")));
+        assert!(state.plan_refresh(invalid, false, &[]).is_err());
+        let mut invalid = state.config.clone();
+        invalid.extra["runtime_admitted_offers"] = json!([]);
+        assert!(state.plan_refresh(invalid.clone(), false, &[]).is_err());
+        // The exact local offer first configured without provenance stays operator-owned.
+        let unmarked = ModelProviderState::from_init(invalid, FakeAdapters::default()).unwrap();
+        assert!(unmarked
+            .plan_refresh(state.config.clone(), false, &[])
+            .is_err());
+        assert!(unmarked
+            .plan_refresh(withdrawal(&unmarked), false, &[])
+            .is_err());
+        assert!(state.offers["admitted"].enabled);
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+        assert!(state.journal.scan_runs().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_pending_close_blocks_dispatch_and_stale_reenable_until_exact_retry() {
+        let mut state = retirement_state();
+        let old = state.config.clone();
+        let desired = withdrawal(&state);
+        let planned = state.plan_refresh(desired.clone(), true, &[]).unwrap();
+        state.begin_retirement(&planned);
+        // This is the retained state when engine closure returns an error.
+        assert!(state.plan_refresh(old.clone(), false, &[]).is_err());
+        let input = json!({"prompt":"blocked"});
+        let request = RunsCreateRequest {
+            expected_execution_binding_hash: None,
+            op: "runs_create".into(),
+            offer_id: "admitted".into(),
+            operation: "text.generate".into(),
+            runtime_binding: create_binding("request:retirement-blocked", "admitted", &input),
+            input,
+        };
+        assert_eq!(
+            state.handle_runs_create(request).unwrap_err().code(),
+            "selection_unavailable"
+        );
+        assert_eq!(state.config.extra, old.extra);
+        assert!(state.offers["operator"].enabled);
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+        let retried = state.plan_refresh(desired.clone(), true, &[]).unwrap();
+        assert_eq!(retried.retire_offer.as_deref(), Some("admitted"));
+        state.apply_refresh(retried);
+        assert!(!state.offers.contains_key("admitted"));
+        assert!(state
+            .plan_refresh(desired, false, &[])
+            .unwrap()
+            .retire_offer
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_retains_unresolved_binding_after_expiry_and_restart_and_worker_exit() {
+        let mut state = retirement_state();
+        let desired = withdrawal(&state);
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding(
+            "request:retained-retirement",
+            &local.id,
+            &json!({"prompt":"x"}),
+        );
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&state.config.base_path, &run.run_id);
+        let before = std::fs::read(&path).unwrap();
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        expire_terminal_run(&mut run);
+        state.journal.store_run(&run).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        state.journal.prune_expired_terminal_runs().unwrap();
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        ModelProviderState::from_init(desired.clone(), FakeAdapters::default()).unwrap();
+        state =
+            ModelProviderState::from_init(state.config.clone(), FakeAdapters::default()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        // A retained worker blocks even after its journal has a known terminal result.
+        run.status = RunStatus::Failed;
+        run.error = Some(RunError {
+            class: ErrorClass::BackendFailed,
+            code: "backend_failed".into(),
+            message: "model execution failed".into(),
+        });
+        state.journal.store_run(&run).unwrap();
+        assert!(state
+            .plan_refresh(desired.clone(), false, &[run.run_id])
+            .is_err());
+        assert!(state
+            .plan_refresh(desired.clone(), false, &["missing-worker-record".into()])
+            .is_err());
+        assert!(state.plan_refresh(desired, false, &[]).is_ok());
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_reclaim_withdraws_settlement_unknown_without_retained_worker() {
+        let mut state = retirement_state();
+        let mut desired = withdrawal(&state);
+        desired.extra["owner_reclaim"] = json!(true);
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding(
+            "request:owner-reclaim-unknown",
+            &local.id,
+            &json!({"prompt": "x"}),
+        );
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        assert_eq!(
+            match state.plan_refresh(withdrawal(&state), false, &[]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("capacity withdrawal ignored settlement_unknown"),
+            },
+            "selection_unavailable"
+        );
+        assert_eq!(
+            match state.plan_refresh(desired.clone(), false, &[run.run_id.clone()]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("owner reclaim ignored retained worker"),
+            },
+            "selection_unavailable"
+        );
+        let refresh = state.plan_refresh(desired, false, &[]).unwrap();
+        assert_eq!(refresh.retire_offer.as_deref(), Some(local.id.as_str()));
+        assert!(refresh.config.extra.get("owner_reclaim").is_none());
+        state.apply_refresh(refresh);
+        let mut restored = state.config.clone();
+        restored.extra["offers"] = json!([local.clone(), state.offers["operator"].clone()]);
+        restored.extra["runtime_admitted_offers"] = json!([{"offer_id": local.id}]);
+        let restored_refresh = state.plan_refresh(restored, false, &[]).unwrap();
+        assert!(restored_refresh.retire_offer.is_none());
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
     fn run_with_id_for_offer(
         run_id: String,
         binding: RuntimeCreateBinding,
@@ -1445,6 +2591,12 @@ mod tests {
     }
 
     #[test]
+    fn run_deadline_expires_at_equality() {
+        assert!(!deadline_expired(41, 42));
+        assert!(deadline_expired(42, 42));
+    }
+
+    #[test]
     fn duplicate_offer_ids_are_rejected() {
         let adapters = FakeAdapters::default();
         let error = match ModelProviderState::from_init(
@@ -1464,6 +2616,179 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code(), "internal_error");
+    }
+
+    #[test]
+    fn old_v1_journals_preserve_authority_and_never_redispatch() {
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Running,
+            RunStatus::SettlementUnknown,
+        ] {
+            let root = temp_root("old-v1-capability");
+            let current = offer("local-text");
+            let input =
+                json!({"schema":elastos_model_contract::TEXT_INPUT_V1_SCHEMA,"prompt":"original"});
+            let binding = create_binding("request:old-v1", &current.id, &input);
+            let mut run = running_run_for_offer(binding.clone(), &current);
+            if status == RunStatus::Completed {
+                transition_terminal(
+                    &current,
+                    &mut run,
+                    status.clone(),
+                    Some(json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"done"})),
+                    None,
+                )
+                .unwrap();
+            } else if status == RunStatus::SettlementUnknown {
+                transition_terminal(
+                    &current,
+                    &mut run,
+                    status.clone(),
+                    None,
+                    Some(RunError {
+                        class: ErrorClass::SettlementUnknown,
+                        code: "settlement_unknown".into(),
+                        message: "Unknown".into(),
+                    }),
+                )
+                .unwrap();
+            }
+            let adapters = FakeAdapters {
+                reconcile_results: Arc::new(Mutex::new(vec![Ok(ReconcileResult::StillRunning {
+                    events: vec![],
+                    backend_state: running_backend_state(),
+                    status: RunStatus::Running,
+                })])),
+                ..Default::default()
+            };
+            let state = init_state(&root, vec![current.clone()], adapters.clone());
+            let config = state.config.clone();
+            state.journal.store_run(&run).unwrap();
+            let path = run_path(&root, &run.run_id);
+            let mut old = serde_json::to_value(&run).unwrap();
+            old["offer"]
+                .as_object_mut()
+                .unwrap()
+                .remove("input_schemas");
+            let bytes = serde_json::to_vec_pretty(&old).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            drop(state);
+            let mut restarted =
+                ModelProviderState::from_init(config.clone(), adapters.clone()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(restarted
+                .journal
+                .load_run(&run.run_id)
+                .unwrap()
+                .offer
+                .input_schemas
+                .is_empty());
+            let request = RunsCreateRequest {
+                op: "runs_create".into(),
+                offer_id: current.id.clone(),
+                operation: current.operation.clone(),
+                input: input.clone(),
+                runtime_binding: binding.clone(),
+                expected_execution_binding_hash: Some(run.execution_binding_hash.clone()),
+            };
+            let result = restarted.handle_runs_create(request).unwrap();
+            assert_eq!(result["data"]["run_id"], run.run_id);
+            let stored = restarted.journal.load_run(&run.run_id).unwrap();
+            assert_eq!(stored.runtime_binding, binding);
+            assert_eq!(stored.input_hash, run.input_hash);
+            assert_eq!(stored.execution_binding_hash, run.execution_binding_hash);
+            assert_eq!(stored.backend_state, run.backend_state);
+            assert_eq!(stored.status, status);
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(
+                *adapters.reconcile_calls.lock().unwrap(),
+                u32::from(status == RunStatus::Running)
+            );
+            if status != RunStatus::Completed {
+                for (pointer, value) in [
+                    ("/offers/0/adapter/model", json!("different-model")),
+                    (
+                        "/offers/0/adapter/api_url",
+                        json!("https://example.invalid/other"),
+                    ),
+                    ("/offers/0/policy/runtime_ms_limit", json!(31_000)),
+                ] {
+                    let mut drift = config.clone();
+                    *drift.extra.pointer_mut(pointer).unwrap() = value;
+                    assert!(ModelProviderState::from_init(drift, adapters.clone()).is_err());
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn text_v2_retry_binds_roles_order_content_and_byte_limit() {
+        let root = temp_root("v2-idempotency");
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::SettlementUnknown,
+                output: None,
+                error: Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            })])),
+            ..Default::default()
+        };
+        let current = offer("local-text");
+        let mut state = init_state(&root, vec![current.clone()], adapters.clone());
+        let input = json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":[
+            {"role":"system","content":"Be concise."},{"role":"user","content":"first"},
+            {"role":"assistant","content":"reply"},{"role":"user","content":"last"}
+        ]});
+        let request = |input: Value| RunsCreateRequest {
+            op: "runs_create".into(),
+            offer_id: current.id.clone(),
+            operation: current.operation.clone(),
+            runtime_binding: create_binding("request:v2-retry", &current.id, &input),
+            input,
+            expected_execution_binding_hash: None,
+        };
+        let first = state.handle_runs_create(request(input.clone())).unwrap();
+        let config = state.config.clone();
+        drop(state);
+        let mut state = ModelProviderState::from_init(config, adapters.clone()).unwrap();
+        assert_eq!(
+            state.handle_runs_create(request(input.clone())).unwrap(),
+            first
+        );
+        let mut role = input.clone();
+        role["messages"][2]["role"] = json!("user");
+        let mut order = input.clone();
+        order["messages"].as_array_mut().unwrap().swap(1, 2);
+        let mut content = input.clone();
+        content["messages"][2]["content"] = json!("changed");
+        for changed in [role, order, content] {
+            assert_eq!(
+                state
+                    .handle_runs_create(request(changed))
+                    .unwrap_err()
+                    .code(),
+                "invalid_request"
+            );
+        }
+        let mut oversized = input;
+        oversized["messages"][3]["content"] =
+            json!("x".repeat(current.policy.input_bytes_limit as usize));
+        assert_eq!(
+            state
+                .handle_runs_create(request(oversized))
+                .unwrap_err()
+                .code(),
+            "policy_limit"
+        );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1492,6 +2817,9 @@ mod tests {
             "prompt": "hello"
         });
         let request = RunsCreateRequest {
+            expected_execution_binding_hash: Some(
+                state.offers["local-text"].execution_binding_hash().unwrap(),
+            ),
             op: "runs_create".to_string(),
             offer_id: "local-text".to_string(),
             operation: "text.generate".to_string(),
@@ -1503,6 +2831,28 @@ mod tests {
         assert_eq!(first["status"], "ok");
         assert_eq!(first["data"]["run_id"], second["data"]["run_id"]);
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn expected_execution_revision_is_checked_before_a_run_is_created() {
+        let root = temp_root("revision-mismatch");
+        let adapters = FakeAdapters::default();
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
+        let input = serde_json::json!({
+            "schema": "elastos.model.input.text/v1",
+            "prompt": "hello"
+        });
+        let wrong = RunsCreateRequest {
+            expected_execution_binding_hash: Some("b".repeat(64)),
+            op: "runs_create".into(),
+            offer_id: "local-text".into(),
+            operation: "text.generate".into(),
+            input: input.clone(),
+            runtime_binding: create_binding("request:revision", "local-text", &input),
+        };
+        let error = state.handle_runs_create(wrong).unwrap_err();
+        assert_eq!(error.code(), "selection_unavailable");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
     }
 
     #[test]
@@ -1780,6 +3130,7 @@ mod tests {
             api_url,
             api_key,
             model,
+            ..
         } = &mut changed_offer.adapter
         {
             *api_url = "https://sentinel.example.test:8443/private-route".to_string();
@@ -2360,6 +3711,7 @@ mod tests {
                         code: "context_rejected".to_string(),
                         message: "model run could not continue".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2422,6 +3774,7 @@ mod tests {
                         "text": "wrong",
                     })),
                     error: None,
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2496,6 +3849,7 @@ mod tests {
                         code: "backend_failed".to_string(),
                         message: "model backend failed".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2554,6 +3908,7 @@ mod tests {
                         code: "cancelled".to_string(),
                         message: "model run was cancelled".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2758,51 +4113,143 @@ mod tests {
     fn concurrency_limit_is_enforced() {
         let root = temp_root("concurrency");
         let adapters = FakeAdapters {
-            dispatch_results: Arc::new(Mutex::new(vec![
-                Ok(DispatchResult::Running {
-                    events: vec![EventSeed {
-                        kind: "dispatched",
-                        data: serde_json::json!({}),
-                    }],
-                    backend_state: serde_json::json!({"job_id":"job-1"}),
-                }),
-                Ok(DispatchResult::Running {
-                    events: vec![EventSeed {
-                        kind: "dispatched",
-                        data: serde_json::json!({}),
-                    }],
-                    backend_state: serde_json::json!({"job_id":"job-2"}),
-                }),
-            ])),
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Running {
+                events: vec![EventSeed {
+                    kind: "dispatched",
+                    data: serde_json::json!({}),
+                }],
+                backend_state: serde_json::json!({"job_id":"job-1"}),
+            })])),
             ..Default::default()
         };
-        let mut state = init_state(&root, vec![offer("local-text")], adapters);
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
+        assert_eq!(offer("local-text").policy.concurrency_limit, 1);
         let input1 = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"one"});
         let input2 = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"two"});
+        let first_binding = create_binding("request:one", "local-text", &input1);
+        let second_binding = create_binding("request:two", "local-text", &input2);
         let first = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
                 input: input1.clone(),
-                runtime_binding: create_binding("request:one", "local-text", &input1),
+                runtime_binding: first_binding,
             })
             .unwrap();
-        let second = state
-            .handle_runs_create(RunsCreateRequest {
-                op: "runs_create".to_string(),
-                offer_id: "local-text".to_string(),
-                operation: "text.generate".to_string(),
-                input: input2.clone(),
-                runtime_binding: create_binding("request:two", "local-text", &input2),
-            })
-            .unwrap();
+        let second_request = RunsCreateRequest {
+            expected_execution_binding_hash: None,
+            op: "runs_create".to_string(),
+            offer_id: "local-text".to_string(),
+            operation: "text.generate".to_string(),
+            input: input2.clone(),
+            runtime_binding: second_binding.clone(),
+        };
+        let second = state.handle_runs_create(second_request.clone()).unwrap();
         assert_eq!(first["data"]["status"], "running");
         assert_eq!(second["data"]["status"], "failed");
+        assert_eq!(second["data"]["terminal"]["error"]["class"], "rate_limited");
+        assert_eq!(second["data"]["terminal"]["error"]["code"], "model_busy");
         assert_eq!(
-            second["data"]["terminal"]["error"]["class"],
-            "selection_unavailable"
+            second["data"]["terminal"]["error"]["message"],
+            "Model is busy."
         );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+
+        let replay = state.handle_runs_create(second_request).unwrap();
+        assert_eq!(replay["data"]["status"], "failed");
+        assert_eq!(replay["data"]["run_id"], second["data"]["run_id"]);
+        assert_eq!(replay["data"]["terminal"]["error"]["class"], "rate_limited");
+        assert_eq!(replay["data"]["terminal"]["error"]["code"], "model_busy");
+        assert_eq!(
+            replay["data"]["terminal"]["error"]["message"],
+            "Model is busy."
+        );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+
+        let events = state
+            .handle_runs_events(RunsEventsRequest {
+                op: "runs_events".to_string(),
+                run_id: second["data"]["run_id"].as_str().unwrap().to_string(),
+                after_sequence: Some(0),
+                runtime_binding: access_binding(&second_binding),
+            })
+            .unwrap();
+        let terminal = events["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["terminal"] == true)
+            .expect("capacity failure keeps a terminal event");
+        assert_eq!(terminal["kind"], "failed");
+        assert_eq!(terminal["data"]["class"], "rate_limited");
+        assert_eq!(terminal["data"]["code"], "model_busy");
+        assert_eq!(terminal["data"]["message"], "Model is busy.");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn private_and_remote_principals_share_one_hosted_concurrency_limit() {
+        let root = temp_root("hosted-private-remote-concurrency");
+        let id = "model:openrouter";
+        let hosted = home_owned_hosted_offer(
+            id,
+            "https://openrouter.ai/api/v1/chat/completions",
+            "fixture-key",
+        );
+        let running = || {
+            Ok(DispatchResult::Running {
+                events: Vec::new(),
+                backend_state: serde_json::json!({"job_id":"fixture-job"}),
+            })
+        };
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![running(), running()])),
+            reconcile_results: Arc::new(Mutex::new(vec![Ok(ReconcileResult::Terminal {
+                events: Vec::new(),
+                status: RunStatus::Completed,
+                output: Some(
+                    serde_json::json!({"schema":"elastos.model.output.text/v1","text":"settled"}),
+                ),
+                error: None,
+                backend_report: None,
+            })])),
+            ..Default::default()
+        };
+        let mut state = init_state(&root, vec![hosted], adapters.clone());
+        let input =
+            serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"small fixture"});
+        let private = create_binding("request:private", id, &input);
+        let mut remote = create_binding("request:remote-busy", id, &input);
+        remote.principal_id = "remote:consumer".to_string();
+        remote.grant_id = "grant:shared-model".to_string();
+        assert_ne!(private.principal_id, remote.principal_id);
+        let request = |binding| RunsCreateRequest {
+            expected_execution_binding_hash: None,
+            op: "runs_create".to_string(),
+            offer_id: id.to_string(),
+            operation: "text.generate".to_string(),
+            input: input.clone(),
+            runtime_binding: binding,
+        };
+        let first = state.handle_runs_create(request(private.clone())).unwrap();
+        assert_eq!(first["data"]["status"], "running");
+        let denied = state.handle_runs_create(request(remote.clone())).unwrap();
+        assert_eq!(denied["data"]["terminal"]["error"]["code"], "model_busy");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        let settled = state
+            .handle_runs_get(RunsGetRequest {
+                op: "runs_get".to_string(),
+                run_id: first["data"]["run_id"].as_str().unwrap().to_string(),
+                runtime_binding: access_binding(&private),
+            })
+            .unwrap();
+        assert_eq!(settled["data"]["status"], "completed");
+        remote.request_id = "request:remote-after-settlement".to_string();
+        let resumed = state.handle_runs_create(request(remote)).unwrap();
+        assert_eq!(resumed["data"]["status"], "running");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 2);
     }
 
     #[test]
@@ -2884,6 +4331,7 @@ mod tests {
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"new"});
         let response = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -2930,6 +4378,7 @@ mod tests {
             serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"new"});
         let error = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "image.generate".to_string(),
@@ -2949,7 +4398,7 @@ mod tests {
     fn owner_access_prunes_newly_expired_terminal_run() {
         let root = temp_root("owner-prune");
         let adapters = FakeAdapters::default();
-        let mut state = init_state(&root, vec![offer("local-text")], adapters);
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"hello"});
         let binding = create_binding("request:owner-prune", "local-text", &input);
         let mut run = StoredRun::new_prepared(
@@ -2983,6 +4432,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "run_not_found");
         assert!(!path.exists());
+
+        for restart in [false, true] {
+            if restart {
+                state = init_state(&root, vec![offer("local-text")], adapters.clone());
+            }
+            for _ in 0..2 {
+                for result in [
+                    state.handle_runs_get(RunsGetRequest {
+                        op: "runs_get".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                    }),
+                    state.handle_runs_events(RunsEventsRequest {
+                        op: "runs_events".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                        after_sequence: Some(0),
+                    }),
+                    state.handle_runs_cancel(RunsCancelRequest {
+                        op: "runs_cancel".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                    }),
+                ] {
+                    assert_eq!(result.unwrap_err().code(), "run_not_found");
+                }
+            }
+            assert!(!path.exists());
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+            assert!(adapters.cancel_allow_send.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -3103,6 +4584,7 @@ mod tests {
 
         for conflicting_request in [
             RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -3113,6 +4595,7 @@ mod tests {
                 let mut binding = create_binding(request_id, "local-text", &input);
                 binding.operation = "image.generate".to_string();
                 RunsCreateRequest {
+                    expected_execution_binding_hash: None,
                     op: "runs_create".to_string(),
                     offer_id: "local-text".to_string(),
                     operation: "image.generate".to_string(),
@@ -3124,6 +4607,7 @@ mod tests {
                 let mut binding = create_binding(request_id, "other-offer", &input);
                 binding.operation = "text.generate".to_string();
                 RunsCreateRequest {
+                    expected_execution_binding_hash: None,
                     op: "runs_create".to_string(),
                     offer_id: "other-offer".to_string(),
                     operation: "text.generate".to_string(),
@@ -3166,6 +4650,7 @@ mod tests {
 
         let first = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -3175,6 +4660,7 @@ mod tests {
             .unwrap();
         let second = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -3564,6 +5050,7 @@ mod tests {
                         code: "cancelled".to_string(),
                         message: "model run was cancelled".to_string(),
                     }),
+                    backend_report: None,
                 }),
             ])),
             reserve_cancel_results: Arc::new(Mutex::new(vec![Ok(CancelReservation {
@@ -3684,6 +5171,7 @@ mod tests {
                     code: "settlement_unknown".to_string(),
                     message: "model backend settlement is unknown".to_string(),
                 }),
+                backend_report: None,
             })])),
             ..Default::default()
         };
@@ -3723,6 +5211,7 @@ mod tests {
         });
         let error = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -3758,6 +5247,7 @@ mod tests {
         });
         let response = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),

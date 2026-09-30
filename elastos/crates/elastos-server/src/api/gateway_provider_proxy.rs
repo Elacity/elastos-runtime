@@ -19,6 +19,10 @@ const LIBRARY_DOWNLOAD_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const LIBRARY_UPLOAD_SESSION_SCHEMA: &str = "elastos.object.upload-session/v1";
 const LIBRARY_UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 const ASSISTANT_CAPSULE_ID: &str = "assistant";
+/// The Home Agent capsule reaches the model provider through the same typed
+/// contract as Assistant; every run is bound and audited to the capsule the
+/// launch token was issued for.
+const HOME_AGENT_CAPSULE_ID: &str = "home-agent";
 const MODEL_TEXT_OUTPUT_SCHEMA: &str = "elastos.model.output.text/v1";
 const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
@@ -102,6 +106,109 @@ const RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE: &str =
     "Runtime custody creator mint is pending exact Wallet or Chain settlement";
 const RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody creator mint is unavailable";
+
+/// The creator tail fails closed with one opaque message; keep the actual
+/// cause and its source line in the operator log so a live failure can be
+/// located without re-instrumenting.
+macro_rules! creator_mint_unavailable {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody creator mint failed closed"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE)
+        }
+    };
+}
+
+/// Chain-provider answers on the creator tail. A `*_pending` code (the
+/// mint receipt or verified listing not yet finalized on enough evidence
+/// sources) is the Chain half of "pending exact Wallet or Chain settlement":
+/// the caller re-polls, exactly as it does while the Wallet approval is
+/// outstanding. Anything else fails closed with the cause in the log.
+fn creator_mint_chain_error(error: (StatusCode, String), line: u32) -> anyhow::Error {
+    let (status, message) = error;
+    let code = message.split(':').next().unwrap_or_default().trim();
+    if status == StatusCode::BAD_REQUEST && code.ends_with("_pending") {
+        return anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+    }
+    tracing::warn!(
+        line,
+        status = status.as_u16(),
+        error = %message,
+        "Runtime custody creator mint failed closed"
+    );
+    anyhow::anyhow!("({}, {message})", status.as_u16())
+        .context(format!("{}:{line}", file!()))
+        .context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE)
+}
+
+/// Same operator-log discipline for the buyer side: "purchase is denied
+/// before buy" is one opaque message over many fail-closed preconditions.
+macro_rules! purchase_denied {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody purchase denied before buy"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+        }
+    };
+}
+
+macro_rules! purchase_denied_missing {
+    () => {
+        || {
+            tracing::warn!(line = line!(), "Runtime custody purchase denied before buy");
+            anyhow::anyhow!("{}:{}", file!(), line!())
+                .context(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+        }
+    };
+}
+
+macro_rules! purchase_unavailable {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody purchase failed closed"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE)
+        }
+    };
+}
+
+macro_rules! purchase_unavailable_missing {
+    () => {
+        || {
+            tracing::warn!(line = line!(), "Runtime custody purchase failed closed");
+            anyhow::anyhow!("{}:{}", file!(), line!()).context(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE,
+            )
+        }
+    };
+}
+
+macro_rules! creator_mint_unavailable_missing {
+    () => {
+        || {
+            tracing::warn!(line = line!(), "Runtime custody creator mint failed closed");
+            anyhow::anyhow!("{}:{}", file!(), line!())
+                .context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE)
+        }
+    };
+}
 const RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE: u16 = 1;
 
 #[derive(Debug, Deserialize)]
@@ -1579,8 +1686,13 @@ pub(super) async fn gateway_provider_proxy(
             }
         },
         "model" => match op.as_str() {
-            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
-                &[ASSISTANT_CAPSULE_ID]
+            "offers_list" => &[
+                ASSISTANT_CAPSULE_ID,
+                HOME_AGENT_CAPSULE_ID,
+                MARKETPLACE_CAPSULE_ID,
+            ],
+            "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
+                &[ASSISTANT_CAPSULE_ID, HOME_AGENT_CAPSULE_ID]
             }
             _ => {
                 return (
@@ -1612,6 +1724,9 @@ pub(super) async fn gateway_provider_proxy(
     let context = required.context.clone();
     let principal_id = context.principal_id.clone();
     let session_id = context.session_id.clone();
+    /* The verified capsule behind the launch token: model runs are bound and
+    audited to it, never to a fixed name. */
+    let launch_capsule_id = required.launch_context.executable_actor.clone();
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
         None => {
@@ -1643,11 +1758,78 @@ pub(super) async fn gateway_provider_proxy(
         )
             .into_response();
     }
+    let mut remote_model_grants = Vec::new();
     if scheme == "model" {
-        request = match normalize_model_provider_request(&op, &request, &context) {
-            Ok(value) => value,
-            Err((status, message)) => return (status, message).into_response(),
-        };
+        request =
+            match normalize_model_provider_request(&op, &request, &context, &launch_capsule_id) {
+                Ok(value) => value,
+                Err((status, message)) => return (status, message).into_response(),
+            };
+        // Approved remote model grants route new runs to the granting Runtime.
+        // A grant lookup failure keeps the local path; it cannot widen
+        // authority. Runs already routed remotely settle through their stored
+        // route even after the grant expired or was denied, so every run
+        // operation consults the route; a local run returns to the local path.
+        remote_model_grants = super::gateway_model_remote::consumer_grants(
+            &state.data_dir,
+            &context,
+            state.collaboration_discovery_service.as_ref(),
+        )
+        .unwrap_or_default();
+        if op != "offers_list" {
+            match super::gateway_model_remote::route_run_operation(
+                Arc::clone(&registry),
+                &state.data_dir,
+                &remote_model_grants,
+                &context,
+                &launch_capsule_id,
+                (&op, &request),
+                crate::auth::now_ts(),
+            )
+            .await
+            {
+                Ok(Some(mut remote_response)) => {
+                    if let Err(err) = project_model_provider_response(&op, &mut remote_response) {
+                        return gateway_provider_error_response(
+                            &scheme,
+                            anyhow::anyhow!(
+                                "remote model service returned an invalid typed response: {err}"
+                            ),
+                        );
+                    }
+                    return (StatusCode::OK, Json(remote_response)).into_response();
+                }
+                Ok(None) => {}
+                Err(super::gateway_model_remote::RemoteRouteError::PreDispatchRefused {
+                    binding,
+                    reason,
+                }) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "status": "error", "code": "remote_model_invocation_refused",
+                            "message": "This invocation was refused before provider dispatch.",
+                            "reason": reason, "refusal": binding,
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(super::gateway_model_remote::RemoteRouteError::Transport(message)) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "code": super::gateway_model_remote::TRANSPORT_INTERRUPTED,
+                            "message": format!("remote model service unreachable: {message}"),
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(err) => {
+                    return gateway_provider_error_response(&scheme, anyhow::anyhow!("{err}"));
+                }
+            }
+        }
     } else {
         request["op"] = serde_json::Value::String(op.clone());
     }
@@ -1778,7 +1960,7 @@ pub(super) async fn gateway_provider_proxy(
         if let Err(err) = append_provider_effect_audit(
             &state.data_dir,
             ProviderEffectAuditInput {
-                capsule_id: ASSISTANT_CAPSULE_ID,
+                capsule_id: &launch_capsule_id,
                 event_type: audit.requested_event,
                 principal_id: &principal_id,
                 session_id: &session_id,
@@ -1791,6 +1973,45 @@ pub(super) async fn gateway_provider_proxy(
                 &scheme,
                 anyhow::anyhow!("model provider audit failed: {}", err),
             );
+        }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            if let Some(offer_id) = request.get("offer_id").and_then(serde_json::Value::as_str) {
+                if let Some(hint) = crate::api::hosted_model_offer_hint(&state.data_dir, offer_id) {
+                    let gate = crate::jev_approval_lens::prepare_assistant_hosted_http(
+                        &state.data_dir,
+                        registry.as_ref(),
+                        &crate::jev_approval_lens::AssistantHostedHttpContext {
+                            request_id: audit.request_id,
+                            principal_id: &principal_id,
+                            session_id: &session_id,
+                            capsule_id: &launch_capsule_id,
+                            grant_id: &context.grant_id,
+                            offer_id,
+                            hint,
+                        },
+                    )
+                    .await;
+                    match gate {
+                        crate::jev_approval_lens::HostedHttpGate::Proceed => {}
+                        crate::jev_approval_lens::HostedHttpGate::NeedsReview => {
+                            return Json(serde_json::json!({
+                                "status": "error",
+                                "code": "approval_required",
+                                "message": crate::jev_approval_lens::HOSTED_HTTP_REVIEW_MESSAGE,
+                            }))
+                            .into_response();
+                        }
+                        crate::jev_approval_lens::HostedHttpGate::Denied => {
+                            return Json(serde_json::json!({
+                                "status": "error",
+                                "code": "approval_denied",
+                                "message": crate::jev_approval_lens::HOSTED_HTTP_DENIED_MESSAGE,
+                            }))
+                            .into_response();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1846,6 +2067,21 @@ pub(super) async fn gateway_provider_proxy(
         }
     };
     if scheme == "model" {
+        if op == "offers_list" && !remote_model_grants.is_empty() {
+            // A consumer Home may run no local model provider at all; granted
+            // remote offers still form its list.
+            if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+                response = super::gateway_model_remote::offers_list_without_local_provider();
+            }
+            super::gateway_model_remote::append_remote_offers(
+                &registry,
+                &remote_model_grants,
+                &context,
+                &launch_capsule_id,
+                &mut response,
+            )
+            .await;
+        }
         if let Err(err) = project_model_provider_response(&op, &mut response) {
             return gateway_provider_error_response(
                 &scheme,
@@ -1918,7 +2154,7 @@ pub(super) async fn gateway_provider_proxy(
         if let Err(err) = append_provider_effect_audit(
             &state.data_dir,
             ProviderEffectAuditInput {
-                capsule_id: ASSISTANT_CAPSULE_ID,
+                capsule_id: &launch_capsule_id,
                 event_type: if completed {
                     audit.completed_event
                 } else {
@@ -1940,6 +2176,25 @@ pub(super) async fn gateway_provider_proxy(
                 anyhow::anyhow!("model provider audit failed: {}", err),
             );
         }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            let outcome = if completed { "accepted" } else { "failed" };
+            let request_id = request
+                .get("offer_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|offer_id| {
+                    crate::jev_approval_lens::outcome_request_id(
+                        &state.data_dir,
+                        offer_id,
+                        audit.request_id,
+                    )
+                })
+                .unwrap_or_else(|| audit.request_id.to_string());
+            let _ = crate::jev_approval_lens::record_actual_outcome(
+                &state.data_dir,
+                &request_id,
+                outcome,
+            );
+        }
     }
 
     Json(response).into_response()
@@ -1955,9 +2210,9 @@ async fn resolve_runtime_custody_creator_account(
         .accounts
         .iter()
         .find(|account| account.account_id == wallet_account_id)
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+        .ok_or_else(creator_mint_unavailable_missing!())?;
     if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     validate_wallet_evm_address(&account.address, "creator")
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
@@ -2033,20 +2288,20 @@ async fn resolve_runtime_custody_creator_mint_source(
         }),
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
-    let source: ResolvedProtectedContentCreatorMintSource = serde_json::from_value(response)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(creator_mint_unavailable!())?;
+    let source: ResolvedProtectedContentCreatorMintSource =
+        serde_json::from_value(response).map_err(creator_mint_unavailable!())?;
     if source.schema != "elastos.chain.protected-content-creator-mint-source/v1"
         || source.abi != "elacity_mint_v1"
         || source.function != "mint(string,uint16,bytes,bytes)"
         || wallet_chain_namespace_network(&source.chain_namespace) != Some(source.network.as_str())
     {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     validate_wallet_evm_address(&source.ledger, "creator ledger")
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+        .map_err(creator_mint_unavailable!())?;
     validate_wallet_evm_address(&source.pay_token, "creator pay token")
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+        .map_err(creator_mint_unavailable!())?;
     Ok(source)
 }
 
@@ -2058,7 +2313,7 @@ async fn resolve_runtime_custody_bound_creator_account(
 ) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
     let account = resolve_runtime_custody_creator_account(state, authority, account_id).await?;
     if account.address != expected_address {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     Ok(account)
 }
@@ -2075,7 +2330,7 @@ pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
         object_uri,
         source_storage,
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(creator_mint_unavailable!())?;
     let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
     let mint_journal_root =
         crate::protected_content_runtime::runtime_mint_journal_root(&state.data_dir);
@@ -2083,12 +2338,12 @@ pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
     let source_digest = runtime_custody_creator_mint_source_digest_for_source(&source);
     match std::fs::symlink_metadata(&mint_journal_root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+        Err(_) => return Err(creator_mint_unavailable_missing!()()),
         Ok(_) => {
             match mint_journal.load_intent(request_id) {
                 Ok(intent) => {
                     if intent.creator_mint_source_digest() != source_digest {
-                        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+                        return Err(creator_mint_unavailable_missing!()());
                     }
                     let account = resolve_runtime_custody_bound_creator_account(
                         state,
@@ -2104,12 +2359,12 @@ pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
                     });
                 }
                 Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {}
-                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+                Err(_) => return Err(creator_mint_unavailable_missing!()()),
             }
             match mint_journal.load_media_preparation(request_id) {
                 Ok(preparation) => {
                     if preparation.creator_mint_source_digest() != source_digest {
-                        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+                        return Err(creator_mint_unavailable_missing!()());
                     }
                     let account = resolve_runtime_custody_bound_creator_account(
                         state,
@@ -2125,7 +2380,7 @@ pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
                     });
                 }
                 Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {}
-                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+                Err(_) => return Err(creator_mint_unavailable_missing!()()),
             }
         }
     }
@@ -2144,11 +2399,7 @@ pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
 }
 
 fn runtime_custody_purchase_chain_id(chain_namespace: &str) -> anyhow::Result<u64> {
-    runtime_custody_creator_chain_id(chain_namespace).map_err(|_| {
-        anyhow::anyhow!(
-            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-        )
-    })
+    runtime_custody_creator_chain_id(chain_namespace).map_err(purchase_unavailable!())
 }
 
 fn runtime_custody_purchase_availability_receipt_digest(
@@ -2293,7 +2544,7 @@ fn validate_runtime_custody_purchase_stage_request(
         || stage.value != request.value
         || stage.data != request.data
     {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        return Err(purchase_denied_missing!()());
     }
     Ok(request)
 }
@@ -2352,7 +2603,7 @@ fn validate_runtime_custody_purchase_record_identity(
             .address
             .eq_ignore_ascii_case(&expected.buyer_account.address)
     {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        return Err(purchase_denied_missing!()());
     }
     Ok(())
 }
@@ -2373,17 +2624,9 @@ async fn resolve_runtime_custody_purchase_plan(
         }),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-        )
-    })?;
+    .map_err(purchase_unavailable!())?;
     let resolved: ResolvedProtectedContentPurchase =
-        serde_json::from_value(response).map_err(|_| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-            )
-        })?;
+        serde_json::from_value(response).map_err(purchase_unavailable!())?;
     let expected_chain_id = runtime_custody_purchase_chain_id(&listing.chain_namespace)?;
     if resolved.schema != "elastos.chain.protected-content-purchase/v1"
         || resolved.network != listing.network
@@ -2421,14 +2664,12 @@ async fn resolve_runtime_custody_purchase_plan(
                 .map(str::to_ascii_lowercase)
         || resolved.verified_listing.available_quantity == "0x0"
     {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        return Err(purchase_denied_missing!()());
     }
     match resolved.steps.as_slice() {
         [buy] if buy.stage == "buy" => {}
         [approval, buy] if approval.stage == "approval" && buy.stage == "buy" => {}
-        _ => anyhow::bail!(
-            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-        ),
+        _ => return Err(purchase_unavailable_missing!()()),
     }
     for step in &resolved.steps {
         validate_wallet_evm_address(&step.to, "purchase transaction target").map_err(
@@ -2464,11 +2705,7 @@ async fn resolve_runtime_custody_purchase_access(
         return Ok(None);
     };
     let access: ResolvedProtectedContentPurchaseAccess =
-        serde_json::from_value(response).map_err(|_| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-            )
-        })?;
+        serde_json::from_value(response).map_err(purchase_unavailable!())?;
     if access.schema != "elastos.chain.protected-content-purchase-access/v1"
         || access.request_id != request_id
         || access.network != listing.network
@@ -2478,9 +2715,7 @@ async fn resolve_runtime_custody_purchase_access(
             .content_access_id
             .eq_ignore_ascii_case(content_access_id_hex)
     {
-        anyhow::bail!(
-            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-        );
+        return Err(purchase_unavailable_missing!()());
     }
     Ok(access.has_access.then_some(access))
 }
@@ -2492,11 +2727,7 @@ async fn complete_runtime_custody_purchase_stage(
 ) -> anyhow::Result<Option<RuntimeTransactionCompletion>> {
     let _approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
         .await
-        .map_err(|(_, _)| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-            )
-        })?;
+        .map_err(purchase_unavailable!())?;
     let completion = match complete_runtime_transaction_effect(
         state,
         authority,
@@ -2513,21 +2744,38 @@ async fn complete_runtime_custody_purchase_stage(
             if status == StatusCode::BAD_REQUEST
                 && message == "transaction approval is not completed" =>
         {
+            tracing::debug!(
+                effect_id = %request.effect_id,
+                "runtime custody purchase: pending, wallet approval not completed"
+            );
             return Ok(None);
         }
-        Err((_, _)) => {
-            anyhow::bail!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-            )
+        Err((status, message)) => {
+            tracing::warn!(
+                effect_id = %request.effect_id,
+                %status,
+                %message,
+                "runtime custody purchase: transaction effect completion failed"
+            );
+            return Err(purchase_unavailable!()(format!("{status}: {message}")));
         }
     };
     if completion.receipt.is_none() || completion.completion_pending {
+        tracing::debug!(
+            effect_id = %completion.effect_id,
+            transaction_hash = %completion.transaction_hash,
+            receipt = completion.receipt.is_some(),
+            completion_pending = completion.completion_pending,
+            completion_error = completion.completion_error.as_deref().unwrap_or(""),
+            already_confirmed = completion.already_confirmed,
+            "runtime custody purchase: pending exact Chain settlement"
+        );
         return Ok(None);
     }
-    if completion.completion_error.is_some() {
-        anyhow::bail!(
-            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-        );
+    if let Some(error) = completion.completion_error.as_deref() {
+        return Err(purchase_unavailable!()(format!(
+            "transaction effect completed with an error: {error}"
+        )));
     }
     Ok(Some(completion))
 }
@@ -2641,6 +2889,264 @@ fn runtime_custody_metadata_name(object_uri: &str) -> &str {
         .unwrap_or("protected-content")
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentMarketSource {
+    schema: String,
+    network: String,
+    authority_gateway_contract: String,
+    #[allow(dead_code)]
+    evidence_rpc_sources: u64,
+}
+
+const ERC1155_IS_APPROVED_FOR_ALL_SELECTOR: &str = "e985e9c5";
+const ERC1155_SET_APPROVAL_FOR_ALL_SELECTOR: &str = "a22cb465";
+
+fn abi_word_from_address(address: &str) -> anyhow::Result<String> {
+    let raw = address
+        .strip_prefix("0x")
+        .filter(|raw| raw.len() == 40 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("invalid EVM address for ABI encoding"))?;
+    Ok(format!("{:0>64}", raw.to_ascii_lowercase()))
+}
+
+fn erc1155_is_approved_for_all_call_data(owner: &str, operator: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "0x{ERC1155_IS_APPROVED_FOR_ALL_SELECTOR}{}{}",
+        abi_word_from_address(owner)?,
+        abi_word_from_address(operator)?
+    ))
+}
+
+fn erc1155_set_approval_for_all_call_data(
+    operator: &str,
+    approved: bool,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "0x{ERC1155_SET_APPROVAL_FOR_ALL_SELECTOR}{}{:0>64}",
+        abi_word_from_address(operator)?,
+        if approved { "1" } else { "0" }
+    ))
+}
+
+/// Decodes the single `bool` word an `isApprovedForAll` call returns.
+/// Anything other than an exact 32-byte 0/1 word is treated as unknown,
+/// which the caller resolves by raising the approval (a spurious second
+/// `setApprovalForAll(true)` is harmless; a missed one breaks every buy).
+fn erc1155_bool_result(result: &str) -> Option<bool> {
+    let raw = result.strip_prefix("0x")?;
+    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    match raw.trim_start_matches('0') {
+        "" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+async fn resolve_runtime_custody_market_gateway(
+    state: &GatewayState,
+    network: &str,
+) -> anyhow::Result<String> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "describe_protected_content_market_source",
+            "network": network,
+        }),
+    )
+    .await
+    .map_err(creator_mint_unavailable!())?;
+    let source: ResolvedProtectedContentMarketSource =
+        serde_json::from_value(response).map_err(creator_mint_unavailable!())?;
+    if source.schema != "elastos.chain.protected-content-market-source/v1"
+        || source.network != network
+    {
+        return Err(creator_mint_unavailable_missing!()());
+    }
+    validate_wallet_evm_address(&source.authority_gateway_contract, "market gateway")
+        .map_err(creator_mint_unavailable!())?;
+    Ok(source.authority_gateway_contract.to_ascii_lowercase())
+}
+
+/// Builds the exact `setApprovalForAll(gateway, true)` transaction on the
+/// mint's operative: the ERC-1155 contract the market gateway resolves from
+/// `(ledger, token_id)` and transfers the sold copies from. The asset ledger
+/// only records the mint; an approval granted there never reaches the
+/// operative, and every purchase reverts with
+/// `ERC1155MissingApprovalForAll(gateway, creator)`.
+fn runtime_custody_creator_operator_approval_request(
+    principal_id: &str,
+    creator_account: &RuntimeCustodyCreatorAccount,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    operative: &str,
+    gateway: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> anyhow::Result<RuntimeTransactionRequest> {
+    let data = erc1155_set_approval_for_all_call_data(gateway, true)?;
+    let stable_request = serde_json::json!({
+        "domain": "elastos.protected-content.creator-operator-approval/v1",
+        "effect_id": "",
+        "wallet_account_id": creator_account.account_id,
+        "address": creator_account.address,
+        "chain_namespace": chain_plan.chain_namespace,
+        "network": chain_plan.network,
+        "to": operative,
+        "value": "0x0",
+        "data": data,
+        "ledger": chain_plan.ledger,
+        "operative": operative,
+        "gateway": gateway,
+        "mint_id": hex::encode(mint_id.as_bytes()),
+    });
+    let request_sha256 = runtime_transaction_request_sha256(&stable_request)?;
+    let mut request = RuntimeTransactionRequest {
+        source: NATIVE_TRANSACTION_SOURCE,
+        effect_id: String::new(),
+        request_sha256,
+        account_id: creator_account.account_id.clone(),
+        address: creator_account.address.clone(),
+        chain_namespace: chain_plan.chain_namespace.clone(),
+        network: chain_plan.network.clone(),
+        to: operative.to_string(),
+        value: "0x0".to_string(),
+        data,
+        approval_reason: "Allow the marketplace gateway to deliver sold copies".to_string(),
+        metadata: serde_json::json!({
+            "product_operation": "protected_content_creator_operator_approval",
+            "ledger": chain_plan.ledger,
+            "operative": operative,
+            "gateway": gateway,
+            "mint_id": hex::encode(mint_id.as_bytes()),
+        }),
+    };
+    let request_binding = transaction_request_binding(&request);
+    request.effect_id = exact_runtime_transaction_effect_id(
+        NATIVE_TRANSACTION_SOURCE,
+        principal_id,
+        &request.request_sha256,
+        &request_binding,
+    )?;
+    Ok(request)
+}
+
+/// Ensures the mint's operative lets the market gateway move the creator's
+/// copies (ERC-1155 operator approval on the contract `buyAccess` transfers
+/// from). Returns Ok when the chain already reports the approval or the
+/// approval effect has settled; bails with the creator-pending message while
+/// the wallet approval or chain settlement is outstanding.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_runtime_custody_creator_operator_approval(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    mint_journal: &elastos_protected_content_runtime::RuntimeMintJournal,
+    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+    mint_id: elastos_protected_content_contracts::Digest32,
+    principal_id: &str,
+    creator_account: &RuntimeCustodyCreatorAccount,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    operative: &str,
+) -> anyhow::Result<()> {
+    validate_wallet_evm_address(operative, "mint operative")
+        .map_err(creator_mint_unavailable!())?;
+    let operative = operative.to_ascii_lowercase();
+    let gateway = resolve_runtime_custody_market_gateway(state, &chain_plan.network).await?;
+    let probe = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "contract_call",
+            "network": chain_plan.network,
+            "to": operative,
+            "data": erc1155_is_approved_for_all_call_data(&creator_account.address, &gateway)?,
+        }),
+    )
+    .await
+    .map_err(creator_mint_unavailable!())?;
+    let approved = probe
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .and_then(erc1155_bool_result)
+        .unwrap_or(false);
+    tracing::debug!(
+        mint_id = %hex::encode(mint_id.as_bytes()),
+        creator = %creator_account.address,
+        %operative,
+        %gateway,
+        approved,
+        "runtime custody creator tail: operative operator approval probed"
+    );
+    if approved {
+        return Ok(());
+    }
+    let request = runtime_custody_creator_operator_approval_request(
+        principal_id,
+        creator_account,
+        chain_plan,
+        &operative,
+        &gateway,
+        mint_id,
+    )?;
+    let effect_binding = runtime_custody_creator_effect_binding(&request)?;
+    if let Some(existing) = mint
+        .creator_state()
+        .and_then(|creator_state| creator_state.operator_approval())
+    {
+        if existing != &effect_binding {
+            return Err(creator_mint_unavailable_missing!()());
+        }
+    } else {
+        mint_journal
+            .bind_creator_operator_approval(mint_id, effect_binding.clone())
+            .map_err(creator_mint_unavailable!())?;
+    }
+    let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    tracing::debug!(
+        effect_id = %approval.effect_id,
+        "runtime custody creator tail: exact wallet effect ensured"
+    );
+    let completion = match complete_runtime_transaction_effect(
+        state,
+        authority,
+        RuntimeTransactionLookup::ApprovalId(effect_binding.approval_request_id()),
+        Some(&request),
+        None,
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err((status, message))
+            if status == StatusCode::BAD_REQUEST
+                && message == "transaction approval is not completed" =>
+        {
+            let _ = approval;
+            {
+                tracing::debug!(
+                    line = line!(),
+                    "runtime custody creator tail: pending exact Wallet or Chain settlement"
+                );
+                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+            }
+        }
+        Err((_, message)) => return Err(anyhow::anyhow!(message)),
+    };
+    if completion.receipt.is_none() || completion.completion_pending {
+        {
+            tracing::debug!(
+                line = line!(),
+                "runtime custody creator tail: pending exact Wallet or Chain settlement"
+            );
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        }
+    }
+    if completion.completion_error.is_some() {
+        return Err(creator_mint_unavailable_missing!()());
+    }
+    Ok(())
+}
+
 fn runtime_custody_creator_effect_binding(
     request: &RuntimeTransactionRequest,
 ) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorEffectBinding> {
@@ -2653,15 +3159,15 @@ fn runtime_custody_creator_effect_binding(
         request.chain_namespace.clone(),
         request.network.clone(),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+    .map_err(creator_mint_unavailable!())
 }
 
 fn runtime_custody_creator_chain_id(chain_namespace: &str) -> anyhow::Result<u64> {
     chain_namespace
         .strip_prefix("eip155:")
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?
+        .ok_or_else(creator_mint_unavailable_missing!())?
         .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+        .map_err(creator_mint_unavailable!())
 }
 
 async fn resolve_runtime_custody_creator_chain_plan(
@@ -2685,9 +3191,9 @@ async fn resolve_runtime_custody_creator_chain_plan(
         }),
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
-    let resolved: ResolvedProtectedContentCreatorMint = serde_json::from_value(response)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(creator_mint_unavailable!())?;
+    let resolved: ResolvedProtectedContentCreatorMint =
+        serde_json::from_value(response).map_err(creator_mint_unavailable!())?;
     let resolved_source_digest = runtime_custody_creator_mint_source_digest(
         &resolved.network,
         &resolved.chain_namespace,
@@ -2708,7 +3214,7 @@ async fn resolve_runtime_custody_creator_chain_plan(
         || !resolved.ledger.eq_ignore_ascii_case(&source.ledger)
         || !resolved.pay_token.eq_ignore_ascii_case(&source.pay_token)
     {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     validate_wallet_evm_address(&resolved.ledger, "creator ledger")
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
@@ -2717,7 +3223,7 @@ async fn resolve_runtime_custody_creator_chain_plan(
     validate_wallet_evm_address(&resolved.pay_token, "creator pay token")
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
     if !resolved.ledger.eq_ignore_ascii_case(&resolved.to) {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     Ok(RuntimeCustodyCreatorChainPlan {
         network: resolved.network,
@@ -2787,13 +3293,16 @@ fn runtime_custody_creator_transaction_request(
     Ok(request)
 }
 
-async fn finalize_runtime_custody_creator_listing(
+/// Resolves the finalized mint receipt (token id + operative) for the settled
+/// mint transaction; a chain-provider `*_pending` answer surfaces as the
+/// creator-pending state so callers re-poll.
+async fn resolve_runtime_custody_creator_mint_receipt(
     state: &GatewayState,
     creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
     creator_address: &str,
     chain_plan: &RuntimeCustodyCreatorChainPlan,
     transaction_hash: &str,
-) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence> {
+) -> anyhow::Result<ResolvedProtectedContentMintReceipt> {
     let receipt_response = wallet_chain_provider_data(
         state,
         serde_json::json!({
@@ -2807,10 +3316,25 @@ async fn finalize_runtime_custody_creator_listing(
         }),
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
-    let receipt: ResolvedProtectedContentMintReceipt = serde_json::from_value(receipt_response)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(|error| creator_mint_chain_error(error, line!()))?;
+    let receipt: ResolvedProtectedContentMintReceipt =
+        serde_json::from_value(receipt_response).map_err(creator_mint_unavailable!())?;
+    tracing::debug!(
+        token_id = %receipt.token_id,
+        operative = %receipt.operative,
+        "runtime custody creator tail: mint receipt resolved"
+    );
+    Ok(receipt)
+}
 
+async fn finalize_runtime_custody_creator_listing(
+    state: &GatewayState,
+    creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    creator_address: &str,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    receipt: &ResolvedProtectedContentMintReceipt,
+    transaction_hash: &str,
+) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence> {
     let listing_response = wallet_chain_provider_data(
         state,
         serde_json::json!({
@@ -2822,14 +3346,14 @@ async fn finalize_runtime_custody_creator_listing(
         }),
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
-    let listing: ResolvedProtectedContentVerifiedListing = serde_json::from_value(listing_response)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(|error| creator_mint_chain_error(error, line!()))?;
+    let listing: ResolvedProtectedContentVerifiedListing =
+        serde_json::from_value(listing_response).map_err(creator_mint_unavailable!())?;
     validate_runtime_custody_creator_terminal_bindings(
         creator_state,
         creator_address,
         chain_plan,
-        &receipt,
+        receipt,
         &listing,
     )?;
     elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence::new(
@@ -2850,7 +3374,7 @@ async fn finalize_runtime_custody_creator_listing(
         transaction_hash,
         crate::auth::now_ts(),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+    .map_err(creator_mint_unavailable!())
 }
 
 fn validate_runtime_custody_creator_terminal_bindings(
@@ -2865,7 +3389,7 @@ fn validate_runtime_custody_creator_terminal_bindings(
         || receipt.network != chain_plan.network
         || receipt.chain_id != expected_chain_id
     {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     if listing.schema != "elastos.chain.protected-content-verified-listing/v1"
         || listing.network != chain_plan.network
@@ -2881,7 +3405,7 @@ fn validate_runtime_custody_creator_terminal_bindings(
             .pay_token
             .eq_ignore_ascii_case(&chain_plan.pay_token)
     {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     Ok(())
 }
@@ -2919,18 +3443,10 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .map(Digest32::new)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+        .ok_or_else(purchase_denied_missing!())?;
     let listing_record =
         crate::protected_content_runtime::load_runtime_custody_listing(&state.data_dir, mint_id)?
-            .ok_or_else(|| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+            .ok_or_else(purchase_denied_missing!())?;
     let listing = &listing_record.package;
     let persisted_purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
         &state.data_dir,
@@ -2939,7 +3455,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     )?;
     let listing_sha256 = listing_record.portable_package_digest();
     if listing.mint_id != input.mint_id {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        return Err(purchase_denied_missing!()());
     }
     let localhost_root = crate::auth::principal_localhost_root(&input.principal_id);
     let profile = crate::collaboration_profile_authority::load_profile_authority(
@@ -2947,17 +3463,11 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         &input.principal_id,
         &localhost_root,
     )?
-    .ok_or_else(|| {
-        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
-    })?;
+    .ok_or_else(purchase_denied_missing!())?;
     let profile_did = profile.document().profile_did.clone();
     let now = crate::auth::now_ts();
     let existing_buyer_account = if let Some(existing) = persisted_purchase.as_ref() {
-        validate_wallet_evm_address(&existing.address, "buyer").map_err(|(_, _)| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+        validate_wallet_evm_address(&existing.address, "buyer").map_err(purchase_denied!())?;
         let buyer_account = RuntimeCustodyCreatorAccount {
             account_id: existing.account_id.clone(),
             address: existing.address.clone(),
@@ -2992,25 +3502,24 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             now,
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+        .map_err(purchase_denied!())?;
+    tracing::debug!(
+        mint_id = %input.mint_id,
+        principal = %input.principal_id,
+        content_cid = %fresh_availability.content_cid(),
+        replicas = fresh_availability.observed_replicas(),
+        "runtime custody buy: fresh availability verified"
+    );
     let expected_content_id =
         crate::protected_content_runtime::runtime_protected_content_id(draft.encrypted_content())
-            .map_err(|_| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+            .map_err(purchase_denied!())?;
     let expected_content_access_id =
         format!("0x{}", hex::encode(draft.content_access_id().as_bytes()));
     if listing.content_id != expected_content_id
         || listing.content_access_id != expected_content_access_id
         || listing.content_cid != fresh_availability.content_cid()
     {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        return Err(purchase_denied_missing!()());
     }
     let (mut purchase, buyer_account) = match (persisted_purchase, existing_buyer_account) {
         (Some(existing), Some(buyer_account)) => (existing, buyer_account),
@@ -3032,15 +3541,11 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                     )?)
                 }
                 [buy] if buy.stage == "buy" => None,
-                _ => anyhow::bail!(
-                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-                ),
+                _ => return Err(purchase_unavailable_missing!()()),
             };
-            let buy_step = steps.next_back().ok_or_else(|| {
-                anyhow::anyhow!(
-                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-                )
-            })?;
+            let buy_step = steps
+                .next_back()
+                .ok_or_else(purchase_unavailable_missing!())?;
             let buy_request = runtime_custody_purchase_transaction_request(
                 &input.principal_id,
                 &buyer_account,
@@ -3089,9 +3594,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             )?;
             (purchase, buyer_account)
         }
-        _ => {
-            anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
-        }
+        _ => return Err(purchase_denied_missing!()()),
     };
 
     let approval_request = purchase
@@ -3172,9 +3675,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 )
             });
         let Some((wallet_binding, chain_observation, confirmed_at)) = wallet_binding else {
-            anyhow::bail!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
-            );
+            return Err(purchase_unavailable_missing!()());
         };
         purchase.progress =
             crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
@@ -3249,34 +3750,34 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
     let mut mint = mint_journal
         .load(facts.mint_id)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+        .map_err(creator_mint_unavailable!())?;
     let source = resolve_runtime_custody_creator_mint_source(state).await?;
     if runtime_custody_creator_mint_source_digest_for_source(&source)
         != input.creator_mint_source_digest
     {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     let creator_account =
         resolve_runtime_custody_creator_account(state, authority, &input.wallet_account_id).await?;
     if creator_account.address != input.wallet_account_address {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
     let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
         creator_account.account_id.clone(),
         input.copies.clone(),
         input.price.clone(),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    .map_err(creator_mint_unavailable!())?;
     if let Some(existing) = mint.creator_state() {
         if existing.desired_terms() != &desired_terms {
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+            return Err(creator_mint_unavailable_missing!()());
         }
         if let Some(terminal) = existing.terminal() {
             if !terminal
                 .seller()
                 .eq_ignore_ascii_case(&creator_account.address)
             {
-                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+                return Err(creator_mint_unavailable_missing!()());
             }
             facts.listing_uri = Some(
                 publish_runtime_custody_creator_listing(
@@ -3316,10 +3817,10 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 metadata_cid,
                 token_uri,
             )
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+            .map_err(creator_mint_unavailable!())?;
             mint = mint_journal
                 .bind_creator_state(facts.mint_id, creator_state.clone())
-                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+                .map_err(creator_mint_unavailable!())?;
             creator_state
         }
     };
@@ -3333,6 +3834,13 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         creator_state.token_uri(),
     )
     .await?;
+    tracing::debug!(
+        mint_id = %hex::encode(facts.mint_id.as_bytes()),
+        network = %chain_plan.network,
+        to = %chain_plan.to,
+        value = %chain_plan.value,
+        "runtime custody creator tail: mint chain plan resolved"
+    );
     let request = runtime_custody_creator_transaction_request(
         &input.principal_id,
         &creator_account,
@@ -3344,16 +3852,20 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     let effect_binding = runtime_custody_creator_effect_binding(&request)?;
     if let Some(existing) = mint.creator_state().and_then(|state| state.effect()) {
         if existing != &effect_binding {
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+            return Err(creator_mint_unavailable_missing!()());
         }
     } else {
         mint_journal
             .bind_creator_effect(facts.mint_id, effect_binding.clone())
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+            .map_err(creator_mint_unavailable!())?;
     }
     let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
         .await
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    tracing::debug!(
+        effect_id = %approval.effect_id,
+        "runtime custody creator tail: exact wallet effect ensured"
+    );
     let completion = match complete_runtime_transaction_effect(
         state,
         authority,
@@ -3369,20 +3881,43 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 && message == "transaction approval is not completed" =>
         {
             let _ = approval;
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+            {
+                tracing::debug!(
+                    line = line!(),
+                    "runtime custody creator tail: pending exact Wallet or Chain settlement"
+                );
+                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+            }
         }
         Err((_, message)) => return Err(anyhow::anyhow!(message)),
     };
     if completion.receipt.is_none() {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        {
+            tracing::debug!(
+                line = line!(),
+                "runtime custody creator tail: pending exact Wallet or Chain settlement"
+            );
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        }
     }
     if completion.completion_pending {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        {
+            tracing::debug!(
+                line = line!(),
+                "runtime custody creator tail: pending exact Wallet or Chain settlement"
+            );
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        }
     }
     if completion.completion_error.is_some() {
-        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        return Err(creator_mint_unavailable_missing!()());
     }
-    let terminal = finalize_runtime_custody_creator_listing(
+    // The finalized receipt names the operative that holds the minted copies.
+    // A listing only becomes deliverable once that operative lets the market
+    // gateway move them (ERC-1155 operator approval); the mint itself never
+    // grants that, so raise it here as a second exact wallet effect when the
+    // chain does not already report it, then verify the listing.
+    let receipt = resolve_runtime_custody_creator_mint_receipt(
         state,
         &creator_state,
         &creator_account.address,
@@ -3390,9 +3925,30 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         &completion.transaction_hash,
     )
     .await?;
+    ensure_runtime_custody_creator_operator_approval(
+        state,
+        authority,
+        &mint_journal,
+        &mint,
+        facts.mint_id,
+        &input.principal_id,
+        &creator_account,
+        &chain_plan,
+        &receipt.operative,
+    )
+    .await?;
+    let terminal = finalize_runtime_custody_creator_listing(
+        state,
+        &creator_state,
+        &creator_account.address,
+        &chain_plan,
+        &receipt,
+        &completion.transaction_hash,
+    )
+    .await?;
     mint = mint_journal
         .mark_creator_completed(facts.mint_id, terminal.clone())
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+        .map_err(creator_mint_unavailable!())?;
     facts.listing_uri = Some(
         publish_runtime_custody_creator_listing(
             registry.as_ref(),
@@ -3429,10 +3985,11 @@ pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value)
         .map(String::as_str)
 }
 
-fn normalize_model_provider_request(
+pub(super) fn normalize_model_provider_request(
     op: &str,
     request: &serde_json::Value,
     context: &HomeLaunchTokenContext,
+    capsule_id: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     match op {
         "offers_list" => {
@@ -3452,7 +4009,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 offer_id: parsed.offer_id.clone(),
@@ -3482,7 +4039,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 run_id: parsed.run_id.clone(),
@@ -3503,7 +4060,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 run_id: parsed.run_id.clone(),
@@ -3767,6 +4324,94 @@ fn library_events_sse_event(payload: serde_json::Value) -> SseEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fail_closed_macros_keep_the_stable_message_and_carry_the_cause() {
+        let error = (creator_mint_unavailable!())("boom");
+        assert_eq!(
+            error.to_string(),
+            RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE
+        );
+        let chain: Vec<String> = error.chain().map(|cause| cause.to_string()).collect();
+        assert_eq!(chain.len(), 3);
+        assert!(chain[1].contains("gateway_provider_proxy.rs:"));
+        assert_eq!(chain[2], "\"boom\"");
+        let missing = (purchase_denied_missing!())();
+        assert_eq!(
+            missing.to_string(),
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+        );
+        assert!(missing.chain().nth(1).unwrap().to_string().contains(".rs:"));
+    }
+
+    #[test]
+    fn erc1155_operator_approval_abi_helpers_encode_and_decode_exactly() {
+        let owner = "0xF36C114c19F96b4174B6D71E392c00dB95093a1E";
+        let gateway = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+        assert_eq!(
+            super::erc1155_is_approved_for_all_call_data(owner, gateway).unwrap(),
+            "0xe985e9c5000000000000000000000000f36c114c19f96b4174b6d71e392c00db95093a1e00000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d"
+        );
+        assert_eq!(
+            super::erc1155_set_approval_for_all_call_data(gateway, true).unwrap(),
+            "0xa22cb46500000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        assert!(super::erc1155_is_approved_for_all_call_data("0x1234", gateway).is_err());
+        assert_eq!(
+            super::erc1155_bool_result(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            super::erc1155_bool_result(
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Some(false)
+        );
+        assert_eq!(super::erc1155_bool_result("0x01"), None);
+        assert_eq!(
+            super::erc1155_bool_result(
+                "0x0000000000000000000000000000000000000000000000000000000000000042"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn creator_mint_chain_error_maps_pending_codes_to_pending_and_others_to_unavailable() {
+        let pending = super::creator_mint_chain_error(
+            (
+                StatusCode::BAD_REQUEST,
+                "protected_content_mint_receipt_pending: protected-content mint receipt is not finalized on enough configured sources".to_string(),
+            ),
+            1,
+        );
+        assert_eq!(
+            pending.to_string(),
+            super::RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE
+        );
+        for (status, message) in [
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_protected_content_mint_receipt: bad".to_string(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "protected_content_mint_receipt_pending: x".to_string(),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "upstream_unreachable: EVM RPC request failed".to_string(),
+            ),
+        ] {
+            let error = super::creator_mint_chain_error((status, message), 1);
+            assert_eq!(
+                error.to_string(),
+                super::RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE
+            );
+        }
+    }
+
     use super::*;
 
     fn test_creator_state() -> elastos_protected_content_runtime::RuntimeMintCreatorState {

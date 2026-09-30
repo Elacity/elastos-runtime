@@ -93,12 +93,18 @@ export function classifyRuntimePageCloseResponse(owner, response) {
     return pendingOutcome(owner.page_id, owner.generation, "malformed_response");
   }
   if (response.closed === true || response.already_closed === true) {
+    const durability = ["failed", "unknown", "proved"].includes(
+      response.profile_durability,
+    )
+      ? response.profile_durability
+      : undefined;
     return {
       state: "terminal",
       page_id: owner.page_id,
       generation: owner.generation,
       terminal_kind:
         response.already_closed === true ? "already_absent" : "closed",
+      ...(durability ? { profile_durability: durability } : {}),
     };
   }
   return pendingOutcome(

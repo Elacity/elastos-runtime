@@ -103,7 +103,35 @@ pub(in crate::api::gateway) fn validate_browser_launch_contract(
 pub(in crate::api::gateway) fn browser_webrtc_signal_value(
     input: BrowserWebrtcSignalRequest,
 ) -> anyhow::Result<serde_json::Value> {
-    match input.signal_type.as_str() {
+    if input
+        .display_generation
+        .as_deref()
+        .is_some_and(|value| !browser_display_generation_valid(value))
+    {
+        anyhow::bail!("invalid Browser display generation");
+    }
+    if input.signal_type == "display_attach" {
+        if input.channel.is_some()
+            || input.sdp.is_some()
+            || input.candidate.is_some()
+            || !input
+                .request_id
+                .as_deref()
+                .is_some_and(browser_display_request_id_valid)
+            || input.display_generation.is_none()
+        {
+            anyhow::bail!("invalid Browser display attach request");
+        }
+        return Ok(serde_json::json!({
+            "schema": BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA, "type": "display_attach",
+            "request_id": input.request_id, "display_generation": input.display_generation,
+        }));
+    }
+    if input.request_id.is_some() {
+        anyhow::bail!("Browser WebRTC signal must not include request_id");
+    }
+    let display_generation = input.display_generation.clone();
+    let signal: anyhow::Result<serde_json::Value> = match input.signal_type.as_str() {
         "offer" => {
             if input.candidate.is_some() {
                 anyhow::bail!("Browser WebRTC offer must not include a candidate");
@@ -160,7 +188,12 @@ pub(in crate::api::gateway) fn browser_webrtc_signal_value(
             }))
         }
         _ => anyhow::bail!("Browser WebRTC signal type is unsupported"),
+    };
+    let mut signal = signal?;
+    if let Some(generation) = display_generation {
+        signal["display_generation"] = serde_json::json!(generation);
     }
+    Ok(signal)
 }
 
 fn validate_browser_webrtc_sdp(kind: &str, sdp: &str) -> anyhow::Result<()> {
@@ -349,6 +382,12 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
     }
     let view_width = browser_display_dimension(view, "width", "view")?;
     let view_height = browser_display_dimension(view, "height", "view")?;
+    if display_session
+        .get("display_generation")
+        .is_some_and(|value| !value.as_str().is_some_and(browser_display_generation_valid))
+    {
+        anyhow::bail!("browser-engine provider returned an invalid display generation");
+    }
     let session_width = browser_display_dimension(display_session, "width", "display_session")?;
     let session_height = browser_display_dimension(display_session, "height", "display_session")?;
     match expected_display_mode {
@@ -413,6 +452,7 @@ fn browser_visible_engine_page(
             &[
                 "schema",
                 "session_id",
+                "display_generation",
                 "mode",
                 "width",
                 "height",

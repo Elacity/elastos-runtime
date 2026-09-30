@@ -71,7 +71,9 @@ fn request_origin_candidate(headers: &HeaderMap) -> anyhow::Result<Option<(Strin
     Ok(None)
 }
 
-fn validated_host_authority(headers: &HeaderMap) -> anyhow::Result<String> {
+pub(in crate::api::gateway) fn validated_host_authority(
+    headers: &HeaderMap,
+) -> anyhow::Result<String> {
     let raw = header_value(headers, "host")?
         .ok_or_else(|| anyhow::anyhow!("request Host header is missing"))?;
     normalize_authority(raw)

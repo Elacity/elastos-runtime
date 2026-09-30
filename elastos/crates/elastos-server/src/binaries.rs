@@ -100,6 +100,15 @@ pub fn resolve_verified_native_provider_binary_with_data_dir(
     data_dir: &Path,
     name: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
+    let bin_dir = std::env::var_os("ELASTOS_CAPSULE_BIN_DIR").map(PathBuf::from);
+    resolve_verified_native_provider_binary_with_bin_dir(data_dir, name, bin_dir.as_deref())
+}
+
+fn resolve_verified_native_provider_binary_with_bin_dir(
+    data_dir: &Path,
+    name: &str,
+    bin_dir: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
     let manifest_path = data_dir.join("components.json");
     let manifest_bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
@@ -140,11 +149,34 @@ pub fn resolve_verified_native_provider_binary_with_data_dir(
             expected_install_path
         );
     }
-    let path = data_dir.join(install_path);
+    let installed_path = data_dir.join(install_path);
+    let path = bin_dir
+        .map(|bin_dir| bin_dir.join(name))
+        .unwrap_or(installed_path);
     if !path.is_file() {
         return Ok(None);
     }
-    verify_component_binary_with_data_dir(data_dir, name, &path)?;
+    let expected_checksum = setup::resolve_platform_info(component, &setup::detect_platform())
+        .and_then(|platform| platform.checksum.as_deref())
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "component '{}' is missing the current platform checksum",
+                name
+            )
+        })?;
+    let verified_checksum = setup::verify_installed_component_binary(data_dir, name, &path)?;
+    if verified_checksum != expected_checksum {
+        anyhow::bail!(
+            "component '{}' selected binary checksum differs from the resolving manifest",
+            name
+        );
+    }
+    tracing::info!(
+        "{} binary verified against installed manifest ({})",
+        name,
+        verified_checksum
+    );
     Ok(Some(path))
 }
 
@@ -348,5 +380,85 @@ mod tests {
             resolve_verified_native_provider_binary_with_data_dir(data_dir, "did-provider")
                 .unwrap();
         assert_eq!(resolved.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn subordinate_runtime_accepts_only_verified_provider_from_parent_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_data_dir = temp.path().join("parent");
+        let child_data_dir = temp.path().join("child");
+        let parent_bin_dir = parent_data_dir.join("bin");
+        std::fs::create_dir_all(&parent_bin_dir).unwrap();
+        std::fs::create_dir_all(&child_data_dir).unwrap();
+        let bytes = b"object-provider-binary";
+        let path = parent_bin_dir.join("object-provider");
+        std::fs::write(&path, bytes).unwrap();
+        let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+        for data_dir in [&parent_data_dir, &child_data_dir] {
+            write_components_manifest(
+                data_dir,
+                "object-provider",
+                &checksum,
+                Some(native_runtime("elastos://storage/*")),
+            );
+        }
+        let resolved = resolve_verified_native_provider_binary_with_bin_dir(
+            &child_data_dir,
+            "object-provider",
+            Some(&parent_bin_dir),
+        )
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some(path.as_path()));
+
+        let child_path = child_data_dir.join("bin/object-provider");
+        std::fs::create_dir_all(child_path.parent().unwrap()).unwrap();
+        std::fs::write(&child_path, bytes).unwrap();
+        let empty_parent_bin = temp.path().join("empty-parent/bin");
+        std::fs::create_dir_all(&empty_parent_bin).unwrap();
+        assert!(resolve_verified_native_provider_binary_with_bin_dir(
+            &child_data_dir,
+            "object-provider",
+            Some(&empty_parent_bin),
+        )
+        .unwrap()
+        .is_none());
+
+        write_components_manifest(
+            &child_data_dir,
+            "object-provider",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            Some(native_runtime("elastos://storage/*")),
+        );
+        let error = resolve_verified_native_provider_binary_with_bin_dir(
+            &child_data_dir,
+            "object-provider",
+            Some(&parent_bin_dir),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("selected binary checksum differs"));
+
+        write_components_manifest(&child_data_dir, "object-provider", &checksum, None);
+        assert!(resolve_verified_native_provider_binary_with_bin_dir(
+            &child_data_dir,
+            "object-provider",
+            Some(&parent_bin_dir),
+        )
+        .is_err());
+
+        write_components_manifest(
+            &child_data_dir,
+            "object-provider",
+            &checksum,
+            Some(native_runtime("elastos://storage/*")),
+        );
+        std::fs::write(&path, b"wrong-binary").unwrap();
+        assert!(resolve_verified_native_provider_binary_with_bin_dir(
+            &child_data_dir,
+            "object-provider",
+            Some(&parent_bin_dir),
+        )
+        .is_err());
     }
 }

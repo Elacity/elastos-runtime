@@ -8,25 +8,25 @@ usage() {
 Usage:
   scripts/browser-vm-target-refresh.sh [options]
 
-Refresh deployed Browser VM helper scripts and guest helper artifacts from a
+Refresh deployed Browser VM host helper scripts after verifying guest parity with a
 reviewed source checkout without running a full Rust/WASM source-home setup.
 
 Options:
   --source-dir PATH       Source checkout. Default: this repository.
   --data-dir PATH         ElastOS data dir. Default: platform data dir.
-  --initrd PATH           Initrd to refresh. May be passed more than once.
+  --initrd PATH           Initrd to verify. May be passed more than once.
                           Default: existing browser-vm/initrd and bin/initrd.
-  --rootfs PATH           Rootfs ext4 to refresh. Default: browser-vm/rootfs.ext4.
+  --rootfs PATH           Rootfs ext4 to verify. Default: browser-vm/rootfs.ext4.
   --guest-control-bridge-bin PATH
                           Optional prebuilt Linux guest-control bridge binary to
-                          refresh inside the rootfs.
+                          compare with the rootfs.
   --backup-dir PATH       Backup directory. Default: data-dir/backups/browser-vm-target-refresh-<timestamp>-<pid>.
   --node-bin PATH         Node executable for refreshed wrapper scripts. Default: auto-detect.
   --verify-only           Report whether target files match; do not write.
   --help, -h              Show this help.
 
-The script preserves initrd/rootfs symlinks by updating their resolved targets.
-It creates timestamped backups before changed installed helpers or VM artifacts
+The script preserves initrd/rootfs bytes and their build receipt. Guest changes
+require a rebuilt image set. It creates backups before changed installed host helpers
 and retains one default backup set. ELASTOS_BROWSER_VM_BACKUP_RETENTION must
 be 1. Finish target closeout by running:
 
@@ -160,13 +160,6 @@ prune_default_backup_dirs() {
     done
 }
 
-safe_label() {
-    local label="${1#/}"
-    label="${label//\//_}"
-    label="${label// /_}"
-    printf '%s\n' "$label"
-}
-
 install_with_backup() {
     local source="$1"
     local target="$2"
@@ -222,20 +215,13 @@ initrd_helper_matches() {
     return "$status"
 }
 
-refresh_initrd() {
+check_initrd() {
     local requested_initrd="$1"
     local source="$2"
     local initrd
-    local work_dir
-    local verify_dir
-    local gzip_level="${ELASTOS_BROWSER_VM_INITRD_GZIP_LEVEL:-1}"
 
     if [[ ! -f "$requested_initrd" ]]; then
         return
-    fi
-    if [[ ! "$gzip_level" =~ ^[1-9]$ ]]; then
-        echo "ELASTOS_BROWSER_VM_INITRD_GZIP_LEVEL must be 1-9" >&2
-        exit 1
     fi
     command -v gzip >/dev/null 2>&1 || { echo "gzip not found" >&2; exit 1; }
     command -v cpio >/dev/null 2>&1 || { echo "cpio not found" >&2; exit 1; }
@@ -245,27 +231,8 @@ refresh_initrd() {
         echo "[browser-vm-target-refresh] unchanged initrd helper: $requested_initrd"
         return
     fi
-    if [[ "$VERIFY_ONLY" == "1" ]]; then
-        echo "[browser-vm-target-refresh] drift initrd helper: $requested_initrd"
-        DRIFT=1
-        return
-    fi
-
-    backup_file "$initrd" "$(safe_label "$requested_initrd").initrd" >/dev/null
-    work_dir="$(mktemp -d)"
-    verify_dir="$(mktemp -d)"
-    gzip -dc "$initrd" | (cd "$work_dir" && cpio -id --quiet)
-    mkdir -p "$work_dir/bin"
-    install -m 644 "$source" "$work_dir/bin/browser-selkies-control-service.mjs"
-    (cd "$work_dir" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip "-${gzip_level}") > "${initrd}.new"
-    mv "${initrd}.new" "$initrd"
-    gzip -dc "$initrd" | (cd "$verify_dir" && cpio -id --quiet bin/browser-selkies-control-service.mjs)
-    if ! cmp -s "$source" "$verify_dir/bin/browser-selkies-control-service.mjs"; then
-        echo "initrd helper refresh did not verify: $requested_initrd" >&2
-        exit 1
-    fi
-    rm -rf "$work_dir" "$verify_dir"
-    echo "[browser-vm-target-refresh] refreshed initrd helper: $requested_initrd -> $initrd"
+    echo "[browser-vm-target-refresh] guest initrd requires a rebuilt image set: $requested_initrd"
+    DRIFT=1
 }
 
 rootfs_helper_matches() {
@@ -316,7 +283,7 @@ verify_rootfs_guest_control_bridge_contract() {
         fi
     done
     if [[ "$missing" == "1" && "$VERIFY_ONLY" != "1" ]]; then
-        echo "rootfs guest-control bridge is stale; pass --guest-control-bridge-bin with the current Linux guest bridge binary" >&2
+        echo "rootfs guest-control bridge is stale; rebuild the image set with the current Linux guest bridge binary" >&2
         exit 1
     fi
 }
@@ -383,50 +350,21 @@ target.write_text(text[start:end])
 PY
 }
 
-refresh_rootfs_file() {
+check_rootfs_file() {
     local rootfs="$1"
     local source="$2"
     local guest_path="$3"
-    local mode="$4"
-    local label="$5"
-    local debugfs="$6"
-    local staged_source
-    local verify_file
-    local commands_file
+    local debugfs="$4"
 
     if rootfs_helper_matches "$rootfs" "$source" "$guest_path" "$debugfs"; then
         echo "[browser-vm-target-refresh] unchanged rootfs helper: $guest_path"
         return
     fi
-    if [[ "$VERIFY_ONLY" == "1" ]]; then
-        echo "[browser-vm-target-refresh] drift rootfs helper: $guest_path"
-        DRIFT=1
-        return
-    fi
-
-    if [[ -z "$ROOTFS_BACKUP_PATH" ]]; then
-        ROOTFS_BACKUP_PATH="$(backup_file "$rootfs" "$(safe_label "$rootfs").${label}.rootfs")"
-    fi
-    staged_source="$(mktemp)"
-    verify_file="$(mktemp)"
-    commands_file="$(mktemp)"
-    cp "$source" "$staged_source"
-    cat > "$commands_file" <<EOF
-rm ${guest_path}
-write $staged_source ${guest_path}
-set_inode_field ${guest_path} mode ${mode}
-EOF
-    "$debugfs" -w -f "$commands_file" "$rootfs" >/dev/null 2>&1
-    "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$verify_file" 2>/dev/null
-    if ! cmp -s "$source" "$verify_file"; then
-        echo "rootfs helper refresh did not verify: $guest_path in $rootfs; backup kept at $ROOTFS_BACKUP_PATH" >&2
-        exit 1
-    fi
-    rm -f "$staged_source" "$verify_file" "$commands_file"
-    echo "[browser-vm-target-refresh] refreshed rootfs helper: $guest_path -> $rootfs"
+    echo "[browser-vm-target-refresh] guest file requires a rebuilt image set: $guest_path"
+    DRIFT=1
 }
 
-refresh_rootfs() {
+check_rootfs_guest_files() {
     local requested_rootfs="$1"
     local source="$2"
     local rootfs
@@ -445,7 +383,6 @@ refresh_rootfs() {
     fi
 
     rootfs="$(resolve_existing_symlink_target "$requested_rootfs")"
-    ROOTFS_BACKUP_PATH=""
     init_source="$(mktemp)"
     selkies_start_source="$(mktemp)"
     manifest_source="$(mktemp)"
@@ -453,22 +390,17 @@ refresh_rootfs() {
     extract_browser_vm_selkies_start "$SOURCE_DIR" "$selkies_start_source"
     write_browser_vm_target_manifest "$manifest_source"
 
-    refresh_rootfs_file "$rootfs" "$manifest_source" \
-        "/etc/elastos/browser-vm-target.json" "0100644" \
-        "target-manifest" "$debugfs"
-    refresh_rootfs_file "$rootfs" "$source" \
-        "/opt/elastos/bin/browser-selkies-control-service.mjs" "0100644" \
-        "control-service" "$debugfs"
-    refresh_rootfs_file "$rootfs" "$init_source" \
-        "/opt/elastos/bin/browser-vm-init" "0100755" \
-        "vm-init" "$debugfs"
-    refresh_rootfs_file "$rootfs" "$selkies_start_source" \
-        "/opt/elastos/bin/browser-vm-selkies-start" "0100755" \
-        "selkies-start" "$debugfs"
+    check_rootfs_file "$rootfs" "$manifest_source" \
+        "/etc/elastos/browser-vm-target.json" "$debugfs"
+    check_rootfs_file "$rootfs" "$source" \
+        "/opt/elastos/bin/browser-selkies-control-service.mjs" "$debugfs"
+    check_rootfs_file "$rootfs" "$init_source" \
+        "/opt/elastos/bin/browser-vm-init" "$debugfs"
+    check_rootfs_file "$rootfs" "$selkies_start_source" \
+        "/opt/elastos/bin/browser-vm-selkies-start" "$debugfs"
     if [[ -n "$GUEST_CONTROL_BRIDGE_BIN" ]]; then
-        refresh_rootfs_file "$rootfs" "$GUEST_CONTROL_BRIDGE_BIN" \
-            "/opt/elastos/bin/browser-vm-guest-control-bridge" "0100755" \
-            "guest-control-bridge" "$debugfs"
+        check_rootfs_file "$rootfs" "$GUEST_CONTROL_BRIDGE_BIN" \
+            "/opt/elastos/bin/browser-vm-guest-control-bridge" "$debugfs"
     fi
     verify_rootfs_guest_control_bridge_contract "$rootfs" "$debugfs"
     rm -f "$init_source" "$selkies_start_source" "$manifest_source"
@@ -592,6 +524,24 @@ echo "[browser-vm-target-refresh] data: $DATA_DIR"
 echo "[browser-vm-target-refresh] backup: $BACKUP_DIR"
 echo "[browser-vm-target-refresh] mode: $([[ "$VERIFY_ONLY" == "1" ]] && echo verify-only || echo write)"
 
+if [[ -f "$ROOTFS" ]]; then
+    ELASTOS_BROWSER_VM_DATA_DIR="$DATA_DIR" \
+    ELASTOS_BROWSER_VM_ROOTFS="$ROOTFS" \
+        "$SOURCE_DIR/scripts/browser-vm-artifact-preflight.sh" --verify-image-set
+fi
+
+if [[ "${#INITRDS[@]}" -gt 0 ]]; then
+    for initrd in "${INITRDS[@]}"; do
+        check_initrd "$initrd" "$selkies_source"
+    done
+fi
+check_rootfs_guest_files "$ROOTFS" "$selkies_source"
+
+if [[ "$DRIFT" == "1" ]]; then
+    echo "Browser guest files differ from source. Rebuild and install the complete image set before refreshing host helpers." >&2
+    exit 1
+fi
+
 install_with_backup "$selkies_source" \
     "$DATA_DIR/scripts/browser-selkies-control-service.mjs" 644 \
     "browser-selkies-control-service.mjs"
@@ -641,13 +591,6 @@ write_node_wrapper "$DATA_DIR/bin/browser-vm-local-crosvm-launcher" \
 write_node_wrapper "$DATA_DIR/bin/browser-vm-prepare-rootfs-pool" \
     "$DATA_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" \
     "browser-vm-prepare-rootfs-pool"
-
-if [[ "${#INITRDS[@]}" -gt 0 ]]; then
-    for initrd in "${INITRDS[@]}"; do
-        refresh_initrd "$initrd" "$selkies_source"
-    done
-fi
-refresh_rootfs "$ROOTFS" "$selkies_source"
 
 if [[ "$VERIFY_ONLY" == "1" && "$DRIFT" == "1" ]]; then
     echo "[browser-vm-target-refresh] verify-only found drift"

@@ -1,14 +1,13 @@
-use anyhow::Context as _;
-use serde::Deserialize;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read as _};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(test)]
+use std::fs;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use elastos_common::localhost::{ensure_file_backed_roots, file_backed_prefixes};
 use elastos_runtime::provider::{
     ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
@@ -57,7 +56,9 @@ const BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
 const MODEL_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
+#[cfg(test)]
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
@@ -71,46 +72,25 @@ const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION"
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelProviderOperatorConfigFile {
-    offers: Vec<serde_json::Value>,
-}
-
+#[cfg(test)]
+use api::model_provider_bridge_config;
+use api::model_provider_config as model_provider_startup_config;
+#[cfg(test)]
 fn model_provider_root_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("providers").join(MODEL_PROVIDER_ID)
 }
 
+#[cfg(test)]
 fn model_provider_config_path(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join(MODEL_PROVIDER_CONFIG_FILE_NAME)
 }
 
+#[cfg(test)]
 fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
 }
 
-fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::BridgeProviderConfig> {
-    let offers = load_model_provider_operator_offers(data_dir)?;
-    Ok(provider::BridgeProviderConfig {
-        base_path: data_dir.to_string_lossy().into_owned(),
-        extra: serde_json::json!({
-            "provider_id": MODEL_PROVIDER_ID,
-            "journal_dir": model_provider_journal_dir(data_dir).to_string_lossy().into_owned(),
-            "offers": offers,
-        }),
-        ..Default::default()
-    })
-}
-
-fn derive_protected_content_runtime_issuer(
-    device_key: &[u8; 32],
-) -> anyhow::Result<elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1> {
-    let (runtime_signing_key, _) = elastos_identity::derive_did(device_key);
-    elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1::new(
-        runtime_signing_key.verifying_key().to_bytes(),
-    )
-    .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))
-}
+use elastos_server::protected_content_runtime::derive_protected_content_runtime_issuer;
 
 fn chain_provider_bridge_config_without_protected_network(
     runtime_operation_issuer: &elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1,
@@ -157,110 +137,6 @@ fn chain_provider_protected_startup_config(
             None
         }
     }
-}
-
-fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
-    let config_path = model_provider_config_path(data_dir);
-    let metadata = match fs::symlink_metadata(&config_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to inspect model-provider operator config {}",
-                    config_path.display()
-                )
-            })
-        }
-    };
-    let config_root = model_provider_root_dir(data_dir);
-    validate_model_provider_private_directory(
-        &data_dir.join("providers"),
-        "model-provider config parent",
-    )?;
-    validate_model_provider_private_directory(&config_root, "model-provider config root")?;
-    let bytes = read_model_provider_private_file(
-        &config_path,
-        &metadata,
-        MODEL_PROVIDER_CONFIG_MAX_BYTES,
-        "model-provider operator config",
-    )?;
-    let raw = String::from_utf8(bytes)
-        .context("model-provider operator config must be valid UTF-8 JSON")?;
-    let config: ModelProviderOperatorConfigFile = serde_json::from_str(&raw)
-        .context("model-provider operator config must contain only the top-level offers key")?;
-    Ok(config.offers)
-}
-
-fn validate_model_provider_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("{label} must be a real directory");
-    }
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o700 {
-            anyhow::bail!("{label} must be owned by the current user with mode 0700");
-        }
-    }
-    Ok(())
-}
-
-fn validate_model_provider_private_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-    label: &str,
-) -> anyhow::Result<()> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!("{label} must be a regular non-symlink file");
-    }
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o600 {
-            anyhow::bail!("{label} must be owned by the current user with mode 0600");
-        }
-    }
-    let _ = path;
-    Ok(())
-}
-
-fn read_model_provider_private_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-    max_bytes: usize,
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    validate_model_provider_private_file(path, metadata, label)?;
-    let metadata_len = usize::try_from(metadata.len())
-        .context("model-provider operator config length does not fit memory bounds")?;
-    if metadata_len > max_bytes {
-        anyhow::bail!("{label} exceeds its byte limit");
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
-    validate_model_provider_private_file(path, &opened_metadata, label)?;
-    let mut bytes = Vec::with_capacity(metadata_len);
-    let read_limit = u64::try_from(max_bytes)?
-        .checked_add(1)
-        .context("model-provider operator config read bound overflow")?;
-    file.take(read_limit).read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        anyhow::bail!("{label} exceeds its byte limit");
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -563,10 +439,214 @@ pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<Serve
     setup_server_infrastructure_impl(false).await
 }
 
+// ---------------------------------------------------------------------------
+// Core planes shared by every composition profile — the full runtime host
+// (`setup_server_infrastructure`), the control plane, and the standalone
+// provider host (`provider_host`). Each returns `Result` so a profile that
+// must fail closed can, while the runtime host keeps warning and degrading.
+// ---------------------------------------------------------------------------
+
+/// Register the in-process content plane: the `content` scheme provider and
+/// the `elastos://content` sub-provider a Carrier replica receive dispatches
+/// to for `import_object` / `import_exact`.
+pub(crate) async fn register_content_plane(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    data_dir: &Path,
+) -> anyhow::Result<Arc<ContentProvider>> {
+    let content_provider = Arc::new(ContentProvider::new(
+        data_dir.to_path_buf(),
+        Arc::downgrade(provider_registry),
+    ));
+    provider_registry.register(content_provider.clone()).await;
+    provider_registry
+        .register_sub_provider("content", content_provider.clone())
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to register elastos://content sub-provider: {err}")
+        })?;
+    Ok(content_provider)
+}
+
+/// Spawn the ipfs-provider capsule and register `elastos://ipfs`, the block
+/// backend the content plane pins imported objects through.
+pub(crate) async fn register_ipfs_provider_plane(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+) -> anyhow::Result<()> {
+    let bridge = provider::ProviderBridge::spawn(binary_path, Default::default())
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
+    let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
+        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "ipfs"),
+    );
+    provider_registry
+        .register_sub_provider("ipfs", ipfs_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register elastos://ipfs sub-provider: {err}"))
+}
+
+/// Spawn the availability-provider capsule and register `elastos://availability`.
+pub(crate) async fn register_availability_provider_plane(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    config: serde_json::Value,
+) -> anyhow::Result<()> {
+    let bridge = provider::ProviderBridge::spawn(
+        binary_path,
+        provider::BridgeProviderConfig {
+            extra: config,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to spawn availability-provider: {err}"))?;
+    let availability_provider: Arc<dyn provider::Provider> = Arc::new(
+        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "availability"),
+    );
+    provider_registry
+        .register_sub_provider("availability", availability_provider)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to register elastos://availability sub-provider: {err}")
+        })
+}
+
+/// Spawn the chain-provider capsule with this data dir's protected-content
+/// network configuration applied and register `elastos://chain`.
+///
+/// A standalone custody host needs this plane: a committee member settles
+/// every release through its own `protected_content_rights_evidence` call,
+/// so the configuration is required here (the full Home profile tolerates its
+/// absence because it degrades protected operations, not the whole host).
+pub(crate) async fn register_chain_provider_plane(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    // The chain plane verifies every signed Runtime release operation it
+    // evaluates against one issuer. On a custody committee member that must
+    // be the CLIENT Runtime the custody state was provisioned to trust (the
+    // operations are signed there), never this host's own device key; a
+    // host without provisioned custody state (the full Home profile, or a
+    // chain-only host) is its own Runtime and keeps the device-key issuer.
+    let custody_state_root =
+        elastos_server::protected_content_runtime::inactive_custody_state_root(data_dir);
+    let runtime_issuer = if custody_state_root.is_dir() {
+        let issuer = custody_provider::load_trusted_runtime_issuer(&custody_state_root).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "provisioned custody state names no readable trusted Runtime issuer: {error:?}"
+                )
+            },
+        )?;
+        tracing::info!(
+            issuer = %format!("0x{}", hex::encode(issuer.as_bytes())),
+            "chain plane trusts the custody state's provisioned Runtime issuer"
+        );
+        issuer
+    } else {
+        let device_key = elastos_identity::load_or_create_device_key(data_dir)
+            .context("chain-provider host identity is unavailable")?;
+        derive_protected_content_runtime_issuer(&device_key)?
+    };
+    let config = chain_provider_bridge_config(data_dir, &runtime_issuer)
+        .context("protected-content chain configuration is invalid")?;
+    if config.extra.get("protected_content_network").is_none() {
+        anyhow::bail!("protected-content chain configuration names no protected_content_network");
+    }
+    let generic_config = chain_provider_bridge_config_without_protected_network(&runtime_issuer);
+    let bridge = provider::ProviderBridge::spawn(binary_path, generic_config)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to spawn chain-provider: {err}"))?;
+    match bridge
+        .request(provider::bridge::ProviderRequest::Init { config })
+        .await
+    {
+        Ok(provider::bridge::ProviderResponse::Ok { .. }) => {}
+        Ok(provider::bridge::ProviderResponse::Error { code, message, .. }) => {
+            let _ = bridge.shutdown().await;
+            anyhow::bail!(
+                "chain-provider rejected the protected-content chain configuration: {code}: {message}"
+            );
+        }
+        Err(err) => {
+            let _ = bridge.shutdown().await;
+            anyhow::bail!("chain-provider transport failed while applying configuration: {err}");
+        }
+    }
+    let chain_provider: Arc<dyn provider::Provider> = Arc::new(
+        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "chain"),
+    );
+    provider_registry
+        .register_sub_provider("chain", chain_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register elastos://chain sub-provider: {err}"))
+}
+
+/// Start the Carrier node and wire it as the registry's provider invoker, so
+/// inbound `provider_invoke` frames dispatch into this registry and outbound
+/// invocations can route over Carrier.
+pub(crate) async fn start_carrier_plane(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    data_dir: &Path,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> anyhow::Result<elastos_server::carrier::CarrierNode> {
+    let carrier_node = elastos_server::carrier::start_carrier_node_with_registry_bound(
+        signing_key,
+        did,
+        data_dir.to_path_buf(),
+        Some(Arc::downgrade(provider_registry)),
+        bind_addr,
+    )
+    .await?;
+    provider_registry
+        .set_carrier_invoker(Arc::new(
+            elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                carrier_node.endpoint.clone(),
+                Arc::downgrade(provider_registry),
+            ),
+        ))
+        .await;
+    Ok(carrier_node)
+}
+
+async fn serve_capability_store(
+    data_dir: &Path,
+) -> anyhow::Result<Arc<capability::CapabilityStore>> {
+    capability::CapabilityStore::with_persistence(data_dir.join("capability_store"))
+        .await
+        .map(Arc::new)
+        .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
+}
+
+/// A configured listener is an operator-owned address; it must survive restarts
+/// and fail closed rather than silently selecting an ephemeral replacement.
+fn configured_carrier_bind_addr(data_dir: &Path) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
+    };
+    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
+    table
+        .get("carrier_bind_addr")
+        .map(|value| {
+            value
+                .as_str()
+                .context("carrier_bind_addr must be a socket address string")?
+                .parse()
+                .context("Invalid carrier_bind_addr")
+        })
+        .transpose()
+}
+
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
+    let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
     let _ = ownership::repair_path_recursive(&data_dir);
     let collaboration_configuration =
         elastos_server::collaboration_startup::load_and_accept_collaboration_startup_configuration(
@@ -579,7 +659,7 @@ async fn setup_server_infrastructure_impl(
         .set_default_owner(local_session_owner(&data_dir)?)
         .await;
     let metrics = Arc::new(primitives::metrics::MetricsManager::new());
-    let capability_store = Arc::new(capability::CapabilityStore::new());
+    let capability_store = serve_capability_store(&data_dir).await?;
     let capability_manager = Arc::new(capability::CapabilityManager::load_or_generate(
         &data_dir,
         capability_store,
@@ -607,17 +687,13 @@ async fn setup_server_infrastructure_impl(
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
     let mut carrier_service = None;
-    let content_provider = Arc::new(ContentProvider::new(
-        data_dir.clone(),
-        Arc::downgrade(&provider_registry),
-    ));
-    provider_registry.register(content_provider.clone()).await;
-    if let Err(err) = provider_registry
-        .register_sub_provider("content", content_provider)
-        .await
-    {
-        tracing::warn!("Failed to register elastos://content sub-provider: {}", err);
-    }
+    let content_plane = match register_content_plane(&provider_registry, &data_dir).await {
+        Ok(provider) => Some(provider),
+        Err(err) => {
+            tracing::warn!("{}", err);
+            None
+        }
+    };
     provider_registry
         .register(Arc::new(DocumentsProvider::new(
             data_dir.clone(),
@@ -743,31 +819,18 @@ async fn setup_server_infrastructure_impl(
                         e
                     );
                 } else {
-                    let config = provider::BridgeProviderConfig {
-                        extra: availability_config,
-                        ..Default::default()
-                    };
-                    match provider::ProviderBridge::spawn(&path, config).await {
-                        Ok(bridge) => {
-                            let availability_provider: Arc<dyn provider::Provider> =
-                                Arc::new(provider::CapsuleProvider::with_scheme(
-                                    Arc::new(bridge),
-                                    "availability",
-                                ));
-                            if let Err(e) = provider_registry
-                                .register_sub_provider("availability", availability_provider)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to register elastos://availability sub-provider: {}",
-                                    e
-                                );
-                            } else {
-                                external_availability_registered = true;
-                            }
+                    match register_availability_provider_plane(
+                        &provider_registry,
+                        &path,
+                        availability_config,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            external_availability_registered = true;
                             tracing::info!("availability-provider capsule from {}", path.display());
                         }
-                        Err(e) => tracing::warn!("Failed to spawn availability-provider: {}", e),
+                        Err(e) => tracing::warn!("{}", e),
                     }
                 }
             } else {
@@ -886,36 +949,6 @@ async fn setup_server_infrastructure_impl(
         ),
     }
 
-    match binaries::resolve_verified_native_provider_binary("model-provider") {
-        Ok(Some(path)) => match model_provider_bridge_config(&data_dir) {
-            Ok(model_config) => match provider::ProviderBridge::spawn(&path, model_config).await {
-                Ok(bridge) => {
-                    let bridge = Arc::new(bridge);
-                    match start_model_provider(
-                        &provider_registry,
-                        bridge,
-                        MODEL_PROVIDER_STATUS_TIMEOUT,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            tracing::info!("model-provider capsule from {}", path.display())
-                        }
-                        Err(_) => {
-                            tracing::warn!("Skipping model-provider because startup failed")
-                        }
-                    }
-                }
-                Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
-            },
-            Err(_) => {
-                tracing::warn!("Skipping model-provider due to invalid private operator config")
-            }
-        },
-        Ok(None) => {}
-        Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
-    }
-
     match binaries::resolve_verified_native_provider_binary(MEDIA_PROVIDER_ID) {
         Ok(Some(path)) => match media_provider_bridge_config(&data_dir) {
             Ok(Some(media_config)) => {
@@ -943,7 +976,9 @@ async fn setup_server_infrastructure_impl(
             Ok(None) => tracing::info!("media-provider is installed but unconfigured"),
             Err(_) => tracing::warn!("Skipping media-provider due to invalid private config"),
         },
-        Ok(None) => {}
+        Ok(None) => tracing::warn!(
+            "media-provider binary is not installed; protected-content media sessions will fail closed"
+        ),
         Err(_) => tracing::warn!("Skipping media-provider due to verification failure"),
     }
 
@@ -977,20 +1012,8 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match provider::ProviderBridge::spawn(&path, Default::default()).await {
-            Ok(bridge) => {
-                let bridge = Arc::new(bridge);
-                let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
-                    provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
-                );
-                if let Err(e) = provider_registry
-                    .register_sub_provider("ipfs", ipfs_provider)
-                    .await
-                {
-                    tracing::warn!("Failed to register elastos://ipfs sub-provider: {}", e);
-                }
-                tracing::info!("ipfs-provider capsule from {}", path.display());
-            }
+        Ok(Some(path)) => match register_ipfs_provider_plane(&provider_registry, &path).await {
+            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
             Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
         },
         Ok(None) => {
@@ -999,6 +1022,116 @@ async fn setup_server_infrastructure_impl(
             );
         }
         Err(e) => tracing::warn!("Skipping ipfs-provider due to verification failure: {}", e),
+    }
+
+    // Admitted model startup reuses the registered native IPFS verifier.
+    match binaries::resolve_verified_native_provider_binary("model-provider") {
+        Ok(Some(path)) => {
+            match model_provider_startup_config(&data_dir, &provider_registry).await {
+                Ok((mut model_config, worker)) => {
+                    #[cfg(target_os = "macos")]
+                    let bridge_result =
+                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
+                            .await
+                            .map(|(bridge, sockets, vacant, config, listener)| {
+                                (bridge, Some((sockets, vacant)), config, Some(listener))
+                            });
+                    #[cfg(target_os = "linux")]
+                    let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
+                        &path,
+                        model_config.clone(),
+                    )
+                    .await
+                    .map(|(bridge, sockets, vacant, config)| {
+                        (bridge, Some((sockets, vacant)), config, None::<()>)
+                    });
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    let bridge_result =
+                        provider::ProviderBridge::spawn(&path, model_config.clone())
+                            .await
+                            .map(|bridge| (bridge, None, model_config.clone(), None::<()>));
+                    match bridge_result {
+                        Ok((bridge, local_sockets, confined_config, hosted_listener)) => {
+                            model_config = confined_config;
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            if let Some((sockets, vacant)) = local_sockets {
+                                provider_registry
+                                    .set_local_model_sockets(sockets, vacant)
+                                    .await;
+                                #[cfg(target_os = "macos")]
+                                if let Some(socket) =
+                                    model_config.extra["runtime_hosted_socket"].as_str()
+                                {
+                                    provider_registry
+                                        .set_hosted_model_socket(socket.to_owned())
+                                        .await;
+                                }
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            let _ = local_sockets;
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = hosted_listener;
+                            let bridge = Arc::new(bridge);
+                            #[cfg(target_os = "macos")]
+                            if let Some(listener) = hosted_listener {
+                                if let Err(error) = api::model_provider_egress::start(
+                                    listener,
+                                    bridge.clone(),
+                                    data_dir.clone(),
+                                ) {
+                                    tracing::warn!(%error, "model hosted egress broker unavailable");
+                                }
+                            }
+                            let startup = async {
+                                #[cfg(unix)]
+                                api::settle_pending_model_startup(
+                                    &data_dir,
+                                    &bridge,
+                                    &model_config,
+                                    worker.as_ref(),
+                                )
+                                .await?;
+                                start_model_provider(
+                                    &provider_registry,
+                                    bridge.clone(),
+                                    MODEL_PROVIDER_STATUS_TIMEOUT,
+                                )
+                                .await
+                            }
+                            .await;
+                            match startup {
+                                Ok(()) => {
+                                    #[cfg(unix)]
+                                    if let Err(error) = api::complete_admitted_model_startup(
+                                        &data_dir,
+                                        &provider_registry,
+                                        worker.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(%error, "model startup activation receipt pending");
+                                    }
+                                    tracing::info!("model-provider capsule from {}", path.display())
+                                }
+                                Err(_) => {
+                                    let _ = bridge.shutdown().await;
+                                    tracing::warn!("Skipping model-provider because startup failed")
+                                }
+                            }
+                        }
+                        Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
+                    }
+                    drop(worker);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Skipping model-provider due to invalid private model configuration"
+                    )
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
     }
 
     match binaries::resolve_verified_native_provider_binary("chain-provider") {
@@ -1317,7 +1450,16 @@ async fn setup_server_infrastructure_impl(
             tracing::info!(
                 "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
             );
+            elastos_server::protected_content_runtime::reconcile_runtime_custody_viewers_after_decrypt_boot(
+                &data_dir,
+                provider_registry.clone(),
+            )
+            .await;
         }
+    } else {
+        tracing::warn!(
+            "protected-content-decrypt-provider binary is not installed; protected-content open and play will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("protected-content-protect-provider")
@@ -1340,6 +1482,10 @@ async fn setup_server_infrastructure_impl(
                 path.display()
             );
         }
+    } else {
+        tracing::warn!(
+            "protected-content-protect-provider binary is not installed; protected-content mint will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("custody-provider") {
@@ -1365,6 +1511,10 @@ async fn setup_server_infrastructure_impl(
                 "custody-provider registered as inactive Runtime custody route; provisional key-provider remains the product path"
             );
         }
+    } else {
+        tracing::warn!(
+            "custody-provider binary is not installed; the inactive Runtime custody route will be unavailable"
+        );
     }
 
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.
@@ -1373,23 +1523,16 @@ async fn setup_server_infrastructure_impl(
     let (carrier_signing_key, carrier_did) = elastos_identity::derive_did(&device_key);
     let mut collaboration_carrier_provider: Option<Arc<dyn provider::Provider>> = None;
     {
-        match elastos_server::carrier::start_carrier_node_with_registry(
+        match start_carrier_plane(
+            &provider_registry,
             &carrier_signing_key,
             &carrier_did,
-            data_dir.clone(),
-            Some(Arc::downgrade(&provider_registry)),
+            &data_dir,
+            carrier_bind_addr,
         )
         .await
         {
             Ok(carrier_node) => {
-                provider_registry
-                    .set_carrier_invoker(Arc::new(
-                        elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
-                            carrier_node.endpoint.clone(),
-                            Arc::downgrade(&provider_registry),
-                        ),
-                    ))
-                    .await;
                 let gossip_provider: Arc<dyn provider::Provider> =
                     Arc::new(elastos_server::carrier::CarrierGossipProvider::new(
                         carrier_node.gossip_state.clone(),
@@ -1402,25 +1545,33 @@ async fn setup_server_infrastructure_impl(
                     tracing::warn!("Failed to register Carrier gossip provider: {}", e);
                 }
                 if !external_availability_registered {
-                    let availability_provider: Arc<dyn provider::Provider> =
-                        Arc::new(
+                    let availability_provider = Arc::new(
                             elastos_server::carrier::CarrierAvailabilityProvider::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
                             carrier_node.gossip_state.clone(),
                             Arc::downgrade(&provider_registry),
                             data_dir.clone(),
                             carrier_peer_attestation_exchange_config_from_env(),
                         ));
+                    availability_provider
+                        .restore_persisted_local_holder_announcements()
+                        .await;
                     if let Err(e) = provider_registry
                         .register_sub_provider("availability", availability_provider)
                         .await
                     {
                         tracing::warn!("Failed to register Carrier availability provider: {}", e);
                     }
+                    if let Some(content) = content_plane.as_ref() {
+                        content.restore_complete_local_objects().await;
+                    }
                 }
                 carrier_service = Some(elastos_server::carrier::CarrierRuntimeService::new(
                     carrier_node,
                 ));
                 tracing::info!("Carrier node online (P2P + gossip)");
+            }
+            Err(e) if carrier_bind_addr.is_some() => {
+                return Err(e).context("Configured Carrier listener could not start");
             }
             Err(e) => {
                 tracing::warn!("Carrier node failed: {:#}", e);
@@ -1437,10 +1588,18 @@ async fn setup_server_infrastructure_impl(
             provider_registry.clone(),
         )
         .await?;
-    let collaboration_context = collaboration_service
+    if let (Some(collaboration), Some(carrier)) =
+        (collaboration_service.as_ref(), carrier_service.as_ref())
+    {
+        collaboration.configure_browser_exit_carrier(carrier).await;
+    }
+    let mut collaboration_context = collaboration_service
         .as_ref()
         .map(|service| service.gateway_context())
         .unwrap_or_default();
+    collaboration_context.carrier_endpoint = carrier_service
+        .as_ref()
+        .and_then(|service| service.endpoint());
 
     maybe_spawn_content_repair_scheduler(provider_registry.clone());
 
@@ -1687,7 +1846,7 @@ fn browser_local_exit_socket_has_listener(path: &Path) -> bool {
     }
 }
 
-fn availability_provider_config_from_env() -> Option<serde_json::Value> {
+pub(crate) fn availability_provider_config_from_env() -> Option<serde_json::Value> {
     if let Ok(raw) = std::env::var("ELASTOS_AVAILABILITY_PROVIDER_CONFIG") {
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => return Some(value),
@@ -1950,6 +2109,35 @@ fn provider_config_from_env_or_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_carrier_listener_is_optional_and_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            None
+        );
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "dev_mode = true\n").unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            None
+        );
+        std::fs::write(&path, r#"carrier_bind_addr = "127.0.0.1:61967""#).unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            Some("127.0.0.1:61967".parse().unwrap())
+        );
+        for invalid in [
+            "carrier_bind_addr = 61967",
+            "carrier_bind_addr = \"invalid\"",
+            "broken = [",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(super::configured_carrier_bind_addr(dir.path()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::ffi::CString;
@@ -2247,7 +2435,8 @@ mod tests {
     async fn browser_engine_startup_reaps_old_or_mixed_version_before_launch() {
         for status in [
             provider_status(BROWSER_ENGINE_PROVIDER_ID, "1.0"),
-            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.1"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.0"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.2"),
             provider_status("other-provider", BROWSER_ENGINE_PROTOCOL_VERSION),
         ] {
             let registry = provider::ProviderRegistry::new();
@@ -2940,16 +3129,83 @@ mod tests {
 
         let config = model_provider_bridge_config(tempdir.path()).unwrap();
 
-        assert_eq!(config.base_path, tempdir.path().to_string_lossy());
+        let canonical_root = tempdir.path().canonicalize().unwrap();
+        assert_eq!(config.base_path, canonical_root.to_string_lossy());
         assert_eq!(config.extra["provider_id"], MODEL_PROVIDER_ID);
         assert_eq!(
             config.extra["journal_dir"],
-            model_provider_journal_dir(tempdir.path())
+            model_provider_journal_dir(&canonical_root)
                 .to_string_lossy()
                 .into_owned()
         );
         assert_eq!(config.extra["offers"], serde_json::json!([]));
         assert!(!model_provider_config_path(tempdir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_config_keeps_operator_offers_without_admission() {
+        let tempdir = TempDir::new().unwrap();
+        let raw = r#"{"offers":[{"id":"operator-owned","enabled":false}]}"#;
+        let path = write_model_provider_operator_config(&tempdir, raw);
+        let expected = model_provider_bridge_config(tempdir.path()).unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let (actual, worker) = model_provider_startup_config(tempdir.path(), &registry)
+            .await
+            .unwrap();
+        assert!(worker.is_none());
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), raw);
+        assert!(!tempdir.path().join("model-preparation").exists());
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_provider_startup_config_resolves_root_alias_to_same_init_identity() {
+        let tempdir = TempDir::new().unwrap();
+        let raw = r#"{"offers":[{"id":"operator-owned","enabled":false}]}"#;
+        let operator_path = write_model_provider_operator_config(&tempdir, raw);
+        let links = TempDir::new().unwrap();
+        let alias = links.path().join("runtime-root");
+        std::os::unix::fs::symlink(tempdir.path(), &alias).unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let initial = model_provider_bridge_config(&alias).unwrap();
+        let (refreshed, worker) = model_provider_startup_config(&alias, &registry)
+            .await
+            .unwrap();
+        assert!(worker.is_none());
+        let canonical =
+            model_provider_bridge_config(&tempdir.path().canonicalize().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(initial).unwrap(),
+            serde_json::to_value(&canonical).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(refreshed).unwrap(),
+            serde_json::to_value(canonical).unwrap()
+        );
+        assert_eq!(fs::read_to_string(operator_path).unwrap(), raw);
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_provider_startup_config_consumes_inventory_validation() {
+        let tempdir = TempDir::new().unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_ok());
+        let inventory = tempdir.path().join("model-preparation");
+        fs::create_dir(&inventory).unwrap();
+        fs::set_permissions(&inventory, fs::Permissions::from_mode(0o700)).unwrap();
+        // An existing incomplete inventory is not the absent-inventory case.
+        let registry = provider::ProviderRegistry::new();
+        assert!(model_provider_startup_config(tempdir.path(), &registry)
+            .await
+            .is_err());
+        assert!(!inventory.join("lock").exists());
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
     }
 
     #[cfg(unix)]
@@ -3025,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_bridge_config_passes_raw_operator_offers_without_nested_validation() {
+    fn model_provider_bridge_config_keeps_unvalidated_offers_without_credentials() {
         let tempdir = TempDir::new().unwrap();
         let raw = serde_json::json!({
             "offers": [
@@ -3076,7 +3332,13 @@ mod tests {
 
         let config = model_provider_bridge_config(tempdir.path()).unwrap();
 
-        assert_eq!(config.extra["offers"], raw["offers"]);
+        let mut expected = raw["offers"].clone();
+        expected[0]["adapter"]
+            .as_object_mut()
+            .unwrap()
+            .remove("api_key");
+        assert_eq!(config.extra["offers"], expected);
+        assert!(!config.extra.to_string().contains("super-secret"));
     }
 
     #[test]
@@ -3617,5 +3879,350 @@ mod tests {
         .unwrap();
         let mut restarted_service = elastos_server::carrier::CarrierRuntimeService::new(restarted);
         restarted_service.shutdown().await.unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // `elastos run <native-provider>` standalone provider host.
+    //
+    // These exercise the real composition: a real custody-provider process on
+    // the Runtime-only `custody` target, the in-process content plane that
+    // serves a Carrier replica `import_object`, and a real Carrier node — with
+    // no HTTP or TLS surface anywhere.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    const PROVIDER_HOST_TEST_CUSTODY_BIN_ENV: &str = "ELASTOS_TEST_CUSTODY_PROVIDER_BIN";
+
+    /// A CID the mock ipfs-provider returns for every `add_directory`, so the
+    /// content plane's exact-object check sees a matching import.
+    #[cfg(unix)]
+    const PROVIDER_HOST_TEST_CID: &str =
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+    #[cfg(unix)]
+    fn required_provider_host_test_binary(env_name: &str) -> PathBuf {
+        let path = PathBuf::from(
+            std::env::var_os(env_name)
+                .unwrap_or_else(|| panic!("missing test binary env: {env_name}")),
+        );
+        assert!(
+            path.is_file(),
+            "test binary is not a file: {}",
+            path.display()
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    fn owner_only_test_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A data dir shaped exactly like `elastos protected-content-config
+    /// provision-custody-node` leaves it: owner-only, with a provisioned
+    /// inactive custody state root bound to this home's Runtime issuer.
+    #[cfg(unix)]
+    fn provisioned_provider_host_data_dir(temp: &TempDir) -> PathBuf {
+        let data_dir = fs::canonicalize(temp.path()).unwrap().join("data");
+        owner_only_test_dir(&data_dir);
+        let state_root = data_dir.join("protected-content/custody-provider/inactive");
+        owner_only_test_dir(state_root.parent().unwrap());
+        let device_key = elastos_identity::load_or_create_device_key(&data_dir).unwrap();
+        let issuer = derive_protected_content_runtime_issuer(&device_key).unwrap();
+        custody_provider::provision_state_root(&state_root, issuer).unwrap();
+        data_dir
+    }
+
+    /// A stdio provider that answers every request with the fixed import CID,
+    /// standing in for a kubo-backed ipfs-provider install.
+    #[cfg(unix)]
+    fn write_mock_ipfs_provider(temp: &TempDir) -> PathBuf {
+        let bin_dir = temp.path().join("mock-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let path = bin_dir.join("ipfs-provider");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{{\"status\":\"ok\",\"data\":{{\"cid\":\"%s\"}}}}\\n' '{PROVIDER_HOST_TEST_CID}'\ndone\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn custody_status_invocation() -> ProviderInvocation {
+        ProviderInvocation {
+            // The Runtime is the only source the custody route accepts.
+            source: "runtime".to_string(),
+            target: "custody".to_string(),
+            op: "status".to_string(),
+            request: serde_json::json!({"op": "status"}),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: elastos_runtime::provider::ProviderInvocationTransport::Local,
+        }
+    }
+
+    /// The exact request a Carrier peer's `provider_invoke` dispatch hands to
+    /// `ProviderRegistry::send_raw("content", ..)` for a replica receive.
+    #[cfg(unix)]
+    fn carrier_replica_import_object_request(source_endpoint_did: &str) -> serde_json::Value {
+        serde_json::json!({
+            "op": "import_object",
+            "cid": PROVIDER_HOST_TEST_CID,
+            "object_kind": "directory",
+            "files": [{
+                "path": "payload.bin",
+                "data": "ZWxhc3Rvcy1yZXBsaWNh",
+            }],
+            "_runtime_invocation": {
+                "schema": "elastos.provider.invocation/v1",
+                "source": "carrier-availability",
+                "target": "content",
+                "op": "import_object",
+                "capability": "provider:carrier-availability->content:import_object",
+                "transport": "carrier-provider-plane",
+                "carrier": {"source_endpoint_did": source_endpoint_did},
+                "transfer": "json",
+                "range": serde_json::Value::Null,
+                "progress": serde_json::Value::Null,
+                "abi": {
+                    "schema": "elastos.provider.transfer-abi/v1",
+                    "transfer": "json",
+                    "transport": "carrier-provider-plane",
+                    "range_supported": false,
+                    "progress_supported": false,
+                    "progress_mode": "none",
+                    "transport_native_stream": false,
+                    "backpressure": "not_applicable",
+                    "cancel_supported": false,
+                },
+            },
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_host_registers_custody_plane_and_publishes_ready_receipt_without_http() {
+        let custody_binary = required_provider_host_test_binary(PROVIDER_HOST_TEST_CUSTODY_BIN_ENV);
+        let temp = TempDir::new().unwrap();
+        let data_dir = provisioned_provider_host_data_dir(&temp);
+
+        let plan = crate::provider_host::ProviderHostPlan::resolve(
+            data_dir.clone(),
+            custody_binary.to_str().unwrap(),
+            &[],
+            Some("127.0.0.1:0"),
+        )
+        .unwrap();
+        assert_eq!(plan.provider_names(), vec!["custody-provider"]);
+
+        let host = crate::provider_host::compose(&plan).await.unwrap();
+        let receipt_path = host.receipt_path().to_path_buf();
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        let (_signing_key, did) = elastos_identity::load_or_create_did(&data_dir).unwrap();
+        assert_eq!(receipt["did"], serde_json::Value::String(did));
+        assert_eq!(
+            receipt["providers"],
+            serde_json::json!(["custody-provider"])
+        );
+        assert!(receipt["carrier_bound"]
+            .as_str()
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+        assert!(receipt["started_at"].as_u64().unwrap() > 0);
+        assert_eq!(
+            fs::metadata(&receipt_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let status = host
+            .registry()
+            .invoke_provider(custody_status_invocation())
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["data"]["provider"], "custody");
+
+        // The provider host stands up no HTTP or TLS surface at all.
+        assert!(!data_dir.join("tls.pem").exists());
+        assert!(!data_dir.join("ca.pem").exists());
+        assert!(!data_dir.join("runtime-coords.json").exists());
+
+        host.shutdown().await.unwrap();
+        assert!(!receipt_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_host_with_content_replica_set_answers_custody_and_content_targets() {
+        let custody_binary = required_provider_host_test_binary(PROVIDER_HOST_TEST_CUSTODY_BIN_ENV);
+        let temp = TempDir::new().unwrap();
+        let data_dir = provisioned_provider_host_data_dir(&temp);
+        let ipfs_binary = write_mock_ipfs_provider(&temp);
+
+        let plan = crate::provider_host::ProviderHostPlan::resolve(
+            data_dir.clone(),
+            custody_binary.to_str().unwrap(),
+            std::slice::from_ref(&ipfs_binary.to_string_lossy().into_owned()),
+            Some("127.0.0.1:0"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.provider_names(),
+            vec!["custody-provider", "ipfs-provider"]
+        );
+
+        let host = crate::provider_host::compose(&plan).await.unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(host.receipt_path()).unwrap()).unwrap();
+        assert_eq!(
+            receipt["providers"],
+            serde_json::json!(["custody-provider", "ipfs-provider"])
+        );
+
+        let status = host
+            .registry()
+            .invoke_provider(custody_status_invocation())
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "ok");
+
+        let (_signing_key, did) = elastos_identity::load_or_create_did(&data_dir).unwrap();
+        let import = host
+            .registry()
+            .send_raw("content", &carrier_replica_import_object_request(&did))
+            .await
+            .unwrap();
+        assert_eq!(import["status"], "ok", "{import}");
+
+        let content_status = host
+            .registry()
+            .send_raw(
+                "content",
+                &serde_json::json!({"op": "status", "cid": PROVIDER_HOST_TEST_CID}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_status["status"], "ok", "{content_status}");
+        assert_eq!(
+            content_status["data"]["availability"]["policy"],
+            "carrier_object_import"
+        );
+
+        host.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn provider_host_plan_rejects_an_unknown_provider_naming_the_supported_set() {
+        let temp = TempDir::new().unwrap();
+        let error = crate::provider_host::ProviderHostPlan::resolve(
+            temp.path().to_path_buf(),
+            "nonexistent-provider",
+            &[],
+            None,
+        )
+        .expect_err("an unknown provider name must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("nonexistent-provider"), "{message}");
+        assert!(message.contains("custody-provider"), "{message}");
+        assert!(message.contains("availability-provider"), "{message}");
+        assert!(message.contains("ipfs-provider"), "{message}");
+        assert!(message.contains("chain-provider"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_host_custody_without_provisioned_state_names_the_provisioning_command() {
+        let custody_binary = required_provider_host_test_binary(PROVIDER_HOST_TEST_CUSTODY_BIN_ENV);
+        let temp = TempDir::new().unwrap();
+        let data_dir = fs::canonicalize(temp.path()).unwrap().join("data");
+        owner_only_test_dir(&data_dir);
+
+        let plan = crate::provider_host::ProviderHostPlan::resolve(
+            data_dir,
+            custody_binary.to_str().unwrap(),
+            &[],
+            Some("127.0.0.1:0"),
+        )
+        .unwrap();
+        let error = match crate::provider_host::compose(&plan).await {
+            Ok(_) => panic!("an unprovisioned custody node must fail closed"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("elastos protected-content-config provision-custody-node"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_capability_store_keeps_revoke_all_after_restart() {
+        let data_dir = TempDir::new().unwrap();
+        let resource = capability::ResourceId::new("elastos://content/fetch");
+        let token = {
+            let store = serve_capability_store(data_dir.path())
+                .await
+                .expect("serve store");
+            let manager = capability::CapabilityManager::load_or_generate(
+                data_dir.path(),
+                store,
+                Arc::new(primitives::audit::AuditLog::new()),
+                Arc::new(primitives::metrics::MetricsManager::new()),
+            );
+            let token = manager.grant(
+                "test-capsule",
+                resource.clone(),
+                capability::Action::Read,
+                capability::TokenConstraints::default(),
+                None,
+            );
+            manager
+                .validate(
+                    &token,
+                    "test-capsule",
+                    capability::Action::Read,
+                    &resource,
+                    None,
+                )
+                .await
+                .expect("grant still validates before revoke");
+            manager.revoke_all("test restart revoke");
+            token
+        };
+
+        let store = serve_capability_store(data_dir.path())
+            .await
+            .expect("reopened serve store");
+        let manager = capability::CapabilityManager::load_or_generate(
+            data_dir.path(),
+            store,
+            Arc::new(primitives::audit::AuditLog::new()),
+            Arc::new(primitives::metrics::MetricsManager::new()),
+        );
+        let result = manager
+            .validate(
+                &token,
+                "test-capsule",
+                capability::Action::Read,
+                &resource,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(capability::manager::ValidationError::TokenRevoked)
+            ),
+            "revoked token must stay revoked after restart: {result:?}"
+        );
     }
 }

@@ -13,6 +13,12 @@ cleanup() {
     kill "$service_pid" >/dev/null 2>&1 || true
     wait "$service_pid" 2>/dev/null || true
   fi
+  if [[ -n "${OWNER_PID_FILE:-}" && -f "${OWNER_PID_FILE:-}" ]]; then
+    owner_pid="$(tr -d '[:space:]' < "$OWNER_PID_FILE")"
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+      kill "$owner_pid" >/dev/null 2>&1 || true
+    fi
+  fi
   shopt -s nullglob
   for pid_file in "$proof_dir"/*.pid; do
     child_pid="$(tr -d '[:space:]' < "$pid_file")"
@@ -27,6 +33,7 @@ trap cleanup EXIT
 fake_launcher="$tmp_dir/fake-settlement-launcher.mjs"
 cat > "$fake_launcher" <<'NODE'
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 
@@ -39,6 +46,48 @@ const suffix = launch.stream_id.replace(/[^A-Za-z0-9_-]/g, "_");
 const pageId = launch.page_id || `page:settlement-${suffix}`;
 const controlSocketPath = `${proofDir}/${suffix}.sock`;
 const pidPath = `${proofDir}/${suffix}.pid`;
+if (process.env.POLLUTE_STDOUT === "1") {
+  process.stdout.write("Allocated inode: 728\n");
+}
+if (process.env.HOLD_AFTER_POLLUTE === "1" && launch.transport_authority) {
+  const writeHoldSettlement = () => {
+    process.stderr.write(`${JSON.stringify({
+      schema: "elastos.browser.vz-launch-settlement/v1",
+      state: "terminal_post_effect_cleanup",
+      message: "polluted stdout hold reaped",
+      binding_hash: launch.transport_authority.binding_hash,
+      generation: launch.transport_authority.generation,
+      page_id: launch.transport_authority.page_id,
+      vm_id: launch.transport_authority.vm_id,
+      stream_id: launch.transport_authority.egress.stream_id,
+      media_stream_id: launch.transport_authority.media.stream_id,
+      effects: {
+        session_directory: true,
+        control_socket: true,
+        ordinary_stream_bridge: true,
+        media_stream_bridge: true,
+        turn_process: true,
+        supervisor_child: true,
+        vm: true,
+      },
+      absence: {
+        child_absent: true,
+        supervisor_child_absent: true,
+        control_socket_absent: true,
+        route_absent: true,
+        turn_listener_absent: true,
+        turn_relay_ports_absent: true,
+        ordinary_stream_bridge_absent: true,
+        media_stream_bridge_absent: true,
+        session_directory_absent: true,
+        vm_absent: true,
+      },
+    })}\n`);
+    process.exit(0);
+  };
+  process.once("SIGTERM", writeHoldSettlement);
+  setInterval(() => {}, 60_000);
+} else {
 const typedFailure = process.env.TYPED_TRANSPORT_FAILURE;
 if (typedFailure && launch.transport_authority) {
   const acted = typedFailure !== "did_not_act";
@@ -84,6 +133,28 @@ if (process.env.LAUNCH_MARKER_PATH) {
 }
 fs.writeFileSync(pidPath, `${process.pid}\n`, { mode: 0o600 });
 if (process.env.FAIL_TRANSPORT_LAUNCH === "1" && launch.transport_authority) {
+  process.exit(23);
+}
+if (process.env.LOG_STARTED_OWNER_HOLD === "1" && launch.transport_authority) {
+  process.stdout.write("Allocated inode: 728\n");
+  process.stderr.write(`${JSON.stringify({
+    schema: "elastos.browser.media-diagnostic/v1",
+    event: "turn_process_started",
+    binding_hash: launch.transport_authority.binding_hash,
+    generation: launch.transport_authority.generation,
+    page_id: launch.transport_authority.page_id,
+    vm_id: launch.transport_authority.vm_id,
+    media_stream_id: launch.transport_authority.media.stream_id,
+    ordinal: 0,
+  })}\n`);
+  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  holder.unref();
+  if (process.env.OWNER_PID_FILE) {
+    fs.writeFileSync(process.env.OWNER_PID_FILE, `${holder.pid}\n`, { mode: 0o600 });
+  }
   process.exit(23);
 }
 if (process.env.MEDIA_DIAGNOSTIC_SMOKE === "1" && launch.transport_authority) {
@@ -219,7 +290,53 @@ guest.listen(controlSocketPath, () => {
       direct_network: false,
     },
   })}\n`);
+  const afterReady = process.env.TYPED_TRANSPORT_AFTER_READY;
+  if (afterReady && launch.transport_authority) {
+    const childAbsent = process.env.TYPED_TRANSPORT_CHILD_ABSENT !== "0";
+    const delayedPorts = process.env.TYPED_TRANSPORT_DELAYED_PORTS === "1";
+    const acted = afterReady !== "did_not_act";
+    const profileDurability = process.env.TYPED_TRANSPORT_PROFILE_DURABILITY || "";
+    process.stderr.write(`${JSON.stringify({
+      schema: "elastos.browser.vz-launch-settlement/v1",
+      state: afterReady,
+      message: delayedPorts
+        ? "injected delayed-port-only settlement"
+        : `injected after-ready ${afterReady}`,
+      binding_hash: launch.transport_authority.binding_hash,
+      generation: launch.transport_authority.generation,
+      page_id: launch.transport_authority.page_id,
+      vm_id: launch.transport_authority.vm_id,
+      stream_id: launch.transport_authority.egress.stream_id,
+      media_stream_id: launch.transport_authority.media.stream_id,
+      effects: {
+        session_directory: acted,
+        control_socket: acted,
+        ordinary_stream_bridge: acted,
+        media_stream_bridge: acted,
+        turn_process: acted,
+        supervisor_child: acted,
+        vm: acted,
+      },
+      absence: {
+        child_absent: childAbsent,
+        supervisor_child_absent: childAbsent,
+        control_socket_absent: true,
+        route_absent: true,
+        turn_listener_absent: delayedPorts ? false : true,
+        turn_relay_ports_absent: delayedPorts ? false : true,
+        ordinary_stream_bridge_absent: true,
+        media_stream_bridge_absent: true,
+        session_directory_absent: true,
+        vm_absent: childAbsent,
+      },
+      ...(profileDurability
+        ? { profile_durability: profileDurability }
+        : {}),
+    })}\n`);
+    process.exit(1);
+  }
 });
+}
 NODE
 chmod +x "$fake_launcher"
 
@@ -255,6 +372,9 @@ const config = {
   shutdown_timeout_ms: 1000,
 };
 if (shutdownProgram) config.shutdown_program = shutdownProgram;
+if (/^[0-9a-f]{64}$/.test(process.env.CONFIG_FINGERPRINT || "")) {
+  config.config_fingerprint = process.env.CONFIG_FINGERPRINT;
+}
 process.stdout.write(JSON.stringify(config));
 NODE
 }
@@ -272,8 +392,17 @@ start_service() {
   LAUNCH_MARKER_PATH="$launch_marker" \
   FAIL_TRANSPORT_LAUNCH="${FAIL_TRANSPORT_LAUNCH:-}" \
   TYPED_TRANSPORT_FAILURE="${TYPED_TRANSPORT_FAILURE:-}" \
+  TYPED_TRANSPORT_AFTER_READY="${TYPED_TRANSPORT_AFTER_READY:-}" \
+  TYPED_TRANSPORT_CHILD_ABSENT="${TYPED_TRANSPORT_CHILD_ABSENT:-}" \
+  TYPED_TRANSPORT_DELAYED_PORTS="${TYPED_TRANSPORT_DELAYED_PORTS:-}" \
+  TYPED_TRANSPORT_PROFILE_DURABILITY="${TYPED_TRANSPORT_PROFILE_DURABILITY:-}" \
   TYPED_TRANSPORT_SUBSTITUTE="${TYPED_TRANSPORT_SUBSTITUTE:-}" \
+  LOG_STARTED_OWNER_HOLD="${LOG_STARTED_OWNER_HOLD:-}" \
+  OWNER_PID_FILE="${OWNER_PID_FILE:-}" \
+  ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG="${ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG:-}" \
   MEDIA_DIAGNOSTIC_SMOKE="${MEDIA_DIAGNOSTIC_SMOKE:-}" \
+  POLLUTE_STDOUT="${POLLUTE_STDOUT:-}" \
+  HOLD_AFTER_POLLUTE="${HOLD_AFTER_POLLUTE:-}" \
     "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" \
       > "$tmp_dir/${label}.out" 2> "$tmp_dir/${label}.err" &
   service_pid=$!
@@ -295,9 +424,11 @@ stop_service() {
 client="$tmp_dir/settlement-client.mjs"
 cat > "$client" <<'NODE'
 import crypto from "node:crypto";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import path from "node:path";
 
 const socketPath = process.env.CONTROL_SOCKET;
 const streamId = process.env.STREAM_ID;
@@ -549,6 +680,24 @@ async function waitFor(predicate, message) {
   throw new Error(message);
 }
 
+async function waitForReconcile(id, check, message) {
+  const deadline = Date.now() + 5000;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await reconcile(id);
+    if (check(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`${message}: ${JSON.stringify(last)}`);
+}
+
+function removeSessionDir(page) {
+  const sessionDir = page?.isolation?.session_dir;
+  if (typeof sessionDir === "string" && sessionDir.startsWith("/")) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+}
+
 async function requireBindingRejected(page, label, mutate) {
   const body = runtimeSerializedCloseBody(page);
   mutate(body.runtime_cleanup);
@@ -662,6 +811,28 @@ if (process.env.PHASE === "binding-equality") {
   if (afterExit.state !== "cleanup_pending") {
     throw new Error(`launcher exit synthesized terminal cleanup: ${JSON.stringify(afterExit)}`);
   }
+  let afterExitStatus = null;
+  const exitDeadline = Date.now() + 5000;
+  while (Date.now() < exitDeadline) {
+    afterExitStatus = await request("GET", "/status");
+    if (
+      afterExitStatus.active_pages === 0 &&
+      afterExitStatus.capacity_available === true &&
+      afterExitStatus.pending_cleanup_pages === 1
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (
+    afterExitStatus?.active_pages !== 0 ||
+    afterExitStatus?.capacity_available !== true ||
+    afterExitStatus?.pending_cleanup_pages !== 1
+  ) {
+    throw new Error(
+      `launcher exit kept live capacity: ${JSON.stringify(afterExitStatus)}`,
+    );
+  }
   const second = await request("POST", "/shutdown", closeBody(page));
   if (
     second.terminal !== true ||
@@ -680,6 +851,240 @@ if (process.env.PHASE === "binding-equality") {
   const alreadyAbsent = await request("POST", "/shutdown", closeBody(page));
   if (alreadyAbsent.terminal !== true || alreadyAbsent.already_absent !== true) {
     throw new Error(`terminal retry lost already-absent proof: ${JSON.stringify(alreadyAbsent)}`);
+  }
+} else if (process.env.PHASE === "exit-then-reopen") {
+  const first = await request("POST", "/pages", openBody(streamId));
+  const live = await request("GET", "/status");
+  if (
+    live.active_pages !== 1 ||
+    live.capacity_available !== false ||
+    live.pending_cleanup_pages !== 0
+  ) {
+    throw new Error(`live page did not occupy capacity: ${JSON.stringify(live)}`);
+  }
+  process.kill(first.process.pid, "SIGTERM");
+  await waitFor(
+    () => !processAlive(first.process.pid),
+    "exit-then-reopen child did not exit",
+  );
+  let afterExit = null;
+  const exitDeadline = Date.now() + 5000;
+  while (Date.now() < exitDeadline) {
+    afterExit = await request("GET", "/status");
+    if (
+      afterExit.active_pages === 0 &&
+      afterExit.capacity_available === true &&
+      afterExit.pending_cleanup_pages === 1
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (
+    afterExit?.active_pages !== 0 ||
+    afterExit?.capacity_available !== true ||
+    afterExit?.pending_cleanup_pages !== 1
+  ) {
+    throw new Error(
+      `VM exit did not free live capacity: ${JSON.stringify(afterExit)}`,
+    );
+  }
+  const pending = await reconcile(streamId);
+  if (pending.state !== "cleanup_pending") {
+    throw new Error(`VM exit synthesized terminal cleanup: ${JSON.stringify(pending)}`);
+  }
+  const closed = await request("POST", "/shutdown", closeBody(first));
+  if (
+    closed.terminal !== true ||
+    Object.values(closed.effects || {}).some((value) => value !== true)
+  ) {
+    throw new Error(`post-exit close was not terminal: ${JSON.stringify(closed)}`);
+  }
+  const afterClose = await request("GET", "/status");
+  if (
+    afterClose.active_pages !== 0 ||
+    afterClose.pending_cleanup_pages !== 0 ||
+    afterClose.capacity_available !== true
+  ) {
+    throw new Error(`terminal close left pending capacity: ${JSON.stringify(afterClose)}`);
+  }
+  const reopenId = `${streamId}-reopen`;
+  const second = await request("POST", "/pages", openBody(reopenId));
+  const reopened = await request("GET", "/status");
+  if (
+    reopened.active_pages !== 1 ||
+    reopened.capacity_available !== false ||
+    second.page_id === first.page_id
+  ) {
+    throw new Error(`fresh open after VM exit failed: ${JSON.stringify({ second, reopened })}`);
+  }
+  const secondClose = await request("POST", "/shutdown", closeBody(second));
+  if (secondClose.terminal !== true) {
+    throw new Error(`reopened page close was not terminal: ${JSON.stringify(secondClose)}`);
+  }
+} else if (process.env.PHASE === "ungraceful-transport-close") {
+  const first = await request("POST", "/pages", openBody(streamId));
+  process.kill(first.process.pid, "SIGKILL");
+  await waitFor(
+    () => !processAlive(first.process.pid),
+    "ungraceful-transport-close child did not exit",
+  );
+  let afterExit = null;
+  const exitDeadline = Date.now() + 5000;
+  while (Date.now() < exitDeadline) {
+    afterExit = await request("GET", "/status");
+    if (
+      afterExit.active_pages === 0 &&
+      afterExit.capacity_available === true &&
+      afterExit.pending_cleanup_pages === 1
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (
+    afterExit?.active_pages !== 0 ||
+    afterExit?.capacity_available !== true ||
+    afterExit?.pending_cleanup_pages !== 1
+  ) {
+    throw new Error(
+      `ungraceful VM exit did not free live capacity: ${JSON.stringify(afterExit)}`,
+    );
+  }
+  const pending = await reconcile(streamId);
+  if (pending.state !== "cleanup_pending") {
+    throw new Error(
+      `ungraceful VM exit synthesized terminal cleanup: ${JSON.stringify(pending)}`,
+    );
+  }
+  const closed = await requestRaw("POST", "/shutdown", closeBody(first));
+  if (
+    closed.status !== 400 ||
+    !String(closed.body.error || "").includes("turn_process_absent")
+  ) {
+    throw new Error(
+      `ungraceful post-exit close synthesized terminal TURN process absence: ${JSON.stringify(closed)}`,
+    );
+  }
+  const afterClose = await request("GET", "/status");
+  if (
+    afterClose.active_pages !== 0 ||
+    afterClose.pending_cleanup_pages !== 1 ||
+    afterClose.capacity_available !== true
+  ) {
+    throw new Error(
+      `ungraceful post-exit close released pending ownership: ${JSON.stringify(afterClose)}`,
+    );
+  }
+} else if (process.env.PHASE === "exit-then-reopen-before-cleanup") {
+  if (transportEnabled) {
+    throw new Error("exit-then-reopen-before-cleanup is a local same-profile phase");
+  }
+  const first = await request("POST", "/pages", openBody(streamId));
+  const live = await request("GET", "/status");
+  if (
+    live.active_pages !== 1 ||
+    live.capacity_available !== false ||
+    live.pending_cleanup_pages !== 0
+  ) {
+    throw new Error(`live page did not occupy capacity: ${JSON.stringify(live)}`);
+  }
+  process.kill(first.process.pid, "SIGTERM");
+  await waitFor(
+    () => !processAlive(first.process.pid),
+    "exit-then-reopen-before-cleanup child did not exit",
+  );
+  let afterExit = null;
+  const exitDeadline = Date.now() + 5000;
+  while (Date.now() < exitDeadline) {
+    afterExit = await request("GET", "/status");
+    if (
+      afterExit.active_pages === 0 &&
+      afterExit.capacity_available === true &&
+      afterExit.pending_cleanup_pages === 1 &&
+      afterExit.pending_cleanup_page_ids?.[0] === first.page_id
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (
+    afterExit?.active_pages !== 0 ||
+    afterExit?.capacity_available !== true ||
+    afterExit?.pending_cleanup_pages !== 1 ||
+    afterExit?.pending_cleanup_page_ids?.[0] !== first.page_id
+  ) {
+    throw new Error(
+      `VM exit did not free live capacity: ${JSON.stringify(afterExit)}`,
+    );
+  }
+  const pending = await reconcile(streamId);
+  if (pending.state !== "cleanup_pending") {
+    throw new Error(`VM exit synthesized terminal cleanup: ${JSON.stringify(pending)}`);
+  }
+  const reopenId = `${streamId}-reopen`;
+  const second = await request("POST", "/pages", openBody(reopenId));
+  const overlapped = await request("GET", "/status");
+  if (
+    second.page_id === first.page_id ||
+    overlapped.active_pages !== 1 ||
+    overlapped.capacity_available !== false ||
+    overlapped.pending_cleanup_pages !== 1 ||
+    !overlapped.page_ids?.includes(second.page_id) ||
+    overlapped.page_ids?.includes(first.page_id) ||
+    !overlapped.pending_cleanup_page_ids?.includes(first.page_id) ||
+    overlapped.pending_cleanup_page_ids?.includes(second.page_id)
+  ) {
+    throw new Error(
+      `same-profile reopen revived the old pending page: ${JSON.stringify({ second, overlapped })}`,
+    );
+  }
+  const oldStatus = await requestRaw(
+    "GET",
+    `/pages/${encodeURIComponent(first.page_id)}/status`,
+  );
+  if (
+    oldStatus.status !== 404 ||
+    !String(oldStatus.body.error || "").includes("cleanup is pending")
+  ) {
+    throw new Error(
+      `old pending page did not stay cleanup-owned: ${JSON.stringify(oldStatus)}`,
+    );
+  }
+  if (!processAlive(second.process.pid) || !fs.existsSync(second.control_socket_path)) {
+    throw new Error("new same-profile page was not intact before old cleanup");
+  }
+  const closedOld = await request("POST", "/shutdown", closeBody(first));
+  if (
+    closedOld.terminal !== true ||
+    Object.values(closedOld.effects || {}).some((value) => value !== true)
+  ) {
+    throw new Error(`old-owner cleanup was not terminal: ${JSON.stringify(closedOld)}`);
+  }
+  const afterOldClose = await request("GET", "/status");
+  if (
+    afterOldClose.active_pages !== 1 ||
+    afterOldClose.capacity_available !== false ||
+    afterOldClose.pending_cleanup_pages !== 0 ||
+    !afterOldClose.page_ids?.includes(second.page_id) ||
+    afterOldClose.page_ids?.includes(first.page_id)
+  ) {
+    throw new Error(
+      `old-owner cleanup disturbed the new page: ${JSON.stringify(afterOldClose)}`,
+    );
+  }
+  if (!processAlive(second.process.pid) || !fs.existsSync(second.control_socket_path)) {
+    throw new Error("old-owner cleanup retired the new same-profile VM");
+  }
+  const terminalOld = await reconcile(streamId);
+  if (terminalOld.state !== "terminal_post_effect_cleanup") {
+    throw new Error(
+      `old-owner cleanup did not persist terminal state: ${JSON.stringify(terminalOld)}`,
+    );
+  }
+  const secondClose = await request("POST", "/shutdown", closeBody(second));
+  if (secondClose.terminal !== true) {
+    throw new Error(`new page close was not terminal: ${JSON.stringify(secondClose)}`);
   }
 } else if (process.env.PHASE === "open-for-restart") {
   const page = await request("POST", "/pages", openBody(streamId));
@@ -736,6 +1141,46 @@ if (process.env.PHASE === "binding-equality") {
   }
   if ((await reconcile(streamId)).state !== "cleanup_pending") {
     throw new Error("stale process identity did not remain pending");
+  }
+} else if (process.env.PHASE === "verify-transport-restart") {
+  const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
+  issuedTransportAuthority = page.transport_authority || null;
+  const pending = await reconcile(streamId);
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.cleanup_binding?.page_id !== page.page_id ||
+    pending.supervisor_result !== undefined
+  ) {
+    throw new Error(
+      `transport restart did not retain only its exact durable cleanup binding: ${JSON.stringify(pending)}`,
+    );
+  }
+  if (!processAlive(page.process.pid)) {
+    throw new Error("transport restart lost its surviving owned launcher");
+  }
+  if (fs.existsSync(page.control_socket_path)) {
+    fs.unlinkSync(page.control_socket_path);
+  }
+  const surviving = await requestRaw(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
+  if (
+    surviving.status !== 400 ||
+    !String(surviving.body.error || "").includes(
+      "exact owned launcher unavailable",
+    )
+  ) {
+    throw new Error(
+      `surviving transport owner was synthesized terminal after restart: ${JSON.stringify(surviving)}`,
+    );
+  }
+  if (!processAlive(page.process.pid)) {
+    throw new Error("transport restart cleanup disturbed the surviving owned launcher");
+  }
+  if ((await reconcile(streamId)).state !== "cleanup_pending") {
+    throw new Error("surviving transport owner did not remain pending");
   }
 } else if (process.env.PHASE === "capacity") {
   const before = fs.readFileSync(process.env.JOURNAL_PATH);
@@ -842,6 +1287,59 @@ if (process.env.PHASE === "binding-equality") {
     unexpectedTurnListener.close(resolve),
   );
 
+  const unexpectedUdpRelay = dgram.createSocket({
+    type: "udp4",
+    reuseAddr: false,
+  });
+  await new Promise((resolve, reject) => {
+    unexpectedUdpRelay.once("error", reject);
+    unexpectedUdpRelay.bind(
+      {
+        address: page.transport_authority.turn.relay_host,
+        port: page.transport_authority.turn.relay_port_min,
+        exclusive: true,
+      },
+      resolve,
+    );
+  });
+  const occupiedRelay = await requestRaw(
+    "POST",
+    "/shutdown",
+    closeBody(page),
+  );
+  if (
+    occupiedRelay.status !== 400 ||
+    !String(occupiedRelay.body.error || "").includes(
+      "turn_relay_ports_absent",
+    )
+  ) {
+    throw new Error(
+      `occupied UDP relay port did not retain cleanup ownership: ${JSON.stringify(occupiedRelay)}`,
+    );
+  }
+  await new Promise((resolve) => unexpectedUdpRelay.close(resolve));
+
+  const listenUnix = (path) =>
+    new Promise((resolve, reject) => {
+      try {
+        fs.unlinkSync(path);
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          reject(error);
+          return;
+        }
+      }
+      const server = net.createServer();
+      server.once("error", reject);
+      server.listen(path, () => resolve(server));
+    });
+  const runtimeEgress = await listenUnix(
+    page.transport_authority.egress.runtime_socket_path,
+  );
+  const runtimeMedia = await listenUnix(
+    page.transport_authority.media.runtime_socket_path,
+  );
+
   const terminal = await request("POST", "/shutdown", closeBody(page));
   const requiredEffects = [
     "transport_session_absent",
@@ -877,6 +1375,16 @@ if (process.env.PHASE === "binding-equality") {
       `transport terminal cleanup was not durable: ${JSON.stringify(durable)}`,
     );
   }
+  if (
+    !fs.existsSync(page.transport_authority.egress.runtime_socket_path) ||
+    !fs.existsSync(page.transport_authority.media.runtime_socket_path)
+  ) {
+    throw new Error(
+      "Runtime stream sockets remaining after owned launcher cleanup were unlinked by helper",
+    );
+  }
+  await new Promise((resolve) => runtimeEgress.close(resolve));
+  await new Promise((resolve) => runtimeMedia.close(resolve));
   const journalAfter = fs.readFileSync(process.env.JOURNAL_PATH, "utf8");
   if (
     journalAfter.includes('"auth_secret":') ||
@@ -1004,6 +1512,342 @@ if (process.env.PHASE === "binding-equality") {
       `substituted transport settlement escaped cleanup ownership: ${JSON.stringify(durable)}`,
     );
   }
+} else if (process.env.PHASE === "polluted-stdout-ready") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  if (page.schema !== "elastos.browser.engine.supervisor-result/v1") {
+    throw new Error(
+      `polluted stdout hid the supervisor result: ${JSON.stringify(page)}`,
+    );
+  }
+  const close = await request("POST", "/shutdown", closeBody(page));
+  if (close.terminal !== true) {
+    throw new Error(`polluted-stdout ready close was not terminal: ${JSON.stringify(close)}`);
+  }
+} else if (process.env.PHASE === "polluted-stdout-hold") {
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  if (
+    failed.status !== 400 ||
+    failed.body.launch_settlement_result?.state !==
+      "terminal_post_effect_cleanup" ||
+    failed.body.launch_settlement_result?.binding_hash !==
+      issuedTransportAuthority.binding_hash
+  ) {
+    throw new Error(
+      `polluted stdout hold did not reap a typed settlement: ${JSON.stringify(failed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "terminal_post_effect_cleanup" ||
+    durable.launch_settlement_result?.binding_hash !==
+      issuedTransportAuthority.binding_hash
+  ) {
+    throw new Error(
+      `polluted stdout hold settlement was not durable: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "delayed-turn-child-present") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  issuedTransportAuthority = page.transport_authority || null;
+  if (process.env.PAGE_FILE) {
+    fs.writeFileSync(process.env.PAGE_FILE, JSON.stringify(page));
+  }
+  await waitFor(
+    () => !processAlive(page.process.pid),
+    "after-ready child with child_absent=false did not exit",
+  );
+  const pending = await waitForReconcile(
+    streamId,
+    (record) =>
+      record.state === "cleanup_pending" &&
+      record.cleanup_binding?.page_id === page.page_id &&
+      record.launch_settlement_result?.absence?.child_absent === false &&
+      record.launch_settlement_result?.effects?.turn_process === true,
+    "after-ready child_absent=false settlement was not durable",
+  );
+  removeSessionDir(page);
+  const closed = await requestRaw(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
+  if (closed.status !== 400 || closed.body?.terminal === true) {
+    throw new Error(
+      `delayed turn with child_absent=false became terminal: ${JSON.stringify(closed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "cleanup_pending" ||
+    durable.launch_settlement_result?.absence?.child_absent !== false ||
+    durable.launch_settlement_result?.binding_hash !==
+      pending.launch_settlement_result?.binding_hash
+  ) {
+    throw new Error(
+      `delayed turn with child_absent=false did not remain pending: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "verify-delayed-turn-child-present-restart") {
+  const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
+  issuedTransportAuthority = page.transport_authority || null;
+  removeSessionDir(page);
+  const pending = await reconcile(streamId);
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.cleanup_binding?.page_id !== page.page_id ||
+    pending.launch_settlement_result?.absence?.child_absent !== false
+  ) {
+    throw new Error(
+      `restart lost child_absent=false cleanup ownership: ${JSON.stringify(pending)}`,
+    );
+  }
+  const closed = await requestRaw(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
+  if (closed.status !== 400 || closed.body?.terminal === true) {
+    throw new Error(
+      `restart delayed turn with child_absent=false became terminal: ${JSON.stringify(closed)}`,
+    );
+  }
+  if ((await reconcile(streamId)).state !== "cleanup_pending") {
+    throw new Error("restart delayed turn with child_absent=false did not remain pending");
+  }
+} else if (process.env.PHASE === "delayed-turn-port-only") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  issuedTransportAuthority = page.transport_authority || null;
+  if (process.env.PAGE_FILE) {
+    fs.writeFileSync(process.env.PAGE_FILE, JSON.stringify(page));
+  }
+  await waitFor(
+    () => !processAlive(page.process.pid),
+    "delayed-port-only child did not exit",
+  );
+  await waitForReconcile(
+    streamId,
+    (record) =>
+      record.state === "cleanup_pending" &&
+      record.cleanup_binding?.page_id === page.page_id &&
+      record.launch_settlement_result?.absence?.child_absent === true &&
+      record.launch_settlement_result?.absence?.turn_listener_absent === false &&
+      record.launch_settlement_result?.absence?.turn_relay_ports_absent === false &&
+      (!process.env.TYPED_TRANSPORT_PROFILE_DURABILITY ||
+        record.profile_durability ===
+          process.env.TYPED_TRANSPORT_PROFILE_DURABILITY ||
+        record.launch_settlement_result?.profile_durability ===
+          process.env.TYPED_TRANSPORT_PROFILE_DURABILITY),
+    "delayed-port-only settlement was not durable",
+  );
+} else if (process.env.PHASE === "verify-delayed-turn-port-only-restart") {
+  const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
+  issuedTransportAuthority = page.transport_authority || null;
+  removeSessionDir(page);
+  const pending = await reconcile(streamId);
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.launch_settlement_result?.absence?.child_absent !== true ||
+    pending.launch_settlement_result?.absence?.turn_listener_absent !== false
+  ) {
+    throw new Error(
+      `restart lost delayed-port-only cleanup ownership: ${JSON.stringify(pending)}`,
+    );
+  }
+  const closed = await request("POST", "/shutdown", runtimeSerializedCloseBody(page));
+  if (
+    closed.terminal !== true ||
+    closed.delayed_turn_port_absence !== true
+  ) {
+    throw new Error(
+      `delayed-port-only restart close was not delayed terminal: ${JSON.stringify(closed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "terminal_post_effect_cleanup" ||
+    durable.terminal_cleanup_receipt?.delayed_turn_port_absence !== true
+  ) {
+    throw new Error(
+      `delayed-port-only restart close was not durable: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "log-started-paths-gone-owner-alive") {
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  if (failed.status !== 400) {
+    throw new Error(
+      `logged started launch did not fail closed: ${JSON.stringify(failed)}`,
+    );
+  }
+  const ownerPid = Number(
+    String(fs.readFileSync(process.env.OWNER_PID_FILE, "utf8")).trim(),
+  );
+  if (!Number.isInteger(ownerPid) || !processAlive(ownerPid)) {
+    throw new Error("logged started owner is not alive before reconcile");
+  }
+  const digest = String(issuedTransportAuthority.binding_hash)
+    .replace(/^sha256:/, "")
+    .toLowerCase();
+  const segment = digest.slice(0, 32);
+  const sessionDir = path.join(
+    process.env.ELASTOS_BROWSER_VM_ROOT || "/tmp/evzs",
+    `vz-${segment}`,
+  );
+  const socketDir = path.join(
+    process.env.ELASTOS_BROWSER_VM_SOCKET_ROOT || "/tmp/evzrc",
+    segment,
+  );
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(socketDir, "c.sock"), "");
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+  fs.rmSync(socketDir, { recursive: true, force: true });
+  const durable = await reconcile(streamId);
+  if (durable.state !== "cleanup_pending") {
+    throw new Error(
+      `logged started launch with a live owner became terminal: ${JSON.stringify(durable)}`,
+    );
+  }
+  if (!processAlive(ownerPid)) {
+    throw new Error("logged started owner was reaped during manufactured settlement");
+  }
+} else if (process.env.PHASE === "log-started-owner-exits-without-native-settlement") {
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  if (failed.status !== 400) {
+    throw new Error(
+      `logged started launch did not fail closed: ${JSON.stringify(failed)}`,
+    );
+  }
+  const digest = String(issuedTransportAuthority.binding_hash)
+    .replace(/^sha256:/, "")
+    .toLowerCase();
+  const segment = digest.slice(0, 32);
+  const sessionDir = path.join(
+    process.env.ELASTOS_BROWSER_VM_ROOT || "/tmp/evzs",
+    `vz-${segment}`,
+  );
+  const socketDir = path.join(
+    process.env.ELASTOS_BROWSER_VM_SOCKET_ROOT || "/tmp/evzrc",
+    segment,
+  );
+  const controlSocket = path.join(socketDir, "c.sock");
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(socketDir, "owner.json"),
+    `${JSON.stringify({
+      schema: "elastos.browser.vz-socket-owner/v1",
+      binding_hash: issuedTransportAuthority.binding_hash,
+      generation: issuedTransportAuthority.generation,
+      page_id: issuedTransportAuthority.page_id,
+      vm_id: issuedTransportAuthority.vm_id,
+      stream_id: issuedTransportAuthority.egress.stream_id,
+      media_stream_id: issuedTransportAuthority.media.stream_id,
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const holder = net.createServer();
+  await new Promise((resolve, reject) => {
+    holder.once("error", reject);
+    holder.listen(controlSocket, resolve);
+  });
+  const live = await reconcile(streamId);
+  if (
+    live.state !== "cleanup_pending" ||
+    live.launch_settlement_result?.state === "terminal_post_effect_cleanup"
+  ) {
+    throw new Error(
+      `once-live owner manufactured a native settlement: ${JSON.stringify(live)}`,
+    );
+  }
+  await new Promise((resolve) => holder.close(resolve));
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+  fs.rmSync(socketDir, { recursive: true, force: true });
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "cleanup_pending" ||
+    durable.launch_settlement_result?.state === "terminal_post_effect_cleanup"
+  ) {
+    throw new Error(
+      `exited owner without a native settlement became terminal: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "native-terminal-then-ordinary-close") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  issuedTransportAuthority = page.transport_authority || null;
+  await waitFor(
+    () => !processAlive(page.process.pid),
+    "native terminal child did not exit",
+  );
+  await waitForReconcile(
+    streamId,
+    (record) =>
+      record.state === "terminal_post_effect_cleanup" &&
+      record.launch_settlement_result?.state ===
+        "terminal_post_effect_cleanup" &&
+      record.launch_settlement_result?.absence?.child_absent === true &&
+      record.terminal_cleanup_receipt === undefined &&
+      (record.profile_durability === "failed" ||
+        record.launch_settlement_result?.profile_durability === "failed"),
+    "native terminal settlement was not durable before ordinary close",
+  );
+  const closed = await request("POST", "/shutdown", runtimeSerializedCloseBody(page));
+  if (
+    closed.terminal !== true ||
+    closed.effects?.child_absent !== true ||
+    closed.profile_durability !== "failed"
+  ) {
+    throw new Error(
+      `ordinary close after native terminal lost failed durability or child absence: ${JSON.stringify(closed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "terminal_post_effect_cleanup" ||
+    durable.launch_settlement_result?.state !==
+      "terminal_post_effect_cleanup" ||
+    durable.profile_durability !== "failed" ||
+    durable.terminal_cleanup_receipt?.effects?.child_absent !== true ||
+    durable.terminal_cleanup_receipt?.profile_durability !== "failed"
+  ) {
+    throw new Error(
+      `ordinary close after native terminal did not retain settlement and receipt: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "verify-failed-flush-durability-restart") {
+  const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
+  issuedTransportAuthority = page.transport_authority || null;
+  removeSessionDir(page);
+  const pending = await reconcile(streamId);
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.launch_settlement_result?.absence?.child_absent !== true ||
+    (pending.profile_durability !== "failed" &&
+      pending.launch_settlement_result?.profile_durability !== "failed")
+  ) {
+    throw new Error(
+      `restart lost failed profile durability: ${JSON.stringify(pending)}`,
+    );
+  }
+  const closed = await request("POST", "/shutdown", runtimeSerializedCloseBody(page));
+  if (
+    closed.terminal !== true ||
+    closed.delayed_turn_port_absence !== true ||
+    closed.profile_durability !== "failed"
+  ) {
+    throw new Error(
+      `failed durability close lost the data-save failure: ${JSON.stringify(closed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "terminal_post_effect_cleanup" ||
+    durable.profile_durability !== "failed" ||
+    durable.terminal_cleanup_receipt?.effects?.child_absent !== true
+  ) {
+    throw new Error(
+      `failed durability reconcile lost truthful child absence: ${JSON.stringify(durable)}`,
+    );
+  }
 } else {
   throw new Error(`unknown settlement phase: ${process.env.PHASE}`);
 }
@@ -1025,6 +1869,40 @@ PHASE="cleanup-retry" \
   "$node_bin" "$client"
 stop_service
 
+reopen_socket="$tmp_dir/reopen-control.sock"
+start_service "$reopen_socket" "" "reopen-service"
+CONTROL_SOCKET="$reopen_socket" \
+STREAM_ID="stream:settlement-exit-then-reopen" \
+PHASE="exit-then-reopen" \
+  "$node_bin" "$client"
+stop_service
+
+reopen_transport_socket="$tmp_dir/reopen-transport-control.sock"
+start_service "$reopen_transport_socket" "" "reopen-transport-service"
+TRANSPORT=1 \
+CONTROL_SOCKET="$reopen_transport_socket" \
+STREAM_ID="stream:settlement-exit-then-reopen-transport" \
+PHASE="exit-then-reopen" \
+  "$node_bin" "$client"
+stop_service
+
+ungraceful_transport_socket="$tmp_dir/ungraceful-transport-control.sock"
+start_service "$ungraceful_transport_socket" "" "ungraceful-transport-service"
+TRANSPORT=1 \
+CONTROL_SOCKET="$ungraceful_transport_socket" \
+STREAM_ID="stream:settlement-ungraceful-transport-close" \
+PHASE="ungraceful-transport-close" \
+  "$node_bin" "$client"
+stop_service
+
+reopen_before_cleanup_socket="$tmp_dir/reopen-before-cleanup-control.sock"
+start_service "$reopen_before_cleanup_socket" "" "reopen-before-cleanup-service"
+CONTROL_SOCKET="$reopen_before_cleanup_socket" \
+STREAM_ID="stream:settlement-exit-then-reopen-before-cleanup" \
+PHASE="exit-then-reopen-before-cleanup" \
+  "$node_bin" "$client"
+stop_service
+
 restart_socket="$tmp_dir/restart-control.sock"
 restart_page="$tmp_dir/restart-page.json"
 start_service "$restart_socket" "" "restart-service-first"
@@ -1041,6 +1919,49 @@ start_service "$restart_socket" "" "restart-service-second"
 CONTROL_SOCKET="$restart_socket" \
 STREAM_ID="stream:settlement-restart" \
 PAGE_FILE="$restart_page" \
+PHASE="verify-restart" \
+  "$node_bin" "$client"
+stop_service
+
+transport_restart_socket="$tmp_dir/transport-restart-control.sock"
+transport_restart_page="$tmp_dir/transport-restart-page.json"
+start_service "$transport_restart_socket" "" "transport-restart-service-first"
+TRANSPORT=1 \
+CONTROL_SOCKET="$transport_restart_socket" \
+STREAM_ID="stream:settlement-transport-restart" \
+PAGE_FILE="$transport_restart_page" \
+PHASE="open-for-restart" \
+  "$node_bin" "$client"
+kill -KILL "$service_pid"
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+rm -f "$transport_restart_socket"
+start_service "$transport_restart_socket" "" "transport-restart-service-second"
+TRANSPORT=1 \
+CONTROL_SOCKET="$transport_restart_socket" \
+STREAM_ID="stream:settlement-transport-restart" \
+PAGE_FILE="$transport_restart_page" \
+PHASE="verify-transport-restart" \
+  "$node_bin" "$client"
+stop_service
+
+fingerprint_socket="$tmp_dir/fingerprint-control.sock"
+fingerprint_page="$tmp_dir/fingerprint-page.json"
+start_service "$fingerprint_socket" "" "fingerprint-service-first"
+CONTROL_SOCKET="$fingerprint_socket" \
+STREAM_ID="stream:settlement-fingerprint-restart" \
+PAGE_FILE="$fingerprint_page" \
+PHASE="open-for-restart" \
+  "$node_bin" "$client"
+kill -KILL "$service_pid"
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+rm -f "$fingerprint_socket"
+CONFIG_FINGERPRINT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+start_service "$fingerprint_socket" "" "fingerprint-service-second"
+CONTROL_SOCKET="$fingerprint_socket" \
+STREAM_ID="stream:settlement-fingerprint-restart" \
+PAGE_FILE="$fingerprint_page" \
 PHASE="verify-restart" \
   "$node_bin" "$client"
 stop_service
@@ -1168,5 +2089,185 @@ if grep -q 'must-not-reach-control-service-log' "$tmp_dir/transport-service.err"
   echo "invalid Browser media diagnostic leaked child stderr into the control log" >&2
   exit 1
 fi
+
+pollute_ready_socket="$tmp_dir/pollute-ready-control.sock"
+POLLUTE_STDOUT=1 \
+  start_service "$pollute_ready_socket" "" "pollute-ready-service"
+CONTROL_SOCKET="$pollute_ready_socket" \
+STREAM_ID="stream:polluted-stdout-ready" \
+PHASE="polluted-stdout-ready" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset POLLUTE_STDOUT
+
+pollute_hold_socket="$tmp_dir/pollute-hold-control.sock"
+pollute_hold_journal="${pollute_hold_socket}.launch-reconciliations.json"
+POLLUTE_STDOUT=1 \
+HOLD_AFTER_POLLUTE=1 \
+  start_service "$pollute_hold_socket" "" "pollute-hold-service"
+CONTROL_SOCKET="$pollute_hold_socket" \
+STREAM_ID="stream:polluted-stdout-hold" \
+JOURNAL_PATH="$pollute_hold_journal" \
+PHASE="polluted-stdout-hold" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset POLLUTE_STDOUT
+unset HOLD_AFTER_POLLUTE
+
+delayed_child_socket="$tmp_dir/delayed-turn-child-present-control.sock"
+delayed_child_journal="${delayed_child_socket}.launch-reconciliations.json"
+delayed_child_page="$tmp_dir/delayed-turn-child-present-page.json"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_CHILD_ABSENT="0" \
+  start_service "$delayed_child_socket" "" "delayed-turn-child-present-service"
+CONTROL_SOCKET="$delayed_child_socket" \
+STREAM_ID="stream:delayed-turn-child-present" \
+JOURNAL_PATH="$delayed_child_journal" \
+PAGE_FILE="$delayed_child_page" \
+PHASE="delayed-turn-child-present" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+kill -KILL "$service_pid"
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+rm -f "$delayed_child_socket"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_CHILD_ABSENT="0" \
+  start_service "$delayed_child_socket" "" "delayed-turn-child-present-restart-service"
+CONTROL_SOCKET="$delayed_child_socket" \
+STREAM_ID="stream:delayed-turn-child-present" \
+JOURNAL_PATH="$delayed_child_journal" \
+PAGE_FILE="$delayed_child_page" \
+PHASE="verify-delayed-turn-child-present-restart" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset TYPED_TRANSPORT_AFTER_READY
+unset TYPED_TRANSPORT_CHILD_ABSENT
+
+delayed_port_socket="$tmp_dir/delayed-turn-port-only-control.sock"
+delayed_port_journal="${delayed_port_socket}.launch-reconciliations.json"
+delayed_port_page="$tmp_dir/delayed-turn-port-only-page.json"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_DELAYED_PORTS="1" \
+  start_service "$delayed_port_socket" "" "delayed-turn-port-only-service"
+CONTROL_SOCKET="$delayed_port_socket" \
+STREAM_ID="stream:delayed-turn-port-only" \
+JOURNAL_PATH="$delayed_port_journal" \
+PAGE_FILE="$delayed_port_page" \
+PHASE="delayed-turn-port-only" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+kill -KILL "$service_pid"
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+rm -f "$delayed_port_socket"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_DELAYED_PORTS="1" \
+  start_service "$delayed_port_socket" "" "delayed-turn-port-only-restart-service"
+CONTROL_SOCKET="$delayed_port_socket" \
+STREAM_ID="stream:delayed-turn-port-only" \
+JOURNAL_PATH="$delayed_port_journal" \
+PAGE_FILE="$delayed_port_page" \
+PHASE="verify-delayed-turn-port-only-restart" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset TYPED_TRANSPORT_AFTER_READY
+unset TYPED_TRANSPORT_DELAYED_PORTS
+
+failed_flush_socket="$tmp_dir/failed-flush-durability-control.sock"
+failed_flush_journal="${failed_flush_socket}.launch-reconciliations.json"
+failed_flush_page="$tmp_dir/failed-flush-durability-page.json"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_DELAYED_PORTS="1" \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  start_service "$failed_flush_socket" "" "failed-flush-durability-service"
+CONTROL_SOCKET="$failed_flush_socket" \
+STREAM_ID="stream:failed-flush-durability" \
+JOURNAL_PATH="$failed_flush_journal" \
+PAGE_FILE="$failed_flush_page" \
+PHASE="delayed-turn-port-only" \
+TRANSPORT=1 \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  "$node_bin" "$client"
+kill -KILL "$service_pid"
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+rm -f "$failed_flush_socket"
+TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+TYPED_TRANSPORT_DELAYED_PORTS="1" \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  start_service "$failed_flush_socket" "" "failed-flush-durability-restart-service"
+CONTROL_SOCKET="$failed_flush_socket" \
+STREAM_ID="stream:failed-flush-durability" \
+JOURNAL_PATH="$failed_flush_journal" \
+PAGE_FILE="$failed_flush_page" \
+PHASE="verify-failed-flush-durability-restart" \
+TRANSPORT=1 \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  "$node_bin" "$client"
+stop_service
+unset TYPED_TRANSPORT_AFTER_READY
+unset TYPED_TRANSPORT_DELAYED_PORTS
+unset TYPED_TRANSPORT_PROFILE_DURABILITY
+
+native_close_socket="$tmp_dir/native-terminal-ordinary-close-control.sock"
+native_close_journal="${native_close_socket}.launch-reconciliations.json"
+TYPED_TRANSPORT_AFTER_READY="terminal_post_effect_cleanup" \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  start_service "$native_close_socket" "" "native-terminal-ordinary-close-service"
+CONTROL_SOCKET="$native_close_socket" \
+STREAM_ID="stream:native-terminal-ordinary-close" \
+JOURNAL_PATH="$native_close_journal" \
+PHASE="native-terminal-then-ordinary-close" \
+TRANSPORT=1 \
+TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+  "$node_bin" "$client"
+stop_service
+unset TYPED_TRANSPORT_AFTER_READY
+unset TYPED_TRANSPORT_PROFILE_DURABILITY
+
+log_started_socket="$tmp_dir/log-started-owner-alive-control.sock"
+log_started_journal="${log_started_socket}.launch-reconciliations.json"
+log_started_owner="$tmp_dir/log-started-owner.pid"
+LOG_STARTED_OWNER_HOLD=1 \
+OWNER_PID_FILE="$log_started_owner" \
+ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG="$tmp_dir/log-started-owner-alive-service.err" \
+  start_service "$log_started_socket" "" "log-started-owner-alive-service"
+CONTROL_SOCKET="$log_started_socket" \
+STREAM_ID="stream:log-started-owner-alive" \
+JOURNAL_PATH="$log_started_journal" \
+OWNER_PID_FILE="$log_started_owner" \
+PHASE="log-started-paths-gone-owner-alive" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+if [[ -f "$log_started_owner" ]]; then
+  owner_pid="$(tr -d '[:space:]' < "$log_started_owner")"
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+    kill "$owner_pid" >/dev/null 2>&1 || true
+  fi
+fi
+unset LOG_STARTED_OWNER_HOLD
+unset OWNER_PID_FILE
+unset ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG
+
+log_exited_socket="$tmp_dir/log-started-owner-exited-control.sock"
+log_exited_journal="${log_exited_socket}.launch-reconciliations.json"
+LOG_STARTED_OWNER_HOLD=1 \
+ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG="$tmp_dir/log-started-owner-exited-service.err" \
+  start_service "$log_exited_socket" "" "log-started-owner-exited-service"
+CONTROL_SOCKET="$log_exited_socket" \
+STREAM_ID="stream:log-started-owner-exited" \
+JOURNAL_PATH="$log_exited_journal" \
+PHASE="log-started-owner-exits-without-native-settlement" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset LOG_STARTED_OWNER_HOLD
+unset ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG
 
 printf '%s\n' '{"schema":"elastos.browser.vm-control-service-settlement-smoke/v1","ok":true}'

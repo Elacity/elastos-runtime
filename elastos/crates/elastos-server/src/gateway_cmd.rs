@@ -31,7 +31,26 @@ where
     F: Fn() -> Fut + Copy + Send + Sync + 'static,
     Fut: Future<Output = anyhow::Result<GatewayControlPlane>> + Send,
 {
+    run_gateway_direct_with_ready(addr, public, cache_dir, publish, setup_control_plane, None).await
+}
+
+pub async fn run_gateway_direct_with_ready<F, Fut>(
+    addr: String,
+    public: bool,
+    cache_dir: Option<PathBuf>,
+    publish: Option<PathBuf>,
+    setup_control_plane: F,
+    on_ready: Option<fn(&str)>,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut + Copy + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<GatewayControlPlane>> + Send,
+{
     if public {
+        anyhow::ensure!(
+            on_ready.is_none(),
+            "Home browser launch requires a local gateway"
+        );
         return run_gateway_public(addr, cache_dir, publish, setup_control_plane).await;
     }
 
@@ -51,12 +70,13 @@ where
         collaboration_context,
         mut collaboration_service,
     } = setup_control_plane().await?;
-    let server_result = api::gateway::start_gateway_server_with_collaboration_context(
+    let server_result = api::gateway::start_gateway_server_with_ready(
         &addr,
         Some(provider_registry),
         collaboration_context,
         cache_path,
         data_dir,
+        on_ready,
     )
     .await;
     finish_gateway_result(
@@ -131,6 +151,9 @@ where
         }
         if let Some(port) = collaboration_context.presence_product_port.clone() {
             sup_inner.set_collaboration_presence_product_port(port);
+        }
+        if let Some(endpoint) = collaboration_context.carrier_endpoint.clone() {
+            sup_inner.set_carrier_endpoint(endpoint);
         }
         if let Some(service) = collaboration_context.discovery_service.clone() {
             sup_inner.set_collaboration_discovery_service(service);

@@ -127,6 +127,35 @@ await assert.rejects(
   /Browser Runtime TURN/,
 );
 
+// A consumer ingress changes only the viewer's route to the same Engine TURN.
+const remote = structuredClone(displaySession);
+const ingressUrl = "turn:viewer.example.test:49200?transport=tcp";
+remote.runtime_turn.viewer_ingress = {
+  schema: "elastos.browser.viewer-ingress/v1", page_id: pageId, generation,
+  engine_binding_hash: bindingHash, owner_runtime_hash: sha256("consumer"),
+  engine_runtime_hash: sha256("engine"), turn_url: ingressUrl,
+};
+remote.runtime_turn.turn_url = ingressUrl;
+remote.ice_servers[0].urls = [ingressUrl];
+assert.deepEqual(await validateRuntimeLaunchTurn(remote, enginePage, now), remote.ice_servers);
+assert.equal(remote.ice_servers[0].credential, credential);
+assert.equal(enginePage.transport_proof.turn.advertised_host, "127.0.0.1");
+for (const mutate of [
+  s => { s.runtime_turn.viewer_ingress.page_id = "foreign"; },
+  s => { s.runtime_turn.viewer_ingress.generation = sha256("other"); },
+  s => { s.runtime_turn.viewer_ingress.engine_binding_hash = sha256("other"); },
+  s => { s.runtime_turn.viewer_ingress.owner_runtime_hash = "raw-provider-route"; },
+  s => { s.runtime_turn.viewer_ingress.extra = true; },
+  s => { s.runtime_turn.viewer_ingress = null; },
+  s => { s.runtime_turn.viewer_ingress.turn_url = "turn:viewer.example.test:49201?transport=tcp"; },
+  s => { s.runtime_turn.viewer_ingress.turn_url = s.runtime_turn.turn_url = "turn:viewer.example.test:49200?transport=udp"; },
+  s => { s.ice_servers[0].credential = "foreign"; },
+  s => { delete s.runtime_turn.viewer_ingress; },
+]) {
+  const invalid = structuredClone(remote); mutate(invalid);
+  await assert.rejects(validateRuntimeLaunchTurn(invalid, enginePage, now), /Browser Runtime TURN/);
+}
+
 const browserMain = await readFile(
   path.join(repoRoot, "capsules/browser/browser/browser.js"),
   "utf8",

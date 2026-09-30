@@ -22,7 +22,7 @@ if (!rom.length) throw new Error("uCity returned no ROM bytes");
 
 const savePath = "/api/viewers/gba-emulator/storage/gba-emulator/save/live-smoke.sav";
 const expected = new TextEncoder().encode(`gba-live-${Date.now()}`);
-await request(savePath, { method: "PUT", body: expected });
+await request(savePath, { method: "PUT", headers: { "If-None-Match": "*" }, body: expected });
 const restored = await request(savePath);
 if (restored.length !== expected.length || restored.some((byte, index) => byte !== expected[index])) {
   throw new Error("principal-scoped save did not round-trip");

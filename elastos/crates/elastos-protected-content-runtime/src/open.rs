@@ -472,6 +472,45 @@ impl fmt::Debug for RuntimePreparedRecipient {
 }
 
 impl RuntimePreparedRecipient {
+    /// Rebuilds a prepared recipient from the parts a caller persisted while
+    /// the viewer release waited on an exact Wallet approval. The decrypt
+    /// provider still holds the recipient key under the opaque handle; this
+    /// only restores the public identity the rights request was bound to, so
+    /// the identical wallet request can be replayed and the release resumed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "these are the exact persisted parts of one prepared recipient"
+    )]
+    pub fn from_persisted_parts(
+        audit_request_id: Digest32,
+        prepared_recipient_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+        binding: ProtectedContentBindingV1,
+        action: RightsActionV1,
+        runtime_operation_issuer: RuntimeOperationIssuerKeyV1,
+        expires_at: u64,
+        recipient_public_key: RecipientPublicKeyBytesV1,
+        recipient_identity: RecipientKeyIdentityV1,
+    ) -> Result<Self, ContractError> {
+        RuntimeReleaseAuditIdV1::new(audit_request_id)?;
+        OpaqueHandleV1::new(prepared_recipient_handle)?;
+        if expires_at == 0 {
+            return Err(ContractError::InvalidField("expires_at"));
+        }
+        if !recipient_identity.matches_public_key(recipient_public_key.as_bytes()) {
+            return Err(ContractError::InvalidField("recipient_identity"));
+        }
+        Ok(Self {
+            audit_request_id,
+            prepared_recipient_handle,
+            binding,
+            action,
+            runtime_operation_issuer,
+            expires_at,
+            recipient_public_key,
+            recipient_identity,
+        })
+    }
+
     pub const fn audit_request_id(&self) -> Digest32 {
         self.audit_request_id
     }

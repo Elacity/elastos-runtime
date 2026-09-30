@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "elastos://model/*",
   "authority": {
     "reason": "Runtime mediates authorization while the provider owns backend selection, credentials, offer configuration, and durable run lifecycle/state.",

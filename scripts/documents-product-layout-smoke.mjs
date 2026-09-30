@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -14,6 +15,7 @@ const { chromium } = playwrightModule.chromium ? playwrightModule : playwrightMo
 
 const capsuleRoot = path.resolve("capsules/documents/browser");
 const homeClipboardClientPath = path.resolve("capsules/home/browser/home-clipboard-client.js");
+const homeNavigationClientPath = path.resolve("capsules/home/browser/home-navigation-client.js");
 const homeClipboardProtocolPath = path.resolve("capsules/home/browser/home-clipboard-protocol.js");
 
 const documents = new Map();
@@ -42,7 +44,7 @@ async function waitForCondition(predicate, timeoutMs, label) {
 }
 
 function createDocument(docDid, title, fileName, body, cid) {
-  return {
+  return withRevision({
     doc_did: docDid,
     document_uri: `localhost://ElastOS/Documents/${docDid}`,
     title,
@@ -53,7 +55,13 @@ function createDocument(docDid, title, fileName, body, cid) {
     updated_at: 1_780_000_600,
     latest_published_cid: cid,
     publish_history: cid ? [{ cid, published_at: 1_780_000_600 }] : [],
-  };
+  });
+}
+
+function withRevision(document) {
+  return { ...document, revision: createHash("sha256").update(JSON.stringify([
+    "person:local:documents-fixture", document.doc_did, document.working_copy_uri, document.title, document.body,
+  ])).digest("hex") };
 }
 
 function resetDocumentsFixture() {
@@ -181,11 +189,11 @@ function createAppServer() {
           return;
         }
         if (op === "save") {
-          const current = documents.get(payload.doc_did);
           saveCalls.push({
             docDid: payload.doc_did,
-            title: payload.title || current?.title || "",
+            title: payload.title,
             body: payload.body || "",
+            if_revision: payload.if_revision,
           });
           activeSaveCalls += 1;
           maxConcurrentSaveCalls = Math.max(maxConcurrentSaveCalls, activeSaveCalls);
@@ -197,12 +205,18 @@ function createAppServer() {
               delayedSaveStart = null;
               delayedSaveRelease = null;
             }
-            const updated = {
+            const current = documents.get(payload.doc_did);
+            if (!current || !/^[0-9a-f]{64}$/.test(payload.if_revision || "") || payload.if_revision !== current.revision) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ status: "error", code: "documents_error", message: "Document changed since it was read. Read the current document before saving." }));
+              return;
+            }
+            const updated = withRevision({
               ...current,
-              title: payload.title || current.title,
+              title: payload.title.trim() || "Untitled",
               body: payload.body || "",
               updated_at: current.updated_at + 1,
-            };
+            });
             documents.set(payload.doc_did, updated);
             json(res, { document: updated });
             return;
@@ -213,15 +227,17 @@ function createAppServer() {
         if (op === "save_as") {
           const current = documents.get(payload.doc_did);
           const docDid = `doc-${documents.size + 1}`;
-          const duplicate = {
+          const duplicate = withRevision({
             ...current,
             doc_did: docDid,
+            document_uri: `localhost://ElastOS/Documents/${docDid}`,
+            working_copy_uri: `localhost://ElastOS/Documents/${docDid}`,
             title: payload.title || `${current.title} copy`,
             file_name: payload.file_name || `${current.file_name.replace(/\.md$/i, "")}-copy.md`,
             body: payload.body || current.body,
             latest_published_cid: null,
             publish_history: [],
-          };
+          });
           documents.set(docDid, duplicate);
           json(res, { document: duplicate });
           return;
@@ -254,6 +270,11 @@ function createAppServer() {
       return;
     }
 
+    if (url.pathname === "/apps/home/home-navigation-client.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeNavigationClientPath).pipe(res);
+      return;
+    }
     if (url.pathname === "/apps/home/home-clipboard-client.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
       createReadStream(homeClipboardClientPath).pipe(res);
@@ -360,8 +381,9 @@ async function run() {
   const server = createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
-  const browser = await chromium.launch({ headless: true, executablePath: brave });
+  let browser;
   try {
+    browser = await chromium.launch({ headless: true, executablePath: brave });
     const consoleErrors = [];
     const pageErrors = [];
     const failedRequests = [];
@@ -620,13 +642,54 @@ async function run() {
       await racePage.close();
     }
 
+    resetDocumentsFixture();
+    const windows = await Promise.all([browser.newPage(), browser.newPage()]);
+    try {
+      for (const page of windows) {
+        trackPage(page, consoleErrors, pageErrors, failedRequests, errorResponses);
+        await page.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+        await page.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
+        await page.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
+      }
+      const held = armDelayedSave();
+      try {
+        await windows[0].locator("#editor").fill("Keep losing draft");
+        await windows[0].getByRole("button", { name: "Save", exact: true }).click();
+        await waitForCondition(() => activeSaveCalls === 1 && saveCalls.length === 1, 5000, "First page Save did not reach the held request.");
+        await windows[1].locator("#editor").fill("Winning body");
+        await windows[1].getByRole("button", { name: "Save", exact: true }).click();
+        await waitForCondition(() => documents.get("doc-alpha").body === "Winning body", 5000, "Second page Save did not persist its body.");
+        await windows[1].waitForFunction(() => document.getElementById("save-button")?.disabled === true);
+      } finally {
+        held.release();
+      }
+      await windows[0].waitForFunction(() => document.getElementById("status-text")?.textContent.includes("changed since it was read"));
+      assert(documents.get("doc-alpha").body === "Winning body", "Stale page overwrote the winner.");
+      assert(await windows[0].locator("#editor").inputValue() === "Keep losing draft", "Conflict erased the losing page draft.");
+      assert(await windows[0].getByRole("button", { name: "Save", exact: true }).isEnabled(), "Conflicted draft must remain dirty and explicitly recoverable.");
+      await windows[0].locator("#editor").fill("Newer losing draft");
+      // Observe beyond the actual 900 ms autosave interval after another edit.
+      await windows[0].waitForTimeout(1200);
+      assert(saveCalls.length === 2, "Conflict must pause automatic writes after further edits.");
+      assert(documents.get("doc-alpha").body === "Winning body", "Paused draft changed the stored winner.");
+      assert(await windows[0].locator("#editor").inputValue() === "Newer losing draft", "Paused autosave erased newer edits.");
+      assert(saveCalls.every((call) => /^[0-9a-f]{64}$/.test(call.if_revision)), "Every page save must carry a revision.");
+    } finally {
+      await Promise.all(windows.map((page) => page.close()));
+    }
+
     assert(failedRequests.length === 0, `Documents layout emitted failed requests: ${JSON.stringify(failedRequests)}`);
     assert(consoleErrors.length === 0, `Documents layout emitted console errors: ${JSON.stringify({ consoleErrors, failedRequests, errorResponses })}`);
     assert(pageErrors.length === 0, `Documents layout emitted page errors: ${JSON.stringify(pageErrors)}`);
     console.log("documents-product-layout-smoke: OK");
   } finally {
-    await browser.close();
-    await new Promise((resolve) => server.close(resolve));
+    delayedSaveRelease?.resolve();
+    try {
+      await browser?.close();
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
   }
 }
 

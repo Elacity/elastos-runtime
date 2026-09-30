@@ -1,5 +1,122 @@
 use super::*;
 
+#[tokio::test]
+async fn gba_viewer_storage_requires_exact_preconditions_and_preserves_the_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), GBA_EMULATOR_CAPSULE_ID).unwrap();
+    let uri = "/api/viewers/gba-emulator/storage/gba-emulator/save/conflict.sav";
+    let send = |headers: Vec<(&str, String)>| {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(HOST, "localhost:61180")
+            .header("origin", "null")
+            .header("x-elastos-home-token", &token);
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from("winner")).unwrap())
+    };
+    for (headers, expected) in [
+        (vec![], StatusCode::PRECONDITION_REQUIRED),
+        (vec![("if-match", "*".to_string())], StatusCode::BAD_REQUEST),
+        (
+            vec![("if-match", "garbage".to_string())],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec![("if-match", format!("W/\"{}\"", "a".repeat(64)))],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec![("if-none-match", "other".to_string())],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec![
+                ("if-none-match", "*".to_string()),
+                ("if-match", format!("\"{}\"", "a".repeat(64))),
+            ],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec![
+                ("if-none-match", "*".to_string()),
+                ("if-none-match", "*".to_string()),
+            ],
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(send(headers).await.unwrap().status(), expected);
+    }
+    let saved = send(vec![("if-none-match", "*".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        saved
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap(),
+        "ETag"
+    );
+    let revision = saved
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        send(vec![("if-none-match", "*".to_string())])
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        send(vec![("if-match", format!("\"{}\"", "0".repeat(64)))])
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let restored = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.headers().get("etag").unwrap(), revision.as_str());
+    assert_eq!(
+        restored
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap(),
+        "ETag"
+    );
+    assert_eq!(
+        axum::body::to_bytes(restored.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"winner"
+    );
+    assert_eq!(
+        send(vec![("if-match", revision)]).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
 #[test]
 fn gba_nonogram_manifest_parses_through_canonical_capsule_schema() {
     let manifest: elastos_common::CapsuleManifest = serde_json::from_str(include_str!(concat!(
@@ -84,6 +201,7 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
             Request::builder()
                 .method("PUT")
                 .uri(save_uri)
+                .header("if-none-match", "*")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token.clone())
@@ -358,6 +476,7 @@ async fn old_install_upgrade_encrypts_ucity_save_and_state_before_normal_round_t
             .await
             .unwrap();
         assert_eq!(restored.status(), StatusCode::OK);
+        let revision = restored.headers().get("etag").unwrap().clone();
         let bytes = axum::body::to_bytes(restored.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -369,6 +488,7 @@ async fn old_install_upgrade_encrypts_ucity_save_and_state_before_normal_round_t
                 Request::builder()
                     .method("PUT")
                     .uri(&uri)
+                    .header("if-match", revision)
                     .header(HOST, "localhost:61180")
                     .header("origin", "null")
                     .header("x-elastos-home-token", &token)
@@ -562,6 +682,7 @@ async fn gba_viewer_save_storage_is_scoped_to_the_launch_principal() {
             Request::builder()
                 .method("PUT")
                 .uri(save_uri)
+                .header("if-none-match", "*")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token.clone())

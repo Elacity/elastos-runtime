@@ -43,34 +43,47 @@ test-elastos *args: prepare-providers
       ELASTOS_TEST_PROTECT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
       ELASTOS_TEST_DECRYPT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
       ELASTOS_TEST_CUSTODY_PROVIDER_BIN="$(pwd)/../capsules/custody-provider/target/release/custody-provider" \
-      cargo test --workspace {{args}}
+      cargo test --workspace --no-fail-fast {{args}}
 
 # The elastos workspace suite (and CI's `cargo test --workspace`) never
 # builds or tests own-workspace capsules; this covers them.
 # Test every capsule that is its own cargo workspace
 test-capsules:
     #!/usr/bin/env bash
-    set -euo pipefail
-    # One shared target dir: the capsule workspaces overlap almost entirely in
-    # dependencies, so sharing compiles each dep once instead of ~25 times and
-    # gives CI a single cacheable path. Cargo fingerprints keep per-workspace
-    # correctness; the loop is sequential, so there is no lock contention.
-    root="$PWD"
+    set -uo pipefail
+    # Dependency artifacts are shared across all workspaces via the root
+    # .cargo/config.toml build-dir (<repo>/target-build), so each dep compiles
+    # once instead of ~25 times. Deliberately NO --target-dir pin: with a
+    # shared build-dir, cargo reuses compiled test executables across
+    # invocations without re-baking their CARGO_BIN_EXE_* paths, so every
+    # invocation style (just, plain cargo test, rust-analyzer, CI) must agree
+    # on each workspace's default target dir or process tests spawn stale
+    # binary paths.
+    failed=0
     for lock in capsules/*/Cargo.lock; do
         capsule="$(dirname "$lock")"
         echo "== testing $capsule =="
-        (cd "$capsule" && cargo test --target-dir "${root}/target-capsules")
+        (cd "$capsule" && cargo test --no-fail-fast) || failed=1
     done
+    exit "$failed"
 
 # Run the workspace suite and every own-workspace capsule suite
-test: test-elastos test-capsules
+test:
+    #!/usr/bin/env bash
+    set -u
+    failed=0
+    just test-elastos || failed=1
+    just test-capsules || failed=1
+    exit "$failed"
 
-# Accurate local replica of the CI test-elastos job: Linux container, cold
-# caches, pristine copy of the working tree (tracked + modified files).
-# nodejs matches the ubuntu-latest runner, where node is preinstalled and
-# elastos-server integration tests spawn it.
+# Collect local source, lint, and test results before a CI-fix push.
+ci-local-prepush:
+    scripts/ci-local-prepush.sh
+
+# Cold Debian container check for test-elastos when Docker is available.
+# It copies the working tree and installs Node for integration tests.
 ci-test-elastos:
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='target-build' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i -e RUSTFLAGS="-D warnings" -e CARGO_TERM_COLOR=always rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && cargo --version >/dev/null && \
         apt-get update -qq >/dev/null && apt-get install -y -qq nodejs >/dev/null && node --version && \
@@ -83,29 +96,29 @@ ci-test-elastos:
         ELASTOS_TEST_PROTECT_PROVIDER_BIN=/w/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider \
         ELASTOS_TEST_DECRYPT_PROVIDER_BIN=/w/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider \
         ELASTOS_TEST_CUSTODY_PROVIDER_BIN=/w/capsules/custody-provider/target/release/custody-provider \
-        cargo test --workspace"'
+        cargo test --workspace --no-fail-fast"'
 
-# Accurate local replica of the CI test-capsules job (same container recipe).
+# Cold Debian container check for test-capsules when Docker is available.
 ci-test-capsules:
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='target-build' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i -e RUSTFLAGS="-D warnings" -e CARGO_TERM_COLOR=always rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && cargo --version >/dev/null && \
         useradd -m ci && chown -R ci:ci /w && \
         su -s /bin/bash ci -c "export PATH=/usr/local/cargo/bin:\$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/ci/.cargo RUSTFLAGS=\"-D warnings\" && cd /w && \
+        failed=0; \
         for lock in capsules/*/Cargo.lock; do \
             capsule=\$(dirname \$lock); \
             echo \"== testing \$capsule ==\"; \
-            (cd \$capsule && cargo test --target-dir /w/target-capsules) || exit 1; \
-        done"'
+            (cd \$capsule && cargo test --no-fail-fast) || failed=1; \
+        done; exit \$failed"'
 
-# Accurate local replica of the CI source-home-linux job. arch selects the
-# matrix leg: arm64 = ubuntu-24.04-arm (native on Apple silicon),
-# amd64 = ubuntu-latest (emulated, much slower).
+# Cold Debian source-home check when Docker is available. arch selects
+# native ARM64 or emulated x86-64; GitHub runs Ubuntu 24.04 for acceptance.
 ci-source-home-linux arch='arm64':
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='target-build' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i --platform linux/{{arch}} -e CARGO_TERM_COLOR=never rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && \
-        apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq >/dev/null && \
+        apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq musl-tools nasm pkg-config >/dev/null && \
         rustup target add wasm32-unknown-unknown "$(uname -m)-unknown-linux-musl" >/dev/null 2>&1 && \
         useradd -m ci && chown -R ci:ci /w && \
         su -s /bin/bash ci -c "set -euo pipefail && \
@@ -114,7 +127,7 @@ ci-source-home-linux arch='arm64':
         export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
         SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
         export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
-        scripts/setup-source-home.sh && \
+        SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR=/usr/bin scripts/setup-source-home.sh && \
         ELASTOS_DATA_DIR=\$XDG_DATA_HOME/elastos scripts/installed-provider-verify.sh && \
         scripts/local-carrier-setup-smoke.sh"'
 
@@ -143,12 +156,19 @@ verify:
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
+    python3 scripts/components-release-integrity-check.py --self-test
+    python3 scripts/publish-platform-artifacts-test.py
+    python3 scripts/release-platform-input-test.py
+    python3 scripts/prepare-release-platform-test.py
+    python3 scripts/media-tools-build-test.py
+    node scripts/home-agent-shell-smoke.mjs
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs
     node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
+    node --test scripts/system-hosted-save.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh

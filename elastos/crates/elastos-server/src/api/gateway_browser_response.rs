@@ -63,6 +63,31 @@ pub(in crate::api::gateway) async fn browser_provider_resource_response(
             format!("{} provider unavailable", call.scheme),
         )
     })?;
+    if call.scheme == "browser-engine"
+        && (call.request.get("page_id").is_some()
+            || call.request.get("lifecycle_generation").is_some())
+    {
+        match gateway_browser_remote::consumer_binding(&state.data_dir, &call.request) {
+            Ok(Some(binding)) => {
+                return gateway_browser_remote::dispatch_consumer(state, &binding, &call.request)
+                    .await
+                    .map_err(|_| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Remote Runtime Engine operation is unavailable or pending settlement"
+                                .into(),
+                        )
+                    })
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Remote Runtime Engine ownership is unavailable".into(),
+                ))
+            }
+        }
+    }
     registry
         .send_raw(call.scheme, &call.request)
         .await

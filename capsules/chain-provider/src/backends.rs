@@ -184,11 +184,25 @@ impl ChainProvider {
         let body = response
             .json::<Value>()
             .map_err(|_| Response::error("upstream_invalid_json", "EVM RPC response malformed"))?;
-        if body.get("error").is_some() {
-            return Err(Response::error(
-                "upstream_rpc_error",
-                "EVM RPC request rejected",
-            ));
+        if let Some(error) = body.get("error") {
+            // Keep the node's own verdict (code, message and, for reverts,
+            // the ABI-encoded error data) so a caller can tell a reverted
+            // estimate from a rejected transaction without the RPC console.
+            let code = error.get("code").cloned().unwrap_or(Value::Null);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("EVM RPC request rejected");
+            let data = error
+                .get("data")
+                .map(|data| data.to_string())
+                .unwrap_or_default();
+            let mut detail = format!("EVM RPC request rejected: {method}: code {code}: {message}");
+            if !data.is_empty() && data != "null" {
+                detail.push_str(&format!(": data {data}"));
+            }
+            detail.truncate(1024);
+            return Err(Response::error("upstream_rpc_error", &detail));
         }
         body.get("result")
             .cloned()

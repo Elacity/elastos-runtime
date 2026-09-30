@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="elastos-c4-sha256" content="59b46bfcfbdc1a1d9ceeb4e601d7c0e04046d20bd26eef3b632d562de39cacf8">
+  <meta name="elastos-c4-sha256" content="8fd2490220023146c36152d3435e66500184aa0096e4ad1ab78f452ed2e2b2dc">
   <title>ElastOS C4 model</title>
   <style>
     :root {
@@ -457,7 +457,7 @@
             N("proposer", 290, 515, "Effect proposer", "target", "Target component", "Submits exact typed Runtime operations."),
             N("journal", 670, 515, "Task journal", "target", "Target component", "Tracks conversation, progress, and results."),
             N("runtime", 945, 90, "Runtime authority", "container", "External container", "Binds principal, session, grants, lifecycle, and audit.", null, 220, 120),
-            N("model", 960, 330, "Model provider", "container", "External container", "Owns selection, credentials, streams, and terminal outcomes.", null, 190, 105),
+            N("model", 960, 330, "Model provider", "container", "External container", "Owns inference semantics, streams, and terminal outcomes; Runtime brokers hosted HTTPS.", null, 190, 105),
             N("effects", 960, 545, "Effect providers", "container", "External containers", "Content, messaging, Browser, wallet, chain, and storage.", null, 190, 105),
             N("roots", 510, 590, "UsersAI roots", "data", "Data store", "Agent task and memory state.", null, 150, 80)
           ],
@@ -505,7 +505,7 @@
             N("gate", 620, 260, "Authority gate", "component", "Runtime", "Identity, session, capability, and grant."),
             N("route", 430, 440, "Runtime route", "component", "Runtime", "Core operation or typed provider call."),
             N("audit", 620, 510, "Durable audit", "data", "Runtime state", "Intent, decision, result, and obligations."),
-            N("provider", 925, 180, "Provider", "container", "Service boundary", "Protocol semantics and credentials."),
+            N("provider", 925, 180, "Provider", "container", "Service boundary", "Protocol semantics; Runtime owns hosted credentials."),
             N("world", 925, 455, "External world", "external", "Backend", "Host, peer, chain, content, wallet, web, or model.")
           ],
           edges: [

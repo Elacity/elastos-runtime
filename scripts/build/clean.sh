@@ -77,8 +77,9 @@ if [ "$DRY_RUN" = true ] || [ "$CLEAN_DATA_ONLY" = false ]; then
         BUILD_SIZE=$((BUILD_SIZE + s))
     fi
 
-    # Capsule targets
-    for dir in elastos/capsules/*/target capsules/*/target; do
+    # Capsule targets, the shared intermediate build dir, and the shared
+    # capsule test dir
+    for dir in elastos/capsules/*/target capsules/*/target target-build target-capsules; do
         if [ -d "$dir" ]; then
             BUILD_DIRS+=("$dir")
             s=$(du -sm "$dir" 2>/dev/null | cut -f1)
@@ -135,8 +136,9 @@ if [ "$CLEAN_DATA_ONLY" = false ]; then
         ok "elastos/target"
     fi
 
-    # Capsule targets
-    for dir in elastos/capsules/*/target capsules/*/target; do
+    # Capsule targets, the shared intermediate build dir, and the shared
+    # capsule test dir
+    for dir in elastos/capsules/*/target capsules/*/target target-build target-capsules; do
         if [ -d "$dir" ]; then
             rm -rf "$dir"
             ok "$dir"

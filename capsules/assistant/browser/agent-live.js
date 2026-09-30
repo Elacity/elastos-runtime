@@ -1,0 +1,693 @@
+/* Live inference bridge — contract era. Chat runs go through the
+   model-provider (elastos://model/*, runs_create + runs_events cursor-poll);
+   readiness = offers_list (an offer is advertised only when its backend is
+   configured — never advertise what we can't serve). Chat carries no tool,
+   grant, or capsule authority (Principle 16).
+   Tip: home-20260814a */
+
+import { getHomeGuiLaunchToken } from "./harness-host.js";
+import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
+import { yieldToBrowser, YIELD_EVENT_SLICE, YIELD_MS } from "./agent-stream-qos.js";
+import {
+  eligibleTextOffers,
+  textOfferRows,
+  textRunCreateBody,
+  applyRunEventsPage,
+  terminalOutputText,
+  contractError,
+} from "./model-contract.js";
+import {
+  compileContext,
+  capabilitiesForOffer,
+  attachProviderPayload,
+  splitSessionMessages,
+  makeBudget,
+  logContextManifest,
+  resolveReasoningPolicy,
+  TEXT_CONTRACT_CAPABILITIES,
+  EMERGENCY_HISTORY_MESSAGE_LIMIT,
+  transcriptCharCount,
+  assertProviderPayloadUnchanged,
+  turnStorePut,
+  turnStorePatch,
+  TurnState,
+  createTurnManifest,
+  newTurnId,
+} from "./agent-context.js";
+
+/** Re-probe at most this often unless forced (online event, harness open). */
+const PROBE_TTL_MS = 15000;
+
+/** PRINCIPLES-safe default — no tools, no capsule authority (UI ≠ authority). */
+export const DEFAULT_LIVE_SYSTEM_PROMPT =
+  "You are the ElastOS Home Agent, running privately on this machine. " +
+  "You have no tools and no capsule authority in this session; answer from " +
+  "knowledge only, and say so plainly when a task would need a tool or grant.";
+
+export const DEFAULT_LIVE_MAX_TOKENS = 8192;
+export const MAX_LIVE_SYSTEM_PROMPT_CHARS = 8_000;
+export const MAX_AGENT_NOTES_CHARS = 4_000;
+
+export function normalizeAgentNotes(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > MAX_AGENT_NOTES_CHARS
+    ? text.slice(0, MAX_AGENT_NOTES_CHARS)
+    : text;
+}
+
+export function clampLiveMaxTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return DEFAULT_LIVE_MAX_TOKENS;
+  }
+  return Math.min(8192, Math.max(16, Math.round(n)));
+}
+
+export function normalizeLiveSystemPrompt(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return DEFAULT_LIVE_SYSTEM_PROMPT;
+  }
+  return text.length > MAX_LIVE_SYSTEM_PROMPT_CHARS
+    ? text.slice(0, MAX_LIVE_SYSTEM_PROMPT_CHARS)
+    : text;
+}
+
+let liveState = {
+  live: false,
+  checking: false,
+  model: "",
+  endpointState: "",
+  reason: "unprobed",
+  checkedAt: 0,
+  /** Live model rows (from advertised model offers). */
+  models: [],
+  catalogModels: [],
+};
+
+let probePromise = null;
+let probeEpoch = 0;
+
+export function getLiveInferenceState() {
+  return { ...liveState, models: liveState.models.slice() };
+}
+
+/** Chat offers → model-menu rows. An offer exists only when its backend is
+ * configured (readiness-honest provider), so listing is the truth probe. */
+const lastBackendReports = Object.create(null);
+let backendReportRunId = "";
+
+function chatOfferRows(offers) {
+  const reports = Object.create(null);
+  for (const [offerId, entry] of Object.entries(lastBackendReports)) {
+    if (entry && entry.runId === backendReportRunId && entry.report) {
+      reports[offerId] = entry.report;
+    }
+  }
+  return textOfferRows(eligibleTextOffers(offers), reports);
+}
+
+function forgetBackendReport(offerId) {
+  if (typeof offerId === "string" && offerId.trim() !== "") {
+    delete lastBackendReports[offerId];
+  }
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+function rememberBackendReport(offerId, report, runId) {
+  if (
+    typeof offerId !== "string" ||
+    offerId.trim() === "" ||
+    typeof runId !== "string" ||
+    runId.trim() === "" ||
+    !report ||
+    typeof report !== "object"
+  ) {
+    return;
+  }
+  if (runId !== backendReportRunId) {
+    return;
+  }
+  lastBackendReports[offerId] = { runId, report };
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+/** A new chat or offer run must not inherit another run's backend facts. */
+export function clearBackendReports() {
+  for (const key of Object.keys(lastBackendReports)) {
+    delete lastBackendReports[key];
+  }
+  backendReportRunId = "";
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+/* An existing choice stays exact. Only a workspace with no choice uses the
+   initial first advertised offer; later absence never substitutes another. */
+let selectedLiveOfferId = "";
+let selectedContentCid = null;
+let selectionEpoch = 0;
+
+export function selectLiveOffer(offerId, modelCid = null) {
+  ++selectionEpoch;
+  selectedLiveOfferId = typeof offerId === "string" ? offerId : "";
+  selectedContentCid = modelCid;
+  if (!liveState.checking) {
+    liveState.live = Boolean(currentChoice(liveState.models, liveState.catalogModels));
+  }
+}
+
+// Explicit user selection retains verified local content. Workspace restore and
+// launch hydration continue to use selectLiveOffer without changing retention.
+export async function selectLiveOfferForUse(offerId, modelCid = null) {
+  const local = liveContentModels().find(model => model.offerId === offerId && (modelCid == null || model.cid === modelCid));
+  // Runtime derives admitted local offer IDs from the verified content binding.
+  // A missing catalog mapping cannot turn that offer into an operator choice.
+  if (modelCid == null && !local && !/^model:[0-9a-f]{64}$/.test(offerId)) {
+    selectLiveOffer(offerId);
+    return true;
+  }
+  const failure = () => new Error("Could not keep this model on this device. Select it again to retry.");
+  if (!local) throw failure();
+  const epoch = selectionEpoch;
+  const token = getHomeGuiLaunchToken();
+  if (!token) throw failure();
+  const body = { capsule: "assistant", interface: "elastos.assistant.model", method: "content.retention",
+    request_id: newRequestId(), input: { cid: local.cid, keep: true } };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35000);
+  try {
+    const response = await fetch(new URL("/api/capsules/interfaces/invoke", window.location.href).href, {
+      method: "POST", headers: { "content-type": "application/json", "x-elastos-home-token": token },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    const result = await response.json();
+    if (!response.ok || result.schema !== "elastos.capsules.invoke-result/v1" || result.status !== "ok"
+        || !["capsule", "interface", "method", "request_id"].every(key => result[key] === body[key])
+        || result.output?.cid !== local.cid || result.output.kept !== true || result.output.admitted !== true) throw failure();
+    if (epoch !== selectionEpoch) return false;
+    if (!liveContentModels().some(model => model.cid === local.cid && model.offerId === offerId)) throw failure();
+    selectLiveOffer(offerId, local.cid);
+    return true;
+  } catch {
+    throw failure();
+  } finally { clearTimeout(timeout); }
+}
+
+export function liveContentChoice() { return selectedContentCid; }
+export function liveContentModels() {
+  return readyModelChoices(liveState.catalogModels || [], liveState.models.map(m => ({ ...m, id: m.offerId })));
+}
+function currentChoice(models, content) {
+  // Initial empty workspace may use the first offer. An existing choice stays exact.
+  const id = selectedLiveOfferId || (selectedContentCid == null ? models[0]?.offerId : "");
+  return selectedModelOffer(models.map(m => ({ ...m, id: m.offerId })), id, selectedContentCid, content || []);
+}
+
+export function liveOfferChoice() {
+  return selectedLiveOfferId;
+}
+
+export function selectedLiveOffer() {
+  return currentChoice(liveState.models, liveState.catalogModels) || null;
+}
+
+/** Cached offers_list — model menu + Configure panel + probe share it. */
+let offersCache = null;
+let offersPromise = null;
+
+export async function fetchModelOffers({ force = false } = {}) {
+  if (!force && offersCache) {
+    return offersCache;
+  }
+  if (!force && offersPromise) {
+    return offersPromise;
+  }
+  const request = (async () => {
+    const data = await modelRunCall("offers_list");
+    if (offersPromise === request) {
+      offersCache = data;
+      // Mode controls follow the same read the chat picker uses (boot, "Refresh models", probes).
+      window.dispatchEvent(new CustomEvent("assistant:model-offers", { detail: data }));
+    }
+    return data;
+  })()
+    .finally(() => {
+      if (offersPromise === request) offersPromise = null;
+    });
+  offersPromise = request;
+  return request;
+}
+
+/**
+ * A current successful offers read must contain the exact chosen text offer.
+ * Refresh ownership applies only to readiness, never to accepted run settlement.
+ */
+export async function probeLiveInference({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && (liveState.checking || now - liveState.checkedAt < PROBE_TTL_MS)) {
+    return probePromise ? probePromise.then(getLiveInferenceState) : getLiveInferenceState();
+  }
+  const epoch = ++probeEpoch;
+  liveState.checking = true;
+  probePromise = (async () => {
+    try {
+      /* Reachability and offers in one call: the 0.7.1 model-provider contract
+         is offers_list / runs_*; it has no ping. */
+      const [offers, content] = await Promise.all([
+        fetchModelOffers({ force: true }),
+        fetch(new URL("/api/capsules/catalog", window.location.href).href, {
+          headers: { "x-elastos-home-token": getHomeGuiLaunchToken() },
+        }).then(async response => response.ok ? catalogModels(await response.json()) : []).catch(() => []),
+      ]);
+      if (epoch !== probeEpoch) return;
+      const models = chatOfferRows(offers);
+      if (!models.length) {
+        liveState = {
+          live: false,
+          checking: false,
+          model: "",
+          endpointState: "no-model-offers",
+          reason: "no-model-offers",
+          checkedAt: Date.now(),
+          models: [],
+          catalogModels: content,
+        };
+        return;
+      }
+      liveState = {
+        live: Boolean(currentChoice(models, content)),
+        checking: false,
+        model: currentChoice(models, content)?.label || "Chosen model unavailable",
+        endpointState: "model-offers",
+        reason: "ready",
+        checkedAt: Date.now(),
+        models,
+        catalogModels: content,
+      };
+    } catch (error) {
+      if (epoch !== probeEpoch) return;
+      liveState = {
+        live: false,
+        checking: false,
+        model: "",
+        endpointState: "unreachable",
+        reason: String(error?.code || error?.message || "unreachable"),
+        checkedAt: Date.now(),
+        models: [],
+        catalogModels: [],
+      };
+    } finally {
+      if (epoch === probeEpoch) probePromise = null;
+    }
+  })();
+  await probePromise;
+  return getLiveInferenceState();
+}
+
+/** Gather → compile → serialize. This is the only live context-policy owner. */
+export function compileLiveContext({
+  session = null,
+  sessionMessages = null,
+  currentInput = null,
+  systemPrompt,
+  notes,
+  maxTokens,
+  capabilities = TEXT_CONTRACT_CAPABILITIES,
+  degradedFallback = false,
+  debug = false,
+} = {}) {
+  const offer = selectedLiveOffer();
+  const effectiveCapabilities = capabilitiesForOffer(offer, capabilities);
+  const raw = sessionMessages || session?.messages || [];
+  let { history, currentInput: splitCurrent } = splitSessionMessages(raw);
+  const current = currentInput || splitCurrent;
+  if (degradedFallback) {
+    history = history.slice(-EMERGENCY_HISTORY_MESSAGE_LIMIT);
+  }
+  const system = normalizeLiveSystemPrompt(systemPrompt);
+  const constraints = [
+    {
+      id: "system",
+      kind: "system_policy",
+      role: "system",
+      authority: "system",
+      content: system,
+      sourceRef: "systemPrompt",
+      mustInclude: true,
+      reason: "mandatory",
+    },
+  ];
+  const noteText = normalizeAgentNotes(notes);
+  if (noteText) {
+    constraints.push({
+      id: "runtime-notes",
+      kind: "runtime_context",
+      role: "system",
+      authority: "runtime",
+      content: `On-Home notes (runtime · host-persisted; not a user message):\n${noteText}`,
+      sourceRef: "agentNotes",
+      mustInclude: true,
+      reason: "mandatory",
+    });
+  }
+  const thinkingChars = (Array.isArray(raw) ? raw : []).reduce(
+    (n, m) => n + String(m?.thinking || "").length,
+    0,
+  );
+  const compiled = compileContext({
+    history,
+    currentInput: current,
+    constraints,
+    intent: "",
+    budget: makeBudget(effectiveCapabilities.context, clampLiveMaxTokens(maxTokens)),
+    capabilities: effectiveCapabilities,
+    transcriptChars: transcriptCharCount(raw),
+    thinkingChars,
+  });
+  attachProviderPayload(compiled);
+  compiled.manifest.offerId = offer?.offerId || "";
+  logContextManifest(compiled.manifest, compiled.invariants, { debug });
+  return compiled;
+}
+
+let liveStreamEpoch = 0;
+let activeRun = null;
+
+export function abortLiveChatStream() {
+  const run = activeRun;
+  if (!run) return Promise.resolve();
+  run.cancelRequested = true;
+  if (run.cancelPromise) return run.cancelPromise;
+  run.patch({ state: TurnState.CANCEL_PENDING, completedAt: null });
+  if (!run.id) return Promise.resolve();
+  const runId = run.id;
+  run.cancelPromise = modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })
+    .catch(() => {
+      if (activeRun === run) {
+        run.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+      }
+    });
+  return run.cancelPromise;
+}
+
+/* Detach the UI from the in-flight run WITHOUT cancelling it. The model contract
+   runs server-side (runs_events is a client cursor-poll, not a held connection),
+   so the run continues; the UI simply stops consuming its events. Navigation-away
+   uses this so a long generation isn't killed; explicit Stop still uses
+   abortLiveChatStream (runs_cancel). */
+export function detachLiveChatStream() {
+  activeRun?.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+  liveStreamEpoch += 1;
+  activeRun = null;
+}
+
+export function unresolvedModelTurn(turn) {
+  return turn?.attachmentAllowed !== false && (!turn?.actorCapsule || turn.actorCapsule === "assistant") && Boolean(turn?.providerRunId || turn?.createRequestId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
+}
+
+export async function modelRunCall(op, body = {}) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    error.preDispatchRefusal = true;
+    throw error;
+  }
+  const res = await fetch(
+    new URL(`/api/provider/model/${op}`, window.location.href).href,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-elastos-home-token": token,
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.status === "error") {
+    const error = new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
+    error.code = data?.code || "model_error";
+    error.status = res.status;
+    if (data?.code === "approval_required") error.approvalOfferId = body.offer_id;
+    error.preDispatchRefusal =
+      data?.code === "approval_required" || data?.code === "approval_denied"
+      || (op === "runs_create" && res.status === 409
+        && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(body.offer_id)
+        && data?.code === "remote_model_invocation_refused"
+        && data?.refusal?.schema === "elastos.model.invocation-refusal/v1"
+        && data.refusal.scope === "invocation" && data.refusal.dispatch === "not_started"
+        && data.refusal.request_id === body.request_id && data.refusal.offer_id === body.offer_id);
+    throw error;
+  }
+  return data?.data ?? data;
+}
+
+const CONTRACT_POLL_MS = 250;
+
+function newRequestId() {
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Stream a chat turn through the typed model contract: runs_create on the
+ * selected text offer, then runs_events cursor-poll by after_sequence.
+ * onDelta({ reasoningDelta, contentDelta, done, seq }) is called as text_delta
+ * events arrive; Stop requests cancellation and keeps reading Runtime settlement.
+ * Full strings are joined once after unlock — not on every poll.
+ */
+export async function streamChatViaContract(
+  messages,
+  {
+    onDelta,
+    onAccepted,
+    onState,
+    maxTokens = DEFAULT_LIVE_MAX_TOKENS,
+    requestedEffort = "medium",
+    contextManifest = null,
+    turnManifest = null,
+    inputParts = [],
+  } = {},
+) {
+  detachLiveChatStream();
+  const epoch = liveStreamEpoch;
+  if (contextManifest) {
+    assertProviderPayloadUnchanged(messages, contextManifest.providerPayloadHash);
+  }
+  const startedAt = Date.now();
+  /* Reasoning effort is recorded on the manifest, never faked via prompt text. */
+  const reasoning = resolveReasoningPolicy(requestedEffort);
+  const manifest = contextManifest
+    ? {
+        ...contextManifest,
+        requestedEffort: reasoning.requested,
+        effectiveEffort: reasoning.effective,
+        effortDegraded: reasoning.degraded,
+      }
+    : { requestedEffort: reasoning.requested, effectiveEffort: reasoning.effective, effortDegraded: reasoning.degraded };
+  const turn =
+    turnManifest ||
+    turnStorePut(
+      createTurnManifest({
+        turnId: newTurnId(),
+        inputParts,
+        reasoning,
+        contextManifest: manifest,
+        startedAt,
+      }),
+    );
+  turnStorePut(turn);
+  const patch = (fields) => {
+    const next = turnStorePatch(turn.turnId, fields) || turn;
+    onState?.(next);
+    return next;
+  };
+  const run = { id: null, patch, cancelRequested: false, cancelPromise: null };
+  activeRun = run;
+  if (turn.createRequestId && !turn.providerRunId) {
+    activeRun = null;
+    throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+  }
+  /* The typed text input has no sampling knobs; the offer's policy owns them.
+     maxTokens shaped the context budget upstream and stays on the manifest. */
+  void clampLiveMaxTokens(maxTokens);
+  const offer = selectedLiveOffer();
+  if (!offer && !turn.providerRunId) {
+    activeRun = null;
+    throw contractError("no_model_offers", "no text model offer on this Home");
+  }
+  if (!turn.providerRunId && manifest.offerId && offer?.offerId !== manifest.offerId) {
+    activeRun = null;
+    throw contractError("model_selection_changed", "Selected model changed while context was prepared");
+  }
+  const resuming = Boolean(turn.providerRunId);
+  let created;
+  let runId;
+  const createRequestId = resuming ? null : newRequestId();
+  if (!resuming) {
+    backendReportRunId = "";
+    forgetBackendReport(offer?.offerId);
+    patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  }
+  try {
+    created = resuming
+      ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
+      : await modelRunCall("runs_create", textRunCreateBody({
+          offer, messages, requestId: createRequestId,
+          maxOutputTokens: manifest.outputReserve,
+        }));
+    runId = typeof created?.run_id === "string" ? created.run_id : "";
+    if (!runId || runId.trim() !== runId || runId.length > 80 || (resuming && runId !== turn.providerRunId)) {
+      throw contractError("no_run_id", "contract returned no run id");
+    }
+  } catch (error) {
+    if (activeRun === run) activeRun = null;
+    if (!resuming) {
+      const refused = error.preDispatchRefusal === true;
+      patch({ state: refused ? TurnState.FAILED : TurnState.SETTLEMENT_UNKNOWN,
+        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null,
+        ...(error.approvalOfferId ? { approvalOfferId: error.approvalOfferId } : {}) });
+      if (!refused) throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+    }
+    throw error;
+  }
+  if (resuming && activeRun !== run) {
+    return { detached: true, turnManifest: turn };
+  }
+  let afterSequence = !resuming && Number.isInteger(Number(created?.sequence_cursor))
+    ? Number(created.sequence_cursor)
+    : 0;
+  run.id = runId;
+  backendReportRunId = runId;
+  patch({
+    providerRunId: runId,
+    state: TurnState.SUBMITTED,
+  });
+
+  let seq = 0;
+  let streamedChars = 0;
+  const emit = (reasoningDelta, contentDelta, done = false) =>
+    onDelta?.({ reasoningDelta, contentDelta, done, seq });
+  const finish = (extra = {}) => {
+    const next = extra.detached ? turn : patch({
+      state: extra.settlementUnknown ? TurnState.SETTLEMENT_UNKNOWN : extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
+      completedAt: Date.now(),
+      ...(extra.outputUnretained ? { outputRetained: false } : {}),
+    });
+    return {
+      usage: null,
+      latencyMs: Date.now() - startedAt,
+      aborted: false,
+      seq,
+      reasoning,
+      contextHash: manifest.semanticContextHash || manifest.contextHash,
+      providerPayloadHash: manifest.providerPayloadHash,
+      ...extra,
+      turnManifest: next,
+    };
+  };
+  const settleFromTerminal = (terminal) => {
+    if (!terminal || typeof terminal !== "object") {
+      return null;
+    }
+    if (terminal.status === "completed") {
+      if (terminal.outputRetained === false) {
+        return finish({ outputUnretained: true });
+      }
+      const finalText = terminalOutputText(terminal.output);
+      if (finalText && streamedChars === 0) {
+        seq += 1;
+        emit("", finalText, false);
+      }
+      return finish();
+    }
+    if (terminal.status === "cancelled") {
+      return finish({ aborted: true });
+    }
+    if (terminal.status === "settlement_unknown") {
+      return finish({ settlementUnknown: true });
+    }
+    const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
+    const code = String(detail.code || terminal.status || "run_failed");
+    patch({ state: TurnState.FAILED, completedAt: Date.now(), error: code.slice(0, 120) });
+    throw contractError(
+      code,
+      String(detail.message || `run ${terminal.status}`),
+    );
+  };
+  const createdTerminal = created.terminal && typeof created.terminal === "object" ? created.terminal : null;
+  rememberBackendReport(offer?.offerId, createdTerminal?.backend_report, runId);
+  if (createdTerminal && created.output_retained === false) {
+    createdTerminal.outputRetained = false;
+  }
+  if (!createdTerminal) {
+    patch({ state: activeRun === run ? TurnState.STREAMING : TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+  }
+  if (activeRun === run) onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  if (!createdTerminal && run.cancelRequested && activeRun === run) void abortLiveChatStream();
+
+  try {
+    if (createdTerminal) {
+      return settleFromTerminal(createdTerminal);
+    }
+    for (;;) {
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
+      }
+      const page = await modelRunCall("runs_events", {
+        run_id: runId,
+        request_id: newRequestId(),
+        after_sequence: afterSequence,
+      });
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
+      }
+      const applied = applyRunEventsPage(page, afterSequence);
+      rememberBackendReport(offer?.offerId, applied.backendReport, runId);
+      afterSequence = applied.nextCursor;
+      let eventsInSlice = 0;
+      let sliceStart = Date.now();
+      for (const delta of applied.textDeltas) {
+        if (epoch !== liveStreamEpoch || activeRun !== run) {
+          return finish({ detached: true });
+        }
+        seq += 1;
+        streamedChars += delta.length;
+        emit("", delta, false);
+        eventsInSlice += 1;
+        if (eventsInSlice >= YIELD_EVENT_SLICE || Date.now() - sliceStart >= YIELD_MS) {
+          await yieldToBrowser();
+          eventsInSlice = 0;
+          sliceStart = Date.now();
+        }
+      }
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
+      }
+      const terminal = applied.terminal || (!applied.hasMore ? created.terminal : null);
+      const settled = settleFromTerminal(terminal);
+      if (settled) {
+        return settled;
+      }
+      if (applied.hasMore) {
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, CONTRACT_POLL_MS));
+    }
+  } finally {
+    if (activeRun === run) {
+      activeRun = null;
+    }
+  }
+}

@@ -261,7 +261,7 @@ These decisions keep the layers from collapsing into one another:
 | Trusted core | Runtime contains only enforcement that must be trusted. UI and protocol policy remain outside it. |
 | Capsule ABI | The checked Component and Bus contracts are the executable Component path. WASI Preview 1 is rejected at product admission. Shipped first-party UI Apps remain web projections until migrated explicitly. |
 | Host adapters | HTTP, browser messaging, loopback, stdio, and in-process calls may implement an adapter, but do not become capsule APIs. |
-| Provider namespace | A provider exposes a typed Runtime-facing contract. Its protocol, credentials, topology, and local bridges stay behind that contract. |
+| Provider namespace | A provider exposes a typed Runtime-facing contract. Its protocol, topology, and local bridges stay behind that contract; Runtime owns hosted model credentials. |
 | Release trust | Runtime verifies expected hashes, signatures, and publisher policy regardless of the transport that delivered an artifact. |
 | Carrier | Carrier is the endpoint-authenticated transport selected by Runtime for peer, message, stream, and content traffic. It does not prove message authorship, grant capabilities, or replace local dispatch. |
 
@@ -404,10 +404,13 @@ a universal CRUD interface or hand-maintained architecture table. New provider
 families must define a typed contract before becoming visible in Home. The
 [documentation index](README.md) lists the current provider contracts.
 
-For model inference, the provider owns backend credentials, selection,
-streaming, cancellation, and error translation. Runtime authorizes the caller
-and selection policy. Model output can propose another typed effect but cannot
-authorize it. See [MODEL_PROVIDER.md](MODEL_PROVIDER.md).
+For model inference, Runtime owns hosted credentials, exact HTTPS destinations,
+caller authority and selection policy. The confined provider owns backend
+adaptation, streaming, cancellation and error translation. The temporary Mac
+operator route bypasses normal Inbox decision and grant checks while enabled;
+the permanent SEC1 authority gate remains open. Model output can propose
+another typed effect but cannot authorize it. See
+[MODEL_PROVIDER.md](MODEL_PROVIDER.md).
 
 ## Orchestration and Runtime communication
 

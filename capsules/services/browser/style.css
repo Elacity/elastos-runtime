@@ -380,6 +380,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   border: 1px solid color-mix(in srgb, var(--color-danger) 26%, transparent);
   border-radius: 7px;
@@ -387,6 +388,16 @@ code {
   background: color-mix(in srgb, var(--color-danger) 9%, transparent);
   color: var(--color-danger);
   font-size: 13px;
+}
+
+.service-terms {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1 1 100%;
+  color: var(--color-text-primary);
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .service-confirm-actions {

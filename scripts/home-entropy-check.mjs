@@ -184,11 +184,13 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -209,11 +211,13 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -442,10 +446,12 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -465,6 +471,7 @@ function isTestOrGeneratedPath(path) {
   const name = parts.at(-1)?.toLowerCase() || "";
   return (
     parts.includes("target") ||
+    parts.includes("target-build") ||
     parts.includes("tests") ||
     parts.includes("test") ||
     parts.includes("__tests__") ||
@@ -728,6 +735,7 @@ const activeUiFiles = [
   "capsules/wallet/browser/style.css",
   "capsules/browser/browser/index.html",
   "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-restore-boot.js",
   "capsules/browser/browser/browser-clipboard.js",
   "capsules/browser/browser/browser-history.js",
   "capsules/browser/browser/browser-input.js",
@@ -864,25 +872,38 @@ for (const [token, value] of new Map([
 }
 
 const assistantIndex = read("capsules/assistant/browser/index.html");
-const assistantScript = read("capsules/assistant/browser/assistant.js");
-const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantController = read("capsules/assistant/browser/assistant.js");
+const assistantEntry = read("capsules/assistant/browser/home-agent.js");
+const assistantWorkspace = read("capsules/assistant/browser/harness-host.js");
+const assistantModes = read("capsules/assistant/browser/assistant-modes.js");
+const assistantScript = [assistantController, assistantEntry, assistantWorkspace, assistantModes,
+  read("capsules/assistant/browser/agent-live.js")].join("\n");
+const assistantStyle = ["style.css", "home-agent.css", "agent-harness.css", "assistant-modes.css"]
+  .map(name => read(`capsules/assistant/browser/${name}`)).join("\n");
+const assistantWorkspaceGateway = read("elastos/crates/elastos-server/src/api/gateway_assistant_workspace_v2.rs");
 const assistantGateway = read(
   "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
 );
 const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
-  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
-  "Assistant must boot through its capsule-owned browser shell",
+  assistantIndex.includes('<script type="module" src="./home-agent.js"></script>') &&
+    assistantEntry.includes('from "./assistant-modes.js"') &&
+    assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
+  "Assistant boots the canonical shell and uses the typed controller for Studio",
+);
+assert(
+  assistantController.includes('from "./model-contract.js"'),
+  "Assistant Chat and Studio decode events through the typed contract module",
 );
 assert(
   !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
   "Assistant must not add browser-owned persistence",
 );
 assert(
-  assistantScript.includes("/api/apps/assistant/workspace") &&
-    !assistantScript.includes("workspace.json") &&
-    !assistantScript.includes("session.agent"),
+  assistantWorkspace.includes('const WORKSPACE_URL = "/api/apps/assistant/workspace-v2"') &&
+    !assistantWorkspace.includes("workspace.json") &&
+    !assistantWorkspace.includes("session.agent"),
   "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
 );
 assert(
@@ -919,17 +940,27 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+    // SVG namespace identifiers inside local data images are not endpoints.
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`.replaceAll("http://www.w3.org/2000/svg", "svg-namespace"),
   ),
   "Assistant capsule source must not expose backend endpoints, topology, or credentials",
 );
 assert(
-  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
-  "Assistant workspace must expose exactly one dedicated Runtime route",
+  (gatewaySource.match(/"\/api\/apps\/assistant\/workspace-v2"/g) || []).length === 1 &&
+    (gatewaySource.match(/"\/api\/apps\/assistant\/workspace"/g) || []).length === 1,
+  "Assistant has one canonical v2 route and retains the legacy workspace route",
+);
+assert(
+  assistantWorkspaceGateway.includes('const SCHEMA: &str = "elastos.assistant.workspace/v2"') &&
+    assistantWorkspaceGateway.includes("MAX_BYTES: usize = 8 * 1024 * 1024") &&
+    assistantWorkspaceGateway.includes('const RELATIVE_PATH: &str = ".AppData/ElastOS/Assistant/workspace-v2.json"') &&
+    assistantWorkspaceGateway.includes("read_principal_root_object(") &&
+    assistantWorkspaceGateway.includes("write_protected_principal_root_object("),
+  "Canonical Assistant uses bounded v2 storage under the protected principal root",
 );
 assert(
   (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
-  "Assistant workspace must use one bounded v1 schema",
+  "Legacy Assistant reads retain their v1 schema",
 );
 assert(
   (assistantGateway.match(
@@ -940,7 +971,7 @@ assert(
     ) || []).length === 1 &&
     (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
     (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
-  "Assistant workspace must use exactly one protected principal-root file",
+  "Legacy Assistant retains its exact protected workspace file for adoption",
 );
 assert(
   assistantGateway.includes("read_principal_root_object(") &&
@@ -949,7 +980,7 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    assistantGateway,
+    `${assistantGateway}\n${assistantWorkspaceGateway}`,
   ),
   "Assistant workspace route must not encode backend endpoints, topology, or credentials",
 );
@@ -1025,6 +1056,7 @@ assert(
 assert(
   systemJs.includes('"/api/apps/system/summary"') &&
     systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes('"/api/apps/system/ai-provider"') &&
     systemJs.includes("createHomeClipboardClient") &&
     systemJs.includes('targetId: "system"') &&
     systemJs.includes('purpose: "identity.did"') &&
@@ -1527,6 +1559,9 @@ const carrierBridge = read(
   "elastos/crates/elastos-server/src/resource_bridge.rs",
 );
 const carrierRuntime = read("elastos/crates/elastos-server/src/carrier.rs");
+const modelServiceRuntime = read(
+  "elastos/crates/elastos-server/src/api/gateway_model_service.rs",
+);
 const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
 const runtimeControl = read(
   "elastos/crates/elastos-server/src/runtime_control.rs",
@@ -1553,6 +1588,7 @@ const chainProvider = readAll([
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
+  "elastos/crates/elastos-common/src/browser_protocol.rs",
   "capsules/browser-engine-adapter/src/main.rs",
   "capsules/browser-engine-adapter/src/display.rs",
   "capsules/browser-engine-adapter/src/ids.rs",
@@ -1994,11 +2030,13 @@ assert(
   "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
 );
 assert(
-  !/agent|harness/i.test(shellStages) &&
-    !/agent|harness/i.test(shellExpose) &&
+  shellStages.includes("export function bindAgentSpace(hooks)") &&
+    !/import[^;]*(shell-assistant-face|agent-|home-agent)/.test(shellStages) &&
+    !/harness|agent-shelf|shelf-handover|home-agent/i.test(shellStages) &&
+    !/harness|agent-shelf|shelf-handover|home-agent|assistant-face/i.test(shellExpose) &&
     !shellWindows.includes("AgentWorkspace") &&
     !homeGuiTemplateHtml.includes("agent"),
-  "Stages and Mission Control migrate without the agent harness: no Agent Space, no shelf morph, no workspace snapshot hook",
+  "Stages list the Agent room as a Space and only ask the face to open or close it: no harness, shelf morph, capsule import or workspace snapshot hook in Stages or Mission Control",
 );
 assert(
   !/fetch\(/.test(shellStages) &&
@@ -2591,6 +2629,14 @@ assert(
   "Home must allow Library picker results to return only to Archive, Browser and Chat Room",
 );
 assert(
+  shellJs.includes('assistant: new Set(["marketplace", "system", "inbox"])') &&
+    shellJs.includes('"home-agent": new Set(["marketplace", "system", "inbox"])') &&
+    shellJs.includes("assistantModelsMarketplaceQuery") &&
+    shellJs.includes("assistantAiProviderSettingsQuery") &&
+    shellJs.includes("marketplaceAssistantHandoffQuery"),
+  "Assistant Models, Settings, and Inbox handoffs must use bounded destinations and queries",
+);
+assert(
   shellJs.includes('marketplace: "runtime-target"') &&
     shellJs.includes('if (policy === "runtime-target")') &&
     shellJs.includes("return normalizedActiveShellName(target) !== HOME_GUI_SHELL_ID;"),
@@ -2689,7 +2735,7 @@ assert(
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
-    shellWindows.includes('"people",') &&
+    JSON.parse(peopleCapsule).window_policy === "single" &&
     shellJs.includes('people: new Set(["chat-room", "system"])') &&
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
@@ -2716,8 +2762,9 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260819a") &&
-    servicesIndex.includes("services-20260711i") &&
+    servicesIndex.includes("services-20260921b") &&
+    servicesIndex.includes("./style.css?v=services-20260921b") &&
+    servicesIndex.includes("./services.js?v=services-20260921b") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
@@ -2729,11 +2776,18 @@ assert(
     servicesScript.includes('const EXIT_SERVICE_KIND = "remote_exit"') &&
     servicesScript.includes('const BROWSER_ENGINE_SERVICE_KIND = "browser_engine"') &&
     servicesScript.includes('const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit"') &&
+    servicesScript.includes('const HOSTED_SHARE_SOURCE = "hosted_connection"') &&
+    servicesScript.includes("HOSTED_SHARE_TERMS_BY_PROCESSOR") &&
+    servicesScript.includes("openrouter-5.1-5.2+model") &&
+    servicesScript.includes("venice-7.3+model") &&
+    servicesScript.includes("Hosted connections stay private until you enable Share") &&
+    !servicesScript.includes("hosted models stay private") &&
     servicesScript.includes("VISIBLE_SERVICE_KINDS") &&
     servicesScript.includes("visibleServiceOffers") &&
     servicesScript.includes("isReadOnlyServiceOffer") &&
     servicesScript.includes("Managed by config") &&
     servicesScript.includes("Approved") &&
+    servicesScript.includes("Expired") &&
     servicesScript.includes("Denied") &&
     servicesScript.includes("serviceRequestStatus") &&
     servicesScript.includes("Share with People") &&
@@ -2748,6 +2802,7 @@ assert(
     servicesStyle.includes(".settings-sidebar") &&
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
+    servicesStyle.includes(".service-terms") &&
     servicesStyle.includes(".pc2-btn-danger") &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
@@ -2786,15 +2841,25 @@ assert(
     gatewayApi.includes("elastos.service-access-decision/v1") &&
     gatewayApi.includes("home_services_sync_access_decisions") &&
     gatewayApi.includes("home_services_send_access_decision") &&
-    gatewayApi.includes("home_services_install_remote_exit_grant") &&
-    gatewayApi.includes("home_services_remove_remote_exit_grant") &&
+    gatewayApi.includes("home_services_activate_pending_decision") &&
+    gatewayApi.includes("home_services_commit_exit_config") &&
+    gatewayApi.includes("elastos.exit.config-ack/v1") &&
+    gatewayApi.includes("pending_access_decision") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_waits_for_provider_ack") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_fences_held_ack_and_rolls_back_failed_state_write") &&
     gatewayApi.includes("elastos.service.remote-exit-grant/v1") &&
     gatewayApi.includes("installed_remote_exit_id") &&
     gatewayApi.includes(
       "Carrier service access request was not delivered to the other person's device",
     ) &&
     gatewayHomeSystemTests.includes('approved_offer["status"], "active"') &&
-    gatewayHomeSystemTests.includes("fake-ticket-services-right") &&
+    gatewayHomeSystemTests.includes('format!("fake-ticket-{right_peer_id}")') &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_rejects_other_principal_and_removed_contact",
+    ) &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_ignores_substituted_legacy_endpoint",
+    ) &&
     gatewayHomeSystemTests.includes(
       'assert_eq!(approved_offer["grant_required"], false)',
     ) &&
@@ -3057,14 +3122,15 @@ assert(
 );
 assert(
   shellAuthJs.includes("profileReadinessActionTarget") &&
-    shellAuthJs.includes('return "people"') &&
+    !shellAuthJs.includes('return "people"') &&
     shellAuthJs.includes('return "system"') &&
-    shellJs.includes("openTargetFromHomeGui(profileActionTarget)") &&
+    shellJs.includes("openTargetFromHomeGui(profileActionTarget, { query })") &&
+    shellJs.includes('query.recovery = "import"') &&
     peopleScript.includes('readiness.schema === "elastos.profile.readiness/v1"') &&
     peopleScript.includes('profileForm?.dataset.profileState === "unavailable"') &&
     !peopleScript.includes("identity.profile ?") &&
     !peopleDiscoverySmoke.includes("identity.profile ?"),
-  "First-run Profile UX must consume typed Runtime readiness: only setup-required opens People, while unavailable, missing, or unknown authority fails closed through System without browser identity inference",
+  "First-run Profile UX must consume typed Runtime readiness: setup-required opens System import, while unavailable, missing, or unknown readiness checks System without browser identity inference",
 );
 const peopleProfileSave = sourceBlock(
   gatewayApi,
@@ -3073,19 +3139,16 @@ const peopleProfileSave = sourceBlock(
 );
 assert(
   peopleProfileSave.includes("validate_profile_authority_update") &&
-    peopleProfileSave.includes("principal_root_recovery_status_for_context") &&
-    peopleProfileSave.includes("PeopleProfileProtectionRequiredResponse") &&
-    gatewayApi.includes("elastos.people.profile-protection-required/v1") &&
+    peopleProfileSave.includes("require_profile_authority_passkey_binding") &&
+    peopleProfileSave.includes("initialize_local_profile") &&
     !peopleProfileSave.includes("ensure_principal_root_protection") &&
     !peopleProfileSave.includes("RecoveryKitDelivery") &&
-    peopleScript.includes("elastos.people.profile-protection-required/v1") &&
-    peopleScript.includes("Open System") &&
-    peopleScript.includes("choose Security") &&
+    !peopleScript.includes("elastos.people.profile-protection-required/v1") &&
     authGatewayApi.includes("mark_recovery_kit_handed_to_person") &&
     gatewayHomeSystemTests.includes(
-      "test_people_profile_creation_requires_completed_system_recovery_without_partial_state",
+      "existing_profile_setup_protects_root_without_claiming_recovery",
     ),
-  "People Profile creation must remain mutation-free until verified System Recovery protection exists; People never mints or retains unseen Recovery material",
+  "Runtime initializes local Profile protection under current passkey authority; exporting a Recovery Kit remains a separate action",
 );
 assert(
   profileUpdates.includes(
@@ -3585,18 +3648,30 @@ assert(
     !fileExists("capsules/gba-engine-provider"),
   "GBA ROM and save access must use generic Runtime viewer routes without a host engine provider",
 );
+const guardedDocumentsProvider = documentsProvider.replace(/objects\s*\.\s*(read|write)\s*\(/g, "objects.$1(");
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_load_body(",
-  "read_principal_root_object(",
+  "objects.read(",
   "Documents body reads",
 );
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_write_body(",
-  "write_principal_root_object(",
+  "objects.write(",
   "Documents body writes",
 );
+for (const entry of ["documents_load_document", "documents_save_local", "documents_create_local", "documents_save_as_local", "documents_import_chat_attachment_local", "documents_delete_local", "documents_export_publish", "documents_finish_publish", "documents_unpublish_local", "documents_load_summary"]) {
+  assert(sourceBlock(documentsProvider, `fn ${entry}(`, entry).includes("PrincipalRootObjectMutation::acquire(data_dir)?"),
+    `${entry} must share the principal-root mutation guard`);
+}
+const documentObjectGuard = sourceBlock(runtimeAuth, "impl<'a> PrincipalRootObjectMutation<'a>", "Documents object guard");
+assert(documentObjectGuard.includes("principal_root_object_mutation_lock()") &&
+  documentObjectGuard.includes("validate_principal_root_object_binding(") &&
+  documentObjectGuard.includes("validate_principal_root_object_path(") &&
+  documentObjectGuard.includes("read_principal_root_object_locked(") &&
+  documentObjectGuard.includes("write_principal_root_object_locked("),
+  "Documents guard must retain authenticated principal-root reads and writes");
 assertProtectedPrincipalRootAccessor(
   gatewayApi,
   "fn home_browser_state(\n",
@@ -3612,13 +3687,16 @@ assertProtectedPrincipalRootAccessor(
 assert(
   gatewayApi.includes("is_unencrypted_principal_root_state") &&
     gatewayTests.includes(
-      "test_home_browser_state_resets_plaintext_for_protected_principal_root",
+      "test_home_browser_state_defaults_preserve_protected_plaintext_and_refuse_overwrite",
+    ) &&
+    gatewayTests.includes(
+      "test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite",
     ) &&
     gatewayTests.includes(
       "test_home_summary_ignores_services_state_left_unencrypted_before_root_protection",
     ) &&
     gatewayTests.includes("test_home_summary_ignores_invalid_protected_services_state"),
-  "Home must reset untrusted or invalid principal-root UI state without accepting it",
+  "Home must return defaults for unreadable principal-root UI state, preserve its bytes and refuse overwrite",
 );
 assertProtectedPrincipalRootAccessor(
   gatewayApi,
@@ -4408,7 +4486,7 @@ assertProtectedPrincipalRootAccessor(
 assertProtectedPrincipalRootAccessor(
   viewerGatewayApi,
   "pub async fn viewer_storage_put(",
-  "write_principal_root_object(",
+  "write_principal_root_object_if_revision(",
   "Viewer/content storage writes",
 );
 assert(
@@ -4724,6 +4802,42 @@ const publishRustRequired = rustConstItems(
 );
 const homeProfile = new Set(components.profiles.home.components);
 const demoProfile = new Set(components.profiles.demo.components);
+assert(
+  homeProfile.has("model-provider") &&
+    homeProfile.has("llama-server") &&
+    demoProfile.has("model-provider") &&
+    demoProfile.has("llama-server"),
+  "Home and demo profiles must install model-provider and llama-server",
+);
+assert(
+  ![...homeProfile].some((component) => component.startsWith("model-qwen")),
+  "Home profile must not install huggingface GGUF components",
+);
+assert(
+  typeof components.model_catalog?.head_cid === "string" &&
+    components.model_catalog.head_cid.startsWith("bafkrei") &&
+    Array.isArray(components.model_catalog.publisher_dids) &&
+    components.model_catalog.publisher_dids.length === 1 &&
+    components.model_catalog.local_use?.max_cache_bytes >= 18516684377 &&
+    components.model_catalog.local_use?.max_model_memory_bytes >= 8589934592,
+  "components.json must pin the signed permanent model catalog with Qwen local-use floors",
+);
+const modelCatalog = JSON.parse(read("model-catalog.json"));
+assert(
+  modelCatalog.signer_did === components.model_catalog.publisher_dids[0] &&
+    modelCatalog.payload?.schema === "elastos.model.catalog/v1" &&
+    !Object.hasOwn(modelCatalog.payload, "expires_at") &&
+    modelCatalog.payload.entries?.[0]?.cid ===
+      "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi",
+  "repo model-catalog.json must be the permanent Qwen publisher snapshot",
+);
+assert(
+  publishReleaseScript.includes("model_catalog") &&
+    publishReleaseScript.includes("model-catalog.json") &&
+    setupSourceHome.includes("install_signed_model_catalog") &&
+    setupSourceHome.includes("install_local_model_engine"),
+  "publish and source-home setup must carry the signed catalog and llama-server",
+);
 const protectedRuntimeProviders = new Set([
   "protected-content-protect-provider",
   "media-provider",
@@ -4830,10 +4944,11 @@ for (const component of [
   "browser-engine-supervisor",
   "browser-native-proxy-engine",
   "browser-stream-bridge",
-  "browser-local-exit",
-  "object-provider",
-  "wallet-provider",
-]) {
+        "browser-local-exit",
+        "object-provider",
+        "wallet-provider",
+        "model-provider",
+    ]) {
   assert(homeProfile.has(component), `Home profile must install ${component}`);
   assert(
     components.external[component],
@@ -4985,6 +5100,38 @@ assert(
   "Marketplace must trust the installed-active catalog instead of inferring product state from source or bundle labels",
 );
 assert(
+  marketplaceUi.includes('elastos.marketplace.navigate/v1') &&
+    marketplaceUi.includes("function applyModelsLaunch") &&
+    marketplaceUi.includes('target: "assistant"') &&
+    marketplaceUi.includes("onReadyOpen: openReadyModelInAssistant") &&
+    read("capsules/home-gui/browser/shell-windows.js").includes(
+      'type: "elastos.marketplace.navigate/v1"',
+    ) &&
+    read("capsules/marketplace/browser/model-management.js").includes(
+      '"Open in Assistant"',
+    ),
+  "Marketplace must accept Models navigation and open a ready CID in Assistant",
+);
+assert(
+  marketplaceUi.includes('data-action="open-ai-provider-settings"') &&
+    marketplaceUi.includes("Manage models") &&
+    !marketplaceUi.includes("OpenRouter") &&
+    read("capsules/assistant/browser/agent-harness.js").includes('["open-ai-provider-settings", "Manage models"]') &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("OpenRouter"),
+  "Assistant and Marketplace must retain their System model-management links",
+);
+assert(
+  assistantIndex.includes('placeholder="Message Assistant"') &&
+    !assistantIndex.includes("Ask on this machine") &&
+    !assistantIndex.includes("agent-think-btn") &&
+    assistantIndex.includes("Show reasoning on replies") &&
+    assistantIndex.includes('aria-haspopup="listbox"') &&
+    (assistantIndex.match(/id="agent-model-picker"/g) || []).length === 1 &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("cost unknown") &&
+    !read("capsules/assistant/browser/agent-shelf.js").includes("Ask on this machine"),
+  "Assistant composer must stay route-neutral with one model selector and no Think chip",
+);
+assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
     marketplaceUi.includes("function acceptedContentLabels(") &&
     marketplaceUi.includes("function executableActions(") &&
@@ -5000,13 +5147,13 @@ assert(
   "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
-  marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
+  marketplaceUi.includes('capsule.cid ? "Verified app" : "Local app"') &&
     marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
     marketplaceUi.includes("Trust:") &&
     marketplaceUi.includes("Status:") &&
     marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
-    !marketplaceUi.includes("Content ID") &&
+    !marketplaceUi.replace(/function technicalDetails\(app\) \{[\s\S]*?function packageLabel/, "").includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
     !marketplaceUi.includes("Package identity:") &&
     !marketplaceUi.includes('price-tag">${app.cid ? "CID"') &&
@@ -5218,6 +5365,7 @@ const walletStyle = read("capsules/wallet/browser/style.css");
 const browserManifest = read("capsules/browser/capsule.json");
 const browser = read("capsules/browser/browser/index.html");
 const browserMain = read("capsules/browser/browser/browser.js");
+const browserRestoreBoot = read("capsules/browser/browser/browser-restore-boot.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -5239,13 +5387,18 @@ const browserUnloadReleaseBlock = sourceBlock(
 );
 assert(
   browserJs.includes('window.addEventListener("beforeunload"') &&
-    browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
+    browserJs.includes('window.addEventListener("pagehide"') &&
+    browserJs.includes("startRecoverableDisplayAttach();") &&
     browserUnloadReleaseBlock.includes("stopPageStatusPolling();") &&
     browserUnloadReleaseBlock.includes("stopPageHeartbeat();") &&
     !browserUnloadReleaseBlock.includes("resizeObserver") &&
     !browserUnloadReleaseBlock.includes("closeRuntimePage(") &&
     !browserUnloadReleaseBlock.includes("publishRuntimePageForHost(null)") &&
     !browserUnloadReleaseBlock.includes("closeRemoteDisplay()") &&
+    !browserUnloadReleaseBlock.includes("prepareRecoverableDisplayAttach") &&
+    !browserUnloadReleaseBlock.includes("startRecoverableDisplayAttach") &&
+    !browserUnloadReleaseBlock.includes("display_attach") &&
+    !browserUnloadReleaseBlock.includes("keepalive") &&
     browserJs.includes("createRuntimePageCleanupController") &&
     browserJs.includes("requireTerminalRuntimePageCloseOutcome") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage") &&
@@ -5355,7 +5508,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260819f";
+const systemAssetVersion = "system-models-20260923a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -5665,6 +5818,8 @@ assert(
     inbox.includes('entry.kind !== "inspect_action_request"') &&
     inbox.includes("wallet-price-http-approve:") &&
     inbox.includes("wallet-price-http-deny:") &&
+    inbox.includes("hosted-http-approve:") &&
+    inbox.includes("hosted-http-deny:") &&
     gatewayApi.includes("append_runtime_capability_notifications") &&
     gatewayApi.includes("/api/capability/pending") &&
     gatewayTests.includes(
@@ -5839,12 +5994,13 @@ assert(
     archiveManager.includes('title: "File"') &&
     archiveManager.includes('title: "Edit"') &&
     archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
-    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("acceptLibraryPickerObject(data)") &&
     archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
     archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
     justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
     justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
-  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
+  "Archive must keep parent-owned menus separate from exact Home picker delivery and retain the shared UI tokens and dedicated smokes",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
@@ -5873,7 +6029,8 @@ assert(
     archiveManager.includes('returnTarget: "archive-manager"') &&
     archiveManager.includes('archive:open-library-object') &&
     archiveManager.includes("async function openLibraryObject(object)") &&
-    archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
+    archiveManager.includes('requestId: libraryPickerRequest.id') &&
+    !archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
     archiveManager.includes("Extract selected") &&
     archiveManager.includes("Extract all") &&
     archiveManager.includes("Select visible") &&
@@ -6016,7 +6173,7 @@ assert(
     shellSurface.includes("function canRevealDesktopObject(object)") &&
     homeShellRegressionSmoke.includes("desktop object without capability metadata opened instead of failing closed") &&
     homeShellRegressionSmoke.includes("desktop object actions without capability metadata reached Runtime") &&
-    shellSurface.includes('openTarget("library", { query: { uri: object.uri } })') &&
+    shellSurface.includes('openTarget("library", { ...options, query: { uri: object.uri } })') &&
     shellSurface.includes("desktopObjectViewer(object)") &&
     shellSurface.includes('openTarget(viewer,') &&
     shellSurface.includes('objectUri: object.uri') &&
@@ -6780,9 +6937,27 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    /"content"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+    /"content"\s*\|\s*"model"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
       carrierRuntime,
     ) &&
+    // The model target is admitted only through the destination-owned grant
+    // check; the generic registry path must never serve it.
+    carrierRuntime.includes('if msg.data["target"] == "model" {') &&
+    carrierRuntime.includes("crate::api::gateway::invoke_remote_model(") &&
+    modelServiceRuntime.includes("authorize_home_service_model(") &&
+    modelServiceRuntime.includes("fn remote_principal_id(") &&
+    modelServiceRuntime.includes('local_object.remove("_runtime_invocation");') &&
+    modelServiceRuntime.includes("fn shareable_offers(") &&
+    modelServiceRuntime.includes("fn shareable_offers_for_home(") &&
+    modelServiceRuntime.includes("fn shareable_listed_offers(") &&
+    modelServiceRuntime.includes("fn public_shared_offer(") &&
+    modelServiceRuntime.includes("crate::api::offer_is_shareable(offer)") &&
+    modelServiceRuntime.includes("shareable_offers_include_explicitly_shared_hosted") &&
+    gatewayApi.includes("/api/apps/system/ai-provider/share") &&
+    gatewayApi.includes("Hosted connections stay private until you enable Share") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_guest_forbidden") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_requires_terms_and_preserves_peer") &&
+    modelServiceRuntime.includes("fn redact_provider_error(") &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
     carrierRuntime.includes("with_carrier_endpoint_and_registry") &&
@@ -7360,6 +7535,38 @@ assert(
   "System browser assets must be cache-busted after UI changes",
 );
 assert(
+  system.includes('data-settings="models"') &&
+    system.includes('data-ai-provider') &&
+    system.includes('id="ai-provider-title" class="pc2-section-title">Hosted<') &&
+    system.includes("Add hosted model") &&
+    !system.includes("This Home stores the key.") &&
+    !system.includes("The selected processor receives prompts outside this Home.") &&
+    system.includes("This Home owns the system prompt for Venice.") &&
+    system.includes('id="ai-provider-name"') &&
+    system.includes('id="ai-provider-kind"') &&
+    system.includes("Hosted by") &&
+    system.includes('value="openrouter"') &&
+    system.includes('value="venice"') &&
+    system.includes('id="ai-provider-key"') &&
+    system.includes('type="password"') &&
+    system.includes('autocomplete="off"') &&
+    system.includes('id="ai-provider-validate"') &&
+    system.includes('id="ai-provider-save"') &&
+    system.includes(">Check key and load models<") &&
+    system.includes(">Save<") &&
+    !system.includes("Share OpenRouter") &&
+    !system.includes("Share Venice") &&
+    systemJs.includes('"/api/apps/system/ai-provider/validate"') &&
+    systemJs.includes("provider: selectedProvider()") &&
+    systemJs.includes("Use in Assistant") &&
+    systemJs.includes("Share as service") &&
+    systemJs.includes('replaceButton.textContent = "Edit"') &&
+    systemJs.includes("Leave the API key blank to keep the stored key.") &&
+    systemJs.includes("Disconnect") &&
+    systemJs.includes("ElastosModelManagement.create"),
+  "System Models tab must host named hosted-model instances with a masked key",
+);
+assert(
   (systemJs.match(/function notifyHomeSummaryChanged\(/g) || []).length === 1,
   "System must keep one Home summary notification helper",
 );
@@ -7685,12 +7892,18 @@ assert(
 );
 assert(
   shellIndex.includes('id="home-unlock-name"') &&
-    shellAuth.includes("display_name: displayName"),
-  "Home passkey creation must collect and persist a passkey/user display name",
+    shellAuth.includes('public_name: displayName') &&
+    shellAuth.includes('JSON.stringify({ intent: pending.intent })'),
+  "Home Create must bind its explicit public name to the registration intent",
 );
 assert(
-  shellAuth.includes("Enter a name for this passkey."),
-  "Home must not create anonymous Passkey/guest principals",
+  shellAuth.includes("Enter the display name people will see.") &&
+    shellAuth.includes('intent: pending.intent') &&
+    !shellAuth.includes("profile_display_name: displayName") &&
+    !shellAuth.includes("display_name: displayName") &&
+    shellIndex.includes('id="home-enrollment-recover"') &&
+    shellIndex.includes('id="home-unlock-name-label"'),
+  "Home guided enrollment must keep Create consent in one intent and offer Recover",
 );
 assert(
   shellAuth.includes("Create guest account") &&
@@ -7716,7 +7929,7 @@ assert(
 assert(
   !shellAuth.includes("status.accounts") &&
     !shellAuth.includes("profile_setup_display_name") &&
-    !shellAuth.includes("guestRegistrationAvailable"),
+    shellAuth.includes("guestRegistrationAvailable = guestRegistrationEnabled;"),
   "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
@@ -7725,7 +7938,7 @@ assert(
   "Home guest creation must be a distinct state, not blended into sign-in",
 );
 assert(
-  shellAuth.includes("setUnlockNameVisible(canCreate)") &&
+  shellAuth.includes('setUnlockNameVisible(enrolling && purpose === "create")') &&
     !shellAuth.includes(
       "const canCreate = !registered || guestRegistrationEnabled",
     ),
@@ -7794,9 +8007,9 @@ assert(
   "Protected-content contracts must reject hidden object, key-release, and decrypt-session authority fields at decode time",
 );
 assert(
-  shellStyle.includes(".visually-hidden") &&
-    shellIndex.includes('class="visually-hidden"'),
-  "Home unlock labels must use a real visually-hidden utility instead of leaking form labels into the UI",
+  shellIndex.includes('id="home-unlock-name-label" for="home-unlock-name"') &&
+    shellIndex.includes('aria-describedby="home-unlock-name-hint"'),
+  "Home enrollment keeps the public-name label and audience hint visible with the editable field",
 );
 assert(
   !shellStyle.includes("home-unlock-kicker"),
@@ -7859,7 +8072,9 @@ assert(
 assert(
   system.includes('id="recovery-password"') &&
     system.includes("Download Recovery Kit") &&
-    system.includes("Downloads everything recoverable for this account") &&
+    system.includes("Save your Profile, Home recovery authority, and included Wallet keys in one kit.") &&
+    system.includes('id="recovery-profile-name"') &&
+    systemJs.includes("intent.profile_display_name = name;") &&
     systemJs.includes("download_password") &&
     systemJs.includes("recoveryDownloadPassword") &&
     systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&
@@ -7878,7 +8093,7 @@ assert(
     recoveryKitLiveSmoke.includes(
       "elastos.full-recovery-bundle.import.response/v2",
     ),
-  "System Recovery Kit download must be the full recover-everything path: data root plus built-in Wallet keys with optional password wrapping",
+  "System Recovery Kit export requires an existing Profile and preserves root authority, included Wallet keys, optional password wrapping and audited import",
 );
 assert(
     system.includes('id="recovery-import"') &&
@@ -8219,8 +8434,10 @@ assert(
   "System must not hold browser wallet adapter authority",
 );
 const tasks = read("TASKS.md");
+const deferredWork = read("docs/audits/2026-09-23-open-backlog-snapshot.md");
 const browserPlanningSurface = [
   tasks,
+  deferredWork,
   read("docs/BROWSER_CAPSULE.md"),
   read("docs/BROWSER_PROVIDER_BAKEOFF.md"),
 ].join("\n");
@@ -8504,7 +8721,7 @@ assert(
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
     browserEngineAdapter.includes(
-      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1"',
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-binding/v2",
@@ -9286,7 +9503,7 @@ assert(
     currentState.includes("provider-role capsules now") &&
     currentState.includes("project authority metadata for service-plane inspection") &&
     currentState.includes("first_party_capsules_have_complete_projection_contract") &&
-    tasks.includes("Keep first-party capsule projection validation covered") &&
+    deferredWork.includes("Keep first-party capsule projection validation covered") &&
     homeShellHostContract.includes("first_party_capsules_have_complete_projection_contract") &&
     includesNormalized(currentState, "Runtime gates, approval, launch tokens, providers, and audit remain") &&
     includesNormalized(currentState, "no desktop GUI markup or code in the neutral host document") &&
@@ -9308,9 +9525,9 @@ assert(
     includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
     currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
     !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
-    tasks.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
-    includesNormalized(tasks, "Keep `elastos:bus@v1` bounded and immutable"),
-  "state.md and TASKS.md must preserve current Home shell proof truth and keep future Components and Bus work versioned",
+    deferredWork.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
+    includesNormalized(deferredWork, "Keep `elastos:bus@v1` bounded and immutable"),
+  "State and the dated backlog must preserve Home shell proof and versioned future Components and Bus work",
 );
 assert(
   homeShellManualUxReport.includes('const SCHEMA = "elastos.home-shell.manual-ux/v1"') &&
@@ -9803,6 +10020,8 @@ assert(
     ) &&
     browserSelkiesControlService.includes("HELLO client") &&
     browserSelkiesControlService.includes("SESSION server") &&
+    browserSelkiesControlService.includes("elastos_display_renegotiate") &&
+    browserSelkiesControlService.includes("DISPLAY_RENEGOTIATE_SIGNAL") &&
     browserSelkiesControlServiceSmoke.includes("HELLO 1") &&
     browserSelkiesControlServiceSmoke.includes("base64") &&
     browserSelkiesControlService.includes('offerer: "engine"') &&
@@ -9877,22 +10096,15 @@ assert(
     ) &&
     browserSelkiesRuntimeExitSmoke.includes("--cleanup-after-verify") &&
     setupSourceHome.includes("install_browser_runtime_helpers") &&
+    !setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    !setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
     !setupSourceHome.includes("browser-per-launch-selkies-supervisor.mjs") &&
     !setupSourceHome.includes("browser-selkies-runtime-exit-target.sh") &&
     !setupSourceHome.includes("browser-hosted-product-operator-config.mjs") &&
     !setupSourceHome.includes("browser-hosted-product-supervisor.mjs") &&
     setupSourceHome.includes("browser-selkies-control-service.mjs") &&
-    setupSourceHome.includes("browser-vm-selkies-start") &&
     setupSourceHome.includes("build Browser VZ engine supervisor") &&
     setupSourceHome.includes("-p elastos-vz --bin browser-vz-engine-supervisor") &&
-    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
-    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
-    setupSourceHome.includes("validate_linux_guest_binary") &&
-    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
-    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
-    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
-    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
-    setupSourceHome.includes("debugfs") &&
     read("scripts/browser-hosted-product-target-preflight.sh").includes(
       "browser-hosted-product-display-smoke.sh",
     ) &&
@@ -10248,6 +10460,13 @@ assert(
       "ice_servers: this.config.iceServers",
     ) &&
     browserSelkiesControlServiceSmoke.includes("status lost Runtime media relay proof") &&
+    browserSelkiesControlService.includes("waitForRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("settleRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("Selkies relay ICE for the new offer") &&
+    browserSelkiesControlService.includes("relayIceCandidates") &&
+    browserSelkiesControlService.includes("rememberIceCandidate") &&
+    browserSelkiesControlService.includes("this.remoteCandidateHistory = [];") &&
+    browserSelkiesControlService.includes("relayIceCandidates(") &&
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&
@@ -10638,8 +10857,10 @@ assert(
     rememberWindowRestoreBounds(entry.node);
     return;
   }`) &&
-    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"])') &&
-    !shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["browser"])') &&
+    shellWindows.includes('targetById(summary, targetId)?.window_policy === "single"') &&
+    !shellWindows.includes('SINGLE_SESSION_TARGETS') &&
+    [JSON.parse(peopleCapsule), inboxCapsuleManifest, walletCapsuleManifest, systemCapsuleManifest]
+      .every(manifest => manifest.window_policy === "single") &&
     shellWindows.includes("export function normalizeRestorableSession") &&
     shellWindows.includes("withBrowserInstanceQuery(options)") &&
     shellWindows.includes("activateTargetGroup(targetId)") &&
@@ -10657,18 +10878,37 @@ assert(
     ) &&
     shellWindowGeometry.includes("node.dataset.browserMaximized") &&
     shellWindowGeometry.includes("browserAspectResizeBounds"),
-  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, keep true singleton handling scoped to People, and must not install generic iframe auto-fit observers that fight the remote display during resize",
+  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, follow manifest-owned window policy, and keep generic iframe auto-fit observers outside the remote display resize path",
 );
 assert(
-  shellWindows.includes("query: normalizedLaunchQuery(entry.launchQuery)") &&
-    shellWindows.includes("query: restorableLaunchQuery(targetId, item)") &&
+  shellWindows.includes("query: restorableLaunchQuery(entry.targetId, { query: entry.launchQuery })") &&
+    shellWindows.includes("const query = restorableLaunchQuery(targetId, item)") &&
     shellWindows.includes('if (targetId === "browser" && !query.browser_instance)') &&
     shellWindows.includes('const launchQuery = targetId === "browser"') &&
     shellWindows.includes("withBrowserInstanceQuery({ query: options.query }).query") &&
     shellWindows.includes("query: restoredWindow.query") &&
+    shellWindows.includes("if (restoredWindow.hidden)") &&
     browserJs.includes("const stalePage = previousPage ? null : recoverableRuntimePage();") &&
     browserJs.includes("await closeRuntimePage(stalePage, {") &&
     browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browser.includes("browser-restore-boot.js?v=browser-20260915c") &&
+    browserRestoreBoot.includes("function waitForReadyAttach") &&
+    browserRestoreBoot.includes("function attachFromKnownUrl") &&
+    browser.includes('rel="modulepreload"') &&
+    browserRestoreBoot.includes("__elastosBrowserRestoreBoot") &&
+    browserRestoreBoot.includes("display_generation") &&
+    browserRestoreBoot.includes('generation.slice("display:".length)') &&
+    browserJs.includes("__elastosBrowserRestoreBoot") &&
+    browserJs.includes("persistRecoverableDisplayQuery") &&
+    browserJs.includes("function startRecoverableDisplayAttach") &&
+    browserJs.includes("keepalive: true") &&
+    browserJs.includes('pending.state === "pending" || pending.state === "ready"') &&
+    !browserJs.includes("prepareRecoverableDisplayAttach") &&
+    browserJs.includes("const connecting = connectRemoteDisplay") &&
+    browserJs.includes("postAnswerWithQueuedLocalIce") &&
+    !read("capsules/browser/browser/browser-remote-display.js").includes("waitForLocalAnswerIce") &&
+    browserJs.includes('url.searchParams.set("page_id"') &&
+    !browserRestoreBoot.includes("sessionStorage") &&
     !browserJs.includes("sessionStorage") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage"),
   "Home must persist Browser window launch query/browser_instance across restore while Browser recovers opaque Runtime cleanup ownership without frame-local session storage",
@@ -11398,7 +11638,7 @@ assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
     gatewayApi.includes("fn home_launch_target") &&
     gatewayApi.includes("fn is_home_visible_target") &&
-    gatewayApi.includes(
+    gatewayApi.replace(/\s+/g, " ").includes(
       "WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID",
     ) &&
     gatewayTests.includes(
@@ -11553,7 +11793,7 @@ assert(
 assert(
   gatewayApi.includes("pub(crate) fn home_launch_auth_data_dir") &&
     authGatewayApi.includes("home_launch_auth_data_dir(&state.data_dir)") &&
-    authGatewayApi.includes("crate::auth::renew_session_grant(&auth_data_dir") &&
+    /crate::auth::renew_session_grant_with_audit\(\s*&auth_data_dir\s*,\s*grant\.clone\(\)/.test(authGatewayApi) &&
     authGatewayApi.includes("an open child token must survive host session renewal") &&
     authGatewayApi.includes("crate::auth::revoke_session_grant(&auth_data_dir") &&
     authGatewayApi.includes(
@@ -11777,7 +12017,7 @@ assert(
   "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
 );
 const productionStorageTaskLines =
-  tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
+  deferredWork.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
   [];
 assert(
   productionStorageTaskLines.length === 1 &&
@@ -11799,7 +12039,7 @@ assert(
     productionStorageTaskLines[0].includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ),
-  "TASKS.md must keep exactly one open production multi-peer availability/storage infrastructure blocker",
+  "The dated open-backlog snapshot must preserve exactly one production multi-peer availability/storage infrastructure blocker",
   productionStorageTaskLines,
 );
 assert(
@@ -11864,7 +12104,7 @@ assert(
       "Optional storage-market endpoint-quorum admission gate",
     ) &&
     contentAvailabilityDoc.includes("Optional external repair-fleet dispatch") &&
-    tasks.includes(
+    deferredWork.includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ) &&
     namespacesDoc.includes("explicit capability keys"),

@@ -282,7 +282,11 @@ fn read_authority_key(path: &Path) -> anyhow::Result<SigningKey> {
     Ok(SigningKey::from_bytes(&key))
 }
 
-fn read_owner_only_file(path: &Path, max_bytes: usize, label: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_owner_only_file(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
     validate_owner_only_parent(path)?;
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to inspect {label}"))?;
@@ -312,7 +316,7 @@ fn read_owner_only_file(path: &Path, max_bytes: usize, label: &str) -> anyhow::R
     Ok(bytes)
 }
 
-fn create_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> anyhow::Result<()> {
+pub(crate) fn create_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> anyhow::Result<()> {
     let parent = validate_owner_only_parent(path)?;
     if fs::symlink_metadata(path).is_ok() {
         anyhow::bail!("{label} output already exists");
@@ -400,7 +404,10 @@ fn sha256_label(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
-fn write_receipt(output: &mut dyn Write, receipt: &impl Serialize) -> anyhow::Result<()> {
+pub(crate) fn write_receipt(
+    output: &mut dyn Write,
+    receipt: &impl Serialize,
+) -> anyhow::Result<()> {
     serde_json::to_writer(&mut *output, receipt)?;
     output.write_all(b"\n")?;
     Ok(())

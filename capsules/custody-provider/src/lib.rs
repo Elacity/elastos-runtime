@@ -3,11 +3,14 @@ use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
-use elastos_protected_content_contracts::{
-    NodeCustodyPublicKeyV1, NodePublicKey, RuntimeOperationIssuerKeyV1,
-    PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
-};
+use elastos_protected_content_contracts::{NodePublicKey, RuntimeOperationIssuerKeyV1};
 use elastos_protected_content_custody::NodeCustodySecretKeyV1;
+pub use elastos_protected_content_provider_contracts::{
+    parse_and_verify_provisioning_output, provisioning_receipt,
+    ProvisionedCustodyProviderPublicKeys, ProvisioningOutputError,
+    CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1 as PROVISIONING_PROVIDER_ID,
+    CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1 as PROVISIONING_SCHEMA_V1,
+};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -18,8 +21,6 @@ const TRUSTED_RUNTIME_ISSUER_FILE: &str = "trusted-runtime-issuer";
 const NODE_CUSTODY_SECRET_FILE: &str = "node-custody-secret";
 const NODE_SIGNING_KEY_FILE: &str = "node-signing-key";
 const DATA_ROOT_DIR: &str = "data";
-pub const PROVISIONING_SCHEMA_V1: &str = "elastos.custody-provider.provisioning-receipt/v1";
-pub const PROVISIONING_PROVIDER_ID: &str = "custody";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyProviderStateRootError {
@@ -49,29 +50,6 @@ pub struct LoadedCustodyProviderState {
     pub node_custody_secret: NodeCustodySecretKeyV1,
     pub data_root: PathBuf,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvisionedCustodyProviderPublicKeys {
-    pub node_public_key: NodePublicKey,
-    pub node_custody_public_key: NodeCustodyPublicKeyV1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProvisioningOutputError {
-    InvalidOutput,
-    InvalidReceipt,
-}
-
-impl std::fmt::Display for ProvisioningOutputError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidOutput => "custody provider provisioning output is invalid",
-            Self::InvalidReceipt => "custody provider provisioning receipt is invalid",
-        })
-    }
-}
-
-impl std::error::Error for ProvisioningOutputError {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,74 +110,6 @@ pub fn parse_runtime_issuer_hex(
         .map_err(|_| CustodyProviderStateRootError::InvalidConfig)
 }
 
-pub fn provisioning_receipt(
-    runtime_issuer: RuntimeOperationIssuerKeyV1,
-    node_public_key: NodePublicKey,
-    node_custody_public_key: NodeCustodyPublicKeyV1,
-) -> [u8; 32] {
-    use sha2::Digest as _;
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(PROVISIONING_SCHEMA_V1.as_bytes());
-    hasher.update(runtime_issuer.as_bytes());
-    hasher.update(node_public_key.as_bytes());
-    hasher.update(node_custody_public_key.as_bytes());
-    hasher.finalize().into()
-}
-
-pub fn parse_and_verify_provisioning_output(
-    value: &serde_json::Value,
-    expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-) -> Result<ProvisionedCustodyProviderPublicKeys, ProvisioningOutputError> {
-    let object = value
-        .as_object()
-        .ok_or(ProvisioningOutputError::InvalidOutput)?;
-    if object.len() != 2 || object.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
-        return Err(ProvisioningOutputError::InvalidOutput);
-    }
-    let data = object
-        .get("data")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(ProvisioningOutputError::InvalidOutput)?;
-    if data.len() != 5
-        || data.get("schema").and_then(serde_json::Value::as_str) != Some(PROVISIONING_SCHEMA_V1)
-        || data.get("provider").and_then(serde_json::Value::as_str)
-            != Some(PROVISIONING_PROVIDER_ID)
-    {
-        return Err(ProvisioningOutputError::InvalidOutput);
-    }
-    let node_public_key = NodePublicKey::new(parse_exact_hex_bytes::<32>(
-        data.get("node_public_key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(ProvisioningOutputError::InvalidOutput)?,
-    )?)
-    .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
-    let node_custody_public_key =
-        NodeCustodyPublicKeyV1::new(parse_exact_hex_bytes::<PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES>(
-            data.get("node_custody_public_key")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(ProvisioningOutputError::InvalidOutput)?,
-        )?)
-        .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
-    let receipt = parse_exact_hex_bytes::<32>(
-        data.get("receipt")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(ProvisioningOutputError::InvalidOutput)?,
-    )?;
-    let expected = provisioning_receipt(
-        expected_runtime_issuer,
-        node_public_key,
-        node_custody_public_key,
-    );
-    if receipt != expected {
-        return Err(ProvisioningOutputError::InvalidReceipt);
-    }
-    Ok(ProvisionedCustodyProviderPublicKeys {
-        node_public_key,
-        node_custody_public_key,
-    })
-}
-
 pub fn validate_state_root_path(root: &Path) -> Result<(), CustodyProviderStateRootError> {
     validate_absolute_path_syntax(root)?;
     validate_existing_path_components(root)?;
@@ -231,6 +141,22 @@ pub fn load_state_from_root(
         node_custody_secret,
         data_root: paths.data_root,
     })
+}
+
+/// Reads only the trusted Runtime issuer a provisioned state root was bound
+/// to, without touching the node's secrets. A custody host uses it to point
+/// every plane that verifies signed Runtime operations (the chain
+/// rights-evidence plane) at the same issuer the custody plane trusts.
+pub fn load_trusted_runtime_issuer(
+    root: &Path,
+) -> Result<RuntimeOperationIssuerKeyV1, CustodyProviderStateRootError> {
+    let root = normalize_root_path(root)?;
+    let paths = CustodyProviderStatePaths::derive(root);
+    validate_existing_path_components(&paths.root)?;
+    validate_owner_only_directory(&paths.root)?;
+    let issuer_bytes = read_hex32_file(&paths.trusted_runtime_issuer)?;
+    RuntimeOperationIssuerKeyV1::new(*issuer_bytes)
+        .map_err(|_| CustodyProviderStateRootError::MissingOrUnsafe)
 }
 
 pub fn provision_state_root(
@@ -339,26 +265,6 @@ fn create_stage_root(parent: &Path) -> Result<PathBuf, CustodyProviderStateRootE
     Err(CustodyProviderStateRootError::ProvisioningFailed)
 }
 
-fn parse_exact_hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], ProvisioningOutputError> {
-    let hex = value
-        .strip_prefix("0x")
-        .ok_or(ProvisioningOutputError::InvalidOutput)?;
-    if hex.len() != N * 2
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(ProvisioningOutputError::InvalidOutput);
-    }
-    let mut decoded = [0u8; N];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        decoded[index] =
-            (hex_nibble(pair[0]).map_err(|_| ProvisioningOutputError::InvalidOutput)? << 4)
-                | hex_nibble(pair[1]).map_err(|_| ProvisioningOutputError::InvalidOutput)?;
-    }
-    Ok(decoded)
-}
-
 fn remove_created_stage_root(path: &Path) -> Result<(), CustodyProviderStateRootError> {
     let file_name = path
         .file_name()
@@ -382,7 +288,8 @@ fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), CustodyProvi
     let to = CString::new(to.as_os_str().as_bytes())
         .map_err(|_| CustodyProviderStateRootError::ProvisioningFailed)?;
     let result = unsafe {
-        nix::libc::renameat2(
+        nix::libc::syscall(
+            nix::libc::SYS_renameat2,
             nix::libc::AT_FDCWD,
             from.as_ptr(),
             nix::libc::AT_FDCWD,
@@ -760,6 +667,30 @@ mod tests {
     fn owner_only_dir(path: &Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_without_replacement_preserves_collision_and_moves_new_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let existing = temp.path().join("existing");
+        owner_only_dir(&source);
+        owner_only_dir(&existing);
+        fs::write(source.join("identity"), b"source").unwrap();
+        fs::write(existing.join("identity"), b"existing").unwrap();
+
+        assert!(matches!(
+            rename_without_replacement(&source, &existing),
+            Err(CustodyProviderStateRootError::Conflict)
+        ));
+        assert_eq!(fs::read(source.join("identity")).unwrap(), b"source");
+        assert_eq!(fs::read(existing.join("identity")).unwrap(), b"existing");
+
+        let destination = temp.path().join("destination");
+        rename_without_replacement(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("identity")).unwrap(), b"source");
     }
 
     #[cfg(unix)]

@@ -1,3 +1,7 @@
+pub(super) use super::gateway_home_system_ai_provider::{
+    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
+    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
+};
 use super::*;
 use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
 use axum::body::Body;
@@ -71,6 +75,7 @@ fn test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: None,
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -134,6 +139,7 @@ async fn documents_test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -169,6 +175,7 @@ async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> Ga
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -201,6 +208,7 @@ async fn library_webspace_test_state(cache_dir: &std::path::Path) -> GatewayStat
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -234,6 +242,7 @@ async fn library_test_state_with_content(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -252,6 +261,7 @@ async fn chain_test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -270,6 +280,7 @@ async fn content_test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -288,6 +299,7 @@ async fn net_test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -310,6 +322,7 @@ async fn net_exit_test_state(cache_dir: &std::path::Path) -> GatewayState {
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -433,6 +446,7 @@ async fn browser_engine_reconciliation_test_state(
             provider_registry: Some(registry),
             collaboration_chat_product_port: None,
             collaboration_presence_product_port: None,
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: cache_dir.to_path_buf(),
@@ -458,6 +472,16 @@ async fn browser_engine_retrying_close_test_state(
     exit_close: Option<MockExitClosePlan>,
     ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 ) -> GatewayState {
+    let carrier_endpoint = if exit_close.is_some() {
+        Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
@@ -505,6 +529,7 @@ async fn browser_engine_retrying_close_test_state(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -531,6 +556,7 @@ async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -585,6 +611,14 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        // This fixture represents an attached Runtime, which owns the endpoint
+        // required by the authenticated remote Exit stream path.
+        carrier_endpoint: Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        ),
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -636,6 +670,14 @@ async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_fail
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        // This fixture represents an attached Runtime, which owns the endpoint
+        // required by the authenticated remote Exit stream path.
+        carrier_endpoint: Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        ),
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -665,6 +707,7 @@ async fn malformed_browser_summary_test_state(cache_dir: &std::path::Path) -> Ga
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -700,6 +743,7 @@ async fn browser_engine_attached_test_state_with_relay(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -747,6 +791,7 @@ async fn wallet_test_state_with_shared_provider(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -800,6 +845,7 @@ async fn wallet_chain_test_state_with_shared_wallet_provider(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -810,6 +856,7 @@ async fn wallet_chain_test_state_with_shared_wallet_provider(
 include!("support_providers.rs");
 include!("support_runtime.rs");
 
+mod assistant_workspace_v2;
 mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
@@ -818,12 +865,18 @@ mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod gba;
+mod home_agent;
 mod home_system;
 mod inspect;
 mod library;
 mod marketplace;
 mod model;
+#[cfg(target_os = "macos")]
+mod model_installed_fixture;
 mod recovery;
+#[cfg(unix)]
+mod remote_engine;
+mod remote_model;
 mod room;
 mod site_publication;
 mod wallet;

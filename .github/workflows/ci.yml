@@ -29,7 +29,7 @@ jobs:
   # parallel once this passes.
   source-gate:
     name: source-gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -38,6 +38,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
@@ -48,14 +52,25 @@ jobs:
           node scripts/browser-entropy-check.mjs
       - name: product UI source proofs
         run: |
+          node --version
           node scripts/home-shell-regression-smoke.mjs
+          node scripts/home-agent-shell-smoke.mjs
+          node --test scripts/home-agent-cancellation.test.mjs
           node scripts/people-discovery-smoke.mjs
+      - name: release artifact source proofs
+        run: |
+          python3 scripts/components-release-integrity-check.py --self-test
+          python3 scripts/publish-platform-artifacts-test.py
+          python3 scripts/release-platform-input-test.py
+          python3 scripts/prepare-release-platform-test.py
+          python3 scripts/media-tools-build-test.py
+          python3 scripts/update-hop-compare-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
 
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: source-gate
     steps:
@@ -68,7 +83,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos
+          prefix-key: ${{ runner.os }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
@@ -77,7 +94,7 @@ jobs:
 
   test-elastos:
     name: test-elastos
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: source-gate
     steps:
@@ -88,7 +105,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos-test
+          prefix-key: ${{ runner.os }}-elastos-test-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # The three provider workspaces are release-built from cold on every
       # run otherwise; with the cache restored, cargo only re-fingerprints
       # the workspace members and reuses every dependency artifact.
@@ -99,9 +118,9 @@ jobs:
             capsules/protected-content-protect-provider/target
             capsules/protected-content-decrypt-provider/target
             capsules/custody-provider/target
-          key: providers-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
+          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            providers-target-${{ runner.os }}-
+            providers-bd-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -113,13 +132,13 @@ jobs:
           ELASTOS_TEST_PROTECT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider
           ELASTOS_TEST_DECRYPT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider
           ELASTOS_TEST_CUSTODY_PROVIDER_BIN: ${{ github.workspace }}/capsules/custody-provider/target/release/custody-provider
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
 
   test-capsules:
     name: test-capsules
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: source-gate
     steps:
@@ -133,9 +152,9 @@ jobs:
         with:
           # Registry/index cache only: this job never builds the elastos
           # workspace, and the capsule build artifacts live in the shared
-          # target-capsules dir cached below.
+          # intermediate build dir cached below.
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-capsules
+          prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
       # The capsule workspaces overlap almost entirely in dependencies, so
       # `just test-capsules` builds them into one shared target dir; caching
@@ -145,24 +164,129 @@ jobs:
       - name: cache capsule build artifacts
         uses: actions/cache@v4
         with:
-          path: target-capsules
-          key: capsules-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
+          # The shared intermediates (root .cargo/config.toml build-dir);
+          # final artifacts stay in each capsule's own small target dir.
+          path: target-build
+          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            capsules-target-${{ runner.os }}-
+            capsules-bd-target-${{ runner.os }}-
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
       - name: test own-workspace capsules
         run: |
-          set -euo pipefail
-          root="$PWD"
+          set -uo pipefail
+          failed=0
           for lock in capsules/*/Cargo.lock; do
               capsule="$(dirname "$lock")"
               echo "== testing $capsule =="
-              (cd "$capsule" && cargo test --target-dir "${root}/target-capsules")
+              (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
+          exit "$failed"
 
-  # The source-home jobs run only once the test phase is green, in parallel
-  # across the three architectures. They are the de-facto release builders:
+  # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
+  # Carrier dial-proof preflight) against a fresh instance of the
+  # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
+  # owns all the logic (throwaway client identity, throwaway compose
+  # project, receipt assertions, full teardown); this job is thin glue over
+  # it. Gated to workflow_dispatch and PRs that actually touch the harness
+  # image, the proof driver, or the protected-content/carrier crates it
+  # exercises -- NOT every push, since the image build + 3-node bring-up
+  # add real wall time.
+  custody-harness-smoke:
+    name: custody-harness-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: source-gate
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    # The top-level `permissions: contents: read` above zeroes every other
+    # scope for every job; dorny/paths-filter resolves a pull_request's
+    # changed files via the GitHub API (this job's checkout is fetch-depth 1,
+    # so there's no local base commit to diff against) and needs
+    # `pull-requests: read` to do that -- without this, the filter step
+    # (unconditional on pull_request) 403s and fails the job on every PR.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - name: detect custody/carrier-relevant changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            custody:
+              - 'deploy/custody-host/**'
+              - 'scripts/protected-content-installed-e2e-proof.sh'
+              - 'scripts/protected-content-installed-static-audit.py'
+              - 'scripts/custody-harness-ci-smoke.sh'
+              - 'capsules/custody-provider/**'
+              - 'capsules/availability-provider/**'
+              - 'capsules/ipfs-provider/**'
+              - 'elastos/crates/elastos-protected-content-*/**'
+              # Targeted, not the whole elastos-server crate (which would
+              # fire this 60-minute job on most PRs): exactly the modules
+              # this smoke actually exercises -- Carrier transport/dial,
+              # standalone provider hosting, and the custody
+              # composition/chain-config CLI the ceremony drives.
+              - 'elastos/crates/elastos-server/src/carrier.rs'
+              - 'elastos/crates/elastos-server/src/carrier_service.rs'
+              - 'elastos/crates/elastos-server/src/provider_host.rs'
+              - 'elastos/crates/elastos-server/src/run_cmd.rs'
+              - 'elastos/crates/elastos-server/src/server_infra.rs'
+              - 'elastos/crates/elastos-server/src/node_cmd.rs'
+              - 'elastos/crates/elastos-server/src/protected_content_config.rs'
+      - id: should-run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no custody/carrier-relevant paths changed on this PR; skipping the smoke run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.should-run.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@1.91.0
+      # Builds the host `elastos` binary the smoke script itself invokes
+      # (identity show, node peer add, node status) -- same cache shape as
+      # the test-elastos/lint jobs above.
+      - if: steps.should-run.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-custody-smoke-bd
+          cache-directories: target-build
+      - if: steps.should-run.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v3
+      # Pre-warms the custody-host image's BuildKit layer cache via the GHA
+      # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
+      # own `docker compose up -d --build` expects it -- that later build
+      # then hits this same local layer cache instead of rebuilding cold.
+      - name: pre-build custody-host image (GHA layer cache)
+        if: steps.should-run.outputs.run == 'true'
+        run: |
+          docker buildx build \
+            -f deploy/custody-host/Dockerfile \
+            -t elastos-custody-host:latest \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            .
+      - name: custody harness smoke
+        if: steps.should-run.outputs.run == 'true'
+        run: scripts/custody-harness-ci-smoke.sh
+      - name: upload evidence receipt on failure
+        if: failure() && steps.should-run.outputs.run == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: custody-harness-smoke-evidence
+          path: /tmp/custody-harness-ci-smoke-evidence/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The source-home jobs run after the cheap source gate, in parallel
+  # with tests across the three architectures. They are the de-facto release builders:
   # setup-source-home compiles the runtime, shell, home-cli and every provider
   # in --release into the repo target dirs, so each job finishes by topping
   # that up to a full workspace release build (incremental at that point) and
@@ -172,22 +296,27 @@ jobs:
     name: source-home-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    needs: [test-elastos, test-capsules]
+    needs: source-gate
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos
+          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
@@ -196,7 +325,7 @@ jobs:
       - name: install host prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y coturn e2fsprogs ffmpeg
+          sudo apt-get install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -211,6 +340,12 @@ jobs:
           export HOME="${SOURCE_HOME}"
           export XDG_DATA_HOME="${SOURCE_HOME}/.local/share"
           export PATH="${CARGO_HOME}/bin:${PATH}"
+          MEDIA_TOOLS_DIR="${RUNNER_TEMP}/source-home-media-tools"
+          install -d -m 700 "${MEDIA_TOOLS_DIR}"
+          for tool in ffmpeg ffprobe; do
+            install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
+          done
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -246,18 +381,23 @@ jobs:
     name: source-home-macos
     runs-on: macos-14
     timeout-minutes: 90
-    needs: [test-elastos, test-capsules]
+    needs: source-gate
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos
+          prefix-key: ${{ runner.os }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -280,19 +420,7 @@ jobs:
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
       - name: install host prerequisites
-        run: |
-          brew install e2fsprogs coturn ffmpeg
-          # setup-source-home's media prerequisite imports ffmpeg/ffprobe and
-          # fail-closed rejects any group-writable ancestor of the resolved
-          # binaries (Homebrew's Cellar defaults to 775). Tighten the
-          # user-owned ancestors so the import chain passes admission.
-          for tool in ffmpeg ffprobe; do
-            p="$(python3 -c "import os,shutil;print(os.path.realpath(shutil.which('$tool')))")"
-            while [ "$p" != "/" ]; do
-              p="$(dirname "$p")"
-              { [ -O "$p" ] && chmod g-w "$p"; } || true
-            done
-          done
+        run: brew install e2fsprogs coturn ffmpeg
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -306,6 +434,12 @@ jobs:
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
           export HOME="${MAC_TEST_HOME}"
           export PATH="${CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}"
+          MEDIA_TOOLS_DIR="${RUNNER_TEMP}/source-home-media-tools"
+          install -d -m 700 "${MEDIA_TOOLS_DIR}"
+          for tool in ffmpeg ffprobe; do
+            install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
+          done
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -337,7 +471,7 @@ jobs:
   # lint/test/source-home job is green.
   release:
     name: publish-github-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     needs:

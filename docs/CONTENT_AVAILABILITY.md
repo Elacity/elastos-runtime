@@ -11,6 +11,12 @@
 
 ## Decision
 
+[Storage, ownership, and access](STORAGE_AND_ACCESS.md) defines the complete
+object journey and its target permission, protection, and recovery behavior.
+This document owns the content addressing and availability part of that model.
+For the replaceable protection boundary, see the
+[implementation guide](OBJECT_PROTECTION_IMPLEMENTATION.md).
+
 IPLD is a good fit for ElastOS, but it is not the network.
 
 Use IPLD as the data model for content-addressed SmartWeb objects: published

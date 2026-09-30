@@ -5,6 +5,7 @@
   "description": "Manage Browser Engine and Browser Exit service access",
   "author": "elastos",
   "role": "app",
+  "window_policy": "single",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

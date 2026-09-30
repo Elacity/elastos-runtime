@@ -124,11 +124,15 @@ async fn enforce_capability(
         .get("X-Capability-Token")
         .and_then(|v| v.to_str().ok());
 
-    // Shell sessions have orchestrator privilege for direct shell calls. Bridge
-    // metadata makes this a delegated capsule call and therefore requires a
-    // capability token, but it never replaces the authenticated session as the
-    // token subject.
+    // Shell sessions keep orchestrator privilege for direct Read calls.
+    // Content and availability Write still require a capability token.
     if session.is_shell() && bridge_capsule_id.is_none() && token_b64.is_none() {
+        if shell_write_requires_token(resource, required_action) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Missing X-Capability-Token header".to_string(),
+            ));
+        }
         return Ok(());
     }
 
@@ -173,6 +177,12 @@ async fn enforce_capability(
         .map_err(|e| (StatusCode::FORBIDDEN, format!("Capability denied: {}", e)))
 }
 
+fn shell_write_requires_token(resource: &str, required_action: Action) -> bool {
+    required_action == Action::Write
+        && (resource.starts_with("elastos://content/")
+            || resource.starts_with("elastos://availability/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +201,20 @@ mod tests {
     #[derive(Default)]
     struct CapturingWalletProvider {
         requests: Mutex<Vec<Value>>,
+    }
+
+    struct CapturingSchemeProvider {
+        scheme: &'static str,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    impl CapturingSchemeProvider {
+        fn new(scheme: &'static str) -> Self {
+            Self {
+                scheme,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -222,6 +246,61 @@ mod tests {
                 }
             }))
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingSchemeProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "capturing scheme provider only supports raw requests".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![self.scheme]
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-scheme"
+        }
+
+        async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+    }
+
+    async fn proxy_as_shell(
+        scheme: &'static str,
+        op: &str,
+        headers: HeaderMap,
+        body: &str,
+    ) -> (
+        Arc<CapturingSchemeProvider>,
+        Result<Json<Value>, (StatusCode, String)>,
+    ) {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingSchemeProvider::new(scheme));
+        registry
+            .register_sub_provider(scheme, provider.clone())
+            .await
+            .unwrap();
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: None,
+        };
+        let result = provider_proxy(
+            State(state),
+            Extension(Session::new(SessionType::Shell, None)),
+            Path((scheme.to_string(), op.to_string())),
+            headers,
+            body.to_string(),
+        )
+        .await;
+        (provider, result)
     }
 
     #[test]
@@ -485,5 +564,186 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(err.1.contains("Capability denied"));
+    }
+
+    #[tokio::test]
+    async fn shell_bearer_without_token_cannot_publish_or_unpublish_content() {
+        for op in ["publish", "unpublish"] {
+            let (provider, result) = proxy_as_shell("content", op, HeaderMap::new(), "{}").await;
+            let err = result.expect_err(op);
+            assert_eq!(err.0, StatusCode::FORBIDDEN, "{op}");
+            assert!(provider.requests.lock().await.is_empty(), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_bearer_without_token_cannot_ensure_availability() {
+        let (provider, result) =
+            proxy_as_shell("availability", "ensure", HeaderMap::new(), "{}").await;
+        let err = result.expect_err("availability ensure");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_unpin_and_import_object_stay_unsupported() {
+        for op in ["unpin", "import_object"] {
+            let (provider, result) = proxy_as_shell("content", op, HeaderMap::new(), "{}").await;
+            let err = result.expect_err(op);
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{op}");
+            assert!(provider.requests.lock().await.is_empty(), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn content_fetch_with_fetch_token_still_dispatches() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingSchemeProvider::new("content"));
+        registry
+            .register_sub_provider("content", provider.clone())
+            .await
+            .unwrap();
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ));
+        let session = Session::new(SessionType::Shell, None);
+        let token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new("elastos://content/fetch"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: Some(capability_manager),
+        };
+
+        let response = provider_proxy(
+            State(state),
+            Extension(session),
+            Path(("content".to_string(), "fetch".to_string())),
+            headers,
+            "{}".to_string(),
+        )
+        .await
+        .expect("fetch-scoped token still authorizes content fetch");
+
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![serde_json::json!({ "op": "fetch" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_grant_does_not_authorize_content_publish() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingSchemeProvider::new("content"));
+        registry
+            .register_sub_provider("content", provider.clone())
+            .await
+            .unwrap();
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ));
+        let session = Session::new(SessionType::Shell, None);
+        let token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new("elastos://model/offers_list"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: Some(capability_manager),
+        };
+
+        let err = provider_proxy(
+            State(state),
+            Extension(session),
+            Path(("content".to_string(), "publish".to_string())),
+            headers,
+            "{}".to_string(),
+        )
+        .await
+        .expect_err("model grant must not satisfy content publish");
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_status_without_token_still_dispatches() {
+        let (provider, result) = proxy_as_shell("content", "status", HeaderMap::new(), "{}").await;
+        let response = result.expect("shell Read still has ambient content status");
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![serde_json::json!({ "op": "status" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn content_publish_with_write_token_still_dispatches() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingSchemeProvider::new("content"));
+        registry
+            .register_sub_provider("content", provider.clone())
+            .await
+            .unwrap();
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ));
+        let session = Session::new(SessionType::Shell, None);
+        let token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new("elastos://content/publish"),
+            Action::Write,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: Some(capability_manager),
+        };
+
+        let response = provider_proxy(
+            State(state),
+            Extension(session),
+            Path(("content".to_string(), "publish".to_string())),
+            headers,
+            "{}".to_string(),
+        )
+        .await
+        .expect("write token still authorizes content publish");
+
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![serde_json::json!({ "op": "publish" })]
+        );
     }
 }

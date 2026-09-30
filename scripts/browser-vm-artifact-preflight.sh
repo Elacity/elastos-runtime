@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+mode="${1:-artifact}"
+if [[ "$#" -gt 1 || ( "$mode" != "artifact" && "$mode" != "--host-readiness" && "$mode" != "--verify-image-set" ) ]]; then
+  echo "usage: browser-vm-artifact-preflight.sh [--host-readiness|--verify-image-set]" >&2
+  exit 2
+fi
+
 platform="${ELASTOS_BROWSER_VM_PLATFORM:-}"
 if [[ -z "$platform" ]]; then
   case "$(uname -s)-$(uname -m)" in
@@ -33,7 +39,7 @@ engine_supervisor="${ELASTOS_BROWSER_VM_ENGINE_SUPERVISOR:-${data_dir}/bin/brows
 target_preflight="${ELASTOS_BROWSER_VM_TARGET_PREFLIGHT:-${repo_root}/scripts/browser-vm-target-preflight.sh}"
 debugfs_bin="${ELASTOS_DEBUGFS_BIN:-$(command -v debugfs 2>/dev/null || true)}"
 
-python3 - \
+exec python3 - \
   "$platform" \
   "$data_dir" \
   "$control_socket" \
@@ -46,7 +52,7 @@ python3 - \
   "$control_service" \
   "$engine_supervisor" \
   "$target_preflight" \
-  "$debugfs_bin" <<'PY'
+  "$debugfs_bin" "$mode" <<'PY'
 import json
 import hashlib
 import os
@@ -69,6 +75,7 @@ import sys
     engine_supervisor,
     target_preflight,
     debugfs_bin,
+    mode,
 ) = sys.argv[1:]
 
 REQUIRED_ROOTFS_FILES = {
@@ -306,7 +313,13 @@ def inspect_ext4_sidecar_manifest(image):
         return result
 
     try:
-        manifest = json.loads(manifest_path.read_text())
+        with manifest_path.open("rb") as handle:
+            contents = handle.read(1024 * 1024 + 1)
+        if len(contents) > 1024 * 1024:
+            raise ValueError("sidecar exceeds 1 MiB")
+        manifest = json.loads(contents)
+        if not isinstance(manifest, dict):
+            raise ValueError("sidecar must be a JSON object")
     except Exception as exc:
         result["errors"].append(f"rootfs manifest sidecar JSON invalid: {exc}")
         return result
@@ -325,10 +338,17 @@ def inspect_ext4_sidecar_manifest(image):
         result["errors"].append(f"rootfs manifest size {manifest.get('size')!r} does not match image size {actual_size}")
 
     expected_sha256 = manifest.get("sha256")
-    if not expected_sha256:
-        result["errors"].append("rootfs manifest sidecar missing sha256")
-    elif sha256_file(image) != expected_sha256:
-        result["errors"].append("rootfs image sha256 does not match sidecar manifest")
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha256)):
+        result["errors"].append("rootfs manifest sidecar requires a lowercase SHA-256 digest")
+    else:
+        try:
+            actual_sha256 = sha256_file(image)
+            result["image_identity"] = {"size": actual_size, "sha256": actual_sha256}
+            if actual_sha256 != expected_sha256:
+                result["errors"].append("rootfs image sha256 does not match sidecar manifest")
+        except OSError as exc:
+            result["errors"].append(f"rootfs image unreadable: {exc}")
 
     preflight = manifest.get("preflight")
     if not isinstance(preflight, dict):
@@ -345,7 +365,16 @@ def inspect_ext4_sidecar_manifest(image):
     result["missing"] = preflight.get("missing") if isinstance(preflight.get("missing"), list) else []
     result["manifest"] = preflight.get("manifest") if isinstance(preflight.get("manifest"), dict) else {}
     result["preflight"] = preflight
+    result["build_receipt"] = manifest
 
+    for name in REQUIRED_ROOTFS_FILES:
+        entry = result["required"].get(name)
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            result["errors"].append(f"rootfs manifest target preflight requires {name}")
+    for name in AUDIO_ROOTFS_FILES:
+        entry = result["optional_audio"].get(name)
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            result["errors"].append(f"rootfs manifest target preflight requires {name}")
     if result["audio_default_ready"] is not True:
         result["errors"].append("rootfs manifest target preflight reports audio_default_ready=false")
     if result["missing"]:
@@ -362,26 +391,13 @@ def inspect_ext4_sidecar_manifest(image):
 
 
 def inspect_ext4_rootfs(image):
-    result = {
-        "ok": False,
-        "inspectable": False,
-        "source_kind": "ext4_image",
-        "source": image,
-        "debugfs": path_stat(debugfs_bin, executable=True),
-        "required": {},
-        "optional_audio": {},
-        "audio_default_ready": False,
-        "missing": [],
-        "errors": [],
-    }
-    if not pathlib.Path(image).is_file():
-        result["errors"].append("rootfs image missing")
+    # Guest file inspection supplements the image receipt on every host.
+    # Availability of debugfs does not change the artifact identity requirement.
+    result = inspect_ext4_sidecar_manifest(image)
+    result["debugfs"] = path_stat(debugfs_bin, executable=True)
+    if not result["ok"] or not result["debugfs"]["ok"]:
         return result
-    if not debugfs_bin or not pathlib.Path(debugfs_bin).exists():
-        result = inspect_ext4_sidecar_manifest(image)
-        result["debugfs"] = path_stat(debugfs_bin, executable=True)
-        return result
-
+    result["source_kind"] = "ext4_image"
     result["inspectable"] = True
     for name, guest_path in REQUIRED_ROOTFS_FILES.items():
         ok = ext4_has(image, guest_path)
@@ -440,6 +456,36 @@ def inspect_rootfs():
 
 rootfs_contract = inspect_rootfs()
 
+
+def verify_image_set():
+    if not rootfs_contract.get("verified_sidecar") or not rootfs_contract.get("ok"):
+        return "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
+    receipt = rootfs_contract["build_receipt"]
+    default_initrd = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
+    initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
+    initrd = os.environ.get(initrd_key) or str(pathlib.Path(data_dir) / default_initrd)
+    try:
+        for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
+            entry = receipt.get(name)
+            actual = pathlib.Path(artifact)
+            if not actual.is_file():
+                return "preparation_required"
+            if (not isinstance(entry, dict) or type(entry.get("size")) is not int
+                    or entry["size"] != actual.stat().st_size
+                    or entry.get("sha256") != sha256_file(artifact)):
+                return "artifact_invalid"
+    except OSError:
+        return "artifact_invalid"
+    return None
+
+
+if mode == "--verify-image-set":
+    reason = verify_image_set()
+    print(json.dumps({"schema": "elastos.browser.vm-image-set/v1",
+                      "ok": reason is None, "reason": reason,
+                      "rootfs_contract": rootfs_contract}))
+    sys.exit(1 if reason else 0)
+
 control = {
     "control_socket": path_stat(control_socket, socket=True),
     "control_service": path_stat(control_service, executable=True),
@@ -475,6 +521,52 @@ missing_for_local_substrate = [
 
 local_substrate_artifacts_ready = not missing_for_local_substrate and rootfs_contract["ok"]
 launch_ready = bool(control["control_socket"]["ok"])
+
+if mode == "--host-readiness":
+    # This operation is read-only. It admits the local host's immutable image
+    # set; control-socket presence is independent of artifact identity.
+    reason = None
+    import platform as host_platform
+    host_id = {("Darwin", "arm64"): "darwin-arm64", ("Linux", "x86_64"): "linux-amd64",
+               ("Linux", "aarch64"): "linux-arm64", ("Linux", "arm64"): "linux-arm64"}.get(
+                   (host_platform.system(), host_platform.machine()))
+    if platform != host_id:
+        reason = "host_unsupported"
+    elif image_reason := verify_image_set():
+        reason = image_reason
+    elif not local_substrate_artifacts_ready:
+        reason = "preparation_required"
+    elif platform == "darwin-arm64" and not (
+        os.path.isabs(turn_program := os.environ.get("ELASTOS_BROWSER_VM_TURN_PROGRAM", ""))
+        and os.path.isfile(turn_program)
+        and os.access(turn_program, os.X_OK)
+    ):
+        reason = "preparation_required"
+    else:
+        try:
+            if reason is None and platform == "darwin-arm64":
+                probe = subprocess.run([vz_supervisor, "--host-capabilities"],
+                                       capture_output=True, text=True, timeout=2, check=True)
+                host = json.loads(probe.stdout)
+                if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
+                    reason = "readiness_unsupported"
+                elif host.get("available") is not True:
+                    reason = ("preparation_required" if host.get("reason") == "preparation_required"
+                              else "host_unsupported")
+            elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
+                import fcntl
+                with open("/dev/kvm", "r+b", buffering=0) as kvm:
+                    if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
+                        reason = "host_unsupported"
+            elif reason is None:
+                reason = "host_unsupported"
+        except (ValueError, subprocess.SubprocessError, AttributeError):
+            reason = "readiness_unsupported"
+        except OSError:
+            reason = "host_unsupported"
+    readiness = {"state": "unavailable", "reason": reason} if reason else {"state": "ready"}
+    print(json.dumps({"schema": "elastos.browser.engine-readiness/v1", "readiness": readiness}))
+    sys.exit(0)
 
 if launch_ready:
     reason = "Browser VM control socket is available; Runtime can delegate Browser launches."

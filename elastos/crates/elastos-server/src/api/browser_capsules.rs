@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
+use sha2::{Digest, Sha256};
 
 use super::capsule_inventory::{
     installed_active_capsule_dir, installed_capsules_root, list_active_capsule_manifests,
@@ -12,10 +13,11 @@ use super::capsule_inventory::{
 };
 use super::gateway::{
     capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
-    validate_file_path, GatewayState,
+    validate_file_path, GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
+const BROWSER_VERSIONED_ASSET_CACHE_CONTROL: &str = "private, max-age=60, must-revalidate";
 const BROWSER_CAPSULE_COOP: &str = "same-origin";
 const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin";
@@ -46,6 +48,7 @@ struct BrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct LaunchableBrowserCapsule {
     pub name: String,
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub role: CapsuleRole,
     /// Capsule-relative entrypoint, the anchor icon routes resolve against.
@@ -57,6 +60,8 @@ pub(crate) struct LaunchableBrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct ViewerBoundCapsule {
     pub name: String,
+    /// Window behavior belongs to the resolved executable viewer.
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub viewer: String,
     pub entrypoint: String,
@@ -65,7 +70,41 @@ pub(crate) struct ViewerBoundCapsule {
     pub icon: Option<String>,
 }
 
+pub async fn redirect_home_root(RawQuery(query): RawQuery) -> Response {
+    let route = match query {
+        Some(query) => format!("{HOME_ROUTE}?{query}"),
+        None => HOME_ROUTE.to_string(),
+    };
+    Redirect::permanent(&route).into_response()
+}
+
+pub async fn serve_home_index(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, None).await
+}
+
+pub async fn serve_home_asset(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(path): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    serve_browser_capsule_asset(
+        &state.data_dir,
+        &headers,
+        HOME_CAPSULE_ID,
+        Some(&path),
+        query.as_deref(),
+    )
+    .await
+}
+
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     Redirect::permanent(&format!("/apps/{app}/")).into_response()
 }
 
@@ -74,6 +113,11 @@ pub async fn serve_browser_app_index(
     headers: axum::http::HeaderMap,
     AxumPath(app): AxumPath<String>,
 ) -> Response {
+    // Old bookmarks return to the owning Home. Its launch path issues a fresh
+    // Assistant token; an old Home Agent token keeps its original actor scope.
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     serve_browser_capsule_path(&state.data_dir, &headers, &app, None).await
 }
 
@@ -81,8 +125,23 @@ pub async fn serve_browser_app_asset(
     State(state): State<GatewayState>,
     headers: axum::http::HeaderMap,
     AxumPath((app, path)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    serve_browser_capsule_path(&state.data_dir, &headers, &app, Some(&path)).await
+    if app == "home-agent" {
+        return if path == "index.html" {
+            Redirect::to(&format!("{HOME_ROUTE}#")).into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
+    serve_browser_capsule_asset(
+        &state.data_dir,
+        &headers,
+        &app,
+        Some(&path),
+        query.as_deref(),
+    )
+    .await
 }
 
 pub(super) fn canonical_browser_capsule_route(route: &str) -> Result<String, String> {
@@ -101,11 +160,59 @@ pub(super) fn canonical_browser_capsule_route(route: &str) -> Result<String, Str
     Ok(parsed[url::Position::BeforePath..].to_string())
 }
 
+fn browser_capsule_versioned_static_asset(relative_path: &str, raw_query: Option<&str>) -> bool {
+    let versioned = raw_query
+        .unwrap_or("")
+        .split('&')
+        .any(|part| part.starts_with("v=browser-"));
+    versioned
+        && matches!(
+            Path::new(relative_path)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("js" | "css" | "woff" | "woff2" | "svg")
+        )
+}
+
+fn browser_capsule_cache_control(relative_path: &str, raw_query: Option<&str>) -> &'static str {
+    if browser_capsule_versioned_static_asset(relative_path, raw_query) {
+        BROWSER_VERSIONED_ASSET_CACHE_CONTROL
+    } else {
+        BROWSER_CAPSULE_CACHE_CONTROL
+    }
+}
+
+fn browser_capsule_etag(bytes: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
+}
+
+fn if_none_match_contains(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
+}
+
 async fn serve_browser_capsule_path(
     data_dir: &Path,
     request_headers: &axum::http::HeaderMap,
     app: &str,
     requested_path: Option<&str>,
+) -> Response {
+    serve_browser_capsule_asset(data_dir, request_headers, app, requested_path, None).await
+}
+
+async fn serve_browser_capsule_asset(
+    data_dir: &Path,
+    request_headers: &axum::http::HeaderMap,
+    app: &str,
+    requested_path: Option<&str>,
+    raw_query: Option<&str>,
 ) -> Response {
     if ensure_wallet_connector_configured(data_dir, app).is_err() {
         return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
@@ -158,11 +265,41 @@ async fn serve_browser_capsule_path(
         };
 
     let is_document = relative_path == capsule.entrypoint;
+    let cache_control = browser_capsule_cache_control(relative_path, raw_query);
+    let etag = browser_capsule_versioned_static_asset(relative_path, raw_query)
+        .then(|| browser_capsule_etag(&bytes));
+    if let Some(etag) = etag.as_deref() {
+        if if_none_match_contains(request_headers, etag) {
+            let mut response = StatusCode::NOT_MODIFIED.into_response();
+            let headers = response.headers_mut();
+            headers.insert("cache-control", cache_control.parse().unwrap());
+            headers.insert("etag", etag.parse().unwrap());
+            headers.insert(
+                "cross-origin-opener-policy",
+                BROWSER_CAPSULE_COOP.parse().unwrap(),
+            );
+            headers.insert(
+                "cross-origin-embedder-policy",
+                BROWSER_CAPSULE_COEP.parse().unwrap(),
+            );
+            headers.insert(
+                "cross-origin-resource-policy",
+                resource_policy.parse().unwrap(),
+            );
+            headers.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                BROWSER_CAPSULE_OPAQUE_ORIGIN.parse().unwrap(),
+            );
+            headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+            headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            return response;
+        }
+    }
     let mut response = (
         StatusCode::OK,
         [
             ("content-type", content_type(relative_path)),
-            ("cache-control", BROWSER_CAPSULE_CACHE_CONTROL),
+            ("cache-control", cache_control),
             ("cross-origin-opener-policy", BROWSER_CAPSULE_COOP),
             ("cross-origin-embedder-policy", BROWSER_CAPSULE_COEP),
             ("cross-origin-resource-policy", resource_policy),
@@ -171,6 +308,9 @@ async fn serve_browser_capsule_path(
     )
         .into_response();
     let headers = response.headers_mut();
+    if let Some(etag) = etag.as_deref() {
+        headers.insert("etag", etag.parse().unwrap());
+    }
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
         BROWSER_CAPSULE_OPAQUE_ORIGIN.parse().unwrap(),
@@ -256,6 +396,7 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
             capsule.manifest.name.clone(),
             LaunchableBrowserCapsule {
                 name: capsule.manifest.name,
+                window_policy: capsule.manifest.window_policy,
                 description: capsule.manifest.description,
                 role: capsule.manifest.role,
                 entrypoint: capsule.manifest.entrypoint,
@@ -268,6 +409,13 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
 }
 
 pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<ViewerBoundCapsule> {
+    let Ok(viewer_capsule) = resolve_browser_capsule(data_dir, viewer) else {
+        return Vec::new();
+    };
+    if viewer_capsule.manifest.role != CapsuleRole::Viewer {
+        return Vec::new();
+    }
+    let window_policy = viewer_capsule.manifest.window_policy;
     let mut capsules = BTreeMap::new();
     let installed_root = installed_capsules_root(data_dir);
     for manifest in list_active_capsule_manifests(data_dir) {
@@ -276,7 +424,6 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             || manifest.capsule_type != CapsuleType::Data
             || manifest.viewer.as_deref() != Some(viewer)
             || !dir.join(&manifest.entrypoint).is_file()
-            || !is_launchable_viewer_capsule(data_dir, viewer)
         {
             continue;
         }
@@ -284,6 +431,7 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             manifest.name.clone(),
             ViewerBoundCapsule {
                 name: manifest.name,
+                window_policy,
                 description: manifest.description,
                 viewer: viewer.to_string(),
                 entrypoint: manifest.entrypoint,
@@ -320,14 +468,16 @@ pub(crate) fn resolve_viewer_bound_capsule(
 ) -> Option<ViewerBoundCapsule> {
     let candidate = installed_active_capsule_dir(data_dir, name)?;
     let manifest = load_capsule_manifest(&candidate, name)?;
+    let viewer_capsule = resolve_browser_capsule(data_dir, viewer).ok()?;
     if manifest.role == CapsuleRole::Content
         && manifest.capsule_type == CapsuleType::Data
         && manifest.viewer.as_deref() == Some(viewer)
         && candidate.join(&manifest.entrypoint).is_file()
-        && is_launchable_viewer_capsule(data_dir, viewer)
+        && viewer_capsule.manifest.role == CapsuleRole::Viewer
     {
         return Some(ViewerBoundCapsule {
             name: manifest.name,
+            window_policy: viewer_capsule.manifest.window_policy,
             description: manifest.description,
             viewer: viewer.to_string(),
             entrypoint: manifest.entrypoint,
@@ -377,8 +527,12 @@ fn asset_serving_root(capsule_dir: &Path, entrypoint: &str) -> PathBuf {
     }
 }
 
+/// Capsules that never serve a browser document (content data, providers) may
+/// still declare an icon set; only those declared variants are servable.
 fn declared_content_icon_paths(manifest: &CapsuleManifest) -> Vec<String> {
-    if manifest.role != CapsuleRole::Content || manifest.capsule_type != CapsuleType::Data {
+    let content_data =
+        manifest.role == CapsuleRole::Content && manifest.capsule_type == CapsuleType::Data;
+    if !content_data && manifest.role != CapsuleRole::Provider {
         return Vec::new();
     }
     let prefix = format!("/apps/{}/", manifest.name);
@@ -612,6 +766,46 @@ mod tests {
         }
     }
 
+    fn write_test_icon_provider_capsule(data_dir: &Path, name: &str, icon: &str) {
+        activate_test_capsule(data_dir, name);
+        let capsule_dir = data_dir.join("capsules").join(name);
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": name,
+                "version": "0.1.0",
+                "description": "Service with icons",
+                "author": "elastos",
+                "role": "provider",
+                "type": "microvm",
+                "entrypoint": "rootfs.ext4",
+                "provides": "elastos://model/*",
+                "authority": {
+                    "reason": "Test provider.",
+                    "capabilities": [
+                        { "resource": "elastos://model/*", "actions": ["read"], "operations": ["offers_list"] }
+                    ],
+                    "audit_events": ["model.offers_list"]
+                },
+                "icon": icon,
+                "permissions": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let icon_dir = capsule_dir.join(icon);
+        fs::create_dir_all(&icon_dir).unwrap();
+        for size in [32_u32, 64, 128, 256] {
+            fs::write(
+                icon_dir.join(format!("icon-{size}.png")),
+                format!("icon-{size}"),
+            )
+            .unwrap();
+        }
+    }
+
     fn write_test_components_manifest(data_dir: &Path, names: &[&str]) {
         let external = names
             .iter()
@@ -642,6 +836,112 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn versioned_static_assets_are_cacheable_and_documents_stay_unstored() {
+        assert!(browser_capsule_versioned_static_asset(
+            "browser.js",
+            Some("v=browser-20260907c")
+        ));
+        assert_eq!(
+            browser_capsule_cache_control("browser.js", Some("v=browser-20260907c")),
+            BROWSER_VERSIONED_ASSET_CACHE_CONTROL
+        );
+        assert!(
+            !BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("immutable"),
+            "versioned assets must revalidate; they must not stay cached for a year"
+        );
+        assert!(
+            !BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("31536000"),
+            "versioned assets must revalidate; they must not stay cached for a year"
+        );
+        assert!(BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("must-revalidate"));
+        assert_eq!(
+            browser_capsule_cache_control("index.html", Some("v=browser-20260907c")),
+            BROWSER_CAPSULE_CACHE_CONTROL
+        );
+        assert_eq!(
+            browser_capsule_cache_control("browser.js", None),
+            BROWSER_CAPSULE_CACHE_CONTROL
+        );
+    }
+
+    #[test]
+    fn versioned_asset_etag_changes_when_bytes_change() {
+        let first = browser_capsule_etag(b"browser.js v1");
+        let second = browser_capsule_etag(b"browser.js v2");
+        assert!(first.starts_with('"') && first.ends_with('"'));
+        assert_ne!(first, second);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::IF_NONE_MATCH, first.parse().unwrap());
+        assert!(if_none_match_contains(&headers, &first));
+        assert!(!if_none_match_contains(&headers, &second));
+    }
+
+    #[tokio::test]
+    async fn versioned_static_assets_revalidate_by_etag() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "test-browser", "Browser test", "app");
+        fs::write(
+            data_dir.path().join("capsules/test-browser/browser.js"),
+            "export const version = 1;\n",
+        )
+        .unwrap();
+        let first = serve_browser_capsule_asset(
+            data_dir.path(),
+            &test_request_headers(),
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_VERSIONED_ASSET_CACHE_CONTROL)
+        );
+        let etag = first
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let mut headers = test_request_headers();
+        headers.insert(axum::http::header::IF_NONE_MATCH, etag.parse().unwrap());
+        let again = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        fs::write(
+            data_dir.path().join("capsules/test-browser/browser.js"),
+            "export const version = 2;\n",
+        )
+        .unwrap();
+        let changed = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(
+            changed
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some(etag.as_str())
+        );
     }
 
     #[test]
@@ -823,6 +1123,7 @@ mod tests {
             "/apps/browser/settings/?view=privacy#home_token=secret"
         );
         assert!(canonical_browser_capsule_route("https://example.test/apps/browser/").is_err());
+        assert!(canonical_browser_capsule_route(HOME_ROUTE).is_err());
     }
 
     #[tokio::test]
@@ -897,6 +1198,59 @@ mod tests {
                 .unwrap();
             assert_eq!(bytes.as_ref(), format!("icon-{size}").as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn declared_provider_icons_are_servable_and_nothing_else_is() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_icon_provider_capsule(data_dir.path(), "model-provider", "icons");
+        fs::write(
+            data_dir.path().join("capsules/model-provider/rootfs.ext4"),
+            "rootfs",
+        )
+        .unwrap();
+
+        for size in [32_u32, 64, 128, 256] {
+            let response = serve_browser_capsule_path(
+                data_dir.path(),
+                &test_request_headers(),
+                "model-provider",
+                Some(&format!("icons/icon-{size}.png")),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), format!("icon-{size}").as_bytes());
+        }
+
+        let rootfs = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            Some("rootfs.ext4"),
+        )
+        .await;
+        assert_eq!(rootfs.status(), StatusCode::NOT_FOUND);
+
+        let manifest = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            Some("capsule.json"),
+        )
+        .await;
+        assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+
+        let document = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            None,
+        )
+        .await;
+        assert_eq!(document.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

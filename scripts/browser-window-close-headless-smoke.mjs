@@ -15,6 +15,7 @@ const state = {
   openStatusRequests: 0,
   releaseInitialOpen: null,
   serverErrors: [],
+  requests: [],
   unknownOpenResult: null,
 };
 
@@ -87,14 +88,14 @@ function topDocument(origin) {
 </html>`;
 }
 
-function browserRoute(homeOrigin) {
+function browserRoute(homeOrigin, includeUrl = true) {
   const query = new URLSearchParams({
     browser_instance: browserInstance,
     display_mode: "webrtc_remote_display",
     guarantee_level: "mechanism_microvm",
     home_origin: homeOrigin,
-    url: "https://example.com/close-proof",
   });
+  if (includeUrl) query.set("url", "https://example.com/close-proof");
   return `/apps/browser/?${query}#home_token=${browserToken}`;
 }
 
@@ -119,11 +120,15 @@ function shellDocument(homeOrigin) {
       });
       window.__browserCloseProof = {
         browserRoute: ${JSON.stringify(browserRoute(homeOrigin))},
+        freshRoute: ${JSON.stringify(browserRoute(homeOrigin, false))},
         navigateAway() {
           browser.src = "/blank";
         },
         reopen() {
           browser.src = this.browserRoute;
+        },
+        openFresh() {
+          browser.src = this.freshRoute;
         },
         resultCount() {
           return results.length;
@@ -186,6 +191,7 @@ function openResult() {
 }
 
 async function handleApi(req, res, url) {
+  if (url.pathname.startsWith("/api/")) state.requests.push(`${req.method} ${url.pathname}`);
   if (req.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
     res.writeHead(204, {
       "access-control-allow-headers": "content-type,x-elastos-home-token",
@@ -196,7 +202,22 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
-    json(res, 200, { sessions: {}, browser_engines: [], remote_carrier_exits: [] });
+    json(res, 200, {
+      schema: "elastos.browser.runtime/v1",
+      sessions: {
+        schema: "elastos.browser.session-capacity/v1",
+        status: "configured",
+        fresh_start_allowed: true,
+        recoverable_page: null,
+        window_close_ownership: {
+          schema: "elastos.browser.window-close-ownership/v1",
+          browser_instance: browserInstance,
+          state: "absent",
+        },
+      },
+      browser_engines: [],
+      remote_carrier_exits: [],
+    });
     return true;
   }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
@@ -367,6 +388,9 @@ try {
   const { chromium } = imported.default || imported;
   chromiumBrowser = await chromium.launch({
     headless: true,
+    ...(process.env.ELASTOS_BROWSER_CLOSE_CHROMIUM_EXECUTABLE
+      ? { executablePath: process.env.ELASTOS_BROWSER_CLOSE_CHROMIUM_EXECUTABLE }
+      : {}),
     args: ["--disable-background-networking", "--no-first-run", "--no-proxy-server"],
   });
   const context = await chromiumBrowser.newContext();
@@ -381,6 +405,7 @@ try {
       addEventListener() {}
       addIceCandidate() { return Promise.resolve(); }
       addTransceiver() {}
+      createDataChannel() { return { readyState: "open", close() {} }; }
       close() { this.connectionState = "closed"; }
       createOffer() { return Promise.resolve({ type: "offer", sdp: "v=0\r\n" }); }
       getStats() { return Promise.resolve(new Map()); }
@@ -419,7 +444,7 @@ try {
     (frame) => frame.url().includes("/apps/browser/"),
     "actual Browser capsule",
   );
-  for (let attempt = 0; attempt < 100 && state.openRequests < 1; attempt += 1) {
+  for (let attempt = 0; attempt < 500 && state.openRequests < 1; attempt += 1) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   }
   assert(state.openRequests === 1, "initial Browser open did not enter the fixture", {
@@ -428,6 +453,8 @@ try {
     consoleErrors,
     failedRequests,
     serverErrors: state.serverErrors,
+    requests: state.requests,
+    browserText: await browserFrame.locator("body").innerText(),
   });
   const transitionRequest = {
     type: "elastos.browser.window-close.request/v1",
@@ -562,7 +589,8 @@ try {
   const binding = results.at(-2);
   const result = results.at(-1);
   assert(
-    state.closeCalls.length === 1 &&
+    state.openRequests === 2 &&
+      state.closeCalls.length === 1 &&
       state.closeCalls[0].pageId === "page-2" &&
       state.closeCalls[0].body?.schema === "elastos.browser.close-request/v2" &&
       state.closeCalls[0].body?.cleanup_id === "cleanup-2" &&
@@ -596,12 +624,35 @@ try {
     "old retained Browser frame did not accept the exact already-absent reap receipt",
     result,
   );
+  await shellFrame.evaluate(() => window.__browserCloseProof.openFresh());
+  browserFrame = await waitForFrame(
+    page,
+    (frame) => frame.url().includes("/apps/browser/") && !new URL(frame.url()).searchParams.has("url"),
+    "fresh Browser capsule",
+  );
+  await browserFrame.waitForFunction(() => document.body.dataset.loading === "false");
+  await shellFrame.evaluate(
+    (message) => window.__browserCloseProof.send(message),
+    { ...request, requestId: "headless-close-exact-absence" },
+  );
+  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 5);
+  const freshResult = await shellFrame.evaluate(() => window.__browserCloseProof.results().at(-1));
+  assert(
+    state.openRequests === 2 && state.closeCalls.length === 1 &&
+      freshResult.state === "terminal" &&
+      freshResult.terminalKind === "no_page" &&
+      freshResult.pageId === "" &&
+      freshResult.cleanupId === "",
+    "fresh Browser did not accept Runtime's exact absence without closing another page",
+    { freshResult, closeCalls: state.closeCalls },
+  );
   assert(pageErrors.length === 0, "Browser close fixture raised page errors", pageErrors);
   assert(state.serverErrors.length === 0, "Browser close fixture server failed", state.serverErrors);
   console.log(JSON.stringify({
     schema: "elastos.browser.window-close-headless-smoke/v1",
     ok: true,
     close_calls: state.closeCalls.length,
+    fresh_close: freshResult.terminalKind,
     unload_close_calls: 0,
   }));
 } finally {

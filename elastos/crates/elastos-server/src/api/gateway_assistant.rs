@@ -28,6 +28,8 @@ pub(super) struct AssistantWorkspace {
     draft: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     selected_offer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_model_cid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +79,8 @@ pub(super) struct AssistantWorkspacePutRequest {
     draft: String,
     #[serde(default)]
     selected_offer_id: Option<String>,
+    #[serde(default)]
+    selected_model_cid: Option<String>,
 }
 
 pub(super) async fn assistant_workspace_get(
@@ -112,7 +116,8 @@ pub(super) async fn assistant_workspace_put(
         Err(err) if is_revision_conflict(&err) => {
             (StatusCode::CONFLICT, err.to_string()).into_response()
         }
-        Err(err) => super::home_error_response(err),
+        Err(err) => gateway_assistant_workspace_v2::migration_error_response(&err)
+            .unwrap_or_else(|| super::home_error_response(err)),
     }
 }
 
@@ -148,6 +153,7 @@ fn default_assistant_workspace() -> AssistantWorkspace {
         sessions: Vec::new(),
         draft: String::new(),
         selected_offer_id: None,
+        selected_model_cid: None,
     }
 }
 
@@ -183,6 +189,8 @@ fn save_assistant_workspace(
     context: &HomeLaunchTokenContext,
     request: AssistantWorkspacePutRequest,
 ) -> anyhow::Result<AssistantWorkspace> {
+    let _migration_guard = gateway_assistant_workspace_v2::mutation_guard()?;
+    gateway_assistant_workspace_v2::ensure_legacy_writable(data_dir, context)?;
     let _guard = assistant_workspace_mutation_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("assistant workspace mutation lock poisoned"))?;
@@ -199,6 +207,7 @@ fn save_assistant_workspace(
         sessions: request.sessions,
         draft: request.draft,
         selected_offer_id: request.selected_offer_id,
+        selected_model_cid: request.selected_model_cid,
     };
     validate_workspace(&next)?;
     let bytes = serde_json::to_vec_pretty(&next)?;
@@ -224,6 +233,7 @@ fn validate_workspace_put_request(request: &AssistantWorkspacePutRequest) -> any
         sessions: request.sessions.clone(),
         draft: request.draft.clone(),
         selected_offer_id: request.selected_offer_id.clone(),
+        selected_model_cid: request.selected_model_cid.clone(),
     })
 }
 
@@ -238,6 +248,22 @@ fn validate_workspace(workspace: &AssistantWorkspace) -> anyhow::Result<()> {
         );
     }
     validate_optional_offer_id(workspace.selected_offer_id.as_deref())?;
+    if let Some(value) = workspace.selected_model_cid.as_deref() {
+        // Persist selection intent only; current admission and readiness are separate reads.
+        anyhow::ensure!(
+            workspace.selected_offer_id.is_some() && value.len() <= 128,
+            "invalid Assistant model selection"
+        );
+        let cid = cid::Cid::try_from(value)?;
+        anyhow::ensure!(
+            cid.version() == cid::Version::V1
+                && cid.to_string() == value
+                && cid.codec() == 0x70
+                && cid.hash().code() == 0x12
+                && cid.hash().digest().len() == 32,
+            "invalid Assistant model selection"
+        );
+    }
     validate_bounded_text(
         &workspace.draft,
         "assistant workspace draft",
@@ -345,4 +371,11 @@ fn is_revision_conflict(err: &anyhow::Error) -> bool {
 fn assistant_workspace_mutation_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(super) fn validate_legacy_workspace_bytes(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    validate_workspace_bytes(bytes)?;
+    let workspace = serde_json::from_slice(bytes)?;
+    validate_workspace(&workspace)?;
+    Ok(serde_json::from_slice(bytes)?)
 }

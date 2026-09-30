@@ -491,10 +491,23 @@ function sortedDesktopTargets(summary) {
 export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
+  const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
+    ? stored.desktop
+    : {};
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
     stored ? stored.desktopHidden : defaultHiddenDesktopTargets(summary),
     summary,
   );
+  if (stored) {
+    for (const target of allVisibleTargets(summary)) {
+      if (
+        !Object.prototype.hasOwnProperty.call(storedDesktop, target.target) &&
+        !normalizedDesktopHidden.includes(target.target)
+      ) {
+        normalizedDesktopHidden.push(target.target);
+      }
+    }
+  }
   shellState.shellLayoutState = {
     taskbar: normalizeTaskbarLayout(
       stored ? stored.taskbar : defaultTaskbarPins(summary),
@@ -504,6 +517,7 @@ export function initializeShellLayout(summary) {
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
     desktopHidden: normalizedDesktopHidden,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
+    setupReminderDismissed: stored?.setupReminderDismissed === true,
   };
 
   let changed =
@@ -513,15 +527,15 @@ export function initializeShellLayout(summary) {
       normalizedDesktopHidden,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
-  const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
-    ? stored.desktop
-    : {};
   const occupiedPositions = [];
-  const layoutEntries = (
-    stored
-      ? desktopLayoutEntries(summary)
-      : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id))
-  );
+  const allEntries = desktopLayoutEntries(summary);
+  const layoutEntries = allEntries.filter((entry) => desktopEntryExists(summary, entry.id));
+  if (stored) {
+    layoutEntries.sort((left, right) => (
+      Number(Object.prototype.hasOwnProperty.call(storedDesktop, right.id)) -
+      Number(Object.prototype.hasOwnProperty.call(storedDesktop, left.id))
+    ));
+  }
   for (const [index, entry] of layoutEntries.entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = storedDesktop[entry.id];
@@ -534,6 +548,24 @@ export function initializeShellLayout(summary) {
     occupiedPositions.push(position);
     if (!storedPosition || !positionsEqual(storedPosition, position)) {
       changed = true;
+    }
+  }
+  // Hidden targets keep their saved positions for a later reveal. They do not
+  // reserve desktop space while visible targets are restored.
+  if (stored) {
+    for (const [index, entry] of allEntries.entries()) {
+      if (desktopEntryExists(summary, entry.id) ||
+          !Object.prototype.hasOwnProperty.call(storedDesktop, entry.id)) {
+        continue;
+      }
+      const storedPosition = storedDesktop[entry.id];
+      const position = clampDesktopPosition(normalizeDesktopPosition(
+        storedPosition, defaultDesktopPosition(index),
+      ));
+      shellState.shellLayoutState.desktop[entry.id] = position;
+      if (!positionsEqual(storedPosition, position)) {
+        changed = true;
+      }
     }
   }
   const currentDesktopIds = new Set(Object.keys(shellState.shellLayoutState.desktop));
@@ -660,7 +692,15 @@ function normalizeTaskbarLayout(taskbar, summary) {
   return normalized;
 }
 
-const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+const DEFAULT_TASKBAR_PINS = [
+  "browser",
+  "library",
+  "marketplace",
+  "wallet",
+  "documents",
+  "chat-room",
+  "system",
+];
 
 function defaultTaskbarPins(summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
@@ -683,10 +723,11 @@ function normalizeDesktopLabels(labels, summary) {
   return normalized;
 }
 
+/* First run: an empty desktop. Apps live in the dock and the Apps face;
+   content (games, models) is reached through Library. Anything the person
+   drags out to the desktop afterwards is respected by the saved layout. */
 function defaultHiddenDesktopTargets(summary) {
-  return allVisibleTargets(summary)
-    .filter((target) => target.target_kind !== "object")
-    .map((target) => target.target);
+  return allVisibleTargets(summary).map((target) => target.target);
 }
 
 function normalizeDesktopHiddenTargets(targetIds, summary) {
@@ -764,7 +805,7 @@ function nextAvailableDesktopPosition(occupiedPositions, preferredIndex) {
 
 function occupiedDesktopPositionsExcept(targetId) {
   return Object.entries(shellState.shellLayoutState.desktop)
-    .filter(([entryId]) => entryId !== targetId)
+    .filter(([entryId]) => entryId !== targetId && isTargetOnDesktop(entryId))
     .map(([, position]) => clampDesktopPosition(position));
 }
 
@@ -843,6 +884,15 @@ export function addTargetToDesktop(targetId) {
     return false;
   }
   shellState.shellLayoutState.desktopHidden = next;
+  const storedPosition = shellState.shellLayoutState.desktop[targetId];
+  const occupiedPositions = occupiedDesktopPositionsExcept(targetId);
+  if (storedPosition && desktopPositionOverlapsAny(storedPosition, occupiedPositions)) {
+    const entries = desktopLayoutEntries(shellState.currentSummary);
+    const preferredIndex = entries.findIndex((entry) => entry.id === targetId);
+    shellState.shellLayoutState.desktop[targetId] = nextAvailableDesktopPosition(
+      occupiedPositions, Math.max(0, preferredIndex),
+    );
+  }
   return true;
 }
 

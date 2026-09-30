@@ -3,6 +3,8 @@ export function createLibraryRuntime({ getHomeToken }) {
   const CHUNKED_UPLOAD_BYTES = 512 * 1024;
   const CHUNKED_UPLOAD_TRANSPORT = "http-chunk-session";
   const homeParentOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+  const pickerId = new URLSearchParams(window.location.search).get("pickerRequestId") || "";
+  let pickerDelivery = null;
 
   async function providerApi(op, payload) {
     const response = await fetch("/api/provider/object/" + encodeURIComponent(op), {
@@ -238,7 +240,29 @@ export function createLibraryRuntime({ getHomeToken }) {
   }
 
   function deliverToTarget(target, payload) {
-    return shellMessage({ type: "home:deliver-to-target", target, payload: payload || {} });
+    if (!pickerId || pickerDelivery) return Promise.resolve(false);
+    const requestId = crypto.randomUUID();
+    const token = getHomeToken();
+    return new Promise((resolve) => {
+      const finish = (accepted) => {
+        window.clearTimeout(timer);
+        window.removeEventListener("message", receive);
+        window.removeEventListener("pagehide", cancel);
+        pickerDelivery = null;
+        resolve(accepted);
+      };
+      const receive = (event) => {
+        if (event.source !== window.top || event.origin !== homeParentOrigin ||
+            event.data?.type !== "home:shell-response" || event.data.requestId !== requestId) return;
+        finish(getHomeToken() === token && event.data.result?.accepted === true && !event.data.error);
+      };
+      const cancel = () => finish(false);
+      const timer = window.setTimeout(cancel, 35_000);
+      pickerDelivery = requestId;
+      window.addEventListener("message", receive);
+      window.addEventListener("pagehide", cancel);
+      if (!shellMessage({ type: "home:deliver-to-target", target, payload: payload || {}, pickerId, requestId })) cancel();
+    });
   }
 
   function closeSelf() {

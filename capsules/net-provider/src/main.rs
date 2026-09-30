@@ -219,8 +219,10 @@ impl NetProvider {
         let Some(host) = url.host_str() else {
             return Response::error("invalid_request", "stream target requires a host");
         };
-        if let Err(err) = validate_public_host(host) {
-            return Response::error("private_network_blocked", err);
+        // Runtime hands this request to the selected Exit, which owns destination
+        // policy, including exact private-target grants. Net opens no connection.
+        if let Err(err) = validate_host_shape(host) {
+            return Response::error("invalid_request", err);
         }
         self.exit_unavailable(
             "stream",
@@ -299,6 +301,18 @@ fn configured_exit_count(config: &Value) -> usize {
 
 fn validate_public_host(host: &str) -> Result<(), String> {
     let host = host.trim().trim_matches(['[', ']']);
+    validate_host_shape(host)?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err(format!("private host blocked: {host}"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return validate_public_ip(ip).map_err(|_| format!("private IP blocked: {host}"));
+    }
+    Ok(())
+}
+
+fn validate_host_shape(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host must not be empty".to_string());
     }
@@ -307,13 +321,6 @@ fn validate_public_host(host: &str) -> Result<(), String> {
         .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'\0'))
     {
         return Err(format!("invalid host: {host}"));
-    }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return Err(format!("private host blocked: {host}"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return validate_public_ip(ip).map_err(|_| format!("private IP blocked: {host}"));
     }
     Ok(())
 }
@@ -448,6 +455,43 @@ mod tests {
                 None,
             );
             assert_eq!(error_code(response), "private_network_blocked");
+        }
+    }
+
+    #[test]
+    fn stream_defers_destination_policy_to_runtime_exit() {
+        let provider = NetProvider::new();
+        for target in [
+            "tcp://localhost:61511",
+            "tcp://127.0.0.1:61511",
+            "tcp://192.168.1.1:80",
+            "tcp://[::1]:61511",
+            "tls://example.com:443",
+        ] {
+            // This is a denied network operation until Runtime obtains an Exit receipt.
+            assert_eq!(
+                error_code(provider.stream(target, None, None, None)),
+                "exit_unavailable",
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_rejects_invalid_targets_before_exit_handoff() {
+        let provider = NetProvider::new();
+        for target in [
+            "not a URL",
+            "file:///etc/hosts",
+            "http://example.com/",
+            "tcp:///",
+            "tcp://bad host:80",
+        ] {
+            assert_eq!(
+                error_code(provider.stream(target, None, None, None)),
+                "invalid_request",
+                "{target}"
+            );
         }
     }
 

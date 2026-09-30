@@ -135,7 +135,9 @@ p {
   min-height: 0;
   flex-direction: column;
   gap: 0.45rem;
-  padding: 12px 10px 14px;
+  /* Unified-sidebar chrome paints the traffic lights over the first 52px;
+     capsule-local value on purpose (see home-entropy-check: Chat/Inbox). */
+  padding: 52px 10px 14px;
   overflow: auto;
   border-right: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
   background: var(--sidebar-bg);

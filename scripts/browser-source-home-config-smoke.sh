@@ -34,6 +34,64 @@ if [[ -z "$node_bin" ]]; then
   exit 2
 fi
 
+"$node_bin" - "$tmp_dir" <<'NODE'
+const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const tmpDir = process.argv[2];
+
+function generate(dataDir, platform, name, controlSocket) {
+  const outDir = path.join(tmpDir, name);
+  const args = [
+    "scripts/browser-source-home-config.mjs",
+    "--data-dir", dataDir,
+    "--platform", platform,
+    "--out-dir", outDir,
+  ];
+  if (controlSocket) args.push("--vm-control-socket", controlSocket);
+  execFileSync(process.execPath, args);
+  const read = (file) => JSON.parse(fs.readFileSync(path.join(outDir, file), "utf8"));
+  const adapter = read("browser-engine-adapter.json").adapters[0];
+  const backend = read("exit-provider.json").backends[0];
+  const localExit = read("browser-local-exit.json");
+  assert.equal(adapter.network_mode, "runtime_net_only");
+  assert.equal(adapter.supervisor.control_socket_path, adapter.supervisor.env.ELASTOS_BROWSER_VM_CONTROL_SOCKET);
+  assert.equal(backend.relay_ipc.path, localExit.relay_ipc_path);
+  const sockets = [backend.adapter_ipc.path, backend.relay_ipc.path, adapter.supervisor.control_socket_path];
+  assert.equal(new Set(sockets).size, 3, "each IPC role needs a distinct socket");
+  for (const socket of sockets) {
+    assert.ok(path.isAbsolute(socket) && !/[\s\0]/.test(socket), "consumers require absolute IPC paths without whitespace");
+    assert.ok(Buffer.byteLength(socket) < 104, "IPC defaults must fit the macOS Unix socket path limit");
+  }
+  return sockets;
+}
+
+const allDefaults = new Set();
+for (const platform of ["darwin-arm64", "linux-amd64", "linux-arm64"]) {
+  // Homes can have long paths with spaces and the same final data-dir name.
+  const homeRoot = path.join(tmpDir, "Long Home ".repeat(16), "Library", "Application Support");
+  const dataDir = path.join(homeRoot, "one", "elastos");
+  const sockets = generate(dataDir, platform, `${platform}-one`);
+  const other = generate(path.join(homeRoot, "two", "elastos"), platform, `${platform}-two`);
+  for (const socket of [...sockets, ...other]) {
+    assert.ok(!allDefaults.has(socket), "distinct Runtime data dirs and platforms need distinct IPC defaults");
+    allDefaults.add(socket);
+  }
+  assert.deepEqual(
+    generate(`${dataDir}/../elastos/`, platform, `${platform}-repeat`),
+    sockets,
+    "IPC defaults must stay stable across normalized data-dir paths and output dirs",
+  );
+  const explicitControl = `/tmp/elastos-config-smoke-${platform}-control.sock`;
+  assert.deepEqual(
+    generate(dataDir, platform, `${platform}-explicit`, explicitControl),
+    [sockets[0], sockets[1], explicitControl],
+    "an explicit VM control socket must preserve this Runtime's Exit IPC defaults",
+  );
+}
+NODE
+
 rejected_output="$tmp_dir/rejected.out"
 if "$node_bin" scripts/browser-source-home-config.mjs \
   --data-dir "$tmp_dir/rejected-data" \
@@ -432,10 +490,11 @@ if (
   throw new Error("Linux remote VZ source-home config must issue VZ transport authority");
 }
 const defaultMacAdapter = defaultMacVmAdapter.adapters?.[0];
-if (defaultMacAdapter?.supervisor?.control_socket_path !== "/tmp/elastos-browser-vm-control-darwin-arm64.sock") {
-  throw new Error("Mac source-home Browser config must declare a default VM control socket");
+const defaultMacControlSocket = defaultMacAdapter?.supervisor?.control_socket_path;
+if (!/^\/tmp\/elastos-browser-darwin-arm64-[0-9a-f]{16}-vm-control\.sock$/.test(defaultMacControlSocket)) {
+  throw new Error("Mac source-home Browser config must declare a Runtime-scoped default VM control socket");
 }
-if (defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_SOCKET !== "/tmp/elastos-browser-vm-control-darwin-arm64.sock") {
+if (defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_SOCKET !== defaultMacControlSocket) {
   throw new Error("Mac source-home Browser supervisor must receive the default VM control socket");
 }
 if (defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS !== "120000") {

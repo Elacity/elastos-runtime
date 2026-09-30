@@ -809,6 +809,7 @@ mod tests {
     use crate::collaboration_discovery_runtime::tests::signed_profile;
     use crate::collaboration_profile_authority::signed_profile_document_for_test;
     use elastos_runtime::signature::generate_keypair;
+    use iroh::Watcher as _;
 
     const NETWORK: &str = "elastos.community.test";
 
@@ -973,6 +974,12 @@ mod tests {
                 rebound.clone(),
             )
             .await;
+        pair._node_a
+            .memory_lookup
+            .add_endpoint_info(_node_b2.endpoint.watch_addr().get());
+        _node_b2
+            .memory_lookup
+            .add_endpoint_info(pair._node_a.endpoint.watch_addr().get());
         let recovered_contacts = store_b2.snapshot().unwrap();
         assert_eq!(recovered_contacts.contacts().len(), 1);
         assert_eq!(

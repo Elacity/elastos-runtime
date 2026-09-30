@@ -24,7 +24,9 @@ case "$(uname -m)" in
         ;;
 esac
 
-TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/elastos-local-carrier-setup.XXXXXX")}"
+SMOKE_TEMP_BASE="${RUNNER_TEMP:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}}"
+mkdir -p "$SMOKE_TEMP_BASE"
+TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${SMOKE_TEMP_BASE}/elastos-local-carrier-setup.XXXXXX")}"
 XDG_DATA_HOME="${TEST_ROOT}/xdg-data"
 DATA_DIR="${XDG_DATA_HOME}/elastos"
 PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
@@ -105,6 +107,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/exit-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/ipfs-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/media-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/model-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/protected-content-protect-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/protected-content-decrypt-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
@@ -116,7 +119,24 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/content-block-graph-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --release --bin home-cli)
+HOME_CLI_RENDERER=$(cargo build --locked --manifest-path "${REPO_ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli --message-format=json | python3 -c '
+import json, sys
+artifacts = [json.loads(line) for line in sys.stdin]
+paths = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact"
+         and item.get("target", {}).get("name") == "home-cli" and item.get("executable")]
+if len(paths) != 1:
+    raise SystemExit("expected one built Home CLI renderer")
+print(paths[0])')
+export HOME_CLI_RENDERER
+MEDIA_TOOLS_ARCHIVE=$(
+    cd "${REPO_ROOT}"
+    source scripts/publish-release.sh
+    TMPDIR="${TEST_ROOT}/media-package"
+    mkdir -p "$TMPDIR"
+    CARGO_TARGET_DIR="${TEST_ROOT}/media-target" \
+        build_packaged_media_tools_archive "${SETUP_PLATFORM}"
+)
+export MEDIA_TOOLS_ARCHIVE
 for capsule in \
     home \
     home-cli \
@@ -162,6 +182,7 @@ NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider
 EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
 IPFS_PROVIDER_BIN="${REPO_ROOT}/capsules/ipfs-provider/target/release/ipfs-provider" \
 MEDIA_PROVIDER_BIN="${REPO_ROOT}/capsules/media-provider/target/release/media-provider" \
+MODEL_PROVIDER_BIN="${REPO_ROOT}/capsules/model-provider/target/release/model-provider" \
 PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
 PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
 BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
@@ -225,6 +246,7 @@ mapping = {
     "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
     "ipfs-provider": pathlib.Path(os.environ["IPFS_PROVIDER_BIN"]),
     "media-provider": pathlib.Path(os.environ["MEDIA_PROVIDER_BIN"]),
+    "model-provider": pathlib.Path(os.environ["MODEL_PROVIDER_BIN"]),
     "protected-content-protect-provider": pathlib.Path(
         os.environ["PROTECTED_CONTENT_PROTECT_PROVIDER_BIN"]
     ),
@@ -255,6 +277,12 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
+media_info = platform_info("media-tools")
+media_archive = artifacts_dir / media_info["release_path"]
+shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
+media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
+media_info["size"] = media_archive.stat().st_size
+
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
     entrypoint = capsule_manifest.get("entrypoint")
@@ -274,6 +302,11 @@ def write_capsule_archive(name, capsule_dir):
         browser_dir = capsule_dir / "browser"
         if browser_dir.is_dir():
             tar.add(browser_dir, arcname=f"{name}/browser")
+        if name == "home-cli":
+            renderer = pathlib.Path(os.environ["HOME_CLI_RENDERER"])
+            if not renderer.is_file() or renderer.is_symlink() or not os.access(renderer, os.X_OK):
+                raise SystemExit(f"missing built Home CLI renderer: {renderer}")
+            tar.add(renderer, arcname="home-cli/bin/home-cli")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -304,6 +337,9 @@ for name, capsule_dir in browser_capsules.items():
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
+catalog_dest = data_dir / "model-catalog.json"
+catalog_dest.write_bytes(components_src.with_name("model-catalog.json").read_bytes())
+catalog_dest.chmod(0o600)
 PY
 
 echo "[local-carrier-setup] staged local artifacts into ${ARTIFACTS_DIR}"
@@ -495,6 +531,7 @@ for installed in \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
     "${DATA_DIR}/capsules/archive-manager/browser/index.html" \
+    "${DATA_DIR}/capsules/assistant/browser/index.html" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \
@@ -507,6 +544,8 @@ do
 done
 
 STATUS_OUT="${TEST_ROOT}/home-status.txt"
+test -x "${DATA_DIR}/capsules/home-cli/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "${DATA_DIR}/capsules/home-cli/bin/home-cli"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \

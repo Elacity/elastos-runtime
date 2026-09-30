@@ -112,8 +112,18 @@ struct SelectionGuard {
     selected_conversation_id: Option<String>,
 }
 
+#[derive(Clone)]
+struct LibraryPickerRequest {
+    id: String,
+    selection: SelectionGuard,
+    consumed: bool,
+}
+
 struct App {
     config: AppConfig,
+    home_parent_origin: Option<String>,
+    picker_document_nonce: String,
+    picker_request: RefCell<Option<LibraryPickerRequest>>,
     state: RefCell<AppState>,
     document: Document,
     body: HtmlElement,
@@ -507,6 +517,10 @@ pub fn start() -> Result<(), JsValue> {
 
     let app = Rc::new(App {
         config,
+        home_parent_origin: extract_query_param(&window.location().href()?, "home_origin"),
+        picker_document_nonce: new_chat_message_request_id()
+            .map_err(|error| JsValue::from_str(&error))?,
+        picker_request: RefCell::new(None),
         state: RefCell::new(state),
         document: document.clone(),
         body: document
@@ -783,6 +797,9 @@ impl App {
         }
         state.error_text = state.direct.notice.clone();
         state.error_transient = false;
+        let guard = current_selection_guard(&state);
+        drop(state);
+        self.publish_home_navigation(&guard);
     }
 
     async fn refresh_direct_messages_for_guard(&self, guard: &SelectionGuard) -> Result<bool, u16> {
@@ -835,7 +852,30 @@ impl App {
         ) else {
             return Ok(false);
         };
+        drop(state);
+        if result.is_ok() {
+            self.publish_home_navigation(guard);
+        }
         result
+    }
+
+    fn publish_home_navigation(&self, guard: &SelectionGuard) {
+        if !self.is_shell_mode() {
+            return;
+        }
+        let Some(query) = navigation_query_for_guard(&self.state.borrow(), guard) else {
+            return;
+        };
+        let Some(window) = window() else { return };
+        let Ok(publish) =
+            Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatNavigation"))
+                .and_then(|value| value.dyn_into::<Function>())
+        else {
+            return;
+        };
+        if let Ok(query) = js_sys::JSON::parse(&query.to_string()) {
+            let _ = publish.call1(&JsValue::UNDEFINED, &query);
+        }
     }
 
     fn apply_summary(&self, summary: &SummaryView) -> bool {
@@ -1022,6 +1062,9 @@ impl App {
                 }
             };
             let _ = selector_app.render();
+            if choice == "shared" {
+                selector_app.publish_home_navigation(&selection_guard);
+            }
             selector_app.start_poll_loop();
             let app = Rc::clone(&selector_app);
             spawn_local(async move {
@@ -1351,15 +1394,20 @@ impl App {
         link_click.forget();
 
         let library_attach_app = Rc::clone(self);
-        let library_attach =
-            Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+        let library_attach = Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(
+            move |event: MessageEvent| {
                 let Some(window) = window() else {
                     return;
                 };
-                let Ok(origin) = window.location().origin() else {
+                let Some(origin) = library_attach_app.home_parent_origin.as_deref() else {
                     return;
                 };
-                if event.origin() != origin {
+                let Ok(Some(top)) = window.top() else {
+                    return;
+                };
+                let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
+                    .unwrap_or(JsValue::NULL);
+                if event.origin() != origin || !JsObject::is(&source, top.as_ref()) {
                     return;
                 }
                 let data = event.data();
@@ -1368,10 +1416,39 @@ impl App {
                 {
                     return;
                 }
-                let blob = js_blob_field(&data, "blob");
-                if blob.is_none() {
+                let Some(request_id) = js_string_field(&data, "requestId") else {
+                    return;
+                };
+                let Some(document_nonce) = js_string_field(&data, "documentNonce") else {
+                    return;
+                };
+                let Some(picker_id) = js_string_field(&data, "pickerId") else {
+                    return;
+                };
+                let Some(delivery_id) = js_string_field(&data, "deliveryId") else {
+                    return;
+                };
+                if picker_id.len() > 128 || delivery_id.len() > 128 {
                     return;
                 }
+                let request = {
+                    let mut pending = library_attach_app.picker_request.borrow_mut();
+                    let Some(request) = pending.as_mut() else {
+                        return;
+                    };
+                    if !library_picker_accepts(
+                        request,
+                        &request_id,
+                        &document_nonce,
+                        &library_attach_app.picker_document_nonce,
+                        &library_attach_app.state.borrow(),
+                    ) {
+                        return;
+                    }
+                    request.consumed = true;
+                    request.clone()
+                };
+                let blob = js_blob_field(&data, "blob");
                 let file_name = js_string_field(&data, "fileName")
                     .or_else(|| js_string_field(&data, "title"))
                     .unwrap_or_else(|| "Library item".to_string());
@@ -1381,17 +1458,24 @@ impl App {
                 spawn_local(async move {
                     app.clear_error();
                     let result = if let Some(blob) = blob {
-                        app.send_library_attachment(&file_name, &mime_type, blob)
+                        app.send_library_attachment(&file_name, &mime_type, blob, &request)
                             .await
                     } else {
                         Err("Library attachment is missing file bytes.".to_string())
                     };
+                    let accepted = result.is_ok() && app.library_picker_is_current(&request);
                     if let Err(err) = result {
                         app.set_error(Some(err));
                     }
+                    let _ = app.post_library_picker_message(serde_json::json!({
+                        "type": "home:picker-accepted", "homeToken": app.config.home_token,
+                        "pickerId": picker_id, "requestId": request_id,
+                        "documentNonce": document_nonce, "deliveryId": delivery_id, "accepted": accepted,
+                    }));
                     let _ = app.render();
                 });
-            }));
+            },
+        ));
         window()
             .ok_or_else(|| JsValue::from_str("window unavailable"))?
             .add_event_listener_with_callback("message", library_attach.as_ref().unchecked_ref())?;
@@ -1904,6 +1988,7 @@ impl App {
             };
             result
         };
+        self.publish_home_navigation(guard);
         for attachment in attachments_to_cache {
             if !self.selection_guard_is_current(guard) {
                 return Ok(changed);
@@ -2210,12 +2295,13 @@ impl App {
         file_name: &str,
         mime_type: &str,
         blob: Blob,
+        request: &LibraryPickerRequest,
     ) -> Result<(), String> {
         let bytes = blob_to_bytes(blob).await?;
         if bytes.is_empty() {
             return Err("Library item is empty.".to_string());
         }
-        self.send_attachment_bytes(file_name, mime_type, &bytes)
+        self.send_attachment_bytes(file_name, mime_type, &bytes, request)
             .await
     }
 
@@ -2224,9 +2310,10 @@ impl App {
         file_name: &str,
         mime_type: &str,
         bytes: &[u8],
+        request: &LibraryPickerRequest,
     ) -> Result<(), String> {
-        if !self.state.borrow().session_active {
-            return Ok(());
+        if !self.library_picker_is_current(request) {
+            return Err("Open a new Library picker in the current conversation.".to_string());
         }
         let headers = self.room_request_headers();
         let start: AttachmentUploadStartResponse = api_post_session_json(
@@ -2245,6 +2332,9 @@ impl App {
             .unwrap_or(256 * 1024);
         let mut offset = 0usize;
         while offset < bytes.len() {
+            if !self.library_picker_is_current(request) {
+                return Err("The selected conversation changed.".to_string());
+            }
             let end = (offset + chunk_size).min(bytes.len());
             let mut chunk_headers = headers.clone();
             chunk_headers.push(("x-elastos-upload-offset", offset.to_string()));
@@ -2256,12 +2346,18 @@ impl App {
             .await?;
             offset = end;
         }
+        if !self.library_picker_is_current(request) {
+            return Err("The selected conversation changed.".to_string());
+        }
         let sent: ConversationObjectView = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/upload/{}/finish", start.upload_id)),
             &headers,
         )
         .await?;
 
+        if !self.library_picker_is_current(request) {
+            return Err("The selected conversation changed.".to_string());
+        }
         let mut state = self.state.borrow_mut();
         state.latest_seq = sent.seq;
         state.objects.push(sent);
@@ -2434,49 +2530,47 @@ impl App {
     }
 
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
-        let Some(home_token) = self.config.home_token.as_deref() else {
-            return Ok(false);
-        };
-        let Some(window) = window() else {
-            return Ok(false);
-        };
-        let Some(parent) = window.parent()? else {
-            return Ok(false);
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
+        if self.config.home_token.is_none() || self.home_parent_origin.is_none() {
             return Ok(false);
         }
-
-        let message = JsObject::new();
-        Reflect::set(
-            &message,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("home:open-target"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("target"),
-            &JsValue::from_str("library"),
-        )?;
-        let query = JsObject::new();
-        Reflect::set(
-            &query,
-            &JsValue::from_str("mode"),
-            &JsValue::from_str("attach"),
-        )?;
-        Reflect::set(
-            &query,
-            &JsValue::from_str("returnTarget"),
-            &JsValue::from_str("chat-room"),
-        )?;
-        Reflect::set(&message, &JsValue::from_str("query"), &query)?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("homeToken"),
-            &JsValue::from_str(home_token),
-        )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
+        let request = LibraryPickerRequest {
+            id: new_chat_message_request_id().map_err(|error| JsValue::from_str(&error))?,
+            selection: current_selection_guard(&self.state.borrow()),
+            consumed: false,
+        };
+        self.post_library_picker_message(serde_json::json!({
+            "type": "home:open-target", "target": "library", "homeToken": self.config.home_token,
+            "query": { "mode": "attach", "returnTarget": "chat-room" },
+            "requestId": request.id, "documentNonce": self.picker_document_nonce,
+        }))?;
+        *self.picker_request.borrow_mut() = Some(request);
         Ok(true)
+    }
+
+    fn post_library_picker_message(&self, message: serde_json::Value) -> Result<(), JsValue> {
+        let window = window().ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
+        let top = window
+            .top()?
+            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
+        let origin = self
+            .home_parent_origin
+            .as_deref()
+            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
+        if origin == "null" || origin == "*" || JsObject::is(top.as_ref(), window.as_ref()) {
+            return Err(JsValue::from_str(
+                "Open Chat from Home to choose a Library item.",
+            ));
+        }
+        top.post_message(&js_sys::JSON::parse(&message.to_string())?, origin)
+    }
+
+    fn library_picker_is_current(&self, request: &LibraryPickerRequest) -> bool {
+        self.picker_request
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.id == request.id)
+            && self.state.borrow().session_active
+            && self.selection_guard_is_current(&request.selection)
     }
 
     async fn poll_once_for_guard(&self, guard: Option<&SelectionGuard>) -> Result<bool, String> {
@@ -3501,9 +3595,39 @@ fn current_selection_guard(state: &AppState) -> SelectionGuard {
     }
 }
 
+fn library_picker_accepts(
+    request: &LibraryPickerRequest,
+    request_id: &str,
+    document_nonce: &str,
+    current_document_nonce: &str,
+    state: &AppState,
+) -> bool {
+    !request.consumed
+        && request.id == request_id
+        && document_nonce == current_document_nonce
+        && state.session_active
+        && selection_guard_matches(state, &request.selection)
+}
+
 fn selection_guard_matches(state: &AppState, guard: &SelectionGuard) -> bool {
     state.selection_generation == guard.generation
         && state.direct.selected_conversation_id == guard.selected_conversation_id
+}
+
+fn navigation_query_for_guard(
+    state: &AppState,
+    guard: &SelectionGuard,
+) -> Option<serde_json::Value> {
+    if !selection_guard_matches(state, guard) {
+        return None;
+    }
+    match guard.selected_conversation_id.as_deref() {
+        Some(id) if selected_conversation(&state.direct.conversations, id).is_some() => {
+            Some(serde_json::json!({ "conversation_id": id }))
+        }
+        Some(_) => None,
+        None => Some(serde_json::json!({})),
+    }
 }
 
 fn resolve_conversation_choice(
@@ -3908,6 +4032,124 @@ mod tests {
         ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
         ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
     };
+
+    #[test]
+    fn navigation_hint_uses_current_verified_selection_without_draft_or_effects() {
+        let mut state = AppState::default();
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:sha256:conversation-b".into(),
+            display_name: "B".into(),
+            removed: false,
+        }];
+        let guard = commit_direct_selection(&mut state, "direct:sha256:conversation-b").unwrap();
+        let conversations = state.direct.conversations.clone();
+        assert!(matches!(
+            apply_direct_refresh_if_current(
+                &mut state,
+                &guard,
+                conversations,
+                DirectMessageList {
+                    conversation_id: "direct:sha256:conversation-b".into(),
+                    messages: vec![]
+                }
+            ),
+            Some(Ok(_))
+        ));
+        state.pending_chat_send = Some(PendingChatSend {
+            request_id: "private-effect".into(),
+            body: "private-draft".into(),
+        });
+        assert_eq!(
+            super::navigation_query_for_guard(&state, &guard),
+            Some(serde_json::json!({
+                "conversation_id": "direct:sha256:conversation-b"
+            }))
+        );
+        let shared = commit_shared_selection(&mut state);
+        let conversations = state.direct.conversations.clone();
+        assert_eq!(
+            apply_direct_refresh_if_current(
+                &mut state,
+                &guard,
+                conversations,
+                DirectMessageList {
+                    conversation_id: "direct:sha256:conversation-b".into(),
+                    messages: vec![]
+                }
+            ),
+            None
+        );
+        assert_eq!(super::navigation_query_for_guard(&state, &guard), None);
+        assert_eq!(
+            super::navigation_query_for_guard(&state, &shared),
+            Some(serde_json::json!({}))
+        );
+        state.direct.selected_conversation_id = Some("missing".into());
+        assert_eq!(
+            super::navigation_query_for_guard(&state, &current_selection_guard(&state)),
+            None
+        );
+    }
+
+    #[test]
+    fn library_picker_requires_current_document_request_and_selection() {
+        let mut state = AppState {
+            session_active: true,
+            ..AppState::default()
+        };
+        let mut request = super::LibraryPickerRequest {
+            id: "request-1".to_string(),
+            selection: current_selection_guard(&state),
+            consumed: false,
+        };
+        assert!(super::library_picker_accepts(
+            &request,
+            "request-1",
+            "doc-1",
+            "doc-1",
+            &state
+        ));
+        assert!(!super::library_picker_accepts(
+            &request,
+            "old-request",
+            "doc-1",
+            "doc-1",
+            &state
+        ));
+        assert!(!super::library_picker_accepts(
+            &request,
+            "request-1",
+            "old-doc",
+            "doc-1",
+            &state
+        ));
+        request.consumed = true;
+        assert!(!super::library_picker_accepts(
+            &request,
+            "request-1",
+            "doc-1",
+            "doc-1",
+            &state
+        ));
+        request.consumed = false;
+        state.selection_generation += 1;
+        assert!(!super::library_picker_accepts(
+            &request,
+            "request-1",
+            "doc-1",
+            "doc-1",
+            &state
+        ));
+        state.selection_generation -= 1;
+        state.session_active = false;
+        assert!(!super::library_picker_accepts(
+            &request,
+            "request-1",
+            "doc-1",
+            "doc-1",
+            &state
+        ));
+    }
 
     #[test]
     fn shell_session_bootstrap_errors_are_typed_and_bounded() {

@@ -132,39 +132,49 @@ impl CapabilityManager {
     ) -> Self {
         let key_path = data_dir.join("signing_key");
 
-        let signing_key = if key_path.exists() {
-            // Try to load existing key
-            match std::fs::read(&key_path) {
-                Ok(bytes) if bytes.len() == 32 => {
-                    let mut key_bytes = [0u8; 32];
-                    key_bytes.copy_from_slice(&bytes);
-                    let key = SigningKey::from_bytes(&key_bytes);
+        let signing_key = match std::fs::symlink_metadata(&key_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                tracing::error!(
+                    "Signing key path {:?} is a symlink; refusing to follow or replace it",
+                    key_path
+                );
+                SigningKey::generate(&mut rand::thread_rng())
+            }
+            Ok(metadata) if metadata.is_file() => match Self::read_signing_key_file(&key_path) {
+                Ok(key) => {
                     tracing::info!("Loaded existing capability signing key from {:?}", key_path);
                     key
                 }
-                Ok(bytes) => {
-                    tracing::warn!(
-                        "Signing key file {:?} has wrong length ({} bytes, expected 32). Generating new key.",
-                        key_path,
-                        bytes.len()
-                    );
-                    Self::generate_and_persist_key(&key_path, &audit_log)
-                }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to read signing key from {:?}: {}. Generating new key.",
+                        "Failed to read signing key from {:?}: {}. Using an ephemeral key.",
                         key_path,
                         e
                     );
-                    Self::generate_and_persist_key(&key_path, &audit_log)
+                    SigningKey::generate(&mut rand::thread_rng())
                 }
+            },
+            Ok(_) => {
+                tracing::error!(
+                    "Signing key path {:?} is not a regular file; using an ephemeral key",
+                    key_path
+                );
+                SigningKey::generate(&mut rand::thread_rng())
             }
-        } else {
-            // No key file — generate and save
-            if let Err(e) = std::fs::create_dir_all(data_dir) {
-                tracing::warn!("Failed to create data directory {:?}: {}", data_dir, e);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = std::fs::create_dir_all(data_dir) {
+                    tracing::warn!("Failed to create data directory {:?}: {}", data_dir, e);
+                }
+                Self::generate_and_persist_key(&key_path, &audit_log)
             }
-            Self::generate_and_persist_key(&key_path, &audit_log)
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to inspect signing key at {:?}: {}. Using an ephemeral key.",
+                    key_path,
+                    e
+                );
+                SigningKey::generate(&mut rand::thread_rng())
+            }
         };
 
         let verifying_key = signing_key.verifying_key();
@@ -178,19 +188,73 @@ impl CapabilityManager {
         }
     }
 
+    fn read_signing_key_file(key_path: &Path) -> std::io::Result<SigningKey> {
+        use std::io::Read as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(key_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() != 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("signing key file has {} bytes, expected 32", bytes.len()),
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&bytes);
+        Ok(SigningKey::from_bytes(&key_bytes))
+    }
+
+    fn persist_signing_key_bytes(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        if let Some(parent) = key_path.parent() {
+            let metadata = std::fs::symlink_metadata(parent)?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "signing key parent must be a real directory",
+                ));
+            }
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(key_path) {
+            let message = if metadata.file_type().is_symlink() {
+                "signing_key must not be a symlink"
+            } else {
+                "signing_key already exists"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                message,
+            ));
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(key_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Generate a new signing key and persist it to disk
     fn generate_and_persist_key(key_path: &Path, audit_log: &AuditLog) -> SigningKey {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
 
-        match std::fs::write(key_path, signing_key.to_bytes()) {
+        match Self::persist_signing_key_bytes(key_path, &signing_key.to_bytes()) {
             Ok(()) => {
-                // Restrict file permissions to owner-only (0600)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
-                }
                 tracing::info!(
                     "Generated and saved new capability signing key to {:?}",
                     key_path
@@ -1394,5 +1458,75 @@ mod tests {
             result,
             Err(ValidationError::DelegationScopeWidened)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_or_generate_refuses_signing_key_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let target = data_dir.join("leaked-key");
+        let key_path = data_dir.join("signing_key");
+        std::os::unix::fs::symlink(&target, &key_path).unwrap();
+
+        let _manager = CapabilityManager::load_or_generate(
+            data_dir,
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+
+        assert!(
+            !target.exists(),
+            "writer must leave the symlink target unwritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(&key_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "signing_key symlink must remain a symlink"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_or_generate_creates_owner_only_signing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let manager = CapabilityManager::load_or_generate(
+            data_dir,
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+        let key_path = data_dir.join("signing_key");
+        let bytes = std::fs::read(&key_path).unwrap();
+        assert_eq!(bytes.len(), 32);
+        let metadata = std::fs::symlink_metadata(&key_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await
+            .expect("fresh signing key must issue a valid token");
     }
 }

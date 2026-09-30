@@ -1,0 +1,17 @@
+# Named `Dockerfile.dockerignore` (BuildKit's Dockerfile-specific ignore
+# file, colocated with the Dockerfile it governs) rather than a plain
+# `.dockerignore` in this same directory: empirically verified (see the
+# task report) that `docker build -f deploy/custody-host/Dockerfile -t
+# elastos-custody-host .` (context root `.`, per the build command this
+# image is built with) does NOT honor a `.dockerignore` placed in the
+# Dockerfile's own subdirectory -- only a context-root `.dockerignore` or
+# this `<dockerfile-name>.dockerignore` form is read. A root-level
+# `.dockerignore` is out of scope (only new files under deploy/custody-host/
+# for this task), and without a working ignore file here `docker build`
+# would try to send target-build/'s tens of GB as build context.
+target
+target-capsules
+target-build
+*/target
+capsules/*/target
+.git

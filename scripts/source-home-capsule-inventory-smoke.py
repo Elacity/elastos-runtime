@@ -219,6 +219,108 @@ def make_kubo_rewritten_components(path):
     )
 
 
+def assert_source_archive_overlay(stamper):
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / "repo"
+        data = Path(temp) / "data"
+        make_source_capsules(root)
+        make_installed_capsules(root, data)
+        components = data / "components.json"
+        release = {"cid": "old-cid", "checksum": "sha256:old-archive", "size": 123,
+                   "release_path": "gba-emulator.tar.gz", "url": "https://fixture.invalid/archive",
+                   "extract_path": "gba-emulator", "install_path": "capsules/gba-emulator"}
+        unrelated = {"install_path": "capsules/another", "platforms": {"*": release.copy()}}
+        provider = {"install_path": "bin/object-provider", "platforms": {"darwin-arm64": {"checksum": "sha256:provider"}}}
+        initial = {"external": {
+            "gba-emulator": {"install_path": "capsules/gba-emulator", "platforms": {"*": release.copy(), "linux-x86_64": release.copy()}},
+            "another": unrelated, "object-provider": provider},
+            "capsules": {"gba-emulator": {"cid": "old-cid", "sha256": "sha256:old-archive", "size": 123}}, "profiles": {}}
+        write_json(components, initial)
+        sidecars = [data / "capsules/gba-emulator" / name for name in [".elastos-cid", ".elastos-artifact-sha256"]]
+        for sidecar in sidecars:
+            sidecar.write_text("old-archive\n")
+        # A later selected capsule fails parity: preserve the entire earlier state.
+        actual_entrypoint = json.loads((root / "capsules/gba-ucity/capsule.json").read_text())["entrypoint"]
+        source_rom = root / "capsules/gba-ucity" / actual_entrypoint
+        source_bytes = source_rom.read_bytes()
+        source_rom.write_bytes(b"different")
+        before = tree_hashes(data)
+        try:
+            stamper.stamp_component_capsules(components, data, root, "darwin-arm64", ["gba-emulator", "gba-ucity"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("mismatched entrypoint must fail before clearing archive metadata")
+        if tree_hashes(data) != before:
+            raise AssertionError("parity failure changed the earlier selected capsule")
+        source_rom.write_bytes(source_bytes)
+        stamper.stamp_component_capsules(components, data, root, "darwin-arm64", ["gba-emulator"])
+        result = json.loads(components.read_text())
+        entry = result["capsules"]["gba-emulator"]
+        if (entry["cid"], entry["sha256"], entry["size"]) != ("", "", 0):
+            raise AssertionError("source overlay retained stale registry archive identity")
+        current = result["external"]["gba-emulator"]["platforms"]["darwin-arm64"]
+        for field in ["cid", "checksum", "size", "release_path", "url"]:
+            if current.get(field) is not None:
+                raise AssertionError(f"source overlay retained stale platform {field}")
+        if current["strategy"] != "source-build" or current["install_path"] != release["install_path"] or current["extract_path"] != release["extract_path"]:
+            raise AssertionError("source overlay lost its managed installation mapping")
+        if any(path.exists() for path in sidecars):
+            raise AssertionError("source overlay retained old archive sidecars")
+        if result["external"]["another"] != unrelated or result["external"]["object-provider"] != provider:
+            raise AssertionError("source overlay changed an unrelated component")
+        for platform in ["*", "linux-x86_64"]:
+            if result["external"]["gba-emulator"]["platforms"][platform] != release:
+                raise AssertionError("source overlay changed another platform's release mapping")
+        installed = data / "capsules/gba-emulator"
+        if entry["entrypoint_sha256"] != "sha256:" + sha256(installed / "browser/index.html") or not entry["browser_assets"]:
+            raise AssertionError("source overlay lost its exact artifact hashes")
+        before = tree_hashes(data)
+        stamper.stamp_component_capsules(components, data, root, "darwin-arm64", ["gba-emulator"])
+        if tree_hashes(data) != before:
+            raise AssertionError("repeated source stamping changed the installation")
+
+        # Alias selection must agree with Runtime; an explicit empty exact
+        # mapping takes precedence over both an alias and a wildcard.
+        for platform, alias in stamper.PLATFORM_ALIASES.items():
+            for exact in (False, True):
+                candidate = json.loads(json.dumps(initial))
+                mappings = {alias: release.copy(), "*": {"install_path": "wrong/wildcard"}}
+                if exact:
+                    mappings[platform] = {}
+                    mappings[alias]["install_path"] = "wrong/alias"
+                candidate["external"]["gba-emulator"]["platforms"] = mappings
+                write_json(components, candidate)
+                stamper.stamp_component_capsules(components, data, root, platform, ["gba-emulator"])
+                result = json.loads(components.read_text())
+                current = result["external"]["gba-emulator"]["platforms"][platform]
+                if current["strategy"] != "source-build" or current["checksum"] is not None:
+                    raise AssertionError(f"source overlay failed for platform {platform}")
+                if ("extract_path" in current) == exact:
+                    raise AssertionError("source overlay used the wrong platform mapping")
+                if result["external"]["gba-emulator"]["platforms"][alias] != mappings[alias]:
+                    raise AssertionError("source overlay changed its alias release mapping")
+
+        # Runtime treats an empty path as an explicit override. Reject it and
+        # conflicting paths before changing either metadata or cache sidecars.
+        for install_path in ("", "capsules/different"):
+            candidate = json.loads(json.dumps(initial))
+            candidate["external"]["gba-emulator"]["platforms"]["darwin-arm64"] = {"install_path": install_path}
+            write_json(components, candidate)
+            for sidecar in sidecars:
+                sidecar.write_text("old-archive\n")
+            before = tree_hashes(data)
+            try:
+                stamper.stamp_component_capsules(components, data, root, "darwin-arm64", ["gba-emulator"])
+            except SystemExit as error:
+                if "external install path mismatch" not in str(error):
+                    raise
+            else:
+                raise AssertionError("conflicting external install path must fail")
+            if tree_hashes(data) != before:
+                raise AssertionError("install path failure changed the installation")
+
+
 def assert_setup_order():
     setup = (ROOT / "scripts" / "setup-source-home.sh").read_text(encoding="utf-8")
     main = setup.split('echo "[setup-source-home] repo:', 1)[1]
@@ -433,6 +535,7 @@ def run_smoke():
         if not user_data.is_file() or sha256(user_data) != protected_before[str(user_data)]:
             raise AssertionError("unsafe cleanup probe modified protected user data")
 
+    assert_source_archive_overlay(stamper)
     assert_setup_order()
     print("PASS source-home capsule inventory smoke")
 

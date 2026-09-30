@@ -3,8 +3,31 @@ use std::path::{Path, PathBuf};
 pub async fn run_capsule(
     path: Option<PathBuf>,
     cid: Option<String>,
+    with: Vec<String>,
+    carrier_addr: Option<String>,
     capsule_args: Vec<String>,
 ) -> anyhow::Result<()> {
+    if let Some(plan) = resolve_provider_host_plan(
+        path.as_deref(),
+        cid.as_deref(),
+        &with,
+        carrier_addr.as_deref(),
+    )? {
+        if !capsule_args.is_empty() {
+            anyhow::bail!(
+                "a native provider host takes no capsule arguments; got: {}",
+                capsule_args.join(" ")
+            );
+        }
+        return crate::provider_host::run(plan).await;
+    }
+    if !with.is_empty() || carrier_addr.is_some() {
+        anyhow::bail!(
+            "--with and --carrier-addr apply only when hosting a native provider; supported providers are: {}",
+            crate::provider_host::ProviderPlane::supported_set()
+        );
+    }
+
     let capsule_dir = resolve_capsule_dir(path, cid).await?;
     let manifest = load_valid_manifest_if_present(&capsule_dir).await?;
 
@@ -51,6 +74,42 @@ pub async fn run_capsule(
     }
 
     Ok(())
+}
+
+/// Decide whether this `elastos run` invocation hosts a native provider.
+///
+/// App-capsule behavior is untouched: a `--cid` run and any target that is an
+/// existing capsule directory take the capsule path exactly as before. Only a
+/// target that cannot be a capsule directory is read as a provider, so an
+/// unknown one fails closed naming the supported set instead of dying on a
+/// missing `capsule.json`.
+fn resolve_provider_host_plan(
+    path: Option<&Path>,
+    cid: Option<&str>,
+    with: &[String],
+    carrier_addr: Option<&str>,
+) -> anyhow::Result<Option<crate::provider_host::ProviderHostPlan>> {
+    if cid.is_some() {
+        return Ok(None);
+    }
+    let Some(target) = path else {
+        return Ok(None);
+    };
+    if target.is_dir() {
+        return Ok(None);
+    }
+    let target = target
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("run target must be valid UTF-8"))?;
+
+    crate::provider_host::ProviderHostPlan::resolve(
+        crate::default_data_dir(),
+        target,
+        with,
+        carrier_addr,
+    )
+    .map(Some)
+    .map_err(|err| err.context(format!("'{target}' is not an existing capsule directory")))
 }
 
 async fn resolve_capsule_dir(

@@ -1,18 +1,16 @@
 # Getting started with ElastOS Runtime
 
-## Install the Linux preview
+## Install from the publisher
 
-The public binary installer is the current Linux `x86_64`/`aarch64` preview.
-macOS uses source-home staging; see the [Mac runbook](MAC.md).
+The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. See the [Mac runbook](MAC.md) for source-home staging.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos
 ```
 
-After setup, `elastos` opens Home. The
+The installer installs Runtime, sets up the Home profile, and opens Home. Keep
+the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
+later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts
@@ -35,16 +33,9 @@ elastos chat --nick alice
 elastos update --check
 ```
 
-The default setup installs the core Home profile. Add content publishing tools
-only when you need them:
-
-```bash
-elastos setup --with kubo --with ipfs-provider --with documents
-elastos share README.md
-elastos open elastos://CID
-```
-
-Replace `CID` with the value returned by `elastos share`.
+Open Documents or Library from Home to work with your files. The source Home
+profile includes these apps and their content backend. For an installed release,
+its signed manifest determines the available components.
 
 The demo profile adds more Apps and tools. The operator profile supports
 `serve`, remote node control, agents, WASM or microVM `run`, and non-interactive

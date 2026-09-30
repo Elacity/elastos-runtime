@@ -334,7 +334,7 @@ struct RoomPendingRequestStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RoomSessionStatus {
-    token: String,
+    session_id: String,
     display_name: String,
     device_label: String,
 }
@@ -1400,7 +1400,7 @@ async fn gather_snapshot_from_parts(
                 .active_sessions
                 .into_iter()
                 .map(|session| RoomSessionStatus {
-                    token: session.token,
+                    session_id: session.session_id,
                     display_name: session.display_name,
                     device_label: session.device_label,
                 })
@@ -1839,28 +1839,71 @@ fn run_home_cli_renderer(
 }
 
 fn resolve_home_cli_renderer_program(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    let installed = data_dir.join("bin").join(HOME_CLI_CAPSULE_NAME);
-    if installed.is_file() {
-        return Ok(installed);
-    }
-
-    let dev = source_capsule_dir(HOME_CLI_CAPSULE_NAME)
-        .join("target")
-        .join("release")
+    let installed = data_dir
+        .join("capsules")
+        .join(HOME_CLI_CAPSULE_NAME)
+        .join("bin")
         .join(HOME_CLI_CAPSULE_NAME);
-    if dev.is_file() {
-        return Ok(dev);
+    let metadata = fs::symlink_metadata(&installed).with_context(|| {
+        format!(
+            "Home is incomplete. Run the installer again to repair Home.\nHome CLI native renderer missing at {}",
+            installed.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Home CLI native renderer must be a regular file: {}",
+            installed.display()
+        );
     }
-
-    anyhow::bail!(
-        "Home CLI native renderer missing.\n\nBuild and install source Home first:\n\n  scripts/setup-source-home.sh\n\nOr build it directly:\n\n  cargo build --manifest-path capsules/home-cli/Cargo.toml --release --bin home-cli"
-    );
-}
-
-fn source_capsule_dir(capsule_name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../capsules")
-        .join(capsule_name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!(
+                "Home CLI native renderer is not executable: {}",
+                installed.display()
+            );
+        }
+    }
+    // exec can interpret an unrecognized executable as a shell script. Home
+    // runs only the target-native renderer delivered inside its capsule.
+    use std::io::Read as _;
+    let mut header = [0u8; 64];
+    fs::File::open(&installed)?
+        .read_exact(&mut header)
+        .with_context(|| {
+            format!(
+                "Home CLI renderer is an invalid native executable: {}",
+                installed.display()
+            )
+        })?;
+    let native = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", arch @ ("x86_64" | "aarch64")) => {
+            header[..7] == *b"\x7fELF\x02\x01\x01"
+                && matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+                && u16::from_le_bytes([header[18], header[19]])
+                    == if arch == "aarch64" { 183 } else { 62 }
+        }
+        ("macos", arch @ ("x86_64" | "aarch64")) => {
+            header[..4] == [0xcf, 0xfa, 0xed, 0xfe]
+                && u32::from_le_bytes(header[4..8].try_into().unwrap())
+                    == if arch == "aarch64" {
+                        0x100000c
+                    } else {
+                        0x1000007
+                    }
+                && u32::from_le_bytes(header[12..16].try_into().unwrap()) == 2
+        }
+        _ => false,
+    };
+    if !native {
+        anyhow::bail!(
+            "Home CLI renderer is an invalid native executable: {}",
+            installed.display()
+        );
+    }
+    Ok(installed)
 }
 
 async fn dispatch_action(
@@ -1918,8 +1961,11 @@ async fn dispatch_action(
             None => Ok("That Chat web guest request is no longer pending.".to_string()),
         };
     }
-    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
-        return match elastos_server::room_service::revoke_session(&default_data_dir(), token)? {
+    if let Some(session_id) = action_id.strip_prefix("room-revoke-session:") {
+        return match elastos_server::room_service::revoke_guest_session_by_id(
+            &default_data_dir(),
+            session_id,
+        )? {
             Some(outcome) => Ok(format!(
                 "Disconnected Chat web guest session for {} on {}.",
                 outcome.display_name, outcome.device_label
@@ -3548,12 +3594,12 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
             ActionReadiness::Blocked("web guest request is no longer pending".to_string())
         };
     }
-    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
+    if let Some(session_id) = action_id.strip_prefix("room-revoke-session:") {
         return if snapshot
             .room
             .active_sessions
             .iter()
-            .any(|session| session.token == token)
+            .any(|session| session.session_id == session_id)
         {
             ActionReadiness::Ready
         } else {
@@ -3703,7 +3749,7 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
     }
     for session in &snapshot.room.active_sessions {
         actions.push(ActionInfo {
-            id: format!("room-revoke-session:{}", session.token),
+            id: format!("room-revoke-session:{}", session.session_id),
             label: format!(
                 "Disconnect {} on {}",
                 session.display_name, session.device_label
@@ -3786,6 +3832,67 @@ mod tests {
     use super::*;
 
     static HOME_CMD_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn home_cli_renderer_resolves_only_the_installed_capsule() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("bin/home-cli");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &legacy).unwrap();
+        let error = resolve_home_cli_renderer_program(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("renderer missing"));
+
+        let renderer = temp.path().join("capsules/home-cli/bin/home-cli");
+        fs::create_dir_all(renderer.parent().unwrap()).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &renderer).unwrap();
+        assert_eq!(
+            resolve_home_cli_renderer_program(temp.path()).unwrap(),
+            renderer
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_cli_renderer_rejects_nonexecutable_link_and_corrupt_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let renderer = temp.path().join("capsules/home-cli/bin/home-cli");
+        fs::create_dir_all(renderer.parent().unwrap()).unwrap();
+        fs::write(&renderer, b"corrupt native renderer").unwrap();
+        fs::set_permissions(&renderer, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_home_cli_renderer_program(temp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("not executable"));
+        fs::remove_file(&renderer).unwrap();
+        symlink(std::env::current_exe().unwrap(), &renderer).unwrap();
+        assert!(resolve_home_cli_renderer_program(temp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        fs::remove_file(&renderer).unwrap();
+        let mut wrong_cpu = fs::read(std::env::current_exe().unwrap()).unwrap()[..64].to_vec();
+        let machine_offset = if cfg!(target_os = "macos") { 4 } else { 18 };
+        wrong_cpu[machine_offset] = 0;
+        for bytes in [wrong_cpu, b"#!/bin/sh\nexit 0\n".repeat(8)] {
+            fs::write(&renderer, bytes).unwrap();
+            fs::set_permissions(&renderer, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(resolve_home_cli_renderer_program(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid native executable"));
+        }
+        fs::write(&renderer, b"\x7fELFcorrupt native renderer").unwrap();
+        fs::set_permissions(&renderer, fs::Permissions::from_mode(0o755)).unwrap();
+        let session = HomeSession {
+            uri_root: "localhost://fixture/home".to_string(),
+            path: temp.path().join("session"),
+        };
+        let error = run_home_cli_renderer(temp.path(), "http://127.0.0.1:1", "fixture", &session)
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid native executable"));
+    }
 
     fn assert_text_contains_all(label: &str, text: &str, needles: &[&str]) {
         for needle in needles {
@@ -4424,13 +4531,13 @@ mod tests {
             },
             "identity": {
                 "profile": {
-                    "display_name": "Anders",
-                    "handle": "person:anders"
+                    "display_name": "Owner",
+                    "handle": "person:owner"
                 }
             },
             "authority": {
                 "signed_in": true,
-                "principal_id": "person:anders"
+                "principal_id": "person:owner"
             },
             "active_shell": {
                 "schema": "elastos.home.active-shell/v1",
@@ -4441,7 +4548,7 @@ mod tests {
                 "contact_count": 1,
                 "contacts": [{
                     "contact_id": "contact-a",
-                    "display_name": "Anders",
+                    "display_name": "Owner",
                     "relationship": "accepted",
                     "route": "elastos://peer/contact-a",
                     "can_message": true
@@ -4503,11 +4610,11 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .display_name,
-            "Anders"
+            "Owner"
         );
         assert_eq!(
             projection.authority.as_ref().unwrap().principal_id,
-            "person:anders"
+            "person:owner"
         );
         assert!(projection.authority.as_ref().unwrap().signed_in);
         assert_eq!(
@@ -5106,6 +5213,35 @@ mod tests {
         snapshot.room.active_session_count = 1;
         assert!(matches!(
             action_readiness("room-revoke-all", &snapshot),
+            ActionReadiness::Ready
+        ));
+    }
+
+    #[test]
+    fn home_room_snapshot_revokes_by_session_id_and_omits_bearer_token() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.active_sessions = vec![RoomSessionStatus {
+            session_id: "guest-session-id".to_string(),
+            display_name: "Guest".to_string(),
+            device_label: "phone".to_string(),
+        }];
+        snapshot.room.active_session_count = 1;
+
+        let encoded = serde_json::to_value(&snapshot.room.active_sessions).unwrap();
+        assert!(encoded[0].get("token").is_none());
+        assert_eq!(encoded[0]["session_id"], "guest-session-id");
+
+        let revoke_ids: Vec<String> = gather_room_actions(&snapshot)
+            .into_iter()
+            .map(|action| action.id)
+            .filter(|id| id.starts_with("room-revoke-session:"))
+            .collect();
+        assert_eq!(
+            revoke_ids,
+            vec!["room-revoke-session:guest-session-id".to_string()]
+        );
+        assert!(matches!(
+            action_readiness("room-revoke-session:guest-session-id", &snapshot),
             ActionReadiness::Ready
         ));
     }

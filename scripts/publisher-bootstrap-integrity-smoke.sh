@@ -9,6 +9,7 @@ from pathlib import Path
 
 install = Path("scripts/install.sh").read_text()
 publish = Path("scripts/publish-release.sh").read_text()
+discover = Path("scripts/discover-source-bootstrap.py").read_text()
 
 required_install = [
     'data.get("role") != "publisher"',
@@ -16,9 +17,14 @@ required_install = [
     "trusted-source Carrier bootstrap overrides are atomic",
 ]
 required_publish = [
-    "/.well-known/elastos/carrier-bootstrap.json?role=publisher",
-    'bootstrap.get("role") != "publisher"',
+    "discover-source-bootstrap.py",
     "trusted-source Carrier bootstrap requires both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID",
+]
+required_discover = [
+    "/.well-known/elastos/carrier-bootstrap.json?role=publisher",
+    'data.get("role") != "publisher"',
+    'data.get("schema") != "elastos.carrier.bootstrap/v1"',
+    '"/api/health"',
 ]
 
 for needle in required_install:
@@ -28,6 +34,10 @@ for needle in required_install:
 for needle in required_publish:
     if needle not in publish:
         raise SystemExit(f"[publisher-bootstrap-integrity] publish-release.sh missing {needle!r}")
+
+for needle in required_discover:
+    if needle not in discover:
+        raise SystemExit(f"[publisher-bootstrap-integrity] discover-source-bootstrap.py missing {needle!r}")
 
 if "keys node-id" in publish:
     raise SystemExit("[publisher-bootstrap-integrity] publish-release.sh must not pair a ticket with keys node-id fallback")

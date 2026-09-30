@@ -7,14 +7,18 @@
 //! Providers are registered at startup and can be dynamically added/removed.
 
 pub mod bridge;
+#[cfg(target_os = "linux")]
+mod linux_model_seccomp;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod local_model_broker;
 mod registry;
 
 pub use bridge::{CapsuleProvider, ProviderBridge, ProviderConfig as BridgeProviderConfig};
 pub use registry::{
-    EntryType, Provider, ProviderByteRange, ProviderCarrierInvoker, ProviderCarrierRoute,
-    ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderProgress,
-    ProviderRegistration, ProviderRegistry, ProviderStreamOptions, ProviderStreamRead,
-    ProviderStreamSession, ProviderTransfer, ResourceAction, ResourceResponse,
+    EntryType, LocalIpfsCapacityObservation, Provider, ProviderByteRange, ProviderCarrierInvoker,
+    ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
+    ProviderProgress, ProviderRegistration, ProviderRegistry, ProviderStreamOptions,
+    ProviderStreamRead, ProviderStreamSession, ProviderTransfer, ResourceAction, ResourceResponse,
 };
 
 // Re-export for use by external provider implementations

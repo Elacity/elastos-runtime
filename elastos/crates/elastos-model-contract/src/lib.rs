@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decisions;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,6 +20,9 @@ pub const MAX_RUNTIME_BINDING_ID_BYTES: usize = 256;
 pub const MAX_RUNTIME_OPERATION_BYTES: usize = 128;
 pub const MAX_RUNTIME_INPUT_HASH_BYTES: usize = 71;
 pub const MAX_RUN_ID_BYTES: usize = 75;
+pub const TEXT_INPUT_V1_SCHEMA: &str = "elastos.model.input.text/v1";
+pub const TEXT_INPUT_V2_SCHEMA: &str = "elastos.model.input.text/v2";
+pub const MAX_TEXT_MESSAGES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractError(String);
@@ -134,11 +139,63 @@ impl RuntimeAccessBinding {
     }
 }
 
+/// Stable run identity shared by Runtime recovery and the provider journal.
+/// Session and grant rotation preserve ownership by principal and capsule.
+pub fn model_run_id(binding: &RuntimeCreateBinding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"elastos:model-run:v1\n");
+    hasher.update(binding.principal_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.capsule_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.request_id.as_bytes());
+    format!("run:sha256:{}", hex_hash(&hasher.finalize()))
+}
+
 pub fn model_input_hash(input: &Value) -> ContractResult<String> {
     let canonical = serde_json::to_vec(input)?;
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     Ok(format!("sha256:{}", hex_hash(&hasher.finalize())))
+}
+
+/// Validate the exact ordered conversation. Offer byte limits apply separately.
+pub fn validate_text_input_v2(input: &Value) -> ContractResult<&[Value]> {
+    let invalid = || ContractError::new("invalid text/v2 conversation");
+    let object = input.as_object().ok_or_else(invalid)?;
+    if (object.len() != 2 && object.len() != 3)
+        || input["schema"] != TEXT_INPUT_V2_SCHEMA
+        || (object.len() == 3
+            && input["max_output_tokens"]
+                .as_u64()
+                .is_none_or(|count| count == 0 || count > u32::MAX as u64))
+    {
+        return Err(invalid());
+    }
+    let messages = input["messages"].as_array().ok_or_else(invalid)?;
+    if messages.is_empty() || messages.len() > MAX_TEXT_MESSAGES {
+        return Err(invalid());
+    }
+    for (index, message) in messages.iter().enumerate() {
+        let message = message.as_object().ok_or_else(invalid)?;
+        if message.len() != 2
+            || message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_none_or(|text| text.is_empty())
+        {
+            return Err(invalid());
+        }
+        match message.get("role").and_then(Value::as_str) {
+            Some("system") if index == 0 => {}
+            Some("user" | "assistant") => {}
+            _ => return Err(invalid()),
+        }
+    }
+    if messages.last().map(|message| &message["role"]) != Some(&Value::from("user")) {
+        return Err(invalid());
+    }
+    Ok(messages)
 }
 
 pub fn validate_input_hash(value: &str) -> ContractResult<()> {
@@ -202,6 +259,97 @@ fn hex_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn text_v2_keeps_messages_and_rejects_invalid_shapes() {
+        let user = json!({"role":"user", "content":"Hello"});
+        let system = json!({"role":"system", "content":"Be concise."});
+        let assistant = json!({"role":"assistant", "content":"Hi"});
+        for messages in [
+            json!([user]),
+            json!([system, user]),
+            json!([system, user, assistant, user]),
+        ] {
+            let input = json!({"schema":TEXT_INPUT_V2_SCHEMA, "messages":messages});
+            assert_eq!(
+                validate_text_input_v2(&input).unwrap(),
+                messages.as_array().unwrap()
+            );
+        }
+        let valid = json!({"schema":TEXT_INPUT_V2_SCHEMA, "messages":[user]});
+        let mut extra_top = valid.clone();
+        extra_top["prompt"] = json!("hidden");
+        let invalid_messages = vec![
+            json!([]),
+            json!([{"role":"user","content":""}]),
+            json!([{"role":"user","content":"ok","name":"hidden"}]),
+            json!([{"role":"agent","content":"ok"}]),
+            json!([{"role":"tool","content":"ok"}]),
+            json!([{"role":"user","content":1}]),
+            json!([user, system, user]),
+            json!([system, system, user]),
+            json!([assistant]),
+            json!([system]),
+            json!(vec![user.clone(); MAX_TEXT_MESSAGES + 1]),
+        ];
+        assert!(validate_text_input_v2(&extra_top).is_err());
+        let bounded =
+            json!({"schema":TEXT_INPUT_V2_SCHEMA,"messages":[user.clone()],"max_output_tokens":32});
+        assert!(validate_text_input_v2(&bounded).is_ok());
+        for invalid_limit in [
+            json!(0),
+            json!(-1),
+            json!("32"),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            let mut invalid = bounded.clone();
+            invalid["max_output_tokens"] = invalid_limit;
+            assert!(validate_text_input_v2(&invalid).is_err());
+        }
+        assert!(
+            validate_text_input_v2(&json!({"schema":TEXT_INPUT_V1_SCHEMA,"messages":[user]}))
+                .is_err()
+        );
+        for messages in invalid_messages {
+            assert!(
+                validate_text_input_v2(&json!({"schema":TEXT_INPUT_V2_SCHEMA,"messages":messages}))
+                    .is_err(),
+                "{messages}"
+            );
+        }
+        let maximum =
+            json!({"schema":TEXT_INPUT_V2_SCHEMA,"messages":vec![user; MAX_TEXT_MESSAGES]});
+        assert_eq!(
+            validate_text_input_v2(&maximum).unwrap().len(),
+            MAX_TEXT_MESSAGES
+        );
+    }
+
+    #[test]
+    fn text_v2_binding_detects_role_order_and_content_changes() {
+        let input = json!({"schema":TEXT_INPUT_V2_SCHEMA,"messages":[
+            {"role":"system","content":"Be concise."},
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"reply"},
+            {"role":"user","content":"last"}
+        ]});
+        let mut binding = sample_create_binding();
+        binding.input_hash = model_input_hash(&input).unwrap();
+        binding
+            .validate(&binding.offer_id, &binding.operation, &input)
+            .unwrap();
+        let mut role = input.clone();
+        role["messages"][2]["role"] = json!("user");
+        let mut order = input.clone();
+        order["messages"].as_array_mut().unwrap().swap(1, 2);
+        let mut content = input.clone();
+        content["messages"][2]["content"] = json!("changed");
+        for changed in [role, order, content] {
+            assert!(binding
+                .validate(&binding.offer_id, &binding.operation, &changed)
+                .is_err());
+        }
+    }
 
     fn sample_input() -> Value {
         json!({

@@ -44,18 +44,28 @@ use url::form_urlencoded;
 
 #[path = "gateway_assistant.rs"]
 mod gateway_assistant;
+#[path = "gateway_assistant_workspace_v2.rs"]
+mod gateway_assistant_workspace_v2;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
+pub(crate) use gateway_browser::gateway_browser_operator::{
+    register_browser_operator_sessions, BrowserOperatorService,
+};
+pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_browser_engine;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
 mod gateway_collaboration_presence;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
+#[path = "gateway_home_agent.rs"]
+mod gateway_home_agent;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
+#[path = "gateway_home_system_ai_provider.rs"]
+mod gateway_home_system_ai_provider;
 #[path = "gateway_home_terminal.rs"]
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
@@ -68,6 +78,16 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_model_remote.rs"]
+mod gateway_model_remote;
+#[path = "gateway_model_service.rs"]
+mod gateway_model_service;
+pub(in crate::api) use gateway_model_service::deny_grant_and_settle as deny_model_grant_and_settle;
+pub(crate) use gateway_model_service::{
+    invoke as invoke_remote_model, model_grant_id, ModelServiceGrant, MODEL_GRANT_SCHEMA,
+    MODEL_GRANT_SCOPE, MODEL_GRANT_TTL_SECS, MODEL_LOCAL_OFFER, MODEL_OPERATIONS,
+    MODEL_SERVICE_KIND, MODEL_SERVICE_URI,
+};
 #[path = "gateway_origin.rs"]
 mod gateway_origin;
 #[path = "gateway_passkey_step_up.rs"]
@@ -99,6 +119,7 @@ pub(crate) fn principal_root_protected_object_inventory(
 ) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
     let mut inventory =
         gateway_assistant::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(gateway_home_agent::principal_root_protected_object_inventory(localhost_root));
     inventory
         .extend(gateway_home_system::principal_root_protected_object_inventory(localhost_root));
     inventory.extend(
@@ -111,8 +132,14 @@ pub(in crate::api) use gateway_home_runtime::capsule_icon_variants;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
+pub(crate) use gateway_home_system::{
+    authorize_home_engine_preparation_cancellation, authorize_home_service_engine,
+    authorize_home_service_exit, sync_runtime_services_mailboxes,
+};
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
+#[cfg(test)]
+pub(super) use gateway_home_token::home_session_cookie_name;
 pub(super) use gateway_home_token::HomeLaunchTokenContext;
 pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
@@ -126,6 +153,13 @@ pub(super) use gateway_home_token::{
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
+};
+
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(super) use gateway_home_system_ai_provider::{
+    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
+    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
 };
 
 #[cfg(test)]
@@ -162,6 +196,7 @@ pub(crate) use gateway_room::{
 pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
 pub(crate) use gateway_server::start_gateway_server_with_collaboration_context;
+pub(crate) use gateway_server::start_gateway_server_with_ready;
 pub use gateway_server::GatewayCollaborationContext;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
@@ -396,7 +431,7 @@ const WALLET_CONNECTOR_CAPSULE_IDS: &[&str] = &[
 pub(crate) const HOME_CAPSULE_ID: &str = "home";
 pub(crate) const HOME_GUI_SHELL_ID: &str = "home-gui";
 pub(crate) const HOME_CLI_SHELL_ID: &str = "home-cli";
-const HOME_ROUTE: &str = "/apps/home/";
+pub(super) const HOME_ROUTE: &str = "/home/";
 pub(crate) const WALLETCONNECT_CONFIG_SCHEMA: &str = "elastos.walletconnect.connector/v1";
 pub(crate) const WALLETCONNECT_CONFIG_PATH: &str =
     "ElastOS/SystemServices/WalletConnect/config.json";
@@ -452,6 +487,7 @@ struct WalletPricePolicy {
 
 #[derive(Clone)]
 pub struct GatewayState {
+    pub(crate) carrier_endpoint: Option<iroh::Endpoint>,
     pub provider_registry: Option<Arc<ProviderRegistry>>,
     pub(crate) collaboration_chat_product_port:
         Option<crate::collaboration_product::CollaborationChatProductPort>,
@@ -698,6 +734,22 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                     gateway_assistant::ASSISTANT_WORKSPACE_MAX_BYTES,
                 )),
         )
+        .route(
+            "/api/apps/assistant/workspace-v2",
+            get(gateway_assistant_workspace_v2::get)
+                .put(gateway_assistant_workspace_v2::put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_assistant_workspace_v2::MAX_BYTES,
+                )),
+        )
+        .route(
+            "/api/apps/home-agent/workspace",
+            get(gateway_home_agent::home_agent_workspace_get)
+                .put(gateway_home_agent::home_agent_workspace_put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
+                )),
+        )
         .route("/api/apps/system/summary", get(system_summary))
         .route(
             "/api/apps/system/appearance/preferences",
@@ -718,6 +770,32 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/access/guest-registration",
             post(system_guest_registration_update),
+        )
+        .route(
+            "/api/apps/system/ai-provider",
+            get(gateway_home_system_ai_provider::system_ai_provider_get)
+                .post(gateway_home_system_ai_provider::system_ai_provider_save)
+                .delete(gateway_home_system_ai_provider::system_ai_provider_delete),
+        )
+        .route(
+            "/api/apps/system/ai-provider/validate",
+            post(gateway_home_system_ai_provider::system_ai_provider_validate),
+        )
+        .route(
+            "/api/apps/system/ai-provider/staged",
+            delete(gateway_home_system_ai_provider::system_ai_provider_discard_staged),
+        )
+        .route(
+            "/api/apps/system/approval-lens",
+            post(gateway_home_system_ai_provider::system_approval_lens_select),
+        )
+        .route(
+            "/api/apps/system/approval-lens/revoke",
+            post(gateway_home_system_ai_provider::system_approval_lens_revoke),
+        )
+        .route(
+            "/api/apps/system/ai-provider/share",
+            post(gateway_home_system_ai_provider::system_ai_provider_share),
         )
         .route(
             "/api/apps/system/wallet/approvals",
@@ -805,6 +883,31 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/browser/pages/:page_id/diagnostics",
             get(gateway_browser::browser_app_page_diagnostics),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/inspect",
+            get(gateway_browser::browser_app_page_inspection_capabilities)
+                .post(gateway_browser::browser_app_page_inspect),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests",
+            get(gateway_browser::gateway_browser_operator::pending_admissions)
+                .post(gateway_browser::gateway_browser_operator::request_admission),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id",
+            get(gateway_browser::gateway_browser_operator::admission_status)
+                .post(gateway_browser::gateway_browser_operator::approve_admission)
+                .delete(gateway_browser::gateway_browser_operator::revoke_admission),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/inspect",
+            post(gateway_browser::gateway_browser_operator::operator_inspect)
+                .layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/detach",
+            post(gateway_browser::gateway_browser_operator::detach_operator),
         )
         .route(
             "/api/apps/browser/pages/:page_id/heartbeat",
@@ -961,7 +1064,9 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/capsules/contracts/audit", get(capsule_contract_audit))
         .route(
             "/api/capsules/interfaces/invoke",
-            post(capsule_interface_invoke),
+            post(capsule_interface_invoke).layer(Extension(
+                gateway_capsule_catalog::ModelPreparationOwner::default(),
+            )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/services/summary", get(services_summary))
@@ -1099,6 +1204,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/viewers/:viewer/storage/:capsule/:scope/:name",
             get(super::viewer_gateway::viewer_storage_get)
                 .put(super::viewer_gateway::viewer_storage_put),
+        )
+        .route("/home", get(super::browser_capsules::redirect_home_root))
+        .route(HOME_ROUTE, get(super::browser_capsules::serve_home_index))
+        .route(
+            "/home/*path",
+            get(super::browser_capsules::serve_home_asset),
+        )
+        .route(
+            "/apps/home",
+            get(super::browser_capsules::redirect_home_root),
+        )
+        .route(
+            "/apps/home/",
+            get(super::browser_capsules::redirect_home_root),
         )
         .route(
             "/apps/:app",
@@ -1282,11 +1401,7 @@ pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
         return Some(did);
     }
 
-    let device_key = data_dir.join("identity").join("device.key");
-    if !device_key.exists() {
-        return None;
-    }
-    elastos_identity::load_or_create_did(data_dir)
+    elastos_identity::load_existing_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
         .filter(|did| !did.trim().is_empty())
@@ -1384,6 +1499,9 @@ fn system_error_response(err: anyhow::Error) -> Response {
     if let Some(text) = gateway_home_system::home_appearance_preference_request_message(&err) {
         return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
     }
+    if let Some(text) = gateway_home_system_ai_provider::ai_provider_request_message(&err) {
+        return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
+    }
     let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("admin passkey required")
@@ -1392,6 +1510,11 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
+    } else if text.contains("model retirement pending")
+        || text.contains("model activation pending")
+        || text.contains("selection_unavailable")
+    {
+        StatusCode::CONFLICT
     } else if text.contains("nickname must")
         || text.contains("missing")
         || text.contains("background image")
@@ -1399,6 +1522,8 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("WalletConnect connector")
         || text.contains("approval method")
         || text.contains("built-in wallet request")
+        || text.contains("share terms")
+        || text.contains("hosted connection is required")
     {
         StatusCode::BAD_REQUEST
     } else {
@@ -1416,6 +1541,12 @@ fn home_error_response(err: anyhow::Error) -> Response {
         .unwrap_or_else(|| err.to_string());
     if text.contains("home launch token") || text.contains("gateway identity") {
         return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if text.contains("admin passkey required") {
+        return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if text.contains("share terms") || text.contains("hosted connection is required") {
+        return (StatusCode::BAD_REQUEST, text).into_response();
     }
     if profile_required.is_some() {
         return (StatusCode::CONFLICT, text).into_response();

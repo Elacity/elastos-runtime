@@ -1455,6 +1455,11 @@ pub struct RuntimeMintCreatorState {
     token_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effect: Option<RuntimeMintCreatorEffectBinding>,
+    /// The creator's ERC-1155 `setApprovalForAll(market gateway, true)` on
+    /// the ledger, raised after the mint lands when the ledger does not yet
+    /// report the approval; without it no purchase can be delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_approval: Option<RuntimeMintCreatorEffectBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal: Option<RuntimeMintCreatorTerminalEvidence>,
 }
@@ -1470,6 +1475,7 @@ impl RuntimeMintCreatorState {
             metadata_cid: metadata_cid.into(),
             token_uri: token_uri.into(),
             effect: None,
+            operator_approval: None,
             terminal: None,
         };
         value.validate()?;
@@ -1482,6 +1488,9 @@ impl RuntimeMintCreatorState {
         validate_intent_text(&self.token_uri)?;
         if let Some(effect) = &self.effect {
             effect.validate()?;
+        }
+        if let Some(operator_approval) = &self.operator_approval {
+            operator_approval.validate()?;
         }
         if let Some(terminal) = &self.terminal {
             terminal.validate()?;
@@ -1506,6 +1515,25 @@ impl RuntimeMintCreatorState {
 
     pub fn effect(&self) -> Option<&RuntimeMintCreatorEffectBinding> {
         self.effect.as_ref()
+    }
+
+    pub fn operator_approval(&self) -> Option<&RuntimeMintCreatorEffectBinding> {
+        self.operator_approval.as_ref()
+    }
+
+    pub fn with_operator_approval(
+        mut self,
+        effect: RuntimeMintCreatorEffectBinding,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        if let Some(existing) = &self.operator_approval {
+            if existing != &effect {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(self);
+        }
+        self.operator_approval = Some(effect);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn terminal(&self) -> Option<&RuntimeMintCreatorTerminalEvidence> {
@@ -2130,6 +2158,24 @@ impl RuntimeMintJournal {
             .take()
             .ok_or(RuntimeMintJournalError::Conflict)?
             .with_effect(effect)?;
+        record.creator_state = Some(creator_state);
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    pub fn bind_creator_operator_approval(
+        &self,
+        mint_id: Digest32,
+        effect: RuntimeMintCreatorEffectBinding,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        let creator_state = record
+            .creator_state
+            .take()
+            .ok_or(RuntimeMintJournalError::Conflict)?
+            .with_operator_approval(effect)?;
         record.creator_state = Some(creator_state);
         self.write_replace(&record)?;
         Ok(record)

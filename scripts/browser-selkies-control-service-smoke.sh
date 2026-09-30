@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+control_only=0
+if [[ "$#" == 1 && "$1" == "--control-only" ]]; then
+  control_only=1
+elif [[ "$#" != 0 ]]; then
+  echo "usage: browser-selkies-control-service-smoke.sh [--control-only]" >&2
+  exit 2
+fi
 tmp_dir="$(mktemp -d)"
 selkies_pid=""
 cdp_pid=""
@@ -294,6 +301,7 @@ import path from "node:path";
 
 const readyPath = process.argv[2];
 const firstUrl = "https://example.com/";
+const walletExecutionContextId = 1;
 const secondUrl = "https://example.com/?elastos-browser-nav-smoke=1";
 const networkChangedUrl = "https://example.com/?network-changed=1";
 const closedOnceUrl = "https://example.com/?closed-once=1";
@@ -459,6 +467,7 @@ server.on("upgrade", (req, socket) => {
       params: {
         name: "__elastosBrowserWalletRuntime",
         payload: JSON.stringify(payload),
+        executionContextId: walletExecutionContextId,
       },
     }));
   };
@@ -489,7 +498,7 @@ server.on("upgrade", (req, socket) => {
         const projection = message.params || {};
         if (
           projection.offline !== false ||
-          projection.latency !== 0 ||
+          projection.latency !== 1 ||
           projection.downloadThroughput !== -1 ||
           projection.uploadThroughput !== -1 ||
           projection.connectionType !== "other"
@@ -512,7 +521,17 @@ server.on("upgrade", (req, socket) => {
         sendText(socket, JSON.stringify({ id: message.id, result: { identifier: "wallet-bridge-smoke" } }));
       } else if (message.method === "Runtime.evaluate") {
         const expression = String(message.params?.expression || "");
-        if (expression.includes("online: navigator.onLine === true")) {
+        if (expression.includes("elastos-wallet-context-v1")) {
+          const result = message.params?.contextId === walletExecutionContextId
+            ? { result: { type: "object", value: {
+              marker: "elastos-wallet-context-v1",
+              page_url: historyEntries[currentIndex]?.url || requested.navigated || firstUrl,
+              is_document: true,
+              is_top_level: true,
+            } } }
+            : { exceptionDetails: { text: "Unknown fixture execution context" } };
+          sendText(socket, JSON.stringify({ id: message.id, result }));
+        } else if (expression.includes("online: navigator.onLine === true")) {
           sendText(socket, JSON.stringify({
             id: message.id,
             result: {
@@ -528,7 +547,47 @@ server.on("upgrade", (req, socket) => {
           }));
         } else if (expression.includes("globalThis[\"__elastosBrowserWalletRuntimeResult\"]")) {
           fs.appendFileSync(`${readyPath}.wallet-results`, `${expression}\n`);
+          let reply;
+          new Function("globalThis", expression)({
+            __elastosBrowserWalletRuntimeResult: (payload) => { reply = JSON.parse(payload); },
+          });
+          const expectedDenial = reply?.id === "wallet:smoke-before-grant";
+          const accepted = expectedDenial
+            ? reply.ok === false && reply.error?.code === 4100
+            : reply?.ok === true;
+          const diagnostic = JSON.stringify({
+            id: String(reply?.id || "").slice(0, 160),
+            ok: reply?.ok,
+            code: reply?.error?.code,
+            message: String(reply?.error?.message || "").slice(0, 300),
+          });
+          fs.appendFileSync(`${readyPath}.wallet-diagnostics`, `${diagnostic}\n`);
+          if (!accepted) {
+            fs.writeFileSync(`${readyPath}.wallet-failed`, diagnostic);
+            sendText(socket, JSON.stringify({ id: message.id, result: {} }));
+            continue;
+          }
           if (expression.includes("wallet:smoke-bridge")) {
+            setTimeout(() => emitWalletBinding({
+              id: "wallet:smoke-before-grant",
+              action: "post",
+              operation: "read",
+              body: { method: "eth_chainId", params: [] },
+            }), 10);
+          } else if (expectedDenial) {
+            fs.writeFileSync(`${readyPath}.wallet-pre-grant-denied`, "4100");
+            setTimeout(() => emitWalletBinding({
+              id: "wallet:smoke-access-request",
+              action: "requestAccounts",
+              body: { chain_namespace: "eip155:20" },
+            }), 10);
+          } else if (expression.includes("wallet:smoke-access-request")) {
+            setTimeout(() => emitWalletBinding({
+              id: "wallet:smoke-access-status",
+              action: "approvalStatus",
+              request_id: "wallet-approval:access-smoke",
+            }), 10);
+          } else if (expression.includes("wallet:smoke-access-status")) {
             setTimeout(() => emitWalletBinding({
               id: "wallet:smoke-read",
               action: "post",
@@ -627,6 +686,8 @@ server.on("upgrade", (req, socket) => {
                 request_id: "wallet-approval:tx-smoke",
               },
             }), 10);
+          } else if (expression.includes("wallet:smoke-tx-broadcast")) {
+            fs.writeFileSync(`${readyPath}.wallet-completed`, "ok");
           }
           sendText(socket, JSON.stringify({ id: message.id, result: { result: { type: "undefined" } } }));
       } else if (typeof message.params?.expression === "string" && message.params.expression.includes("JSON.stringify({ url: window.location.href")) {
@@ -953,23 +1014,60 @@ const server = http.createServer((req, res) => {
     if (req.method === "GET" && target.pathname === "/api/apps/browser/wallet/bridge") {
       res.end(JSON.stringify({
         schema: "elastos.browser.wallet-bridge/v1",
+        principal_id: "person:local:wallet-smoke",
+        session_id: "session:wallet-smoke",
+        launch_id: "launch:wallet-smoke",
         accounts: [
           {
             account_id: "wallet:eip155:20:0x1111111111111111111111111111111111111111",
             chain_namespace: "eip155:20",
             address: "0x1111111111111111111111111111111111111111",
+            proof_type: "managed_evm",
             label: "ESC Smoke",
           },
         ],
         default_chain_namespace: "eip155:20",
         default_account_id: "wallet:eip155:20:0x1111111111111111111111111111111111111111",
         bridge_url: "http://runtime.local/api/apps/browser/wallet/bridge",
+        account_access_url: "http://runtime.local/api/apps/browser/wallet/request-account-access",
         read_url: "http://runtime.local/api/apps/browser/wallet/read",
         approval_url: "http://runtime.local/api/apps/browser/wallet/request-signature",
         transaction_url: "http://runtime.local/api/apps/browser/wallet/request-transaction",
         transaction_broadcast_url: "http://runtime.local/api/apps/browser/wallet/broadcast-transaction",
         approval_status_url: "http://runtime.local/api/apps/browser/wallet/approvals",
         home_token: "wallet-token-smoke",
+      }));
+      return;
+    }
+    if (req.method === "POST" && target.pathname === "/api/apps/browser/wallet/request-account-access") {
+      res.end(JSON.stringify({
+        schema: "elastos.browser.account-access-request-result/v1",
+        approval_request: {
+          request_id: "wallet-approval:access-smoke",
+          status: "pending",
+          expires_at: Math.floor(Date.now() / 1000) + 600,
+        },
+        requires_approval: true,
+      }));
+      return;
+    }
+    if (req.method === "GET" && target.pathname === "/api/apps/browser/wallet/approvals/wallet-approval%3Aaccess-smoke") {
+      res.end(JSON.stringify({
+        schema: "elastos.browser.wallet-approval-status/v1",
+        request_id: "wallet-approval:access-smoke",
+        status: "completed",
+        account_access: {
+          permission: "eth_accounts",
+          principal_id: "person:local:wallet-smoke",
+          session_id: "session:wallet-smoke",
+          launch_id: "launch:wallet-smoke",
+          origin: "https://example.com",
+          requested_chain_namespace: "eip155:20",
+          chain_namespaces: ["eip155:20"],
+          account_id: "wallet:eip155:20:0x1111111111111111111111111111111111111111",
+          address: "0x1111111111111111111111111111111111111111",
+          grant_expires_at: Math.floor(Date.now() / 1000) + 600,
+        },
       }));
       return;
     }
@@ -1161,11 +1259,16 @@ failed_status="$(curl --silent --show-error \
     "network_mode": "runtime_net_only",
     "direct_network": false,
     "wallet": {
+      "principal_id": "person:local:wallet-smoke",
+      "session_id": "session:wallet-smoke",
+      "launch_id": "launch:wallet-smoke",
+      "account_access_url": "http://runtime.local/api/apps/browser/wallet/request-account-access",
       "accounts": [
         {
           "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
           "chain_namespace": "eip155:20",
           "address": "0x1111111111111111111111111111111111111111",
+          "proof_type": "managed_evm",
           "label": "ESC Smoke"
         }
       ],
@@ -1210,7 +1313,7 @@ if (response.active_pages !== 0) throw new Error("failed open leaked an active S
 const projection = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (
   projection.offline !== false ||
-  projection.latency !== 0 ||
+  projection.latency !== 1 ||
   projection.downloadThroughput !== -1 ||
   projection.uploadThroughput !== -1 ||
   projection.connectionType !== "other"
@@ -1535,17 +1638,23 @@ if ! curl --silent --show-error --fail-with-body \
       "height": 721
     },
     "wallet": {
+      "principal_id": "person:local:wallet-smoke",
+      "session_id": "session:wallet-smoke",
+      "launch_id": "launch:wallet-smoke",
+      "account_access_url": "http://runtime.local/api/apps/browser/wallet/request-account-access",
       "accounts": [
         {
           "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
           "chain_namespace": "eip155:20",
           "address": "0x1111111111111111111111111111111111111111",
+          "proof_type": "managed_evm",
           "label": "ESC Smoke"
         },
         {
           "account_id": "wallet:eip155:8453:0x2222222222222222222222222222222222222222",
           "chain_namespace": "eip155:8453",
           "address": "0x2222222222222222222222222222222222222222",
+          "proof_type": "managed_evm",
           "label": "Base Smoke"
         }
       ],
@@ -1608,12 +1717,15 @@ for (const expected of [
 }
 ' "$tmp_dir/fake-cdp-ready.json.init-script"
 for _ in {1..100}; do
-  proxy_request_count="$(wc -l <"$tmp_dir/fake-runtime-proxy-requests.jsonl" | tr -d ' ')"
-  [[ "$proxy_request_count" -ge 8 ]] && break
+  [[ -f "$tmp_dir/fake-cdp-ready.json.wallet-failed" || -f "$tmp_dir/fake-cdp-ready.json.wallet-completed" ]] && break
   sleep 0.02
 done
-if [[ "$proxy_request_count" -lt 8 ]]; then
-  echo "Runtime wallet proxy received only $proxy_request_count requests; expected at least 8" >&2
+proxy_request_count="$(wc -l <"$tmp_dir/fake-runtime-proxy-requests.jsonl" | tr -d ' ')"
+if [[ "$proxy_request_count" -lt 10 || -f "$tmp_dir/fake-cdp-ready.json.wallet-failed" || ! -f "$tmp_dir/fake-cdp-ready.json.wallet-completed" ]]; then
+  echo "Runtime wallet sequence incomplete: $proxy_request_count proxy requests; expected at least 10 and completed broadcast" >&2
+  if [[ -f "$tmp_dir/fake-cdp-ready.json.wallet-diagnostics" ]]; then
+    tail -n 12 "$tmp_dir/fake-cdp-ready.json.wallet-diagnostics" >&2
+  fi
   exit 1
 fi
 "$node_bin" -e '
@@ -1621,6 +1733,21 @@ const fs = require("fs");
 const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n/).filter(Boolean);
 const requests = lines.map((line) => JSON.parse(line));
 const seen = new Map(requests.map((request) => [request.pathname, request]));
+if (fs.readFileSync(process.argv[2], "utf8") !== "4100") {
+  throw new Error("Runtime wallet read was not denied before account access");
+}
+const accessIndex = requests.findIndex((request) => request.pathname === "/api/apps/browser/wallet/request-account-access");
+const grantIndex = requests.findIndex((request) => request.pathname === "/api/apps/browser/wallet/approvals/wallet-approval%3Aaccess-smoke");
+if (accessIndex < 0 || grantIndex <= accessIndex || requests.slice(0, grantIndex).some((request) => request.method === "POST" && request.pathname !== "/api/apps/browser/wallet/request-account-access")) {
+  throw new Error("Runtime wallet dispatched an operation before account-access approval");
+}
+if (JSON.stringify(requests[accessIndex].body) !== JSON.stringify({ chain_namespace: "eip155:20", page_url: "https://example.com/", origin: "https://example.com" })) {
+  throw new Error("Runtime wallet account-access request lost its exact document context");
+}
+const grantUrl = new URL(requests[grantIndex].url);
+if (grantUrl.searchParams.get("page_url") !== "https://example.com/" || grantUrl.searchParams.get("origin") !== "https://example.com") {
+  throw new Error("Runtime wallet approval status lost its exact document context");
+}
 for (const path of [
   "/api/apps/browser/wallet/bridge",
   "/api/apps/browser/wallet/read",
@@ -1668,7 +1795,7 @@ if (seen.get("/api/apps/browser/wallet/request-transaction").body?.method !== "e
 if (seen.get("/api/apps/browser/wallet/broadcast-transaction").body?.request_id !== "wallet-approval:tx-smoke") {
   throw new Error("Runtime wallet transaction broadcast body was not delivered through the proxy");
 }
-' "$tmp_dir/fake-runtime-proxy-requests.jsonl"
+' "$tmp_dir/fake-runtime-proxy-requests.jsonl" "$tmp_dir/fake-cdp-ready.json.wallet-pre-grant-denied"
 "$node_bin" -e '
 const viewport = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (viewport.width !== 1920 || viewport.height !== 1080) throw new Error("initial CDP page raster must fill the fixed 1080p compositor");
@@ -1914,14 +2041,16 @@ if (response.file_chooser?.pending !== true || response.file_chooser?.mode !== "
 ' "$click_response"
 
 file_upload_response="$tmp_dir/file-upload-response.json"
+file_chooser_request_id="$("$node_bin" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).file_chooser.request_id)' "$click_response")"
 curl --silent --show-error --fail \
   --unix-socket "$control_socket" \
   --header "content-type: application/json" \
   --data @- \
-  "http://browser-engine/pages/$page_id/input" >"$file_upload_response" <<'JSON'
+  "http://browser-engine/pages/$page_id/input" >"$file_upload_response" <<JSON
 {
   "event": {
     "type": "file_upload",
+    "request_id": "$file_chooser_request_id",
     "file_name": "avatar.png",
     "mime_type": "image/png",
     "content_base64": "SGVsbG8gQnJvd3Nlcg==",
@@ -2222,9 +2351,106 @@ if (response.accepted !== true || response.direct_network !== false) throw new E
 if (inserted !== "Paste Text 123") throw new Error(`paste_text did not use CDP Input.insertText: ${inserted}`);
 ' "$paste_response" "$tmp_dir/fake-cdp-ready.json.inserted-text"
 
+# Passive log reads share the real control route with status and page close.
+# This checks page-channel closure; the adapter cleanup boundary stays below.
+"$node_bin" --input-type=module - "$control_socket" "$page_id" "$tmp_dir/control.log" <<'NODE'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+const [socketPath, encodedPageId, logPath] = process.argv.slice(2);
+const pageId = decodeURIComponent(encodedPageId);
+const controller = new AbortController();
+const deadline = setTimeout(() => controller.abort(), 2500);
+function request(path, method = "GET") {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path, method, signal: controller.signal }, res => {
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          assert.equal(res.statusCode, 200, `${method} ${path}`);
+          resolve(JSON.parse(Buffer.concat(chunks)));
+        } catch (error) { reject(error); }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+function checkLogs(result) {
+  assert.equal(result.schema, "elastos.browser.selkies-control.logs/v1");
+  for (const log of Object.values(result.logs)) {
+    if (!log.present) continue;
+    assert.ok(Number.isFinite(Date.parse(log.mtime)), "retained log age must be visible");
+    assert.ok(log.tail.length <= 8192, "log tail must be bounded");
+  }
+}
+try {
+  let before;
+  for (let round = 0; round < 3; round++) {
+    const [logs, status] = await Promise.all([request("/logs"), request("/status")]);
+    checkLogs(logs);
+    assert.equal(status.schema, "elastos.browser.selkies-control.status/v1");
+    assert.ok(status.page_ids.includes(pageId), "log polling must retain the page");
+    before = status.page_ids;
+  }
+  const [firstLogs, closed, lastLogs] = await Promise.all([
+    request("/logs"), request(`/pages/${encodeURIComponent(pageId)}/close`, "POST"), request("/logs"),
+  ]);
+  checkLogs(firstLogs); checkLogs(lastLogs);
+  assert.deepEqual(closed, { schema: "elastos.browser.close-result/v1", page_id: pageId, closed: true });
+  const after = await request("/status");
+  assert.deepEqual(after.page_ids.sort(), before.filter(id => id !== pageId).sort());
+  const events = fs.readFileSync(logPath, "utf8").split("\n").filter(line => line.startsWith("{")).map(line => JSON.parse(line));
+  assert.equal(events.some(event => event.kind === "request" && event.path === "/logs"), false,
+    "log polling must not append its own request events");
+} finally {
+  clearTimeout(deadline);
+  controller.abort();
+}
+NODE
+
+if [[ "$control_only" == 1 ]]; then
+  printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service","adapter_cleanup_verified":false}'
+  exit 0
+fi
+
+# The shared control bridge owns page channels. This smoke owns Chromium,
+# Selkies, and the proxy, so the bridge cannot certify their terminal cleanup.
+# Keep the product display checks and require the adapter to reject that
+# incomplete close response instead of inventing a supervisor receipt here.
+preflight_status=0
 scripts/browser-selkies-target-preflight.sh \
   --out-dir "$tmp_dir/target-preflight" \
   --control-socket "$tmp_dir/target-preflight.sock" \
+  --runtime-fetch-proxy-url "http://127.0.0.1:$runtime_proxy_port" \
   --selkies-ws-url "ws://127.0.0.1:$selkies_port/signaling" \
   --browser-cdp-endpoint "http://127.0.0.1:$cdp_port" \
-  --ice-server "stun:stun.example.invalid:3478" >/dev/null
+  --ice-server "stun:stun.example.invalid:3478" \
+  >"$tmp_dir/target-preflight.stdout" 2>"$tmp_dir/target-preflight.stderr" || preflight_status=$?
+if ! "$node_bin" - "$preflight_status" "$tmp_dir/target-preflight.stderr" <<'NODE'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const [status, stderrPath] = process.argv.slice(2);
+const stderr = fs.readFileSync(stderrPath, "utf8");
+// The unchanged display smoke reports each failed response as JSON and throws
+// its first failure after shutdown. Require close to be the only failing gate.
+const responses = [...stderr.matchAll(/^\{[\s\S]*?^\}/gm)].map(match => JSON.parse(match[0]));
+assert.equal(Number(status), 1, "shared bridge preflight must fail at terminal cleanup");
+assert.deepEqual(responses, [{
+  status: "error",
+  code: "engine_close_indeterminate",
+  message: "Browser supervisor did not return an exact typed terminal cleanup receipt",
+}]);
+assert.deepEqual(stderr.match(/^(?:\w*Error):[^\n]*/gm), ["Error: adapter close_page failed"],
+  "launch, display validation, and shutdown must pass before accepting the expected close rejection");
+NODE
+then
+  cat "$tmp_dir/target-preflight.stdout" "$tmp_dir/target-preflight.stderr" >&2
+  exit 1
+fi
+for fixture_pid in "$selkies_pid" "$cdp_pid" "$proxy_pid"; do
+  kill -0 "$fixture_pid"
+done
+printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service-and-adapter-close-rejection","unowned_cleanup_rejected":true,"adapter_cleanup_verified":false}'

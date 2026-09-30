@@ -11,6 +11,7 @@ Each top-level ledger has one job:
 ## Start here
 
 - [Repository README](../README.md): quick install, source build, and system model
+- [Runtime overview](OVERVIEW.md): product and repository orientation
 - [Getting started](GETTING_STARTED.md): user installation and source development
 - [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
@@ -33,10 +34,14 @@ Each top-level ledger has one job:
 - [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
   actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Storage, ownership, and access](STORAGE_AND_ACCESS.md): encrypted storage,
+  protected use, sharing, groups, devices, agents, revocation, and recovery
 - [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
   models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
+- [Collaboration network profile](COLLABORATION_NETWORK_PROFILE.md): private
+  collaboration routes and authority
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract
 
 ## Runtime and interface contracts
@@ -51,6 +56,7 @@ Each top-level ledger has one job:
   lifecycle, and child intents
 - [Interactive runtime contract](INTERACTIVE_RUNTIME_CONTRACT.md): interactive
   sessions and return behavior
+- [Execution](EXECUTION.md): release execution boundaries
 - [Command runtime matrix](COMMAND_MATRIX.md): Runtime ownership for every
   command
 - [Authentication audit chain](AUTH_AUDIT_CHAIN.md): activation and retention
@@ -67,9 +73,13 @@ Each top-level ledger has one job:
   topic membership, gossip operations, and trust limits
 - [Model provider](MODEL_PROVIDER.md): provider and model selection, streams,
   cancellation, recovery, and terminal outcomes
+- [Model package handoff](MODEL_PACKAGE_HANDOFF.md): signed model package inputs
+  and verification
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
+- [Object protection implementation](OBJECT_PROTECTION_IMPLEMENTATION.md):
+  replaceable dKMS/dDRM boundary, migration rules, delivery slices, and acceptance
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
   identity, rights, custody and release schemas
 - [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule
@@ -82,6 +92,9 @@ Each top-level ledger has one job:
 ## Browser contracts and decisions
 
 - [Browser capsule](BROWSER_CAPSULE.md): Browser, Net, Exit, and Engine contract
+- [Browser protocol](BROWSER_PROTOCOL.md): typed Browser operations
+- [Browser support](BROWSER_SUPPORT.md): target and operator support matrix
+- [Browser acceptance](BROWSER_ACCEPTANCE.md): B01–B16 product criteria
 - [Browser VM target](BROWSER_VM_TARGET.md): VM guest, helper, media, and target maintenance
 - [Browser provider acceptance](BROWSER_PROVIDER_BAKEOFF.md): shared candidate
   gates; current status comes from generated evidence
@@ -92,6 +105,7 @@ Each top-level ledger has one job:
   installed-product, and release decision checklist
 - [Home journey audit](audits/README.md): privacy-reviewed workbook with
   findings, coverage and the limits of its installed test evidence
+- [Collaboration handoff](COLLABORATION_HANDOFF.md): dated integration evidence
 - [Mac source-home staging](MAC.md): Apple silicon staging and Browser acceptance
 - [Inspector testing](INSPECTOR_TESTING.md): local Inspector checks
 - [Sites](SITES.md): local site roots and public exposure

@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Protected video viewer through the Runtime object-provider boundary",
   "role": "viewer",
+  "window_policy": "multiple",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

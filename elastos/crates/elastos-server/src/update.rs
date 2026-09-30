@@ -220,12 +220,16 @@ pub fn format_bytes(bytes: usize) -> String {
 
 /// Detect the current platform for release binary selection.
 pub fn detect_release_platform() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "x86_64-linux"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64-linux"
-    } else {
-        "unknown"
+    release_platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn release_platform_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("linux", "x86_64") => "x86_64-linux",
+        ("linux", "aarch64") => "aarch64-linux",
+        ("macos", "x86_64") => "x86_64-darwin",
+        ("macos", "aarch64") => "aarch64-darwin",
+        _ => "unknown",
     }
 }
 
@@ -531,11 +535,49 @@ pub async fn run_update_for_data_dir(
     .await
 }
 
+/// Bind a verified release envelope to the exact bytes chosen by its signed head.
+/// This digest is additional envelope evidence; the CID remains content identity.
+fn verify_release_binding(
+    head: &serde_json::Value,
+    release_bytes: &[u8],
+    release: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use sha2::Digest;
+    let head = &head["payload"];
+    let release = &release["payload"];
+    if head["schema"].as_str() != Some("elastos.release.head/v1")
+        || release["schema"].as_str() != Some("elastos.release/v1")
+    {
+        anyhow::bail!("Release head or release schema is unsupported");
+    }
+    let expected = head["release_sha256"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 64
+                && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata"))?;
+    let actual = hex::encode(sha2::Sha256::digest(release_bytes));
+    if actual != expected {
+        anyhow::bail!("Release envelope differs from the signed head; retry after the publisher finishes updating");
+    }
+    for field in ["version", "channel"] {
+        let value = head[field]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Release head requires a nonempty {field}"))?;
+        if release[field].as_str() != Some(value) {
+            anyhow::bail!("Release head and release {field} must match");
+        }
+    }
+    Ok(())
+}
+
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 async fn run_upgrade_from_head(
     fetch_fn: &FetchFn,
-    _head: &serde_json::Value,
+    head: &serde_json::Value,
     head_bytes: &[u8],
     resolved_head_cid: Option<&str>,
     version: &str,
@@ -551,6 +593,33 @@ async fn run_upgrade_from_head(
     discovery_method: &str,
     working_gateway: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Admit the exact signed publication before check-only/version success or artifacts.
+    if release_cid.is_empty() {
+        anyhow::bail!("Release head has no latest_release_cid");
+    }
+    println!(
+        "  Fetching release: {}...",
+        &release_cid[..12.min(release_cid.len())]
+    );
+    let release_bytes = if let Some(gateway) = working_gateway {
+        println!(
+            "  Using release manifest from explicit transport override: {}",
+            gateway
+        );
+        fetch_release_manifest_via_gateway(gateway).await?
+    } else {
+        fetch_fn(release_cid.to_string(), ordered_gateways.to_vec()).await?
+    };
+
+    // Verify the chosen envelope, then its binding to the already verified head.
+    let (release, signer_did) = verify_release_envelope_against_dids(
+        &release_bytes,
+        "elastos.release.v1",
+        &source.publisher_dids,
+    )?;
+    verify_release_binding(head, &release_bytes, &release)?;
+    println!("  Release signer: {}", signer_did);
+
     // 5. Compare versions
     println!();
     println!("  Latest available:  {}", version);
@@ -627,32 +696,6 @@ async fn run_upgrade_from_head(
 
     println!();
     println!("  Installing {} → {}...", current_version, version);
-
-    // 6. Fetch release.json
-    if release_cid.is_empty() {
-        anyhow::bail!("Release head has no latest_release_cid");
-    }
-    println!(
-        "  Fetching release: {}...",
-        &release_cid[..12.min(release_cid.len())]
-    );
-    let release_bytes = if let Some(gateway) = working_gateway {
-        println!(
-            "  Using release manifest from explicit transport override: {}",
-            gateway
-        );
-        fetch_release_manifest_via_gateway(gateway).await?
-    } else {
-        fetch_fn(release_cid.to_string(), ordered_gateways.to_vec()).await?
-    };
-
-    // 7. Verify release.json
-    let (release, signer_did) = verify_release_envelope_against_dids(
-        &release_bytes,
-        "elastos.release.v1",
-        &source.publisher_dids,
-    )?;
-    println!("  Release signer: {}", signer_did);
 
     // 8. Download binary for current platform
     let release_platform = detect_release_platform();
@@ -900,6 +943,230 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
+
+    #[test]
+    fn release_platform_matches_publisher_keys_for_each_host() {
+        // CPU architecture alone must not select a Linux executable on macOS.
+        // These are release keys; components use setup's separate platform names.
+        for (os, arch, expected) in [
+            ("linux", "x86_64", "x86_64-linux"),
+            ("linux", "aarch64", "aarch64-linux"),
+            ("macos", "x86_64", "x86_64-darwin"),
+            ("macos", "aarch64", "aarch64-darwin"),
+            ("windows", "aarch64", "unknown"),
+            ("linux", "riscv64", "unknown"),
+        ] {
+            assert_eq!(release_platform_for(os, arch), expected);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(detect_release_platform(), "aarch64-darwin");
+    }
+
+    fn binding_envelope(payload: serde_json::Value, domain: &str) -> Vec<u8> {
+        // Disposable deterministic identity; never a live publisher key.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &key,
+            domain,
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        serde_json::to_vec(&serde_json::json!({
+            "payload": payload, "signature": signature, "signer_did": signer_did
+        }))
+        .unwrap()
+    }
+
+    fn binding_head(release: &[u8]) -> serde_json::Value {
+        use sha2::Digest;
+        serde_json::json!({
+            "schema": "elastos.release.head/v1", "version": "0.7.1", "channel": "stable",
+            "latest_release_cid": "release-a",
+            "release_sha256": hex::encode(sha2::Sha256::digest(release))
+        })
+    }
+
+    #[test]
+    fn test_release_binding_requires_digest_and_consistent_metadata() {
+        let payload = serde_json::json!({"schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable"});
+        let release = binding_envelope(payload.clone(), "elastos.release.v1");
+        let envelope: serde_json::Value = serde_json::from_slice(&release).unwrap();
+        let head = serde_json::json!({"payload": binding_head(&release)});
+        verify_release_binding(&head, &release, &envelope).unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!("a".repeat(63)),
+            serde_json::json!("G".repeat(64)),
+            serde_json::json!("A".repeat(64)),
+            serde_json::json!("0".repeat(64)),
+        ] {
+            let mut changed = head.clone();
+            changed["payload"]["release_sha256"] = invalid;
+            assert!(verify_release_binding(&changed, &release, &envelope).is_err());
+        }
+        for field in ["schema", "version", "channel"] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(7),
+                serde_json::json!(""),
+                serde_json::json!("other"),
+            ] {
+                let mut changed = payload.clone();
+                changed[field] = invalid;
+                let bytes = binding_envelope(changed, "elastos.release.v1");
+                let envelope = serde_json::from_slice(&bytes).unwrap();
+                // Rebind these bytes so the schema/identity check, not the
+                // digest mismatch, is responsible for rejection.
+                let head = serde_json::json!({"payload": binding_head(&bytes)});
+                assert!(verify_release_binding(&head, &bytes, &envelope).is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_release_binding_precedes_artifacts_check_and_same_version_on_both_transports() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let payload = serde_json::json!({
+            "schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+            "platforms": {(detect_release_platform()): {
+                "binary": {"cid": "binary-a", "sha256": "a".repeat(64)},
+                "components": {"cid": "components", "sha256": "b".repeat(64)}
+            }}
+        });
+        let release = binding_envelope(payload.clone(), "elastos.release.v1");
+        let head = binding_head(&release);
+        let mut different_payload = payload;
+        different_payload["platforms"][detect_release_platform()]["binary"]["cid"] =
+            serde_json::json!("binary-b");
+        let different = binding_envelope(different_payload, "elastos.release.v1");
+        let mut whitespace = release.clone();
+        whitespace.push(b' ');
+        let mut byte_change = release.clone();
+        let index = byte_change.iter().position(|byte| *byte == b'7').unwrap();
+        byte_change[index] = b'8';
+        let mut missing = head.clone();
+        missing.as_object_mut().unwrap().remove("release_sha256");
+        let mut invalid = head.clone();
+        invalid["release_sha256"] = serde_json::json!("invalid");
+        let mut schema = head.clone();
+        schema["schema"] = serde_json::json!("other");
+        let cases = [
+            ("matching", head.clone(), release.clone(), true),
+            ("different signed release", head.clone(), different, false),
+            ("whitespace", head.clone(), whitespace, false),
+            ("one byte", head.clone(), byte_change, false),
+            ("missing digest", missing, release.clone(), false),
+            ("invalid digest", invalid, release.clone(), false),
+            ("invalid head schema", schema, release.clone(), false),
+        ];
+        for gateway_transport in [false, true] {
+            for (name, payload, release_bytes, matching) in &cases {
+                for mode in ["install", "check", "same-version"] {
+                    let head_bytes = binding_envelope(payload.clone(), "elastos.release.head.v1");
+                    let did = crate::crypto::encode_signing_key_did(
+                        &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    );
+                    let verified_head =
+                        verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did)
+                            .unwrap();
+                    let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                        "name": "test", "publisher_dids": [did], "channel": "stable"
+                    }))
+                    .unwrap();
+                    let artifact_requests = Arc::new(AtomicUsize::new(0));
+                    let cid_requests = Arc::new(AtomicUsize::new(0));
+                    let counter = artifact_requests.clone();
+                    let metadata_counter = cid_requests.clone();
+                    let bytes = release_bytes.clone();
+                    let fetch: FetchFn = Box::new(move |cid, _| {
+                        let counter = counter.clone();
+                        let metadata_counter = metadata_counter.clone();
+                        let bytes = bytes.clone();
+                        Box::pin(async move {
+                            if cid == "release-a" {
+                                metadata_counter.fetch_add(1, Ordering::SeqCst);
+                                return Ok(bytes);
+                            }
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            anyhow::bail!("artifact-request-blocked")
+                        })
+                    });
+                    let bytes = release_bytes.clone();
+                    let gateway_requests = Arc::new(AtomicUsize::new(0));
+                    let metadata_counter = gateway_requests.clone();
+                    let app = Router::new().route(
+                        "/release.json",
+                        get(move || {
+                            let bytes = bytes.clone();
+                            metadata_counter.fetch_add(1, Ordering::SeqCst);
+                            async move { bytes }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let gateway = format!("http://{}", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    let data = tempfile::tempdir().unwrap();
+                    let result = run_upgrade_from_head(
+                        &fetch,
+                        &verified_head,
+                        &head_bytes,
+                        None,
+                        "0.7.1",
+                        "release-a",
+                        None,
+                        if mode == "same-version" {
+                            "0.7.1"
+                        } else {
+                            "0.7.0"
+                        },
+                        &source,
+                        data.path(),
+                        mode == "check",
+                        &[],
+                        true,
+                        false,
+                        "test",
+                        gateway_transport.then_some(gateway.as_str()),
+                    )
+                    .await;
+                    server.abort();
+                    assert_eq!(
+                        cid_requests.load(Ordering::SeqCst),
+                        usize::from(!gateway_transport)
+                    );
+                    assert_eq!(
+                        gateway_requests.load(Ordering::SeqCst),
+                        usize::from(gateway_transport)
+                    );
+                    let expects_artifact = *matching && mode == "install";
+                    assert_eq!(
+                        artifact_requests.load(Ordering::SeqCst),
+                        usize::from(expects_artifact),
+                        "{name}/{mode}/{gateway_transport}"
+                    );
+                    if expects_artifact {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("artifact-request-blocked"));
+                    } else {
+                        assert_eq!(
+                            result.is_ok(),
+                            *matching,
+                            "{name}/{mode}/{gateway_transport}: {result:?}"
+                        );
+                    }
+                    assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_is_ipfs_content_gateway_matches_known_hosts() {

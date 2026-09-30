@@ -266,6 +266,52 @@ pub(crate) fn update_profile_authority(
     let _guard = profile_authority_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("profile authority mutation lock poisoned"))?;
+    write_profile_authority_update(
+        data_dir,
+        principal_id,
+        localhost_root,
+        proof_binding_id,
+        display_name,
+        handle,
+        updated_at,
+    )
+}
+
+pub(crate) fn ensure_initial_profile_authority(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    proof_binding_id: &str,
+    display_name: &str,
+    updated_at: u64,
+) -> anyhow::Result<VerifiedCollaborationProfileDocument> {
+    let _guard = profile_authority_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("profile authority mutation lock poisoned"))?;
+    require_profile_authority_passkey_binding(data_dir, principal_id, Some(proof_binding_id))?;
+    if let Some(existing) = load_profile_authority(data_dir, principal_id, localhost_root)? {
+        return Ok(existing);
+    }
+    write_profile_authority_update(
+        data_dir,
+        principal_id,
+        localhost_root,
+        proof_binding_id,
+        display_name,
+        None,
+        updated_at,
+    )
+}
+
+fn write_profile_authority_update(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    proof_binding_id: &str,
+    display_name: &str,
+    handle: Option<&str>,
+    updated_at: u64,
+) -> anyhow::Result<VerifiedCollaborationProfileDocument> {
     require_profile_authority_passkey_binding(data_dir, principal_id, Some(proof_binding_id))?;
     let (local_device_did, display_name, handle) =
         prepare_profile_authority_update(data_dir, display_name, handle)?;
@@ -1041,7 +1087,7 @@ fn decode_profile_signing_seed(value: &str) -> anyhow::Result<[u8; 32]> {
     Ok(seed)
 }
 
-fn clean_profile_display_name(input: &str) -> anyhow::Result<String> {
+pub(crate) fn clean_profile_display_name(input: &str) -> anyhow::Result<String> {
     let display_name = crate::auth::clean_principal_display_name(Some(input))?
         .ok_or_else(|| anyhow!("display name must not be empty"))?;
     let normalized = display_name.to_ascii_lowercase();
@@ -1125,7 +1171,18 @@ mod tests {
     fn write_device_key(data_dir: &Path, seed_byte: u8) -> String {
         let seed = [seed_byte; 32];
         std::fs::create_dir_all(data_dir.join("identity")).unwrap();
-        std::fs::write(data_dir.join("identity").join("device.key"), seed).unwrap();
+        let key_path = data_dir.join("identity").join("device.key");
+        std::fs::write(&key_path, seed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                data_dir.join("identity"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let (_, did) = elastos_identity::derive_did(&seed);
         did
     }

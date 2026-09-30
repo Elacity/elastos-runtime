@@ -28,6 +28,12 @@ const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
+const recoveryProfileSetup = document.querySelector("#recovery-profile-setup");
+const recoveryProfileName = document.querySelector("#recovery-profile-name");
+let recoveryProfileRequired = false;
+let recoveryProfileStatus = "unavailable";
+let recoveryProfileDraftInitialized = false;
+let recoveryExportBusy = false;
 const recoveryImportInput = document.querySelector("#recovery-import");
 const recoveryPasswordInput = document.querySelector("#recovery-password");
 const recoveryStatusNode = document.querySelector('[data-field="recovery-status"]');
@@ -49,6 +55,10 @@ const technicalInspectStatusNode = document.querySelector("#technical-inspect-st
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
+const models = window.ElastosModelManagement.create({
+  root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
+  onReadyOpen: ({ cid, offer_id }) => openCapsuleTarget("assistant", { model_cid: cid, offer_id }),
+});
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
@@ -83,10 +93,9 @@ const ACCENT_VALUES = new Set([
 ]);
 const DEFAULT_COPY_LABEL = "Copy";
 const COPIED_LABEL = "Copied";
-if (frameHomeToken && homeParentOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeParentOrigin);
-}
 let apiHomeToken = frameHomeToken;
+let initialRecoveryState = null;
+const recoveryDocumentNonce = window.crypto.randomUUID();
 let chainNetworks = [];
 let chainStatusById = new Map();
 let chainLifecycleById = new Map();
@@ -94,6 +103,7 @@ let technicalInspectEntries = [];
 let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
+let currentProfileName = "";
 let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
@@ -140,6 +150,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
+  models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
@@ -162,13 +173,13 @@ async function boot() {
     document.querySelector("#system-locked").hidden = false;
     return;
   }
-  homeClipboard.start();
   configureSettingsTabs();
   configureSettingsSearch();
   activateSettingsTab(requestedSettingsTab || "account");
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
@@ -176,14 +187,101 @@ async function boot() {
   configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
-  await refreshSystemSummary();
-  await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
-  await refreshAccountList().catch(() => {});
-  await refreshRecoveryStatus();
+  initialRecoveryState = (async () => {
+    await refreshSystemSummary();
+    await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
+    await refreshAccountList().catch(() => {});
+    await refreshRecoveryStatus();
+  })();
+  configureHomeRecoverySave();
+  // Clipboard announces app-ready to top Home; share that same bound-handler
+  // readiness with the opaque shell that owns this window.
+  if (homeClipboard.start() && window.parent !== window.top) {
+    window.parent.postMessage({ type: "home:app-ready", homeToken: frameHomeToken,
+      documentNonce: recoveryDocumentNonce }, "*");
+  }
+  await initialRecoveryState;
   await refreshChainNetworks();
   await refreshCapsuleCatalog().catch((error) => {
     console.error("catalog refresh failed", error);
     showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
+  });
+}
+
+function configureHomeRecoverySave() {
+  let lastSequence = 0;
+  let busy = false;
+  let active = true;
+  const reply = (data, ok) => {
+    if (active) window.parent.postMessage({ type: "elastos.system.window.result/v1",
+      homeToken: frameHomeToken, documentNonce: recoveryDocumentNonce,
+      requestId: data.requestId, ok: ok === true }, "*");
+  };
+  // The opaque Home shell and current token bind this document's requests.
+  window.addEventListener("pagehide", () => {
+    active = false;
+    if (window.parent !== window && window.parent !== window.top) {
+      window.parent.postMessage({ type: "home:app-unloading", homeToken: frameHomeToken,
+        documentNonce: recoveryDocumentNonce }, "*");
+    }
+  }, { once: true });
+  window.addEventListener("message", async (event) => {
+    const data = event.data;
+    if (!active || window.parent === window.top || event.source !== window.parent
+      || event.origin !== "null" || !frameHomeToken || frameHomeToken !== apiHomeToken
+      || !data || data.homeToken !== frameHomeToken
+      || typeof data.requestId !== "string" || !/^[a-zA-Z0-9-]{1,64}$/.test(data.requestId)) return;
+    if (data.type === "elastos.system.window-ready.request/v1"
+      && hasExactKeys(data, ["type", "homeToken", "requestId"])) {
+      try { await initialRecoveryState; } catch (_error) { return; }
+      if (active && frameHomeToken === apiHomeToken) {
+        window.parent.postMessage({ type: "elastos.system.window-ready.result/v1",
+          homeToken: frameHomeToken, documentNonce: recoveryDocumentNonce,
+          requestId: data.requestId }, "*");
+      }
+      return;
+    }
+    if (data.type !== "elastos.system.window.request/v1"
+      || !hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce", "sequence", "action", "query"])
+      || data.documentNonce !== recoveryDocumentNonce
+      || !Number.isSafeInteger(data.sequence) || data.sequence <= lastSequence) return;
+    // A high-water mark rejects replay with constant memory, including busy requests.
+    lastSequence = data.sequence;
+    if (busy) {
+      reply(data, false);
+      return;
+    }
+    busy = true;
+    let ok = false;
+    try {
+      await initialRecoveryState;
+      if (active && frameHomeToken === apiHomeToken) {
+        const query = data.query;
+        if (data.action === "save" && hasExactKeys(query, [])) {
+          activateSettingsTab("security");
+          recoveryDownloadButton?.focus();
+          ok = await onRecoveryDownload({ isActive: () => active && frameHomeToken === apiHomeToken });
+        } else if (data.action === "navigate" && query && typeof query === "object"
+          && !Array.isArray(query)
+          && Object.keys(query).every(key => key === "settings" || key === "recovery")
+          && typeof query.settings === "string"
+          && normalizedRequestedSettingsTab(query.settings) === query.settings
+          && query.settings !== ""
+          && (query.recovery === undefined || (query.recovery === "import" && query.settings === "security"))) {
+          activateSettingsTab(query.settings);
+          if (query.settings === "security") {
+            (query.recovery === "import" ? recoveryImportInput
+              : (recoveryProfileRequired ? recoveryProfileName : recoveryDownloadButton))?.focus();
+          }
+          ok = true;
+        }
+      }
+    } catch (_error) {
+      showRecoveryNote("System could not complete the request. Refresh System and try again.", "error");
+    } finally {
+      busy = false;
+    }
+    reply(data, ok);
   });
 }
 
@@ -210,6 +308,7 @@ function activateSettingsTab(settings) {
   if (!tab) {
     return;
   }
+  models.setVisible(tab === "models");
   for (const item of document.querySelectorAll(".settings-sidebar-item")) {
     item.classList.toggle("active", item.dataset.settings === tab);
   }
@@ -229,11 +328,14 @@ function normalizedRequestedSettingsTab(settings) {
 }
 
 function focusRequestedSettingsAction() {
+  const action = readQueryParam("recovery") === "import"
+    ? recoveryImportInput
+    : (recoveryProfileRequired ? recoveryProfileName : recoveryDownloadButton);
   if (
     requestedSettingsActionFocused
     || requestedSettingsTab !== "security"
-    || !recoveryDownloadButton
-    || recoveryDownloadButton.disabled
+    || !action
+    || action.disabled
   ) {
     return;
   }
@@ -244,7 +346,7 @@ function focusRequestedSettingsAction() {
     return;
   }
   requestedSettingsActionFocused = true;
-  recoveryDownloadButton.focus();
+  action.focus();
 }
 
 function hasShellAccess() {
@@ -268,8 +370,23 @@ async function fetchJson(url, init) {
   return response.json();
 }
 
+function renderRecoveryProfileSetup(identity) {
+  const readiness = identity.profile_readiness;
+  recoveryProfileStatus = readiness?.schema === "elastos.profile.readiness/v1"
+    && ["ready", "setup_required"].includes(readiness.status) ? readiness.status : "unavailable";
+  recoveryProfileRequired = recoveryProfileStatus === "setup_required";
+  if (recoveryProfileSetup) recoveryProfileSetup.hidden = !recoveryProfileRequired;
+  if (recoveryProfileRequired && recoveryProfileName && !recoveryProfileDraftInitialized) {
+    recoveryProfileName.value = readText(identity.profile_setup_display_name);
+    recoveryProfileDraftInitialized = true;
+  }
+}
+
 function renderSystemSummary(systemSummary) {
   const identity = systemSummary.identity || {};
+  currentProfileName = identity.profile?.schema === "elastos.profile-summary/v1"
+    ? readText(identity.profile.display_name) : "";
+  renderRecoveryProfileSetup(identity);
   const appearance = parseAppearance(systemSummary.appearance);
   const authority = systemSummary.authority || {};
   const access = systemSummary.access || {};
@@ -562,6 +679,472 @@ async function onGuestRegistrationChange() {
     showGuestRegistrationStatus(String(error.message || error), "error");
   } finally {
     setGuestRegistrationControlState();
+  }
+}
+
+function configureAiProvider() {
+  const instancesNode = document.querySelector("#ai-provider-instances");
+  const addButton = document.querySelector("#ai-provider-add");
+  const formNode = document.querySelector("#ai-provider-form");
+  const nameInput = document.querySelector("#ai-provider-name");
+  const providerSelect = document.querySelector("#ai-provider-kind");
+  const keyInput = document.querySelector("#ai-provider-key");
+  const modelSelect = document.querySelector("#ai-provider-model");
+  const validateButton = document.querySelector("#ai-provider-validate");
+  const saveButton = document.querySelector("#ai-provider-save");
+  const cancelButton = document.querySelector("#ai-provider-cancel");
+  const veniceFact = document.querySelector("[data-ai-provider-venice-fact]");
+  if (!instancesNode || !addButton || !formNode || !nameInput || !providerSelect || !keyInput || !modelSelect || !validateButton || !saveButton || !cancelButton) {
+    return;
+  }
+  const validationEndButton = document.createElement("button");
+  validationEndButton.className = "pc2-btn pc2-btn-secondary";
+  validationEndButton.type = "button";
+  validationEndButton.textContent = "End key-check access";
+  validationEndButton.hidden = true;
+  validateButton.after(validationEndButton);
+  const selectedProvider = () => (providerSelect.value === "venice" ? "venice" : "openrouter");
+  let editingId = "";
+  let latestStatus = null;
+  const updateValidationEnd = () => {
+    const state = latestStatus?.validation_egress_approval_state?.[selectedProvider()];
+    validationEndButton.hidden = latestStatus?.hosted_external_https !== "operator_ready" && state !== "pending" && state !== "approved";
+    validationEndButton.textContent = latestStatus?.hosted_external_https === "operator_ready" ? "End hosted HTTPS" : "End key-check access";
+  };
+  const setBusy = (busy) => {
+    addButton.disabled = busy || !hasShellAccess();
+    nameInput.disabled = busy || !hasShellAccess();
+    providerSelect.disabled = busy || !hasShellAccess() || Boolean(editingId);
+    keyInput.disabled = busy || !hasShellAccess();
+    modelSelect.disabled = busy || !hasShellAccess();
+    validateButton.disabled = busy || !hasShellAccess();
+    validationEndButton.disabled = busy || !hasShellAccess();
+    saveButton.disabled = busy || !hasShellAccess();
+    cancelButton.disabled = busy;
+    cancelButton.textContent = latestStatus?.staged_connections?.some((entry) => entry.id === editingId)
+      ? "Close; keep staged key" : "Cancel";
+    instancesNode.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy || !hasShellAccess() || button.dataset.egressPaused === "true";
+    });
+  };
+  const showState = (message, tone) => {
+    setTextFields("ai-provider-state", message);
+    for (const node of document.querySelectorAll('[data-field="ai-provider-state"]')) {
+      node.hidden = !message;
+      node.dataset.tone = tone || "";
+    }
+  };
+  const showPrivacy = (privacy) => {
+    const text = readText(privacy);
+    setTextFields("ai-provider-privacy", text ? `Discovered privacy: ${text}.` : "");
+    for (const node of document.querySelectorAll('[data-field="ai-provider-privacy"]')) {
+      node.hidden = !text;
+    }
+  };
+  const applyProviderChrome = () => {
+    if (veniceFact) veniceFact.hidden = selectedProvider() !== "venice";
+    updateValidationEnd();
+  };
+  const fillModels = (models, selected) => {
+    const values = [];
+    const privacyById = new Map();
+    for (const model of models) {
+      const id = typeof model === "string" ? readText(model) : readText(model && model.id);
+      if (!id || values.includes(id)) continue;
+      values.push(id);
+      const privacy = model && typeof model === "object" ? readText(model.privacy) : "";
+      if (privacy) privacyById.set(id, privacy);
+    }
+    const current = readText(selected);
+    if (current && !values.includes(current)) values.unshift(current);
+    modelSelect.replaceChildren();
+    for (const id of values) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = id;
+      option.dataset.privacy = privacyById.get(id) || "";
+      modelSelect.append(option);
+    }
+    if (current) modelSelect.value = current;
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  };
+  const hideForm = () => {
+    editingId = "";
+    formNode.hidden = true;
+    instancesNode.hidden = false;
+    document.querySelector("#local-models").hidden = false;
+    document.querySelector("#approval-lens").hidden = false;
+    addButton.hidden = false;
+    nameInput.value = "";
+    keyInput.value = "";
+    providerSelect.value = "openrouter";
+    fillModels([], "");
+    applyProviderChrome();
+    setBusy(false);
+  };
+  const showForm = (instance) => {
+    formNode.hidden = false;
+    instancesNode.hidden = true;
+    document.querySelector("#local-models").hidden = true;
+    document.querySelector("#approval-lens").hidden = true;
+    addButton.hidden = true;
+    editingId = instance && instance.id ? String(instance.id) : "";
+    nameInput.value = instance && instance.name ? String(instance.name) : "";
+    providerSelect.value = instance && instance.provider === "venice" ? "venice" : "openrouter";
+    keyInput.value = "";
+    fillModels([], instance && instance.selected_model ? instance.selected_model : "");
+    applyProviderChrome();
+    document.querySelector("#ai-provider-form-title").textContent = editingId ? "Edit hosted model" : "Add hosted model";
+    saveButton.textContent = "Save";
+    keyInput.focus();
+    setBusy(false);
+  };
+  const renderInstances = (status) => {
+    const connections = status && Array.isArray(status.connections) ? status.connections : [];
+    instancesNode.replaceChildren();
+    for (const connection of connections) {
+      if (!connection || connection.connected !== true) continue;
+      if (connection.operation === "decision.evaluate") continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const title = document.createElement("p");
+      title.className = "pc2-card-label";
+      title.textContent = readText(connection.name) || "Hosted model";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${readText(connection.processor_label) || "Hosted"} · ${readText(connection.selected_model)}`;
+      const actions = document.createElement("div");
+      actions.className = "system-inline-row";
+      const useButton = document.createElement("button");
+      useButton.className = "pc2-btn";
+      useButton.type = "button";
+      useButton.textContent = "Use in Assistant";
+      useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
+      useButton.disabled = connection.egress_state === "paused";
+      useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
+      const shareButton = document.createElement("button");
+      shareButton.className = "pc2-btn pc2-btn-secondary";
+      shareButton.type = "button";
+      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
+      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
+      const replaceButton = document.createElement("button");
+      replaceButton.className = "pc2-btn pc2-btn-secondary";
+      replaceButton.type = "button";
+      replaceButton.textContent = "Edit";
+      replaceButton.addEventListener("click", () => {
+        showForm(connection);
+        showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
+      });
+      const disconnectButton = document.createElement("button");
+      disconnectButton.className = "pc2-btn pc2-btn-secondary";
+      disconnectButton.type = "button";
+      disconnectButton.textContent = "Disconnect";
+      disconnectButton.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        setBusy(true);
+        showState("", "");
+        try {
+          latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+            method: "DELETE",
+            headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: connection.id }),
+          });
+          hideForm();
+          await refreshStatus();
+          showState(`${readText(connection.name)} is disconnected.`, "");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not disconnect that hosted model."), "error");
+        } finally {
+          setBusy(false);
+        }
+      });
+      const state = document.createElement("span");
+      state.className = "ai-provider-state";
+      state.textContent = connection.egress_state === "operator_ready" ? "Hosted HTTPS active"
+        : connection.egress_state === "ready" ? "Hosted connection approved"
+        : connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
+        : connection.egress_approval_state === "pending" ? "Hosted connection needs Inbox review"
+        : connection.egress_state === "paused" ? "External HTTPS paused"
+        : connection.approval_state === "approved" ? "Assistant access approved"
+        : connection.share_enabled ? "Shared" : "Private";
+      title.append(state);
+      const more = document.createElement("details");
+      more.className = "ai-provider-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Details and access";
+      const identity = document.createElement("p");
+      identity.className = "pc2-card-sublabel";
+      identity.textContent = `Instance: ${connection.id}`;
+      const secondary = document.createElement("div");
+      secondary.className = "system-inline-row";
+      secondary.append(shareButton);
+      if (connection.egress_state === "operator_ready" || connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
+        const endApproval = document.createElement("button");
+        endApproval.className = "pc2-btn pc2-btn-secondary";
+        endApproval.type = "button";
+        endApproval.textContent = connection.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
+        endApproval.addEventListener("click", async () => {
+          if (!hasShellAccess()) return;
+          endApproval.disabled = true;
+          try {
+            await fetchJson("/api/apps/system/approval-lens/revoke", {
+              method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+              body: JSON.stringify({ id: connection.id }),
+            });
+            await refreshStatus();
+            showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended. A later request needs Inbox review again.", "");
+          } catch (error) {
+            showState(publicSystemError(error, "Approval could not be ended."), "error");
+            endApproval.disabled = false;
+          }
+        });
+        secondary.append(endApproval);
+      }
+      secondary.append(disconnectButton);
+      more.append(summary, identity, secondary);
+      actions.append(useButton, replaceButton);
+      card.append(title, detail, actions, more);
+      instancesNode.append(card);
+    }
+    for (const staged of Array.isArray(status?.staged_connections) ? status.staged_connections : []) {
+      if (!staged || !/^model:hosted-[0-9a-f]{32}$/i.test(staged.id || "")) continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${staged.provider} · ${staged.has_saved_model ? "Staged key change" : "Key check needed"}`;
+      const resume = document.createElement("button");
+      resume.className = "pc2-btn pc2-btn-secondary";
+      resume.type = "button";
+      resume.textContent = "Continue setup";
+      resume.addEventListener("click", () => {
+        const saved = connections.find((entry) => entry.id === staged.id);
+        showForm(saved || { id: staged.id, provider: String(staged.provider).toLowerCase() });
+        showState("This Home kept the staged key. Check it again, approve the connection in Inbox if asked, then choose a model.", "");
+      });
+      const discard = document.createElement("button");
+      discard.className = "pc2-btn pc2-btn-secondary";
+      discard.type = "button";
+      discard.textContent = "Discard staged key";
+      discard.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        discard.disabled = true;
+        showState("Finishing any current key check, then removing the staged key.", "");
+        try {
+          await fetchJson("/api/apps/system/ai-provider/staged", {
+            method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: staged.id }),
+          });
+          await refreshStatus();
+          showState(staged.has_saved_model
+            ? "Staged key removed. The saved model key remains. Check Inbox before its next request."
+            : "Staged key removed.", "success");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not discard the staged key."), "error");
+          discard.disabled = false;
+        }
+      });
+      card.append(detail, resume, discard);
+      instancesNode.append(card);
+    }
+  };
+  const lensModel = document.querySelector("#approval-lens-model");
+  const lensStatus = document.querySelector("#approval-lens-status");
+  const lensSelect = document.querySelector("#approval-lens-select");
+  const lensEdit = document.querySelector("#approval-lens-edit");
+  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
+  const lensEnd = document.createElement("button");
+  lensEnd.className = "pc2-btn pc2-btn-secondary";
+  lensEnd.type = "button";
+  lensEnd.textContent = "End hosted approval";
+  lensEnd.hidden = true;
+  lensDisconnect.after(lensEnd);
+  const updateLensEnd = () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    lensEnd.hidden = !connection || (connection.egress_state !== "operator_ready" && connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
+    lensEnd.textContent = connection?.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
+    lensEnd.disabled = !hasShellAccess();
+  };
+  const renderLens = (status) => {
+    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
+    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
+    lensModel.replaceChildren();
+    for (const connection of decisions) {
+      const option = document.createElement("option"); option.value = connection.id;
+      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
+      lensModel.append(option);
+    }
+    if (current) lensModel.value = current.id;
+    lensStatus.textContent = current && status.hosted_external_https === "paused"
+      ? `${current.name} selected · external HTTPS paused`
+      : current ? `Using ${current.name} · ${current.processor_label}`
+      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
+      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
+    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
+    updateLensEnd();
+  };
+  lensModel.addEventListener("change", updateLensEnd);
+  lensEnd.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensEnd.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      await refreshStatus();
+      showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Approval could not be ended."), "error");
+      lensEnd.disabled = false;
+    }
+  });
+  lensEdit.addEventListener("click", () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection) return;
+    showForm(connection);
+    showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
+  });
+  lensDisconnect.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensDisconnect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/ai-provider", {
+        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      hideForm();
+      await refreshStatus();
+      showState(`${readText(connection.name)} is disconnected.`, "");
+    } catch (error) {
+      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
+      lensDisconnect.disabled = false;
+    }
+  });
+  lensSelect.addEventListener("click", async () => {
+    lensSelect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
+      await refreshStatus();
+    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
+    finally { lensSelect.disabled = false; }
+  });
+  const refreshStatus = async () => {
+    latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
+    document.querySelector("#ai-provider-egress-note").textContent = latestStatus.hosted_external_https === "operator_ready"
+      ? "Owner-authorized HTTPS is active for configured hosted models. This Home stores keys and pays for requests. End hosted HTTPS here at any time."
+      : latestStatus.hosted_external_https === "consent_required"
+        ? "This Home keeps provider keys. Approve each hosted connection in Inbox before its key check or model request."
+        : "External HTTPS is paused. Saved keys, models, and past results stay here.";
+    renderInstances(latestStatus);
+    renderLens(latestStatus);
+    updateValidationEnd();
+    return latestStatus;
+  };
+  validationEndButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: `validation:${selectedProvider()}` }),
+      });
+      await refreshStatus();
+      showState("Hosted HTTPS ended for this Home.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Key-check access could not be ended."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  addButton.addEventListener("click", () => {
+    showForm(null);
+    showState("Choose a host, enter its key, then check and choose a model. The name is optional.", "");
+  });
+  cancelButton.addEventListener("click", () => {
+    hideForm();
+    addButton.focus();
+    showState("", "");
+  });
+  providerSelect.addEventListener("change", applyProviderChrome);
+  modelSelect.addEventListener("change", () => {
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  });
+  validateButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      // Validation and Save use the same Runtime connection identity.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
+      const result = await fetchJson("/api/apps/system/ai-provider/validate", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, id: editingId }),
+      });
+      fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
+      showState("This key is valid.", "success");
+    } catch (error) {
+      showState(hostedProviderValidationError(error), "error");
+    } finally {
+      await refreshStatus().catch(() => {});
+      setBusy(false);
+    }
+  });
+  saveButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      // Keep this instance identity when activation fails after persistence.
+      // Retrying Save updates the same connection instead of creating another.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
+      const body = {
+        id: editingId,
+        provider: selectedProvider(),
+        name: nameInput.value,
+        api_key: keyInput.value,
+        model: modelSelect.value,
+      };
+      latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      hideForm();
+      await refreshStatus();
+      showState("This hosted model is saved on this Home.", "success");
+    } catch (error) {
+      await refreshStatus().catch(() => {});
+      const activationPending = /selection_unavailable|model activation pending|model retirement pending/.test(String(error.message || error));
+      const consentPending = String(error.message || error).includes("Approve this hosted connection in Inbox");
+      showState(activationPending
+        ? "This model is saved. Activation is waiting for current model work to finish. Select Save to try again."
+        : consentPending ? "The key is stored on this Home. Approve this connection in Inbox, then select Save again."
+        : publicSystemError(error, "This Home could not save that hosted model."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  hideForm();
+  setBusy(false);
+  if (hasShellAccess()) {
+    addButton.disabled = true;
+    refreshStatus().then(() => setBusy(false)).catch((error) => {
+      if (/^request failed: 403 admin passkey required$/i.test(String(error.message || error))) {
+        keyInput.value = "";
+        formNode.hidden = true;
+        addButton.hidden = true;
+        document.querySelector("#approval-lens").hidden = true;
+        showState("Hosted model setup is not available for this account yet.", "error");
+        return;
+      }
+      showState(publicSystemError(error, "Hosted model status is unavailable."), "error");
+    });
   }
 }
 
@@ -1101,7 +1684,7 @@ function pulseDeviceDidCopyButton() {
   }, 1200);
 }
 
-function openCapsuleTarget(target) {
+function openCapsuleTarget(target, query = {}) {
   const id = readText(target);
   if (!id || !homeParentOrigin || !window.top || window.top === window) {
     return;
@@ -1109,6 +1692,7 @@ function openCapsuleTarget(target) {
   window.top.postMessage({
     type: "home:open-target",
     target: id,
+    query,
     homeToken: apiHomeToken,
   }, homeParentOrigin);
 }
@@ -2054,7 +2638,8 @@ function accountRow(passkey, listState = {}) {
 
   const title = document.createElement("strong");
   const role = passkeyRoleLabel(passkey.role);
-  const label = readText(passkey.display_name) || (passkey.current ? "Current account" : "Account");
+  const label = readText(passkey.display_name)
+    || (passkey.current ? currentProfileName || "Current account" : "Account");
   title.textContent = label;
 
   nameWrap.append(title);
@@ -2211,12 +2796,30 @@ async function refreshRecoveryStatus() {
 }
 
 function setRecoveryStatus(status) {
+  if (recoveryProfileStatus === "unavailable") {
+    showRecoveryStatus("Unavailable", "error");
+    showRecoveryNote("Profile setup could not be checked. Refresh System and try again.", "error");
+    setRecoveryButton("Download Recovery Kit", true);
+    return;
+  }
+  if (recoveryProfileRequired) {
+    showRecoveryStatus("Finish setup", "muted");
+    showRecoveryNote("Confirm your Profile name, then save the complete kit offline.", "muted");
+    setRecoveryButton("Create Profile and save kit", false);
+    return;
+  }
+  if (status?.required_actions?.includes("download_recovery_kit_with_profile")) {
+    showRecoveryStatus("Profile needs backup", "muted");
+    showRecoveryNote("Save a new kit that includes your Profile.", "muted");
+    setRecoveryButton("Save complete Recovery Kit", false);
+    return;
+  }
   const configured = status && status.recovery_configured === true;
   const downloadAvailable = status && status.recovery_download_available === true;
   const protectedRoot = status && status.protection_configured === true;
   if (configured && downloadAvailable) {
     showRecoveryStatus("", "success");
-    showRecoveryNote("Downloads Home data recovery plus built-in Wallet recovery keys after passkey verification.", "muted");
+    showRecoveryNote("Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.", "muted");
     setRecoveryButton("Download Recovery Kit", false);
     return;
   }
@@ -2236,19 +2839,24 @@ function setRecoveryStatus(status) {
   setRecoveryButton("Create Recovery Kit", false);
 }
 
-async function onRecoveryDownload() {
-  if (!hasShellAccess() || !recoveryDownloadButton) {
-    return;
+async function onRecoveryDownload(options = {}) {
+  const isActive = typeof options?.isActive === "function" ? options.isActive : () => true;
+  if (!hasShellAccess() || recoveryProfileStatus === "unavailable" || !recoveryDownloadButton || recoveryDownloadButton.disabled || recoveryExportBusy) {
+    return false;
   }
   clearRecoveryPending();
+  recoveryExportBusy = true;
   setRecoveryButton(recoveryDownloadButton.textContent, true);
+  if (recoveryProfileName) recoveryProfileName.readOnly = true;
   showRecoveryStatus("Preparing", "muted");
   showRecoveryNote("", "muted");
   try {
     const status = await fetchJson("/api/auth/recovery/status", {
       headers: shellHeaders(),
     });
-    const bundle = await exportFullRecoveryBundle(status);
+    if (!isActive()) return false;
+    const bundle = await exportFullRecoveryBundle(status, isActive);
+    if (!isActive()) return false;
     downloadRecoveryKit(bundle);
     if (recoveryPasswordInput) {
       recoveryPasswordInput.value = "";
@@ -2263,10 +2871,19 @@ async function onRecoveryDownload() {
     );
     setRecoveryButton("Download Recovery Kit", false);
     notifyHomeSummaryChanged();
+    await refreshSystemSummary().catch(() => {
+      showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
+    });
+    return true;
   } catch (error) {
     showRecoveryStatus("Not set", "error");
     showRecoveryNote(String(error.message || error), "error");
     setRecoveryButton("Download Recovery Kit", false);
+    return false;
+  } finally {
+    recoveryExportBusy = false;
+    if (recoveryProfileName) recoveryProfileName.readOnly = false;
+    setRecoveryButton(recoveryDownloadButton.textContent, recoveryProfileStatus === "unavailable");
   }
 }
 
@@ -2358,6 +2975,7 @@ async function submitRecoveryImport(body, terminalRetryToken = "") {
     apiHomeToken = readText(response.home_token);
   }
   await refreshRecoveryStatus();
+  await refreshSystemSummary();
   await refreshAccountList();
   notifyHomeSummaryChanged();
   if (recoveryImportIsComplete(response)) {
@@ -2405,7 +3023,10 @@ function recoveryImportPlan(status, imported, options = {}) {
   throw new Error("Unsupported Recovery Kit file.");
 }
 
-async function exportFullRecoveryBundle(status) {
+async function exportFullRecoveryBundle(status, isActive = () => true) {
+  if (recoveryProfileStatus === "unavailable") {
+    throw new Error("Profile setup could not be checked. Refresh System and try again.");
+  }
   const downloadPassword = recoveryDownloadPassword();
   const intent = {
     principal_id: readText(status.principal_id),
@@ -2413,10 +3034,19 @@ async function exportFullRecoveryBundle(status) {
     label: "Recovery Kit",
     download_password: downloadPassword || null,
   };
+  if (recoveryProfileRequired) {
+    const name = recoveryProfileName?.value.trim() || "";
+    if (!name) {
+      recoveryProfileName?.focus();
+      throw new Error("Enter a Profile name.");
+    }
+    intent.profile_display_name = name;
+  }
   const stepUpToken = await requestPasskeyStepUp(
     "auth.full-recovery-bundle.export",
     intent,
   );
+  if (!isActive()) throw new Error("Recovery Kit save was cancelled.");
   return fetchJson("/api/auth/recovery/full-export", {
     method: "POST",
     headers: shellHeaders({ "content-type": "application/json" }),
@@ -2426,6 +3056,7 @@ async function exportFullRecoveryBundle(status) {
       localhost_root: intent.localhost_root,
       label: intent.label,
       step_up_token: stepUpToken,
+      ...(intent.profile_display_name ? { profile_display_name: intent.profile_display_name } : {}),
       ...(downloadPassword ? { download_password: downloadPassword } : {}),
     }),
   });
@@ -2529,7 +3160,7 @@ function downloadRecoveryKit(kit) {
 function setRecoveryButton(label, disabled) {
   if (recoveryDownloadButton) {
     recoveryDownloadButton.textContent = readText(label) || "Download Recovery Kit";
-    recoveryDownloadButton.disabled = disabled || !hasShellAccess();
+    recoveryDownloadButton.disabled = disabled || recoveryExportBusy || !hasShellAccess();
   }
 }
 
@@ -3144,6 +3775,7 @@ function normalizeAppearanceHex(value) {
 }
 
 function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const actual = Object.keys(value).sort();
   const expected = [...expectedKeys].sort();
   return actual.length === expected.length
@@ -3160,6 +3792,33 @@ function publicSystemError(value, fallback) {
     return fallback;
   }
   return message;
+}
+
+function hostedProviderValidationError(value) {
+  const message = readText(value && value.message ? value.message : value);
+  if (message.includes("Approve this hosted connection in Inbox")) {
+    return "The key is stored on this Home. Approve this connection in Inbox, then select Check key and load models again.";
+  }
+  for (const detail of [
+    "The hosted connection request was denied. Try again after the decision window.",
+    "Hosted access was denied or ended. Review Inbox.",
+    "Hosted HTTPS was ended on this Home. Start a new connection check in Inbox.",
+    "Runtime blocked this hosted route. Review the connection configuration.",
+    "Hosted HTTPS could not reach the host. Check the network and try again.",
+    "This Home could not check the hosted connection. Try again.",
+  ]) {
+    if (message.includes(detail)) return detail;
+  }
+  if (message.includes("Hosted external HTTPS is paused until Runtime network authority is available.")) {
+    return "External HTTPS is paused on this Home. The key has not been checked.";
+  }
+  if (/invalid (OpenRouter|Venice) key/i.test(message)) {
+    return "The provider could not validate this key.";
+  }
+  if (/^request failed: 403 admin passkey required$/i.test(message)) {
+    return "Sign in as the Home admin to check provider keys.";
+  }
+  return publicSystemError(value, "This Home could not check the key. Try again.");
 }
 
 function showError(error) {

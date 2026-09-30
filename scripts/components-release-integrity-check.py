@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,14 @@ ALIASES = {
 CHECKSUM_RE = re.compile(r"^(sha256:[0-9a-fA-F]{64}|sha512:[0-9a-fA-F]{128})$")
 DEV_STRATEGIES = {"source-build", "local-copy"}
 FETCH_FIELDS = ("release_path", "cid", "url")
+PROVIDER_ICON_SIZES = (32, 64, 128, 256)
+RELEASE_PLATFORMS = {
+    "linux-amd64": "x86_64-linux",
+    "linux-arm64": "aarch64-linux",
+    "darwin-arm64": "aarch64-darwin",
+    "macos-arm64": "aarch64-darwin",
+    "darwin-amd64": "x86_64-darwin",
+}
 
 
 def non_empty(value):
@@ -93,6 +102,16 @@ def stamped_source_home_capsules(data, selected_components):
     return stamped
 
 
+def source_capsule_root(source_root, name):
+    for candidate in (
+        Path(source_root) / "capsules" / name,
+        Path(source_root) / "elastos" / "capsules" / name,
+    ):
+        if (candidate / "capsule.json").is_file():
+            return candidate
+    return None
+
+
 def audit_manifest(data, platforms, selected_components=None, source_home_capsules=None):
     external = data.get("external") or {}
     errors = []
@@ -127,6 +146,135 @@ def audit_manifest(data, platforms, selected_components=None, source_home_capsul
             error = checksum_error(name, platform, info)
             if error:
                 errors.append(error)
+    return errors
+
+
+def audit_release_artifacts(data, platforms, artifact_root):
+    """Verify locally advertised files; external URL-only downloads stay external."""
+    root = Path(artifact_root)
+    errors = []
+    if not platforms:
+        return ["artifact checks require an explicit platform"]
+    if root.is_symlink() or not root.is_dir():
+        return ["artifact root must be a regular directory"]
+
+    def verify(label, info):
+        relative = info.get("release_path")
+        if (not non_empty(relative) or "\\" in relative
+                or any(part in {"", ".", ".."} for part in relative.split("/"))):
+            errors.append(f"{label}: unsafe release_path {relative!r}")
+            return
+        checksum = info.get("checksum")
+        size = info.get("size")
+        if not isinstance(checksum, str) or not CHECKSUM_RE.fullmatch(checksum):
+            errors.append(f"{label}: invalid artifact checksum")
+            return
+        if type(size) is not int or size <= 0:
+            errors.append(f"{label}: artifact size must be a positive integer")
+            return
+        path = root
+        try:
+            for part in relative.split("/"):
+                path = path / part
+                if path.is_symlink():
+                    raise ValueError("artifact path contains a symlink")
+            metadata = path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("artifact must be a regular file")
+            if metadata.st_size != size:
+                raise ValueError("artifact size mismatch")
+            algorithm, expected = checksum.split(":", 1)
+            digest = hashlib.new(algorithm)
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected.lower():
+                raise ValueError("artifact checksum mismatch")
+        except (OSError, ValueError) as exc:
+            errors.append(f"{label} {relative}: {exc}")
+
+    for platform in platforms:
+        for name, component in sorted((data.get("external") or {}).items()):
+            entries = [(name, component)]
+            if isinstance(component.get("capsule_metadata"), dict):
+                entries.append((f"{name} capsule_metadata", component["capsule_metadata"]))
+            for label, entry in entries:
+                _, info = resolve_platform_info(entry, platform)
+                if info is not None and "release_path" in info:
+                    verify(f"{label} {platform}", info)
+        release_platform = RELEASE_PLATFORMS.get(platform, platform)
+        for name, entry in sorted((data.get("capsules") or {}).items()):
+            capsule_platforms = entry.get("platforms")
+            if (not isinstance(capsule_platforms, list) or not capsule_platforms
+                    or any(not non_empty(value) for value in capsule_platforms)):
+                errors.append(f"{name}: capsule release platforms must be a nonempty list")
+                continue
+            if release_platform not in capsule_platforms:
+                continue
+            verify(f"{name} {platform}", {
+                "release_path": f"{name}-{release_platform}.capsule.tar.gz",
+                "checksum": f"sha256:{entry.get('sha256', '')}",
+                "size": entry.get("size"),
+            })
+    return errors
+
+
+def audit_provider_capsule_metadata(data, platforms, selected_components=None, source_root=None):
+    errors = []
+    external = data.get("external") or {}
+    for name, component in sorted(external.items()):
+        if selected_components is not None and name not in selected_components:
+            continue
+        if not isinstance(component, dict):
+            continue
+        metadata = component.get("capsule_metadata")
+        if not isinstance(metadata, dict):
+            continue
+
+        errors.extend(
+            audit_manifest(
+                {"external": {name: metadata}},
+                platforms,
+                selected_components={name},
+            )
+        )
+
+        expected_install_path = f"capsules/{name}"
+        if metadata.get("install_path") != expected_install_path:
+            errors.append(f"{name}: capsule_metadata install_path mismatch")
+
+        capsule_root = source_capsule_root(source_root, name) if source_root else None
+        if capsule_root is None:
+            if source_root is not None:
+                errors.append(f"{name}: provider capsule source manifest missing")
+            continue
+
+        try:
+            manifest = json.loads((capsule_root / "capsule.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append(f"{name}: failed to read provider source manifest: {exc}")
+            continue
+        if manifest.get("role") != "provider":
+            errors.append(f"{name}: provider source manifest role mismatch")
+        icon_dir = str(manifest.get("icon") or "").strip().strip("/")
+        if not icon_dir:
+            errors.append(f"{name}: provider source manifest icon path is missing")
+            continue
+        if ".." in Path(icon_dir).parts:
+            errors.append(f"{name}: provider source manifest icon path escapes the capsule")
+            continue
+        for size in PROVIDER_ICON_SIZES:
+            icon_path = capsule_root / icon_dir / f"icon-{size}.png"
+            if not icon_path.is_file():
+                errors.append(f"{name}: provider icon asset missing for size {size}")
+        for platform, info in sorted((metadata.get("platforms") or {}).items()):
+            if not isinstance(info, dict):
+                errors.append(f"{name}: capsule_metadata {platform} must be an object")
+                continue
+            if info.get("install_path") != expected_install_path:
+                errors.append(f"{name}: capsule_metadata {platform} install_path mismatch")
+            if info.get("extract_path") != name:
+                errors.append(f"{name}: capsule_metadata {platform} extract_path mismatch")
     return errors
 
 
@@ -446,6 +594,68 @@ def run_self_test():
             source_home_stamped,
         ):
             raise AssertionError("source-home stamped capsule should not require release archive checksum")
+
+        provider_root = root / "capsules" / "provider-demo"
+        (provider_root / "icons").mkdir(parents=True)
+        provider_manifest = {
+            "schema": "elastos.capsule/v1",
+            "name": "provider-demo",
+            "version": "0.1.0",
+            "description": "Provider demo",
+            "author": "elastos",
+            "role": "provider",
+            "type": "wasm",
+            "runtime_abi": "elastos.provider-stdio/v1",
+            "execution": "native-provider",
+            "provides": "elastos://demo/*",
+            "icon": "icons",
+        }
+        (provider_root / "capsule.json").write_text(
+            json.dumps(provider_manifest), encoding="utf-8"
+        )
+        for size in PROVIDER_ICON_SIZES:
+            (provider_root / "icons" / f"icon-{size}.png").write_bytes(
+                f"icon-{size}".encode("utf-8")
+            )
+        provider_good = {
+            "external": {
+                "provider-demo": {
+                    "install_path": "bin/provider-demo",
+                    "platforms": {
+                        "linux-amd64": {
+                            "release_path": "provider-demo-linux-amd64",
+                            "checksum": f"sha256:{good_hash}",
+                        }
+                    },
+                    "capsule_metadata": {
+                        "install_path": "capsules/provider-demo",
+                        "platforms": {
+                            "*": {
+                                "cid": "bafy-provider-demo",
+                                "checksum": f"sha256:{good_hash}",
+                                "size": 123,
+                                "install_path": "capsules/provider-demo",
+                                "extract_path": "provider-demo",
+                                "release_path": "provider-demo-capsule-metadata.tar.gz",
+                            }
+                        },
+                    },
+                }
+            }
+        }
+        if audit_manifest(provider_good, ["linux-amd64"]):
+            raise AssertionError("provider binary metadata must survive the external merge")
+        if provider_good["external"]["provider-demo"]["platforms"]["linux-amd64"] != {
+            "release_path": "provider-demo-linux-amd64",
+            "checksum": f"sha256:{good_hash}",
+        }:
+            raise AssertionError("provider capsule metadata must not replace binary platform data")
+        if audit_provider_capsule_metadata(
+            provider_good,
+            ["linux-amd64"],
+            source_root=root,
+        ):
+            raise AssertionError("matching provider capsule metadata should pass")
         source_home_kubo_manifest = {
             "external": {
                 "kubo": {
@@ -574,6 +784,10 @@ def parse_args(argv):
         help="Check the effective component entries for this setup platform. May be repeated.",
     )
     parser.add_argument(
+        "--artifact-root",
+        help="Verify hashes and sizes of advertised local release files in this staged directory.",
+    )
+    parser.add_argument(
         "--source-root",
         help="Repository root used to verify capsule artifact metadata in the manifest.",
     )
@@ -620,6 +834,16 @@ def main(argv):
         args.platform,
         selected_components,
         source_home_capsules,
+    )
+    if args.artifact_root:
+        errors.extend(audit_release_artifacts(data, args.platform, args.artifact_root))
+    errors.extend(
+        audit_provider_capsule_metadata(
+            data,
+            args.platform,
+            selected_components,
+            args.source_root,
+        )
     )
     errors.extend(
         audit_capsule_artifact_metadata(

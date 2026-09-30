@@ -266,6 +266,11 @@ button {
   cursor: default;
 }
 
+.model-content-identity,
+.modal-developer {
+  overflow-wrap: anywhere;
+}
+
 .store-row:focus-visible {
   outline: 2px solid var(--el-focus);
   outline-offset: 2px;
@@ -681,6 +686,29 @@ button {
   background: var(--bg-hover);
 }
 
+/* The model detail's one forward action reads as the primary button. */
+[data-model-management] .modal-btn[data-model-control="use"],
+[data-model-management] .modal-btn[data-model-control="open-assistant"] {
+  border-color: transparent;
+  color: #fff;
+  background: var(--accent);
+}
+
+[data-model-management] .modal-btn[data-model-control="use"]:hover,
+[data-model-management] .modal-btn[data-model-control="open-assistant"]:hover {
+  background: var(--accent-hover);
+}
+
+[data-model-management] .modal-btn[data-model-control="use"]:disabled,
+[data-model-management] .modal-btn[data-model-control="open-assistant"]:disabled {
+  opacity: 0.55;
+}
+
+[data-model-management] .model-row {
+  border-top: 0;
+  padding-top: 4px;
+}
+
 .store-loading {
   margin-top: 12px;
 }
@@ -843,6 +871,17 @@ button {
     padding: 20px 20px 32px;
   }
 
+  .store-nav {
+    display: flex;
+    flex-shrink: 0;
+    overflow-x: auto;
+  }
+
+  .store-nav-item {
+    flex: 0 0 auto;
+    width: auto;
+  }
+
   .store-row-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -897,3 +936,9 @@ button {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+.shared-model-card { padding: 16px 0; border-bottom: 1px solid var(--el-hairline); }
+.shared-model-card h3, .shared-model-card p { margin: 0 0 8px; }
+.shared-model-card details { margin-top: 12px; font-size: 12px; overflow-wrap: anywhere; }
+.shared-model-facts { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 3fr); gap: 6px 12px; font-size: 13px; }
+.shared-model-facts dt { color: var(--el-muted); }
+.shared-model-facts dd { margin: 0; overflow-wrap: anywhere; }

@@ -49,7 +49,7 @@ Environment:
   ELASTOS_BROWSER_MAC_VM_PROFILE_RESET_PROOF default: 0; set 1 to reset the virtual test principal profile after proof pages close
   ELASTOS_BROWSER_MAC_VM_PROOF_AUTH_PROFILE optional persistent virtual-auth profile dir for authenticated ela.city proof
   HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_OPTIONAL default: 1 for this proof
-  ELASTOS_BROWSER_VM_CONTROL_SOCKET        default: /tmp/elastos-browser-vm-control-darwin-arm64.sock
+  ELASTOS_BROWSER_VM_CONTROL_SOCKET        optional override; default: browser-vm-product supervisor.control_socket_path in the target adapter config
   ELASTOS_MAC_BROWSER_DATA_DIR             default: ~/elastos-mac-test-home/Library/Application Support/elastos
   ELASTOS_NODE_BIN                         optional node binary
 USAGE
@@ -100,8 +100,33 @@ embedded_open_urls="${HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS:-}"
 if [[ -n "$click_href_re" ]]; then
   embedded_open_urls="$proof_url"
 fi
-control_socket="${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-/tmp/elastos-browser-vm-control-darwin-arm64.sock}"
 data_dir="${ELASTOS_MAC_BROWSER_DATA_DIR:-${HOME}/elastos-mac-test-home/Library/Application Support/elastos}"
+control_socket="${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-}"
+if [[ -z "$control_socket" ]]; then
+  control_socket="$("$node_bin" - "$data_dir/config/browser-engine-adapter.json" <<'NODE'
+const fs = require("node:fs");
+const configPath = process.argv[2];
+function fail(reason) {
+  console.error(`Cannot resolve Browser VM control socket from ${configPath}: ${reason}`);
+  process.exit(2);
+}
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+} catch {
+  fail("expected a readable JSON adapter config");
+}
+const adapters = Array.isArray(config?.adapters)
+  ? config.adapters.filter(entry => entry?.id === "browser-vm-product") : [];
+if (adapters.length !== 1) fail("expected exactly one browser-vm-product adapter");
+const socket = adapters[0].supervisor?.control_socket_path;
+if (typeof socket !== "string" || !socket.startsWith("/") || /[\r\n\0]/.test(socket)) {
+  fail("supervisor.control_socket_path must be an absolute path without control characters");
+}
+process.stdout.write(socket);
+NODE
+)"
+fi
 installed_home="${data_dir}/capsules/home/browser/index.html"
 source_home="capsules/home/browser/index.html"
 tmp_dir="$(mktemp -d /tmp/elastos-browser-mac-vm-proof-XXXXXX)"

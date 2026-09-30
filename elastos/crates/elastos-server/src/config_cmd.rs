@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use elastos_server::sources::default_data_dir;
 
 pub fn run_config(cmd: crate::ConfigCommand) -> anyhow::Result<()> {
@@ -22,20 +24,32 @@ pub fn run_config(cmd: crate::ConfigCommand) -> anyhow::Result<()> {
                 let _ = std::fs::create_dir_all(&data_dir);
                 String::new()
             };
-            let mut table: toml::Table = contents.parse().unwrap_or_default();
-            let toml_val = if let Ok(b) = value.parse::<bool>() {
-                toml::Value::Boolean(b)
-            } else if let Ok(n) = value.parse::<i64>() {
-                toml::Value::Integer(n)
-            } else {
-                toml::Value::String(value)
-            };
-            table.insert(key.clone(), toml_val);
-            std::fs::write(&config_path, toml::to_string_pretty(&table)?)?;
+            let updated = updated_config(&contents, &key, &value)?;
+            std::fs::write(&config_path, updated)?;
             println!("Set {} in {}", key, config_path.display());
         }
     }
     Ok(())
+}
+
+fn updated_config(contents: &str, key: &str, value: &str) -> anyhow::Result<String> {
+    if key == "carrier_bind_addr" {
+        value
+            .parse::<std::net::SocketAddr>()
+            .context("Invalid carrier_bind_addr")?;
+    }
+    let mut table: toml::Table = contents
+        .parse()
+        .context("Invalid config.toml; existing settings preserved")?;
+    let toml_val = if let Ok(b) = value.parse::<bool>() {
+        toml::Value::Boolean(b)
+    } else if let Ok(n) = value.parse::<i64>() {
+        toml::Value::Integer(n)
+    } else {
+        toml::Value::String(value.to_string())
+    };
+    table.insert(key.to_string(), toml_val);
+    Ok(toml::to_string_pretty(&table)?)
 }
 
 fn render_config_show(path: &Path, contents: &str) -> String {
@@ -53,6 +67,20 @@ fn render_config_show(path: &Path, contents: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn carrier_binding_update_preserves_settings_and_rejects_invalid_input() {
+        let updated =
+            super::updated_config("dev_mode = true\n", "carrier_bind_addr", "127.0.0.1:61967")
+                .unwrap();
+        let table: toml::Table = updated.parse().unwrap();
+        assert_eq!(table["dev_mode"].as_bool(), Some(true));
+        assert_eq!(table["carrier_bind_addr"].as_str(), Some("127.0.0.1:61967"));
+        assert!(super::updated_config("dev_mode = true", "carrier_bind_addr", "invalid").is_err());
+        assert!(
+            super::updated_config("broken = [", "carrier_bind_addr", "127.0.0.1:61967").is_err()
+        );
+    }
+
     use std::path::Path;
 
     use super::render_config_show;

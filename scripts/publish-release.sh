@@ -77,6 +77,7 @@ DEFAULT_CAPSULES=(
     inbox
     assistant
     elacity-player
+    model-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -110,6 +111,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     assistant
     elacity-player
+    model-provider
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -149,7 +151,8 @@ ALLOWED_CHANNELS=(
     jetson-test
 )
 
-# Navigate to project root
+# Navigate to project root; relative CLI paths belong to the original caller.
+PUBLISH_CALLER_DIR="$PWD"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # ── Help ──────────────────────────────────────────────────────────────
@@ -170,21 +173,23 @@ show_help() {
     echo "  --channel NAME     Release channel (stable | canary | jetson-test; default: stable)"
     echo "  --skip-build       Skip building binaries (use existing artifacts)"
     echo "  --skip-rootfs      Skip rootfs building (reuse existing .capsule.tar.gz and skip capsule rebuilds)"
-    echo "  --dry-run          Local rehearsal: no network reads/writes, no IPNS publish, no public URL,"
-    echo "                     publish state (last-release-*) untouched; --key optional (ephemeral key)"
     echo "  --capsules CSV     Override publish capsule list (default: Home capsule set)"
     echo "  --no-public-url    Skip auto-starting gateway+tunnel and URL emission"
     echo "  --public-with-sudo Start auto-public gateway+tunnel via sudo"
     echo "  --allow-signer-rotation  Allow signer DID to differ from the current canonical publisher signer"
     echo "  --gateway-addr     Gateway listen addr for auto-public URL (default: 127.0.0.1:8090)"
+    echo "  --platform-input PLATFORM=DIR  Import each of the three reviewed native inputs (repeat three times)"
+    echo "  --preview-platform PLATFORM  Canary preview from exactly one native input for PLATFORM, published from that host"
     echo "  --cross ARCH       Also cross-compile for ARCH (e.g., aarch64). Creates multi-platform release."
     echo "  --public-timeout   Seconds to wait for trycloudflare URL (default: 60)"
     echo "  --help             Show this help"
     echo ""
+    echo "  Read-only planning: elastos publish-release --version X.Y.Z --dry-run"
+    echo ""
     echo -e "${BOLD}Output:${NC}"
     echo "  Publishes per-capsule artifacts + runtime binary as raw CIDs."
     echo "  Creates signed release.json/release-head.json plus content-object sidecars."
-    echo "  Installer downloads only: binary + components.json (2 files)."
+    echo "  Installer downloads the Runtime, components.json, and the pinned model catalog."
     echo "  Use --cross aarch64 when publishing from x86_64 for Jetson installs."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
@@ -210,68 +215,21 @@ default_elastos_data_dir() {
         printf '%s\n' "${ELASTOS_DATA_DIR}"
         return
     fi
-    if [[ -n "${XDG_DATA_HOME:-}" ]]; then
-        printf '%s\n' "${XDG_DATA_HOME%/}/elastos"
-        return
-    fi
-    printf '%s\n' "${HOME}/.local/share/elastos"
+    (
+        # The publisher enters the repository root before defining helpers.
+        source scripts/install.sh
+        installer_data_dir "$HOME" "${XDG_DATA_HOME:-}"
+    )
 }
 
 discover_source_bootstrap_json() {
-    local data_dir
+    local data_dir helper
     data_dir="$(default_elastos_data_dir)"
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/discover-source-bootstrap.py"
     DATA_DIR="${data_dir}" \
     COORDS_PATH="${ELASTOS_RUNTIME_COORDS_FILE:-${data_dir}/runtime-coords.json}" \
-    EXPECTED_VERSION="${ELASTOS_SOURCE_EXPECTED_VERSION:-${VERSION:-}}" \
-    python3 - <<'PY'
-import json
-import os
-import pathlib
-import urllib.request
-
-coords_path = pathlib.Path(os.environ["COORDS_PATH"])
-if not coords_path.exists():
-    print("{}")
-    raise SystemExit(0)
-
-try:
-    coords = json.loads(coords_path.read_text())
-    api = coords["api_url"].rstrip("/")
-except Exception:
-    print("{}")
-    raise SystemExit(0)
-
-version = ""
-try:
-    with urllib.request.urlopen(api + "/api/health", timeout=2) as resp:
-        health = json.loads(resp.read().decode())
-    version = health.get("version", "") or ""
-except Exception:
-    version = ""
-
-try:
-    with urllib.request.urlopen(api + "/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=5) as resp:
-        bootstrap = json.loads(resp.read().decode())
-    if bootstrap.get("schema") != "elastos.carrier.bootstrap/v1":
-        print("{}")
-        raise SystemExit(0)
-    if bootstrap.get("role") != "publisher":
-        print("{}")
-        raise SystemExit(0)
-    ticket = (bootstrap.get("ticket") or "").strip()
-    node_id = (bootstrap.get("node_id") or "").strip()
-    if not ticket or not node_id:
-        print("{}")
-        raise SystemExit(0)
-    print(json.dumps({
-        "ticket": ticket,
-        "node_id": node_id,
-        "role": "publisher",
-        "version": version,
-    }))
-except Exception:
-    print("{}")
-PY
+    PYTHONDONTWRITEBYTECODE=1 \
+    python3 "$helper"
 }
 
 canonical_publisher_gateway() {
@@ -279,6 +237,14 @@ canonical_publisher_gateway() {
 }
 
 inspect_signer_did() {
+    if [[ -n "${PREPARED_INPUT_ROOT:-}" ]]; then
+        # Signer identity comes from --key. Do not forward platform inputs; a
+        # prepared Runtime binary may still reject a two-platform CLI set.
+        "$ELASTOS" publish-release --version "$VERSION" --channel "$CHANNEL" \
+            --key "$KEY_PATH" --dry-run \
+            | sed -n 's/^  Signer:[[:space:]]*//p' | head -n1
+        return
+    fi
     cargo run -q -p elastos-server --manifest-path "elastos/Cargo.toml" -- publish-release \
         --version "$VERSION" \
         --channel "$CHANNEL" \
@@ -491,6 +457,11 @@ support_binary_build_path() {
     capsule_dir=$(resolve_capsule_dir "$name" || true)
     [[ -n "$capsule_dir" ]] || return 1
 
+    if [[ "${RELEASE_PREPARE_LOCKED:-false}" == true && -n "${CARGO_TARGET_DIR:-}" ]]; then
+        printf '%s/%srelease/%s\n' "$CARGO_TARGET_DIR" "${target:+${target}/}" "$name"
+        return 0
+    fi
+
     # Workspace members (under elastos/capsules/) compile to the workspace
     # root target dir, not the capsule's own target dir.
     local paths=()
@@ -519,6 +490,10 @@ build_support_binary() {
     local target="${3:-}"
     local use_cross="${4:-false}"
     local capsule_dir binary
+    local build_args=(build --release)
+    if [[ "${RELEASE_PREPARE_LOCKED:-false}" == true ]]; then
+        build_args+=(--locked)
+    fi
     capsule_dir=$(resolve_capsule_dir "$name" || true)
     [[ -n "$capsule_dir" ]] || die "Source directory not found for support asset '${name}'"
     binary=$(support_binary_build_path "$name" "$target")
@@ -532,12 +507,12 @@ build_support_binary() {
     info "  Building ${name} (${platform})..." >&2
     if [[ -n "$target" ]]; then
         if [[ "$use_cross" == true ]] && command -v cross >/dev/null 2>&1; then
-            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross build --release --target "$target") >&2
+            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross "${build_args[@]}" --target "$target") >&2 || return
         else
-            (cd "$capsule_dir" && cargo build --release --target "$target") >&2
+            (cd "$capsule_dir" && cargo "${build_args[@]}" --target "$target") >&2 || return
         fi
     else
-        (cd "$capsule_dir" && cargo build --release) >&2
+        (cd "$capsule_dir" && cargo "${build_args[@]}") >&2 || return
     fi
 
     binary=$(support_binary_build_path "$name" "$target")
@@ -548,6 +523,7 @@ build_support_binary() {
 build_packaged_capsule_archive() {
     local platform="$1"
     local capsule_name="$2"
+    local native_renderer="${3:-}"
     local capsule_dir capsule_type entrypoint stage_root archive
 
     capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
@@ -558,23 +534,89 @@ build_packaged_capsule_archive() {
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     stage_root="${TMPDIR}/support-assets-${platform}-${capsule_name}"
     archive="${TMPDIR}/support-assets-${platform}/${capsule_name}.tar.gz"
-    rm -rf "$stage_root"
-    mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")"
+    rm -rf "$stage_root" || return
+    mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")" || return
 
     case "$capsule_type" in
         data)
-            copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}"
+            copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}" || return
             [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
             ;;
         wasm)
-            stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}"
+            stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}" || return
             ;;
         *)
             die "Unsupported packaged app capsule type for ${capsule_name}: ${capsule_type}"
             ;;
     esac
 
-    create_capsule_tar "$archive" "$stage_root" "$capsule_name"
+    if [[ -n "$native_renderer" ]]; then
+        [[ "$capsule_name" == home-cli && -x "$native_renderer" && ! -L "$native_renderer" ]] \
+            || die "Home CLI packaging requires a built native renderer"
+        mkdir -p "${stage_root}/${capsule_name}/bin" || return
+        install -m 755 "$native_renderer" "${stage_root}/${capsule_name}/bin/home-cli" || return
+    fi
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
+    echo "$archive"
+}
+
+provider_capsule_names() {
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path(".")
+components = json.loads(Path("components.json").read_text(encoding="utf-8"))
+for name, component in sorted((components.get("external") or {}).items()):
+    if not isinstance(component.get("provider_runtime"), dict):
+        continue
+    capsule_dir = None
+    for candidate in (root / "capsules" / name, root / "elastos" / "capsules" / name):
+        if (candidate / "capsule.json").is_file():
+            capsule_dir = candidate
+            break
+    if capsule_dir is None:
+        continue
+    manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
+    if manifest.get("role") != "provider":
+        raise SystemExit(f"{name} capsule manifest role must be provider")
+    icon_dir = str(manifest.get("icon") or "").strip().strip("/")
+    if not icon_dir:
+        raise SystemExit(f"{name} provider capsule icon path is missing")
+    if ".." in Path(icon_dir).parts:
+        raise SystemExit(f"{name} provider capsule icon path escapes the capsule")
+    print(name)
+PY
+}
+
+build_packaged_provider_capsule_metadata_archive() {
+    local capsule_name="$1"
+    local capsule_dir icon_dir stage_root archive_dir archive size source
+
+    capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
+    [[ -n "$capsule_dir" ]] || die "${capsule_name} source directory not found"
+    [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
+
+    [[ "$(capsule_manifest_field "$capsule_name" "role")" == "provider" ]] \
+        || die "${capsule_name} capsule manifest role must be provider"
+    icon_dir=$(capsule_manifest_field "$capsule_name" "icon")
+    [[ -n "$icon_dir" ]] || die "${capsule_name} provider capsule icon path is missing"
+
+    stage_root="${TMPDIR}/provider-contract-${capsule_name}"
+    archive_dir="${TMPDIR}/supported-provider-contract-archives"
+    archive="${archive_dir}/${capsule_name}-capsule-metadata.tar.gz"
+    rm -rf "$stage_root" || return
+    mkdir -p "${stage_root}/${capsule_name}" "$archive_dir" || return
+
+    copy_release_source_file "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json" || return
+    for size in 32 64 128 256; do
+        source="${capsule_dir}/${icon_dir}/icon-${size}.png"
+        [[ -f "$source" ]] || die "${capsule_name} provider capsule icon missing: ${icon_dir}/icon-${size}.png"
+        mkdir -p "${stage_root}/${capsule_name}/${icon_dir}" || return
+        copy_release_source_file "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png" || return
+    done
+
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
     echo "$archive"
 }
 
@@ -598,6 +640,12 @@ copy_clean_capsule_tree() {
     local src="$1"
     local dest="$2"
     mkdir -p "$dest"
+    if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
+        local prefix
+        prefix=$(git -C "$src" rev-parse --show-prefix) || return
+        git archive "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" | tar -xf - -C "$dest"
+        return
+    fi
     tar \
         --exclude='./target' \
         --exclude='./node_modules' \
@@ -606,16 +654,50 @@ copy_clean_capsule_tree() {
         -cf - -C "$src" . | tar -xf - -C "$dest"
 }
 
+copy_release_source_file() {
+    local src="$1"
+    local dest="$2"
+    if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
+        git show "${RELEASE_PREPARE_SOURCE_COMMIT}:${src}" > "$dest"
+    else
+        cp "$src" "$dest"
+    fi
+}
+
 create_capsule_tar() {
     local archive="$1"
     local stage_root="$2"
     local capsule_name="$3"
-    tar --sort=name \
-        --mtime='UTC 1970-01-01' \
-        --owner=0 \
-        --group=0 \
-        --numeric-owner \
-        -czf "$archive" -C "$stage_root" "$capsule_name"
+    python3 - "$archive" "$stage_root" "$capsule_name" <<'PY'
+import gzip
+from pathlib import Path
+import sys
+import tarfile
+
+archive, stage_root, capsule_name = sys.argv[1:]
+
+def normalize(info):
+    # Equivalent checkouts can share inodes differently. Store regular files
+    # independently, while preserving explicit symbolic links.
+    if info.islnk():
+        info.type = tarfile.REGTYPE
+        info.linkname = ""
+        info.size = (Path(stage_root) / info.name).stat().st_size
+    info.uid = info.gid = info.mtime = 0
+    info.uname = info.gname = ""
+    info.pax_headers = {}
+    info.mode = 0o777 if info.issym() else (
+        0o755 if info.isdir() or info.mode & 0o111 else 0o644
+    )
+    return info
+
+# tarfile sorts recursive entries. The gzip header must also be independent
+# of the output filename and wall clock, on both macOS and Linux.
+with open(archive, "wb") as output:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
+            package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+PY
 }
 
 stage_wasm_capsule() {
@@ -629,9 +711,9 @@ stage_wasm_capsule() {
     runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
 
     if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
-        ensure_rust_target_installed "wasm32-unknown-unknown"
+        ensure_rust_target_installed "wasm32-unknown-unknown" || return
         info "  Building ${capsule_name} Component..." >&2
-        scripts/build-component-capsule.sh "$capsule_dir" >&2
+        scripts/build-component-capsule.sh "$capsule_dir" >&2 || return
     elif [[ "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
         info "  Using ${capsule_name} Runtime projection from source..." >&2
     else
@@ -648,12 +730,16 @@ stage_wasm_capsule() {
     done
     [[ -n "$built_wasm" ]] || die "${capsule_name} entrypoint missing after build: ${entrypoint}"
 
-    mkdir -p "$dest"
-    cp "${capsule_dir}/capsule.json" "$dest/"
-    cp "$built_wasm" "${dest}/${entrypoint}"
+    mkdir -p "$(dirname "${dest}/${entrypoint}")" || return
+    copy_release_source_file "${capsule_dir}/capsule.json" "$dest/capsule.json" || return
     if [[ -d "${capsule_dir}/browser" ]]; then
-        mkdir -p "${dest}/browser"
-        copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser"
+        mkdir -p "${dest}/browser" || return
+        copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser" || return
+    fi
+    if [[ "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
+        copy_release_source_file "$built_wasm" "${dest}/${entrypoint}" || return
+    else
+        cp "$built_wasm" "${dest}/${entrypoint}" || return
     fi
 }
 
@@ -664,32 +750,62 @@ record_direct_asset() {
     local install_path="$4"
     local release_path="$5"
     local extract_path="${6:-}"
-    local cid checksum size
+    local checksum size
 
-    cid=$(ipfs_add "$staged")
-    checksum=$(sha256 "$staged")
-    size=$(file_size "$staged")
+    checksum=$(sha256 "$staged") || return
+    size=$(file_size "$staged") || return
 
     if [[ -n "$extract_path" ]]; then
         echo "$updates_json" | jq \
             --arg name "$name" \
-            --arg cid "$cid" \
             --arg checksum "sha256:${checksum}" \
             --arg install_path "$install_path" \
             --arg extract_path "$extract_path" \
             --arg release_path "$release_path" \
             --argjson size "$size" \
-            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}'
+            '.[$name] = {checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}'
     else
         echo "$updates_json" | jq \
             --arg name "$name" \
-            --arg cid "$cid" \
             --arg checksum "sha256:${checksum}" \
             --arg install_path "$install_path" \
             --arg release_path "$release_path" \
             --argjson size "$size" \
-            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}'
+            '.[$name] = {checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}'
     fi
+}
+
+record_provider_capsule_metadata_asset() {
+    local updates_json="$1"
+    local name="$2"
+    local staged="$3"
+    local install_path="$4"
+    local release_path="$5"
+    local extract_path="$6"
+    local checksum size
+
+    checksum=$(sha256 "$staged") || return
+    size=$(file_size "$staged") || return
+
+    echo "$updates_json" | jq \
+        --arg name "$name" \
+        --arg checksum "sha256:${checksum}" \
+        --arg install_path "$install_path" \
+        --arg extract_path "$extract_path" \
+        --arg release_path "$release_path" \
+        --argjson size "$size" \
+        '.external[$name].capsule_metadata = {
+            install_path: $install_path,
+            platforms: {
+                "*": {
+                    checksum: $checksum,
+                    size: $size,
+                    install_path: $install_path,
+                    extract_path: $extract_path,
+                    release_path: $release_path
+                }
+            }
+        }'
 }
 
 stamp_direct_assets() {
@@ -718,27 +834,115 @@ print(json.dumps({"external": external}))
 PY
 }
 
+build_packaged_media_tools_archive() {
+    local setup_platform="$1"
+    local host_platform cache target_root stage_root archive
+    case "$(uname -s):$(uname -m)" in
+        Darwin:arm64|Darwin:aarch64) host_platform=darwin-arm64 ;;
+        Linux:x86_64) host_platform=linux-amd64 ;;
+        Linux:aarch64|Linux:arm64) host_platform=linux-arm64 ;;
+        *) die "Unsupported native media-tools build platform" ;;
+    esac
+    [[ "$host_platform" == "$setup_platform" ]] \
+        || die "Prepare media-tools on ${setup_platform}; the media builder requires a native host"
+    target_root="${CARGO_TARGET_DIR:-}"
+    if [[ -z "$target_root" ]]; then
+        target_root=$(cd elastos && cargo metadata --locked --offline --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])') || return
+    fi
+    cache="${target_root}/media-tools/${setup_platform}"
+    scripts/build-media-tools.sh --output "$cache" >&2 || return
+    stage_root="${TMPDIR}/media-tools-${setup_platform}"
+    archive="${TMPDIR}/media-tools-${setup_platform}.tar.gz"
+    mkdir -p "$stage_root" || return
+    cp -R "$cache" "${stage_root}/media-tools" || return
+    create_capsule_tar "$archive" "$stage_root" media-tools || return
+    echo "$archive"
+}
+
 build_supported_direct_assets() {
     local platform="$1"
     local setup_platform="$2"
     local target="${3:-}"
     local use_cross="${4:-false}"
-    local stage_dir updates_json name binary staged install_path release_path
+    local stage_dir updates_json name binary staged install_path release_path archive
 
     stage_dir="${TMPDIR}/supported-assets-${platform}"
-    mkdir -p "$stage_dir"
+    mkdir -p "$stage_dir" || return
     updates_json='{}'
 
+    archive=$(build_packaged_media_tools_archive "$setup_platform") || return
+    release_path="media-tools-${setup_platform}.tar.gz"
+    staged="${stage_dir}/${release_path}"
+    cp "$archive" "$staged" || return
+    updates_json=$(record_direct_asset "$updates_json" media-tools "$staged" "tools/media-tools" "$release_path" media-tools) || return
+
     for name in "${SUPPORT_BINARY_ASSETS[@]}"; do
-        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross")
+        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross") || return
         release_path="${name}-${setup_platform}"
         staged="${stage_dir}/${release_path}"
-        cp "$binary" "$staged"
+        cp "$binary" "$staged" || return
         install_path="bin/${name}"
-        updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path")
+        updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path") || return
     done
 
+    # Home CLI remains one capsule; its terminal renderer makes this archive native.
+    binary=$(build_support_binary home-cli "$platform" "$target" "$use_cross") || return
+    archive=$(build_packaged_capsule_archive "$platform" home-cli "$binary") || return
+    release_path="home-cli-${setup_platform}.tar.gz"
+    staged="${stage_dir}/${release_path}"
+    cp "$archive" "$staged" || return
+    updates_json=$(record_direct_asset "$updates_json" home-cli "$staged" "capsules/home-cli" "$release_path" home-cli) || return
+
     stamp_direct_assets "$setup_platform" "$updates_json"
+}
+
+stage_release_artifacts() {
+    local artifact_dir="$1"
+    local f base CROSS_SRC
+    mkdir -p "$artifact_dir"
+    # Save platform binaries for direct gateway serving
+    cp "${STAGED_ELASTOS}" "${artifact_dir}/elastos-${PLATFORM}"
+    if [[ -n "${CROSS_ELASTOS:-}" && -f "${CROSS_ELASTOS}" ]]; then
+        cp "${CROSS_ELASTOS}" "${artifact_dir}/elastos-${CROSS_PLATFORM}"
+    fi
+    cp "${TMPDIR}/components.json" "${artifact_dir}/components-${PLATFORM}.json"
+    if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
+        cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "${artifact_dir}/components-${CROSS_PLATFORM}.json"
+    fi
+    # Copy first-party support assets for Carrier-served setup fetches.
+    for f in "${TMPDIR}/supported-assets-${PLATFORM}"/* \
+        "${TMPDIR}/supported-assets-universal"/*; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "${artifact_dir}/$(basename "$f")"
+    done
+    for f in "${TMPDIR}/supported-provider-contracts-universal"/*; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "${artifact_dir}/$(basename "$f")"
+    done
+    if [[ -n "${CROSS_PLATFORM:-}" ]]; then
+        for f in "${TMPDIR}/supported-assets-${CROSS_PLATFORM}"/*; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "${artifact_dir}/$(basename "$f")"
+        done
+    fi
+    # Copy capsule artifacts for Carrier serving (platform-suffixed)
+    for f in "${ARTIFACTS_DIR}"/*.capsule.tar.gz; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .capsule.tar.gz)
+        cp -f "$f" "${artifact_dir}/${base}-${PLATFORM}.capsule.tar.gz"
+    done
+    if [[ -f model-catalog.json ]]; then
+        cp -f model-catalog.json "${artifact_dir}/model-catalog.json"
+    fi
+    if [[ -n "${CROSS_PLATFORM:-}" ]]; then
+        CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
+        [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
+        for f in "${CROSS_SRC}"/*.capsule.tar.gz; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f" .capsule.tar.gz)
+            cp -f "$f" "${artifact_dir}/${base}-${CROSS_PLATFORM}.capsule.tar.gz"
+        done
+    fi
 }
 
 build_platform_independent_direct_assets() {
@@ -747,11 +951,10 @@ build_platform_independent_direct_assets() {
     local archive staged capsule
 
     stage_dir="${TMPDIR}/supported-assets-universal"
-    mkdir -p "$stage_dir"
+    mkdir -p "$stage_dir" || return
     updates_json='{}'
 
     for capsule in \
-        home-cli \
         home-gui \
         home \
         system \
@@ -776,19 +979,97 @@ build_platform_independent_direct_assets() {
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"
         else
-            archive=$(build_packaged_capsule_archive "$platform" "$capsule")
+            archive=$(build_packaged_capsule_archive "$platform" "$capsule") || return
         fi
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
-        cp "$archive" "$staged"
-        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule")
+        cp "$archive" "$staged" || return
+        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule") || return
     done
 
     stamp_direct_assets "*" "$updates_json"
 }
 
+build_platform_independent_provider_capsule_metadata_assets() {
+    local stage_dir updates_json provider archive staged release_path providers
+
+    stage_dir="${TMPDIR}/supported-provider-contracts-universal"
+    mkdir -p "$stage_dir" || return
+    updates_json='{}'
+
+    providers=$(provider_capsule_names) || return
+    while IFS= read -r provider; do
+        [[ -n "$provider" ]] || continue
+        archive=$(build_packaged_provider_capsule_metadata_archive "$provider") || return
+        release_path="${provider}-capsule-metadata.tar.gz"
+        staged="${stage_dir}/${release_path}"
+        cp "$archive" "$staged" || return
+        updates_json=$(
+            record_provider_capsule_metadata_asset \
+                "$updates_json" \
+                "$provider" \
+                "$staged" \
+                "capsules/${provider}" \
+                "$release_path" \
+                "$provider"
+        ) || return
+    done <<< "$providers"
+
+    echo "$updates_json"
+}
+# Attach transport identities only after local asset preparation succeeds.
+# Builders above return unsigned descriptors with no placeholder CIDs.
+publish_direct_assets() {
+    local updates_json="$1"
+    local platform="$2"
+    local release_paths release_path staged candidate cid count
+    release_paths=$(printf '%s\n' "$updates_json" | jq -r \
+        '[.. | objects | .release_path? // empty] | unique[]') || return
+    while IFS= read -r release_path; do
+        [[ -n "$release_path" ]] || continue
+        case "$release_path" in
+            */*|*\\*|.|..) die "Invalid direct asset filename: $release_path" ;;
+        esac
+        staged=""
+        count=0
+        for candidate in \
+            "${TMPDIR}/supported-assets-${platform}/${release_path}" \
+            "${TMPDIR}/supported-assets-universal/${release_path}" \
+            "${TMPDIR}/supported-provider-contracts-universal/${release_path}"; do
+            if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+                staged="$candidate"
+                count=$((count + 1))
+            fi
+        done
+        [[ "$count" == 1 ]] || die "Expected one staged direct asset: $release_path (found $count)"
+        cid=$(ipfs_add "$staged") || return
+        updates_json=$(printf '%s\n' "$updates_json" | jq \
+            --arg path "$release_path" --arg cid "$cid" \
+            'walk(if type == "object" and .release_path? == $path then .cid = $cid else . end)') || return
+    done <<< "$release_paths"
+    printf '%s\n' "$updates_json"
+}
+
 merge_direct_assets() {
     jq -s '.[0] * .[1]' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+# The native preparation worker uses the same template and profile merge.
+generate_components_json() {
+    local capsule_entries="$1"
+    local direct_assets="$2"
+    local external profiles catalog
+    external=$(jq '.external' components.json)
+    profiles=$(jq '.profiles' components.json)
+    catalog=$(jq -c '.model_catalog // null' components.json)
+    jq -n \
+        --arg schema "elastos.components/v1" \
+        --argjson capsules "$capsule_entries" \
+        --argjson external "$external" \
+        --argjson profiles "$profiles" \
+        --argjson direct "$direct_assets" \
+        --argjson catalog "$catalog" \
+        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles} + (if $catalog == null then {} else {model_catalog: $catalog} end)'
 }
 
 runtime_tunnel_url() {
@@ -815,6 +1096,303 @@ runtime_tunnel_url() {
     return 0
 }
 
+# Input admission and byte staging happen before signing, uploads or state writes.
+stage_platform_inputs() {
+    local output="$1"
+    shift
+    local value args=()
+    for value in "$@"; do args+=(--input "$value"); done
+    python3 scripts/release-platform-input.py stage-inputs \
+        --version "$VERSION" --output "$output" "${args[@]}" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"}
+}
+
+publish_prepared_platform_inputs() {
+    local root="$1"
+    local path cid components_cid components_sha components_size
+    python3 scripts/release-platform-input.py verify-staged "$root" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"} || return
+    : > "${TMPDIR}/input-cids.jsonl"
+    while IFS= read -r path; do
+        cid=$(ipfs_add "$root/artifacts/$path") || return
+        jq -nc --arg path "$path" --arg cid "$cid" '{($path): $cid}' >> "${TMPDIR}/input-cids.jsonl" || return
+    done < <(jq -r '.files | keys[]' "$root/assembly.json")
+    jq -s 'add' "${TMPDIR}/input-cids.jsonl" > "${TMPDIR}/input-cids.json" || return
+    python3 scripts/release-platform-input.py attach-cids "$root" \
+        --cids "${TMPDIR}/input-cids.json" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"} || return
+    PREPARED_ARTIFACTS_DIR="$root/artifacts"
+    components_cid=$(ipfs_add "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    components_sha=$(sha256 "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    components_size=$(file_size "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    PLATFORMS_JSON=$(jq -n --slurpfile assembly "$root/assembly.json" \
+        --slurpfile cids "${TMPDIR}/input-cids.json" \
+        --arg cid "$components_cid" --arg sha "$components_sha" --argjson size "$components_size" '
+        $assembly[0] as $a | $cids[0] as $c | reduce $a.platforms[] as $p ({};
+        .[$p] = {binary: {cid: $c["elastos-"+$p], sha256: $a.files["elastos-"+$p].sha256,
+                         size: $a.files["elastos-"+$p].size},
+                 components: {cid: $cid, sha256: $sha, size: $size}})') || return
+    RELEASE_SOURCE_JSON=$(jq -c '.source | {commit,tree}' "$root/assembly.json") || return
+    STAGED_ELASTOS="$PREPARED_ARTIFACTS_DIR/elastos-${PLATFORM}"
+    cp "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json" "${TMPDIR}/components.json" || return
+    BINARY_CID=$(printf '%s' "$PLATFORMS_JSON" | jq -r --arg p "$PLATFORM" '.[$p].binary.cid')
+    BINARY_SHA256=$(sha256 "$STAGED_ELASTOS")
+    BINARY_SIZE=$(file_size "$STAGED_ELASTOS")
+    COMPONENTS_CID="$components_cid"
+    COMPONENTS_SHA256="$components_sha"
+    COMPONENTS_SIZE="$components_size"
+    CAPSULE_ENTRIES='{}'
+    CROSS_CAPSULE_ENTRIES='{}'
+    CROSS_PLATFORM='' CROSS_BINARY_CID='' CROSS_COMPONENTS_CID=''
+    SHELL_CID='' SHELL_SHA256=''
+}
+
+# The Publisher root serves stable paths: release-head.json, release.json,
+# install.sh and artifacts/<name>. A prepared set is checked against its own
+# signed metadata, staged beside the current publication, then promoted by
+# per-file rename with release-head.json last, so a reader sees the previous
+# head until every advertised byte is in place. Renames are atomic per file,
+# not per release: a reader that already holds the previous head can still meet
+# replaced artifact bytes at a stable path and fails closed on its checksum.
+verify_release_publication_set() {
+    local head="$1" release="$2" install="$3" artifact_dir="$4"
+    python3 - "$head" "$release" "$install" "$artifact_dir" <<'PY'
+import hashlib
+import importlib.util
+import json
+import stat
+import sys
+from pathlib import Path
+
+head_path, release_path, install_path, artifact_root = (Path(p) for p in sys.argv[1:5])
+spec = importlib.util.spec_from_file_location(
+    "components_integrity", "scripts/components-release-integrity-check.py")
+integrity = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(integrity)
+
+
+def regular(path, label):
+    if path.is_symlink() or not path.exists() or not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError(f"{label} must be a regular file: {path}")
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"{label} is empty: {path}")
+    return data
+
+
+def envelope(data, schema, label):
+    try:
+        value = json.loads(data)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}")
+    payload = value.get("payload") if isinstance(value, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema") != schema:
+        raise ValueError(f"{label} is not a {schema} envelope")
+    if any(not isinstance(value.get(k), str) or not value[k] for k in ("signature", "signer_did")):
+        raise ValueError(f"{label} is missing its signature or signer")
+    return payload
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+try:
+    release_bytes = regular(release_path, "release.json")
+    head = envelope(regular(head_path, "release-head.json"), "elastos.release.head/v1", "release-head.json")
+    release = envelope(release_bytes, "elastos.release/v1", "release.json")
+    regular(install_path, "install.sh")
+    if head.get("release_sha256") != digest(release_bytes):
+        raise ValueError("release-head.json does not bind these release.json bytes")
+    for field in ("version", "channel"):
+        if not isinstance(head.get(field), str) or not head[field] or release.get(field) != head[field]:
+            raise ValueError(f"release-head.json and release.json {field} differ")
+    if artifact_root.is_symlink() or not artifact_root.is_dir():
+        raise ValueError(f"artifact directory must be a regular directory: {artifact_root}")
+    present = {}
+    for entry in artifact_root.iterdir():
+        if (entry.name.startswith(".") or "\\" in entry.name or entry.is_symlink()
+                or not stat.S_ISREG(entry.lstat().st_mode)):
+            raise ValueError(f"artifact entries must be plain regular files: {entry.name}")
+        present[entry.name] = entry
+    platforms = release.get("platforms")
+    if not isinstance(platforms, dict) or not platforms:
+        raise ValueError("release.json advertises no platforms")
+    referenced = set()
+    errors = []
+    for platform, descriptor in sorted(platforms.items()):
+        setup = next((s for s, r in integrity.RELEASE_PLATFORMS.items() if r == platform), None)
+        if setup is None:
+            raise ValueError(f"release.json advertises an unknown platform: {platform}")
+        for kind, name in (("binary", f"elastos-{platform}"), ("components", f"components-{platform}.json")):
+            if name not in present:
+                raise ValueError(f"advertised artifact is missing: {name}")
+            data = present[name].read_bytes()
+            info = descriptor.get(kind) if isinstance(descriptor, dict) else None
+            if not isinstance(info, dict) or info.get("sha256") != digest(data) or info.get("size") != len(data):
+                raise ValueError(f"advertised {kind} differs from its bytes: {name}")
+            referenced.add(name)
+        try:
+            manifest = json.loads(present[f"components-{platform}.json"].read_bytes())
+        except ValueError as exc:
+            raise ValueError(f"components-{platform}.json is not valid JSON: {exc}")
+        errors += integrity.audit_release_artifacts(manifest, [setup], artifact_root)
+        for component in (manifest.get("external") or {}).values():
+            if not isinstance(component, dict):
+                continue
+            for entry in (component, component.get("capsule_metadata")):
+                if isinstance(entry, dict):
+                    _, info = integrity.resolve_platform_info(entry, setup)
+                    if isinstance(info, dict) and isinstance(info.get("release_path"), str):
+                        referenced.add(info["release_path"])
+        for name, entry in (manifest.get("capsules") or {}).items():
+            if isinstance(entry, dict) and platform in (entry.get("platforms") or []):
+                referenced.add(f"{name}-{platform}.capsule.tar.gz")
+    if errors:
+        raise ValueError("; ".join(errors))
+    extra = sorted(set(present) - referenced)
+    pin = None
+    for name in present:
+        if name.startswith("components-") and name.endswith(".json"):
+            try:
+                candidate = json.loads(present[name].read_bytes()).get("model_catalog")
+            except ValueError as exc:
+                raise ValueError(f"{name} is not valid JSON: {exc}")
+            if pin is None:
+                pin = candidate
+            elif pin != candidate:
+                raise ValueError("prepared components disagree on model_catalog")
+    if isinstance(pin, dict):
+        head = pin.get("head_cid")
+        if not isinstance(head, str) or not head:
+            raise ValueError("model_catalog.head_cid is required")
+        if "model-catalog.json" not in present:
+            raise ValueError("advertised model catalog pin is missing model-catalog.json")
+        data = present["model-catalog.json"].read_bytes()
+        digest = hashlib.sha256(data).digest()
+        actual = "b" + __import__("base64").b32encode(b"\x01\x55\x12\x20" + digest).decode("ascii").lower().rstrip("=")
+        if actual != head:
+            raise ValueError(f"model-catalog.json head {actual} does not match pin {head}")
+        referenced.add("model-catalog.json")
+        extra = sorted(set(present) - referenced)
+    if extra:
+        raise ValueError(f"prepared artifacts are not advertised by this release: {extra}")
+except (OSError, ValueError, TypeError, AttributeError) as exc:
+    raise SystemExit(f"Release publication set rejected: {exc}")
+PY
+}
+
+reject_release_publication_collision() {
+    if [[ -L "$1" ]] || [[ -e "$1" && ! -f "$1" ]]; then
+        die "Publisher destination must be a regular file or absent: $1"
+    fi
+}
+
+check_release_publication_destinations() {
+    local publisher_root="$1" artifact_dir="$2"
+    local source destination
+    if [[ -e "$publisher_root" || -L "$publisher_root" ]] && [[ ! -d "$publisher_root" ]]; then
+        die "Publisher root is not a directory: ${publisher_root}"
+    fi
+    if [[ -L "${publisher_root}/artifacts" ]] || \
+       [[ -e "${publisher_root}/artifacts" && ! -d "${publisher_root}/artifacts" ]]; then
+        die "Publisher artifacts path must be a regular directory: ${publisher_root}/artifacts"
+    fi
+    for source in "${artifact_dir}"/*; do
+        reject_release_publication_collision "${publisher_root}/artifacts/$(basename "$source")"
+    done
+    for destination in install.sh release.json release-head.json; do
+        reject_release_publication_collision "${publisher_root}/${destination}"
+    done
+}
+
+copy_release_publication_file() {
+    cp "$1" "$2" || return
+    cmp -s "$1" "$2"
+}
+
+stage_release_publication() {
+    local scratch="$1" head="$2" release="$3" install="$4" artifact_dir="$5"
+    local source
+    mkdir -p "${scratch}/staged/artifacts" "${scratch}/previous/artifacts" || return
+    for source in "${artifact_dir}"/*; do
+        copy_release_publication_file "$source" "${scratch}/staged/artifacts/$(basename "$source")" || return
+    done
+    copy_release_publication_file "$install" "${scratch}/staged/install.sh" || return
+    copy_release_publication_file "$release" "${scratch}/staged/release.json" || return
+    copy_release_publication_file "$head" "${scratch}/staged/release-head.json" || return
+}
+
+# The current file keeps a hard link under the attempt's scratch so a failed
+# rename can put it back without a moment where the path is absent. The path
+# is recorded as pending before its rename, so restore always sees a replaced
+# file even when bookkeeping fails afterwards.
+promote_release_publication_file() {
+    local scratch="$1" relative="$2" destination="$3"
+    if [[ -f "$destination" ]]; then
+        ln "$destination" "${scratch}/previous/${relative}" || return
+    fi
+    printf '%s\n' "$relative" >> "${scratch}/promoted" || return
+    mv -f "${scratch}/staged/${relative}" "$destination"
+}
+
+promote_release_publication() {
+    local scratch="$1" publisher_root="$2"
+    local staged relative
+    : > "${scratch}/promoted" || return
+    for staged in "${scratch}/staged/artifacts"/* "${scratch}/staged/install.sh" \
+        "${scratch}/staged/release.json" "${scratch}/staged/release-head.json"; do
+        relative="${staged#"${scratch}/staged/"}"
+        promote_release_publication_file "$scratch" "$relative" "${publisher_root}/${relative}" || return
+    done
+}
+
+restore_release_publication() {
+    local scratch="$1" publisher_root="$2"
+    local relative previous status=0
+    [[ -f "${scratch}/promoted" ]] || return 0
+    while IFS= read -r relative; do
+        previous="${scratch}/previous/${relative}"
+        if [[ -f "$previous" ]]; then
+            # A pending path whose rename never ran still shares the saved inode.
+            if [[ ! "$previous" -ef "${publisher_root}/${relative}" ]]; then
+                mv -f "$previous" "${publisher_root}/${relative}" || status=1
+            fi
+        else
+            rm -f "${publisher_root}/${relative}" || status=1
+        fi
+    done < "${scratch}/promoted"
+    return "$status"
+}
+
+export_release_publication() {
+    local publisher_root="$1" head="$2" release="$3" install="$4" artifact_dir="$5"
+    local scratch stale
+    verify_release_publication_set "$head" "$release" "$install" "$artifact_dir" || return
+    check_release_publication_destinations "$publisher_root" "$artifact_dir" || return
+    mkdir -p "${publisher_root}/artifacts" || return
+    for stale in "${publisher_root}"/.publish-release.*; do
+        if [[ -e "$stale" ]]; then
+            warn "Staging from an interrupted publication attempt remains: ${stale}"
+        fi
+    done
+    scratch=$(mktemp -d "${publisher_root}/.publish-release.XXXXXX") || return
+    if ! stage_release_publication "$scratch" "$head" "$release" "$install" "$artifact_dir"; then
+        rm -rf "$scratch"
+        die "Failed to stage the release publication set; the current publication is unchanged"
+    fi
+    if ! promote_release_publication "$scratch" "$publisher_root"; then
+        if restore_release_publication "$scratch" "$publisher_root"; then
+            rm -rf "$scratch"
+            die "Failed to promote the release publication set; the previous publication was restored"
+        fi
+        die "Failed to promote the release publication set and could not restore every previous file; inspect ${scratch}"
+    fi
+    rm -rf "$scratch"
+}
+
+# Sourcing exposes local builders without invoking the publisher.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 # ── Parse args ────────────────────────────────────────────────────────
 
 VERSION=""
@@ -823,13 +1401,15 @@ IPFS_PROVIDER_BIN=""
 CHANNEL="stable"
 SKIP_BUILD=false
 SKIP_ROOTFS=false
-DRY_RUN=false
 PUBLISH_PUBLIC_URL=true
 PUBLIC_WITH_SUDO=false
 ALLOW_SIGNER_ROTATION=false
 GATEWAY_ADDR="127.0.0.1:8090"
 PUBLIC_URL_TIMEOUT=60
 CROSS_ARCH=""
+PLATFORM_INPUTS=()
+PREVIEW_PLATFORM=""
+CAPSULES_EXPLICIT=false
 STATE_DIR="${ELASTOS_PUBLISH_STATE_DIR:-.}"
 
 while [[ $# -gt 0 ]]; do
@@ -849,7 +1429,7 @@ while [[ $# -gt 0 ]]; do
             CHANNEL="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --skip-rootfs) SKIP_ROOTFS=true; shift ;;
-        --dry-run) DRY_RUN=true; shift ;;
+        --dry-run) die "Use elastos publish-release --dry-run for a read-only plan. This low-level script builds and publishes releases." ;;
         --no-public-url) PUBLISH_PUBLIC_URL=false; shift ;;
         --public-with-sudo) PUBLIC_WITH_SUDO=true; shift ;;
         --allow-signer-rotation) ALLOW_SIGNER_ROTATION=true; shift ;;
@@ -862,7 +1442,18 @@ while [[ $# -gt 0 ]]; do
         --cross)
             [[ -z "${2:-}" ]] && die "Usage: --cross ARCH (e.g., aarch64)"
             CROSS_ARCH="$2"; shift 2 ;;
+        --platform-input)
+            [[ -z "${2:-}" ]] && die "Usage: --platform-input PLATFORM=DIR"
+            input_name="${2%%=*}"
+            input_path="${2#*=}"
+            [[ "$2" == *=* && -n "$input_path" ]] || die "Usage: --platform-input PLATFORM=DIR"
+            [[ "$input_path" == /* ]] || input_path="$PUBLISH_CALLER_DIR/$input_path"
+            PLATFORM_INPUTS+=("${input_name}=${input_path}"); shift 2 ;;
+        --preview-platform)
+            [[ -z "${2:-}" ]] && die "Usage: --preview-platform PLATFORM"
+            PREVIEW_PLATFORM="$2"; shift 2 ;;
         --capsules)
+            CAPSULES_EXPLICIT=true
             [[ -z "${2:-}" ]] && die "Usage: --capsules name1,name2,..."
             IFS=',' read -r -a CAPSULES <<< "$2"
             shift 2 ;;
@@ -873,22 +1464,10 @@ done
 # ── Preflight ─────────────────────────────────────────────────────────
 
 [[ -z "$VERSION" ]] && die "--version is required"
-if [[ "$DRY_RUN" == true ]]; then
-    # Local-only rehearsal: never start the public gateway/tunnel path.
-    PUBLISH_PUBLIC_URL=false
-    if [[ -z "$KEY_PATH" ]]; then
-        KEY_PATH=$(mktemp -t elastos-dryrun-key.XXXXXX)
-        python3 -c 'import secrets; print(secrets.token_hex(32))' > "$KEY_PATH"
-        warn "Dry run without --key: signing with ephemeral throwaway key ${KEY_PATH}"
-    fi
-fi
-[[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
-[[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
 bash "./scripts/check-versioning.sh" "$VERSION"
 if ! is_allowed_channel "$CHANNEL"; then
     die "Unsupported release channel '${CHANNEL}'. Allowed channels: ${ALLOWED_CHANNELS[*]}"
 fi
-mkdir -p "$STATE_DIR"
 export ELASTOS_RELEASE_VERSION="$VERSION"
 
 for cmd in jq python3 curl; do
@@ -897,6 +1476,47 @@ done
 
 sha256 /dev/null &>/dev/null || die "No SHA-256 tool available"
 
+if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
+    [[ "$SKIP_BUILD" == false && "$SKIP_ROOTFS" == false && -z "$CROSS_ARCH" && "$CAPSULES_EXPLICIT" == false ]] \
+        || die "--platform-input conflicts with --skip-build, --skip-rootfs, --cross and --capsules"
+fi
+# A preview publishes one explicitly named native input on the canary channel
+# from that platform's own host. Stable admission keeps every supplied native
+# input when at least two release platforms are present.
+PREVIEW_ARGS=()
+if [[ -n "$PREVIEW_PLATFORM" ]]; then
+    [[ "$CHANNEL" == canary ]] || die "--preview-platform requires --channel canary"
+    [[ ${#PLATFORM_INPUTS[@]} -eq 1 && "${PLATFORM_INPUTS[0]%%=*}" == "$PREVIEW_PLATFORM" ]] \
+        || die "--preview-platform ${PREVIEW_PLATFORM} requires exactly one --platform-input ${PREVIEW_PLATFORM}=DIR"
+    PREVIEW_ARGS=(--preview-platform "$PREVIEW_PLATFORM")
+fi
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+PREPARED_INPUT_ROOT=""
+if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
+    PREPARED_INPUT_ROOT="${TMPDIR}/native-inputs"
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64) PLATFORM=x86_64-linux; SETUP_PLATFORM=linux-amd64 ;;
+        Linux:aarch64|Linux:arm64) PLATFORM=aarch64-linux; SETUP_PLATFORM=linux-arm64 ;;
+        Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64 ;;
+        *) die "Prepared input publication requires a supported native coordinator" ;;
+    esac
+    if [[ -n "$PREVIEW_PLATFORM" && "$PLATFORM" != "$PREVIEW_PLATFORM" ]]; then
+        die "--preview-platform ${PREVIEW_PLATFORM} must be published from a ${PREVIEW_PLATFORM} host (this host is ${PLATFORM})"
+    fi
+    stage_platform_inputs "$PREPARED_INPUT_ROOT" "${PLATFORM_INPUTS[@]}"
+    jq -e --arg p "$PLATFORM" '.platforms | index($p)' "$PREPARED_INPUT_ROOT/assembly.json" >/dev/null \
+        || die "prepared inputs do not include this host platform: ${PLATFORM}"
+    ELASTOS="$PREPARED_INPUT_ROOT/artifacts/elastos-${PLATFORM}"
+    HOST_DATA_DIR="$(default_elastos_data_dir)"
+    if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
+        IPFS_PROVIDER_BIN="$PREPARED_INPUT_ROOT/artifacts/ipfs-provider-${SETUP_PLATFORM}"
+    fi
+fi
+[[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
+[[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
+mkdir -p "$STATE_DIR"
+
 if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
     IPFS_PROVIDER_BIN=$(find_ipfs_provider_binary || true)
 fi
@@ -904,6 +1524,7 @@ fi
 [[ ! -x "$IPFS_PROVIDER_BIN" ]] && die "ipfs-provider binary is not executable: $IPFS_PROVIDER_BIN"
 export ELASTOS_IPFS_PROVIDER_BIN="$IPFS_PROVIDER_BIN"
 
+if [[ -z "$PREPARED_INPUT_ROOT" ]]; then
 # Resolve target dir from .cargo/config.toml (supports custom target-dir for WSL2 ext4 perf)
 CARGO_TARGET_DIR=""
 if [[ -f "elastos/.cargo/config.toml" ]]; then
@@ -916,15 +1537,12 @@ else
     ELASTOS="elastos/target/release/elastos"
 fi
 
+fi
+
 CANDIDATE_SIGNER_DID="$(inspect_signer_did)"
 [[ -n "$CANDIDATE_SIGNER_DID" ]] || die "Failed to determine signer DID from ${KEY_PATH}"
 CANONICAL_GATEWAY="$(canonical_publisher_gateway)"
-CURRENT_CANONICAL_SIGNER_DID=""
-if [[ "$DRY_RUN" == true ]]; then
-    warn "Dry run: skipping canonical signer check against ${CANONICAL_GATEWAY}"
-else
-    CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
-fi
+CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
 if [[ -n "$CURRENT_CANONICAL_SIGNER_DID" && "$ALLOW_SIGNER_ROTATION" != true && "$CANDIDATE_SIGNER_DID" != "$CURRENT_CANONICAL_SIGNER_DID" ]]; then
     die "Signer DID mismatch for canonical publisher.\n  Candidate: ${CANDIDATE_SIGNER_DID}\n  Canonical: ${CURRENT_CANONICAL_SIGNER_DID}\n  Gateway:   ${CANONICAL_GATEWAY}\nRe-run with --allow-signer-rotation only for an intentional trust-anchor rotation."
 fi
@@ -935,11 +1553,12 @@ echo -e "${DIM}  Version:  ${VERSION}${NC}"
 echo -e "${DIM}  Channel:  ${CHANNEL}${NC}"
 echo -e "${DIM}  IPFS provider: ${IPFS_PROVIDER_BIN}${NC}"
 echo -e "${DIM}  Capsules: ${CAPSULES[*]}${NC}"
-if [[ "$DRY_RUN" == true ]]; then
-    echo -e "${YELLOW}  Mode:     DRY RUN (local only — no network, no publish-state writes)${NC}"
-fi
 echo ""
 
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    info "Publishing the admitted three-platform native inputs..."
+    publish_prepared_platform_inputs "$PREPARED_INPUT_ROOT"
+else
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
 
 if [ "$SKIP_BUILD" = true ]; then
@@ -1020,11 +1639,19 @@ esac
 
 HOST_DATA_DIR="$(default_elastos_data_dir)"
 
-# Host musl target for rootfs compilation.
+# MicroVM guests use Linux even when the publisher runs on macOS.
 case "${ARCH}" in
-    x86_64)  HOST_RUST_TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64) HOST_RUST_TARGET="aarch64-unknown-linux-musl" ;;
+    x86_64)  GUEST_RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    aarch64) GUEST_RUST_TARGET="aarch64-unknown-linux-musl" ;;
     *) die "No musl target for host arch: ${ARCH}" ;;
+esac
+
+# Providers run on the host, independently of the microVM guest target.
+case "${PLATFORM}" in
+    *-linux)       NATIVE_RUST_TARGET="$GUEST_RUST_TARGET" ;;
+    x86_64-darwin)  NATIVE_RUST_TARGET="x86_64-apple-darwin" ;;
+    aarch64-darwin) NATIVE_RUST_TARGET="aarch64-apple-darwin" ;;
+    *) die "No native Rust target for ${PLATFORM}" ;;
 esac
 
 # ── Cross-compilation setup ──────────────────────────────────────────
@@ -1140,10 +1767,6 @@ PY
             [[ "$strategy" == "source-build" || "$strategy" == "local-copy" ]] && continue  # Can't auto-download
 
             if [[ -n "$dep_url" ]]; then
-                if [[ "$DRY_RUN" == true ]]; then
-                    warn "  Dry run: skipping download of ${dep} for ${CROSS_ARCH}"
-                    continue
-                fi
                 info "  Downloading ${dep} for ${CROSS_ARCH}..."
                 local dl_tmp
                 dl_tmp="$(mktemp -d)"
@@ -1301,9 +1924,6 @@ if [[ ${#missing_external[@]} -gt 0 && "$SKIP_ROOTFS" != true ]]; then
     die "Missing external components required for publish rootfs build (${SETUP_PLATFORM}): ${unique_external}\n  Run: elastos setup --with ${unique_external}"
 fi
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
-
 ARTIFACTS_DIR="${TMPDIR}/artifacts"
 mkdir -p "$ARTIFACTS_DIR"
 LOCAL_ARTIFACT_CACHE_DIR="artifacts"
@@ -1347,7 +1967,7 @@ else
 
     # Phase 1: Compile all capsule binaries sequentially (Cargo handles internal
     # parallelism; avoids lock contention from concurrent cargo invocations).
-    info "  Compiling capsule binaries (${HOST_RUST_TARGET})..."
+    info "  Compiling capsule binaries (${GUEST_RUST_TARGET})..."
     for capsule in "${CAPSULES[@]}"; do
         capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
         capsule_type=""
@@ -1356,7 +1976,7 @@ else
         fi
         if [[ "$capsule_type" == "microvm" && -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
             info "    ${capsule} (host)..."
-            (cd "$capsule_dir" && cargo build --release --target "$HOST_RUST_TARGET" 2>&1) \
+            (cd "$capsule_dir" && cargo build --release --target "$GUEST_RUST_TARGET" 2>&1) \
                 || die "Compile failed for ${capsule}"
         fi
     done
@@ -1365,7 +1985,7 @@ else
     VSOCK_PROXY_DIR="elastos/tools/vsock-proxy"
     if [[ -f "${VSOCK_PROXY_DIR}/Cargo.toml" ]]; then
         info "    vsock-proxy (host)..."
-        (cd "$VSOCK_PROXY_DIR" && cargo build --release --target "$HOST_RUST_TARGET" 2>&1) \
+        (cd "$VSOCK_PROXY_DIR" && cargo build --release --target "$GUEST_RUST_TARGET" 2>&1) \
             || die "Compile failed for vsock-proxy"
     fi
 
@@ -1398,7 +2018,7 @@ else
             fi
         fi
         info "    ${capsule} (rootfs)..."
-        ./scripts/build/build-rootfs.sh "$capsule" --skip-compile --target "$HOST_RUST_TARGET" --output "$ARTIFACTS_DIR" \
+        ./scripts/build/build-rootfs.sh "$capsule" --skip-compile --target "$GUEST_RUST_TARGET" --output "$ARTIFACTS_DIR" \
             >"${ROOTFS_LOGS_DIR}/${capsule}.log" 2>&1 \
             || die "Rootfs build failed for ${capsule}. Check log: ${ROOTFS_LOGS_DIR}/${capsule}.log"
     done
@@ -1535,6 +2155,22 @@ publish_platform_capsules() {
     echo "$entries"
 }
 
+info "Preparing direct share/open support assets..."
+UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
+UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS=$(build_platform_independent_provider_capsule_metadata_assets)
+UNIVERSAL_DIRECT_ASSETS=$(merge_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS")
+HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$NATIVE_RUST_TARGET" false)
+CROSS_DIRECT_ASSETS="{}"
+if [[ -n "$CROSS_ARCH" ]]; then
+    CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+fi
+
+# Registry and setup delivery must identify the same native Home CLI package.
+cp "${TMPDIR}/supported-assets-${PLATFORM}/home-cli-${SETUP_PLATFORM}.tar.gz" "${ARTIFACTS_DIR}/home-cli.capsule.tar.gz"
+if [[ -n "$CROSS_ARCH" ]]; then
+    cp "${TMPDIR}/supported-assets-${CROSS_PLATFORM}/home-cli-${CROSS_SETUP_PLATFORM}.tar.gz" "${CROSS_ARTIFACTS_DIR}/home-cli.capsule.tar.gz"
+fi
+
 info "Publishing capsule artifacts to IPFS..."
 
 # Host platform capsules.
@@ -1549,33 +2185,16 @@ if [[ -n "$CROSS_ARCH" && -d "${CROSS_ARTIFACTS_DIR:-/nonexistent}" ]]; then
     CROSS_CAPSULE_ENTRIES=$(publish_platform_capsules "$CROSS_ARTIFACTS_DIR" "$CROSS_PLATFORM")
 fi
 
-info "Publishing direct share/open support assets..."
-UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
-HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$HOST_RUST_TARGET" false)
+info "Publishing prepared direct assets..."
+UNIVERSAL_DIRECT_ASSETS=$(publish_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$PLATFORM")
+HOST_PLATFORM_DIRECT_ASSETS=$(publish_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$PLATFORM")
 HOST_DIRECT_ASSETS=$(merge_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
-CROSS_DIRECT_ASSETS="{}"
 if [[ -n "$CROSS_ARCH" ]]; then
-    CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+    CROSS_PLATFORM_DIRECT_ASSETS=$(publish_direct_assets "$CROSS_PLATFORM_DIRECT_ASSETS" "$CROSS_PLATFORM")
     CROSS_DIRECT_ASSETS=$(merge_direct_assets "$CROSS_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 fi
 
 # ── Step 5: Generate components.json with real CIDs ──────────────────
-
-# Generate per-platform components.json (each platform has its own capsule CIDs).
-generate_components_json() {
-    local capsule_entries="$1"
-    local direct_assets="$2"
-    local external profiles
-    external=$(jq '.external' components.json)
-    profiles=$(jq '.profiles' components.json)
-    jq -n \
-        --arg schema "elastos.components/v1" \
-        --argjson capsules "$capsule_entries" \
-        --argjson external "$external" \
-        --argjson profiles "$profiles" \
-        --argjson direct "$direct_assets" \
-        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles}'
-}
 
 validate_generated_components_json() {
     local manifest="$1"
@@ -1590,6 +2209,22 @@ COMPONENTS_JSON=$(generate_components_json "$CAPSULE_ENTRIES" "$HOST_DIRECT_ASSE
 
 echo "$COMPONENTS_JSON" > "${TMPDIR}/components.json"
 validate_generated_components_json "${TMPDIR}/components.json" "$SETUP_PLATFORM"
+python3 - "${TMPDIR}/components.json" model-catalog.json <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+pin = manifest.get("model_catalog")
+if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
+    raise SystemExit("generated components.json dropped model_catalog.head_cid")
+data = pathlib.Path(sys.argv[2]).read_bytes()
+head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
+if head != pin["head_cid"]:
+    raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
+PY
 
 COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components.json")
 COMPONENTS_SIZE=$(file_size "${TMPDIR}/components.json")
@@ -1609,13 +2244,13 @@ CROSS_BINARY_SIZE=""
 if [[ -n "$CROSS_ARCH" && "$CROSS_CAPSULE_ENTRIES" != "{}" ]]; then
     info "Generating components.json for ${CROSS_PLATFORM}..."
     CROSS_COMPONENTS_JSON=$(generate_components_json "$CROSS_CAPSULE_ENTRIES" "$CROSS_DIRECT_ASSETS")
-    echo "$CROSS_COMPONENTS_JSON" > "${TMPDIR}/components-${CROSS_ARCH}.json"
-    validate_generated_components_json "${TMPDIR}/components-${CROSS_ARCH}.json" "$CROSS_SETUP_PLATFORM"
-    CROSS_COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components-${CROSS_ARCH}.json")
-    CROSS_COMPONENTS_SIZE=$(file_size "${TMPDIR}/components-${CROSS_ARCH}.json")
+    echo "$CROSS_COMPONENTS_JSON" > "${TMPDIR}/components-${CROSS_PLATFORM}.json"
+    validate_generated_components_json "${TMPDIR}/components-${CROSS_PLATFORM}.json" "$CROSS_SETUP_PLATFORM"
+    CROSS_COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components-${CROSS_PLATFORM}.json")
+    CROSS_COMPONENTS_SIZE=$(file_size "${TMPDIR}/components-${CROSS_PLATFORM}.json")
 
     info "Publishing components.json (${CROSS_PLATFORM}) to IPFS..."
-    CROSS_COMPONENTS_CID=$(ipfs_add "${TMPDIR}/components-${CROSS_ARCH}.json")
+    CROSS_COMPONENTS_CID=$(ipfs_add "${TMPDIR}/components-${CROSS_PLATFORM}.json")
     info "Components CID (${CROSS_PLATFORM}): ${CROSS_COMPONENTS_CID}"
 fi
 
@@ -1626,16 +2261,16 @@ info "Publishing elastos binary to IPFS..."
 # Stage runtime binary into TMPDIR so publish works from any checkout path.
 STAGED_ELASTOS="${TMPDIR}/elastos"
 if [[ -n "$CARGO_TARGET_DIR" ]]; then
-    HOST_MUSL_ELASTOS="${CARGO_TARGET_DIR}/${HOST_RUST_TARGET}/release/elastos"
+    HOST_MUSL_ELASTOS="${CARGO_TARGET_DIR}/${NATIVE_RUST_TARGET}/release/elastos"
 else
-    HOST_MUSL_ELASTOS="elastos/target/${HOST_RUST_TARGET}/release/elastos"
+    HOST_MUSL_ELASTOS="elastos/target/${NATIVE_RUST_TARGET}/release/elastos"
 fi
 if [[ "$PLATFORM" == *-linux ]]; then
-    ensure_rust_target_installed "$HOST_RUST_TARGET"
+    ensure_rust_target_installed "$NATIVE_RUST_TARGET"
     if [[ "$SKIP_BUILD" != true ]]; then
         if [[ ! -f "$HOST_MUSL_ELASTOS" ]] || ([[ -f "$ELASTOS" ]] && [[ "$HOST_MUSL_ELASTOS" -ot "$ELASTOS" ]]); then
             info "Building portable musl runtime binary for host (${PLATFORM})..."
-            (cd elastos && cargo build --release --target "${HOST_RUST_TARGET}" -p elastos-server) \
+            (cd elastos && cargo build --release --target "${NATIVE_RUST_TARGET}" -p elastos-server) \
                 || die "Portable musl build failed for ${PLATFORM}"
         fi
     fi
@@ -1705,6 +2340,29 @@ if [[ -n "$CROSS_ARCH" ]]; then
     fi
 fi
 
+# Assemble the files advertised by this release before signing its metadata.
+PREPARED_ARTIFACTS_DIR="${TMPDIR}/publication-artifacts"
+stage_release_artifacts "$PREPARED_ARTIFACTS_DIR"
+[[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/elastos-${PLATFORM}")" == "$BINARY_SHA256" ]] \
+    || die "Staged runtime differs from the release descriptor (${PLATFORM})"
+[[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/components-${PLATFORM}.json")" == "$COMPONENTS_SHA256" ]] \
+    || die "Staged components differ from the release descriptor (${PLATFORM})"
+python3 scripts/components-release-integrity-check.py \
+    --manifest "${PREPARED_ARTIFACTS_DIR}/components-${PLATFORM}.json" \
+    --platform "$SETUP_PLATFORM" --artifact-root "$PREPARED_ARTIFACTS_DIR"
+if [[ -n "$CROSS_PLATFORM" ]]; then
+    [[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/elastos-${CROSS_PLATFORM}")" == "$CROSS_BINARY_SHA256" ]] \
+        || die "Staged runtime differs from the release descriptor (${CROSS_PLATFORM})"
+    [[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json")" == "$CROSS_COMPONENTS_SHA256" ]] \
+        || die "Staged components differ from the release descriptor (${CROSS_PLATFORM})"
+    python3 scripts/components-release-integrity-check.py \
+        --manifest "${PREPARED_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json" \
+        --platform "$CROSS_SETUP_PLATFORM" --artifact-root "$PREPARED_ARTIFACTS_DIR"
+fi
+
+# End build-mode preparation.
+fi
+
 # ── Step 7: Create + sign release.json ───────────────────────────────
 
 PREV_RELEASE_CID="null"
@@ -1712,6 +2370,7 @@ if [[ -f "${STATE_DIR}/last-release-cid" ]]; then
     PREV_RELEASE_CID="\"$(cat "${STATE_DIR}/last-release-cid")\""
 fi
 
+if [[ -z "$PREPARED_INPUT_ROOT" ]]; then
 # Build the platforms object. Start with the host platform.
 PLATFORMS_JSON=$(jq -n \
     --arg platform "$PLATFORM" \
@@ -1747,6 +2406,8 @@ if [[ -n "$CROSS_BINARY_CID" && -n "$CROSS_COMPONENTS_CID" ]]; then
     info "Release includes: ${PLATFORM}, ${CROSS_PLATFORM}"
 fi
 
+fi
+
 RELEASE_PAYLOAD=$(jq -ncS \
     --arg schema "elastos.release/v1" \
     --arg channel "$CHANNEL" \
@@ -1756,6 +2417,7 @@ RELEASE_PAYLOAD=$(jq -ncS \
     --arg shell_cid "${SHELL_CID}" \
     --arg shell_sha256 "${SHELL_SHA256}" \
     --argjson platforms "$PLATFORMS_JSON" \
+    --argjson source "${RELEASE_SOURCE_JSON:-null}" \
     '{
         schema: $schema,
         channel: $channel,
@@ -1765,7 +2427,8 @@ RELEASE_PAYLOAD=$(jq -ncS \
         shell_cid: $shell_cid,
         shell_sha256: $shell_sha256,
         platforms: $platforms
-    }')
+    } + (if $source == null then {} else {source: $source} end)
+      | if $source == null then . else del(.shell_cid,.shell_sha256) end')
 
 info "Signing release payload..."
 SIGN_OUTPUT=$(echo -n "$RELEASE_PAYLOAD" | "$ELASTOS" sign-payload --domain elastos.release.v1 --key "$KEY_PATH")
@@ -1779,6 +2442,7 @@ RELEASE_JSON=$(jq -n \
     '{ payload: $payload, signature: $signature, signer_did: $signer_did }')
 
 echo "$RELEASE_JSON" > "${TMPDIR}/release.json"
+RELEASE_SHA256=$(sha256 "${TMPDIR}/release.json")
 
 info "Publishing release.json to IPFS..."
 RELEASE_CID=$(ipfs_add "${TMPDIR}/release.json")
@@ -1833,6 +2497,7 @@ HEAD_PAYLOAD=$(jq -ncS \
     --arg schema "elastos.release.head/v1" \
     --arg channel "$CHANNEL" \
     --arg latest_release_cid "$RELEASE_CID" \
+    --arg release_sha256 "$RELEASE_SHA256" \
     --arg release_object_cid "$RELEASE_OBJECT_CID" \
     --arg version "$VERSION" \
     --argjson updated_at "$(now_unix)" \
@@ -1842,6 +2507,7 @@ HEAD_PAYLOAD=$(jq -ncS \
         schema: $schema,
         channel: $channel,
         latest_release_cid: $latest_release_cid,
+        release_sha256: $release_sha256,
         release_object_cid: $release_object_cid,
         version: $version,
         updated_at: $updated_at,
@@ -1891,9 +2557,7 @@ if [[ -f "$KUBO_COORD_FILE" ]]; then
     KUBO_PORT=$(jq -r '.api_port // empty' "$KUBO_COORD_FILE" 2>/dev/null || true)
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
-    info "Dry run: skipping IPNS publish (would announce /ipfs/${HEAD_CID})."
-elif [[ -n "$KUBO_PORT" ]]; then
+if [[ -n "$KUBO_PORT" ]]; then
     info "Publishing HEAD to IPNS (lifetime=8760h)..."
     IPNS_RESPONSE=$(curl -s -X POST "http://127.0.0.1:${KUBO_PORT}/api/v0/name/publish?arg=/ipfs/${HEAD_CID}&key=self&lifetime=8760h" 2>/dev/null || true)
     IPNS_NAME=$(echo "$IPNS_RESPONSE" | jq -r '.Name // empty' 2>/dev/null || true)
@@ -2009,54 +2673,16 @@ mkdir -p artifacts
 cp "$STAMPED_INSTALL" artifacts/install.sh
 cp "${TMPDIR}/release.json" artifacts/release.json
 cp "${TMPDIR}/release-head.json" artifacts/release-head.json
-cp "${TMPDIR}/components.json" artifacts/components-x86_64.json
-[[ -f "${TMPDIR}/components-${CROSS_ARCH:-}.json" ]] && \
-    cp "${TMPDIR}/components-${CROSS_ARCH}.json" "artifacts/components-${CROSS_ARCH}.json"
+for components_file in "${PREPARED_ARTIFACTS_DIR}"/components-*.json; do
+    cp "$components_file" "artifacts/$(basename "$components_file")"
+done
 info "Installer CID: ${INSTALL_SCRIPT_CID}"
 
 # Save release metadata to runtime-owned publisher state for gateway serving.
 RUNTIME_DATA_DIR="${HOST_DATA_DIR}"
 PUBLISHER_ROOT="${RUNTIME_DATA_DIR}/ElastOS/SystemServices/Publisher"
-PUBLISHER_ARTIFACTS_DIR="${PUBLISHER_ROOT}/artifacts"
-mkdir -p "${PUBLISHER_ARTIFACTS_DIR}"
-cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
-cp "$STAMPED_INSTALL" "${PUBLISHER_ROOT}/install.sh"
-# Save platform binaries for direct gateway serving
-cp "${STAGED_ELASTOS}" "${PUBLISHER_ARTIFACTS_DIR}/elastos-${PLATFORM}"
-if [[ -n "${CROSS_ELASTOS:-}" && -f "${CROSS_ELASTOS}" ]]; then
-    cp "${CROSS_ELASTOS}" "${PUBLISHER_ARTIFACTS_DIR}/elastos-${CROSS_PLATFORM}"
-fi
-cp "${TMPDIR}/components.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${PLATFORM}.json"
-if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_ARCH}.json" ]]; then
-    cp "${TMPDIR}/components-${CROSS_ARCH}.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json"
-fi
-# Copy first-party support assets for Carrier-served setup fetches.
-for f in "${TMPDIR}/supported-assets-${PLATFORM}"/*; do
-    [ -f "$f" ] || continue
-    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
-done
-if [[ -n "${CROSS_PLATFORM:-}" ]]; then
-    for f in "${TMPDIR}/supported-assets-${CROSS_PLATFORM}"/*; do
-        [ -f "$f" ] || continue
-        cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
-    done
-fi
-# Copy capsule artifacts for Carrier serving (platform-suffixed)
-for f in "${ARTIFACTS_DIR}"/*.capsule.tar.gz; do
-    [ -f "$f" ] || continue
-    base=$(basename "$f" .capsule.tar.gz)
-    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/${base}-${PLATFORM}.capsule.tar.gz"
-done
-if [[ -n "${CROSS_PLATFORM:-}" ]]; then
-    CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
-    [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
-    for f in "${CROSS_SRC}"/*.capsule.tar.gz; do
-        [ -f "$f" ] || continue
-        base=$(basename "$f" .capsule.tar.gz)
-        cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/${base}-${CROSS_PLATFORM}.capsule.tar.gz"
-    done
-fi
+export_release_publication "$PUBLISHER_ROOT" \
+    "${TMPDIR}/release-head.json" "${TMPDIR}/release.json" "$STAMPED_INSTALL" "$PREPARED_ARTIFACTS_DIR"
 info "Saved release artifacts to ${PUBLISHER_ROOT} for gateway serving"
 
 # ── Step 10: Start public gateway URL (best-effort) ──────────────────
@@ -2208,33 +2834,25 @@ fi
 
 # ── Step 11: Save state ───────────────────────────────────────────────
 
-if [[ "$DRY_RUN" == true ]]; then
-    info "Dry run: publish state untouched (last-release-* files not written)."
-else
-    echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
-    echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
-    echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
-    echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
-    echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
-    if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
-        echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
-    fi
+echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
+echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
+echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
+echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
+echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
+if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
+    echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
 fi
 
 # ── Step 12: Print results ────────────────────────────────────────────
 
 echo ""
-if [[ "$DRY_RUN" == true ]]; then
-    echo -e "${YELLOW}${BOLD}Dry run complete — nothing published.${NC}"
-    echo -e "${DIM}  Local only: artifacts built, signed and pinned to the local IPFS repo.${NC}"
-    echo -e "${DIM}  Skipped: canonical signer check, IPNS publish, public URL, publish-state writes.${NC}"
-else
-    echo -e "${GREEN}${BOLD}Release published!${NC}"
-fi
+echo -e "${GREEN}${BOLD}Release published!${NC}"
 echo ""
 echo -e "  Version:      ${BOLD}${VERSION}${NC}"
 echo -e "  Channel:      ${CHANNEL}"
-if [[ -n "$CROSS_BINARY_CID" ]]; then
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    echo -e "  Platforms:    $(printf '%s' "$PLATFORMS_JSON" | jq -r 'keys | join(", ")')"
+elif [[ -n "$CROSS_BINARY_CID" ]]; then
     echo -e "  Platforms:    ${PLATFORM}, ${CROSS_PLATFORM}"
 else
     echo -e "  Platform:     ${PLATFORM}"
@@ -2262,7 +2880,7 @@ fi
 echo ""
 CANONICAL_PUBLIC_GATEWAY_URL=""
 CANONICAL_PUBLIC_INSTALL_URL=""
-if [[ "$DRY_RUN" != true && -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
+if [[ -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
     if curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/install.sh" >/dev/null 2>&1 && \
        curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/release-head.json" >/dev/null 2>&1; then
         CANONICAL_PUBLIC_GATEWAY_URL="${STAMPED_PUBLISHER_GATEWAY}"
@@ -2321,8 +2939,12 @@ TOTAL_ARTIFACTS=${#CAPSULES[@]}
 if [[ -n "$CROSS_BINARY_CID" ]]; then
     TOTAL_ARTIFACTS=$(( ${#CAPSULES[@]} * 2 ))
 fi
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    echo -e "${DIM}  Native release inputs published for the admitted platforms; generic microVM rootfs acceptance is separate.${NC}"
+else
 echo -e "${DIM}  Capsule artifacts published: ${TOTAL_ARTIFACTS} (${#CAPSULES[@]} capsules × $([ -n "$CROSS_BINARY_CID" ] && echo "2 platforms" || echo "1 platform"))${NC}"
-echo -e "${DIM}  Installer downloads: binary + components.json (2 files, platform-specific)${NC}"
+fi
+echo -e "${DIM}  Installer downloads: Runtime, components.json, and the pinned model catalog${NC}"
 echo -e "${DIM}  Native setup assets are stamped per platform in components.json${NC}"
 echo -e "${DIM}  Browser/static/WASM capsule assets are stamped once under '*' in components.json${NC}"
 echo -e "${DIM}  Capsules downloaded on-demand by supervisor${NC}"
@@ -2341,6 +2963,11 @@ if command -v ipfs &>/dev/null && ipfs swarm peers &>/dev/null 2>&1; then
         if [[ -d "artifacts-${CROSS_ARCH:-}" ]]; then
             for f in "artifacts-${CROSS_ARCH}"/*.capsule.tar.gz; do
                 [[ -f "$f" ]] && ipfs add -q "$f" >/dev/null 2>&1 || true
+            done
+        fi
+        if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+            for f in "$PREPARED_ARTIFACTS_DIR"/*; do
+                ipfs add -q "$f" >/dev/null 2>&1 || true
             done
         fi
         # Add binaries

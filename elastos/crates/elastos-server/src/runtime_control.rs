@@ -5,6 +5,9 @@ use std::time::Duration;
 use crate::local_http::LoopbackHttpBaseUrl;
 use sha2::Digest;
 
+pub(crate) mod gateway_children;
+pub use gateway_children::watch_gateway_owner;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeCoords {
     pub api_url: String,
@@ -555,7 +558,16 @@ fn sync_managed_runtime_child_components_manifest(
     let child_data_dir = managed_runtime_child_data_dir(child_home);
     let child_bin_dir = child_data_dir.join("bin");
     std::fs::create_dir_all(&child_bin_dir)?;
-    std::fs::write(child_data_dir.join("components.json"), manifest_bytes)?;
+    std::fs::write(child_data_dir.join("components.json"), &manifest_bytes)?;
+    let verified_manifest: crate::setup::ComponentsManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            anyhow::anyhow!("managed home runtime requires a valid parent manifest: {error}")
+        })?;
+    crate::setup::install_signed_model_catalog(
+        &child_data_dir,
+        &verified_manifest,
+        &parent_manifest,
+    )?;
     for (name, parent_binary) in verified_binaries {
         std::fs::copy(parent_binary, child_bin_dir.join(name))?;
     }
@@ -1243,6 +1255,9 @@ async fn ensure_managed_runtime(
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
+    let gateway_owner = subordinate_gateway_host
+        .then(|| gateway_children::Owner::read(data_dir))
+        .transpose()?;
     let child_home_dir =
         subordinate_gateway_host.then(|| managed_runtime_child_home_dir(data_dir, runtime_kind));
     if let Some(child_home_dir) = child_home_dir.as_ref() {
@@ -1365,14 +1380,31 @@ async fn ensure_managed_runtime(
             );
         }
     }
-    let mut child = child
+    if let Some(owner) = gateway_owner.as_ref() {
+        owner.configure(&mut child)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child.process_group(0);
+    }
+    // Registration and owner retirement share a cross-process lock. There is no
+    // await between acquiring this lock and publishing the complete child record.
+    let ownership_lock = gateway_owner
+        .as_ref()
+        .map(|owner| owner.lock_start())
+        .transpose()?;
+    let child = child
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start runtime: {}", e))?;
+    let mut child =
+        gateway_children::StartingChild::new(child, gateway_owner.as_ref(), &coords_path)?;
+    drop(ownership_lock);
 
     if runtime_notices_enabled() {
         eprintln!(
             "Runtime started (pid {}). Log: {}",
-            child.id(),
+            child.child.id(),
             log_path.display()
         );
     }
@@ -1383,6 +1415,7 @@ async fn ensure_managed_runtime(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child
+            .child
             .try_wait()
             .map_err(|e| anyhow::anyhow!("Failed to check runtime status: {}", e))?
         {
@@ -1400,6 +1433,7 @@ async fn ensure_managed_runtime(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Some(coords) = managed_runtime_ready(&coords_path, expected_version).await {
             terminate_sibling_managed_runtime_children(runtime_kind, coords.pid);
+            child.ready();
             drop(start_guard);
             return Ok(coords);
         }
@@ -1815,6 +1849,71 @@ mod tests {
             )
             .is_err()
         );
+        assert!(!child_data_dir.join("model-catalog.json").exists());
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_copies_signed_model_catalog_into_child_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        let catalog = br#"{"payload":{"schema":"elastos.model.catalog/v1"},"signature":"ab","signer_did":"did:key:z"}"#;
+        write_parent_signed_model_catalog(tmp.path(), catalog);
+
+        sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
+
+        let child_catalog = managed_runtime_child_data_dir(&home).join("model-catalog.json");
+        assert_eq!(std::fs::read(&child_catalog).unwrap(), catalog);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&child_catalog)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_rejects_missing_signed_model_catalog_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        pin_parent_model_catalog_head(
+            tmp.path(),
+            &crate::setup::catalog_head_cid(b"absent").unwrap(),
+        );
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error.to_string().contains("model-catalog.json"));
+        assert!(error.to_string().contains("missing"));
+        assert!(!managed_runtime_child_data_dir(&home)
+            .join("model-catalog.json")
+            .exists());
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_rejects_mismatched_signed_model_catalog_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        std::fs::write(tmp.path().join("model-catalog.json"), b"catalog-a").unwrap();
+        pin_parent_model_catalog_head(
+            tmp.path(),
+            &crate::setup::catalog_head_cid(b"catalog-b").unwrap(),
+        );
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error.to_string().contains("does not match the pinned"));
+        assert!(!managed_runtime_child_data_dir(&home)
+            .join("model-catalog.json")
+            .exists());
     }
 
     #[test]
@@ -1944,6 +2043,22 @@ mod tests {
         .unwrap();
         std::fs::write(data_dir.join("components.json"), &manifest_bytes).unwrap();
         manifest_bytes
+    }
+
+    fn pin_parent_model_catalog_head(data_dir: &Path, head_cid: &str) {
+        let path = data_dir.join("components.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["model_catalog"] = serde_json::json!({
+            "head_cid": head_cid,
+            "publisher_dids": ["did:key:z6Mkabcdefghijklmnopqrstuvwxyz0123456789ABCDE"]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    fn write_parent_signed_model_catalog(data_dir: &Path, catalog: &[u8]) {
+        std::fs::write(data_dir.join("model-catalog.json"), catalog).unwrap();
+        pin_parent_model_catalog_head(data_dir, &crate::setup::catalog_head_cid(catalog).unwrap());
     }
 
     #[test]

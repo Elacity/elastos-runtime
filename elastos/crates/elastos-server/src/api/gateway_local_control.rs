@@ -25,6 +25,7 @@ pub(crate) struct GatewayLocalControl {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     _coords: crate::runtime_control::GatewayRuntimeCoordsGuard,
+    _browser_operators: Arc<super::gateway::BrowserOperatorService>,
 }
 
 pub(crate) async fn start_gateway_local_control(
@@ -39,14 +40,28 @@ pub(crate) async fn start_gateway_local_control(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let session_registry = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+    let browser_operators =
+        super::gateway::register_browser_operator_sessions(data_dir, session_registry.clone());
     let app = gateway_local_control_router(registry, session_registry, attach_secret.clone());
     let (shutdown, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        let connections = axum_server::Handle::new();
+        let server = axum_server::Server::<std::net::SocketAddr>::from_listener(listener)
+            .handle(connections.clone())
+            .serve(app.into_make_service());
+        tokio::pin!(server);
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = shutdown_rx => {
+                connections.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+                (&mut server).await
+            }
+        };
+        connections.shutdown();
+        while connections.connection_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+        result
     });
 
     let coords = crate::runtime_control::RuntimeCoords {
@@ -72,6 +87,7 @@ pub(crate) async fn start_gateway_local_control(
         shutdown: Some(shutdown),
         task: Some(task),
         _coords: coords_guard,
+        _browser_operators: browser_operators,
     })
 }
 

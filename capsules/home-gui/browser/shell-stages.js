@@ -4,7 +4,7 @@
  *
  * Glossary (engineer nouns — UI says Desktop / Space only):
  * - Desktop — windowed Space (primary "desktop" or desk-*); many windows
- * - Space — any ring entry: a Desktop or one fullscreen app Space
+ * - Space — any ring entry: the Agent room, a Desktop or one fullscreen app Space
  * - Stage — internal id for the active Space (activeStageId); not user copy
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  * UI ≠ authority: Space switches never mint Capsule/Carrier grants.
@@ -17,6 +17,11 @@ import {
 } from "./shell-window-geometry.js?v=home-20260813a";
 
 const DESKTOP_STAGE = "desktop";
+/* Singleton Agent Space — the Assistant's room, pinned far left of the ring.
+   Home GUI owns the morph there (shell-assistant-face); the ring only asks it
+   to open or close, and lists it only while the capsule is installed. */
+const AGENT_STAGE = "agent";
+let agentSpaceHooks = null;
 let liveRegion = null;
 let stageRecency = [];
 let focusWindowFn = null;
@@ -86,6 +91,39 @@ export function getExtraDesktops() {
 
 export function isDesktopSpace(spaceId) {
   return spaceId === DESKTOP_STAGE || getExtraDesktops().includes(spaceId);
+}
+
+export function agentStageId() {
+  return AGENT_STAGE;
+}
+
+export function isAgentSpace(spaceId) {
+  return spaceId === AGENT_STAGE;
+}
+
+/**
+ * @param {{
+ *   available: () => boolean,
+ *   busy: () => boolean,
+ *   open: () => void,
+ *   close: () => void,
+ * }} hooks
+ */
+export function bindAgentSpace(hooks) {
+  agentSpaceHooks = hooks;
+}
+
+function agentSpaceAvailable() {
+  return agentSpaceHooks?.available?.() === true;
+}
+
+/* Agent ↔ other Space switches ride the Shelf morph, never a slide or cut. */
+function syncAgentSpaceToActiveStage(next) {
+  if (isAgentSpace(next)) {
+    agentSpaceHooks?.open?.();
+  } else {
+    agentSpaceHooks?.close?.();
+  }
 }
 
 export function getActiveStageId() {
@@ -216,6 +254,9 @@ export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
   if (!entry) {
     return false;
   }
+  if (isAgentSpace(active)) {
+    return false;
+  }
   if (isDesktopSpace(active)) {
     if (entry.fullscreenStage) {
       return false;
@@ -229,12 +270,15 @@ export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
 export function syncStagePresentation() {
   const active = getActiveStageId();
   const desktopLike = isDesktopSpace(active);
+  const agentLike = isAgentSpace(active);
   document.body.dataset.activeStage = active;
-  document.body.dataset.stageKind = desktopLike ? "desktop" : "fullscreen";
-  document.body.classList.toggle("stage-active", !desktopLike);
+  document.body.dataset.stageKind = agentLike ? "agent" : desktopLike ? "desktop" : "fullscreen";
+  /* stage-active tucks the Dock — the Agent room keeps the Shelf composer. */
+  document.body.classList.toggle("stage-active", !desktopLike && !agentLike);
   document.body.classList.toggle("stage-desktop", desktopLike);
+  document.body.classList.toggle("stage-agent", agentLike);
   syncSpacePager();
-  if (desktopLike) {
+  if (desktopLike || agentLike) {
     document.body.classList.remove("stage-menubar-reveal", "stage-dock-reveal");
   } else {
     bindEdgeReveal();
@@ -246,7 +290,7 @@ export function syncStagePresentation() {
     entry.node.dataset.fullscreenStage = staged ? "true" : "false";
     entry.node.dataset.desktopSpace = entry.desktopSpaceId || DESKTOP_STAGE;
     entry.node.dataset.spaceVisible = visible ? "true" : "false";
-    entry.node.dataset.stageActive = !desktopLike && visible ? "true" : "false";
+    entry.node.dataset.stageActive = !desktopLike && !agentLike && visible ? "true" : "false";
     syncMaximizeButton(entry.node, staged);
     syncMinimizeButton(entry.node, staged);
     if (!document.body.classList.contains("expose-active")) {
@@ -258,6 +302,9 @@ export function syncStagePresentation() {
 }
 
 function nodesForSpace(spaceId) {
+  if (isAgentSpace(spaceId)) {
+    return [];
+  }
   if (isDesktopSpace(spaceId)) {
     return [...shellState.windows.values()]
       .filter(
@@ -458,31 +505,62 @@ function playSpaceSlide(fromId, toId, { announce = true, focus = true } = {}) {
   return true;
 }
 
-export function setActiveStage(stageId, { announce = true, focus = true, animate = true } = {}) {
+export function setActiveStage(
+  stageId,
+  { announce = true, focus = true, animate = true, syncAgentSpace = true } = {},
+) {
   let next = DESKTOP_STAGE;
   if (isDesktopSpace(stageId)) {
     next = stageId;
+  } else if (isAgentSpace(stageId) && agentSpaceAvailable()) {
+    next = AGENT_STAGE;
   } else if (stageEntry(stageId)?.fullscreenStage) {
     next = stageId;
   }
   const prev = getActiveStageId();
-  if (animate && prev !== next && playSpaceSlide(prev, next, { announce, focus })) {
+  /* Mid-morph the face owns the pill; a switch into or out of the Agent room
+     waits for it to settle. The face's own calls (syncAgentSpace false) pass. */
+  if (syncAgentSpace && agentSpaceHooks?.busy?.() && (isAgentSpace(next) || isAgentSpace(prev))) {
+    return prev;
+  }
+  /* Into the room from the ring: the face runs the morph and flips the ring
+     itself once the room covers the floor, so the off-Space cut is unseen. */
+  if (syncAgentSpace && isAgentSpace(next) && !isAgentSpace(prev)) {
+    agentSpaceHooks?.open?.();
+    if (announce) {
+      announceStage("Agent");
+    }
+    return prev;
+  }
+  const canSlide =
+    animate &&
+    prev !== next &&
+    !isAgentSpace(prev) &&
+    !isAgentSpace(next) &&
+    playSpaceSlide(prev, next, { announce, focus });
+  if (canSlide) {
     return next;
   }
   shellState.activeStageId = next;
-  if (!isDesktopSpace(next)) {
+  if (!isDesktopSpace(next) && !isAgentSpace(next)) {
     touchRecency(next);
   }
   syncStagePresentation();
+  /* The face may already own the dance (Dock button) — no second morph. */
+  if (syncAgentSpace) {
+    syncAgentSpaceToActiveStage(next);
+  }
   if (announce) {
-    if (isDesktopSpace(next)) {
+    if (isAgentSpace(next)) {
+      announceStage("Agent");
+    } else if (isDesktopSpace(next)) {
       announceStage(next === DESKTOP_STAGE ? "Desktop" : spaceLabelForDesktop(next));
     } else {
       const entry = stageEntry(next);
       announceStage(`${entry?.title || "App"}, fullscreen`);
     }
   }
-  if (focus && !isDesktopSpace(next)) {
+  if (focus && !isDesktopSpace(next) && !isAgentSpace(next)) {
     focusWindowFn?.(next);
   }
   persist();
@@ -504,6 +582,9 @@ export function desktopSpaceLabel(spaceId) {
 }
 
 function spaceLabelForPager(spaceId) {
+  if (isAgentSpace(spaceId)) {
+    return "Agent";
+  }
   if (isDesktopSpace(spaceId)) {
     return spaceLabelForDesktop(spaceId);
   }
@@ -673,7 +754,13 @@ function defaultStageRing() {
     const br = bi === -1 ? 999 : bi;
     return ar - br;
   });
-  return [DESKTOP_STAGE, ...getExtraDesktops(), ...staged.map((entry) => entry.id)];
+  /* Agent far left; then Desktop(s); then fullscreen app Spaces. */
+  return [
+    ...(agentSpaceAvailable() ? [AGENT_STAGE] : []),
+    DESKTOP_STAGE,
+    ...getExtraDesktops(),
+    ...staged.map((entry) => entry.id),
+  ];
 }
 
 export function buildStageRing() {
@@ -684,6 +771,11 @@ export function buildStageRing() {
     return fallback;
   }
   const ring = [];
+  /* The Agent room is pinned far left, whatever order was saved. */
+  if (valid.has(AGENT_STAGE)) {
+    ring.push(AGENT_STAGE);
+    valid.delete(AGENT_STAGE);
+  }
   for (const id of order) {
     if (typeof id === "string" && valid.has(id)) {
       ring.push(id);
@@ -701,17 +793,20 @@ export function buildStageRing() {
 
 /** Reorder Spaces for Mission Control / flick ring. toIndex is insert index without spaceId. */
 export function moveSpaceInRing(spaceId, toIndex) {
-  if (!spaceId) {
+  if (!spaceId || isAgentSpace(spaceId)) {
     return false;
   }
   const current = buildStageRing();
   if (!current.includes(spaceId)) {
     return false;
   }
-  const ring = current.filter((id) => id !== spaceId);
+  /* toIndex counts the window-bearing Spaces Mission Control lays out; the
+     Agent room keeps its seat far left. */
+  const pinned = current.filter((id) => isAgentSpace(id));
+  const ring = current.filter((id) => id !== spaceId && !isAgentSpace(id));
   const clamped = Math.max(0, Math.min(Number(toIndex) || 0, ring.length));
   ring.splice(clamped, 0, spaceId);
-  shellState.spaceOrder = ring;
+  shellState.spaceOrder = [...pinned, ...ring];
   persist();
   return true;
 }
@@ -817,13 +912,17 @@ export function ensureDesktopForNewLaunch() {
 
 export function exitActiveFullscreenStage() {
   const active = getActiveStageId();
-  if (isDesktopSpace(active)) {
+  if (isDesktopSpace(active) || isAgentSpace(active)) {
     return false;
   }
   return exitFullscreenStage(active);
 }
 
 function spaceHasVisibleContent(spaceId, { ignoreWindowId = null } = {}) {
+  /* The Agent room hosts no windows — never the neighbour a closing Space lands on. */
+  if (isAgentSpace(spaceId)) {
+    return false;
+  }
   if (isDesktopSpace(spaceId)) {
     return [...shellState.windows.values()].some(
       (entry) =>
@@ -970,10 +1069,14 @@ export function neighborSpaceAfterClosing(closedSpaceId) {
     }
   }
   if (index >= 0) {
-    if (index + 1 < fullRing.length && fullRing[index + 1] !== closedSpaceId) {
+    if (
+      index + 1 < fullRing.length &&
+      fullRing[index + 1] !== closedSpaceId &&
+      !isAgentSpace(fullRing[index + 1])
+    ) {
       return fullRing[index + 1];
     }
-    if (index - 1 >= 0) {
+    if (index - 1 >= 0 && !isAgentSpace(fullRing[index - 1])) {
       return fullRing[index - 1];
     }
   }

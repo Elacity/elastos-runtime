@@ -1,0 +1,10 @@
+[build]
+# Shared intermediate build dir for every workspace in this repo (elastos/,
+# capsules/*, elastos/tools/*): dependency artifacts, fingerprints, and
+# incremental state compile once and land in one CI-cacheable path.
+# Final artifacts (binaries, test executables' uplifted outputs) stay in each
+# workspace's own target dir, so every existing target/{debug,release} path
+# keeps working. Config-relative, so this resolves to <repo>/target-build
+# from any subdirectory. Requires cargo >= 1.91 (build-dir stabilization),
+# which rust-toolchain.toml pins.
+build-dir = "target-build"
