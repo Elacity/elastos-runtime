@@ -1917,3 +1917,17 @@ code {
   font-size: 28px;
   line-height: var(--system-phone-title-line);
 }
+
+:root[data-el-form-factor="phone"] .settings-content .pc2-btn,
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  min-height: var(--el-touch-target);
+}
+
+/* Under 16px, iOS zooms the page when a field takes focus. */
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] [data-settings="models"] summary {
+  line-height: var(--el-touch-target);
+}
