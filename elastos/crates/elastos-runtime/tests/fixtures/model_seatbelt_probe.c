@@ -76,6 +76,19 @@ int main(void) {
         int unrelated = inet_result("127.0.0.1", port);
         int other_socket = unix_result(other);
         int selected_socket = unix_result(selected);
+        char engine_socket[4096];
+        snprintf(engine_socket, sizeof(engine_socket), "%.*s.engine.sock",
+                 (int)strlen(selected) - 5, selected);
+        struct stat engine_metadata;
+        int engine_preflight = lstat(engine_socket, &engine_metadata) == 0 ? 0 : errno;
+        int engine_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un engine_addr = {.sun_family = AF_UNIX};
+        snprintf(engine_addr.sun_path, sizeof(engine_addr.sun_path), "%s", engine_socket);
+        int engine_bind = bind(engine_fd, (struct sockaddr *)&engine_addr,
+                               sizeof(engine_addr)) == 0 ? 0 : errno;
+        int engine_stat = lstat(engine_socket, &engine_metadata) == 0 ? 0 : errno;
+        int engine_unlink = unlink(engine_socket) == 0 ? 0 : errno;
+        close(engine_fd);
         int system_read = opened("/usr/bin", O_RDONLY);
         int canary_read = opened(canary, O_RDONLY);
         int model_read = opened(model, O_RDONLY);
@@ -128,12 +141,15 @@ int main(void) {
                "\"model_rename_errno\":%d,\"descendant_model_rename_errno\":%d,"
                "\"journal_alias_create_errno\":%d,\"journal_alias_write_errno\":%d,"
                "\"journal_write_errno\":%d,\"base_canonical_errno\":%d,"
+               "\"engine_preflight_errno\":%d,\"engine_bind_errno\":%d,"
+               "\"engine_stat_errno\":%d,\"engine_unlink_errno\":%d,"
                "\"inherited_writable_regular_fds\":%d}}\n",
                external, descendant[0], unrelated, descendant[1], other_socket,
                descendant[2], selected_socket, descendant[3], system_read,
                descendant[4], canary_read, descendant[5], model_read, model_write,
                descendant[6], model_link, descendant[7], model_rename, descendant[8],
                symlink_create, alias_write, journal_write, base_canonical,
+               engine_preflight, engine_bind, engine_stat, engine_unlink,
                inherited_writable_regular_fds);
         fflush(stdout);
     }

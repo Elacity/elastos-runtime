@@ -675,7 +675,7 @@ impl ProviderBridge {
                 "(allow network-outbound (literal \"{socket}\"))\n"
             ));
             policy.push_str(&format!(
-                "(allow file-write* (literal \"{}\"))\n",
+                "(allow file-read-metadata (literal \"{0}\"))\n(allow file-write* (literal \"{0}\"))\n",
                 seatbelt_path(Path::new(&engine_socket))?
             ));
             brokers.0.push(
@@ -2856,6 +2856,10 @@ mod tests {
         assert_eq!(data["descendant_other_socket_errno"], libc::EPERM);
         assert_eq!(data["selected_socket_errno"], 0);
         assert_eq!(data["descendant_selected_socket_errno"], 0);
+        assert_eq!(data["engine_preflight_errno"], libc::ENOENT);
+        assert_eq!(data["engine_bind_errno"], 0);
+        assert_eq!(data["engine_stat_errno"], 0);
+        assert_eq!(data["engine_unlink_errno"], 0);
         assert_eq!(data["system_read_errno"], libc::EPERM);
         assert_eq!(data["descendant_system_read_errno"], libc::EPERM);
         assert_eq!(data["model_read_errno"], 0);
