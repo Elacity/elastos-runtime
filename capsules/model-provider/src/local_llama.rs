@@ -367,6 +367,7 @@ fn engine_arguments(
     args.extend([
         "--ctx-size".into(),
         settings.context_size.to_string().into(),
+        "--no-context-shift".into(),
         "--parallel".into(),
         settings.parallel.to_string().into(),
         "--threads".into(),
@@ -952,6 +953,7 @@ mod tests {
             "11434",
             "--ctx-size",
             "256",
+            "--no-context-shift",
             "--parallel",
             "2",
             "--threads",

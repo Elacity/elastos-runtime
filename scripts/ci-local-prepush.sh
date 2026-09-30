@@ -48,6 +48,7 @@ run publish-platform python3 scripts/publish-platform-artifacts-test.py
 run release-input python3 scripts/release-platform-input-test.py
 run prepare-platform python3 scripts/prepare-release-platform-test.py
 run media-tools python3 scripts/media-tools-build-test.py
+run update-hop python3 scripts/update-hop-compare-test.py
 run browser-close node --test scripts/browser-window-close-handshake.test.mjs
 
 if ! disk_safe; then

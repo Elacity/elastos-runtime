@@ -68,7 +68,7 @@ assert.ok(
   "Assistant Chat and Studio decode events through the typed contract module",
 );
 assert.ok(agentLive.includes("after_sequence: afterSequence"), "runs_events is polled by after_sequence");
-assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: createRequestId })"));
+assert.ok(agentLive.includes("maxOutputTokens: manifest.outputReserve"));
 assert.ok(agentLive.includes('modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })'));
 assert.ok(!agentLive.includes("agent-run-cursor"), "the URUX cursor helper is gone");
 
@@ -236,6 +236,7 @@ assert.ok(!/Planning weekend|calm weekend/.test(read("capsules/assistant/browser
 /* ---- the pure contract module -------------------------------------------- */
 
 const contract = await import(new URL("model-contract.js", capsuleDir));
+const context = await import(new URL("agent-context.js", capsuleDir));
 const homeMessageContract = await import(
   new URL("capsules/home-gui/browser/home-agent-message-contract.js", root)
 );
@@ -356,7 +357,9 @@ assert.deepEqual(rows, [
     label: "Local chat",
     detail: "This Home · local",
     streamOutput: true,
+    routeKind: "local",
     inputSchemas: [],
+    context: null,
     selectionFacts: localFacts,
   },
 ]);
@@ -501,6 +504,42 @@ assert.deepEqual(body, {
   operation: "text.generate",
   request_id: "req-1",
   input: { schema: "elastos.model.input.text/v1", prompt: contract.transcriptPrompt(messages) },
+});
+const boundedLocal = contract.textOfferRows([{ ...textOffers[0], context: {
+  context_window_tokens: 256, max_output_tokens: 64,
+} }])[0];
+const effective = context.capabilitiesForOffer(boundedLocal);
+assert.deepEqual(effective.context, {
+  ...context.TEXT_CONTRACT_CAPABILITIES.context,
+  maxInputTokens: 256,
+  maxOutputTokens: 64,
+});
+assert.equal(context.makeBudget(effective.context, 32).outputReserve, 32);
+assert.ok(context.makeBudget(effective.context, 32).hardEstimatedInputLimit < 256 - 32);
+const longHistory = Array.from({ length: 25 }, (_, i) => ({
+  id: `turn-${i}`, role: i % 2 ? "assistant" : "user", content: `turn ${i} ${"x".repeat(400)}`,
+}));
+const packed = context.compileContext({
+  history: longHistory,
+  currentInput: { id: "current", role: "user", content: "Continue" },
+  constraints: [{ id: "system", kind: "system_policy", role: "system", content: "Be brief.", mustInclude: true }],
+  budget: context.makeBudget(effective.context, 32),
+  capabilities: effective,
+});
+assert.ok(packed.omitted.length > 0);
+assert.ok(packed.manifest.estimatedInputTokens <= packed.budget.hardEstimatedInputLimit);
+assert.equal(packed.manifest.outputReserve, 32);
+for (const missing of [null, {}, { context_window_tokens: 256 },
+  { context_window_tokens: 256, max_output_tokens: 256 }]) {
+  assert.throws(() => context.capabilitiesForOffer({ ...boundedLocal, context: missing }),
+    { code: "context_overflow" });
+}
+assert.deepEqual(contract.textRunCreateBody({
+  offer: boundedLocal, messages, requestId: "bounded", maxOutputTokens: 32,
+}).input, {
+  schema: contract.MODEL_TEXT_INPUT_SCHEMA,
+  prompt: contract.transcriptPrompt(messages),
+  max_output_tokens: 32,
 });
 // Follow the serialized offer response through selection into the run request.
 const conversation = [
