@@ -12,9 +12,9 @@ This repo currently has three distinct version layers. They should not be read a
 
 1. **Core runtime release train**
    - the coordinated workspace line under [`elastos/Cargo.toml`](../elastos/Cargo.toml)
-   - read its version from the workspace manifest; release status belongs in `state.md`
-   - the workspace currently says `0.7.0`; this is source package metadata,
-     while the signed public release is stamped `0.7.1`
+   - read its version from the workspace manifest; release status belongs in the release issue on GitHub
+   - the workspace version is source package metadata; the signed public
+     release carries the stamped version
 
 2. **Stamped public release version**
    - the publish/install/update version injected through `ELASTOS_RELEASE_VERSION`
@@ -28,8 +28,8 @@ This repo currently has three distinct version layers. They should not be read a
 
 Current rule:
 
-- use the stamped `0.7.1` identity for the signed public release; a local
-  workspace `0.7.0` value alone does not identify the installed product
+- use the stamped identity for the signed public release; the workspace
+  version alone does not identify the installed product
 - treat capsule-local `0.1.0` values as local package metadata unless and until the repo intentionally unifies them
 - do not present capsule-local `0.1.0` values as if they supersede or contradict a stamped public release
 
@@ -88,8 +88,10 @@ Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 
 ## Pre-release Policy
 
-Use `-rc.N` for release candidates until the product meets the intended stable
-contract. Record the active release and its evidence in `state.md`.
+Use `-rc.N` for a signed candidate that is published before its final version.
+A monthly source release (a repository tag with GitHub-built, unstamped
+binaries) uses plain `X.Y.Z`; its notes state what is not ready for users.
+The release issue on GitHub records the active release and its evidence.
 
 Current rule:
 
