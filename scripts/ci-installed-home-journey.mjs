@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { MODEL_TEXT_INPUT_SCHEMA } from "../capsules/assistant/browser/model-contract.js";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
 const [base, evidence] = process.argv.slice(2);
@@ -59,7 +60,7 @@ try {
   stage = "model_package_admission";
   const marketplace = await app("marketplace");
   const interfaces = await request(marketplace, "/api/capsules/interfaces");
-  const content = interfaces.interfaces.find(row => row.capsule === "marketplace" && row.bindings.some(b => b.method.id === "content.use"));
+  const content = interfaces.interfaces.find(row => row.capsule === "marketplace" && row.bindings.some(b => b.method === "content.use" && b.executable));
   assert(content, "Marketplace declares Content Use");
   const used = await request(marketplace, "/api/capsules/interfaces/invoke", {
     capsule: "marketplace", interface: content.interface.id, method: "content.use",
@@ -81,7 +82,7 @@ try {
   const assistant = await app("assistant");
   const created = await request(assistant, "/api/provider/model/runs_create", {
     offer_id: offer, operation: "text.generate", request_id: `ci-reply-${randomUUID()}`,
-    input: { schema: "elastos.model.text-input/v1", prompt: "Say hello in one sentence." },
+    input: { schema: MODEL_TEXT_INPUT_SCHEMA, prompt: "Say hello in one sentence." },
   });
   assert.equal(created.status, "ok");
   const run_id = created.data.run_id;

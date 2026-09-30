@@ -336,7 +336,7 @@ jobs:
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
-          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: "1"
+          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: ${{ matrix.os == 'ubuntu-22.04-arm' && '0' || '1' }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
@@ -375,7 +375,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
-          scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+          ELASTOS_LOCAL_TEST_ROOT="${HOME}/.elastos-ci/carrier-fixture" scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
       - name: prepare pinned installed model journey
         run: |
           scripts/ci-installed-journeys.sh prepare
