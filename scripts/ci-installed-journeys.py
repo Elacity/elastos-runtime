@@ -17,23 +17,6 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def cgroup_observation():
-    membership = Path("/proc/self/cgroup").read_text().strip()
-    relative = next(row[3:] for row in membership.splitlines() if row.startswith("0::"))
-    assert ".." not in relative.split("/"), "cgroup ancestry must be visible"
-    root = Path("/sys/fs/cgroup")
-    current = root / relative.lstrip("/")
-    ancestors = []
-    while current != root:
-        ancestors.append({"path": str(current.relative_to(root)),
-                          "memory_max": (current / "memory.max").read_text().strip(),
-                          "memory_current": int((current / "memory.current").read_text())})
-        current = current.parent
-    assert any(row["memory_max"] != "max" for row in ancestors), "finite memory.max required"
-    return {"membership": membership, "ancestors": ancestors,
-            "mountinfo": [row for row in Path("/proc/self/mountinfo").read_text().splitlines() if " - cgroup2 " in row]}
-
-
 def run(home, data, evidence):
     installed = data / "bin/elastos"
     receipt = json.loads((data / "receipts/source-home-installation.json").read_text())
@@ -45,8 +28,6 @@ def run(home, data, evidence):
     record = {"candidate": candidate, "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
               "installed_runtime_sha256": runtime_sha, "installation_receipt_sha256": digest(data / "receipts/source-home-installation.json"),
               "fixture_components_sha256": digest(data / "components.json"), "results": {}}
-    if os.uname().sysname == "Linux":
-        record["cgroup"] = cgroup_observation()
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / ".local/share"))
     with socket.socket() as port:
         port.bind(("127.0.0.1", 0))

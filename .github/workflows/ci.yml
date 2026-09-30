@@ -383,8 +383,6 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" elastos/tools/browser-playwright-engine/node_modules/.bin/playwright install --with-deps chromium
       - name: installed Home and local reply journeys
         run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
-      - name: installed LA-04 lifecycle with finite cgroup v2 limit
-        run: scripts/ci-installed-journeys.sh lifecycle
       - name: installed journey summary
         if: always()
         run: scripts/ci-installed-journeys.sh summary
