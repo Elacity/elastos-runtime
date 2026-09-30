@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Run journeys against this job's installed Home; save only public proof."""
+import argparse
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import time
+import urllib.request
+from pathlib import Path
+
+
+def digest(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def cgroup_observation():
+    membership = Path("/proc/self/cgroup").read_text().strip()
+    relative = next(row[3:] for row in membership.splitlines() if row.startswith("0::"))
+    assert ".." not in relative.split("/"), "cgroup ancestry must be visible"
+    root = Path("/sys/fs/cgroup")
+    current = root / relative.lstrip("/")
+    ancestors = []
+    while current != root:
+        ancestors.append({"path": str(current.relative_to(root)),
+                          "memory_max": (current / "memory.max").read_text().strip(),
+                          "memory_current": int((current / "memory.current").read_text())})
+        current = current.parent
+    assert any(row["memory_max"] != "max" for row in ancestors), "finite memory.max required"
+    return {"membership": membership, "ancestors": ancestors,
+            "mountinfo": [row for row in Path("/proc/self/mountinfo").read_text().splitlines() if " - cgroup2 " in row]}
+
+
+def run(home, data, evidence):
+    installed = data / "bin/elastos"
+    receipt = json.loads((data / "receipts/source-home-installation.json").read_text())
+    runtime_sha = digest(installed)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    # Inspect the installation receipt and the installed bytes before launch.
+    assert candidate == receipt["source"]["commit"]
+    assert runtime_sha == receipt["runtime"]["installed_sha256"].removeprefix("sha256:")
+    record = {"candidate": candidate, "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              "installed_runtime_sha256": runtime_sha, "installation_receipt_sha256": digest(data / "receipts/source-home-installation.json"),
+              "fixture_components_sha256": digest(data / "components.json"), "results": {}}
+    if os.uname().sysname == "Linux":
+        record["cgroup"] = cgroup_observation()
+    environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / ".local/share"))
+    with socket.socket() as port:
+        port.bind(("127.0.0.1", 0))
+        address = f"localhost:{port.getsockname()[1]}"
+    started = time.monotonic()
+    # Runtime logs stay private in the isolated Home; upload receipts/screenshots only.
+    log = (home / "journey-runtime.private.log").open("wb")
+    child = subprocess.Popen([str(installed), "serve", "--addr", address], env=environment, stdout=log, stderr=log, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            assert child.poll() is None, "installed Runtime exited before health"
+            try:
+                with urllib.request.urlopen(f"http://{address}/api/health", timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            raise RuntimeError("installed Runtime health deadline")
+        subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence)], env=environment, check=True)
+        record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
+    finally:
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
+        log.close()
+        record["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        if (evidence / "home-journey.json").exists():
+            record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
+        (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("home", type=Path)
+    parser.add_argument("data", type=Path)
+    parser.add_argument("evidence", type=Path)
+    args = parser.parse_args()
+    run(args.home.resolve(), args.data.resolve(), args.evidence.resolve())
