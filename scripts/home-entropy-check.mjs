@@ -7839,6 +7839,32 @@ assert(
     !shellWindows.includes("Math.random"),
   "Opaque Home GUI must accept one exact checked host correlation with no browser-storage or random fallback",
 );
+{
+  // Unreachable gateway: the host page is the one document talking to the
+  // gateway, so it decides; the shell only presents, from its trusted parent.
+  const linkHost = read("capsules/home/browser/home-link-status.js");
+  const linkShell = read("capsules/home-gui/browser/shell-link-status.js");
+  const trustedGuard = "  if (!isTrustedHomeGuiMessage(event, window.parent, homeOrigin)) {\n    return;\n  }";
+  const linkBranch = '  if (message.type === "home:link-status") {\n    applyHomeLinkStatus(message);\n    return;\n  }';
+  assert(
+    linkHost.includes('export const LINK_STATUS_MESSAGE = "home:link-status";') &&
+      linkHost.includes("const GATEWAY_GONE_STATUSES = new Set([502, 503, 504]);") &&
+      linkHost.includes("  if (error instanceof TypeError) {\n    return true;\n  }") &&
+      shellJs.includes('import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";') &&
+      shellJs.includes('activeShellFrame?.addEventListener("load", () => homeLink.replay());') &&
+      shellJs.includes("    refreshShellSummary().then(() => {\n      homeLink.reportSuccess();") &&
+      shellJs.includes("    if (!homeLink.reportFailure(error)) {\n      console.warn(\"home event channel failed\", error);") &&
+      homeGuiShell.indexOf(trustedGuard) !== -1 &&
+      homeGuiShell.indexOf(trustedGuard) < homeGuiShell.indexOf(linkBranch) &&
+      linkShell.includes('  if (typeof message?.reachable !== "boolean") {\n    return;\n  }') &&
+      homeGuiTemplateHtml.includes('<span id="toolbar-link-status" class="toolbar-link-status" role="status">') &&
+      homeGuiTemplateHtml.includes('<p class="notification-center-link-title">Reconnecting to your Home…</p>') &&
+      homeGuiStyle.includes('body[data-home-link="reconnecting"] .toolbar-link-status-dot,\nbody[data-home-link="reconnecting"] .notification-center-link {\n  display: block;') &&
+      homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .toolbar-link-status-dot {\n    animation: none;") &&
+      read("justfile").includes("node --test scripts/home-link-status.test.mjs"),
+    "Unreachable gateway: the host page reports only requests that never reached the gateway (or a proxy's 502/503/504), retries on a timer and relays home:link-status; the shell takes it only from its trusted parent and shows Reconnecting… in the bar (a live region) and an explanation atop Notification Centre; unit-tested in verify",
+  );
+}
 assert(
   homeBrowserContextSmoke.includes("assertions > 0") &&
     homeBrowserContextSmoke.includes(
