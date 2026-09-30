@@ -22,6 +22,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # An explicit dispatch ref may select a tag independently of the workflow ref.
+  CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -59,6 +61,7 @@ jobs:
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |
+          python3 scripts/ci-release-policy-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
@@ -80,6 +83,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
@@ -102,6 +106,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test-bd
@@ -111,6 +116,7 @@ jobs:
       # run otherwise; with the cache restored, cargo only re-fingerprints
       # the workspace members and reuses every dependency artifact.
       - name: cache provider build artifacts
+        if: env.CI_USE_CACHE == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -148,6 +154,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           # Registry/index cache only: this job never builds the elastos
           # workspace, and the capsule build artifacts live in the shared
@@ -161,6 +168,7 @@ jobs:
       # The key rotates with any capsule lockfile or toolchain change, which
       # bounds stale-artifact growth under the restore-keys fallback.
       - name: cache capsule build artifacts
+        if: env.CI_USE_CACHE == 'true'
         uses: actions/cache@v4
         with:
           # The shared intermediates (root .cargo/config.toml build-dir);
@@ -250,7 +258,7 @@ jobs:
       # Builds the host `elastos` binary the smoke script itself invokes
       # (identity show, node peer add, node status) -- same cache shape as
       # the test-elastos/lint jobs above.
-      - if: steps.should-run.outputs.run == 'true'
+      - if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
@@ -265,11 +273,14 @@ jobs:
       - name: pre-build custody-host image (GHA layer cache)
         if: steps.should-run.outputs.run == 'true'
         run: |
+          cache_args=()
+          if [[ "${CI_USE_CACHE}" == "true" ]]; then
+            cache_args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+          fi
           docker buildx build \
             -f deploy/custody-host/Dockerfile \
             -t elastos-custody-host:latest \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+            "${cache_args[@]}" \
             --load \
             .
       - name: custody harness smoke
@@ -311,6 +322,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
@@ -392,6 +404,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
@@ -402,6 +415,7 @@ jobs:
       # Cache the verified release tarball and pre-seed bin/kubo so setup
       # skips the download entirely (ELACITY-2308).
       - name: cache kubo release
+        if: env.CI_USE_CACHE == 'true'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/kubo-cache
@@ -472,7 +486,7 @@ jobs:
     name: publish-github-release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - lint
       - test-elastos
