@@ -12608,6 +12608,14 @@ assert(
     "Phone sheet handles: Control Centre, Notification Centre and Spotlight end in a 44 px Close handle (tap closes, a 48 px drag up closes, shorter snaps back); the launcher, closed by the Dock's Apps button, gets a drag-down grabber only; hidden off phone, unit-tested in verify and probed by the phone smoke",
   );
 
+  // Unreachable gateway on the phone bar: only the dot shows; the words stay
+  // for screen readers, and the smoke plays the host.
+  assert(
+    phoneRule("  .toolbar-link-status-text {\n    position: absolute;\n    width: 1px;\n    height: 1px;\n    overflow: hidden;\n    clip: rect(0, 0, 0, 0);") &&
+      phoneSmoke.includes("...phoneLinkFailures(run)"),
+    "Unreachable gateway on phone: the bar shows only the Reconnecting dot (the words stay for screen readers) and the phone smoke plays the host",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&

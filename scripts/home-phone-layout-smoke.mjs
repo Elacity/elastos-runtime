@@ -845,6 +845,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let keyboardProbe = null;
   let spotlightProbe = null;
   let sheetHandleProbe = null;
+  let linkProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -880,6 +881,9 @@ async function runProfile(browser, engineId, profile, origin) {
       if (surface.id === "spotlight-results" && profile.id === "phone-portrait") {
         spotlightProbe = await probeSpotlight(page, frame);
       }
+      if (surface.id === "notifications" && profile.id === "phone-portrait") {
+        linkProbe = await probeHomeLink(page, frame, dir);
+      }
       await surface.close(frame);
     }
     if (profile.id === "phone-portrait") {
@@ -910,7 +914,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -1001,6 +1005,62 @@ function phoneSpotlightFailures(run) {
   }
   if (raised.panelBottom > raised.viewportHeight - KEYBOARD_PROBE_INSET_PX) {
     failures.push(`${label}: with the keyboard up the results must end above it. Got ${JSON.stringify(raised)}`);
+  }
+  return failures;
+}
+
+// Host says the gateway is gone (`home:link-status`). The bar shows
+// "Reconnecting…" and Notification Centre opens with the explanation;
+// a reachable message clears both. Only the host page may post it.
+const LINK_DOT_MIN_GAP_PX = 8;
+
+async function probeHomeLink(page, frame, dir) {
+  const post = (reachable) => page.evaluate((message) => {
+    document.getElementById("active-shell-frame").contentWindow.postMessage(message, "*");
+  }, { type: "home:link-status", reachable });
+  const read = () => frame.evaluate(() => {
+    const banner = document.querySelector(".notification-center-link");
+    const dot = document.querySelector(".toolbar-link-status-dot").getBoundingClientRect();
+    return {
+      link: document.body.dataset.homeLink || "",
+      bar: document.querySelector("#toolbar-link-status-text")?.textContent || "",
+      banner: banner ? getComputedStyle(banner).display : "missing",
+      dotGap: Math.round(dot.left - document.querySelector("#toolbar-home").getBoundingClientRect().right),
+      overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+    };
+  });
+  await frame.evaluate(() => {
+    window.parent.postMessage({ type: "home:link-status", reachable: false }, "*");
+  });
+  await sleep(KEYBOARD_SETTLE_MS);
+  const spoofed = await read();
+  await post(false);
+  await sleep(KEYBOARD_SETTLE_MS);
+  const down = await read();
+  await screenshot(page, dir, "notifications-reconnecting");
+  await post(true);
+  await sleep(KEYBOARD_SETTLE_MS);
+  return { spoofed, down, up: await read() };
+}
+
+function phoneLinkFailures(run) {
+  if (!run.link) {
+    return [];
+  }
+  const { spoofed, down, up } = run.link;
+  const label = `${run.engine}/${run.profile}/link`;
+  const failures = [];
+  if (spoofed.link !== "" || spoofed.bar !== "") {
+    failures.push(`${label}: a capsule frame must not move the Home link. Got ${JSON.stringify(spoofed)}`);
+  }
+  if (down.link !== "reconnecting" || down.bar !== "Reconnecting…" || down.banner === "none" || down.overflow) {
+    failures.push(`${label}: the host's unreachable message must show Reconnecting on the bar and in Notification Centre without overflowing. Got ${JSON.stringify(down)}`);
+  }
+  if (down.dotGap < LINK_DOT_MIN_GAP_PX) {
+    failures.push(`${label}: the bar's Reconnecting dot must stand clear of the brand. Got ${JSON.stringify(down)}`);
+  }
+  if (up.link !== "" || up.bar !== "" || up.banner !== "none") {
+    failures.push(`${label}: a reachable message must clear the bar and the explanation. Got ${JSON.stringify(up)}`);
   }
   return failures;
 }
@@ -1381,7 +1441,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

@@ -5915,6 +5915,16 @@ body.assistant-space-active #inbox-rail {
     }
   }
 
+  /* The phone bar has room for the dot only; the words stay for screen
+     readers and Notification Centre explains. */
+  .toolbar-link-status-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+
   .control-centre-quick-open {
     display: block;
   }

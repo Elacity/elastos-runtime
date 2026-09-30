@@ -274,6 +274,18 @@ The smoke types a query to measure Spotlight's rows (`spotlight-results`)
 and, on portrait, raises the host keyboard inset to check the panel ends
 above it.
 
+Unreachable gateway: a phone leaving Wi-Fi or a restarting gateway must not
+look like a Home that quietly stopped updating. The host page, the one
+document that talks to the gateway, counts only requests that never reached
+it (a fetch `TypeError`) or a proxy's 502/503/504, retries every 3 s and
+posts `home:link-status` to the shell (`home-link-status.js`). The shell
+takes it only from its trusted parent (`shell-link-status.js`): the bar
+shows "Reconnecting…" in a live region (a pulsing dot only on the phone bar,
+static under reduced motion) and Notification Centre opens with the
+explanation. The first answer clears both; a reloaded shell hears the state
+again. The smoke plays the host on portrait, checks a capsule frame cannot
+move it, and screenshots `notifications-reconnecting`.
+
 ### After M4 (sheets), 2026-09-24
 
 Identical in Chromium and WebKit on the phone profiles; every shell surface
