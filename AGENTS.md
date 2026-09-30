@@ -7,8 +7,9 @@ are the only place for work status, acceptance criteria and proof.
 ## Work Tracking And Acceptance
 
 - GitHub issues own the work queue. In each lane, take the lowest-numbered open
-  task whose dependencies are satisfied and which has no active blocker. Keep
-  at most one task issue In progress per lane. Parent issues group the lane;
+  task in the current weekly milestone whose dependencies are satisfied and
+  which has no active blocker. Keep at most one task issue In progress per
+  lane. Parent issues group the lane;
   they do not authorize a second active task. User messages approve, redirect
   or reorder work; they do not create a parallel task list.
 - Close a task only when its Done means is proven and its PR has the required
@@ -58,10 +59,9 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Branch Roles
 
-- `main` is the stable source line.
-- `upstream/<version>-dev` branches are development integration lines. The
-  owning GitHub issue records the approved task base; fetched refs verify it.
-  This replaces the old rule to choose the active line from `state.md` and fetched refs.
+- `main` is the release line. It changes only through the weekly release PR.
+- `develop` is the integration line. Task PRs merge into it when their checks
+  and reviews pass (see Review And Commit Discipline).
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
@@ -75,32 +75,32 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Creating Work Branches
 
-Every 0.7.1 task branch uses [feat/0.7.1-models](https://github.com/Elacity/elastos-runtime/tree/feat/0.7.1-models) as its base and PR target unless
-the owning issue specifies another base. This is standing approval; do not ask
-for each task. Fetch the current base before branching and record it in the issue.
-Tasks that use this default base depend on the models branch and merge back into
-it. Exceptions follow the base and target recorded in their issue. If the base
-moves, check compatibility before merging; history rewrite still needs approval.
-This standing approval takes precedence over the branching skill's per-task
-base question for 0.7.1.
-
-For other work without an approved issue base, use a user-selected
-`upstream/XX-dev` integration branch. The current checkout and `main` are not
-implicit bases:
-
-- Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
-  `feat/*`/`fix/*` branches before proposing bases.
-- Ask the user which base to start from, offering each `upstream/XX-dev`
-  (newest recommended) plus "an existing working branch" for work that depends
-  on another in-flight branch. Ask even when only one dev line exists.
-- If the chosen base is a working branch rather than `upstream/XX-dev`, warn
-  immediately: the new branch must merge back only after (or together with)
-  its parent, merging it into `upstream/XX-dev` may conflict with the parent's
-  changes, and it needs a rebase if the parent moves.
-- Name branches `feat/<slug>` or `fix/<slug>`. Pushes and upstream tracking
-  follow the Push Approval Levels below.
+Every task branch uses [develop](https://github.com/Elacity/elastos-runtime/tree/develop)
+as its base and PR target unless the owning issue names another base. This is
+standing approval; do not ask for each task. Fetch the current base before
+branching. If the base moves, check compatibility before merging; history
+rewrite still needs approval. A branch that depends on another in-flight branch
+says so in its PR and merges after its parent. Name branches `feat/<slug>` or
+`fix/<slug>`. Pushes and upstream tracking follow the Push Approval Levels below.
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
+
+## Weekly Releases
+
+- Each weekly release has a milestone `0.7.N`. Its scope is fixed on the
+  Wednesday before the release; work that misses it moves to the next milestone.
+- On Tuesday the candidate is cut from `develop` as `release/0.7.N` with the
+  version bump and changelog, and opened as a PR to `main`.
+- Three people confirm the candidate before the tag. Sasha reviews the visible
+  changes (CI screenshots and a short look) on his Wednesday. `irzhywau`
+  approves the release PR. Anders runs the ten-minute journey on his Mac:
+  update from the previous weekly release or a fresh install, sign in, one local
+  AI reply, one chat message and one Browser page. A failed journey or a visible
+  regression holds the tag for that week.
+- On Wednesday the PR merges, `v0.7.N` is tagged on the merge commit, and `main`
+  merges back into `develop`.
+- 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets
+  its Done means.
 
 ## Branch Lifecycle
 
@@ -210,12 +210,10 @@ target before acting.
 - **No approval needed:** fast-forward pushes to the branch of the active task
   or its existing draft PR; opening draft PRs; rerunning checks; reading logs.
   Report what was pushed, including the remote, branch, commits and check results.
-- **Standing task-merge permission:** merge a task PR only into the repository
-  and target branch explicitly approved by the user for that task.
-  Check that approval before merging. A change to the approved target requires
-  explicit user approval. The current candidate must pass all required checks,
-  independent review must be complete, required human reviews must approve the
-  candidate, all findings must be resolved, and its dependencies must be integrated.
+- **Standing task-merge permission:** merge a task PR into `develop`, or into
+  the base its issue names, when all required checks pass, one independent agent
+  review has passed with its findings resolved, every required human review in
+  Review And Commit Discipline approves, and its dependencies are integrated.
   Check compatibility with the current base and report the PR, source and merge
   commits, review and checks. Use a normal merge; history rewrite needs approval.
 - **Standing test-key permission:** create and use disposable keys and signatures
@@ -251,10 +249,16 @@ capsules, provider config, and `components.json`.
 - Keep review requests off draft PRs. When a PR leaves draft, request the
   required reviewers on GitHub yourself and name them in the report. Keep an
   existing request instead of sending a duplicate.
-- For a PR authored by Anders that touches signing, update checks, Inbox
-  approvals, keys, sandboxing or seed publishing, name `irzhywau` as a required
-  human reviewer. Also name the feature owner when the task requires that review.
-  Independent agent review and required human review are separate evidence.
+- `irzhywau` is a required human reviewer for a PR that touches signing, update
+  checks, Inbox approvals, keys, sandboxing or isolation, seed publishing, or CI
+  and release workflows, and for each weekly release PR. When `irzhywau` is the
+  author, Anders reviews. Also name the feature owner when the task requires
+  that review. Other task PRs merge on green checks and one independent agent
+  review. Independent agent review and required human review are separate
+  evidence.
+- Review has at most two rounds. After two rounds, or after the same failure
+  twice, fix the product cause or escalate: review questions go to `irzhywau`,
+  scope questions to Anders. Ask before building new diagnostic tooling.
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
 - Preserve commit history by default. Ask before amending, squashing, rebasing
@@ -311,6 +315,12 @@ path the user is actually running. Report the edited source path, built artifact
 path, installed artifact path, SHA-256 of the built and installed artifact,
 restart or stale-process cleanup performed, and the live localhost proof command
 and result.
+
+Prove installed behavior on the CI install jobs (GitHub-hosted Linux x86-64,
+Linux ARM64 and macOS machines) when they cover the journey, and link that CI
+run as the proof. Otherwise use the installed-proof steps above. The Jetson is
+checked on the weekly candidate. A PR that changes what users see links the CI
+screenshots at desktop and phone width.
 
 ## Journey Register Gate
 

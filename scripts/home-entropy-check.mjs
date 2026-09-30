@@ -1853,9 +1853,10 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("`main` is the stable source line") &&
-    agentsContract.includes("`upstream/<version>-dev` branches are development integration lines") &&
-    includesNormalized(agentsContract, "the active line from `state.md` and fetched refs") &&
+    agentsContract.includes("## Weekly Releases") &&
+    agentsContract.includes("`main` is the release line") &&
+    agentsContract.includes("`develop` is the integration line") &&
+    includesNormalized(agentsContract, "Fetch the current base before branching") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
