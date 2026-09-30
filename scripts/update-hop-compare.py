@@ -145,9 +145,24 @@ def health(port):
         return False
 
 
-def operator_response_lost(output):
-    return ("operator peer returned an empty response" in output
-            or bool(re.search(r"Error: connection lost\s+Caused by:\s+timed out", output)))
+def operator_response_lost(output, host_exit):
+    return host_exit == 75 and (
+        "operator peer returned an empty response" in output
+        or bool(re.search(r"Error: connection lost\s+Caused by:\s+timed out", output)))
+
+
+def update_evidence(config, before, after, host_text, command_text):
+    expected_hash = config["new"]["binary_sha256"]
+    replaced = after["binary_sha256"] == expected_hash and before["binary_sha256"] != expected_hash
+    install_line = (r"^[ \t]*Installing " + re.escape(config["old"]["version"])
+                    + " → " + re.escape(config["new"]["version"]) + r"\.\.\.[ \t]*$")
+    cache_line = (r"^[ \t]*(?:Capsule cache unchanged|Cleared [1-9][0-9]* changed cached capsule\(s\): "
+                  r"[a-zA-Z0-9_-]+(?:, [a-zA-Z0-9_-]+)*)[ \t]*$")
+    return {
+        "attempted": replaced or bool(re.search(install_line, host_text + "\n" + command_text, re.M)),
+        "cache_stage_observed": bool(re.search(cache_line, host_text, re.M)),
+        "operator_response_lost": operator_response_lost(command_text, after["host_exit"]),
+    }
 
 
 def inspect(config):
@@ -317,16 +332,17 @@ def run(config, output):
             proc.wait()
             return 124
 
-    def info(role):
-        if role != "controller":
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(f"http://127.0.0.1:{config['ports'][role]}/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=3) as response:
-                bootstrap = json.load(response)
-            need(bootstrap.get("schema") == "elastos.carrier.bootstrap/v1", role + " Carrier bootstrap unavailable")
-            return {"did": bootstrap["did"], "connect_ticket": bootstrap["ticket"]}
+    def local_info(role):
         label = role + "-info"
         need(command(role, ["node", "info", "--json"], label) == 0, label + " failed")
         return read(output / (label + ".log"))
+
+    def info(role):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{config['ports'][role]}/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=3) as response:
+            bootstrap = json.load(response)
+        need(bootstrap.get("schema") == "elastos.carrier.bootstrap/v1", role + " Carrier bootstrap unavailable")
+        return {"did": bootstrap["did"], "connect_ticket": bootstrap["ticket"]}
 
     def observe(role, host, label):
         version = "unavailable"
@@ -364,9 +380,14 @@ def run(config, output):
                 need(selected["publisher_dids"] == [publisher["did"]], "local publisher identity differs from signed fixture")
                 selected.update(connect_ticket=publisher["connect_ticket"], publisher_node_id="", discovery_uri="", ipns_name="")
                 write(path, stored)
+                if role == "operator":
+                    # Read fixture identity before its gateway can hold the lock.
+                    target_did = local_info(role)["did"]
+                    need(isinstance(target_did, str) and target_did, "operator fixture identity unavailable")
                 host = start(role)
                 if role == "operator":
-                    controller, target = info("controller"), info(role)
+                    controller, target = local_info("controller"), info(role)
+                    need(target["did"] == target_did, "operator target identity differs from its gateway bootstrap")
                     need(target.get("connect_ticket"), "operator target ticket unavailable")
                     need(command(role, ["node", "peer", "add", "--did", controller["did"], "--allow", "status.read", "--allow", "update.check", "--allow", "update.apply"], "target-peer") == 0, "target peer admission failed")
                     need(command("controller", ["node", "peer", "add", "--did", target["did"], "--ticket", target["connect_ticket"]], "controller-peer") == 0, "controller peer admission failed")
@@ -382,13 +403,11 @@ def run(config, output):
                 after = observe(role, host, role + "-version-after")
                 host_text = (output / (role + "-host.log")).read_text(errors="replace")
                 command_text = (output / (role + "-apply.log")).read_text(errors="replace")
-                apply_text = host_text + command_text
+                apply_text = host_text + "\n" + command_text
                 observation = {"role": role, "new": config["new"], "before": before, "after": after,
                                "new_components_semantic_sha256": artifacts["components"]["semantic_sha256"],
-                               "attempted": "Installing " in apply_text or after["binary_sha256"] != before["binary_sha256"],
                                "apply_exit": exit_code,
-                               "cache_stage_observed": "Capsule cache unchanged" in host_text or bool(re.search(r"Cleared \d+ changed cached capsule", host_text)),
-                               "operator_response_lost": operator_response_lost(command_text)}
+                               **update_evidence(config, before, after, host_text, command_text)}
                 write(output / (role + "-observation.json"), observation)
                 checks = compare(observation)
                 stages = ["Installing ", "Downloading binary", "Binary verified", "Downloading components",
