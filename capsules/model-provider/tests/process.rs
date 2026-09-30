@@ -736,6 +736,17 @@ fn installed_local_resource_lifecycle() {
         owned
     };
     let mut first = init("first");
+    if std::env::var("ELASTOS_MODEL_RESOURCE_PROOF_LOW_MEMORY").as_deref() == Ok("1") {
+        let created = create_local_prompt(&mut first, "real-low-memory", "Say hello.");
+        let refused = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));
+        assert_eq!(
+            refused["data"]["terminal"]["error"]["code"], "model_memory_unavailable",
+            "{refused}"
+        );
+        assert!(descendants(first.child.id()).is_empty());
+        first.shutdown();
+        return;
+    }
     let mut second = init("second");
     let created = create_local_prompt(&mut first, "real-first", "Say hello.");
     let ready = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));

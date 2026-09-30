@@ -81,14 +81,18 @@ PY
             cp -R "$ENGINE" "${FIXTURE}/${name}/engine"
             install -m 400 "${CI_HOME}/model-inputs/inputs/SmolLM2-135M-Instruct-Q8_0.gguf" "${FIXTURE}/${name}/model.gguf"
         done
-        sudo systemd-run --quiet --wait --pipe --collect \
-            --unit="elastos-ci-la04-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+        for qualification in low-memory lifecycle; do
+            limit=4G; low_memory=0
+            [[ "$qualification" != low-memory ]] || { limit=1G; low_memory=1; }
+            sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="elastos-ci-la04-${qualification}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" \
-            -p MemoryMax=4G -p MemorySwapMax=0 -p TasksMax=512 \
+            -p "MemoryMax=${limit}" -p MemorySwapMax=0 -p TasksMax=512 \
             -p "WorkingDirectory=${ROOT}" \
             /usr/bin/env "PATH=${PATH}" "HOME=${CI_HOME}" \
             "ELASTOS_MODEL_RESOURCE_PROOF_ROOT=${FIXTURE}" \
-            bash -c 'python3 - "$1" <<'"'"'PY'"'"'
+            "ELASTOS_MODEL_RESOURCE_PROOF_LOW_MEMORY=${low_memory}" \
+            bash -ec 'python3 - "$1" <<'"'"'PY'"'"'
 import json, sys
 sys.path.insert(0, "scripts")
 from importlib.machinery import SourceFileLoader
@@ -96,15 +100,17 @@ module = SourceFileLoader("journeys", "scripts/ci-installed-journeys.py").load_m
 open(sys.argv[1], "w").write(json.dumps(module.cgroup_observation(), indent=2))
 PY
 "$2" installed_local_resource_lifecycle --ignored --exact --nocapture' \
-            fixture "${EVIDENCE}/la04-cgroup.json" "$TEST_BIN" 2>&1 | tee "${EVIDENCE}/la04-lifecycle.log"
+            fixture "${EVIDENCE}/la04-${qualification}-cgroup.json" "$TEST_BIN" 2>&1 | tee "${EVIDENCE}/la04-${qualification}.log"
+        done
         python3 - "$EVIDENCE" <<'PY'
 import json, sys
 from pathlib import Path
 root = Path(sys.argv[1])
-text = (root / "la04-lifecycle.log").read_text()
-assert text.count("test installed_local_resource_lifecycle ... ok") == 1
-assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
-(root / "la04-result.json").write_text(json.dumps({"la04_lifecycle": "passed"}))
+for qualification in ["low-memory", "lifecycle"]:
+    text = (root / f"la04-{qualification}.log").read_text()
+    assert text.count("test installed_local_resource_lifecycle ... ok") == 1
+    assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
+(root / "la04-result.json").write_text(json.dumps({"la04_low_memory": "passed", "la04_lifecycle": "passed"}))
 PY
         ;;
     summary)
@@ -114,7 +120,7 @@ from pathlib import Path
 root, data = map(Path, sys.argv[1:])
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 sha = hashlib.file_digest((data / "bin/elastos").open("rb"), "sha256").hexdigest()
-results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run", "la04_lifecycle": "not required on macOS" if sys.platform == "darwin" else "failed or not run"}
+results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run", "la04_low_memory": "not required on macOS" if sys.platform == "darwin" else "failed or not run", "la04_lifecycle": "not required on macOS" if sys.platform == "darwin" else "failed or not run"}
 elapsed = None
 for name in ["installed-journeys.json", "la04-result.json"]:
     if (root / name).exists():

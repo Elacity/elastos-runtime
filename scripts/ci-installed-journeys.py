@@ -22,16 +22,24 @@ def cgroup_observation():
     relative = next(row[3:] for row in membership.splitlines() if row.startswith("0::"))
     assert ".." not in relative.split("/"), "cgroup ancestry must be visible"
     root = Path("/sys/fs/cgroup")
+    mounts = [row for row in Path("/proc/self/mountinfo").read_text().splitlines() if " - cgroup2 " in row]
+    assert len(mounts) == 1 and mounts[0].split()[3:5] == ["/", str(root)], "global cgroup2 mount required"
     current = root / relative.lstrip("/")
     ancestors = []
-    while current != root:
-        ancestors.append({"path": str(current.relative_to(root)),
-                          "memory_max": (current / "memory.max").read_text().strip(),
-                          "memory_current": int((current / "memory.current").read_text())})
+    while True:
+        maximum = (current / "memory.max").read_text().strip() if (current / "memory.max").exists() else None
+        usage = int((current / "memory.current").read_text()) if (current / "memory.current").exists() else None
+        controllers = (current / "cgroup.controllers").read_text().split()
+        ancestors.append({"path": str(current), "memory_max": maximum,
+                          "memory_current": usage, "controllers": controllers})
+        if current == root:
+            assert maximum is None and "memory" in controllers, "global memory-controller root required"
+            break
+        assert maximum is not None and usage is not None, "complete visible ancestor accounting required"
         current = current.parent
-    assert any(row["memory_max"] != "max" for row in ancestors), "finite memory.max required"
+    assert any(row["memory_max"] not in (None, "max") for row in ancestors), "finite memory.max required"
     return {"membership": membership, "ancestors": ancestors,
-            "mountinfo": [row for row in Path("/proc/self/mountinfo").read_text().splitlines() if " - cgroup2 " in row]}
+            "mountinfo": mounts, "global_memory_controller_root_visible": True}
 
 
 def run(home, data, evidence):
