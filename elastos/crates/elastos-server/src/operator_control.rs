@@ -450,50 +450,19 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
             source.name
         )
     })?;
-    let release = client.release_head().await.with_context(|| {
-        format!(
-            "Carrier discovery from trusted source '{}' failed to return a release head.",
-            source.name
-        )
-    })?;
-    let release = release.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Carrier discovery from trusted source '{}' returned no release head.",
-            source.name
-        )
-    })?;
-    let head_cid = release
-        .get("head_cid")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
-    let head_bytes = if let Some(cid) = head_cid.as_deref() {
-        client.fetch_content(cid, None).await.with_context(|| {
+    let discovered = crate::update::discover_carrier_release_head(&client, &source)
+        .await
+        .with_context(|| {
             format!(
-                "Carrier fetch of head CID {cid} from trusted source '{}' failed.",
+                "Carrier release discovery for trusted source '{}' failed",
                 source.name
             )
-        })?
-    } else {
-        // Older publishers announce a signed head without its content CID.
-        client
-            .fetch_file("release-head.json")
-            .await
-            .with_context(|| {
-                format!(
-                    "Carrier fetch of legacy release-head.json from trusted source '{}' failed.",
-                    source.name
-                )
-            })?
-    };
-    if let Some(cid) = head_cid.as_deref() {
-        crate::update::verify_release_metadata_cid(cid, &head_bytes)?;
-    }
-
-    let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)?;
-    crate::update::verify_source_channel(
-        &source,
-        head["payload"]["channel"].as_str().unwrap_or(""),
+        })?;
+    let head_cid = discovered.head_cid;
+    let head = verify_release_envelope(
+        &discovered.bytes,
+        "elastos.release.head.v1",
+        &primary_publisher,
     )?;
     let latest_version = head["payload"]["version"]
         .as_str()
@@ -908,15 +877,18 @@ fn normalized_channel(source: &TrustedSource) -> String {
 async fn try_operator_p2p_discovery(
     source: &TrustedSource,
     _publisher_did: &str,
-) -> Option<String> {
-    let client = crate::carrier::CarrierClient::connect_trusted_source(
+) -> Result<Option<crate::update::DiscoveredHead>> {
+    let Ok(client) = crate::carrier::CarrierClient::connect_trusted_source(
         source,
         OPERATOR_CONNECT_TIMEOUT_SECS + 5,
     )
     .await
-    .ok()?;
-    let release = client.release_head().await.ok()??;
-    release["head_cid"].as_str().map(|value| value.to_string())
+    else {
+        return Ok(None);
+    };
+    crate::update::discover_carrier_release_head(&client, source)
+        .await
+        .map(Some)
 }
 
 fn now_ts() -> u64 {

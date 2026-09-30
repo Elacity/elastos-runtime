@@ -93,10 +93,16 @@ pub async fn run_update_command(
     .await
 }
 
-async fn try_p2p_discovery(source: &TrustedSource, _publisher_did: &str) -> Option<String> {
-    let client = elastos_server::carrier::CarrierClient::connect_trusted_source(source, 15)
+async fn try_p2p_discovery(
+    source: &TrustedSource,
+    _publisher_did: &str,
+) -> anyhow::Result<Option<update::DiscoveredHead>> {
+    let Ok(client) =
+        elastos_server::carrier::CarrierClient::connect_trusted_source(source, 15).await
+    else {
+        return Ok(None);
+    };
+    update::discover_carrier_release_head(&client, source)
         .await
-        .ok()?;
-    let release = client.release_head().await.ok()??;
-    release["head_cid"].as_str().map(|s| s.to_string())
+        .map(Some)
 }

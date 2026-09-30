@@ -1,9 +1,7 @@
 //! Update/upgrade logic: Carrier-first release fetch, explicit transport
 //! overrides, platform detection, cache management, and the main update flow.
 //!
-//! `try_p2p_discovery` and `start_release_discovery_responder` remain in
-//! main.rs because they depend on binary-only infrastructure (`IpfsBridge`,
-//! `find_installed_provider_binary`).
+//! CLI and operator entry points share signed head discovery and admission.
 
 use std::cmp::Ordering;
 use std::future::Future;
@@ -28,11 +26,99 @@ pub type FetchFn = Box<
 >;
 
 /// Async callback for attempting P2P release discovery.
+/// An unavailable connection returns None; discovery errors remain terminal.
 pub type TryP2pFn = Box<
-    dyn Fn(TrustedSource, String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+    dyn Fn(
+            TrustedSource,
+            String,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<DiscoveredHead>>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Verified discovery bytes, with a head CID only when the publisher supplied one.
+#[derive(Clone, Debug)]
+pub struct DiscoveredHead {
+    pub head_cid: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+pub async fn discover_carrier_release_head(
+    client: &crate::carrier::CarrierClient,
+    source: &TrustedSource,
+) -> anyhow::Result<DiscoveredHead> {
+    let announcement = client
+        .release_head()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Trusted source returned no release head"))?;
+    resolve_discovered_head(&announcement, source, |cid| async move {
+        match cid {
+            Some(cid) => client.fetch_content(&cid, None).await,
+            None => client.fetch_file("release-head.json").await,
+        }
+    })
+    .await
+}
+
+async fn resolve_discovered_head<F, Fut>(
+    announcement: &serde_json::Value,
+    source: &TrustedSource,
+    fetch: F,
+) -> anyhow::Result<DiscoveredHead>
+where
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let field = |name: &str| -> anyhow::Result<Option<&str>> {
+        match announcement.get(name) {
+            None => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                Ok((!value.is_empty()).then_some(value.as_str()))
+            }
+            Some(_) => anyhow::bail!("Invalid release announcement {name}"),
+        }
+    };
+    let head_cid = field("head_cid")?;
+    let release_cid = field("release_cid")?;
+    // Older publishers put the release CID in head_cid. Missing receipt fields
+    // also require the signed filename discovery path; explicit CIDs bypass it.
+    let distinct_head = head_cid.is_some() && release_cid.is_some() && head_cid != release_cid;
+    let bytes = fetch(if distinct_head {
+        head_cid.map(str::to_owned)
+    } else {
+        None
+    })
+    .await?;
+    let publisher = source
+        .publisher_dids
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Trusted source has no publisher DID"))?;
+    let head = verify_release_envelope(&bytes, "elastos.release.head.v1", publisher)?;
+    anyhow::ensure!(
+        head["payload"]["schema"] == "elastos.release.head/v1",
+        "Unsupported release head schema"
+    );
+    verify_source_channel(source, head["payload"]["channel"].as_str().unwrap_or(""))?;
+    let signed_release = head["payload"]["latest_release_cid"]
+        .as_str()
+        .filter(|cid| !cid.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Release head has no latest_release_cid"))?;
+    if let Some(release) = release_cid {
+        anyhow::ensure!(
+            release == signed_release,
+            "Release announcement differs from signed head"
+        );
+    }
+    let head_cid = match head_cid {
+        Some(cid) if !distinct_head && cid == signed_release => None,
+        Some(cid) => {
+            verify_release_metadata_cid(cid, &bytes)?;
+            Some(cid.to_owned())
+        }
+        None => None,
+    };
+    Ok(DiscoveredHead { head_cid, bytes })
+}
 
 /// An empty installed version is the legacy first-install state. Every
 /// nonempty version must have exact SemVer syntax before it is compared.
@@ -513,12 +599,13 @@ pub async fn run_update_for_data_dir(
                 )
                 .await
                 {
-                    Ok(Some(cid)) => {
-                        // Found via Carrier — will be reported below
-                        resolved_head_cid = Some(cid);
+                    Ok(Ok(Some(head))) => {
+                        resolved_head_cid = head.head_cid;
+                        discovered_head_bytes = Some(head.bytes);
                         Some("Carrier")
                     }
-                    Ok(None) => None,
+                    Ok(Ok(None)) => None,
+                    Ok(Err(error)) => return Err(error),
                     Err(_) => None,
                 };
             }
@@ -1138,6 +1225,234 @@ mod tests {
             "latest_release_cid": cid::Cid::new_v1(0x55, multihash).to_string(),
             "release_sha256": hex::encode(digest)
         })
+    }
+
+    fn discovery_fixture() -> (TrustedSource, Vec<u8>, Vec<u8>) {
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let source = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [did], "channel": "stable",
+            "installed_version": "0.7.0"
+        }))
+        .unwrap();
+        let release = binding_envelope(
+            serde_json::json!({"schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable"}),
+            "elastos.release.v1",
+        );
+        let head = binding_envelope(binding_head(&release), "elastos.release.head.v1");
+        (source, head, release)
+    }
+
+    #[tokio::test]
+    async fn discovery_handles_old_new_and_missing_cid_announcements() {
+        let (source, head, release) = discovery_fixture();
+        let head_cid = raw_cid(&head);
+        let release_cid = raw_cid(&release);
+        for (announcement, fetch_cid, resolved_cid) in [
+            (
+                serde_json::json!({"head_cid":head_cid,"release_cid":release_cid}),
+                Some(head_cid.clone()),
+                Some(head_cid.clone()),
+            ),
+            // Actual older publisher shape with a completed publish receipt.
+            (
+                serde_json::json!({"head_cid":release_cid,"release_cid":release_cid}),
+                None,
+                None,
+            ),
+            // Older publisher without its publish receipt.
+            (
+                serde_json::json!({"head_cid":release_cid,"release_cid":""}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"head_cid":"","release_cid":""}),
+                None,
+                None,
+            ),
+            (serde_json::json!({}), None, None),
+            (serde_json::json!({"release_cid":release_cid}), None, None),
+            (
+                serde_json::json!({"head_cid":head_cid}),
+                None,
+                Some(head_cid.clone()),
+            ),
+        ] {
+            let result = resolve_discovered_head(&announcement, &source, |cid| {
+                assert_eq!(cid, fetch_cid, "{announcement}");
+                std::future::ready(Ok(head.clone()))
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.head_cid, resolved_cid, "{announcement}");
+            assert_eq!(result.bytes, head);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_refuses_inconsistent_or_unauthenticated_heads() {
+        let (source, head, release) = discovery_fixture();
+        let release_cid = raw_cid(&release);
+        let head_cid = raw_cid(&head);
+        let modern = serde_json::json!({"head_cid":head_cid,"release_cid":release_cid});
+        let legacy = serde_json::json!({"head_cid":release_cid,"release_cid":release_cid});
+        for (announcement, bytes) in [
+            (modern.clone(), release.clone()), // Valid release signature is the wrong domain.
+            (legacy.clone(), release.clone()),
+            (modern.clone(), b"malformed head".to_vec()),
+            (
+                serde_json::json!({"head_cid":head_cid,"release_cid":"wrong-release"}),
+                head.clone(),
+            ),
+            (
+                serde_json::json!({"head_cid":"wrong-cid","release_cid":release_cid}),
+                head.clone(),
+            ),
+            (serde_json::json!({"head_cid":null}), head.clone()),
+        ] {
+            assert!(
+                resolve_discovered_head(&announcement, &source, |_| {
+                    std::future::ready(Ok(bytes))
+                })
+                .await
+                .is_err(),
+                "{announcement}"
+            );
+        }
+        // An exact modern head fetch failure stays a failure; no filename retry.
+        assert!(resolve_discovered_head(&modern, &source, |cid| {
+            assert_eq!(cid, Some(head_cid));
+            std::future::ready(Err(anyhow::anyhow!("fixture fetch failure")))
+        })
+        .await
+        .is_err());
+        for changed_source in [
+            TrustedSource {
+                channel: "canary".into(),
+                ..source.clone()
+            },
+            TrustedSource {
+                publisher_dids: vec!["did:key:other".into()],
+                ..source.clone()
+            },
+        ] {
+            assert!(resolve_discovered_head(&legacy, &changed_source, |_| {
+                std::future::ready(Ok(head.clone()))
+            })
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_discovery_keeps_version_admission_and_exact_explicit_cids() {
+        let (source, head, release) = discovery_fixture();
+        let release_cid = raw_cid(&release);
+        let announcement = serde_json::json!({"head_cid":release_cid,"release_cid":release_cid});
+        let discovered = resolve_discovered_head(&announcement, &source, |_| {
+            std::future::ready(Ok(head.clone()))
+        })
+        .await
+        .unwrap();
+        let discovery: TryP2pFn =
+            Box::new(move |_, _| Box::pin(std::future::ready(Ok(Some(discovered.clone())))));
+        for installed in ["0.7.0", "0.7.2"] {
+            let data = tempfile::tempdir().unwrap();
+            let mut sources = crate::sources::TrustedSourcesConfig::empty();
+            sources.upsert_source(TrustedSource {
+                installed_version: installed.into(),
+                ..source.clone()
+            });
+            save_trusted_sources(data.path(), &sources).unwrap();
+            let bytes = release.clone();
+            let expected = release_cid.clone();
+            let fetch: FetchFn = Box::new(move |cid, _| {
+                assert_eq!(cid, expected);
+                Box::pin(std::future::ready(Ok(bytes.clone())))
+            });
+            let result = run_update_for_data_dir(
+                data.path(),
+                &fetch,
+                Some(&discovery),
+                true,
+                None,
+                false,
+                Vec::new(),
+                installed,
+                true,
+                false,
+            )
+            .await;
+            if installed == "0.7.0" {
+                result.unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("older than installed"));
+            }
+            // An explicit release CID is not reinterpreted as legacy discovery.
+            let err = run_update_for_data_dir(
+                data.path(),
+                &fetch,
+                Some(&discovery),
+                true,
+                Some(release_cid.clone()),
+                false,
+                Vec::new(),
+                installed,
+                true,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Signed envelope signature verification failed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_verification_error_stops_transport_fallback() {
+        let (source, head, release) = discovery_fixture();
+        let announcement = serde_json::json!({
+            "head_cid": raw_cid(&head), "release_cid": raw_cid(&release)
+        });
+        let data = tempfile::tempdir().unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(data.path(), &sources).unwrap();
+        let discovery: TryP2pFn = Box::new(move |source, _| {
+            let announcement = announcement.clone();
+            let bytes = release.clone();
+            Box::pin(async move {
+                resolve_discovered_head(&announcement, &source, |_| std::future::ready(Ok(bytes)))
+                    .await
+                    .map(Some)
+            })
+        });
+        let fetch: FetchFn =
+            Box::new(|_, _| panic!("invalid discovery must stop content fetching"));
+        let err = run_update_for_data_dir(
+            data.path(),
+            &fetch,
+            Some(&discovery),
+            true,
+            None,
+            false,
+            vec!["http://127.0.0.1:1".into()],
+            "0.7.0",
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Signed envelope signature verification failed"
+        );
     }
 
     #[tokio::test]
