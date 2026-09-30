@@ -1503,10 +1503,10 @@ async fn run_queued_local_text_worker(
         }
     };
     engines.cancel_idle_release().await;
-    engines
-        .close_other_offers(&offer_id)
-        .await
-        .map_err(map_local_llama_fault)?;
+    if let Err(fault) = engines.close_other_offers(&offer_id).await {
+        engines.release_when_idle().await;
+        return Err(map_local_llama_fault(fault));
+    }
     let mut result = tokio::select! {
         biased;
         _ = cancel.wait_for(|cancelled| *cancelled) => Ok(worker_settlement_unknown_result()),

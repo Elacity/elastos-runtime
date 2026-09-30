@@ -221,6 +221,9 @@ Incomplete metadata, split models, arithmetic overflow and other layouts return
 `model_resources_unavailable`. Low memory returns `model_memory_unavailable`;
 low disk space returns `model_disk_unavailable`. The person can free resources
 or select a supported smaller model, then send a new request.
+Linux admission requires a visible unified cgroup hierarchy through the global
+memory-controller root. A restricted cgroup namespace or unreadable limit
+returns `model_resources_unavailable` because its full memory budget is unknown.
 
 Switching closes the previous local engine. A completed run can reuse its warm
 engine for 60 seconds. An idle timer holds the same execution permit as a run

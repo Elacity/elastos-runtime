@@ -400,6 +400,18 @@ fn cgroup_memory(
             return Err(fail);
         }
         let controllers = read(&path.join("cgroup.controllers")).map_err(|_| fail)?;
+        if path == root {
+            // A cgroup namespace can hide stricter ancestors. Only the global
+            // memory-controller root (which has no memory.max) proves that this
+            // walk observed the entire enforced hierarchy.
+            if !controllers.split_whitespace().any(|name| name == "memory")
+                || !matches!(read(&path.join("memory.max")), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(fail);
+            }
+            break;
+        }
         match read(&path.join("memory.max")) {
             Ok(limit) if limit.trim() == "max" => {}
             Ok(limit) => {
@@ -413,22 +425,16 @@ fn cgroup_memory(
                 available = available.min(limit.saturating_sub(used));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if path != root {
-                    let enabled = read(&path.parent().ok_or(fail)?.join("cgroup.subtree_control"))
-                        .map_err(|_| fail)?;
-                    if enabled.split_whitespace().any(|name| name == "memory")
-                        || controllers.split_whitespace().any(|name| name == "memory")
-                    {
-                        return Err(fail);
-                    }
+                let enabled = read(&path.parent().ok_or(fail)?.join("cgroup.subtree_control"))
+                    .map_err(|_| fail)?;
+                if enabled.split_whitespace().any(|name| name == "memory")
+                    || controllers.split_whitespace().any(|name| name == "memory")
+                {
+                    return Err(fail);
                 }
-                // The real hierarchy root has no memory.max. For a child, both
-                // views above must show that memory accounting is disabled.
+                // Both views must show that memory accounting is disabled.
             }
             Err(_) => return Err(fail),
-        }
-        if path == root {
-            break;
         }
         if !path.pop() || !path.starts_with(root) {
             return Err(fail);
@@ -600,6 +606,16 @@ mod tests {
         std::fs::write(root.join("parent/cgroup.subtree_control"), "cpu").unwrap();
         std::fs::write(leaf.join("cgroup.controllers"), "cpu").unwrap();
         assert_eq!(observe(), Ok((500, 300)));
+        // A namespace root can report unlimited memory while an invisible
+        // parent has a finite limit. Any root memory.max marks an incomplete
+        // hierarchy, including a finite local limit.
+        for limit in ["max", "900"] {
+            std::fs::write(root.join("memory.max"), limit).unwrap();
+            assert_eq!(observe(), Err(LocalLlamaFault::ResourcesUnavailable));
+        }
+        std::fs::remove_file(root.join("memory.max")).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu").unwrap();
+        assert_eq!(observe(), Err(LocalLlamaFault::ResourcesUnavailable));
         std::fs::remove_file(root.join("cgroup.controllers")).unwrap();
         assert_eq!(observe(), Err(LocalLlamaFault::ResourcesUnavailable));
         assert_eq!(
