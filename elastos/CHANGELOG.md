@@ -4,6 +4,53 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-30
+
+Monthly developer release of the 0.7.1 work line. It is a source snapshot for
+developers and testers, not a release for users. The workspace version moves
+to `0.7.1`; capsule manifest versions do not change. The GitHub binaries are
+unsigned source builds and report `0.7.1-dev`. The signed installer and the
+update channel do not change. An earlier signed preview build also reports
+`0.7.1`; it is older code, and the next signed release replaces it. The first
+release for users is planned as 0.8.0, and issues #83 to #93 track what it
+still needs.
+
+### Added
+- Local models: signed model catalogue metadata, verified model content that
+  is prepared, admitted, kept and retired through Marketplace and System
+  controls, and a bounded local llama engine with recovery. Local chat is
+  bound to the engine's context limit and keeps the negotiated chat roles.
+- Remote and hosted models: granted remote model offers and runs travel over
+  Carrier and are authorised on the owning Runtime. Hosted runs support
+  Responses with honest cancellation, keep repeatable connections and their
+  secrets on this Home, and show the offer and selection facts in Assistant.
+- Home: first run seeds an empty desktop and pins Marketplace; new lock face;
+  storefront and one Home entry; the recovery kit comes before passkey setup;
+  apps declare their own window policy; the Home Agent runs as its own capsule
+  on the typed model contract.
+- Browser: remote Engine sessions go through Runtime authority; the local
+  Engine image dependencies are verified; scoped operator inspection and
+  reference fill need approval.
+- Services shows the AI model service beside Engine and Exit.
+- Protected content: installed custody and chain prerequisites can be
+  provisioned. The protected-content path stays inactive.
+
+### Fixed
+- Update tests observe isolated CLI and operator update hops accurately
+  (#74, #79).
+- The x264 build fetch is pinned to its commit and tree (#119).
+- Browser, model, setup, Services and Assistant fixes; see the commit log
+  since v0.7.0.
+
+### Known limits
+- A hosted model route set up explicitly by an operator on a Mac can skip
+  Inbox (#85).
+- Signed updates have open defects (#107). A later update may need a
+  reinstall.
+- Chat sign-up is hard to find (#86).
+- The Jetson Runtime install and its visible Assistant reply are not proven
+  yet (#90, #97).
+
 ## [0.7.0] - 2026-08-31
 
 The coordinated workspace version moves to `0.7.0`. Capsule manifests changed
