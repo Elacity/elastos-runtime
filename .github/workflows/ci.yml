@@ -376,11 +376,20 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           ELASTOS_LOCAL_TEST_ROOT="${HOME}/.elastos-ci/carrier-fixture" scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+      # Playwright 1.59.1's archive extractor hangs on Node 26 (#40724).
+      # Keep the pinned operator protocol; use Node 22 only for installation.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: prepare pinned installed model journey
+        timeout-minutes: 15
         run: |
           scripts/ci-installed-journeys.sh prepare
           npm install --ignore-scripts --no-package-lock --prefix elastos/tools/browser-playwright-engine
           PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" elastos/tools/browser-playwright-engine/node_modules/.bin/playwright install --with-deps chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
       - name: installed Home and local reply journeys
         run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
       - name: installed journey summary
@@ -495,11 +504,19 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      # Use the same bounded installer runtime as the Linux jobs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: prepare pinned installed model journey
+        timeout-minutes: 15
         run: |
           scripts/ci-installed-journeys.sh prepare
           npm install --ignore-scripts --no-package-lock --prefix elastos/tools/browser-playwright-engine
           PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" elastos/tools/browser-playwright-engine/node_modules/.bin/playwright install chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
       - name: installed Home and local reply journeys
         run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
       - name: installed journey summary
