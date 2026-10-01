@@ -1655,33 +1655,11 @@ async fn handle_file_stream(
             if head_path.is_file() {
                 let content = tokio::fs::read(&head_path).await?;
                 let head: serde_json::Value = serde_json::from_slice(&content)?;
-                // Extract fields the client expects in flat format
-                let head_cid = head["payload"]["latest_release_cid"]
-                    .as_str()
-                    .unwrap_or_default();
-                let version = head["payload"]["version"].as_str().unwrap_or_default();
-                let channel = head["payload"]["channel"].as_str().unwrap_or("stable");
-                let signer_did = head["signer_did"].as_str().unwrap_or_default();
-                // Read release_cid from publish state if available
-                let release_cid = if let Ok(state_bytes) = tokio::fs::read(&state_path).await {
-                    serde_json::from_slice::<serde_json::Value>(&state_bytes)
-                        .ok()
-                        .and_then(|s| s["last_release_cid"].as_str().map(|s| s.to_string()))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
+                let publish_state = match tokio::fs::read(&state_path).await {
+                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok(),
+                    Err(_) => None,
                 };
-
-                let response = serde_json::json!({
-                    "ok": true,
-                    "release": {
-                        "head_cid": head_cid,
-                        "release_cid": release_cid,
-                        "version": version,
-                        "channel": channel,
-                        "signer_did": signer_did,
-                    }
-                });
+                let response = release_head_announcement(&head, publish_state.as_ref());
                 send_json(send, &response).await?;
             } else {
                 send_json(
@@ -1897,6 +1875,29 @@ async fn handle_file_stream(
         }
     }
     Ok(())
+}
+
+fn release_head_announcement(
+    head: &serde_json::Value,
+    publish_state: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // Both CIDs come from the publisher's completed publish receipt.
+    let head_cid = publish_state
+        .and_then(|state| state["last_head_cid"].as_str())
+        .unwrap_or_default();
+    let release_cid = publish_state
+        .and_then(|state| state["last_release_cid"].as_str())
+        .unwrap_or_default();
+    serde_json::json!({
+        "ok": true,
+        "release": {
+            "head_cid": head_cid,
+            "release_cid": release_cid,
+            "version": head["payload"]["version"].as_str().unwrap_or_default(),
+            "channel": head["payload"]["channel"].as_str().unwrap_or("stable"),
+            "signer_did": head["signer_did"].as_str().unwrap_or_default(),
+        }
+    })
 }
 
 async fn carrier_content_fetch_bytes(
@@ -15479,6 +15480,24 @@ pub(crate) mod tests {
         }
 
         shutdown_test_carrier_node(node).await;
+    }
+
+    #[test]
+    fn release_announcement_uses_distinct_published_head_and_release_cids() {
+        let head = serde_json::json!({
+            "signer_did": "did:key:fixture",
+            "payload": {"version": "0.7.1", "channel": "stable", "latest_release_cid": "release-cid"}
+        });
+        let state = serde_json::json!({
+            "last_head_cid": "head-cid", "last_release_cid": "release-cid"
+        });
+        let announcement = release_head_announcement(&head, Some(&state));
+        assert_eq!(announcement["release"]["head_cid"], "head-cid");
+        assert_eq!(announcement["release"]["release_cid"], "release-cid");
+
+        let legacy = release_head_announcement(&head, None);
+        assert_eq!(legacy["release"]["head_cid"], "");
+        assert_eq!(legacy["release"]["version"], "0.7.1");
     }
 
     #[test]
