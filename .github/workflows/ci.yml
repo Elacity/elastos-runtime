@@ -141,6 +141,18 @@ jobs:
         run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: install content boundary browser fixture
+        run: |
+          npm install --prefix "${RUNNER_TEMP}/content-sandbox-browser" --no-save --package-lock=false playwright@1.59.1
+          "${RUNNER_TEMP}/content-sandbox-browser/node_modules/.bin/playwright" install chromium --with-deps
+      - name: gateway content sandbox browser regression
+        working-directory: elastos
+        env:
+          ELASTOS_PLAYWRIGHT_MODULE: ${{ runner.temp }}/content-sandbox-browser/node_modules/playwright/index.mjs
+        run: cargo test -p elastos-server content_sandbox_browser -- --ignored --nocapture
 
   test-capsules:
     name: test-capsules
