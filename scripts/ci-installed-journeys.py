@@ -46,7 +46,7 @@ def run(home, data, evidence):
         while time.monotonic() < deadline:
             assert child.poll() is None, "installed Runtime exited before health"
             try:
-                with urllib.request.urlopen(f"http://{address}/api/health", timeout=1) as response:
+                with urllib.request.urlopen(f"http://{address}/healthz", timeout=1) as response:
                     if response.status == 200:
                         break
             except OSError:
