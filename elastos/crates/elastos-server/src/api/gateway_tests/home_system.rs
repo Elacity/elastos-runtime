@@ -8683,6 +8683,160 @@ fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
 }
 
 #[tokio::test]
+async fn test_private_engine_request_requires_share_before_inbox_approval() {
+    for model_shared in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        std::fs::create_dir_all(right.path().join("config")).unwrap();
+        std::fs::write(
+            right.path().join("config/browser-engine-adapter.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(right.path().join("bin")).unwrap();
+        std::fs::write(right.path().join("bin/model-provider"), b"").unwrap();
+        let services_token =
+            app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+        if model_shared {
+            let (status, _) = services_contact_post(
+                &bob.app,
+                &services_token,
+                "/api/apps/services/offers",
+                json!({"offer_id":MODEL_LOCAL_OFFER,"section":"mine","selected":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let alice_token =
+            app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, _) = services_contact_post(
+            &alice.app,
+            &alice_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":services_engine_offer(&bob),"section":"others","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = home_test_post_json(
+            &bob.app,
+            "/api/apps/home/launch",
+            &bob.authority.home_token,
+            "http://localhost:61180",
+            json!({"target":INBOX_CAPSULE_ID}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (_, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        let request = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_request")
+            .unwrap();
+        assert!(request["body"].as_str().unwrap().contains(
+            "Your Browser Engine is private. Share it in Services before approving this request."
+        ));
+        let action = request["action_ref"]["action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert!(!status.is_success());
+        assert!(
+            message.contains("Your Browser Engine is private. Share it in Services"),
+            "{message}"
+        );
+        let (_, still_pending) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(still_pending["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action_ref"]["action_id"] == action));
+
+        let (status, _) = services_contact_post(
+            &bob.app,
+            &services_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":"local:provider:browser-engine","section":"mine","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert!(services["local_offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["offer_id"] == "local:provider:browser-engine"));
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+        let (_, ready_inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(!ready_inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action_ref"]["action_id"] == action)
+            .unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("is private"));
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{message}");
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_services_inbox_request_copy_matches_engine_or_exit_and_exact_approval() {
     for (engine, service_name, offer_name, approval_text) in [
         (
@@ -10122,13 +10276,15 @@ async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_sign
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
     let service = bob.discovery_service.clone();
     service.sync_services_mailboxes_once(right.path(), 0).await;
-    assert!(bob
-        .peer_provider
-        .state
-        .provider_requests
-        .lock()
-        .await
-        .is_empty());
+    let initial_peer_calls = bob.peer_provider.state.provider_requests.lock().await;
+    assert!(
+        initial_peer_calls.iter().all(|call| matches!(
+            call["op"].as_str(),
+            Some("get_ticket" | "gossip_join" | "gossip_join_peers" | "gossip_recv")
+        )),
+        "an empty mailbox may poll but must not send: {initial_peer_calls:?}"
+    );
+    drop(initial_peer_calls);
     assert!(
         services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
             ["requests"]
