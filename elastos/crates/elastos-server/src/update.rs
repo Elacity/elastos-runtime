@@ -776,6 +776,7 @@ async fn run_upgrade_from_head(
     } else {
         fetch_fn(release_cid.to_string(), ordered_gateways.to_vec()).await?
     };
+    // Gateway bytes are bound by verify_release_binding; release_sha256 must stay mandatory.
     if working_gateway.is_none() {
         verify_release_metadata_cid(release_cid, &release_bytes)?;
     }
