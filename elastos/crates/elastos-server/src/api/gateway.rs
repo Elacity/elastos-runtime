@@ -1240,9 +1240,13 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/ipfs/:cid/", get(serve_cid_root))
         .route("/ipfs/:cid/*path", get(serve_cid_file))
         .route("/*path", get(serve_public_site_path))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
         .layer(axum::middleware::from_fn(capsule_origin_cors))
+        .layer(axum::middleware::from_fn_with_state(
+            state.data_dir.clone(),
+            home_cli_terminal_access,
+        ))
 }
 
 // ---------------------------------------------------------------------------

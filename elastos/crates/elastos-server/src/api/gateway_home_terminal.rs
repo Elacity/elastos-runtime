@@ -27,6 +27,7 @@ const HOME_TERMINAL_EVENT_SCHEMA: &str = "elastos.home-cli.terminal-event/v1";
 const HOME_TERMINAL_HOST_INTENT_SCHEMA: &str = "elastos.home.terminal-host-intent/v1";
 const HOME_TERMINAL_INTENT_SCHEMA: &str = "elastos.home-cli.terminal-intent/v1";
 const HOME_TERMINAL_EVENT_KEEPALIVE_SECS: u64 = 15;
+const HOME_TERMINAL_POLICY_CHECK_INTERVAL_SECS: u64 = 1;
 const HOME_TERMINAL_EVENT_DISCONNECT_GRACE_SECS: u64 = 3;
 const HOME_TERMINAL_PENDING_ATTACH_TIMEOUT_SECS: u64 = 20;
 const HOME_TERMINAL_EXIT_AUTH_GRACE_MS: u64 = 2_000;
@@ -54,6 +55,43 @@ static HOME_TERMINAL_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<HomeTerminalSe
     OnceLock::new();
 static HOME_TERMINAL_ARCHIVED_REPLAYS: OnceLock<StdMutex<HomeTerminalArchivedReplayStore>> =
     OnceLock::new();
+
+// Runtime owns this setting outside the app storage roots. The host CLI owns
+// changes to developer_mode; the gateway reads the value for each request.
+fn home_terminal_policy_allows(data_dir: &FsPath) -> bool {
+    let developer_mode = std::fs::read_to_string(data_dir.join("config.toml"))
+        .ok()
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .and_then(|config| config.get("developer_mode").and_then(toml::Value::as_bool))
+        .unwrap_or(false);
+    developer_mode
+        && !crate::auth::guest_registration_enabled(&home_launch_auth_data_dir(data_dir))
+            .unwrap_or(true)
+}
+
+pub(super) async fn home_cli_terminal_access(
+    State(data_dir): State<PathBuf>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request
+        .uri()
+        .path()
+        .starts_with("/api/apps/home-cli/terminal/")
+        && !home_terminal_policy_allows(&data_dir)
+    {
+        return home_terminal_policy_refusal();
+    }
+    next.run(request).await
+}
+
+fn home_terminal_policy_refusal() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "Web terminal requires host developer mode and closed guest registration.",
+    )
+        .into_response()
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct HomeTerminalStreamQuery {
@@ -185,6 +223,7 @@ struct HomeTerminalCleanupTarget {
 }
 
 enum HomeTerminalStartError {
+    PolicyRefused,
     Capacity(HomeTerminalCapacityError),
     Runtime(anyhow::Error),
 }
@@ -350,6 +389,10 @@ pub(super) async fn home_cli_terminal_start(
     headers: HeaderMap,
     start: Option<Json<HomeTerminalStartRequest>>,
 ) -> Response {
+    // Body extraction can wait while the host operator changes the policy.
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
@@ -362,8 +405,17 @@ pub(super) async fn home_cli_terminal_start(
         Ok(size) => size,
         Err(response) => return response,
     };
-    match start_home_terminal_session(context, size, Some(gateway_api_url.0.to_string())).await {
-        Ok(session) => Json(serde_json::json!({
+    match start_home_terminal_session(
+        context,
+        size,
+        Some(gateway_api_url.0.to_string()),
+        &state.data_dir,
+    )
+    .await
+    {
+        Ok(session) => {
+            spawn_home_terminal_policy_watchdog(session.session_id.clone(), state.data_dir);
+            Json(serde_json::json!({
             "schema": HOME_TERMINAL_SESSION_SCHEMA,
             "session_id": session.session_id,
             "transport": "runtime_pty_stream",
@@ -395,7 +447,9 @@ pub(super) async fn home_cli_terminal_start(
                 "principal_id": session.principal_id
             }
         }))
-        .into_response(),
+            .into_response()
+        }
+        Err(HomeTerminalStartError::PolicyRefused) => home_terminal_policy_refusal(),
         Err(HomeTerminalStartError::Capacity(err)) => home_terminal_capacity_response(err),
         Err(HomeTerminalStartError::Runtime(err)) => home_error_response(err),
     }
@@ -469,6 +523,7 @@ pub(super) async fn home_cli_terminal_events(
 }
 
 pub(super) async fn home_cli_terminal_input_socket(
+    State(state): State<GatewayState>,
     Path(session_id): Path<String>,
     Query(query): Query<HomeTerminalStreamQuery>,
     socket: WebSocketUpgrade,
@@ -485,7 +540,9 @@ pub(super) async fn home_cli_terminal_input_socket(
         .input_stream_generation
         .fetch_add(1, Ordering::AcqRel)
         + 1;
-    socket.on_upgrade(move |socket| home_terminal_input_socket(socket, session, generation))
+    socket.on_upgrade(move |socket| {
+        home_terminal_input_socket(socket, session, generation, state.data_dir)
+    })
 }
 
 pub(super) fn home_terminal_input_ticket_matches(presented: Option<&str>, expected: &str) -> bool {
@@ -496,8 +553,13 @@ async fn home_terminal_input_socket(
     mut socket: WebSocket,
     session: Arc<HomeTerminalSession>,
     generation: u64,
+    data_dir: PathBuf,
 ) {
     while let Some(Ok(message)) = socket.recv().await {
+        if !home_terminal_policy_allows(&data_dir) {
+            close_home_terminal_session(&session.session_id, "terminal access disabled").await;
+            break;
+        }
         if session.input_stream_generation.load(Ordering::Acquire) != generation {
             break;
         }
@@ -514,6 +576,11 @@ async fn home_terminal_input_socket(
             break;
         }
         let mut input = session.input.lock().await;
+        if !home_terminal_policy_allows(&data_dir) {
+            drop(input);
+            close_home_terminal_session(&session.session_id, "terminal access disabled").await;
+            break;
+        }
         let Some(input) = input.as_mut() else {
             break;
         };
@@ -529,6 +596,9 @@ pub(super) async fn home_cli_terminal_resize(
     headers: HeaderMap,
     Json(resize): Json<HomeTerminalResizeRequest>,
 ) -> Response {
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     if let Some(schema) = resize.schema.as_deref() {
         if schema != HOME_TERMINAL_RESIZE_SCHEMA {
             return (
@@ -576,6 +646,9 @@ pub(super) async fn home_cli_terminal_intent(
     headers: HeaderMap,
     Json(intent): Json<HomeTerminalHostIntentRequest>,
 ) -> Response {
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
@@ -633,6 +706,7 @@ async fn start_home_terminal_session(
     _context: HomeLaunchTokenContext,
     _size: HomeTerminalSize,
     _gateway_api_url: Option<String>,
+    _data_dir: &FsPath,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     Err(HomeTerminalStartError::Runtime(anyhow::anyhow!(
         "Runtime PTY terminal is not supported on this platform"
@@ -644,6 +718,7 @@ async fn start_home_terminal_session(
     context: HomeLaunchTokenContext,
     size: HomeTerminalSize,
     gateway_api_url: Option<String>,
+    data_dir: &FsPath,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     let cleanup = prepare_home_terminal_start(&context, now_unix_ms())
         .await
@@ -685,6 +760,11 @@ async fn start_home_terminal_session(
         });
     }
 
+    // Session planning and cleanup can yield. Check again at the process gate,
+    // with no asynchronous operation between this check and spawn.
+    if !home_terminal_policy_allows(data_dir) {
+        return Err(HomeTerminalStartError::PolicyRefused);
+    }
     let child = command
         .spawn()
         .with_context(|| format!("failed to start terminal process {}", command_spec.label))?;
@@ -1006,6 +1086,24 @@ fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
     });
 }
 
+fn spawn_home_terminal_policy_watchdog(session_id: String, data_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(
+                HOME_TERMINAL_POLICY_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            if home_terminal_session(&session_id).await.is_none() {
+                break;
+            }
+            if !home_terminal_policy_allows(&data_dir) {
+                close_home_terminal_session(&session_id, "terminal access disabled").await;
+                break;
+            }
+        }
+    });
+}
+
 async fn wait_home_terminal_pty_reader_drained(session: &HomeTerminalSession) {
     if session.pty_reader_drained.load(Ordering::SeqCst) {
         return;
@@ -1287,6 +1385,11 @@ async fn home_terminal_session(session_id: &str) -> Option<Arc<HomeTerminalSessi
         .cloned()
 }
 
+#[cfg(test)]
+pub(super) async fn home_terminal_process_id(session_id: &str) -> Option<u32> {
+    home_terminal_session(session_id).await?.child_pid
+}
+
 async fn close_home_terminal_session(session_id: &str, message: &str) -> Option<()> {
     let session = remove_home_terminal_session(session_id).await?;
     close_home_terminal_session_handle(session, message).await;
@@ -1295,11 +1398,13 @@ async fn close_home_terminal_session(session_id: &str, message: &str) -> Option<
 
 async fn close_home_terminal_session_handle(session: Arc<HomeTerminalSession>, message: &str) {
     let session_id = session.session_id.clone();
+    // A full PTY can block a writer while it holds the input lock. Terminating
+    // the process first releases that write and lets input cleanup complete.
+    kill_home_terminal_process(session.child_pid);
     {
         let mut input_handle = session.input.lock().await;
         input_handle.take();
     }
-    kill_home_terminal_process(session.child_pid);
     emit_home_terminal_event(
         &session,
         HomeTerminalEvent {
@@ -1736,6 +1841,95 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_policy_revocation_releases_blocked_pty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+        let pty = open_home_terminal_pty(HomeTerminalSize {
+            cols: 100,
+            rows: 32,
+        })
+        .unwrap();
+        unsafe {
+            let mut termios = std::mem::zeroed();
+            assert_eq!(
+                libc::tcgetattr(pty.slave_stdin.as_raw_fd(), &mut termios),
+                0
+            );
+            libc::cfmakeraw(&mut termios);
+            assert_eq!(
+                libc::tcsetattr(pty.slave_stdin.as_raw_fd(), libc::TCSANOW, &termios),
+                0
+            );
+        }
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::from(pty.slave_stdin))
+            .stdout(Stdio::from(pty.slave_stdout))
+            .stderr(Stdio::from(pty.slave_stderr))
+            .kill_on_drop(true);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(command);
+        let session = test_terminal_session(child, Some(pty.input));
+        insert_home_terminal_session(session.clone()).await;
+        let writing_session = session.clone();
+        let completed_writes = Arc::new(AtomicU64::new(0));
+        let progress = completed_writes.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut input = writing_session.input.lock().await;
+            let input = input.as_mut().unwrap();
+            locked_tx.send(()).unwrap();
+            loop {
+                if input
+                    .write_all(&[b'x'; HOME_TERMINAL_INPUT_MAX_BYTES])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                progress.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        locked_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let before = completed_writes.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if completed_writes.load(Ordering::SeqCst) == before {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("raw PTY input must reach backpressure");
+        assert!(session.input.try_lock().is_err());
+        assert!(!writer.is_finished());
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+        spawn_home_terminal_policy_watchdog(session.session_id.clone(), dir.path().to_path_buf());
+        tokio::time::timeout(Duration::from_secs(3), session.child.lock().await.wait())
+            .await
+            .expect("policy revocation must terminate the child despite a blocked write")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("child termination must release the blocked PTY writer")
+            .unwrap();
+        assert!(session.input.lock().await.is_none());
+        test_cleanup_terminal_artifacts(&session.session_id).await;
+        drop(pty.reader);
+    }
 
     #[test]
     fn terminal_utf8_decoder_keeps_split_multibyte_text_intact() {
@@ -2376,9 +2570,16 @@ mod tests {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
+        Ok(test_terminal_session(child, None))
+    }
+
+    fn test_terminal_session(
+        child: Child,
+        input: Option<HomeTerminalInput>,
+    ) -> Arc<HomeTerminalSession> {
         let child_pid = child.id();
         let (events, _receiver) = broadcast::channel(32);
-        Ok(Arc::new(HomeTerminalSession {
+        Arc::new(HomeTerminalSession {
             session_id: format!("term-test-{}", random_hex_token()),
             stream_ticket: format!("ticket-test-{}", random_hex_token()),
             input_ticket: format!("input-test-{}", random_hex_token()),
@@ -2387,7 +2588,7 @@ mod tests {
             grant_id: "grant-test".to_string(),
             child_pid,
             created_at_ms: now_unix_ms(),
-            input: Mutex::new(None),
+            input: Mutex::new(input),
             child: Mutex::new(child),
             events,
             replay: StdMutex::new(HomeTerminalReplayLog::default()),
@@ -2395,6 +2596,6 @@ mod tests {
             input_stream_generation: AtomicU64::new(0),
             pty_reader_drained: AtomicBool::new(true),
             pty_reader_drained_notify: Notify::new(),
-        }))
+        })
     }
 }

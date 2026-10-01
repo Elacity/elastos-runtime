@@ -1112,7 +1112,7 @@ enum ConfigCommand {
     Show,
     /// Set a configuration value
     Set {
-        /// Key to set (e.g. "dev_mode", "enable_cache")
+        /// Key to set (e.g. "developer_mode", "enable_cache")
         key: String,
         /// Value to set
         value: String,
