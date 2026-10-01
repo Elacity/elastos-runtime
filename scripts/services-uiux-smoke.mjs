@@ -492,6 +492,18 @@ async function assertVerifiedLaunch(page, server, diagnostics) {
 
 async function assertSelectAvailableOffer(page, server) {
   const frame = await bootLaunchedPage(page, server);
+  const requestable = await frame.evaluate(() => {
+    const card = document.querySelector('[data-service-offer-id="request-browser-engine"]')?.closest(".service-card");
+    return {
+      heading: document.getElementById("other-services")?.textContent || "",
+      status: card?.querySelector(".status-badge")?.textContent?.trim(),
+      copy: card?.querySelector(".service-copy")?.textContent?.trim(),
+    };
+  });
+  assert(requestable.heading.includes("Services from People")
+    && requestable.status === "Ask owner"
+    && requestable.copy?.includes("The owner must share their Browser Engine in Services and approve in Inbox before Browser can use it."),
+  "an unapproved contact Engine must show the Share and approval steps", requestable);
   await frame.click('[data-service-offer-id="request-browser-engine"]');
   await frame.waitForFunction(
     () =>
@@ -502,6 +514,11 @@ async function assertSelectAvailableOffer(page, server) {
       ),
   );
   assert(server.trace.offerPosts.length === 1, "selecting an available offer must send one POST", server.trace.offerPosts);
+  const requestedCopy = await frame.evaluate(() => [...document.querySelectorAll(".service-card")]
+    .find((card) => card.textContent?.includes("Lin's Browser Engine"))
+    ?.querySelector(".service-copy")?.textContent?.trim());
+  assert(requestedCopy?.includes("Request sent. The owner must share their Browser Engine"),
+    "a sent request must not claim that the private Engine is ready", requestedCopy);
   assert(
     JSON.stringify(server.trace.offerPosts[0]) === JSON.stringify({
       homeToken: TOKEN,
