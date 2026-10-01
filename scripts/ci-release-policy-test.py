@@ -11,8 +11,15 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 SOURCE = WORKFLOW.read_text()
 # Read the fixed job/step indentation used here; actionlint checks YAML syntax.
-JOBS = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
-                       SOURCE.split("\njobs:\n", 1)[1]))
+def jobs(source):
+    return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
+                           source.split("\njobs:\n", 1)[1]))
+
+
+JOBS = jobs(SOURCE)
+CACHE_RE = re.compile(
+    r"uses: (?:Swatinem/rust-cache|actions/cache(?:/restore|/save)?)@"
+    r"|^\s+cache(?:-from|-to)?:|type=gha", re.M)
 
 
 def field(block, name):
@@ -22,11 +29,12 @@ def field(block, name):
     return match[1]
 
 
-def steps(job):
-    return re.split(r"(?m)^      - ", JOBS[job].split("    steps:\n", 1)[1])[1:]
+def steps(job, workflow_jobs=JOBS):
+    return re.split(r"(?m)^      - ", workflow_jobs[job].split("    steps:\n", 1)[1])[1:]
 
 
 def evaluate(expression, context):
+    # eval accepts only this repository's own ci.yml expressions, never external input.
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
@@ -52,10 +60,44 @@ CASES = [
 ]
 
 
+def validate_cache_guards(source):
+    workflow_jobs = jobs(source)
+    for job in workflow_jobs:
+        for step in steps(job, workflow_jobs):
+            matches = list(CACHE_RE.finditer(step))
+            if not matches:
+                continue
+            # Buildx shell cache arguments live inside this explicit cache-only branch.
+            shell_guards = list(re.finditer(
+                r'(?ms)^\s*if \[\[ "\$\{CI_USE_CACHE\}" == "true" \]\]; then\n'
+                r'(.*?)^\s*fi\s*$', step))
+            shell_guards = [guard for guard in shell_guards
+                            if not re.search(r"(?m)^\s*(?:else|elif)\b", guard[1])]
+            remaining = [match for match in matches
+                         if not (match[0] == "type=gha" and any(
+                             guard.start(1) <= match.start() < guard.end(1)
+                             for guard in shell_guards))]
+            if not remaining:
+                continue
+            guard = field(step, "if")
+            if "env.CI_USE_CACHE == 'true'" not in guard:
+                raise AssertionError(f"unguarded cache in {job}")
+            for event, ref, ref_type, override, cached, _ in CASES:
+                if cached:
+                    continue
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override,
+                           "env.CI_USE_CACHE": "false",
+                           "steps.should-run.outputs.run": "true"}
+                if evaluate(guard, context):
+                    raise AssertionError(f"cache guard permits uncached build in {job}")
+
+
 class ReleasePolicyTests(unittest.TestCase):
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
+        validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
-                  if re.search(r"uses: (Swatinem/rust-cache|actions/cache)@", step)]
+                  if CACHE_RE.search(step) and "type=gha" not in step]
         self.assertEqual(len(caches), 9)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
@@ -71,6 +113,26 @@ class ReleasePolicyTests(unittest.TestCase):
                         self.assertEqual(evaluate(field(step, "if"), context),
                                          cached and (job != "custody-harness-smoke" or should_run),
                                          f"cache guard in {job}")
+
+    def test_unguarded_cache_paths_are_rejected(self):
+        additions = [
+            "      - uses: actions/cache/restore@v4\n",
+            "      - uses: actions/cache/save@v4\n",
+            "      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n",
+            "      - uses: docker/build-push-action@v6\n        with:\n          cache-from: type=gha\n",
+            "      - uses: docker/build-push-action@v6\n        with:\n          cache-to: type=gha,mode=max\n",
+            "      - run: docker buildx build --cache-from type=gha .\n",
+            '      - run: |\n          if [[ "${CI_USE_CACHE}" == "true" ]]; then\n'
+            '            echo cached\n          else\n'
+            '            docker buildx build --cache-from type=gha .\n          fi\n',
+            "      - if: env.CI_USE_CACHE == 'true' || startsWith(github.ref, 'refs/tags/')\n"
+            "        uses: actions/cache/restore@v4\n",
+        ]
+        for addition in additions:
+            with self.subTest(step=addition):
+                injected = SOURCE.replace("    steps:\n", "    steps:\n" + addition, 1)
+                with self.assertRaises(AssertionError):
+                    validate_cache_guards(injected)
 
     def test_buildx_imports_and_exports_layers_only_when_cache_is_enabled(self):
         step, = [step for step in steps("custody-harness-smoke")
