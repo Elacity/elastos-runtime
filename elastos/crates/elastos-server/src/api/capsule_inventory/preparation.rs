@@ -5799,6 +5799,9 @@ mod tests {
                 Some(&record.operation_id),
             )
             .await;
+            // Explicit Use keeps A. Release that intent before capacity pressure
+            // may select A for retirement after the catalog moves to B.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             // A remains active in this real provider after the one-entry signed
             // catalog moves to B. Its retirement cannot use B's catalog facts.
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -6722,6 +6725,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/v1/chat/completions/input_tokens':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'input_tokens': 1}).encode())
+            return
         assert self.path == '/v1/chat/completions' and body['model'] == alias
         assert body['chat_template_kwargs'] == {'enable_thinking': False}
         prompt = body['messages'][0]['content']
@@ -6909,6 +6917,8 @@ server.serve_forever()
                 )
                 .await
                 .unwrap();
+            // Let pressure reach the unknown-run gate rather than the Keep gate.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
             let next_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
             next_catalog["entries"][0]["cid"] = serde_json::json!(next_cid);
