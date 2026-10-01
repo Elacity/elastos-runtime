@@ -190,10 +190,150 @@ When XDG variables are unset, the default paths are:
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
-components before installation. The installed `components.json` records what
-the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [state.md](../state.md) records
-whether exact public-manifest parity evidence has been accepted.
+components before installation. The installer and updater retain the verified
+publisher manifest; setup can stamp installed file metadata into its local
+registry. Profile membership alone therefore does not establish which files
+are installed. Exact artifact and manifest checks establish installation
+parity; the owning issue records the accepted proof.
+
+## Proposed complete release layout
+
+This contract is proposed for installation-layout review. It describes the
+intended Unix installer and updater behavior; the current installation still
+replaces the binary, manifest and support assets in sequence. Filesystem
+migration and installed acceptance require a reviewed implementation.
+
+Runtime will select one verified release set for each Home launch. The installer,
+updater and offline migration will use one installation coordinator. Home keeps
+ownership of identity, passkeys, configuration and user data throughout an
+update.
+
+### Release and Home roots
+
+Let `DATA` be the existing platform application-data directory: on Linux,
+`${XDG_DATA_HOME:-$HOME/.local/share}/elastos`; on macOS,
+`$HOME/Library/Application Support/elastos`. Let `BIN` be the existing installed
+command path, including an explicit installer `--install-dir` or trusted
+source's `install_path`. Both paths are absolute and remain stable.
+
+| Proposed path | Ownership and purpose |
+| --- | --- |
+| `DATA/install/sets/<set-id>/` | One immutable, verified release set |
+| `DATA/install/active` | Relative symlink to the selected set |
+| `DATA/install/staged` | Relative symlink to the single prepared set, when present |
+| `DATA/install/rollback` | Relative symlink to one verified prior set during a named update window |
+| `DATA/install/transaction.json` | Owner-only commit and recovery record |
+| `DATA/installation.lock` | Shared coordinator lock for install, update and migration |
+| `BIN` | Stable launcher for this Home's selected Runtime |
+| `DATA/sources.json` | Home-owned trust and transport configuration |
+| `DATA/backups/<migration-id>/` | Separate, bounded protected-root migration backup |
+
+A set contains Runtime under `bin/elastos`, the verified `components.json`,
+the selected profile's provider binaries and complete first-party capsule
+bundles, and its release-owned support files. It also contains the consumed
+signed `release-head.json`, `release.json`, and any manifest-pinned catalog,
+under `metadata/`, including the exact signed-input components bytes when setup
+materializes a local registry. A receipt binds their hashes, platform, selected
+profile, artifact member paths and installed version. Its `set-id` is the SHA-256 of
+that receipt's canonical artifact inventory. A changed profile creates a new
+set rather than modifying the active set.
+
+All set members and pointer targets stay within `DATA/install`. Archive
+admission checks paths, links and hashes before extraction becomes eligible for
+activation. Manifest installation paths such as `bin/<provider>` and
+`capsules/<app>` are relative to the selected set. Home-owned caches, downloaded
+content, model inventory, keys, policy and provider configuration remain in
+their existing data locations. Only the release-owned files listed in the
+receipt enter a set.
+
+The Home's `ElastOS/SystemServices/Publisher` directory keeps its own publishing
+output. Consumed release metadata belongs to the set's `metadata/` directory.
+The installer and updater will stop writing consumed releases into Publisher.
+
+### Command and component resolution
+
+The launcher at `BIN` resolves `active` once, checks the set receipt, and executes
+that set's Runtime with the existing Home data root. Runtime pins this same set
+root for manifest, provider, capsule and helper lookup until the process ends.
+Checksum verification uses the pinned set's manifest and artifact receipts:
+archive hashes bind fetched packages, and member hashes bind extracted files.
+All component lookups use the pinned set for the life of the process.
+
+This requires explicit changes to the existing `binaries.rs` provider lookup and
+`setup.rs` manifest/install-path resolution. Source checkout and explicit
+operator override paths keep their own provenance and verification. A release
+set admits members only through its receipt. Existing data-root component
+paths are legacy inputs for migration, rather than fallback release members.
+
+For a legacy installation, the coordinator first imports only the current
+Runtime and release-owned component files into a verified legacy set. It pins
+that set as active, then atomically replaces `BIN` with the launcher. A refusal
+before this preparation completes preserves the old executable and Home.
+Custom command paths can be on another filesystem: launcher preparation uses
+a temporary file beside `BIN`, while the release commit stays on the data
+filesystem. A rerun reads the transaction and resumes the same set.
+
+### Lock order and commit
+
+The lock order is installation lock, host-process lock, then protected-object
+mutation lock. Each host startup takes the installation lock while it resolves
+and pins a set and acquires `host-process.lock`; it then releases the
+installation lock. A running host submits update work to the coordinator and
+releases its host ownership before offline commit. It keeps using its pinned
+set while download and verification are in progress.
+
+The coordinator holds the installation lock through preparation and commit.
+It verifies the complete selected set and writes a durable `prepared` record
+before requesting the existing host to stop. It checks release of host
+ownership and cleanup of owned children before the offline phase. Automatic
+restart is a separate host lifecycle operation.
+
+The current protected-root migration helper acquires the host-process lock
+itself and requires a backup directly beneath `DATA/backups`. The proposed
+coordinator acquires host ownership once for migration and commit. Implementation
+must give that helper an internal entry point which accepts the already-held
+host guard; its standalone CLI entry keeps its own acquisition. Both then take
+the protected-object mutation lock. This preserves the existing lock boundary
+and avoids recursive host locking. Migration backup size and recovery are
+admitted before the helper mutates Home data. A failed migration restores or
+recovers its own journaled data before an older Runtime can run again.
+
+With host ownership held, the coordinator flushes the verified set and writes
+the previous and next set IDs into the transaction. It creates a replacement
+relative symlink beside `active`, then uses one same-filesystem atomic rename
+to select the new set and flushes the parent directory. This pointer rename is
+the release commit and selects Runtime and all release members together.
+
+The active receipt is authoritative for the installed release. The coordinator
+then reconciles only installed-version/head fields in `sources.json`, preserving
+Home trust and transport edits, and marks the transaction committed. Every
+install, update and host startup first recovers an unfinished transaction under
+the installation lock. Recovery after pointer commit keeps the selected Runtime,
+manifest and installed-version record consistent.
+
+### Interruption, disk and retention
+
+Before commit, interruption leaves the prior active set selected. A retry
+checks the staged receipt and resumes verified work or removes only its partial
+set. After pointer commit, recovery validates the active receipt, completes
+source-record reconciliation and accounts for migration recovery before host
+startup. An invalid committed set keeps Home stopped and gives the operator a
+specific recovery action; rollback also requires compatible or restored Home
+data. Reverting a pointer alone does not undo a data migration.
+
+Space admission covers downloads, extraction, the selected set and any
+migration backup on each affected volume. It preserves at least 10% free space,
+or the operator's higher reserve. The same reserve is checked during staging
+and before commit. Low space stops preparation while the active set remains
+usable.
+
+Retention permits one active set, one staged set and one verified rollback set
+for a named update window. The transaction records each set's owner, byte size
+and cleanup condition. A further update waits until the prior window closes.
+Migration backups have separate ownership and expiry; release cleanup preserves
+Home data and Publisher output. Completion requires exact installed journey,
+interruption/retry and low-space evidence before this layout becomes the
+installation contract.
 
 ## Capability policy
 
