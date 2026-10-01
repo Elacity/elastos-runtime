@@ -846,6 +846,22 @@ fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminal
 
     let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    // Runtime owns both original descriptors. Unrelated child processes must
+    // not retain a slave and prevent terminal cleanup from releasing a write.
+    for fd in [master_fd, slave_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            return Err(io::Error::last_os_error()).context("set PTY close-on-exec");
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error()).context("verify PTY close-on-exec");
+        }
+        if flags & libc::FD_CLOEXEC == 0 {
+            return Err(io::Error::other("PTY close-on-exec flag was not retained").into());
+        }
+    }
     Ok(HomeTerminalPty {
         input: HomeTerminalInput::Pty(master.try_clone().context("clone PTY master for input")?),
         reader: master,
@@ -1842,6 +1858,56 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(unix)]
+    fn test_home_cli_terminal_pty_descriptors_are_close_on_exec() {
+        let pty = open_home_terminal_pty(HomeTerminalSize {
+            cols: 100,
+            rows: 32,
+        })
+        .unwrap();
+        let HomeTerminalInput::Pty(input) = &pty.input;
+        for fd in [
+            pty.reader.as_raw_fd(),
+            input.as_raw_fd(),
+            pty.slave_stdin.as_raw_fd(),
+            pty.slave_stdout.as_raw_fd(),
+            pty.slave_stderr.as_raw_fd(),
+        ] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_fixture_cleanup_kills_child_on_panic() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let cleanup = TestBlockedPtyCleanup {
+            child_pid: child.id(),
+            writer: None,
+        };
+        let panic = std::panic::catch_unwind(|| {
+            let _cleanup = cleanup;
+            panic!("exercise terminal fixture assertion cleanup");
+        });
+        assert!(panic.is_err());
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("panic cleanup must terminate and reap the fixture child")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn test_home_cli_terminal_policy_revocation_releases_blocked_pty_input() {
@@ -1882,6 +1948,10 @@ mod tests {
         let child = command.spawn().unwrap();
         drop(command);
         let session = test_terminal_session(child, Some(pty.input));
+        let mut cleanup = TestBlockedPtyCleanup {
+            child_pid: session.child_pid,
+            writer: None,
+        };
         insert_home_terminal_session(session.clone()).await;
         let writing_session = session.clone();
         let completed_writes = Arc::new(AtomicU64::new(0));
@@ -1891,7 +1961,9 @@ mod tests {
             let mut input = writing_session.input.lock().await;
             let input = input.as_mut().unwrap();
             locked_tx.send(()).unwrap();
-            loop {
+            // A finite flood reaches backpressure without relying on an I/O
+            // error to stop generating new writes after the slave closes.
+            for _ in 0..32 {
                 if input
                     .write_all(&[b'x'; HOME_TERMINAL_INPUT_MAX_BYTES])
                     .await
@@ -1902,7 +1974,11 @@ mod tests {
                 progress.fetch_add(1, Ordering::SeqCst);
             }
         });
-        locked_rx.await.unwrap();
+        cleanup.writer = Some(writer.abort_handle());
+        tokio::time::timeout(Duration::from_secs(2), locked_rx)
+            .await
+            .expect("writer must acquire the input lock")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let before = completed_writes.load(Ordering::SeqCst);
@@ -1918,17 +1994,52 @@ mod tests {
         assert!(!writer.is_finished());
         std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
         spawn_home_terminal_policy_watchdog(session.session_id.clone(), dir.path().to_path_buf());
-        tokio::time::timeout(Duration::from_secs(3), session.child.lock().await.wait())
-            .await
-            .expect("policy revocation must terminate the child despite a blocked write")
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // Release the child lock on each poll so cleanup can use it.
+                if session.child.lock().await.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy revocation must terminate the child despite a blocked write");
+        cleanup.child_pid = None;
         tokio::time::timeout(Duration::from_secs(2), writer)
             .await
             .expect("child termination must release the blocked PTY writer")
             .unwrap();
-        assert!(session.input.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.input.lock().await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy revocation must close input after the blocked writer releases it");
         test_cleanup_terminal_artifacts(&session.session_id).await;
         drop(pty.reader);
+    }
+
+    #[cfg(unix)]
+    struct TestBlockedPtyCleanup {
+        child_pid: Option<u32>,
+        writer: Option<tokio::task::AbortHandle>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestBlockedPtyCleanup {
+        fn drop(&mut self) {
+            // This runs during assertion unwinding, before Tokio shuts down.
+            // Killing the only slave owner releases any pending blocking write.
+            kill_home_terminal_process(self.child_pid);
+            if let Some(writer) = &self.writer {
+                writer.abort();
+            }
+        }
     }
 
     #[test]
