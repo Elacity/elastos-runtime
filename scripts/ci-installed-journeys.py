@@ -4,12 +4,15 @@ import argparse
 import hashlib
 import json
 import os
+import runpy
 import signal
 import socket
 import subprocess
 import time
 import urllib.request
 from pathlib import Path
+
+TIMING = runpy.run_path(str(Path(__file__).with_name("ci-installed-model-timing.py")))
 
 
 def digest(path):
@@ -63,7 +66,12 @@ def run(home, data, evidence):
                 time.sleep(0.25)
         else:
             raise RuntimeError("installed Runtime health deadline")
-        subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence), str(data)], env=environment, check=True)
+        observer = TIMING["ModelTimingObserver"](child, data, started)
+        try:
+            with observer:
+                subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence), str(data)], env=environment, check=True)
+        finally:
+            record["model_timing"] = observer.receipt()
         record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
     finally:
         try:
@@ -76,6 +84,7 @@ def run(home, data, evidence):
             os.killpg(child.pid, signal.SIGKILL)
             child.wait(timeout=5)
         log.close()
+        record.setdefault("model_timing", {})["provider_stages"] = TIMING["stage_timings"](home / "journey-runtime.private.log")
         record["disk_after"] = disk_observation(data)
         record["elapsed_seconds"] = round(time.monotonic() - started, 2)
         if (evidence / "home-journey.json").exists():

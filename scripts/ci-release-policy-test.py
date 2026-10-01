@@ -259,5 +259,56 @@ class InstalledJourneyTests(unittest.TestCase):
                 self.stop.assert_not_called()
 
 
+class InstalledModelTimingTests(unittest.TestCase):
+    def setUp(self):
+        self.timing = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-model-timing.py"))
+
+    def test_public_receipt_refuses_private_text_unknown_stages_and_invalid_times(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "private.log"
+            log.write_text("\n".join([
+                "[model-provider] local timing stage=engine_ready elapsed_ms=123",
+                "[model-provider] local timing stage=run_timeout elapsed_ms=120000",
+                "[model-provider] local timing stage=operator_secret elapsed_ms=1",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=1 private=/operator/key",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=3600001",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=-1",
+                "private model text and credentials",
+            ]))
+            self.assertEqual(self.timing["stage_timings"](log), [
+                {"stage": "engine_ready", "elapsed_ms": 123},
+                {"stage": "run_timeout", "elapsed_ms": 120000},
+            ])
+
+    def test_probe_refuses_wrong_alias_malformed_and_oversize_responses(self):
+        alias = "a" * 32
+        cases = [(json.dumps({"data": [{"id": alias}]}).encode(), "matching_alias"),
+                 (json.dumps({"data": [{"id": "b" * 32}]}).encode(), "wrong_alias"),
+                 (b"private malformed response", "unavailable"),
+                 (b"x" * 16385, "oversize")]
+        for body, expected in cases:
+            with self.subTest(expected=expected), mock.patch("socket.socket") as connect:
+                wire = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                connect.return_value.__enter__.return_value.recv.side_effect = [wire, b""]
+                self.assertEqual(self.timing["matching_alias"]("/owned.engine.sock", alias), expected)
+
+    def test_observer_refuses_unrelated_processes_and_foreign_engine_paths(self):
+        data = Path("/isolated/data/elastos")
+        engine = (f"{data}/libexec/llama-server -m /model --host /owned.engine.sock "
+                  f"--ctx-size 4096 --alias {'a' * 32}")
+        rows = {2: (1, str(data / "bin/model-provider")),
+                3: (2, str(data / "bin/model-provider") + " --internal-local-llama-guard"),
+                4: (3, engine)}
+        observe = self.timing["owned_engine"]
+        self.assertEqual(list(observe(rows, 1, data)), [(4, "/owned.engine.sock", "a" * 32)])
+        self.assertEqual(list(observe(rows, 9, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (3, engine.replace(str(data), "/foreign"))}, 1, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (2, engine)}, 1, data)), [])
+        for guard in ("/foreign/guard --internal-local-llama-guard",
+                      str(data / "bin/model-provider") + " --internal-local-llama-guard extra"):
+            with self.subTest(guard=guard):
+                self.assertEqual(list(observe({**rows, 3: (2, guard)}, 1, data)), [])
+
+
 if __name__ == "__main__":
     unittest.main()
