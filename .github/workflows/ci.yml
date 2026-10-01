@@ -145,9 +145,13 @@ jobs:
         with:
           node-version: '26'
       - name: install content boundary browser fixture
+        timeout-minutes: 5
+        env:
+          DEBUG: pw:install
         run: |
-          npm install --prefix "${RUNNER_TEMP}/content-sandbox-browser" --no-save --package-lock=false playwright@1.59.1
-          "${RUNNER_TEMP}/content-sandbox-browser/node_modules/.bin/playwright" install chromium --with-deps
+          # 1.60 fixes ZIP extraction hanging on Node 26 (Playwright #40747).
+          npm install --prefix "${RUNNER_TEMP}/content-sandbox-browser" --no-save --package-lock=false playwright@1.60.0
+          "${RUNNER_TEMP}/content-sandbox-browser/node_modules/.bin/playwright" install chromium --with-deps --only-shell
       - name: gateway content sandbox browser regression
         working-directory: elastos
         env:
