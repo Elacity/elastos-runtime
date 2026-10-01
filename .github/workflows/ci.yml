@@ -181,9 +181,11 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+      # Playwright 1.59.1's installer hangs extracting Chromium under Node 26;
+      # the smokes themselves run on Node 26 below.
       - uses: actions/setup-node@v4
         with:
-          node-version: '26'
+          node-version: '24'
       # Saved straight after install: the smokes may fail, and actions/cache
       # only saves when the whole job succeeds.
       - name: restore Playwright browsers
@@ -205,6 +207,9 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
       - name: browser layout smokes
         run: just product-ui-browser
 
