@@ -55,6 +55,14 @@ target.
 | Updates | `elastos update`, `elastos upgrade` | `upgrade` dispatches to the same update handler. Discovery may use Carrier or explicit gateways, but no local runtime is required. |
 | Offline principal-root maintenance | hidden `elastos principal-root-migrate`, hidden `elastos principal-root-upgrade` | Operates on an explicit data directory. The Runtime must be offline and the command requires explicit backup inputs. |
 
+The host operator sets accepted public gateway authorities with
+`elastos config set gateway_allowed_hosts '["home.example.com"]'`, then restarts
+the gateway. Each authority includes its port when it uses a non-default port.
+The gateway also accepts its configured bind authority and exact-port loopback
+aliases. A public publisher can expose the Carrier ticket and node ID with
+`elastos config set gateway_public_publisher_bootstrap true`; its publisher
+bootstrap omits the Runtime DID. The default bootstrap requires caller authority.
+
 ## Trust, content, and publishing
 
 | Command family | Class | Included behavior |

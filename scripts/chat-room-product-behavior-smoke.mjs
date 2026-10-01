@@ -9,11 +9,12 @@ const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const chatIndexPath = resolve(repoRoot, "capsules/chat-room/browser/index.html");
 const source = readFileSync(chatIndexPath, "utf8");
 
-function extractInlineScript(needle) {
-  const blocks = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  const match = blocks.find((entry) => entry[1].includes(needle));
-  assert(match, `missing inline script for ${needle}`);
-  return match[1];
+function extractScript(needle) {
+  const scripts = [...source.matchAll(/<script src="\.\/([^"?]+)(?:\?[^"]*)?"><\/script>/g)]
+    .map((entry) => readFileSync(resolve(repoRoot, "capsules/chat-room/browser", entry[1]), "utf8"));
+  const script = scripts.find((entry) => entry.includes(needle));
+  assert(script, `missing script for ${needle}`);
+  return script;
 }
 
 class FakeElement {
@@ -190,8 +191,8 @@ function plainJson(value) {
 }
 
 function main() {
-  const accessModeScript = extractInlineScript("data-room-access-mode");
-  const behaviorScript = extractInlineScript("function announceHomeChrome()");
+  const accessModeScript = extractScript("data-room-access-mode");
+  const behaviorScript = extractScript("function announceHomeChrome()");
   const env = createEnvironment();
 
   vm.runInContext(accessModeScript, env.context);

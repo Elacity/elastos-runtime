@@ -104,7 +104,12 @@ async fn start_gateway_server_with_shutdown(
         ),
         None => None,
     };
-    let gateway_api_url = trusted_gateway_api_url(addr)?;
+    let gateway_api_url = if addr.parse::<axum::http::uri::Authority>()?.port_u16() == Some(0) {
+        trusted_gateway_api_url(&listener.local_addr()?.to_string())?
+    } else {
+        trusted_gateway_api_url(addr)?
+    };
+    super::gateway_frontdoor::GatewayFrontDoor::load(&data_dir, &gateway_api_url)?;
     let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let state = GatewayState {
         carrier_endpoint: collaboration.carrier_endpoint,
