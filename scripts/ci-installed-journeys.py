@@ -20,6 +20,12 @@ def digest(path):
     return value.hexdigest()
 
 
+def disk_observation(data):
+    usage = os.statvfs(data)
+    return {"capacity_bytes": usage.f_blocks * usage.f_frsize,
+            "available_bytes": usage.f_bavail * usage.f_frsize}
+
+
 def run(home, data, evidence):
     installed = data / "bin/elastos"
     receipt = json.loads((data / "receipts/source-home-installation.json").read_text())
@@ -31,6 +37,10 @@ def run(home, data, evidence):
     record = {"candidate": candidate, "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
               "installed_runtime_sha256": runtime_sha, "installation_receipt_sha256": digest(data / "receipts/source-home-installation.json"),
               "fixture_components_sha256": digest(data / "components.json"), "results": {}}
+    record["disk_before"] = disk_observation(data)
+    (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
+    if record["disk_before"]["available_bytes"] * 100 < record["disk_before"]["capacity_bytes"] * 12:
+        raise RuntimeError("installed journey requires 12% free disk")
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / ".local/share"))
     with socket.socket() as port:
         port.bind(("127.0.0.1", 0))
@@ -53,7 +63,7 @@ def run(home, data, evidence):
                 time.sleep(0.25)
         else:
             raise RuntimeError("installed Runtime health deadline")
-        subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence)], env=environment, check=True)
+        subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence), str(data)], env=environment, check=True)
         record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
     finally:
         try:
@@ -66,6 +76,7 @@ def run(home, data, evidence):
             os.killpg(child.pid, signal.SIGKILL)
             child.wait(timeout=5)
         log.close()
+        record["disk_after"] = disk_observation(data)
         record["elapsed_seconds"] = round(time.monotonic() - started, 2)
         if (evidence / "home-journey.json").exists():
             record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])

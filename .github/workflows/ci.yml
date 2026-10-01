@@ -488,11 +488,74 @@ jobs:
             "${RUNNER_TEMP}/kubo-cache" \
             "${HOME}/.elastos-ci/source-home/Library/Application Support/elastos" \
             darwin-arm64
-      - name: require 16 GiB free disk
+      - name: reclaim unused stock Xcode and require build headroom
         run: |
           set -euo pipefail
-          df -Pk .
-          df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
+          python3 - <<'PYCODE'
+          import json, os, re, shutil, stat, subprocess
+          from pathlib import Path
+
+          def unused_xcodes(applications, selected):
+              applications = applications.resolve(strict=True)
+              protected = set()
+              for path in selected:
+                  resolved = path.resolve(strict=True)
+                  for bundle in (resolved, *resolved.parents):
+                      if bundle.parent == applications and bundle.suffix == ".app":
+                          protected.add(bundle)
+                          break
+              return sorted(path for path in applications.iterdir()
+                            if re.fullmatch(r"Xcode_[0-9]+(?:\.[0-9]+)*\.app", path.name)
+                            and not path.is_symlink() and path.is_dir()
+                            and path.resolve(strict=True) not in protected)
+
+          def identity(path):
+              value = path.lstat()
+              return value.st_dev, value.st_ino, value.st_mode
+
+          def selected_xcodes():
+              selected = [Path(subprocess.check_output(["xcode-select", "-p"], text=True).strip())]
+              if os.environ.get("DEVELOPER_DIR"):
+                  selected.append(Path(os.environ["DEVELOPER_DIR"]))
+              generic = Path("/Applications/Xcode.app")
+              if generic.exists() or generic.is_symlink():
+                  selected.append(generic)
+              return selected
+
+          if (os.environ.get("GITHUB_ACTIONS"), os.environ.get("RUNNER_ENVIRONMENT"),
+              os.environ.get("RUNNER_OS")) != ("true", "github-hosted", "macOS"):
+              raise SystemExit("stock Xcode reclaim requires a GitHub-hosted Mac")
+          applications = Path("/Applications")
+          root_identity = identity(applications)
+          if not stat.S_ISDIR(root_identity[2]):
+              raise SystemExit("/Applications must be a physical directory")
+          selected = selected_xcodes()
+          candidates = {path: identity(path) for path in unused_xcodes(applications, selected)}
+          usage = shutil.disk_usage(".")
+          # setup-source-home documents a roughly 10 GiB cold-build footprint.
+          # Leave 12 GiB for that build and retain 12% for installed journeys.
+          required = max((usage.total * 15 + 99) // 100,
+                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          print(json.dumps({"stage": "before", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required,
+                            "selected": [str(path.resolve(strict=True)) for path in selected],
+                            "unused_stock_xcode": [path.name for path in candidates]}), flush=True)
+          for path in candidates:
+              if usage.free >= required:
+                  break
+              still_unused = unused_xcodes(applications, selected_xcodes())
+              if identity(applications) != root_identity or identity(path) != candidates[path]:
+                  raise SystemExit("stock Xcode reclaim scope identity changed")
+              if not stat.S_ISDIR(identity(path)[2]) or path not in still_unused:
+                  raise SystemExit("stock Xcode reclaim candidate became protected or changed type")
+              print("Reclaim unused stock Xcode: " + path.name, flush=True)
+              subprocess.run(["sudo", "rm", "-rf", "--", str(path)], check=True)
+              usage = shutil.disk_usage(".")
+          print(json.dumps({"stage": "after", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required}), flush=True)
+          if usage.free < required:
+              raise SystemExit("stock Xcode reclaim did not provide build headroom")
+          PYCODE
       - name: install host prerequisites
         run: brew install e2fsprogs coturn ffmpeg
       - name: source-home into isolated MAC_TEST_HOME
@@ -515,6 +578,16 @@ jobs:
             install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
           done
           export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
+          python3 - <<'PYCODE'
+          import json, shutil
+          usage = shutil.disk_usage(".")
+          required = max((usage.total * 15 + 99) // 100,
+                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          print(json.dumps({"stage": "before_source_home", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required}), flush=True)
+          if usage.free < required:
+              raise SystemExit("source-home build headroom is unavailable after host prerequisites")
+          PYCODE
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"

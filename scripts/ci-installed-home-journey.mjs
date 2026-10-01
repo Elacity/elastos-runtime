@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statfsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { MODEL_TEXT_INPUT_SCHEMA } from "../capsules/assistant/browser/model-contract.js";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
-const [base, evidence] = process.argv.slice(2);
+const [base, evidence, data] = process.argv.slice(2);
 const { cid } = JSON.parse(readFileSync(join(evidence, "package.json")));
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -20,6 +20,11 @@ await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
 } });
 let stage = "sign_in";
 const results = {};
+const disk = {};
+function observeDisk() {
+  const usage = statfsSync(data);
+  return { capacity_bytes: usage.blocks * usage.bsize, available_bytes: usage.bavail * usage.bsize };
+}
 async function app(target) {
   const shell = page.frameLocator("#active-shell-frame");
   const [control, surface] = {
@@ -40,7 +45,12 @@ async function request(frame, path, body) {
     const response = await fetch(path, { method: body ? "POST" : "GET",
       headers: { "x-elastos-home-token": token, ...(body ? { "content-type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(35000) });
-    if (!response.ok) throw new Error(`Runtime request failed: ${path} ${response.status}`);
+    if (!response.ok) {
+      const failure = await response.json().catch(() => ({}));
+      // Retain the public protocol code; response text can contain operator data.
+      const code = typeof failure.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(failure.code) ? failure.code : "unavailable";
+      throw new Error(`Runtime request failed: ${path} ${response.status} code=${code}`);
+    }
     return response.json();
   }, { path, body });
 }
@@ -70,6 +80,7 @@ try {
   const interfaces = await request(marketplace, "/api/capsules/interfaces");
   const content = interfaces.interfaces.find(row => row.capsule === "marketplace" && row.bindings.some(b => b.method === "content.use" && b.executable));
   assert(content, "Marketplace declares Content Use");
+  disk.before_content_use = observeDisk();
   const used = await request(marketplace, "/api/capsules/interfaces/invoke", {
     capsule: "marketplace", interface: content.interface.id, method: "content.use",
     request_id: `ci-use-${randomUUID()}`, input: { cid },
@@ -107,10 +118,11 @@ try {
   assert.equal(typeof text, "string");
   assert(text.trim().length > 0);
   results.installed_runtime_reply = "passed";
-  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, reply_characters: text.length, model_cid: cid }, null, 2));
+  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, reply_characters: text.length, model_cid: cid }, null, 2));
 } catch (error) {
   results[stage] = "failed";
-  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, failure_stage: stage, failure: error.message }, null, 2));
+  disk.at_failure = observeDisk();
+  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, failure_stage: stage, failure: error.message }, null, 2));
   await page.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
   throw error;
 } finally {
