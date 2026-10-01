@@ -87,7 +87,7 @@ pub(in crate::api) fn admit_passkey_begin(
     data_dir: &Path,
     peer: Option<SocketAddr>,
     path: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let Some(kind) = CeremonyKind::from_path(path) else {
         return Ok(());
     };
@@ -102,12 +102,14 @@ pub(in crate::api) fn admit_passkey_begin(
     if admitted {
         Ok(())
     } else {
-        Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", "60")],
-            "Passkey sign-in is busy. Try again shortly.",
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "60")],
+                "Passkey sign-in is busy. Try again shortly.",
+            )
+                .into_response(),
+        ))
     }
 }
 

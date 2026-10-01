@@ -4378,7 +4378,7 @@ mod tests {
                 .map(|peer| peer.0);
             if let Err(response) = admit_passkey_begin(&state.data_dir, peer, request.uri().path())
             {
-                return response;
+                return *response;
             }
             next.run(request).await
         }

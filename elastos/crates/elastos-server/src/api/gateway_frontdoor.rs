@@ -269,7 +269,7 @@ pub(super) async fn gateway_admission(
         if let Err(response) =
             super::super::auth_gateway::admit_passkey_begin(&state.data_dir, peer, path)
         {
-            return response;
+            return *response;
         }
     }
     let opaque = origin == Some("null");
