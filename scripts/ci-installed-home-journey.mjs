@@ -22,9 +22,12 @@ let stage = "sign_in";
 const results = {};
 async function app(target) {
   const shell = page.frameLocator("#active-shell-frame");
-  await shell.locator("#launcher-toggle").click();
-  await shell.locator(`#launcher-grid [data-target="${target}"]`).first().click();
-  const iframe = shell.locator(`section.window[data-target="${target}"] iframe.window-frame`).last();
+  const [control, surface] = {
+    marketplace: ['.taskbar-item[data-target="marketplace"]', 'section.window[data-target="marketplace"] iframe.window-frame'],
+    assistant: ["#assistant-toggle", "#assistant-space-frame"],
+  }[target];
+  await shell.locator(control).click();
+  const iframe = shell.locator(surface).last();
   await iframe.waitFor({ state: "visible", timeout: 30000 });
   const frame = await (await iframe.elementHandle()).contentFrame();
   await frame.waitForURL(url => url.pathname.startsWith(`/apps/${target}/`));
@@ -51,6 +54,11 @@ try {
   await page.waitForFunction(() => document.body.dataset.homeStatus === "ready" && document.body.dataset.homeAuthority === "signed", null, { timeout: 60000 });
   const shell = page.frameLocator("#active-shell-frame");
   await shell.locator("#desktop").waitFor({ state: "visible", timeout: 30000 });
+  const setupReminder = shell.locator("#setup-sheet");
+  if (await setupReminder.isVisible()) {
+    await shell.locator("#setup-sheet-close").click();
+    await setupReminder.waitFor({ state: "hidden", timeout: 5000 });
+  }
   await page.screenshot({ path: join(evidence, "home-desktop.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await shell.locator("#desktop").waitFor({ state: "visible" });
