@@ -893,6 +893,12 @@ verify_signature "${TMPDIR}/release-head.json" "elastos.release.head.v1" "$MAINT
 
 RELEASE_CID=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["latest_release_cid"]')
 RELEASE_VERSION=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["version"]')
+# Keep these release-version expressions in sync with scripts/check-versioning.sh.
+release_version_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+release_version_meta='(\+[0-9A-Za-z.-]+)?'
+release_version_preferred="^${release_version_core}(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?${release_version_meta}$"
+[[ "$RELEASE_VERSION" =~ $release_version_preferred ]] \
+    || die "Invalid signed release version '${RELEASE_VERSION}'; ask the publisher for a release that follows the version policy"
 RELEASE_CHANNEL=$(json_get "${TMPDIR}/release-head.json" 'd["payload"].get("channel","stable")')
 if ! is_allowed_channel "$RELEASE_CHANNEL"; then
     die "Unsupported release channel '${RELEASE_CHANNEL}' in release-head.json. Allowed channels: ${ALLOWED_CHANNELS[*]}"

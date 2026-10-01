@@ -122,14 +122,25 @@ where
 
 /// An empty installed version is the legacy first-install state. Every
 /// nonempty version must have exact SemVer syntax before it is compared.
+pub(crate) fn parse_installed_release_version(
+    installed: &str,
+) -> anyhow::Result<Option<semver::Version>> {
+    if installed.is_empty() {
+        return Ok(None);
+    }
+    semver::Version::parse(installed).map(Some).map_err(|err| {
+        anyhow::anyhow!(
+            "Invalid installed release version '{installed}': {err}. Repair: run 'elastos update --force' locally on this Home to install the signed release and restore installed_version"
+        )
+    })
+}
+
 pub fn compare_release_versions(installed: &str, offered: &str) -> anyhow::Result<Ordering> {
     let offered = semver::Version::parse(offered)
         .map_err(|err| anyhow::anyhow!("Invalid signed release version '{offered}': {err}"))?;
-    if installed.is_empty() {
+    let Some(installed) = parse_installed_release_version(installed)? else {
         return Ok(Ordering::Greater);
-    }
-    let installed = semver::Version::parse(installed)
-        .map_err(|err| anyhow::anyhow!("Invalid installed release version '{installed}': {err}"))?;
+    };
     Ok(offered.cmp_precedence(&installed))
 }
 
@@ -803,7 +814,16 @@ async fn run_upgrade_from_head(
         }
     );
 
-    let version_order = compare_release_versions(current_version, version)?;
+    let comparison_version = if force
+        && !current_version.is_empty()
+        && semver::Version::parse(current_version).is_err()
+    {
+        println!("  Repairing invalid installed release version '{current_version}' with the signed release.");
+        ""
+    } else {
+        current_version
+    };
+    let version_order = compare_release_versions(comparison_version, version)?;
     match version_order {
         Ordering::Equal if !force => {
             println!();
@@ -949,6 +969,10 @@ async fn run_upgrade_from_head(
         }
     }
     println!("  Components verified (SHA-256 ✓)");
+    crate::setup::validate_update_components_manifest(
+        &comp_data,
+        &crate::setup::detect_platform(),
+    )?;
 
     // 10. Atomic replace binary
     let bin_path = if source.install_path.is_empty() {
@@ -1166,6 +1190,211 @@ mod tests {
             assert!(compare_release_versions("0.7.0", invalid).is_err());
             assert!(compare_release_versions(invalid, "0.7.1").is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn update_admission_refusals_preserve_binary_manifest_and_source() {
+        for (installed, force, checksum, strategy, expected) in [
+            (
+                "unknown",
+                false,
+                Some(format!("sha256:{}", "a".repeat(64))),
+                None,
+                "elastos update --force",
+            ),
+            (
+                "0.7.0",
+                false,
+                None,
+                None,
+                "requires a SHA-256 or SHA-512 checksum",
+            ),
+            (
+                "unknown",
+                true,
+                None,
+                None,
+                "requires a SHA-256 or SHA-512 checksum",
+            ),
+            (
+                "0.7.0",
+                false,
+                Some("sha256:bad".to_string()),
+                None,
+                "requires a SHA-256 or SHA-512 checksum",
+            ),
+            (
+                "0.7.0",
+                false,
+                Some(format!("sha256:{}", "a".repeat(64))),
+                Some("local-copy"),
+                "development installation strategy",
+            ),
+            (
+                "0.7.0",
+                false,
+                Some(format!("sha256:{}", "a".repeat(64))),
+                Some("source-build"),
+                "development installation strategy",
+            ),
+        ] {
+            let components = serde_json::to_vec(&serde_json::json!({
+                "external": {"model-provider": {"platforms": {
+                    (crate::setup::detect_platform()): {"checksum": checksum, "strategy": strategy}
+                }}}, "profiles": {}
+            }))
+            .unwrap();
+            let (data, source, head, head_bytes, release_cid, fetch) =
+                admission_fixture(installed, components);
+            let before_source = std::fs::read(data.path().join("sources.json")).unwrap();
+            let result = run_upgrade_from_head(
+                &fetch,
+                &head,
+                &head_bytes,
+                None,
+                "0.7.1",
+                &release_cid,
+                None,
+                installed,
+                &source,
+                data.path(),
+                false,
+                &[],
+                true,
+                force,
+                "fixture",
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(result.to_string().contains(expected), "{result:#}");
+            assert_eq!(std::fs::read(&source.install_path).unwrap(), b"old binary");
+            assert_eq!(
+                std::fs::read(data.path().join("components.json")).unwrap(),
+                b"{ \"external\": {}, \"profiles\": {} }"
+            );
+            assert_eq!(
+                std::fs::read(data.path().join("sources.json")).unwrap(),
+                before_source
+            );
+        }
+    }
+
+    #[test]
+    fn update_manifest_admission_accepts_checksums_on_alias_and_wildcard_platforms() {
+        for platform_key in ["x86_64-linux", "*"] {
+            for checksum in [
+                format!("sha256:{}", "a".repeat(64)),
+                format!("sha512:{}", "A".repeat(128)),
+            ] {
+                let manifest = serde_json::to_vec(&serde_json::json!({
+                    "external": {"provider": {"platforms": {
+                        (platform_key): {"checksum": checksum},
+                        "darwin-arm64": {"strategy": "source-build"}
+                    }}}, "profiles": {}
+                }))
+                .unwrap();
+                crate::setup::validate_update_components_manifest(&manifest, "linux-amd64")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forced_signed_update_repairs_invalid_installed_version() {
+        let components = b"{\"external\":{},\"profiles\":{}}".to_vec();
+        let (data, source, head, head_bytes, release_cid, fetch) =
+            admission_fixture("unknown", components.clone());
+        run_upgrade_from_head(
+            &fetch,
+            &head,
+            &head_bytes,
+            None,
+            "0.7.1",
+            &release_cid,
+            None,
+            "unknown",
+            &source,
+            data.path(),
+            false,
+            &[],
+            true,
+            true,
+            "fixture",
+            None,
+        )
+        .await
+        .unwrap();
+        let sources = load_trusted_sources(data.path()).unwrap();
+        assert_eq!(sources.default_source().unwrap().installed_version, "0.7.1");
+        assert_eq!(
+            std::fs::read(data.path().join("components.json")).unwrap(),
+            components
+        );
+        assert_eq!(
+            std::fs::read(&source.install_path).unwrap(),
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n"
+        );
+    }
+
+    fn admission_fixture(
+        installed: &str,
+        components: Vec<u8>,
+    ) -> (
+        tempfile::TempDir,
+        TrustedSource,
+        serde_json::Value,
+        Vec<u8>,
+        String,
+        FetchFn,
+    ) {
+        use sha2::Digest;
+        let data = tempfile::tempdir().unwrap();
+        let binary = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n".to_vec();
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+                "platforms": {(detect_release_platform()): {
+                    "binary": {"cid": "binary", "sha256": hex::encode(sha2::Sha256::digest(&binary))},
+                    "components": {"cid": "components", "sha256": hex::encode(sha2::Sha256::digest(&components))}
+                }}
+            }),
+            "elastos.release.v1",
+        );
+        let head_bytes = binding_envelope(binding_head(&release), "elastos.release.head.v1");
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did).unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [did], "channel": "stable",
+            "installed_version": installed, "install_path": data.path().join("elastos")
+        }))
+        .unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source.clone());
+        save_trusted_sources(data.path(), &sources).unwrap();
+        std::fs::write(&source.install_path, b"old binary").unwrap();
+        std::fs::write(
+            data.path().join("components.json"),
+            b"{ \"external\": {}, \"profiles\": {} }",
+        )
+        .unwrap();
+        let release_cid = raw_cid(&release);
+        let requested_release = release_cid.clone();
+        let fetch: FetchFn = Box::new(move |cid, _| {
+            let bytes = if cid == requested_release {
+                release.clone()
+            } else if cid == "binary" {
+                binary.clone()
+            } else if cid == "components" {
+                components.clone()
+            } else {
+                panic!("unexpected artifact request")
+            };
+            Box::pin(async move { Ok(bytes) })
+        });
+        (data, source, head, head_bytes, release_cid, fetch)
     }
 
     #[test]

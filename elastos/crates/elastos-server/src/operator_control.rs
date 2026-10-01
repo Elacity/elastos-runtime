@@ -433,6 +433,7 @@ pub async fn gather_local_node_status(data_dir: &Path) -> Result<OperatorNodeSta
 
 pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdateCheck> {
     let source = load_default_trusted_source(data_dir)?;
+    crate::update::parse_installed_release_version(&source.installed_version)?;
     let primary_publisher =
         source.publisher_dids.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
@@ -499,6 +500,7 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
 
 pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> {
     let source = load_default_trusted_source(data_dir)?;
+    crate::update::parse_installed_release_version(&source.installed_version)?;
     let source_name = source.name.clone();
     let channel = normalized_channel(&source);
     let previous_version = source.installed_version.clone();
@@ -1656,6 +1658,28 @@ mod tests {
     use axum::{Json, Router};
     use elastos_runtime::signature::generate_keypair;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn operator_refuses_invalid_installed_version_with_local_repair_hint() {
+        let data = tempfile::tempdir().unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(
+            serde_json::from_value(serde_json::json!({
+                "name": "fixture", "installed_version": "unknown"
+            }))
+            .unwrap(),
+        );
+        crate::sources::save_trusted_sources(data.path(), &sources).unwrap();
+        for result in [
+            gather_local_update_check(data.path()).await.map(|_| ()),
+            apply_local_update(data.path()).await.map(|_| ()),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("elastos update --force"));
+        }
+    }
 
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");

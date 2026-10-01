@@ -42,6 +42,39 @@ pub struct ComponentsManifest {
     pub model_catalog: Option<ModelCatalogConfig>,
 }
 
+/// Admit the publisher's exact manifest before update replaces installed artifacts.
+pub fn validate_update_components_manifest(bytes: &[u8], platform: &str) -> anyhow::Result<()> {
+    let manifest: ComponentsManifest = serde_json::from_slice(bytes)?;
+    for (name, component) in &manifest.external {
+        let Some(info) = resolve_platform_info(component, platform) else {
+            continue;
+        };
+        anyhow::ensure!(
+            !matches!(
+                info.strategy.as_deref(),
+                Some("local-copy" | "source-build")
+            ),
+            "Update component {name} for {platform} uses a development installation strategy"
+        );
+        // Keep checksum syntax aligned with checksum_error() in
+        // scripts/components-release-integrity-check.py; update requires every selected entry.
+        let valid = info.checksum.as_deref().is_some_and(|checksum| {
+            let digest = checksum
+                .strip_prefix("sha256:")
+                .map(|digest| (digest, 64))
+                .or_else(|| checksum.strip_prefix("sha512:").map(|digest| (digest, 128)));
+            digest.is_some_and(|(digest, size)| {
+                digest.len() == size && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        });
+        anyhow::ensure!(
+            valid,
+            "Update component {name} for {platform} requires a SHA-256 or SHA-512 checksum"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCatalogConfig {
