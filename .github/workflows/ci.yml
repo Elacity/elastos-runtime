@@ -210,8 +210,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
+      # The smokes default to a macOS Brave install unless BRAVE_BIN is set.
       - name: browser layout smokes
-        run: just product-ui-browser
+        run: |
+          BRAVE_BIN="$(cd elastos/tools/browser-playwright-engine && node -p "require('playwright').chromium.executablePath()")"
+          export BRAVE_BIN
+          just product-ui-browser
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
