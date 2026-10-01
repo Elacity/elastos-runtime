@@ -1271,11 +1271,9 @@ async fn bind_carrier_endpoint(
     })?;
     match bound.bind().await {
         Ok(endpoint) => Ok(endpoint),
-        Err(error) if !allow_ephemeral_fallback => {
-            anyhow::bail!(
-                "Failed to bind requested Carrier address {requested_bind_addr}: {error}"
-            );
-        }
+        Err(error) if !allow_ephemeral_fallback => Err(error).with_context(|| {
+            format!("Failed to bind requested Carrier address {requested_bind_addr}")
+        }),
         Err(_) => builder()?
             .bind()
             .await
@@ -1324,7 +1322,32 @@ async fn bind_short_lived_carrier_dial_bound(
     let secret_key = SecretKey::from_bytes(&rng_bytes);
     let endpoint = match bind_addr {
         Some(address) => {
-            bind_carrier_endpoint(secret_key, network, approved.as_ref(), address, false).await?
+            // The pinned UDP transport schedules physical close after endpoint shutdown.
+            // A sequential setup fetch waits only for its exact configured address.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                match bind_carrier_endpoint(
+                    secret_key.clone(),
+                    network,
+                    approved.as_ref(),
+                    address,
+                    false,
+                )
+                .await
+                {
+                    Ok(endpoint) => break endpoint,
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                        }) && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         None => short_lived_endpoint_builder(secret_key, network, approved.as_ref())?
             .bind()
@@ -10217,6 +10240,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn carrier_configured_short_lived_bind_waits_for_port_release() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind_addr = occupied.local_addr().unwrap();
+        let releasing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(occupied);
+        });
+        let peer = SecretKey::from_bytes(&[141; 32]).public();
+        let addr = iroh::EndpointAddr::from(peer)
+            .with_addrs([iroh::TransportAddr::Ip("127.0.0.1:9".parse().unwrap())]);
+        let (endpoint, _) = bind_short_lived_carrier_dial_bound(addr, Some(bind_addr))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.bound_sockets(), vec![bind_addr]);
+        releasing.await.unwrap();
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
     async fn carrier_configured_setup_fetch_owns_fixed_port() {
         let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .clear_ip_transports()
@@ -10288,9 +10330,22 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
             assert_eq!(bytes, b"fixture");
-            // The next component can immediately take the same configured port.
-            drop(std::net::UdpSocket::bind(bind_addr).unwrap());
         }
+        // The second fetch exercises same-address reuse while transport disposal completes.
+        // Physical release follows the pinned transport's bounded asynchronous close.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match std::net::UdpSocket::bind(bind_addr) {
+                    Ok(socket) => break drop(socket),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("configured Carrier port release failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("configured Carrier port must be released after fetch cleanup");
         tokio::time::timeout(Duration::from_secs(5), serving)
             .await
             .unwrap()
