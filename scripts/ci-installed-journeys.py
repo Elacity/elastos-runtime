@@ -41,7 +41,7 @@ def run(home, data, evidence):
     (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
     if record["disk_before"]["available_bytes"] * 100 < record["disk_before"]["capacity_bytes"] * 12:
         raise RuntimeError("installed journey requires 12% free disk")
-    environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / ".local/share"))
+    environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(data.parent))
     with socket.socket() as port:
         port.bind(("127.0.0.1", 0))
         number = port.getsockname()[1]

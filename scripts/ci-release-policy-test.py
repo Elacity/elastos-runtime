@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Check CI release/cache decisions without builds, Docker, or publication."""
 import os
+import hashlib
+import json
 from pathlib import Path
 import re
+import runpy
+import signal
 import subprocess
+import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
@@ -175,6 +181,82 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-capsules", "source-home-linux", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+
+class InstalledJourneyTests(unittest.TestCase):
+    def fixture(self, root, platform):
+        home = root / "home"
+        data = home / ("Library/Application Support/elastos" if platform == "macos"
+                       else ".local/share/elastos")
+        evidence = root / "evidence"
+        (data / "bin").mkdir(parents=True)
+        (data / "receipts").mkdir()
+        evidence.mkdir()
+        runtime = data / "bin/elastos"
+        runtime.write_bytes(b"installed fixture Runtime")
+        receipt = {"source": {"commit": "c" * 40}, "runtime": {
+            "installed_sha256": "sha256:" + hashlib.sha256(runtime.read_bytes()).hexdigest()}}
+        (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+        (data / "components.json").write_text("{}")
+        return home, data, evidence, receipt
+
+    def execute(self, home, data, evidence, available=20):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        child = mock.Mock(pid=12345)
+        child.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+
+        def node_journey(*args, **kwargs):
+            (evidence / "home-journey.json").write_text(json.dumps({"results": {
+                "home_screenshots": "passed", "model_package_admission": "passed",
+                "installed_runtime_reply": "passed"}}))
+
+        with mock.patch.dict(os.environ, {"PATH": "/fixture-tools"}, clear=True), \
+                mock.patch.object(subprocess, "check_output", return_value="c" * 40 + "\n"), \
+                mock.patch.object(subprocess, "Popen", return_value=child) as gateway, \
+                mock.patch.object(subprocess, "run", side_effect=node_journey) as node, \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(os, "killpg") as stop, \
+                mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
+                    "capacity_bytes": 100, "available_bytes": available}}):
+            try:
+                journey["run"](home, data, evidence)
+            finally:
+                self.gateway, self.node, self.stop = gateway, node, stop
+        return child
+
+    def test_gateway_and_node_share_the_installed_fixture_root(self):
+        for platform in ("macos", "linux"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), platform)
+                child = self.execute(home, data, evidence)
+                self.assertEqual(self.gateway.call_args.args[0][:2],
+                                 [str(data / "bin/elastos"), "gateway"])
+                self.assertEqual(self.node.call_args.args[0][:2],
+                                 ["node", "scripts/ci-installed-home-journey.mjs"])
+                for process in (self.gateway, self.node):
+                    env = process.call_args.kwargs["env"]
+                    self.assertEqual(env["HOME"], str(home))
+                    self.assertEqual(Path(env["XDG_DATA_HOME"]) / "elastos", data)
+                    self.assertEqual(env["PATH"], "/fixture-tools")
+                self.stop.assert_called_once_with(child.pid, signal.SIGTERM)
+                child.wait.assert_called_once_with(timeout=15)
+
+    def test_receipt_hash_and_disk_refuse_launch(self):
+        for failure in ("receipt", "hash", "disk"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, receipt = self.fixture(Path(temp), "macos")
+                if failure == "receipt":
+                    receipt["source"]["commit"] = "d" * 40
+                    (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+                elif failure == "hash":
+                    (data / "bin/elastos").write_bytes(b"changed fixture Runtime")
+                with self.assertRaises(RuntimeError if failure == "disk" else AssertionError):
+                    self.execute(home, data, evidence, available=11 if failure == "disk" else 20)
+                self.gateway.assert_not_called()
+                self.node.assert_not_called()
+                self.stop.assert_not_called()
 
 
 if __name__ == "__main__":
