@@ -158,7 +158,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "test-elastos": ("test-elastos", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
-            "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
+            "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
@@ -167,7 +167,10 @@ class ReleasePolicyTests(unittest.TestCase):
             self.assertEqual(field(JOBS[job], "name"), name)
             self.assertEqual(field(JOBS[job], "runs-on"), runner)
         self.assertEqual(field(JOBS["source-home-linux"], "os"),
-                         "[ubuntu-24.04, ubuntu-24.04-arm]")
+                         "[ubuntu-24.04, ubuntu-22.04-arm]")
+        self.assertIn("          - os: ubuntu-22.04-arm\n"
+                      "            check_name: ubuntu-24.04-arm\n",
+                      JOBS["source-home-linux"])
         needs = JOBS["release"].split("    needs:\n", 1)[1].split("    permissions:\n", 1)[0]
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-capsules", "source-home-linux", "source-home-macos"])
