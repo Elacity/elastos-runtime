@@ -2079,15 +2079,6 @@ pub(crate) fn install_signed_model_catalog(
     Ok(())
 }
 
-pub fn write_installed_manifest_bytes(
-    data_dir: &Path,
-    manifest_bytes: &[u8],
-    platform: &str,
-) -> anyhow::Result<Vec<String>> {
-    let manifest: ComponentsManifest = serde_json::from_slice(manifest_bytes)?;
-    write_installed_manifest(data_dir, &manifest, platform)
-}
-
 // ── List mode ───────────────────────────────────────────────────────
 
 fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &str) {
@@ -2408,6 +2399,8 @@ fn required_release_artifact_checksum<'a>(
     }
 }
 
+/// Refresh support assets after the updater installs the verified manifest bytes.
+/// The publisher owns that manifest; setup's local stamping stays separate.
 pub async fn refresh_installed_components_for_update(
     data_dir: &Path,
     old_components: Option<&[u8]>,
@@ -2527,7 +2520,6 @@ pub async fn refresh_installed_components_for_update(
 
     refreshed.sort();
     refreshed.dedup();
-    write_installed_manifest_bytes(data_dir, new_components, platform)?;
     Ok(refreshed)
 }
 
@@ -5689,6 +5681,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_refresh_preserves_manifest_bytes_without_asset_changes() {
+        let new_bytes = b"{ \n \"profiles\": {}, \"external\":{}, \"capsules\": {}, \"publisher_extension\":true }\n";
+        let old_bytes = br#"{"external":{},"capsules":{},"profiles":{}}"#;
+        for old in [None, Some(old_bytes.as_slice()), Some(new_bytes.as_slice())] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("components.json");
+            fs::write(&path, new_bytes).unwrap();
+            let expected_hash = sha2::Sha256::digest(new_bytes);
+            let refreshed =
+                refresh_installed_components_for_update(tmp.path(), old, new_bytes, "x86_64-linux")
+                    .await
+                    .unwrap();
+            assert!(refreshed.is_empty());
+            let installed = fs::read(&path).unwrap();
+            assert_eq!(sha2::Sha256::digest(&installed), expected_hash);
+            assert_eq!(installed, new_bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn test_refresh_installed_components_for_update_refreshes_changed_local_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -5736,10 +5748,17 @@ mod tests {
             "profiles": {}
         });
 
+        // The updater installs the publisher's bytes before refreshing assets.
+        let mut new_bytes = b" \n".to_vec();
+        new_bytes.extend(serde_json::to_vec(&new_manifest).unwrap());
+        new_bytes.extend(b"\n ");
+        let manifest_path = data_dir.join("components.json");
+        fs::write(&manifest_path, &new_bytes).unwrap();
+        let expected_hash = sha2::Sha256::digest(&new_bytes);
         let refreshed = refresh_installed_components_for_update(
             data_dir,
             Some(&serde_json::to_vec(&old_manifest).unwrap()),
-            &serde_json::to_vec(&new_manifest).unwrap(),
+            &new_bytes,
             "x86_64-linux",
         )
         .await
@@ -5747,6 +5766,9 @@ mod tests {
 
         assert_eq!(refreshed, vec!["localhost-provider".to_string()]);
         assert_eq!(fs::read(&install_path).unwrap(), b"new-binary");
+        let installed = fs::read(&manifest_path).unwrap();
+        assert_eq!(sha2::Sha256::digest(&installed), expected_hash);
+        assert_eq!(installed, new_bytes);
     }
 
     #[tokio::test]
