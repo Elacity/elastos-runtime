@@ -28,14 +28,16 @@ async fn discard_staged_setup(
     authorize()?;
     crate::api::model_provider_config::require_staged_hosted_key(data_dir, id)?;
     #[cfg(unix)]
-    let _end = if crate::api::model_provider_egress_decision::end_offer(data_dir, id)? > 0 {
+    let _ended = crate::api::model_provider_egress_decision::end_offer(data_dir, id)?;
+    #[cfg(target_os = "macos")]
+    let _end = if _ended > 0 {
         Some(crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await)
     } else {
         None
     };
     authorize()?;
     crate::api::model_provider_config::discard_staged_hosted_key(data_dir, id)?;
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     let _cleanup_end = if _end.is_none() {
         Some(crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await)
     } else {
@@ -602,7 +604,7 @@ pub(super) async fn system_approval_lens_revoke(
     } else {
         None
     };
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     let _end = if ended_https > 0 {
         Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &req.id).await)
     } else {
@@ -947,13 +949,13 @@ pub(super) async fn system_ai_provider_delete(
         Err(err) => return system_error_response(err),
     };
     #[cfg(unix)]
-    let ended =
+    let _ended =
         match crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &offer_id) {
             Ok(ended) => ended,
             Err(err) => return system_error_response(err),
         };
-    #[cfg(unix)]
-    let _end = if ended > 0 {
+    #[cfg(target_os = "macos")]
+    let _end = if _ended > 0 {
         Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await)
     } else {
         None
@@ -970,7 +972,7 @@ pub(super) async fn system_ai_provider_delete(
     ) {
         return system_error_response(err);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     let _removal_end = if _end.is_none() {
         Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await)
     } else {

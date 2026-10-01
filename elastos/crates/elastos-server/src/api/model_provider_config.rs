@@ -1731,6 +1731,7 @@ pub(crate) async fn save_hosted_offer(
     ai_provider_status(data_dir)
 }
 
+#[cfg(test)]
 pub(crate) async fn remove_hosted_offer(
     data_dir: &Path,
     registry: Option<&provider::ProviderRegistry>,

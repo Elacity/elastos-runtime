@@ -1780,6 +1780,7 @@ async fn owner_inbox_retains_hosted_route_history_and_ends_exact_decision() {
     assert_eq!(summary["notifications"]["attention_count"], 261);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn owner_inbox_end_keeps_competing_decision_from_cancelling_without_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -2162,7 +2163,7 @@ async fn staged_discard_without_staged_key_preserves_saved_approval() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn system_delete_and_discard_drain_committed_authority_before_cleanup() {
     for (discard, decision, revoke) in [

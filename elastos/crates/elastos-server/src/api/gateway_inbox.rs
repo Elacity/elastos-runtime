@@ -478,11 +478,12 @@ async fn dispatch_inbox_action(
         let _decision = crate::api::model_provider_egress_decision::transition_gate()
             .lock()
             .await;
-        let offer_id = crate::api::model_provider_egress_decision::endable_decision_offer_id(
+        let _offer_id = crate::api::model_provider_egress_decision::endable_decision_offer_id(
             data_dir, request_id, proof,
         )?;
         crate::api::model_provider_egress_decision::end_decision(data_dir, request_id, proof)?;
-        let _end = crate::api::model_provider_egress::begin_hosted_end(data_dir, &offer_id).await;
+        #[cfg(target_os = "macos")]
+        let _end = crate::api::model_provider_egress::begin_hosted_end(data_dir, &_offer_id).await;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
         return Ok(
             "Ended this hosted access. A later request needs a new Inbox decision.".to_string(),
