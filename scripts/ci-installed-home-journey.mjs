@@ -45,7 +45,7 @@ async function request(frame, path, body) {
   }, { path, body });
 }
 try {
-  await page.goto(`${base}/home/`, { waitUntil: "domcontentloaded" });
+  assert((await page.goto(`${base}/home/`, { waitUntil: "domcontentloaded" })).ok(), "installed Home frontdoor responds successfully");
   await page.locator("#home-unlock-name").waitFor({ state: "visible", timeout: 60000 });
   await page.locator("#home-unlock-name").fill("CI journey");
   const completed = page.waitForResponse(response => response.url().endsWith("/api/auth/passkey/register/complete"));

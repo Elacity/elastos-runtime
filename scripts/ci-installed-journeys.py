@@ -40,7 +40,7 @@ def run(home, data, evidence):
     started = time.monotonic()
     # Runtime logs stay private in the isolated Home; upload receipts/screenshots only.
     log = (home / "journey-runtime.private.log").open("wb")
-    child = subprocess.Popen([str(installed), "serve", "--addr", bind_address], env=environment, stdout=log, stderr=log, start_new_session=True)
+    child = subprocess.Popen([str(installed), "gateway", "--addr", bind_address], env=environment, stdout=log, stderr=log, start_new_session=True)
     try:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
