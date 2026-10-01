@@ -389,10 +389,10 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           ELASTOS_LOCAL_TEST_ROOT="${HOME}/.elastos-ci/carrier-fixture" scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
       # Playwright 1.59.1's archive extractor hangs on Node 26 (#40724).
-      # Keep the pinned operator protocol; use Node 22 only for installation.
+      # Keep the pinned operator protocol; use Node 24 only for installation.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
       - name: prepare pinned installed model journey
         timeout-minutes: 15
         run: |
@@ -521,7 +521,7 @@ jobs:
       # Use the same bounded installer runtime as the Linux jobs.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
       - name: prepare pinned installed model journey
         timeout-minutes: 15
         run: |
