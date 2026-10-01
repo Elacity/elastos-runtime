@@ -11,6 +11,15 @@ mkdir -p "$EVIDENCE"
 
 case "${1:-}" in
     prepare)
+        case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) PLATFORM=linux-amd64 ;;
+            Linux-aarch64|Linux-arm64) PLATFORM=linux-arm64 ;;
+            Darwin-arm64) PLATFORM=darwin-arm64 ;;
+            *) echo "Unsupported installed journey platform" >&2; exit 1 ;;
+        esac
+        # The existing seed contract verifies the declared archive checksum.
+        # Linux source-home skips Kubo by default; macOS reuses its seeded cache.
+        scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" "$DATA" "$PLATFORM"
         if [[ "$(uname -s)-$(uname -m)" == Linux-aarch64 ]]; then
             # #97's Carrier fixture already installs this pinned archive through
             # Runtime setup. Reuse its complete verified bundle and receipt.
@@ -56,6 +65,10 @@ for name in ["installed-journeys.json"]:
         row = json.loads((root / name).read_text())
         results.update(row.get("results", {}))
         elapsed += row.get("elapsed_seconds", 0)
+(root / "core-summary.json").write_text(json.dumps({
+    "candidate": commit, "installed_runtime_sha256": sha,
+    "results": results, "elapsed_seconds": elapsed,
+}, indent=2) + "\n")
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
     summary.write("| Journey | Result |\n| --- | --- |\n")

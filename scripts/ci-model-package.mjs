@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, isAbsolute, sep } from "node:path";
 
 const [dataArg, inputsArg, outputArg] = process.argv.slice(2);
 const data = resolve(dataArg), inputs = resolve(inputsArg), output = resolve(outputArg);
@@ -55,7 +55,20 @@ for (const file of entry.object_manifest.files) {
 }
 entry.object_manifest.content_digest = `sha256:${digest.digest("hex")}`;
 writeFileSync(join(packageDir, "_elastos_object.json"), canonical(entry.object_manifest), { mode: 0o400 });
-const kubo = join(data, "bin/kubo"), repo = join(data, "ipfs-repo");
+const manifestBytes = readFileSync(join(data, "components.json"));
+const components = JSON.parse(manifestBytes);
+const host = ({ "linux-x64": "linux-amd64", "linux-arm64": "linux-arm64", "darwin-arm64": "darwin-arm64" })[`${process.platform}-${process.arch}`];
+assert(host, "supported installed Kubo platform required");
+const component = components.external.kubo, info = component.platforms[host];
+assert(info, "installed manifest declares Kubo for this platform");
+const sourceManifestBytes = readFileSync("components.json");
+const sourceInfo = JSON.parse(sourceManifestBytes).external.kubo.platforms[host];
+for (const field of ["url", "checksum", "extract_path"]) assert.equal(info[field], sourceInfo[field], `Kubo ${field} matches the archive-verifying seed contract`);
+const installPath = info.install_path ?? component.install_path;
+assert(typeof installPath === "string" && installPath && !isAbsolute(installPath) && !installPath.split(/[\\/]/).includes(".."), "Kubo install_path stays inside the isolated data root");
+const kubo = resolve(data, installPath), repo = join(data, "ipfs-repo");
+assert(kubo.startsWith(data + sep), "declared Kubo executable stays inside the data root");
+const kuboReceipt = { platform: host, install_path: installPath, archive_checksum: info.checksum, executable_sha256: `sha256:${sha(readFileSync(kubo))}`, components_sha256: `sha256:${sha(manifestBytes)}`, source_components_sha256: `sha256:${sha(sourceManifestBytes)}` };
 const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024 }).trim();
 run(["init", "--empty-repo"]);
 for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
@@ -69,7 +82,6 @@ const signer_did = "did:key:z" + encode(Buffer.concat([Buffer.from([0xed, 1]), p
 const message = createHash("sha256").update("elastos.model.catalog.v1\0").update(canonical(payload)).digest();
 const catalog = Buffer.from(canonical({ payload, signer_did, signature: sign(null, message, privateKey).toString("hex") }));
 writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
-const components = JSON.parse(readFileSync(join(data, "components.json")));
 components.model_catalog = { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: 1024 ** 3, max_model_memory_bytes: 4 * 1024 ** 3 } };
 writeFileSync(join(data, "components.json"), JSON.stringify(components), { mode: 0o600 });
-writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: entry.object_manifest.files.find(f => f.path === "weights.gguf").sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission" }, null, 2));
+writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: entry.object_manifest.files.find(f => f.path === "weights.gguf").sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
