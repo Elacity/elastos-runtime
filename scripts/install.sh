@@ -895,7 +895,7 @@ RELEASE_CID=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["latest_relea
 RELEASE_VERSION=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["version"]')
 # Keep these release-version expressions in sync with scripts/check-versioning.sh.
 release_version_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-release_version_meta='(\+[0-9A-Za-z.-]+)?'
+release_version_meta='(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
 release_version_preferred="^${release_version_core}(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?${release_version_meta}$"
 [[ "$RELEASE_VERSION" =~ $release_version_preferred ]] \
     || die "Invalid signed release version '${RELEASE_VERSION}'; ask the publisher for a release that follows the version policy"

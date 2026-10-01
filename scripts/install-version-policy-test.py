@@ -29,6 +29,9 @@ class InstallVersionPolicyTests(unittest.TestCase):
         script = expressions(installer, "release_version_") + '\n[[ "$1" =~ $release_version_preferred ]]'
         for version, accepted in [
             ("0.7.3", True), ("0.7.3-rc.1", True), ("0.7.3-beta.0+build.1", True),
+            ("0.7.3+-", True), ("0.7.3+01", True), ("0.7.3+a", True),
+            ("0.7.3+.", False), ("0.7.3+a..b", False),
+            ("0.7.3+.a", False), ("0.7.3+a.", False),
             ("", False), ("unknown", False), ("0.7", False), ("0.7.03", False),
             ("0.7.3-rc1", False), ("0.7.3-rc.01", False), ("0.7.3-other.1", False),
         ]:
