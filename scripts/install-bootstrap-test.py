@@ -664,6 +664,8 @@ class InstallationTests(unittest.TestCase):
             "sources.json": b'{"schema":"elastos.trusted-sources/v1","note":"previous"}\n',
             "Users/alice/notes.txt": b"user data stays\n",
             "capsules/shell/cache.bin": b"cached capsule stays\n",
+            "updates/consumed/release-head.json": b"previous consumed head\n",
+            "updates/consumed/release.json": b"previous consumed release\n",
             "ElastOS/SystemServices/Publisher/release-head.json": b"previous head\n",
             "ElastOS/SystemServices/Publisher/release.json": b"previous release\n",
         }
@@ -737,8 +739,8 @@ class InstallationTests(unittest.TestCase):
                     self.assertEqual(changed, {
                         ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/model-catalog.json",
                         "xdg-data/elastos/sources.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
+                        "xdg-data/elastos/updates/consumed/release-head.json",
+                        "xdg-data/elastos/updates/consumed/release.json"})
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
@@ -806,15 +808,18 @@ class InstallationTests(unittest.TestCase):
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
         self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node")
                          if transport == "publisher" else ([], "head-a", "", ""))
-        publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
-        self.assertEqual((publisher / "release-head.json").read_bytes(), head)
-        self.assertEqual((publisher / "release.json").read_bytes(), release)
+        consumed = sandbox.data / "updates/consumed"
+        self.assertEqual((consumed / "release-head.json").read_bytes(), head)
+        self.assertEqual((consumed / "release.json").read_bytes(), release)
         after = sandbox.home_state()
+        publisher_prefix = "xdg-data/elastos/ElastOS/SystemServices/Publisher"
+        self.assertEqual({key: value for key, value in after.items() if key.startswith(publisher_prefix)},
+                         {key: value for key, value in before.items() if key.startswith(publisher_prefix)})
         changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
         self.assertEqual(changed, {
             ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/sources.json",
-            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
-            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
+            "xdg-data/elastos/updates/consumed/release-head.json",
+            "xdg-data/elastos/updates/consumed/release.json"})
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_staged_executable_accepts_exact_signed_version(self):
@@ -831,6 +836,24 @@ class InstallationTests(unittest.TestCase):
                         self.assert_clean_install(sandbox, transport, did, head, release,
                                                   sandbox.home_state(), runtime=binary)
 
+    def test_fresh_install_saves_consumed_receipts(self):
+        did, head, release = installable_fixture()
+        for transport in ["publisher", "cid"]:
+            with self.subTest(transport=transport):
+                with InstallerSandbox(head, release, did) as sandbox:
+                    sandbox.respond("binary", RUNTIME_STUB)
+                    sandbox.respond("components", COMPONENTS)
+                    sandbox.respond("bootstrap", BOOTSTRAP)
+                    result, requests = sandbox.run("--install-only", transport=transport)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(requests, self.REQUESTS[transport])
+                    self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
+                    consumed = sandbox.data / "updates/consumed"
+                    self.assertEqual((consumed / "release-head.json").read_bytes(), head)
+                    self.assertEqual((consumed / "release.json").read_bytes(), release)
+                    self.assertFalse((sandbox.data / "ElastOS/SystemServices/Publisher").exists())
+                    self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
     def test_staged_executable_refusal_preserves_installation_then_valid_retry_installs(self):
         # These binaries carry the signed, advertised hash; only the staged
         # executable's own behavior can reject them, and that must happen
@@ -842,6 +865,18 @@ class InstallationTests(unittest.TestCase):
              RUNTIME_STUB.replace(b'echo "elastos 0.7.1" ;;', b'echo "elastos 0.7.1"; exit 3 ;;'),
              "failed its version check (exit 3)", ["--version"]),
             ("empty output", "0.7.1", RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b":"),
+             "version mismatch", ["--version"]),
+            ("exact version only on stderr", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1" >&2'),
+             "version mismatch", ["--version"]),
+            ("version split between stdout and stderr", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'printf "elastos "; printf "0.7.1" >&2'),
+             "version mismatch", ["--version"]),
+            ("exact stdout with stderr warning", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1"; echo "warning" >&2'),
+             "version mismatch", ["--version"]),
+            ("exact stdout with blank stderr line", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1"; echo >&2'),
              "version mismatch", ["--version"]),
             ("invalid executable", "0.7.1", b"\x00\x01\x02 not an executable\n", "failed its version check", []),
         ]
