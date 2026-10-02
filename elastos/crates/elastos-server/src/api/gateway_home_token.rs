@@ -439,6 +439,39 @@ pub(crate) fn require_home_token_context(
     .map(|required| required.context)
 }
 
+/// Verify a launch before body extraction. The handler retains its actor gate.
+pub(super) fn require_gateway_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    if require_home_token_context(data_dir, headers).is_ok() {
+        return Ok(());
+    }
+    let token = single_home_launch_token_header(headers)?
+        .ok_or_else(|| anyhow::anyhow!("missing launch token"))?;
+    if token.len() > 16 * 1024 {
+        anyhow::bail!("invalid launch token");
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&token)?;
+    let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)?;
+    let actor = &envelope.payload.launch_context.executable_actor;
+    let browser = headers.contains_key("origin")
+        || headers.contains_key("referer")
+        || headers.contains_key("sec-fetch-site");
+    require_home_launch_token_for_any_from_with_origin(
+        data_dir,
+        headers,
+        &[actor],
+        None,
+        if browser {
+            HomeLaunchOriginPolicy::Browser
+        } else {
+            HomeLaunchOriginPolicy::InternalShell
+        },
+    )
+    .map(|_| ())
+}
+
 pub(crate) fn home_launch_token_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-elastos-home-token")

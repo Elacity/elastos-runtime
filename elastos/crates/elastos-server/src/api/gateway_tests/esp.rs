@@ -155,15 +155,38 @@ async fn invoke_esp_method_with_input(
 }
 
 #[tokio::test]
+async fn esp_initialize_requires_explicit_gateway_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    for method in ["GET", "POST"] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method(method)
+                    .uri("/api/esp/initialize")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
 async fn esp_initialize_describes_existing_projection_routes() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
 
     let response = app
         .clone()
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -241,7 +264,7 @@ async fn esp_initialize_describes_existing_projection_routes() {
 
     let inspect_without_system_token = app
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/provider/inspect/plan")
                 .header(CONTENT_TYPE, "application/json")
@@ -259,12 +282,14 @@ async fn esp_initialize_describes_existing_projection_routes() {
 async fn esp_initialize_keeps_http_adapter_separate_from_authority_model() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
 
     let response = app
         .clone()
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -308,9 +333,10 @@ async fn esp_initialize_keeps_http_adapter_separate_from_authority_model() {
 
     let negotiated = app
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"esp_version":"0","accepts":["elastos.capsules.catalog/v1"]}"#,
@@ -335,16 +361,18 @@ async fn esp_initialize_keeps_http_adapter_separate_from_authority_model() {
 }
 
 #[tokio::test]
-async fn esp_initialize_negotiates_schema_tags_without_authority() {
+async fn esp_initialize_negotiates_schema_tags_without_granting_method_authority() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
 
     let response = app
         .clone()
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"esp_version":"0","accepts":["elastos.inspect.gate-preview/v1","elastos.unknown/v1"]}"#,
@@ -370,9 +398,10 @@ async fn esp_initialize_negotiates_schema_tags_without_authority() {
 
     let unsupported_version = app
         .oneshot(
-            test_browser_request("localhost:61180", "null")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"esp_version":"1","accepts":[]}"#))
                 .unwrap(),

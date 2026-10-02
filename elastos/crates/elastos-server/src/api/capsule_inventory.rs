@@ -50,7 +50,11 @@ struct ModelCatalogEntry {
     object_manifest: Value,
 }
 
-fn read_model_catalog_file(data_dir: &Path, name: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_model_catalog_file(
+    data_dir: &Path,
+    name: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
     let root = std::fs::symlink_metadata(data_dir)?;
     if !root.is_dir() || root.file_type().is_symlink() {
         anyhow::bail!("model catalog requires a real data directory");
