@@ -542,7 +542,7 @@ build_packaged_capsule_archive() {
             copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}" || return
             [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
             ;;
-        wasm)
+        wasm|web-projection)
             stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}" || return
             ;;
         *)
@@ -578,8 +578,8 @@ for name, component in sorted((components.get("external") or {}).items()):
     if capsule_dir is None:
         continue
     manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
-    if manifest.get("role") != "provider":
-        raise SystemExit(f"{name} capsule manifest role must be provider")
+    if (manifest.get("role"), manifest.get("type"), manifest.get("execution"), manifest.get("runtime_abi"), manifest.get("entrypoint")) != ("provider", "native-provider", "native-provider", "elastos.provider-stdio/v1", name):
+        raise SystemExit(f"{name} capsule manifest must describe native-provider execution")
     icon_dir = str(manifest.get("icon") or "").strip().strip("/")
     if not icon_dir:
         raise SystemExit(f"{name} provider capsule icon path is missing")
@@ -709,6 +709,13 @@ stage_wasm_capsule() {
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     [[ -n "$entrypoint" ]] || die "${capsule_name} capsule manifest missing entrypoint"
     runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
+    local capsule_type execution
+    capsule_type=$(capsule_manifest_field "$capsule_name" "type")
+    execution=$(capsule_manifest_field "$capsule_name" "execution")
+    if [[ "$runtime_abi" == "elastos.component/v1" && ( "$capsule_type" != "wasm" || "$execution" != "component" ) ]] ||
+       [[ "$runtime_abi" == "elastos.runtime-projection/v1" && ( "$capsule_type" != "web-projection" || "$execution" != "web-projection" ) ]]; then
+        die "${capsule_name} type contradicts its execution ABI"
+    fi
 
     if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
         ensure_rust_target_installed "wasm32-unknown-unknown" || return
@@ -1559,6 +1566,15 @@ if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
     info "Publishing the admitted three-platform native inputs..."
     publish_prepared_platform_inputs "$PREPARED_INPUT_ROOT"
 else
+# Native providers and the trusted shell helper use reviewed native inputs.
+# The legacy rootfs path cannot establish those host artifact contracts.
+for capsule in "${CAPSULES[@]}"; do
+    capsule_type="$(capsule_manifest_field "$capsule" "type")"
+    if [[ "$capsule_type" == "native-provider" || "$capsule_type" == "native-host" ]]; then
+        die "${capsule} requires the existing --platform-input native publication path; legacy rootfs packaging cannot describe native execution"
+    fi
+done
+
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
 
 if [ "$SKIP_BUILD" = true ]; then
@@ -1595,7 +1611,7 @@ PY
                 info "  Building ${capsule} Component..."
                 ensure_rust_target_installed "wasm32-unknown-unknown"
                 scripts/build-component-capsule.sh "$capsule_dir" 2>&1
-            elif [[ "$capsule_type" == "wasm" && "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
+            elif [[ "$capsule_type" == "web-projection" && "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
                 info "  Using ${capsule} Runtime projection from source..."
             elif [[ "$capsule_type" == "wasm" ]]; then
                 die "${capsule} uses unsupported runtime_abi '${runtime_abi:-unset}'"
@@ -2002,8 +2018,8 @@ else
         capsule_type=""
         if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
             capsule_type=$(capsule_manifest_field "$capsule" "type")
-            if [[ "$capsule_type" == "wasm" ]]; then
-                info "    ${capsule} (wasm package)..."
+            if [[ "$capsule_type" == "wasm" || "$capsule_type" == "web-projection" ]]; then
+                info "    ${capsule} (${capsule_type} package)..."
                 archive=$(build_packaged_capsule_archive "$PLATFORM" "$capsule")
                 cp "$archive" "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" \
                     >"${ROOTFS_LOGS_DIR}/${capsule}.log" 2>&1
@@ -2081,7 +2097,7 @@ else
             capsule_type=""
             if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
                 capsule_type=$(capsule_manifest_field "$capsule" "type")
-                if [[ "$capsule_type" == "wasm" || "$capsule_type" == "data" ]]; then
+                if [[ "$capsule_type" == "wasm" || "$capsule_type" == "web-projection" || "$capsule_type" == "data" ]]; then
                     info "    ${capsule} (${capsule_type} package, ${CROSS_PLATFORM})..."
                     cp "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" "${CROSS_ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" \
                         >"${CROSS_LOGS_DIR}/${capsule}.log" 2>&1

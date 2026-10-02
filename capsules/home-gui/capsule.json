@@ -5,7 +5,7 @@
   "description": "Desktop Home view for ElastOS",
   "author": "elastos",
   "role": "shell",
-  "type": "wasm",
+  "type": "web-projection",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
   "execution": "web-projection",

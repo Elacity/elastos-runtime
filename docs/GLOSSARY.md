@@ -4,12 +4,36 @@
 >
 > This file is for term lookup, not for the primary repo narrative or current
 > behavior contract. Use [ARCHITECTURE.md](ARCHITECTURE.md) for the system
-> summary and [state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
-> [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for current truth.
+> summary. The owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+> record current acceptance and proof. [COMMAND_MATRIX.md](COMMAND_MATRIX.md)
+> defines command ownership.
 
 Key terms used in the ElastOS codebase and documentation.
 
 **Naming convention:** "ElastOS" (two capitals) is this runtime. "Elastos" is the broader ecosystem and foundation. `elastos` (lowercase) is the binary, crate names, and URI scheme.
+
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
 
 ## ElastOS Four Quadrants
 
@@ -20,7 +44,7 @@ for the canonical definition.
 
 ## Runtime
 
-The minimal trusted base (`elastos` binary). It enforces isolation, signatures,
+The trusted base (`elastos` binary). It checks signatures,
 capabilities, routing, lifecycle, and audit. Capsules and providers run outside
 the trusted core. Native host and engine adapters may also sit outside it, but
 they do not become capsules merely because they are separate processes.
@@ -44,8 +68,9 @@ normally does not expose raw key material for encryption.
 
 The stable person/contact identity used by signed People, discovery, accepted
 contacts, and direct-conversation identity. A Profile DID belongs to a
-principal-owned signed Profile document and remains stable across device
-replacement or revocation. It is not the passkey and not the local principal
+principal-owned signed Profile document and can remain stable across device
+replacement or revocation when a valid Recovery Kit restores it. A stolen
+profile key requires a new identity. It is not the passkey and not the local principal
 identifier. It represents the person in collaboration, but the signed Profile
 document is not the human actor or the delivery device.
 
@@ -87,7 +112,11 @@ The portable signed package model in ElastOS. A Digital Capsule is capability-go
 
 ## Capsule
 
-Shorthand for a Digital Capsule, usually referring to an executable one. Capsules start with zero ambient authority and must request capability tokens for any action. Two main executable substrates exist today: **WASM** (lightweight) and **microVM** (full Linux sandbox via crosvm).
+Shorthand for a Digital Capsule, usually an executable package. First-party apps
+use web projections; first-party providers use native operating-system processes.
+WASM Components have a separate tested authoring path. Browser VM engines have
+host-specific adapters and need target proof. A package role or declared type
+alone establishes neither isolation nor granted authority.
 
 ## Capsule Runtime (AppCapsule Runtime)
 

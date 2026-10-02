@@ -5,8 +5,10 @@
   "description": "Wallet authority provider for proof challenges, linked accounts, and typed signing approvals",
   "author": "elastos",
   "role": "provider",
-  "type": "microvm",
-  "entrypoint": "rootfs.ext4",
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "wallet-provider",
   "icon": "icons",
   "provides": "elastos://wallet/meta/status",
   "authority": {

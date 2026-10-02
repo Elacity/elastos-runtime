@@ -1,5 +1,28 @@
 # Installing ElastOS
 
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
+
 ## Install from the publisher
 
 The installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. The signed release determines which binaries exist for a given platform.
@@ -146,7 +169,9 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
+Native Home and chat use the host Runtime without a Browser VM. The current
+Linux/crosvm Browser launcher uses passwordless `sudo` for network setup.
+Root-free Browser networking is a target under the isolation plan.
 The default Home profile omits `crosvm` and `vmlinux`. Use an explicit profile
 or source-home provisioning for microVM and Browser VM work.
 
@@ -192,8 +217,21 @@ The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [state.md](../state.md) records
+from the version label or a successful setup. The owning [GitHub issue](https://github.com/Elacity/elastos-runtime/issues) records
 whether exact public-manifest parity evidence has been accepted.
+
+## Data, keys and backups
+
+Runtime stores keys next to the data they protect in its data home. A full
+backup of that home contains all keys, including wallet keys. Protect the backup
+with the same care as the running Home. A Recovery Kit is sensitive recovery
+material; keep it under your own control.
+
+The seed operator can read the data, wallet keys and recovery phrases stored on
+the seed. Use a Home whose operator you trust for sensitive work. Encryption on
+the seed does not protect stored secrets from its operator. Recovery can restore
+lost access with valid recovery material, but recovery from a stolen device or
+profile key requires a new identity.
 
 ## Capability policy
 

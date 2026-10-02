@@ -5,8 +5,10 @@
   "description": "Operator WebSpace resolver adapter for Runtime-mediated metadata, byte read, and mutable write-back tests",
   "author": "elastos",
   "role": "provider",
-  "type": "microvm",
-  "entrypoint": "rootfs.ext4",
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "operator-drive-adapter",
   "provides": "elastos://operator-drive-adapter/*",
   "authority": {
     "reason": "Attaches an operator-managed resolver namespace to localhost://WebSpaces without exposing resolver credentials, host paths, or raw backend APIs to app capsules.",

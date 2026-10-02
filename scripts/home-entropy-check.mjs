@@ -4083,7 +4083,7 @@ assert(
 );
 assert(
   homeCliManifest.role === "shell" &&
-    homeCliManifest.type === "wasm" &&
+    homeCliManifest.type === "web-projection" &&
     homeCliManifest.runtime_abi === "elastos.runtime-projection/v1" &&
     homeCliManifest.bus_contract === "elastos.runtime-projection/v1" &&
     homeCliManifest.execution === "web-projection" &&
@@ -4113,7 +4113,7 @@ assert(
 );
 assert(
   browserCapsuleManifest.role === "app" &&
-    browserCapsuleManifest.type === "wasm" &&
+    browserCapsuleManifest.type === "web-projection" &&
     browserCapsuleManifest.runtime_abi === "elastos.runtime-projection/v1" &&
     browserCapsuleManifest.bus_contract === "elastos.runtime-projection/v1" &&
     browserCapsuleManifest.execution === "web-projection" &&
@@ -5156,8 +5156,11 @@ assert(
   "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
-  marketplaceUi.includes('capsule.cid ? "Verified app" : "Local app"') &&
+  marketplaceUi.includes('capsule.cid ? "Published app" : "Local app"') &&
     marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("Publisher verification unavailable") &&
+    marketplaceUi.includes("Declared author ·") &&
+    !marketplaceUi.includes("isFirstPartyPublisher") &&
     marketplaceUi.includes("Trust:") &&
     marketplaceUi.includes("Status:") &&
     marketplaceUi.includes("Available actions") &&

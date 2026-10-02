@@ -17,13 +17,37 @@ as the supported authoring contract, not as evidence of product adoption.
 
 The commands in this guide create capsule source packages. A source package is
 an authoring and build input, not a complete signed Digital Capsule. Source
-packages may omit `signature` during local development; [state.md](../state.md)
-records the current first-party signing gap. The source-home setup copies these
+packages may omit `signature` during local development. The owning
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record
+first-party signing and distribution acceptance. The source-home setup copies these
 packages into its local data home, and local development may launch them. Their
 presence or successful launch does not prove signed distribution, portable
 installation, or Runtime admission on another node. A distributable Digital
 Capsule requires a complete signed artifact. Each Runtime decides separately
 whether to admit it under local trust policy.
+
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
 
 ## Choose one role
 
@@ -88,7 +112,7 @@ A web projection uses:
 
 ```json
 {
-  "type": "wasm",
+  "type": "web-projection",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
   "execution": "web-projection",
@@ -103,7 +127,33 @@ and routing boundary. Runtime handles core operations directly and sends
 provider-backed effects through the provider registry. Each substrate retains
 its documented lifecycle and cleanup contract. Launch tokens establish bounded
 launch context, but they do not prove principal or session authority by
-themselves. Same-origin access grants no authority.
+themselves. The current Home authority described above also applies to this
+projection path.
+
+### Native-provider fields
+
+An installed native provider uses:
+
+```json
+{
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "<provider-binary>"
+}
+```
+
+Its role is `provider`. Runtime starts the registered binary as an
+operating-system process through the existing component launcher. Generic
+capsule compute and CLI `run` reject this type. A provider template describes
+its contract; it does not make that provider available for installation or
+execution. `authority` describes requested ownership, not an operating-system
+sandbox. The current provider boundary is described above.
+
+The repository also has one internal `shell` host helper with descriptive
+`type`, `execution`, and `runtime_abi` values of `native-host`. It remains an
+existing trusted host launcher. Generic capsule compute and CLI `run` reject
+this helper type. It is separate from a sandboxed web shell projection.
 
 ### Data fields
 

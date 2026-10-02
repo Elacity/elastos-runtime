@@ -263,7 +263,8 @@ publish_direct_assets() { touch "$TEST_UPLOAD"; echo '{}'; }
             (capsule / "browser").mkdir(parents=True)
             (capsule / "browser/index.html").write_text("<title>Home</title>")
             (capsule / "capsule.json").write_text(json.dumps({
-                "type": "wasm", "entrypoint": "browser/index.html",
+                "type": "web-projection", "entrypoint": "browser/index.html",
+                "execution": "web-projection",
                 "runtime_abi": "elastos.runtime-projection/v1",
             }))
             result = subprocess.run(["bash", "-euc", functions + '''

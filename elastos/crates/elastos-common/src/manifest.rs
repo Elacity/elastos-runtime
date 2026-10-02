@@ -446,10 +446,12 @@ impl CapsuleManifest {
 
         if self.window_policy.is_some()
             && (!matches!(self.role, CapsuleRole::App | CapsuleRole::Viewer)
-                || self.capsule_type != CapsuleType::Wasm
                 || !matches!(
-                    self.execution,
-                    Some(CapsuleExecution::WebProjection | CapsuleExecution::Component)
+                    (&self.capsule_type, &self.execution),
+                    (
+                        CapsuleType::WebProjection,
+                        Some(CapsuleExecution::WebProjection)
+                    ) | (CapsuleType::Wasm, Some(CapsuleExecution::Component))
                 )
                 || !self.projections.contains(&CapsuleProjection::Web))
         {
@@ -766,9 +768,28 @@ impl CapsuleManifest {
                 ));
             }
         }
-        if self.execution.as_ref() == Some(&CapsuleExecution::WebProjection) {
-            if self.capsule_type != CapsuleType::Wasm {
-                return Err("web projection capsules must use type=wasm".to_string());
+        if self.capsule_type == CapsuleType::WebProjection || self.is_runtime_projection() {
+            if self.capsule_type != CapsuleType::WebProjection {
+                return Err("web projection capsules must use type=web-projection".to_string());
+            }
+            if !matches!(
+                self.role,
+                CapsuleRole::App | CapsuleRole::Viewer | CapsuleRole::Shell
+            ) {
+                return Err(
+                    "web projection capsules require an app, viewer or shell role".to_string(),
+                );
+            }
+            if self.execution.as_ref() != Some(&CapsuleExecution::WebProjection) {
+                return Err(
+                    "web projection capsules must declare execution=web-projection".to_string(),
+                );
+            }
+            if self.microvm.is_some() || self.wit_world_sha256.is_some() {
+                return Err(
+                    "web projection capsules cannot declare microVM or component metadata"
+                        .to_string(),
+                );
             }
             if self.runtime_abi.as_ref() != Some(&CapsuleRuntimeAbi::RuntimeProjectionV1) {
                 return Err(
@@ -785,6 +806,54 @@ impl CapsuleManifest {
             if !self.projections.contains(&CapsuleProjection::Web) {
                 return Err("web projection capsules must declare a web projection".to_string());
             }
+        }
+
+        if self.capsule_type == CapsuleType::NativeProvider
+            || self.execution.as_ref() == Some(&CapsuleExecution::NativeProvider)
+            || self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::ProviderStdioV1)
+        {
+            if self.capsule_type != CapsuleType::NativeProvider
+                || self.role != CapsuleRole::Provider
+                || self.execution.as_ref() != Some(&CapsuleExecution::NativeProvider)
+                || self.runtime_abi.as_ref() != Some(&CapsuleRuntimeAbi::ProviderStdioV1)
+            {
+                return Err("native providers require role=provider, type=native-provider, execution=native-provider and runtime_abi=elastos.provider-stdio/v1".to_string());
+            }
+            if self.microvm.is_some()
+                || self.bus_contract.is_some()
+                || self.wit_world_sha256.is_some()
+            {
+                return Err("native providers cannot declare microVM, component or projection execution metadata".to_string());
+            }
+        }
+        if (self.capsule_type == CapsuleType::NativeHost
+            || self.execution.as_ref() == Some(&CapsuleExecution::NativeHost)
+            || self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::NativeHost))
+            && (self.capsule_type != CapsuleType::NativeHost
+                || self.execution.as_ref() != Some(&CapsuleExecution::NativeHost)
+                || self.runtime_abi.as_ref() != Some(&CapsuleRuntimeAbi::NativeHost)
+                || self.role != CapsuleRole::Shell
+                || self.name != "shell"
+                || self.entrypoint != "shell"
+                || self.microvm.is_some()
+                || self.bus_contract.is_some()
+                || self.wit_world_sha256.is_some()
+                || !self.projections.is_empty())
+        {
+            return Err("native-host metadata describes only the existing trusted shell helper: role=shell, name=shell, entrypoint=shell, type/execution/runtime_abi=native-host".to_string());
+        }
+        if (self.execution.as_ref() == Some(&CapsuleExecution::Microvm)
+            || self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::MicrovmLinux)
+            || self.microvm.is_some())
+            && self.capsule_type != CapsuleType::MicroVM
+        {
+            return Err("microVM execution metadata requires type=microvm".to_string());
+        }
+        if (self.execution.as_ref() == Some(&CapsuleExecution::Data)
+            || self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::Data))
+            && self.capsule_type != CapsuleType::Data
+        {
+            return Err("data execution metadata requires type=data".to_string());
         }
 
         Ok(())
@@ -926,6 +995,15 @@ impl ProviderCapabilitySchema {
 #[serde(rename_all = "lowercase")]
 pub enum CapsuleType {
     Wasm,
+    /// Browser projection, opened through Runtime's existing web host.
+    #[serde(rename = "web-projection")]
+    WebProjection,
+    /// Native service contract; trusted components own provider launch.
+    #[serde(rename = "native-provider")]
+    NativeProvider,
+    /// Existing trusted Runtime shell helper; generic capsule execution refuses it.
+    #[serde(rename = "native-host")]
+    NativeHost,
     MicroVM,
     Oci,
     Media,
@@ -935,6 +1013,10 @@ pub enum CapsuleType {
 /// Current capsule execution ABI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CapsuleRuntimeAbi {
+    #[serde(rename = "native-host")]
+    NativeHost,
+    #[serde(rename = "elastos.provider-stdio/v1")]
+    ProviderStdioV1,
     #[serde(rename = "wasi-preview1")]
     WasiPreview1,
     #[serde(rename = "elastos.runtime-projection/v1")]
@@ -951,6 +1033,8 @@ pub enum CapsuleRuntimeAbi {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapsuleExecution {
+    NativeHost,
+    NativeProvider,
     WasiReceipt,
     WasiApp,
     WebProjection,
@@ -1265,7 +1349,7 @@ mod tests {
     fn window_policy_validates_presentation_contract() {
         let base = serde_json::json!({
             "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "window-fixture",
-            "role": "app", "type": "wasm", "entrypoint": "browser/index.html",
+            "role": "app", "type": "web-projection", "entrypoint": "browser/index.html",
             "runtime_abi": "elastos.runtime-projection/v1",
             "bus_contract": "elastos.runtime-projection/v1",
             "execution": "web-projection", "projections": ["web"]
@@ -1290,6 +1374,7 @@ mod tests {
             }
         }
         let mut component = base.clone();
+        component["type"] = serde_json::json!("wasm");
         component["runtime_abi"] = serde_json::json!("elastos.component/v1");
         component["bus_contract"] = serde_json::json!(ELASTOS_BUS_V1_CONTRACT);
         component["wit_world_sha256"] = serde_json::json!(elastos_bus_v1_wit_sha256());
@@ -1378,7 +1463,7 @@ mod tests {
             "version": "0.1.0",
             "name": "browser",
             "role": "app",
-            "type": "wasm",
+            "type": "web-projection",
             "runtime_abi": "elastos.runtime-projection/v1",
             "bus_contract": "elastos.runtime-projection/v1",
             "execution": "web-projection",
@@ -1481,6 +1566,140 @@ mod tests {
     }
 
     #[test]
+    fn first_party_manifests_state_actual_execution() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut checked = 0;
+        for directory in [root.join("capsules"), root.join("elastos/capsules")] {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path().join("capsule.json");
+                if !path.is_file() {
+                    continue;
+                }
+                let manifest: CapsuleManifest =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                manifest
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                if manifest.is_runtime_projection() {
+                    assert_eq!(
+                        manifest.capsule_type,
+                        CapsuleType::WebProjection,
+                        "{}",
+                        path.display()
+                    );
+                }
+                if manifest.role == CapsuleRole::Provider {
+                    assert_eq!(
+                        manifest.capsule_type,
+                        CapsuleType::NativeProvider,
+                        "{}",
+                        path.display()
+                    );
+                    assert_eq!(manifest.entrypoint, manifest.name, "{}", path.display());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 40, "first-party manifest coverage was lost");
+    }
+
+    #[test]
+    fn execution_types_reject_contradictory_metadata() {
+        let projection: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../templates/capsules/web-app/capsule.json"
+        ))
+        .unwrap();
+        for (field, invalid) in [
+            ("type", serde_json::json!("wasm")),
+            ("type", serde_json::json!("microvm")),
+            ("type", serde_json::json!("native-provider")),
+            ("role", serde_json::json!("provider")),
+            ("role", serde_json::json!("content")),
+            ("execution", serde_json::Value::Null),
+            ("execution", serde_json::json!("microvm")),
+            ("execution", serde_json::json!("component")),
+            ("runtime_abi", serde_json::Value::Null),
+            (
+                "runtime_abi",
+                serde_json::json!("elastos.provider-stdio/v1"),
+            ),
+            ("bus_contract", serde_json::Value::Null),
+            ("microvm", serde_json::json!({})),
+        ] {
+            let mut value = projection.clone();
+            value[field] = invalid;
+            assert!(
+                serde_json::from_value::<CapsuleManifest>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "projection {field}"
+            );
+        }
+        let provider: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../templates/capsules/provider-contract/capsule.json"
+        ))
+        .unwrap();
+        for (field, invalid) in [
+            ("type", serde_json::json!("wasm")),
+            ("type", serde_json::json!("microvm")),
+            ("role", serde_json::json!("app")),
+            ("role", serde_json::json!("shell")),
+            ("execution", serde_json::Value::Null),
+            ("execution", serde_json::json!("microvm")),
+            ("execution", serde_json::json!("web-projection")),
+            ("runtime_abi", serde_json::Value::Null),
+            ("runtime_abi", serde_json::json!("microvm-linux")),
+            ("runtime_abi", serde_json::json!("elastos.component/v1")),
+            (
+                "bus_contract",
+                serde_json::json!("elastos.runtime-projection/v1"),
+            ),
+            ("microvm", serde_json::json!({})),
+        ] {
+            let mut value = provider.clone();
+            value[field] = invalid;
+            assert!(
+                serde_json::from_value::<CapsuleManifest>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "provider {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_host_metadata_is_limited_to_existing_shell_helper() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../../capsules/shell/capsule.json")).unwrap();
+        serde_json::from_value::<CapsuleManifest>(base.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        for (field, invalid) in [
+            ("name", serde_json::json!("arbitrary-native-app")),
+            ("entrypoint", serde_json::json!("arbitrary-program")),
+            ("role", serde_json::json!("app")),
+            ("type", serde_json::json!("wasm")),
+            ("execution", serde_json::Value::Null),
+            ("runtime_abi", serde_json::Value::Null),
+            ("microvm", serde_json::json!({})),
+            ("projections", serde_json::json!(["web"])),
+        ] {
+            let mut value = base.clone();
+            value[field] = invalid;
+            assert!(
+                serde_json::from_value::<CapsuleManifest>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "native host {field}"
+            );
+        }
+    }
+
+    #[test]
     fn test_component_manifest_rejects_missing_wit_hash() {
         let json = format!(
             r#"{{
@@ -1545,7 +1764,7 @@ mod tests {
             "version": "0.1.0",
             "name": "duplicate-projection",
             "role": "app",
-            "type": "wasm",
+            "type": "web-projection",
             "runtime_abi": "elastos.runtime-projection/v1",
             "bus_contract": "elastos.runtime-projection/v1",
             "execution": "web-projection",
@@ -1565,7 +1784,7 @@ mod tests {
             "version": "0.1.0",
             "name": "bad-bus-contract",
             "role": "app",
-            "type": "wasm",
+            "type": "web-projection",
             "runtime_abi": "elastos.runtime-projection/v1",
             "bus_contract": "not a descriptor",
             "execution": "web-projection",
@@ -1587,7 +1806,7 @@ mod tests {
             "description": "Document viewer",
             "author": "elastos",
             "role": "viewer",
-            "type": "wasm",
+            "type": "web-projection",
             "runtime_abi": "elastos.runtime-projection/v1",
             "bus_contract": "elastos.runtime-projection/v1",
             "execution": "web-projection",

@@ -8,7 +8,6 @@ import {
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
 import {
-  fetchJson,
   focusModeEnabled,
   formatBadgeCount,
   setDesktopIconsVisible,
@@ -27,8 +26,8 @@ import { openExpose } from "./shell-expose.js?v=home-20260813a";
 import { summaryDisplayName } from "./shell-chrome.js?v=home-20260813a";
 
 /* Control Centre: the quick layer for controls that already have canonical
-   stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
-   (shell-gated discovery), Mission Control, and session deep links. Owns no
+   stores — theme, sounds, focus, accent, dock, desktop icons — plus
+   Mission Control and session deep links. Owns no
    authority of its own. */
 
 let panel = null;
@@ -43,8 +42,6 @@ let accentCustomWriteTimer = 0;
 let focusSwitch = null;
 let approvalsRow = null;
 let approvalsDetail = null;
-let discoverySwitch = null;
-let discoveryDetail = null;
 let carrierDetail = null;
 let soundsSwitch = null;
 let dockSwitch = null;
@@ -61,7 +58,6 @@ let quickWalletRow = null;
 let quickWalletDetail = null;
 let outsideDismissBound = false;
 let registered = false;
-let discoveryTick = 0;
 
 export function bindControlCentre() {
   if (panel) {
@@ -77,8 +73,6 @@ export function bindControlCentre() {
   focusSwitch = document.querySelector("#control-centre-focus");
   approvalsRow = document.querySelector("#control-centre-approvals");
   approvalsDetail = document.querySelector("#control-centre-approvals-detail");
-  discoverySwitch = document.querySelector("#control-centre-discovery");
-  discoveryDetail = document.querySelector("#control-centre-discovery-detail");
   carrierDetail = document.querySelector("#control-centre-carrier-detail");
   soundsSwitch = document.querySelector("#control-centre-sounds");
   dockSwitch = document.querySelector("#control-centre-dock");
@@ -173,15 +167,6 @@ export function bindControlCentre() {
     showInboxRail();
   });
 
-  discoverySwitch?.addEventListener("click", () => {
-    const on = discoverySwitch.getAttribute("aria-checked") === "true";
-    setDiscoveryEnabled(!on).catch((error) => {
-      console.warn("discovery toggle failed", error);
-      playUiSound("error");
-      syncNearby(shellState.currentSummary);
-    });
-  });
-
   soundsSwitch?.addEventListener("click", () => {
     const next = !uiSoundsEnabled();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
@@ -270,14 +255,12 @@ export function showControlCentre() {
   button?.setAttribute("aria-expanded", "true");
   bindOutsideDismiss();
   panel.focus({ preventScroll: true });
-  startDiscoveryTick();
 }
 
 export function hideControlCentre({ restoreFocus = true } = {}) {
   if (!controlCentreOpen()) {
     return;
   }
-  stopDiscoveryTick();
   button?.setAttribute("aria-expanded", "false");
   dismissWithMotion(panel, {
     className: "menubar-card-leaving",
@@ -307,7 +290,7 @@ export function syncControlCentre(summary) {
   syncAccentRow();
   syncFocusSwitch();
   syncApprovals(summary);
-  syncNearby(summary);
+  syncCarrier(summary);
   syncSoundsSwitch();
   syncDockSwitch();
   syncDesktopIconsSwitch();
@@ -465,62 +448,12 @@ function syncApprovals(summary) {
   approvalsDetail.textContent = count > 0 ? `${formatBadgeCount(count)} pending` : "None";
 }
 
-function discoveryRemainingSeconds(discovery) {
-  const until = Number(discovery?.expires_at || discovery?.enabled_until || 0);
-  if (!Number.isFinite(until) || until <= 0) {
-    return 0;
-  }
-  const remaining = until - Math.floor(Date.now() / 1000);
-  return Math.max(0, remaining);
-}
-
-function formatMmSs(totalSeconds) {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
-}
-
-function syncNearby(summary) {
-  const discovery = summary?.people?.discovery;
-  const remaining = discoveryRemainingSeconds(discovery);
-  const on = discovery?.enabled === true && remaining > 0;
-  discoverySwitch?.setAttribute("aria-checked", on ? "true" : "false");
-  if (discoveryDetail) {
-    discoveryDetail.hidden = !on;
-    discoveryDetail.textContent = on ? `Discoverable · ${formatMmSs(remaining)}` : "";
-  }
+function syncCarrier(summary) {
   if (carrierDetail) {
-    const status = discovery?.status;
+    const status = summary?.people?.discovery?.status;
     carrierDetail.textContent =
       status === "visible" ? "Online" :
       status === "runtime_unavailable" ? "Unavailable" : "Idle";
-  }
-}
-
-async function setDiscoveryEnabled(enabled) {
-  await fetchJson("/api/apps/home/discovery", {
-    method: "POST",
-    body: JSON.stringify({ enabled }),
-  });
-  await shellState.requestSummaryRefresh?.();
-  syncNearby(shellState.currentSummary);
-}
-
-function startDiscoveryTick() {
-  stopDiscoveryTick();
-  discoveryTick = window.setInterval(() => {
-    if (!controlCentreOpen()) {
-      stopDiscoveryTick();
-      return;
-    }
-    syncNearby(shellState.currentSummary);
-  }, 1000);
-}
-
-function stopDiscoveryTick() {
-  if (discoveryTick) {
-    window.clearInterval(discoveryTick);
-    discoveryTick = 0;
   }
 }
 

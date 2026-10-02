@@ -5,8 +5,10 @@
   "description": "Carrier network provider for elastos://tunnel/ (public cloudflared quick tunnels)",
   "author": "elastos",
   "role": "provider",
-  "type": "microvm",
-  "entrypoint": "rootfs.ext4",
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "tunnel-provider",
   "requires": [
     { "name": "cloudflared", "kind": "external" }
   ],
