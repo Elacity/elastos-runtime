@@ -6,9 +6,10 @@ All notable changes to the public ElastOS Runtime repository.
 
 ### Fixed
 
-- Runtime stages and verifies offline updates with unchanged support assets
-  under one installation lock and journal. Failed or interrupted activation
-  restores the previous release files. Automatic Home restart remains a follow-up.
+- Runtime adds an internal offline update foundation with staged verification,
+  an installation lock and journal, and restoration after failed or interrupted
+  activation. The default CLI update flow is preserved. Home restart ownership
+  and integration remain a follow-up.
 
 ## [0.7.1] - 2026-09-30
 

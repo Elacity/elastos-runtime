@@ -9,10 +9,13 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use elastos_common::localhost::{publisher_release_head_path, publisher_release_manifest_path};
+
 use crate::crypto::{verify_release_envelope, verify_release_envelope_against_dids};
 use crate::install_transaction::{InstallTransaction, ReleaseFile};
 use crate::sources::{
-    default_data_dir, default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
+    default_data_dir, default_install_path, load_trusted_sources, normalize_gateways,
+    save_trusted_sources, TrustedSource,
 };
 
 /// Async callback for fetching content by CID from the trusted source.
@@ -627,6 +630,78 @@ pub(crate) async fn run_update_for_data_dir_in_context(
     force: bool,
     carrier_context: crate::setup::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
+    run_update_for_data_dir_with_mode(
+        data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+        carrier_context,
+        ApplyMode::Normal,
+    )
+    .await
+}
+
+/// Internal foundation for a Home restart owner that has stopped Runtime.
+/// This uses the normal signed discovery and admission flow, then stages an
+/// offline transaction with unchanged support assets. The caller owns restart
+/// and installed Home acceptance.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_frozen_update_for_data_dir(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    run_update_for_data_dir_with_mode(
+        data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+        crate::setup::FirstPartyCarrierContext::Setup,
+        ApplyMode::FrozenOffline,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Normal,
+    FrozenOffline,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_update_for_data_dir_with_mode(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+    apply_mode: ApplyMode,
+) -> anyhow::Result<()> {
     if !check_only {
         recover_pending_installation(data_dir)?;
     }
@@ -788,6 +863,7 @@ pub(crate) async fn run_update_for_data_dir_in_context(
         discovery_method,
         working_gateway.as_deref(),
         carrier_context,
+        apply_mode,
     )
     .await
 }
@@ -849,7 +925,8 @@ async fn run_upgrade_from_head(
     force: bool,
     discovery_method: &str,
     working_gateway: Option<&str>,
-    _carrier_context: crate::setup::FirstPartyCarrierContext,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+    apply_mode: ApplyMode,
 ) -> anyhow::Result<()> {
     // Admit the exact signed publication before check-only/version success or artifacts.
     if release_cid.is_empty() {
@@ -1042,6 +1119,145 @@ async fn run_upgrade_from_head(
     }
     println!("  Components verified (SHA-256 ✓)");
 
+    if apply_mode == ApplyMode::Normal {
+        // 10. Atomic replace binary
+        let bin_path = if source.install_path.is_empty() {
+            default_install_path()
+        } else {
+            PathBuf::from(&source.install_path)
+        };
+        let bin_dir = bin_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let tmp_bin = bin_dir.join(".elastos.upgrade.tmp");
+
+        std::fs::create_dir_all(&bin_dir)?;
+        std::fs::write(&tmp_bin, &binary_data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755))?;
+        }
+        if let Err(error) = verify_installed_binary_version(&tmp_bin, version).await {
+            std::fs::remove_file(&tmp_bin)?;
+            return Err(error);
+        }
+        std::fs::rename(&tmp_bin, &bin_path)?;
+        println!("  Installed binary: {}", bin_path.display());
+        println!("  Installed binary verified (version ✓)");
+
+        // 11. Atomic replace components.json
+        let comp_path = data_dir.join("components.json");
+        let old_components = std::fs::read(&comp_path).ok();
+        let changed_capsules =
+            changed_capsule_names(old_components.as_deref(), &comp_data).unwrap_or_default();
+        let tmp_comp = data_dir.join(".components.upgrade.tmp");
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::write(&tmp_comp, &comp_data)?;
+        std::fs::rename(&tmp_comp, &comp_path)?;
+        println!("  Installed components: {}", comp_path.display());
+
+        let refreshed_components =
+            crate::setup::refresh_installed_components_for_update_in_context(
+                data_dir,
+                old_components.as_deref(),
+                &comp_data,
+                &component_platform,
+                carrier_context,
+            )
+            .await?;
+        if refreshed_components.is_empty() {
+            println!("  Installed support assets unchanged");
+        } else {
+            println!(
+                "  Refreshed installed support assets: {}",
+                refreshed_components.join(", ")
+            );
+        }
+
+        // 12. Clear only changed capsule cache entries.
+        let cleared = evict_changed_capsule_cache(data_dir, &changed_capsules);
+        if cleared > 0 {
+            println!(
+                "  Cleared {} changed cached capsule(s): {}",
+                cleared,
+                changed_capsules.join(", ")
+            );
+        } else if old_components.is_some() {
+            println!("  Capsule cache unchanged");
+        }
+
+        // The replaced binary makes an existing host exit through its installed
+        // binary supersession watch. Do not migrate protected objects until that
+        // host has released the Runtime identity and all object owners are offline.
+        wait_for_runtime_host_release(data_dir).await?;
+        let principal_root_backup = data_dir.join("backups").join(format!(
+            "principal-root-upgrade-{}-{}",
+            crate::auth::now_ts(),
+            std::process::id()
+        ));
+        let principal_root_receipt =
+            crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+                data_dir,
+                &principal_root_backup,
+            )?;
+        println!(
+            "  Principal-root readiness: {} ({} object(s))",
+            principal_root_receipt.status, principal_root_receipt.object_count
+        );
+
+        // 13. Save new state
+        if let Some(parent) = publisher_release_head_path(data_dir).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(publisher_release_head_path(data_dir), head_bytes)?;
+        std::fs::write(publisher_release_manifest_path(data_dir), &release_bytes)?;
+
+        // Build gateway list with working gateway first (if discovered via gateway)
+        let save_gateways = if ordered_gateways.is_empty() && working_gateway.is_none() {
+            normalize_gateways(&source.gateways)
+        } else if let Some(wg) = working_gateway {
+            let wg_normalized = wg.trim_end_matches('/').to_string();
+            let mut gws = vec![wg_normalized.clone()];
+            for g in ordered_gateways {
+                let normalized = g.trim_end_matches('/').to_string();
+                if normalized != wg_normalized {
+                    gws.push(normalized);
+                }
+            }
+            normalize_gateways(&gws)
+        } else {
+            normalize_gateways(ordered_gateways)
+        };
+
+        let mut sources = load_trusted_sources(data_dir)?;
+        if let Some(stored_source) = sources.source_named_mut(Some(&source.name)) {
+            stored_source.gateways = save_gateways;
+            stored_source.installed_version = version.to_string();
+            stored_source.install_path = bin_path.display().to_string();
+            stored_source.head_cid = resolved_head_cid
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| stored_source.head_cid.clone());
+        } else {
+            let mut updated_source = source.clone();
+            updated_source.gateways = save_gateways;
+            updated_source.installed_version = version.to_string();
+            updated_source.install_path = bin_path.display().to_string();
+            updated_source.head_cid = resolved_head_cid
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| updated_source.head_cid.clone());
+            sources.upsert_source(updated_source);
+        }
+        save_trusted_sources(data_dir, &sources)?;
+
+        println!();
+        println!("  ElastOS {} installed successfully!", version);
+        println!();
+
+        return Ok(());
+    }
+
     // This first recovery seam supports an offline hop with unchanged support assets.
     // The installation lock coordinates writers; the host lock keeps the Home offline.
     let bin_path = if source.install_path.is_empty() {
@@ -1150,10 +1366,28 @@ async fn run_upgrade_from_head(
     })?;
 
     println!();
-    println!("  ElastOS {} release files installed. Start Runtime with the restart owner to verify the Home journey.", version);
+    println!(
+        "  Runtime {} files are installed. Start Home to check the update.",
+        version
+    );
     println!();
 
     Ok(())
+}
+
+async fn wait_for_runtime_host_release(data_dir: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if crate::host_lock::active_host_process(data_dir)?.is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the active Runtime did not stop for principal-root upgrade; installation is not ready"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Frozen support proves byte preservation across this update window. Signed archive
@@ -1309,13 +1543,11 @@ fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::save_trusted_sources;
     use axum::body::Body;
     use axum::extract::Path as AxumPath;
     use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
-    use elastos_common::localhost::publisher_release_head_path;
 
     fn raw_cid(bytes: &[u8]) -> String {
         use sha2::Digest;
@@ -1914,6 +2146,7 @@ mod tests {
             "fixture",
             None,
             crate::setup::FirstPartyCarrierContext::Setup,
+            ApplyMode::Normal,
         )
         .await;
         assert!(result
@@ -1938,6 +2171,7 @@ mod tests {
             "fixture",
             None,
             crate::setup::FirstPartyCarrierContext::Setup,
+            ApplyMode::Normal,
         )
         .await
         .unwrap();
@@ -1994,6 +2228,7 @@ mod tests {
             "fixture",
             None,
             crate::setup::FirstPartyCarrierContext::Setup,
+            ApplyMode::Normal,
         )
         .await
         .unwrap_err();
@@ -2153,6 +2388,7 @@ mod tests {
                         "test",
                         gateway_transport.then_some(gateway.as_str()),
                         crate::setup::FirstPartyCarrierContext::Setup,
+                        ApplyMode::Normal,
                     )
                     .await;
                     server.abort();
@@ -2250,6 +2486,24 @@ mod tests {
         executable: &[u8],
         components: &[u8],
     ) -> anyhow::Result<()> {
+        apply_signed_fixture_with_mode(
+            data_dir,
+            source,
+            executable,
+            components,
+            ApplyMode::FrozenOffline,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn apply_signed_fixture_with_mode(
+        data_dir: &Path,
+        _source: &TrustedSource,
+        executable: &[u8],
+        components: &[u8],
+        mode: ApplyMode,
+    ) -> anyhow::Result<()> {
         use sha2::Digest;
 
         let binary_cid = raw_cid(executable);
@@ -2273,12 +2527,8 @@ mod tests {
         let release_cid = raw_cid(&release);
         let head_bytes = binding_envelope(binding_head(&release), "elastos.release.head.v1");
         let head_cid = raw_cid(&head_bytes);
-        let head = verify_release_envelope(
-            &head_bytes,
-            "elastos.release.head.v1",
-            &source.publisher_dids[0],
-        )?;
         let artifacts = std::collections::HashMap::from([
+            (head_cid.clone(), head_bytes),
             (release_cid.clone(), release),
             (binary_cid, executable.to_vec()),
             (components_cid, components.to_vec()),
@@ -2288,26 +2538,200 @@ mod tests {
             let bytes = artifacts.get(&cid).expect("unexpected fixture CID").clone();
             Box::pin(async move { Ok(bytes) })
         });
-        run_upgrade_from_head(
-            &fetch,
-            &head,
-            &head_bytes,
-            Some(&head_cid),
-            "0.7.1",
-            &release_cid,
-            None,
-            &source.installed_version,
-            source,
-            data_dir,
-            false,
-            &[],
-            true,
-            false,
-            "fixture",
-            None,
-            crate::setup::FirstPartyCarrierContext::Setup,
+        match mode {
+            ApplyMode::Normal => {
+                run_update_for_data_dir(
+                    data_dir,
+                    &fetch,
+                    None,
+                    false,
+                    Some(head_cid),
+                    true,
+                    vec![],
+                    "0.7.0",
+                    true,
+                    false,
+                )
+                .await
+            }
+            ApplyMode::FrozenOffline => {
+                run_frozen_update_for_data_dir(
+                    data_dir,
+                    &fetch,
+                    None,
+                    false,
+                    Some(head_cid),
+                    true,
+                    vec![],
+                    "0.7.0",
+                    true,
+                    false,
+                )
+                .await
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn default_apply_fixture(
+        components: &[u8],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, TrustedSource) {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path().join("data");
+        let binary = fixture.path().join("bin/elastos");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(data.join("components.json"), components).unwrap();
+        std::fs::write(data.join("owner-data"), b"owner data").unwrap();
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [did], "channel": "stable",
+            "installed_version": "0.7.0", "install_path": binary
+        }))
+        .unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source.clone());
+        save_trusted_sources(&data, &sources).unwrap();
+        (fixture, data, binary, source)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_signed_update_waits_for_online_host_after_binary_activation() {
+        let components =
+            br#"{"schema":"elastos.components/v1","external":{},"profiles":{},"capsules":{}}"#;
+        let (_fixture, data, binary, source) = default_apply_fixture(components);
+        let executable = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
+        let host = crate::host_lock::acquire_host_process_lock(&data, "fixture", "online").unwrap();
+        assert!(crate::host_lock::active_host_process(&data)
+            .unwrap()
+            .is_some());
+        let selected_binary = binary.clone();
+        let selected_data = data.clone();
+        let release_host = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::fs::read(&selected_binary).unwrap() != executable {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "default apply never activated the binary while host was online"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Keep the host active briefly after activation so apply must wait.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert_eq!(
+                load_trusted_sources(&selected_data)
+                    .unwrap()
+                    .default_source()
+                    .unwrap()
+                    .installed_version,
+                "0.7.0",
+                "state must be saved only after the online host releases ownership"
+            );
+            assert!(!publisher_release_head_path(&selected_data).exists());
+            drop(host);
+        });
+        let result = apply_signed_fixture_with_mode(
+            &data,
+            &source,
+            executable,
+            components,
+            ApplyMode::Normal,
         )
-        .await
+        .await;
+        release_host.await.unwrap();
+        result.unwrap();
+        assert!(crate::host_lock::active_host_process(&data)
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&binary).unwrap(), executable);
+        assert_eq!(
+            load_trusted_sources(&data)
+                .unwrap()
+                .default_source()
+                .unwrap()
+                .installed_version,
+            "0.7.1"
+        );
+        assert_eq!(
+            std::fs::read(data.join("owner-data")).unwrap(),
+            b"owner data"
+        );
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_signed_update_refreshes_changed_support_and_only_changed_capsule_cache() {
+        let empty =
+            br#"{"schema":"elastos.components/v1","external":{},"profiles":{},"capsules":{}}"#;
+        let (_fixture, data, binary, source) = default_apply_fixture(empty);
+        let old_provider_source = data.join("old-provider-source");
+        let new_provider_source = data.join("new-provider-source");
+        std::fs::write(&old_provider_source, b"old provider").unwrap();
+        std::fs::write(&new_provider_source, b"new provider").unwrap();
+        std::fs::create_dir_all(data.join("bin")).unwrap();
+        std::fs::write(data.join("bin/fixture-provider"), b"old provider").unwrap();
+        for name in ["changed", "retained"] {
+            std::fs::create_dir_all(data.join("capsules").join(name)).unwrap();
+            std::fs::write(
+                data.join("capsules").join(name).join("cached.wasm"),
+                name.as_bytes(),
+            )
+            .unwrap();
+        }
+        let manifest = |provider_source: &Path, version: &str, changed_cid: &str| {
+            serde_json::json!({
+                "schema": "elastos.components/v1",
+                "external": {"fixture-provider": {
+                    "version": version, "install_path": "bin/fixture-provider",
+                    "platforms": {(crate::setup::detect_platform()): {
+                        "strategy": "local-copy", "source": provider_source,
+                        "install_path": "bin/fixture-provider"
+                    }}
+                }},
+                "profiles": {},
+                "capsules": {
+                    "changed": {"cid": changed_cid, "sha256": "a", "size": 1, "platforms": []},
+                    "retained": {"cid": "retained-cid", "sha256": "b", "size": 1, "platforms": []}
+                }
+            })
+        };
+        let old = serde_json::to_vec(&manifest(&old_provider_source, "0.1.0", "old-cid")).unwrap();
+        let new = serde_json::to_vec(&manifest(&new_provider_source, "0.2.0", "new-cid")).unwrap();
+        std::fs::write(data.join("components.json"), &old).unwrap();
+        let executable = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
+        apply_signed_fixture_with_mode(&data, &source, executable, &new, ApplyMode::Normal)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(data.join("bin/fixture-provider")).unwrap(),
+            b"new provider"
+        );
+        assert!(!data.join("capsules/changed").exists());
+        assert_eq!(
+            std::fs::read(data.join("capsules/retained/cached.wasm")).unwrap(),
+            b"retained"
+        );
+        assert_eq!(std::fs::read(data.join("components.json")).unwrap(), new);
+        assert_eq!(std::fs::read(&binary).unwrap(), executable);
+        assert_eq!(
+            std::fs::read(data.join("owner-data")).unwrap(),
+            b"owner data"
+        );
+        assert_eq!(
+            load_trusted_sources(&data)
+                .unwrap()
+                .default_source()
+                .unwrap()
+                .installed_version,
+            "0.7.1"
+        );
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
     }
 
     #[cfg(unix)]
