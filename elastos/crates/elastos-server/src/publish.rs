@@ -1789,8 +1789,8 @@ mod tests {
         release_discovery_topics, resolve_platform_input_paths, save_publish_state,
         select_capsules, source_discovery_uri, validate_platform_input_options,
         validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
-        PublishReleaseOptions, PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform,
-        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
+        DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
