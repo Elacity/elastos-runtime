@@ -167,6 +167,8 @@ show_help() {
     echo -e "${BOLD}Required:${NC}"
     echo "  --version X.Y.Z    Runtime release version (see docs/VERSIONING.md)"
     echo "  --key PATH         Ed25519 signing key (hex-encoded, 32 bytes)"
+    echo "  --prepare-only DIR Prepare unsigned native inputs for the separate custodian signer"
+    echo "  --publisher-did DID  Public signer DID for unsigned preparation"
     echo ""
     echo -e "${BOLD}Optional:${NC}"
     echo "  --ipfs-provider-bin PATH  Path to ipfs-provider binary (optional auto-detect)"
@@ -1144,6 +1146,40 @@ publish_prepared_platform_inputs() {
     SHELL_CID='' SHELL_SHA256=''
 }
 
+prepare_release_signing_input() {
+    local root="$1" output="$2" publisher="$3" bootstrap ticket node gateway ipns
+    local args=() prev
+    ticket="${ELASTOS_SOURCE_CONNECT_TICKET:-}"
+    node="${ELASTOS_PUBLISHER_NODE_ID:-}"
+    if [[ -n "$ticket" || -n "$node" ]]; then
+        [[ -n "$ticket" && -n "$node" ]] || die "unsigned preparation requires the Carrier ticket and node from one publisher"
+    else
+        bootstrap=$(discover_source_bootstrap_json) || return
+        ticket=$(printf '%s' "$bootstrap" | jq -r '.ticket // empty')
+        node=$(printf '%s' "$bootstrap" | jq -r '.node_id // empty')
+    fi
+    [[ -n "$ticket" && -n "$node" ]] || die "unsigned preparation requires a Publisher Carrier ticket/node pair"
+    gateway="${ELASTOS_PUBLISHER_GATEWAY:-$(canonical_publisher_gateway)}"
+    ipns="${ELASTOS_IPNS_NAME:-}"
+    jq -nc --arg did "$publisher" --arg ticket "$ticket" --arg node "$node" \
+        --arg gateway "${gateway%/}" --arg ipns "$ipns" \
+        '{MAINTAINER_DID:$did,SOURCE_CONNECT_TICKET:$ticket,PUBLISHER_NODE_ID:$node,PUBLISHER_GATEWAY:$gateway,IPNS_NAME:$ipns}' \
+        > "${TMPDIR}/signing-stamps.json" || return
+    jq --argjson platforms "$PLATFORMS_JSON" '
+        reduce ($platforms | to_entries[]) as $p (. ;
+            .["components-"+$p.key+".json"] = $p.value.components.cid)' \
+        "${TMPDIR}/input-cids.json" > "${TMPDIR}/signing-cids.json" || return
+    for prev in release head; do
+        local path="${STATE_DIR}/last-release-cid" option=--prev-release-cid
+        if [[ "$prev" == head ]]; then path="${STATE_DIR}/last-release-head-cid"; option=--prev-head-cid; fi
+        if [[ -f "$path" ]]; then args+=("$option" "$(cat "$path")"); fi
+    done
+    python3 scripts/release-platform-input.py signing-input "$root" \
+        --cids "${TMPDIR}/signing-cids.json" --stamps "${TMPDIR}/signing-stamps.json" \
+        --channel "$CHANNEL" --output "$output" \
+        ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"} ${args[@]+"${args[@]}"}
+}
+
 # The Publisher root serves stable paths: release-head.json, release.json,
 # install.sh and artifacts/<name>. A prepared set is checked against its own
 # signed metadata, staged beside the current publication, then promoted by
@@ -1397,6 +1433,8 @@ fi
 
 VERSION=""
 KEY_PATH=""
+PREPARE_OUTPUT=""
+PREPARE_PUBLISHER_DID=""
 IPFS_PROVIDER_BIN=""
 CHANNEL="stable"
 SKIP_BUILD=false
@@ -1421,6 +1459,14 @@ while [[ $# -gt 0 ]]; do
         --key)
             [[ -z "${2:-}" ]] && die "Usage: --key path/to/release.key"
             KEY_PATH="$2"; shift 2 ;;
+        --prepare-only)
+            [[ -n "${2:-}" ]] || die "Usage: --prepare-only DIR"
+            PREPARE_OUTPUT="$2"
+            [[ "$PREPARE_OUTPUT" == /* ]] || PREPARE_OUTPUT="$PUBLISH_CALLER_DIR/$PREPARE_OUTPUT"
+            shift 2 ;;
+        --publisher-did)
+            [[ -n "${2:-}" ]] || die "Usage: --publisher-did DID"
+            PREPARE_PUBLISHER_DID="$2"; shift 2 ;;
         --ipfs-provider-bin)
             [[ -z "${2:-}" ]] && die "Usage: --ipfs-provider-bin PATH"
             IPFS_PROVIDER_BIN="$2"; shift 2 ;;
@@ -1476,6 +1522,16 @@ done
 
 sha256 /dev/null &>/dev/null || die "No SHA-256 tool available"
 
+if [[ -n "$PREPARE_OUTPUT" ]]; then
+    [[ -z "$KEY_PATH" && "$ALLOW_SIGNER_ROTATION" == false ]] || die "unsigned preparation accepts public inputs only; the custodian owns signing and signer changes"
+    [[ ${#PLATFORM_INPUTS[@]} -gt 0 && -n "$PREPARE_PUBLISHER_DID" ]] || die "unsigned preparation requires --platform-input and --publisher-did"
+    [[ ! -e "$PREPARE_OUTPUT" && ! -L "$PREPARE_OUTPUT" && -d "$(dirname "$PREPARE_OUTPUT")" ]] || die "unsigned output must be a new directory under an existing parent"
+    PUBLISH_PUBLIC_URL=false
+    PUBLIC_WITH_SUDO=false
+elif [[ -n "$PREPARE_PUBLISHER_DID" ]]; then
+    die "--publisher-did requires --prepare-only"
+fi
+
 if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
     [[ "$SKIP_BUILD" == false && "$SKIP_ROOTFS" == false && -z "$CROSS_ARCH" && "$CAPSULES_EXPLICIT" == false ]] \
         || die "--platform-input conflicts with --skip-build, --skip-rootfs, --cross and --capsules"
@@ -1513,9 +1569,11 @@ if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
         IPFS_PROVIDER_BIN="$PREPARED_INPUT_ROOT/artifacts/ipfs-provider-${SETUP_PLATFORM}"
     fi
 fi
-[[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
-[[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
-mkdir -p "$STATE_DIR"
+if [[ -z "$PREPARE_OUTPUT" ]]; then
+    [[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
+    [[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
+    mkdir -p "$STATE_DIR"
+fi
 
 if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
     IPFS_PROVIDER_BIN=$(find_ipfs_provider_binary || true)
@@ -1539,12 +1597,14 @@ fi
 
 fi
 
+if [[ -z "$PREPARE_OUTPUT" ]]; then
 CANDIDATE_SIGNER_DID="$(inspect_signer_did)"
 [[ -n "$CANDIDATE_SIGNER_DID" ]] || die "Failed to determine signer DID from ${KEY_PATH}"
 CANONICAL_GATEWAY="$(canonical_publisher_gateway)"
 CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
 if [[ -n "$CURRENT_CANONICAL_SIGNER_DID" && "$ALLOW_SIGNER_ROTATION" != true && "$CANDIDATE_SIGNER_DID" != "$CURRENT_CANONICAL_SIGNER_DID" ]]; then
     die "Signer DID mismatch for canonical publisher.\n  Candidate: ${CANDIDATE_SIGNER_DID}\n  Canonical: ${CURRENT_CANONICAL_SIGNER_DID}\n  Gateway:   ${CANONICAL_GATEWAY}\nRe-run with --allow-signer-rotation only for an intentional trust-anchor rotation."
+fi
 fi
 
 echo ""
@@ -1556,8 +1616,13 @@ echo -e "${DIM}  Capsules: ${CAPSULES[*]}${NC}"
 echo ""
 
 if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
-    info "Publishing the admitted three-platform native inputs..."
+    info "Importing the admitted native inputs..."
     publish_prepared_platform_inputs "$PREPARED_INPUT_ROOT"
+    if [[ -n "$PREPARE_OUTPUT" ]]; then
+        prepare_release_signing_input "$PREPARED_INPUT_ROOT" "$PREPARE_OUTPUT" "$PREPARE_PUBLISHER_DID"
+        info "Unsigned input is ready for operator approval and the separately installed custodian signer."
+        exit 0
+    fi
 else
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
 

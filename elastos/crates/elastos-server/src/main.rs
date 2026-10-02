@@ -198,10 +198,24 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         capsules: Vec<String>,
 
-        /// Prepared native input for each release platform (repeat PLATFORM=DIR three times)
+        /// Prepared native inputs (at least two platforms, or one explicit canary preview)
         #[arg(long = "platform-input", value_name = "PLATFORM=DIR",
               conflicts_with_all = &["skip_build", "skip_rootfs", "cross", "capsules"])]
         platform_inputs: Vec<String>,
+
+        /// Inspect one Apple silicon Mac input on canary before operator publication
+        #[arg(long, value_name = "PLATFORM", value_parser = ["aarch64-darwin"],
+              requires = "platform_inputs")]
+        preview_platform: Option<String>,
+
+        /// Prepare unsigned native inputs for the separately installed custodian signer
+        #[arg(long, value_name = "DIR", requires_all = &["platform_inputs", "publisher_did"],
+              conflicts_with_all = &["key", "public_url", "public_with_sudo"])]
+        prepare_only: Option<PathBuf>,
+
+        /// Public signer DID for unsigned preparation
+        #[arg(long, value_name = "DID", requires = "prepare_only")]
+        publisher_did: Option<String>,
 
         /// Override release signing key path
         #[arg(long)]
@@ -1420,6 +1434,9 @@ async fn main() -> anyhow::Result<()> {
             cross,
             capsules,
             platform_inputs,
+            preview_platform,
+            prepare_only,
+            publisher_did,
             key,
             dry_run,
             preflight_only,
@@ -1439,6 +1456,9 @@ async fn main() -> anyhow::Result<()> {
                 cross,
                 capsules,
                 platform_inputs,
+                preview_platform,
+                prepare_only,
+                publisher_did,
                 key,
                 dry_run,
                 preflight_only,
@@ -2280,6 +2300,106 @@ mod tests {
             invalid.extend(conflict);
             assert!(super::Cli::try_parse_from(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn publish_release_cli_accepts_mac_preview_and_refuses_invalid_options() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+            "--dry-run",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            preview_platform,
+            platform_inputs,
+            channel,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(preview_platform.as_deref(), Some("aarch64-darwin"));
+        assert_eq!(platform_inputs, ["aarch64-darwin=/prepared/mac"]);
+        assert_eq!(channel, "canary");
+        assert!(dry_run);
+        for conflict in [
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        let mut unsupported = args;
+        unsupported[7] = "aarch64-linux";
+        assert!(super::Cli::try_parse_from(unsupported).is_err());
+        assert!(super::Cli::try_parse_from([
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--dry-run",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn publish_release_cli_prepares_public_inputs_without_a_key_option() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "1.2.3",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+            "--prepare-only",
+            "/prepared/unsigned",
+            "--publisher-did",
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            prepare_only,
+            publisher_did,
+            key,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(prepare_only.unwrap().to_str(), Some("/prepared/unsigned"));
+        assert!(publisher_did.unwrap().starts_with("did:key:"));
+        assert!(key.is_none());
+        for conflict in [
+            vec!["--key", "/custodian/unopened.pem"],
+            vec!["--public-url"],
+            vec!["--public-with-sudo"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        assert!(super::Cli::try_parse_from(&args[..12]).is_err());
     }
 
     #[test]

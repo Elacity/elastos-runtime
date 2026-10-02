@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise unsigned input admission without builds, uploads or signing."""
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -23,6 +24,11 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("platform_input", Path(__file__).with_name("release-platform-input.py"))
 inputs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inputs)
+
+signer_spec = importlib.util.spec_from_file_location("release_signer_fixture", Path(__file__).with_name("release-signer.py"))
+signer = importlib.util.module_from_spec(signer_spec)
+sys.modules[signer_spec.name] = signer
+signer_spec.loader.exec_module(signer)
 
 
 def binary(platform):
@@ -811,8 +817,292 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
         with self.assertRaisesRegex(ValueError, "candidate checkout"):
             inputs.validate_inputs(self.values())
 
+    def signing_fixture(self):
+        platform = "aarch64-darwin"
+        stage = self.root / "signing-stage"
+        record = inputs.stage_inputs([f"{platform}={self.bundles[platform]}"], "0.7.1", stage,
+                                     preview_platform=platform)
+        cids_path = self.root / "signing-cids.json"
+        cids = {name: signer.raw_cid((stage / "artifacts" / name).read_bytes())
+                for name in record["files"]}
+        self.write_json(cids_path, cids)
+        inputs.attach_input_cids(stage, cids_path, preview_platform=platform)
+        components = f"components-{platform}.json"
+        cids[components] = signer.raw_cid((stage / "artifacts" / components).read_bytes())
+        self.write_json(cids_path, cids)
+        # RFC 8032 public verification key only; no signing seed or backend.
+        did = signer.public_did(bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"))
+        stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "public-ticket",
+                  "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid",
+                  "IPNS_NAME": ""}
+        stamps_path = self.root / "signing-stamps.json"
+        self.write_json(stamps_path, stamps)
+        template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"'
+                    for name in sorted(signer.STAMPS | {"HEAD_CID"})) + "\n").encode()
+        blob_oid = hashlib.sha1(b"blob " + str(len(template)).encode() + b"\0" + template).hexdigest()
+        for context in (
+                patch.object(inputs, "installer_source_blob", return_value=(blob_oid, template)),
+                patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3))):
+            context.start()
+            self.addCleanup(context.stop)
+        return SimpleNamespace(stage=stage, cids=cids, cids_path=cids_path, stamps=stamps,
+                               stamps_path=stamps_path, template=template, blob_oid=blob_oid,
+                               output=self.root / "unsigned-input", platform=platform)
+
+    def prepare_signing_fixture(self, fixture, **overrides):
+        options = {"channel": "canary", "output": fixture.output, "preview_platform": fixture.platform}
+        options.update(overrides)
+        return inputs.signing_input(fixture.stage, fixture.cids_path, fixture.stamps_path, **options)
+
+    def test_unsigned_mac_canary_handoff_binds_exact_files_installer_and_source(self):
+        fixture = self.signing_fixture()
+        manifest = self.prepare_signing_fixture(fixture)
+        rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
+        self.assertIn(b'HEAD_CID=""', rendered)
+        self.assertEqual(manifest["source"], {"commit": "a" * 40, "tree": "b" * 40})
+        self.assertEqual((manifest["version"], manifest["channel"]), ("0.7.1", "canary"))
+        self.assertEqual(manifest["installer"], {"blob_oid": fixture.blob_oid, "stamps": fixture.stamps})
+        self.assertEqual(manifest["release"]["source"], manifest["source"])
+        self.assertEqual(manifest["release"]["installer_sha256"], signer.sha256(rendered))
+        self.assertEqual(manifest["release"]["released_at"], manifest["head"]["updated_at"])
+        self.assertEqual(set(manifest["release"]["platforms"]), {fixture.platform})
+        self.assertIsNone(manifest["release"]["prev_release_cid"])
+        self.assertIsNone(manifest["head"]["prev_head_cid"])
+        self.assertEqual((fixture.output / "signing-input.json").read_bytes(), signer.json_bytes(manifest))
+        self.assertEqual(set(path.name for path in fixture.output.iterdir()), set(fixture.cids) | {"signing-input.json"})
+        for name, cid in fixture.cids.items():
+            source = fixture.stage / "artifacts" / name
+            copied = fixture.output / name
+            self.assertEqual(copied.read_bytes(), source.read_bytes())
+            record = inputs.file_record(source)
+            self.assertEqual(manifest["files"][name], {"cid": cid, "sha256": record["sha256"], "size": record["size"]})
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o400)
+        for kind, name in (("binary", f"elastos-{fixture.platform}"),
+                           ("components", f"components-{fixture.platform}.json")):
+            self.assertEqual(manifest["release"]["platforms"][fixture.platform][kind], manifest["files"][name])
+        # Admit the exported data through the production signer, with public
+        # source responses only. This stops before constructing any backend.
+        commit, tree, scripts = "a" * 40, "b" * 40, "c" * 40
+        prefix = f"/repos/{signer.REPOSITORY}"
+        api = {
+            f"{prefix}/git/ref/tags/v0.7.1": {"ref": "refs/tags/v0.7.1", "object": {"type": "commit", "sha": commit}},
+            f"{prefix}/git/commits/{commit}": {"sha": commit, "tree": {"sha": tree}},
+            f"{prefix}/git/ref/heads/main": {"ref": "refs/heads/main", "object": {"type": "commit", "sha": commit}},
+            f"{prefix}/compare/{commit}...{commit}?per_page=1": {"status": "identical", "ahead_by": 0, "behind_by": 0,
+                "base_commit": {"sha": commit}, "merge_base_commit": {"sha": commit}},
+            f"{prefix}/git/trees/{tree}": {"sha": tree, "truncated": False, "tree": [{"path": "scripts", "type": "tree", "mode": "040000", "sha": scripts}]},
+            f"{prefix}/git/trees/{scripts}": {"sha": scripts, "truncated": False, "tree": [{"path": "install.sh", "type": "blob", "mode": "100755", "sha": fixture.blob_oid}]},
+            f"{prefix}/git/blobs/{fixture.blob_oid}": {"sha": fixture.blob_oid, "encoding": "base64", "size": len(fixture.template),
+                "content": base64.b64encode(fixture.template).decode()},
+        }
+        policy = {"repository": signer.REPOSITORY, "tag": "v0.7.1", "tag_oid": commit, "commit": commit, "tree": tree,
+                  "version": "0.7.1", "channel": "canary", "publisher_did": fixture.stamps["MAINTAINER_DID"],
+                  "manifest_sha256": signer.sha256(signer.json_bytes(manifest)),
+                  "max_file_bytes": 1024 * 1024, "max_snapshot_bytes": 8 * 1024 * 1024}
+        snapshot = (self.root / "custodian-public-snapshot").resolve()
+        snapshot.mkdir(mode=0o700)
+        prepared = signer.prepare(policy, fixture.output.resolve(), "signing-input.json", api.__getitem__, snapshot)
+        self.assertEqual(prepared.release, signer.json_bytes(manifest["release"]))
+        self.assertEqual(dict(prepared.files)["install.sh"].read_bytes(), rendered)
+
+    def test_unsigned_handoff_refuses_existing_and_symlink_output(self):
+        fixture = self.signing_fixture()
+        fixture.output.mkdir()
+        marker = fixture.output / "keep"
+        marker.write_bytes(b"existing public bytes")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.prepare_signing_fixture(fixture)
+        self.assertEqual(marker.read_bytes(), b"existing public bytes")
+        dangling = self.root / "output-link"
+        target = self.root / "absent-output"
+        dangling.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.prepare_signing_fixture(fixture, output=dangling)
+        self.assertTrue(dangling.is_symlink())
+        self.assertFalse(target.exists())
+
+    def test_unsigned_handoff_refuses_changed_artifacts_and_missing_cid_map(self):
+        fixture = self.signing_fixture()
+        with self.assertRaises(FileNotFoundError):
+            inputs.signing_input(fixture.stage, self.root / "missing-cids.json", fixture.stamps_path,
+                                 "canary", fixture.output, fixture.platform)
+        missing = dict(fixture.cids)
+        del missing[f"elastos-{fixture.platform}"]
+        self.write_json(fixture.cids_path, missing)
+        with self.assertRaisesRegex(ValueError, "complete artifact set"):
+            self.prepare_signing_fixture(fixture)
+        self.write_json(fixture.cids_path, fixture.cids)
+        (fixture.stage / "artifacts/home.tar.gz").write_bytes(b"changed public bytes")
+        with self.assertRaisesRegex(ValueError, "differs from admitted bytes"):
+            self.prepare_signing_fixture(fixture)
+        self.assertFalse(fixture.output.exists())
+
+    def test_unsigned_handoff_refuses_raw_cid_mismatch_and_unsafe_stamps(self):
+        fixture = self.signing_fixture()
+        changed = dict(fixture.cids)
+        changed[f"elastos-{fixture.platform}"] = signer.raw_cid(b"different public bytes")
+        self.write_json(fixture.cids_path, changed)
+        with self.assertRaisesRegex(ValueError, "raw CID differs"):
+            self.prepare_signing_fixture(fixture)
+        self.write_json(fixture.cids_path, fixture.cids)
+        for stamps in ({**fixture.stamps, "SOURCE_CONNECT_TICKET": "$(touch marker)"},
+                       {**fixture.stamps, "PUBLISHER_GATEWAY": "http://staging.invalid"},
+                       {**fixture.stamps, "MAINTAINER_DID": "did:key:invalid"},
+                       {**fixture.stamps, "HEAD_CID": "circular-head"}):
+            self.write_json(fixture.stamps_path, stamps)
+            with self.subTest(stamps=stamps), self.assertRaises(ValueError):
+                self.prepare_signing_fixture(fixture)
+            self.assertFalse(fixture.output.exists())
+
+    def test_unsigned_handoff_refuses_rehashed_generated_components(self):
+        fixture = self.signing_fixture()
+        admitted = (fixture.stage / "components.json").read_bytes()
+        generated = fixture.stage / "artifacts" / f"components-{fixture.platform}.json"
+        components = json.loads(generated.read_bytes())
+        components["external"]["shell"]["platforms"]["darwin-arm64"]["install_path"] = "bin/unapproved"
+        self.write_json(generated, components)
+        changed = dict(fixture.cids)
+        changed[generated.name] = signer.raw_cid(generated.read_bytes())
+        self.write_json(fixture.cids_path, changed)
+        with patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("tampered components copied")):
+            with self.assertRaisesRegex(ValueError, "generated components differ"):
+                self.prepare_signing_fixture(fixture)
+        self.assertFalse(fixture.output.exists())
+        self.assertEqual((fixture.stage / "components.json").read_bytes(), admitted)
+
+    def test_unsigned_stage_refuses_15_percent_floor_before_any_copy(self):
+        output = self.root / "low-disk-stage"
+        platform = "aarch64-darwin"
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=14_000)), \
+                patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk stage copied")):
+            with self.assertRaisesRegex(ValueError, "15%"):
+                inputs.stage_inputs([f"{platform}={self.bundles[platform]}"], "0.7.1", output,
+                                    preview_platform=platform)
+        self.assertFalse(output.exists())
+        self.assertFalse(list(self.root.glob(".platform-import-*")))
+
+    def shell_signing_fixture(self):
+        scratch = self.root / "shell-signing"
+        scratch.mkdir()
+        state = self.root / "shell-state"
+        state.mkdir()
+        previous = {"last-release-cid": signer.unixfs_metadata_cid(b"previous public release"),
+                    "last-release-head-cid": signer.unixfs_metadata_cid(b"previous public head")}
+        for name, cid in previous.items():
+            (state / name).write_text(cid)
+        cids = {"elastos-aarch64-darwin": signer.raw_cid(b"public binary"),
+                "home.tar.gz": signer.raw_cid(b"public app archive")}
+        self.write_json(scratch / "input-cids.json", cids)
+        components_cid = signer.raw_cid(b"public generated components")
+        platforms = self.root / "shell-platforms.json"
+        self.write_json(platforms, {"aarch64-darwin": {
+            "binary": {"cid": cids["elastos-aarch64-darwin"]}, "components": {"cid": components_cid}}})
+        return SimpleNamespace(scratch=scratch, state=state, previous=previous, cids=cids,
+                               components_cid=components_cid, platforms=platforms,
+                               capture=self.root / "python-arguments", output=self.root / "unsigned-shell-output")
+
+    def run_shell_signing_fixture(self, fixture, ticket="public-ticket", node="public-node"):
+        body = r'''source "$1"
+TMPDIR="$2"
+STATE_DIR="$3"
+PLATFORMS_JSON=$(cat "$4")
+CAPTURE="$5"
+CHANNEL=canary
+PREVIEW_ARGS=(--preview-platform aarch64-darwin)
+KEY_PATH="$6/key-must-stay-absent"
+discover_source_bootstrap_json() { echo unexpected-bootstrap-discovery >&2; return 94; }
+inspect_signer_did() { echo unexpected-key-inspection >&2; return 95; }
+python3() { printf '%s\n' "$@" > "$CAPTURE"; }
+prepare_release_signing_input "$6/native-inputs" "$7" "$8"
+'''
+        did = signer.public_did(bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"))
+        result = subprocess.run(["/bin/bash", "-euc", body, "public-signing-helper",
+                                 str(Path(__file__).with_name("publish-release.sh")), str(fixture.scratch),
+                                 str(fixture.state), str(fixture.platforms), str(fixture.capture),
+                                 str(self.root), str(fixture.output), did], capture_output=True, text=True,
+                                env={**os.environ, "ELASTOS_SOURCE_CONNECT_TICKET": ticket,
+                                     "ELASTOS_PUBLISHER_NODE_ID": node,
+                                     "ELASTOS_PUBLISHER_GATEWAY": "https://staging.invalid/",
+                                     "ELASTOS_IPNS_NAME": "public-ipns"})
+        return did, result
+
+    def test_shell_unsigned_helper_passes_complete_public_inputs_without_signing(self):
+        fixture = self.shell_signing_fixture()
+        before = {path.name: path.read_bytes() for path in fixture.state.iterdir()}
+        did, result = self.run_shell_signing_fixture(fixture)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads((fixture.scratch / "signing-cids.json").read_bytes()),
+                         {**fixture.cids, "components-aarch64-darwin.json": fixture.components_cid})
+        self.assertEqual(json.loads((fixture.scratch / "signing-stamps.json").read_bytes()),
+                         {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "public-ticket",
+                          "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid",
+                          "IPNS_NAME": "public-ipns"})
+        arguments = fixture.capture.read_text().splitlines()
+        self.assertEqual(arguments, ["scripts/release-platform-input.py", "signing-input", str(self.root / "native-inputs"),
+                         "--cids", str(fixture.scratch / "signing-cids.json"),
+                         "--stamps", str(fixture.scratch / "signing-stamps.json"), "--channel", "canary",
+                         "--output", str(fixture.output), "--preview-platform", "aarch64-darwin",
+                         "--prev-release-cid", fixture.previous["last-release-cid"],
+                         "--prev-head-cid", fixture.previous["last-release-head-cid"]])
+        self.assertNotIn("--key", arguments)
+        self.assertFalse((self.root / "key-must-stay-absent").exists())
+        self.assertFalse(fixture.output.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in fixture.state.iterdir()}, before)
+
+    def test_shell_unsigned_helper_refuses_unpaired_bootstrap_before_python(self):
+        fixture = self.shell_signing_fixture()
+        before = {path.name: path.read_bytes() for path in fixture.state.iterdir()}
+        for ticket, node in (("public-ticket", ""), ("", "public-node")):
+            with self.subTest(ticket=ticket, node=node):
+                _, result = self.run_shell_signing_fixture(fixture, ticket, node)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("ticket and node from one publisher", result.stderr)
+                self.assertNotIn("unexpected-bootstrap-discovery", result.stderr)
+                self.assertFalse(fixture.capture.exists())
+                self.assertFalse((fixture.scratch / "signing-stamps.json").exists())
+                self.assertFalse(fixture.output.exists())
+                self.assertEqual({path.name: path.read_bytes() for path in fixture.state.iterdir()}, before)
+
+    def test_unsigned_handoff_refuses_changed_copy_and_removes_its_scratch(self):
+        fixture = self.signing_fixture()
+        original_copy = inputs.shutil.copyfile
+        def changed_copy(source, destination):
+            original_copy(source, destination)
+            Path(destination).write_bytes(b"changed while copying public fixture")
+        with patch.object(inputs.shutil, "copyfile", side_effect=changed_copy):
+            with self.assertRaisesRegex(ValueError, "artifact changed while preparing"):
+                self.prepare_signing_fixture(fixture)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(list(self.root.glob(".signing-input-*")))
+
+    def test_unsigned_handoff_refuses_low_disk_before_copy_and_stable_preview(self):
+        fixture = self.signing_fixture()
+        with self.assertRaisesRegex(ValueError, "preview requires canary"):
+            self.prepare_signing_fixture(fixture, channel="stable")
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
+                patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk input copied")):
+            with self.assertRaisesRegex(ValueError, "15 percent"):
+                self.prepare_signing_fixture(fixture)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(list(self.root.glob(".signing-input-*")))
+
 
 class SourceRecordTest(unittest.TestCase):
+    def test_installer_blob_uses_selected_commit_and_validates_inert_bytes(self):
+        template = b"#!/bin/sh\n# public installer Git blob\n"
+        blob = hashlib.sha1(b"blob " + str(len(template)).encode() + b"\0" + template).hexdigest()
+        source = {"commit": "a" * 40, "tree": "b" * 40}
+        with patch.object(inputs, "run", return_value=blob) as run, \
+                patch.object(inputs.subprocess, "check_output", return_value=template) as read:
+            self.assertEqual(inputs.installer_source_blob(source), (blob, template))
+            run.assert_called_once_with("git", "rev-parse", source["commit"] + ":scripts/install.sh")
+            read.assert_called_once_with(["git", "cat-file", "blob", blob], cwd=inputs.SOURCE_ROOT)
+        for invalid in ("e" * 40, "malformed"):
+            with self.subTest(blob=invalid), patch.object(inputs, "run", return_value=invalid), \
+                    patch.object(inputs.subprocess, "check_output", return_value=template), \
+                    self.assertRaisesRegex(ValueError, "source blob differs"):
+                inputs.installer_source_blob(source)
+
     def test_dangling_receipt_link_is_rejected_before_writing(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

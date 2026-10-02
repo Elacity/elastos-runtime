@@ -557,8 +557,8 @@ def stage_inputs(values, version, output, preview_platform=None):
     parent = output.parent.resolve()
     parent.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(parent)
-    if usage.free - sum(record["size"] for record in files.values()) < usage.total / 10:
-        raise ValueError("publication staging requires at least 10% free after its copy")
+    if (usage.free - sum(record["size"] for record in files.values())) * 100 < usage.total * 15:
+        raise ValueError("publication staging requires at least 15% free after its copy")
     with tempfile.TemporaryDirectory(prefix=".platform-import-", dir=parent) as temporary:
         stage = Path(temporary) / "input"
         artifacts = stage / "artifacts"
@@ -612,9 +612,7 @@ def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     return record
 
 
-def attach_input_cids(stage, cids_path, preview_platform=None):
-    record = verify_staged_inputs(stage, allow_generated=True, preview_platform=preview_platform)
-    cids = json.loads(cids_path.read_text())
+def prepared_components_bytes(stage, record, cids):
     if set(cids) != set(record["files"]) or any(
             not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9]+", cid) for cid in cids.values()):
         raise ValueError("upload results must bind every admitted artifact to a nonempty CID")
@@ -637,11 +635,102 @@ def attach_input_cids(stage, cids_path, preview_platform=None):
         errors += integrity.audit_release_artifacts(manifest, [setup], stage / "artifacts")
         if errors:
             raise ValueError("; ".join(errors))
+    return output_bytes
+
+
+def attach_input_cids(stage, cids_path, preview_platform=None):
+    record = verify_staged_inputs(stage, allow_generated=True, preview_platform=preview_platform)
+    cids = json.loads(cids_path.read_text())
+    output_bytes = prepared_components_bytes(stage, record, cids)
     for platform in record["platforms"]:
         output = stage / "artifacts" / f"components-{platform}.json"
         if not output.exists():
             output.write_bytes(output_bytes)
     return record
+
+
+def installer_source_blob(source):
+    """Read the selected installer as inert Git data, not working-tree code."""
+    oid = run("git", "rev-parse", source["commit"] + ":scripts/install.sh")
+    data = subprocess.check_output(["git", "cat-file", "blob", oid], cwd=SOURCE_ROOT)
+    actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{40}", oid) or actual != oid:
+        raise ValueError("installer source blob differs")
+    return oid, data
+
+
+def signing_input(stage, cids_path, stamps_path, channel, output,
+                  preview_platform=None, prev_release_cid=None, prev_head_cid=None):
+    """Prepare data for the separately installed custodian signer; no key input."""
+    spec = importlib.util.spec_from_file_location("release_signer", SCRIPT_ROOT / "release-signer.py")
+    signer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = signer
+    spec.loader.exec_module(signer)
+    record = verify_staged_inputs(stage, allow_generated=True, preview_platform=preview_platform)
+    signer.require(channel in signer.CHANNELS, "release channel refused")
+    signer.require(preview_platform is None or channel == "canary", "preview requires canary")
+    source = {name: record["source"][name] for name in ("commit", "tree")}
+    cids = signer.parse_json(cids_path.read_bytes())
+    stamps = signer.parse_json(stamps_path.read_bytes())
+    signer.check_did(stamps.get("MAINTAINER_DID"))
+    blob_oid, template = installer_source_blob(source)
+    rendered = signer.render_installer(template, stamps, stamps["MAINTAINER_DID"])
+    names = set(record["files"]) | {f"components-{p}.json" for p in record["platforms"]}
+    signer.require(set(cids) == names, "CID results must bind the complete artifact set")
+    expected_components = prepared_components_bytes(stage, record,
+        {name: cids[name] for name in record["files"]})
+    for platform in record["platforms"]:
+        signer.require(regular_file(stage / "artifacts", f"components-{platform}.json").read_bytes()
+                       == expected_components, "generated components differ from admitted inputs")
+    files = {}
+    for name in sorted(names):
+        signer.relative_path(name)
+        info = file_record(regular_file(stage / "artifacts", name))
+        codec, cid_digest = signer.cid_info(cids[name])
+        signer.require(codec != 0x55 or cid_digest.hex() == info["sha256"], "raw CID differs from artifact")
+        files[name] = {"sha256": info["sha256"], "size": info["size"], "cid": cids[name]}
+    for previous in (prev_release_cid, prev_head_cid):
+        if previous is not None:
+            signer.cid_info(previous)
+    platforms = {p: {kind: files[name] for kind, name in (
+        ("binary", f"elastos-{p}"), ("components", f"components-{p}.json"))}
+        for p in record["platforms"]}
+    now = int(datetime.now(timezone.utc).timestamp())
+    manifest = {"source": source, "version": record["version"], "channel": channel,
+                "files": files, "installer": {"blob_oid": blob_oid, "stamps": stamps},
+                "release": {"schema": "elastos.release/v1", "source": source,
+                            "version": record["version"], "channel": channel,
+                            "released_at": now, "prev_release_cid": prev_release_cid,
+                            "platforms": platforms, "installer_sha256": signer.sha256(rendered)},
+                "head": {"updated_at": now, "prev_head_cid": prev_head_cid}}
+    manifest_bytes = signer.json_bytes(manifest)
+    signer.require(len(manifest_bytes) <= signer.MAX_JSON, "signing input too large")
+    if output.exists() or output.is_symlink():
+        raise ValueError("signing input output already exists")
+    parent = output.parent.resolve(strict=True)
+    destination = parent / output.name
+    signer.require(not destination.is_relative_to(stage.resolve()), "signing input output must be outside staging")
+    usage = shutil.disk_usage(parent)
+    total = sum(info["size"] for info in files.values()) + len(manifest_bytes)
+    signer.require((usage.free - total) * 100 >= usage.total * 15, "signing input requires 15 percent free after its copy")
+    with tempfile.TemporaryDirectory(prefix=".signing-input-", dir=parent) as temporary:
+        prepared = Path(temporary) / "input"
+        prepared.mkdir(mode=0o700)
+        for name, info in files.items():
+            path = prepared / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(regular_file(stage / "artifacts", name), path)
+            signer.require(digest(path) == info["sha256"] and path.stat().st_size == info["size"],
+                           "artifact changed while preparing signing input")
+            path.chmod(0o400)
+        (prepared / "signing-input.json").write_bytes(manifest_bytes)
+        (prepared / "signing-input.json").chmod(0o400)
+        verify_staged_inputs(stage, allow_generated=True, preview_platform=preview_platform)
+        # rename refuses an existing non-empty destination; refuse all existing
+        # destinations here, including empty directories and symlinks.
+        signer.require(not destination.exists() and not destination.is_symlink(), "signing input output already exists")
+        prepared.rename(destination)
+    return manifest
 
 
 def main():
@@ -667,7 +756,15 @@ def main():
     attach = commands.add_parser("attach-cids")
     attach.add_argument("root", type=Path)
     attach.add_argument("--cids", required=True, type=Path)
-    for command in (combined, stage, staged, attach):
+    prepare = commands.add_parser("signing-input", help="prepare unsigned data for the custodian signer")
+    prepare.add_argument("root", type=Path)
+    prepare.add_argument("--cids", required=True, type=Path)
+    prepare.add_argument("--stamps", required=True, type=Path)
+    prepare.add_argument("--channel", required=True)
+    prepare.add_argument("--output", required=True, type=Path)
+    prepare.add_argument("--prev-release-cid")
+    prepare.add_argument("--prev-head-cid")
+    for command in (combined, stage, staged, attach, prepare):
         command.add_argument("--preview-platform", choices=PLATFORMS,
                              help="admit exactly this one native input instead of all release platforms")
     args = parser.parse_args()
@@ -682,6 +779,11 @@ def main():
             verify_staged_inputs(args.root, preview_platform=args.preview_platform)
         elif args.command == "attach-cids":
             attach_input_cids(args.root, args.cids, args.preview_platform)
+        elif args.command == "signing-input":
+            signing_input(args.root, args.cids, args.stamps, args.channel, args.output,
+                          args.preview_platform, args.prev_release_cid, args.prev_head_cid)
+            print("Prepared unsigned signing input: " + hashlib.sha256(
+                (args.output / "signing-input.json").read_bytes()).hexdigest())
         else:
             receipts = validate_inputs(args.input, args.version, args.preview_platform)
             print(f"Verified source and local bytes for {len(receipts)} platform inputs; publication and installed acceptance remain separate.")

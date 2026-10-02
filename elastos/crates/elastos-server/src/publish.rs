@@ -154,6 +154,9 @@ pub(crate) struct PublishReleaseOptions {
     pub(crate) cross: Option<String>,
     pub(crate) capsules: Vec<String>,
     pub(crate) platform_inputs: Vec<String>,
+    pub(crate) preview_platform: Option<String>,
+    pub(crate) prepare_only: Option<PathBuf>,
+    pub(crate) publisher_did: Option<String>,
     pub(crate) key: Option<PathBuf>,
     pub(crate) dry_run: bool,
     pub(crate) preflight_only: bool,
@@ -257,11 +260,15 @@ struct PublishKeyPreview {
 
 pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> anyhow::Result<()> {
     let workspace_root = workspace_root();
+    validate_prepare_options(&options)?;
     validate_platform_input_options(&options)?;
     if !options.platform_inputs.is_empty() {
         let caller_dir =
             std::env::current_dir().context("Failed to resolve the caller directory")?;
         resolve_platform_input_paths(&mut options.platform_inputs, &caller_dir)?;
+        if let Some(output) = &mut options.prepare_only {
+            *output = caller_dir.join(&*output);
+        }
     }
     let (available_capsules, selected_capsules) = if options.platform_inputs.is_empty() {
         let manifests = load_capsule_manifests(&workspace_root)?;
@@ -278,7 +285,14 @@ pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> a
     let previous_state = load_publish_state(&state_path)?;
 
     if options.dry_run {
-        let key = inspect_release_key(options.key.as_deref())?;
+        let key = if options.prepare_only.is_some() {
+            PublishKeyPreview {
+                path: PathBuf::new(),
+                signer_did: options.publisher_did.clone(),
+            }
+        } else {
+            inspect_release_key(options.key.as_deref())?
+        };
         print_publish_plan(
             &options,
             &key,
@@ -293,6 +307,44 @@ pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> a
     let preflight = run_publish_preflight(&options, &workspace_root, &selected_capsules)?;
     if options.preflight_only {
         print_preflight_report(&options, &preflight);
+        return Ok(());
+    }
+
+    if let Some(output) = &options.prepare_only {
+        if output.exists() || output.symlink_metadata().is_ok() {
+            anyhow::bail!("Unsigned signing-input output already exists");
+        }
+        let mut command = Command::new("bash");
+        command
+            .arg(workspace_root.join("scripts/publish-release.sh"))
+            .arg("--version")
+            .arg(&options.version)
+            .arg("--channel")
+            .arg(&options.channel)
+            .arg("--prepare-only")
+            .arg(output)
+            .arg("--publisher-did")
+            .arg(
+                options
+                    .publisher_did
+                    .as_deref()
+                    .context("Public signer DID required")?,
+            )
+            .env("ELASTOS_PUBLISH_STATE_DIR", publish_state_dir(&data_dir))
+            .current_dir(&workspace_root);
+        append_publish_selection_args(&mut command, &options, &selected_capsules);
+        if let Some(provider) = &options.ipfs_provider_bin {
+            command.arg("--ipfs-provider-bin").arg(provider);
+        }
+        let status = command
+            .status()
+            .context("Failed to prepare unsigned signing input")?;
+        if !status.success() {
+            anyhow::bail!(
+                "Unsigned signing-input preparation exited with status {}",
+                status
+            );
+        }
         return Ok(());
     }
 
@@ -932,6 +984,9 @@ fn validate_publish_inputs(
         for input in &options.platform_inputs {
             command.arg("--input").arg(input);
         }
+        if let Some(platform) = &options.preview_platform {
+            command.arg("--preview-platform").arg(platform);
+        }
         let output = command
             .output()
             .context("Failed to validate prepared release platform inputs")?;
@@ -1023,7 +1078,48 @@ fn validate_publish_inputs(
     Ok(())
 }
 
+fn validate_prepare_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
+    if options.prepare_only.is_some() {
+        if options.platform_inputs.is_empty()
+            || options.key.is_some()
+            || options.public_url
+            || options.public_with_sudo
+        {
+            anyhow::bail!("Unsigned preparation requires native inputs and public signer data; the custodian owns signing");
+        }
+        let did = options
+            .publisher_did
+            .as_deref()
+            .context("--prepare-only requires --publisher-did")?;
+        let key = elastos_server::crypto::decode_did_key(did)?;
+        if elastos_server::crypto::encode_did_key(&key)? != did {
+            anyhow::bail!("Canonical public Ed25519 signer DID required");
+        }
+    } else if options.publisher_did.is_some() {
+        anyhow::bail!("--publisher-did requires --prepare-only");
+    }
+    Ok(())
+}
+
 fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
+    if let Some(platform) = &options.preview_platform {
+        if platform != "aarch64-darwin" {
+            anyhow::bail!("--preview-platform supports aarch64-darwin only");
+        }
+        if options.channel != "canary" {
+            anyhow::bail!("--preview-platform requires --channel canary");
+        }
+        if !options.dry_run && !options.preflight_only && options.prepare_only.is_none() {
+            anyhow::bail!(
+                "--preview-platform requires --prepare-only, --dry-run or --preflight-only"
+            );
+        }
+        if options.platform_inputs.len() != 1 {
+            anyhow::bail!(
+                "--preview-platform requires exactly one --platform-input aarch64-darwin=DIR"
+            );
+        }
+    }
     if options.platform_inputs.is_empty() {
         return Ok(());
     }
@@ -1044,7 +1140,13 @@ fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::R
             anyhow::bail!("--platform-input requires each supported platform exactly once: x86_64-linux, aarch64-linux, aarch64-darwin");
         }
     }
-    if supplied.len() < 2 {
+    if let Some(platform) = &options.preview_platform {
+        if !supplied.contains(platform.as_str()) {
+            anyhow::bail!(
+                "--preview-platform requires exactly one --platform-input aarch64-darwin=DIR"
+            );
+        }
+    } else if supplied.len() < 2 {
         anyhow::bail!("--platform-input requires at least two platforms: x86_64-linux, aarch64-linux, aarch64-darwin");
     }
     Ok(())
@@ -1076,6 +1178,9 @@ fn append_publish_selection_args(
         for input in &options.platform_inputs {
             command.arg("--platform-input").arg(input);
         }
+        if let Some(platform) = &options.preview_platform {
+            command.arg("--preview-platform").arg(platform);
+        }
     }
 }
 
@@ -1084,6 +1189,9 @@ fn print_publish_selection(options: &PublishReleaseOptions, selected_capsules: &
         println!("  Capsules:  {}", selected_capsules.join(", "));
     } else {
         println!("  Mode:      import verified native Home platform inputs");
+        if let Some(platform) = &options.preview_platform {
+            println!("  Preview:   {platform} on canary (operator publication)");
+        }
         for input in &options.platform_inputs {
             println!("  Input:     {}", input);
         }
@@ -1256,7 +1364,12 @@ fn print_preflight_report(options: &PublishReleaseOptions, preflight: &PublishPr
     println!("  Channel:   {}", options.channel);
     println!("  Profile:   {}", options.profile);
     println!("  Script:    {}", preflight.script_path.display());
-    println!("  Key path:  {}", preflight.key_path.display());
+    if let Some(output) = &options.prepare_only {
+        println!("  Unsigned input: {}", output.display());
+        println!("  Signing: separately installed custodian tool");
+    } else {
+        println!("  Key path:  {}", preflight.key_path.display());
+    }
     println!(
         "  IPFS bin:  {}",
         preflight
@@ -1589,7 +1702,12 @@ fn print_publish_plan(
             .as_deref()
             .unwrap_or("(will be generated on first real publish)")
     );
-    println!("  Key path:  {}", key.path.display());
+    if let Some(output) = &options.prepare_only {
+        println!("  Unsigned input: {}", output.display());
+        println!("  Signing: separately installed custodian tool");
+    } else {
+        println!("  Key path:  {}", key.path.display());
+    }
     print_publish_selection(options, selected_capsules);
     if options.platform_inputs.is_empty() {
         println!("  Available: {}", available_capsules.join(", "));
@@ -1686,9 +1804,9 @@ mod tests {
         changed_capsules, discover_available_capsules, load_publish_state, operator_release_notes,
         publish_profile_capsules, release_discovery_topics, resolve_platform_input_paths,
         save_publish_state, select_capsules, source_discovery_uri, validate_platform_input_options,
-        validate_publish_inputs, validate_publishable_manifest, PublishReleaseOptions,
-        PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
-        DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
+        PublishReleaseOptions, PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform,
+        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -1709,6 +1827,9 @@ mod tests {
                 .iter()
                 .map(|platform| format!("{platform}=/prepared/{platform}"))
                 .collect(),
+            preview_platform: None,
+            prepare_only: None,
+            publisher_did: None,
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -1760,6 +1881,125 @@ mod tests {
             }
             assert!(validate_platform_input_options(&options).is_err(), "{flag}");
         }
+    }
+
+    fn preview_options() -> PublishReleaseOptions {
+        let mut options = platform_input_options();
+        options.channel = "canary".to_string();
+        options.platform_inputs = vec!["aarch64-darwin=/prepared/mac".to_string()];
+        options.preview_platform = Some("aarch64-darwin".to_string());
+        options.dry_run = true;
+        options
+    }
+
+    #[test]
+    fn test_platform_input_unsigned_preparation_keeps_custodian_key_boundary() {
+        let mut options = preview_options();
+        options.dry_run = false;
+        options.prepare_only = Some("/prepared/unsigned".into());
+        options.publisher_did =
+            Some("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw".to_string());
+        validate_prepare_options(&options).unwrap();
+        validate_platform_input_options(&options).unwrap();
+        for refusal in [
+            "key",
+            "publisher",
+            "invalid-did",
+            "noncanonical-did",
+            "inputs",
+            "public-url",
+            "sudo",
+        ] {
+            let mut invalid = options.clone();
+            match refusal {
+                "key" => invalid.key = Some("/custodian/unopened.pem".into()),
+                "publisher" => invalid.publisher_did = None,
+                "invalid-did" => {
+                    invalid.publisher_did = Some("did:web:example.invalid".to_string())
+                }
+                "noncanonical-did" => {
+                    invalid.publisher_did =
+                        Some(format!(" {}", options.publisher_did.as_deref().unwrap()))
+                }
+                "inputs" => invalid.platform_inputs.clear(),
+                "public-url" => invalid.public_url = true,
+                "sudo" => invalid.public_with_sudo = true,
+                _ => unreachable!(),
+            }
+            assert!(validate_prepare_options(&invalid).is_err(), "{refusal}");
+        }
+        options.prepare_only = None;
+        assert!(validate_prepare_options(&options).is_err());
+    }
+
+    #[test]
+    fn test_platform_input_preview_accepts_only_canary_mac_inspection() {
+        let options = preview_options();
+        validate_platform_input_options(&options).unwrap();
+        let mut preflight = options.clone();
+        preflight.dry_run = false;
+        preflight.preflight_only = true;
+        validate_platform_input_options(&preflight).unwrap();
+        for case in [
+            "publication",
+            "stable",
+            "unsupported",
+            "absent",
+            "mixed",
+            "wrong-input",
+            "malformed",
+            "skip-build",
+            "skip-rootfs",
+            "cross",
+            "capsules",
+            "profile",
+        ] {
+            let mut invalid = options.clone();
+            match case {
+                "publication" => invalid.dry_run = false,
+                "stable" => invalid.channel = "stable".to_string(),
+                "unsupported" => invalid.preview_platform = Some("aarch64-linux".to_string()),
+                "absent" => invalid.platform_inputs.clear(),
+                "mixed" => invalid
+                    .platform_inputs
+                    .push("x86_64-linux=/prepared/linux".to_string()),
+                "wrong-input" => {
+                    invalid.platform_inputs[0] = "aarch64-linux=/prepared/linux".to_string()
+                }
+                "malformed" => invalid.platform_inputs[0] = "aarch64-darwin=".to_string(),
+                "skip-build" => invalid.skip_build = true,
+                "skip-rootfs" => invalid.skip_rootfs = true,
+                "cross" => invalid.cross = Some("aarch64".to_string()),
+                "capsules" => invalid.capsules = vec!["home".to_string()],
+                "profile" => invalid.profile = "demo".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(validate_platform_input_options(&invalid).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn test_platform_input_preview_arguments_reach_publisher_and_input_admission() {
+        let options = preview_options();
+        let mut command = std::process::Command::new("bash");
+        append_publish_selection_args(&mut command, &options, &[]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--platform-input",
+                "aarch64-darwin=/prepared/mac",
+                "--preview-platform",
+                "aarch64-darwin"
+            ]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("scripts")).unwrap();
+        std::fs::write(
+            temp.path().join("scripts/release-platform-input.py"),
+            "import sys\nassert sys.argv[1:] == ['validate-inputs', '--version', '0.7.1', '--input', 'aarch64-darwin=/prepared/mac', '--preview-platform', 'aarch64-darwin']\n",
+        ).unwrap();
+        validate_publish_inputs(&options, temp.path(), &[]).unwrap();
     }
 
     #[test]
@@ -2212,6 +2452,7 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2242,6 +2483,7 @@ mod tests {
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2294,6 +2536,7 @@ mod tests {
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2322,6 +2565,7 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -2354,6 +2598,7 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -2383,6 +2628,7 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
             key: None,
             dry_run: false,
             preflight_only: false,
