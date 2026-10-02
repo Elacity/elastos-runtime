@@ -8,7 +8,8 @@ on:
         required: false
         default: ""
   push:
-    branches: [main]
+    # develop pushes keep the shared build caches warm for every PR into develop.
+    branches: [main, develop]
     tags: ["v*"]
   pull_request:
 
@@ -25,6 +26,10 @@ env:
   RUSTFLAGS: "-D warnings"
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
+  # Only merged code on develop or main saves caches. PR runs restore them but
+  # never save, so one PR cannot evict every other PR's cache (10 GB repo cap)
+  # or write a cache that later runs trust.
+  CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -92,6 +97,7 @@ jobs:
           prefix-key: ${{ runner.os }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
@@ -115,12 +121,14 @@ jobs:
           prefix-key: ${{ runner.os }}-elastos-test-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The three provider workspaces are release-built from cold on every
       # run otherwise; with the cache restored, cargo only re-fingerprints
       # the workspace members and reuses every dependency artifact.
-      - name: cache provider build artifacts
+      - name: restore provider build artifacts
+        id: providers-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             capsules/protected-content-protect-provider/target
@@ -134,6 +142,15 @@ jobs:
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
           cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
+      - name: save provider build artifacts
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            capsules/protected-content-protect-provider/target
+            capsules/protected-content-decrypt-provider/target
+            capsules/custody-provider/target
+          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo test
         working-directory: elastos
         env:
@@ -165,14 +182,16 @@ jobs:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The capsule workspaces overlap almost entirely in dependencies, so
       # `just test-capsules` builds them into one shared target dir; caching
       # it turns every warm run's dependency builds into fingerprint checks.
       # The key rotates with any capsule lockfile or toolchain change, which
       # bounds stale-artifact growth under the restore-keys fallback.
-      - name: cache capsule build artifacts
+      - name: restore capsule build artifacts
+        id: capsules-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           # The shared intermediates (root .cargo/config.toml build-dir);
           # final artifacts stay in each capsule's own small target dir.
@@ -192,6 +211,13 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+      # Saved only from develop or main, so PR runs never write shared caches.
+      - name: save capsule build artifacts
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.capsules-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target-build
+          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
@@ -267,6 +293,7 @@ jobs:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-custody-smoke-bd
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
         uses: docker/setup-buildx-action@v3
       # Pre-warms the custody-host image's BuildKit layer cache via the GHA
@@ -336,15 +363,18 @@ jobs:
           prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
+      # A stalled mirror once held this step until the 90-minute job limit.
       - name: install host prerequisites
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -418,7 +448,10 @@ jobs:
             ${{ runner.temp }}/source-home-journeys/*.log
           retention-days: 7
           if-no-files-found: error
+      # ARM PRs also need the archive for the Jetson compatibility check.
+      # Other PR jobs already proved the release build through setup-source-home.
       - name: build and package release binaries
+        if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
@@ -471,6 +504,7 @@ jobs:
           prefix-key: ${{ runner.os }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -557,6 +591,7 @@ jobs:
               raise SystemExit("stock Xcode reclaim did not provide build headroom")
           PYCODE
       - name: install host prerequisites
+        timeout-minutes: 15
         run: brew install e2fsprogs coturn ffmpeg
       - name: source-home into isolated MAC_TEST_HOME
         env:
@@ -620,7 +655,10 @@ jobs:
             ${{ runner.temp }}/source-home-journeys/*.log
           retention-days: 7
           if-no-files-found: error
+      # Packages are uploaded only for tags, main and dispatch runs; PR runs
+      # already proved the release build through setup-source-home.
       - name: build and package release binaries
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.

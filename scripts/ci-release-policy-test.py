@@ -44,7 +44,7 @@ def evaluate(expression, context):
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    expression = re.sub(r"(?:github|inputs|env|steps)\.[\w.-]+",
+    expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
     return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
 
@@ -52,6 +52,7 @@ def evaluate(expression, context):
 # event, workflow ref, ref type, checkout override, caches, publication
 CASES = [
     ("push", "refs/heads/main", "branch", "", True, False),
+    ("push", "refs/heads/develop", "branch", "", True, False),
     ("push", "refs/heads/v-work", "branch", "", True, False),
     ("push", "refs/tags/v0.7.1", "tag", "", False, True),
     ("push", "refs/tags/candidate", "tag", "", False, False),
@@ -64,6 +65,10 @@ CASES = [
     ("workflow_dispatch", "refs/heads/main", "branch", "a" * 40, False, False),
     ("workflow_dispatch", "refs/tags/v0.7.1", "tag", "main", False, False),
 ]
+# Only pushes of merged code to these branches may write shared caches.
+SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
+NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
+                "steps.capsules-cache.outputs.cache-hit": "false"}
 
 
 def validate_cache_guards(source):
@@ -93,18 +98,56 @@ def validate_cache_guards(source):
                     continue
                 context = {"github.event_name": event, "github.ref": ref,
                            "github.ref_type": ref_type, "inputs.ref": override,
-                           "env.CI_USE_CACHE": "false",
-                           "steps.should-run.outputs.run": "true"}
+                           "env.CI_USE_CACHE": "false", "env.CI_SAVE_CACHE": "true",
+                           "steps.should-run.outputs.run": "true", **NO_CACHE_HIT}
                 if evaluate(guard, context):
                     raise AssertionError(f"cache guard permits uncached build in {job}")
 
 
+def validate_arm_package_dependency(source):
+    linux_steps = steps("source-home-linux", jobs(source))
+    package, = [step for step in linux_steps
+                if step.startswith("name: build and package release binaries\n")]
+    verify, = [step for step in linux_steps
+               if step.startswith("name: verify Jetson release compatibility\n")]
+    for event, ref, ref_type, override, _, _ in CASES:
+        for platform in ("ubuntu-24.04", "ubuntu-22.04-arm"):
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override,
+                       "matrix.os": platform}
+            if evaluate(field(verify, "if"), context) and not evaluate(field(package, "if"), context):
+                raise AssertionError("ARM compatibility check requires its packaged archive")
+
+
 class ReleasePolicyTests(unittest.TestCase):
+    def test_package_guards_preserve_arm_proof_and_skip_other_pr_archives(self):
+        for job, platform in (("source-home-linux", "ubuntu-24.04"),
+                              ("source-home-linux", "ubuntu-22.04-arm"),
+                              ("source-home-macos", "macos-14")):
+            package, = [step for step in steps(job)
+                        if step.startswith("name: build and package release binaries\n")]
+            for event, ref, ref_type, override, _, _ in CASES:
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override,
+                           "matrix.os": platform}
+                with self.subTest(job=job, platform=platform, event=event, ref=ref):
+                    expected = event != "pull_request" or platform == "ubuntu-22.04-arm"
+                    self.assertEqual(evaluate(field(package, "if"), context), expected)
+
+    def test_arm_compatibility_always_has_its_archive(self):
+        validate_arm_package_dependency(SOURCE)
+
+    def test_skipping_the_arm_pr_archive_is_refused(self):
+        broken = SOURCE.replace("github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'",
+                                "github.event_name != 'pull_request'", 1)
+        with self.assertRaisesRegex(AssertionError, "requires its packaged archive"):
+            validate_arm_package_dependency(broken)
+
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 9)
+        self.assertEqual(len(caches), 11)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -113,12 +156,27 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(use_cache, cached)
                 self.assertEqual(evaluate(field(JOBS["release"], "if"), context), publish)
                 context["env.CI_USE_CACHE"] = str(use_cache).lower()
+                save = evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)
+                self.assertEqual(save, event == "push" and ref in SAVING_REFS)
+                context["env.CI_SAVE_CACHE"] = str(save).lower()
+                context.update(NO_CACHE_HIT)
                 for should_run in (True, False):
                     context["steps.should-run.outputs.run"] = str(should_run).lower()
                     for job, step in caches:
-                        self.assertEqual(evaluate(field(step, "if"), context),
-                                         cached and (job != "custody-harness-smoke" or should_run),
+                        expected = cached and (job != "custody-harness-smoke" or should_run)
+                        if "actions/cache/save@" in step:
+                            expected = expected and save
+                        self.assertEqual(evaluate(field(step, "if"), context), expected,
                                          f"cache guard in {job}")
+
+    def test_pull_requests_never_save_shared_caches(self):
+        for job in JOBS:
+            for step in steps(job):
+                if "Swatinem/rust-cache@" in step:
+                    self.assertEqual(field(step, "save-if"), "${{ env.CI_SAVE_CACHE == 'true' }}",
+                                     f"rust-cache in {job} must save only from develop or main")
+                if "actions/cache@" in step and "kubo-cache" not in step:
+                    self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
     def test_unguarded_cache_paths_are_rejected(self):
         additions = [
