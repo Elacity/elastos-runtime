@@ -1,6 +1,5 @@
 use super::*;
 use elastos_runtime::signature::{generate_keypair, SigningKey};
-use sha2::Digest as _;
 
 // This named fixture owns a disposable, memory-only key. Files contain only
 // signed public metadata and harmless candidate bytes; candidates stay inert.
@@ -528,7 +527,7 @@ async fn test_missing_release_publication_404() {
 #[tokio::test]
 async fn test_unsigned_release_publication_503() {
     let temporary = tempfile::tempdir().unwrap();
-    let path = publisher_release_head_path(temporary.path());
+    let path = elastos_common::localhost::publisher_release_head_path(temporary.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, br#"{"payload":{"schema":"elastos.release.head/v1"}}"#).unwrap();
     let response = gateway_router(test_state(temporary.path()))

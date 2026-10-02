@@ -30,9 +30,8 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use elastos_common::localhost::{
-    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
-    publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
-    publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
+    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_site_releases_dir,
+    rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
 use elastos_common::{CapsuleRole, CapsuleType};
 use elastos_identity::IdentityManager;
