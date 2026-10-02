@@ -134,6 +134,202 @@ class PlatformInputTest(unittest.TestCase):
         self.refresh(root)
         return root
 
+    def reuse_fixture(self, version="0.7.2", platform="aarch64-darwin"):
+        stage = (self.root / "reused").resolve()
+        stage.mkdir()
+        return SimpleNamespace(input=self.bundles["aarch64-darwin"].resolve(), root=stage,
+                               platform=platform, version=version)
+
+    def record_reuse(self, args, reuse=True):
+        runtime = args.root / f"artifacts/elastos-{args.platform}"
+        runtime.write_bytes(binary(args.platform) + b"M2 Runtime")
+        runtime.chmod(0o755)
+        omissions = self.root / "reused-omissions.json"
+        self.write_json(omissions, [])
+        current_source = {"commit": "d" * 40, "tree": "e" * 40, "clean": True,
+                          "lockfiles": {"elastos/Cargo.lock": "f" * 64}}
+        record = SimpleNamespace(root=args.root, version=args.version, platform=args.platform,
+                                 target=inputs.PLATFORMS[args.platform][1],
+                                 source_commit=current_source["commit"], source_tree=current_source["tree"],
+                                 omissions_json=omissions, reuse_support=reuse)
+        with patch.object(inputs, "source_identity", return_value=current_source), \
+                patch.object(inputs, "run", return_value="M2-tool"):
+            inputs.record(record)
+        return inputs.verify(args.root)
+
+    def test_support_reuse_changes_only_runtime_with_original_receipt_provenance(self):
+        args = self.reuse_fixture()
+        original_bytes = (args.input / "platform-input.json").read_bytes()
+        original = inputs.copy_support(args)
+        self.assertFalse((args.root / "artifacts/elastos-aarch64-darwin").exists())
+        self.assertEqual((args.root / "support-input.json").read_bytes(), original_bytes)
+        current = self.record_reuse(args)
+        self.assertEqual(current["version"], "0.7.2")
+        self.assertEqual(current["source"]["commit"], "d" * 40)
+        self.assertEqual(current["tools"]["cargo"], "M2-tool")
+        self.assertEqual(current["support_origin"], {"receipt_path": "support-input.json",
+                         "sha256": hashlib.sha256(original_bytes).hexdigest()})
+        self.assertEqual(current["build_command"][-2:], ["--reuse-support", "<input>"])
+        for name, record in original["files"].items():
+            if name == "artifacts/elastos-aarch64-darwin":
+                self.assertNotEqual(current["files"][name], record)
+            else:
+                self.assertEqual(current["files"][name], record)
+                self.assertEqual((args.root / name).read_bytes(), (args.input / name).read_bytes())
+        with patch.object(inputs, "source_identity", return_value=current["source"]):
+            staged = inputs.stage_inputs([f"aarch64-darwin={args.root}"], "0.7.2",
+                                         self.root / "reused-stage", "aarch64-darwin")
+        self.assertNotIn("support-input.json", staged["files"])
+
+    def test_support_reuse_refuses_platform_same_version_template_and_tamper(self):
+        for fault in ("platform", "version", "template", "tamper"):
+            with self.subTest(fault=fault):
+                args = self.reuse_fixture()
+                if fault == "platform":
+                    args.platform = "x86_64-linux"
+                elif fault == "version":
+                    args.version = "0.7.1"
+                elif fault == "template":
+                    (inputs.SOURCE_ROOT / "components.json").write_text("changed template")
+                else:
+                    (args.input / "artifacts/home.tar.gz").write_bytes(b"tampered")
+                with self.assertRaises(ValueError):
+                    inputs.copy_support(args)
+                self.assertEqual(list(args.root.iterdir()), [])
+                args.root.rmdir()
+                self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+
+    def test_support_reuse_refuses_nested_origin_and_low_disk(self):
+        args = self.reuse_fixture()
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
+                self.assertRaisesRegex(ValueError, "15% free"):
+            inputs.copy_support(args)
+        self.assertEqual(list(args.root.iterdir()), [])
+        inputs.copy_support(args)
+        self.record_reuse(args)
+        nested = self.root / "nested"
+        nested.mkdir()
+        with self.assertRaisesRegex(ValueError, "nested reused"):
+            inputs.copy_support(SimpleNamespace(input=args.root, root=nested.resolve(),
+                                               platform=args.platform, version="0.7.3"))
+        self.assertEqual(list(nested.iterdir()), [])
+
+    def test_support_reuse_refuses_overwrite_and_symlinks_preserving_existing_files(self):
+        args = self.reuse_fixture()
+        marker = args.root / "components.json"
+        marker.write_bytes(b"operator-owned marker")
+        with self.assertRaises(FileExistsError):
+            inputs.copy_support(args)
+        self.assertEqual(marker.read_bytes(), b"operator-owned marker")
+        self.assertEqual(list(args.root.iterdir()), [marker])
+        marker.unlink()
+        (args.root / "artifacts").symlink_to(args.input / "artifacts", target_is_directory=True)
+        with self.assertRaises(OSError):
+            inputs.copy_support(args)
+        self.assertTrue((args.root / "artifacts").is_symlink())
+        self.assertEqual(len(list(args.root.iterdir())), 1)
+
+    def test_support_copy_race_and_receipt_change_clean_owned_copies(self):
+        for fault in ("support", "receipt"):
+            with self.subTest(fault=fault):
+                args = self.reuse_fixture()
+                original_copy = inputs.shutil.copyfileobj
+                changed = False
+                def copy(source, output, length):
+                    nonlocal changed
+                    original_copy(source, output, length)
+                    if not changed:
+                        changed = True
+                        path = args.input / ("artifacts/home.tar.gz" if fault == "support" else "platform-input.json")
+                        path.write_bytes(path.read_bytes() + b" ")
+                with patch.object(inputs.shutil, "copyfileobj", side_effect=copy), self.assertRaises((ValueError, json.JSONDecodeError)):
+                    inputs.copy_support(args)
+                self.assertEqual(list(args.root.iterdir()), [])
+                args.root.rmdir()
+                # Each fault starts from independently qualified source bytes.
+                (args.input / "artifacts/home.tar.gz").write_bytes(self.app)
+                receipt_path = args.input / "platform-input.json"
+                self.write_json(receipt_path, json.loads(receipt_path.read_bytes()))
+                self.refresh(args.input)
+
+    def test_reused_record_requires_flag_and_original_file_records(self):
+        args = self.reuse_fixture()
+        inputs.copy_support(args)
+        with self.assertRaisesRegex(ValueError, "requires --reuse-support"):
+            self.record_reuse(args, reuse=False)
+        (args.root / "artifacts/home.tar.gz").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "original receipt"):
+            self.record_reuse(args)
+        self.assertFalse((args.root / "platform-input.json").exists())
+
+    def test_reused_verify_refuses_origin_hash_header_runtime_record_and_support_drift(self):
+        args = self.reuse_fixture()
+        inputs.copy_support(args)
+        self.record_reuse(args)
+        receipt_path, origin_path = args.root / "platform-input.json", args.root / "support-input.json"
+        current, original = json.loads(receipt_path.read_bytes()), json.loads(origin_path.read_bytes())
+        for fault in ("hash", "runtime-record", "source", "tools", "nested", "support"):
+            with self.subTest(fault=fault):
+                receipt, origin = copy.deepcopy(current), copy.deepcopy(original)
+                if fault == "hash":
+                    origin["created_at"] = "changed"
+                elif fault == "runtime-record":
+                    origin["files"]["artifacts/elastos-aarch64-darwin"]["sha256"] = "invalid"
+                elif fault == "source":
+                    origin["source"]["clean"] = False
+                elif fault == "tools":
+                    origin["tools"] = {}
+                elif fault == "nested":
+                    origin["support_origin"] = {}
+                else:
+                    (args.root / "artifacts/home.tar.gz").write_bytes(self.app + b"changed")
+                    receipt["files"]["artifacts/home.tar.gz"] = inputs.file_record(args.root / "artifacts/home.tar.gz")
+                self.write_json(origin_path, origin)
+                receipt["files"]["support-input.json"] = inputs.file_record(origin_path)
+                if fault != "hash":
+                    receipt["support_origin"]["sha256"] = inputs.digest(origin_path)
+                self.write_json(receipt_path, receipt)
+                with self.assertRaises(ValueError):
+                    inputs.verify(args.root)
+                (args.root / "artifacts/home.tar.gz").write_bytes(self.app)
+
+    def test_receipt_header_refuses_malformed_public_shapes(self):
+        original = json.loads((self.bundles["aarch64-darwin"] / "platform-input.json").read_bytes())
+        invalid = [None, [], {**original, "platform": []}, {**original, "source": None},
+                   {**original, "tools": []}, {**original, "files": []},
+                   {**original, "omitted_platform_components": [None]}]
+        for receipt in invalid:
+            with self.subTest(receipt=receipt), self.assertRaises(ValueError):
+                inputs.verify_receipt_header(receipt)
+
+    def test_support_copy_refuses_full_mode_change_after_an_earlier_copy(self):
+        args = self.reuse_fixture()
+        original_copy = inputs.shutil.copyfileobj
+        calls = 0
+        def copy(source, output, length):
+            nonlocal calls
+            original_copy(source, output, length)
+            calls += 1
+            if calls == 2:
+                # home.tar.gz sorts first after excluding Runtime; its executable bit stays false.
+                path = args.input / "artifacts/home.tar.gz"
+                path.chmod((path.stat().st_mode & 0o777) ^ 0o040)
+        with patch.object(inputs.shutil, "copyfileobj", side_effect=copy), \
+                self.assertRaisesRegex(ValueError, "after copy"):
+            inputs.copy_support(args)
+        self.assertEqual(list(args.root.iterdir()), [])
+
+    def test_reused_receipt_refuses_different_copied_omissions(self):
+        args = self.reuse_fixture()
+        inputs.copy_support(args)
+        self.record_reuse(args)
+        receipt_path = args.root / "platform-input.json"
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["omitted_platform_components"] = ["home"]
+        self.write_json(receipt_path, receipt)
+        with self.assertRaises(ValueError):
+            inputs.verify(args.root)
+
     def values(self):
         return [f"{platform}={root}" for platform, root in self.bundles.items()]
 

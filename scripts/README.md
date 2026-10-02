@@ -49,7 +49,7 @@ builder. It supports Linux x86_64, Linux ARM64 and macOS Apple silicon. Choose
 an absent output directory outside the checkout:
 
 ```sh
-scripts/prepare-release-platform.sh --version 0.7.1 --output /path/to/new-platform-input
+scripts/prepare-release-platform.sh --version VERSION --output /path/to/new-platform-input
 python3 scripts/release-platform-input.py verify /path/to/new-platform-input
 ```
 
@@ -80,6 +80,26 @@ Publisher import, signing and promotion follow this preparation boundary and
 remain separate release work. These commands perform local file operations;
 the builds can fetch Cargo dependencies. Keep their output through candidate
 review, then remove it after adoption or abandonment.
+
+For a staged update that keeps its support inventory fixed, prepare the next
+Runtime with the first version's verified native input:
+
+```sh
+scripts/prepare-release-platform.sh --version NEXT_VERSION \
+  --reuse-support /path/to/first-platform-input --output /path/to/next-platform-input
+python3 scripts/release-platform-input.py verify /path/to/next-platform-input
+```
+
+This path builds only Runtime. It copies the exact component manifest, provider,
+capsule and catalogue files from the first input. Both inputs use the same
+platform and component template. The next receipt binds its Runtime source and
+version, and `support_origin` binds the first receipt stored as
+`support-input.json`. Use an original native input as the support source; a
+receipt that already reuses support is refused. Keep both receipts with the
+staging handoff so the operator can verify the support's original qualification.
+Use the same installer source blob and public bootstrap stamps for both signed
+sets to keep their installer bytes fixed. Signing and publication still follow
+the separate operator procedure below.
 
 ## Public-install proof
 
