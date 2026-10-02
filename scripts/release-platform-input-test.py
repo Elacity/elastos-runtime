@@ -1093,9 +1093,8 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         commit, tree, scripts = "a" * 40, "b" * 40, "c" * 40
         prefix = f"/repos/{signer.REPOSITORY}"
         api = {
-            f"{prefix}/git/ref/tags/v0.7.1": {"ref": "refs/tags/v0.7.1", "object": {"type": "commit", "sha": commit}},
             f"{prefix}/git/commits/{commit}": {"sha": commit, "tree": {"sha": tree}},
-            f"{prefix}/git/ref/heads/main": {"ref": "refs/heads/main", "object": {"type": "commit", "sha": commit}},
+            f"{prefix}/git/ref/heads/develop": {"ref": "refs/heads/develop", "object": {"type": "commit", "sha": commit}},
             f"{prefix}/compare/{commit}...{commit}?per_page=1": {"status": "identical", "ahead_by": 0, "behind_by": 0,
                 "base_commit": {"sha": commit}, "merge_base_commit": {"sha": commit}},
             f"{prefix}/git/trees/{tree}": {"sha": tree, "truncated": False, "tree": [{"path": "scripts", "type": "tree", "mode": "040000", "sha": scripts}]},
@@ -1103,7 +1102,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
             f"{prefix}/git/blobs/{fixture.blob_oid}": {"sha": fixture.blob_oid, "encoding": "base64", "size": len(fixture.template),
                 "content": base64.b64encode(fixture.template).decode()},
         }
-        policy = {"repository": signer.REPOSITORY, "tag": "v0.7.1", "tag_oid": commit, "commit": commit, "tree": tree,
+        policy = {"repository": signer.REPOSITORY, "develop_oid": commit, "commit": commit, "tree": tree,
                   "version": "0.7.1", "channel": "canary", "publisher_did": fixture.stamps["MAINTAINER_DID"],
                   "manifest_sha256": signer.sha256(signer.json_bytes(manifest)),
                   "max_file_bytes": 1024 * 1024, "max_snapshot_bytes": 8 * 1024 * 1024}

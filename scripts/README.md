@@ -265,9 +265,23 @@ elastos publish-release --version VERSION --channel canary \
 The resulting `signing-input.json` binds the source commit/tree, artifact
 hashes, sizes and CIDs, release data and public installer stamps. The operator
 records its SHA-256 in a protected policy outside the input directory. That
-policy also pins the repository, remote version tag, tag object, main-line
-commit/tree, version, channel, public DID, file/total quotas and the trusted
-Python, OpenSSL and signer tool paths and SHA-256 hashes. The operator alone
+policy also pins the repository, exact source `commit` and `tree`, version,
+channel, public DID, file/total quotas and the trusted Python, OpenSSL and
+signer tool paths and SHA-256 hashes. For `canary`, the policy pins the current
+remote `develop` head in `develop_oid`; the source commit must be that head or
+its ancestor. For `stable` and `jetson-test`, the policy pins `tag` as `vVERSION`
+and `tag_oid` as the remote tag object; the tagged source commit must belong to
+`main`. The signer selects these fixed repository branches from the channel.
+
+Before approving a canary policy, the operator verifies the exact candidate
+commit/tree against its merged pull request on GitHub and the successful
+required checks for that commit. The installed signer also comes from a
+reviewed commit merged into `develop` with successful required checks. The
+operator verifies its source commit/tree and installed file hash, and records
+the canonical GitHub pull request and check links in the owning issue. The
+protected policy approval carries this review and CI acceptance; the signer's
+GitHub source checks prove commit/tree identity and branch membership. Anders
+approves each canary signing and publication. The operator alone
 sets the protected Ed25519 PEM key path. Use the signer from its installed,
 reviewed path, with a clean environment and its pinned Python:
 
@@ -277,10 +291,12 @@ env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
   --output-root /path/to/new-signed-set
 ```
 
-The tool verifies the approved remote tag belongs to main, reads candidate
-files as data, and asks the operator to confirm the source before signing. It
-fetches the installer template from that approved tree. Its frozen installer
-keeps `HEAD_CID` empty to avoid a hash cycle; the signed head binds the final
+The tool verifies the pinned remote `develop` head and candidate ancestry for
+canary, or the approved remote version tag and `main` ancestry for the other
+channels. A moved `develop` head requires a fresh operator policy approval.
+The tool reads candidate files as data and asks the operator to confirm the
+source before signing. It fetches the installer template from that approved
+tree. Its frozen installer keeps `HEAD_CID` empty to avoid a hash cycle; the signed head binds the final
 release CID and installer hash. Carrier holder identity and ticket remain
 public transport inputs, separate from the signer identity.
 

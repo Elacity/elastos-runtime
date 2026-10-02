@@ -25,6 +25,7 @@ spec.loader.exec_module(S)
 PUBLIC = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
 DID = S.public_did(PUBLIC)
 COMMIT, TREE, MAIN, SCRIPTS, TAG = (digit * 40 for digit in "abcde")
+DEVELOP = "1" * 40
 
 
 class FakeBackend:
@@ -159,6 +160,128 @@ class SignerTests(unittest.TestCase):
         self.api[path] = original
         original["object"]["sha"] = MAIN
         with self.assertRaisesRegex(ValueError, "tag moved"):
+            self.prepare()
+
+    def canary_policy(self):
+        self.policy["channel"] = "canary"
+        self.policy["develop_oid"] = DEVELOP
+        del self.policy["tag"]
+        del self.policy["tag_oid"]
+        self.manifest["channel"] = self.manifest["release"]["channel"] = "canary"
+        self.approve_manifest()
+        prefix = f"/repos/{S.REPOSITORY}"
+        del self.api[f"{prefix}/git/ref/tags/v1.2.3"]
+        self.api[f"{prefix}/git/ref/heads/develop"] = {
+            "ref": "refs/heads/develop", "object": {"type": "commit", "sha": DEVELOP}}
+        self.api[f"{prefix}/git/commits/{DEVELOP}"] = {"sha": DEVELOP, "tree": {"sha": "f" * 40}}
+        self.api[f"{prefix}/compare/{COMMIT}...{DEVELOP}?per_page=1"] = {
+            "status": "ahead", "behind_by": 0, "ahead_by": 1,
+            "base_commit": {"sha": COMMIT}, "merge_base_commit": {"sha": COMMIT}}
+
+    def test_canary_merged_develop_source_preserves_publication_contract(self):
+        self.canary_policy()
+        # Main has no ancestry proof for this develop-only candidate.
+        del self.api[f"/repos/{S.REPOSITORY}/compare/{COMMIT}...{MAIN}?per_page=1"]
+        publication = dict(S.sign_publication(self.prepare(), FakeBackend()))
+        release = S.parse_json(publication["release.json"])["payload"]
+        head = S.parse_json(publication["release-head.json"])["payload"]
+        self.assertEqual(release["source"], {"commit": COMMIT, "tree": TREE})
+        self.assertEqual(release["channel"], "canary")
+        self.assertEqual(head["channel"], "canary")
+        self.assertFalse(any("/tags/" in path or "/heads/main" in path for path in self.requests))
+        self.assertFalse(self.marker.exists())
+
+    def test_canary_identical_develop_head_is_supported(self):
+        self.canary_policy()
+        prefix = f"/repos/{S.REPOSITORY}"
+        self.policy["develop_oid"] = COMMIT
+        self.api[f"{prefix}/git/ref/heads/develop"]["object"]["sha"] = COMMIT
+        self.api[f"{prefix}/compare/{COMMIT}...{COMMIT}?per_page=1"] = {
+            "status": "identical", "behind_by": 0, "ahead_by": 0,
+            "base_commit": {"sha": COMMIT}, "merge_base_commit": {"sha": COMMIT}}
+        self.prepare()
+
+    def test_canary_local_only_commit_or_develop_ref_is_refused(self):
+        self.canary_policy()
+        for path in (f"/repos/{S.REPOSITORY}/git/commits/{COMMIT}",
+                     f"/repos/{S.REPOSITORY}/git/ref/heads/develop"):
+            with self.subTest(path=path):
+                original = self.api.pop(path)
+                with self.assertRaisesRegex(ValueError, "unavailable"):
+                    self.prepare()
+                self.api[path] = original
+        self.assertEqual(list(self.snapshot.iterdir()), [])
+
+    def test_canary_off_develop_or_malformed_comparison_is_refused(self):
+        self.canary_policy()
+        path = f"/repos/{S.REPOSITORY}/compare/{COMMIT}...{DEVELOP}?per_page=1"
+        original = copy.deepcopy(self.api[path])
+        for changes in ({"status": "behind"}, {"status": "diverged"}, {"behind_by": 1}, {"behind_by": False},
+                        {"ahead_by": -1}, {"ahead_by": True}, {"status": "identical"}, {"ahead_by": 0},
+                        {"merge_base_commit": {"sha": DEVELOP}}, {"base_commit": {"sha": DEVELOP}},
+                        {"base_commit": None}, {"merge_base_commit": None}):
+            with self.subTest(changes=changes):
+                self.api[path] = {**original, **changes}
+                with self.assertRaises(ValueError):
+                    self.prepare()
+        self.assertEqual(list(self.snapshot.iterdir()), [])
+
+    def test_canary_moved_wrong_or_malformed_ref_and_tree_are_refused(self):
+        self.canary_policy()
+        prefix = f"/repos/{S.REPOSITORY}"
+        ref = self.api[f"{prefix}/git/ref/heads/develop"]
+        for changes in ({"ref": "refs/heads/main"}, {"object": {"type": "commit", "sha": MAIN}},
+                        {"object": {"type": "tag", "sha": DEVELOP}}, {"object": {"type": "commit", "sha": "bad"}}):
+            with self.subTest(changes=changes), mock.patch.dict(ref, changes):
+                with self.assertRaises(ValueError):
+                    self.prepare()
+        self.api[f"{prefix}/git/commits/{COMMIT}"]["tree"]["sha"] = MAIN
+        with self.assertRaisesRegex(ValueError, "source tree"):
+            self.prepare()
+        self.api[f"{prefix}/git/commits/{COMMIT}"]["tree"]["sha"] = TREE
+        self.api[f"{prefix}/git/commits/{DEVELOP}"]["sha"] = MAIN
+        with self.assertRaisesRegex(ValueError, "typed develop"):
+            self.prepare()
+
+    def test_canary_requires_full_develop_pin_and_fixed_branch(self):
+        self.canary_policy()
+        for value in (None, True, "1" * 7):
+            with self.subTest(value=value), mock.patch.dict(self.policy, {"develop_oid": value}):
+                with self.assertRaisesRegex(ValueError, "full Git"):
+                    self.prepare()
+        # Candidate-controlled branch names cannot redirect the canonical proof.
+        self.policy["branch"] = "feature/local-only"
+        self.api[f"/repos/{S.REPOSITORY}/compare/{COMMIT}...{DEVELOP}?per_page=1"]["status"] = "diverged"
+        with self.assertRaisesRegex(ValueError, "outside develop"):
+            self.prepare()
+
+    def test_stable_develop_only_candidate_keeps_tag_and_main_gate(self):
+        self.canary_policy()
+        self.policy["channel"] = "stable"
+        self.manifest["channel"] = self.manifest["release"]["channel"] = "stable"
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "tag must match"):
+            self.prepare()
+        self.policy.update(tag="v1.2.3", tag_oid=COMMIT, branch="develop")
+        prefix = f"/repos/{S.REPOSITORY}"
+        self.api[f"{prefix}/git/ref/tags/v1.2.3"] = {
+            "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}}
+        self.api[f"{prefix}/compare/{COMMIT}...{MAIN}?per_page=1"]["status"] = "diverged"
+        with self.assertRaisesRegex(ValueError, "outside main"):
+            self.prepare()
+        self.assertIn(f"{prefix}/git/ref/heads/main", self.requests)
+        self.assertFalse(any("/heads/develop" in path for path in self.requests))
+
+    def test_canary_manifest_and_release_channel_mismatch_are_refused(self):
+        self.canary_policy()
+        self.manifest["channel"] = "stable"
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "source/version/channel"):
+            self.prepare()
+        self.manifest["channel"] = "canary"
+        self.manifest["release"]["channel"] = "stable"
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "release identity"):
             self.prepare()
 
     def test_off_main_diverged_or_malformed_comparison_is_refused(self):

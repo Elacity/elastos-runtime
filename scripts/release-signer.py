@@ -4,7 +4,8 @@ Launch it from the signing account with an empty environment (env -i), so the
 OS loader and Python start without candidate-controlled library/site settings.
 
 Only api.github.com supplies source authority. The operator-owned policy (outside
-the input root) pins repository/tag/tag_oid/commit/tree/version/channel,
+the input root) pins repository/commit/tree/version/channel and either a
+canary develop_oid or a remote version tag/tag_oid for main admission,
 publisher_did, manifest_sha256 and tool/python/openssl {path, sha256}, plus a
 custodian-owned key_path and max_file_bytes/max_snapshot_bytes quotas. The key
 is an Ed25519 PEM readable by OpenSSL only.
@@ -280,39 +281,47 @@ def verify_source(policy, fetch):
     require(policy.get("repository") == REPOSITORY, "repository refused")
     version = policy.get("version")
     require(type(version) is str and VERSION.fullmatch(version) and len(version) <= 128, "release version refused")
-    require(policy.get("tag") == "v" + version, "tag must match release version")
     require(policy.get("channel") in CHANNELS, "release channel refused")
-    for field in ("tag_oid", "commit", "tree"):
+    for field in ("commit", "tree"):
         oid(policy.get(field))
     prefix = f"/repos/{REPOSITORY}"
-    tag = ref_object(fetch(f"{prefix}/git/ref/tags/{policy['tag']}"), "tags/" + policy["tag"])
-    require(tag["sha"] == policy["tag_oid"], "approved tag moved")
-    seen = set()
-    while tag["type"] == "tag":
-        require(tag["sha"] not in seen and len(seen) < 4, "tag chain refused")
-        seen.add(tag["sha"])
-        response = fetch(f"{prefix}/git/tags/{tag['sha']}")
-        require(response.get("sha") == tag["sha"] and response.get("tag") == policy["tag"], "tag object differs")
-        tag = response.get("object")
-        require(type(tag) is dict and tag.get("type") in ("tag", "commit"), "tag target refused")
-        oid(tag.get("sha"))
-    require(tag["sha"] == policy["commit"], "tag commit differs")
+    canary = policy["channel"] == "canary"
+    if canary:
+        oid(policy.get("develop_oid"))
+    else:
+        require(policy.get("tag") == "v" + version, "tag must match release version")
+        oid(policy.get("tag_oid"))
+        tag = ref_object(fetch(f"{prefix}/git/ref/tags/{policy['tag']}"), "tags/" + policy["tag"])
+        require(tag["sha"] == policy["tag_oid"], "approved tag moved")
+        seen = set()
+        while tag["type"] == "tag":
+            require(tag["sha"] not in seen and len(seen) < 4, "tag chain refused")
+            seen.add(tag["sha"])
+            response = fetch(f"{prefix}/git/tags/{tag['sha']}")
+            require(response.get("sha") == tag["sha"] and response.get("tag") == policy["tag"], "tag object differs")
+            tag = response.get("object")
+            require(type(tag) is dict and tag.get("type") in ("tag", "commit"), "tag target refused")
+            oid(tag.get("sha"))
+        require(tag["sha"] == policy["commit"], "tag commit differs")
     commit = fetch(f"{prefix}/git/commits/{policy['commit']}")
     require(commit.get("sha") == policy["commit"] and type(commit.get("tree")) is dict
             and commit["tree"].get("sha") == policy["tree"], "approved source tree differs")
-    main = ref_object(fetch(f"{prefix}/git/ref/heads/main"), "heads/main")
-    require(main["type"] == "commit", "main commit required")
-    main_commit = fetch(f"{prefix}/git/commits/{main['sha']}")
-    require(main_commit.get("sha") == main["sha"] and type(main_commit.get("tree")) is dict,
-            "typed main commit required")
-    oid(main_commit["tree"].get("sha"))
-    compare = fetch(f"{prefix}/compare/{policy['commit']}...{main['sha']}?per_page=1")
+    branch = "develop" if canary else "main"
+    head = ref_object(fetch(f"{prefix}/git/ref/heads/{branch}"), "heads/" + branch)
+    require(head["type"] == "commit", branch + " commit required")
+    if canary:
+        require(head["sha"] == policy["develop_oid"], "approved develop ref moved")
+    head_commit = fetch(f"{prefix}/git/commits/{head['sha']}")
+    require(head_commit.get("sha") == head["sha"] and type(head_commit.get("tree")) is dict,
+            "typed " + branch + " commit required")
+    oid(head_commit["tree"].get("sha"))
+    compare = fetch(f"{prefix}/compare/{policy['commit']}...{head['sha']}?per_page=1")
     require(compare.get("status") in ("ahead", "identical")
             and type(compare.get("behind_by")) is int and compare["behind_by"] == 0
             and type(compare.get("ahead_by")) is int and compare["ahead_by"] >= 0,
-            "candidate is outside main")
+            "candidate is outside " + branch)
     require((compare["status"] == "identical") == (compare["ahead_by"] == 0)
-            and (main["sha"] == policy["commit"]) == (compare["status"] == "identical"), "comparison status differs")
+            and (head["sha"] == policy["commit"]) == (compare["status"] == "identical"), "comparison status differs")
     for field, expected in (("base_commit", policy["commit"]), ("merge_base_commit", policy["commit"])):
         require(type(compare.get(field)) is dict and compare[field].get("sha") == expected, "comparison commit differs")
 
@@ -660,7 +669,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix=".elastos-signing-", dir=args.output_root.parent) as scratch:
         prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
         require(confirmed(prepared, sys.stdin, sys.stderr), "signing cancelled")
-        # Recheck the tag after operator confirmation, before any backend operation.
+        # Recheck canonical source authority after confirmation, before backend use.
         verify_source(policy, github_json)
         backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
         try:
