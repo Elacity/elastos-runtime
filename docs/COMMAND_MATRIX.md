@@ -55,6 +55,29 @@ target.
 | Updates | `elastos update`, `elastos upgrade` | `upgrade` dispatches to the same update handler. Discovery may use Carrier or explicit gateways, but no local runtime is required. |
 | Offline principal-root maintenance | hidden `elastos principal-root-migrate`, hidden `elastos principal-root-upgrade` | Operates on an explicit data directory. The Runtime must be offline and the command requires explicit backup inputs. |
 
+The host operator controls web terminal access with
+`elastos config set developer_mode true` and
+`elastos config set developer_mode false`. Runtime stores this boolean in
+`config.toml` in its data folder. The default is off. Home and apps use Runtime
+routes and app storage roots; the host CLI owns this setting. The existing
+`dev_mode` setting controls capsule signature checks separately.
+
+Runtime refuses all web terminal routes with HTTP 403 while developer mode is
+off or guest registration is enabled. This includes signed-in owners. A refused
+start request creates no host process. The next request uses the current
+setting. Runtime checks existing web terminal sessions each second and closes
+them when the policy refuses access. It also checks the policy before each
+input message. Home CLI shows a refusal with host operator guidance and a
+Return to Desktop button. The host CLI `elastos home` remains available.
+
+The host operator sets accepted public gateway authorities with
+`elastos config set gateway_allowed_hosts '["home.example.com"]'`, then restarts
+the gateway. Each authority includes its port when it uses a non-default port.
+The gateway also accepts its configured bind authority and exact-port loopback
+aliases. A public publisher can expose the Carrier ticket and node ID with
+`elastos config set gateway_public_publisher_bootstrap true`; its publisher
+bootstrap omits the Runtime DID. The default bootstrap requires caller authority.
+
 ## Trust, content, and publishing
 
 | Command family | Class | Included behavior |

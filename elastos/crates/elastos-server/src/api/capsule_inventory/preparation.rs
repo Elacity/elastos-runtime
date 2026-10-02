@@ -2277,12 +2277,16 @@ async fn verify_package_identity(
 fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Value> {
     // Runtime-owned profiles from verified local engine proofs. Catalog
     // metadata cannot tune execution. Other hosts require their own proof.
+    crate::setup::verify_arm64_model_host(platform)?;
     let (threads, gpu_layers) = match platform {
         // Apple silicon offloads every layer to Metal (local Qwen proof).
         "darwin-arm64" => (8, 99),
         // Linux x86-64 runs on a bounded CPU thread budget without GPU offload
         // (pinned SmolLM2 proof on the b10516 Ubuntu bundle).
         "linux-amd64" => (4, 0),
+        // Jetson uses the pinned ARMv8.2 bundle on CPU. Runtime checks CPU
+        // features and host library loading before it admits the engine.
+        "linux-arm64" => (4, 0),
         _ => anyhow::bail!("admitted model host profile is unavailable"),
     };
     Ok(serde_json::json!({
@@ -3423,14 +3427,11 @@ mod tests {
                 "shutdown_timeout_ms":5000, "enable_thinking":false
             })
         );
-        for platform in [
-            "linux-arm64",
-            "darwin-amd64",
-            "linux-x86_64",
-            "Linux-amd64",
-            "*",
-            "",
-        ] {
+        assert_eq!(
+            local_model_startup_profile("linux-arm64").unwrap(),
+            local_model_startup_profile("linux-amd64").unwrap()
+        );
+        for platform in ["darwin-amd64", "linux-x86_64", "Linux-amd64", "*", ""] {
             assert!(
                 local_model_startup_profile(platform).is_err(),
                 "{platform:?} has no proved host profile"
@@ -3441,7 +3442,8 @@ mod tests {
     // Startup binding runs wherever a Runtime-owned host profile exists.
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "linux", target_arch = "x86_64")
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64")
     ))]
     mod startup_binding {
         use super::*;
@@ -3725,7 +3727,7 @@ mod tests {
             for _ in 0..2 {
                 let request = Request::builder()
                     .uri("/api/capsules/catalog")
-                    .header("host", "localhost:61180")
+                    .header("host", "localhost")
                     .header("origin", "null")
                     .header("x-elastos-home-token", &token)
                     .body(Body::empty())
@@ -3919,7 +3921,7 @@ mod tests {
         ) -> (axum::http::StatusCode, serde_json::Value) {
             use tower::ServiceExt as _;
             let request = axum::http::Request::builder()
-                .header("host", "localhost:61180")
+                .header("host", "localhost")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .header("content-type", "application/json");
@@ -4163,10 +4165,17 @@ mod tests {
             provider.hold.store(true, Ordering::Release);
             let request_app = app.clone();
             let request_token = token.clone();
-            let request = tokio::spawn(async move {
+            // JoinSet aborts held fixture requests if an assertion fails.
+            let mut requests = tokio::task::JoinSet::new();
+            requests.spawn(async move {
                 readiness_catalog_request(&request_app, &request_token, None).await
             });
-            provider.entered.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             // This succeeds while the read is held: no inventory/worker lock spans provider I/O.
             retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
             let config_path = root.path().join("components.json");
@@ -4175,7 +4184,12 @@ mod tests {
                 config["model_catalog"]["publisher_dids"] = serde_json::json!([])
             });
             provider.release.notify_one();
-            let (status, catalog) = request.await.unwrap();
+            let (status, catalog) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
             assert_eq!(status, axum::http::StatusCode::OK);
             assert_eq!(catalog["model_catalog_state"], "unavailable");
             assert!(catalog["capsules"]
@@ -4189,13 +4203,23 @@ mod tests {
                 .iter()
                 .any(|r| r["cid"] == record.package_cid));
             std::fs::write(config_path, original).unwrap();
-            let request =
-                tokio::spawn(async move { readiness_catalog_request(&app, &token, None).await });
-            provider.entered.notified().await;
+            requests.spawn(async move { readiness_catalog_request(&app, &token, None).await });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             crate::auth::revoke_session_grant(root.path(), &context().session_id, now().unwrap())
                 .unwrap();
             provider.release.notify_one();
-            assert_eq!(request.await.unwrap().0, axum::http::StatusCode::FORBIDDEN);
+            let (status, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]

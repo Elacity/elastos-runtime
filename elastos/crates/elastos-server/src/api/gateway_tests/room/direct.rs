@@ -181,7 +181,14 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.status(),
+            if token.is_none() {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
     }
     let expired_token = issue_expired_home_launch_token_with_context(
         fixture.dir.path(),
@@ -200,7 +207,7 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
         ))
         .await
         .unwrap();
-    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
 
     let list = fixture
         .app
@@ -319,7 +326,7 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
         ))
         .await
         .unwrap();
-    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
     // The chat window shares the person's real session, so revoking it also
     // retires the registered delivery context — background direct-message
     // authority fails closed with the session instead of outliving it.

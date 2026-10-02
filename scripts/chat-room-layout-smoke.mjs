@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const chatRoot = join(repoRoot, "capsules/chat-room/browser");
 const indexSource = readFileSync(join(chatRoot, "index.html"), "utf8").replace(
-  /<script type="module">[\s\S]*?<\/script>/,
+  /<script type="module" src="\.\/chat-room\.js"><\/script>/,
   "",
 );
 
@@ -32,6 +32,10 @@ const server = createServer((request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1");
   if (url.pathname === "/") {
     send(response, 200, "text/html; charset=utf-8", indexSource);
+    return;
+  }
+  if (["/chat-access.js", "/chat-emoji.js", "/chat-chrome.js"].includes(url.pathname)) {
+    send(response, 200, "text/javascript; charset=utf-8", readFileSync(join(chatRoot, url.pathname.slice(1))));
     return;
   }
   if (url.pathname === "/style.css") {

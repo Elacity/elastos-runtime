@@ -149,13 +149,15 @@ def check_media_tools_records(records, info, platform):
         raise ValueError("media-tools package contains an empty required file")
 
 
-def check_archive(path, extract_path=None, provider=False, home_cli_platform=None, media_platform=None):
+def check_archive(path, extract_path=None, provider=False, home_cli_platform=None,
+                  media_platform=None, engine_platform=None):
     seen = set()
     regular = set()
     links = set()
     contract = None
     media_records = {}
     media_info = None
+    engine_libraries = 0
     renderer = "home-cli/bin/home-cli"
     with tarfile.open(path, "r|gz") as archive:
         for entry in archive:
@@ -164,6 +166,8 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
                     or any(p in {"", ".", ".."} for p in name.split("/"))
                     or name in seen):
                 raise ValueError(f"{path.name}: unsafe or duplicate archive member {name!r}")
+            if engine_platform is not None and name != extract_path and not name.startswith(extract_path + "/"):
+                raise ValueError(f"{path.name}: ARM64 engine member escapes its archive root: {name}")
             if media_platform is not None and (not name.startswith("media-tools/") and name != "media-tools"
                                                or not (entry.isfile() or entry.isdir())):
                 raise ValueError(f"{path.name}: media-tools requires regular files within its archive root")
@@ -203,6 +207,12 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
                     raise ValueError(f"{path.name}: Home CLI renderer must be a regular file")
                 check_native_header(archive.extractfile(entry).read(64), entry.mode,
                                     home_cli_platform, renderer)
+            if engine_platform is not None and entry.isfile() and (
+                    name == f"{extract_path}/llama-server" or ".so" in PurePosixPath(name).name):
+                check_native_header(archive.extractfile(entry).read(64), entry.mode,
+                                    engine_platform, name)
+                if ".so" in PurePosixPath(name).name:
+                    engine_libraries += 1
             if provider and name == f"{extract_path}/capsule.json":
                 if not entry.isfile() or entry.size > 1024 * 1024:
                     raise ValueError(f"{path.name}: invalid provider capsule manifest")
@@ -210,6 +220,10 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
             seen.add(name)
     if home_cli_platform is not None and (extract_path != "home-cli" or renderer not in regular):
         raise ValueError(f"{path.name}: Home CLI native renderer is missing")
+    if engine_platform is not None and f"{extract_path}/llama-server" not in regular:
+        raise ValueError(f"{path.name}: ARM64 llama-server executable is missing")
+    if engine_platform is not None and engine_libraries == 0:
+        raise ValueError(f"{path.name}: ARM64 llama-server libraries are missing")
     if media_platform is not None:
         if extract_path != "media-tools":
             raise ValueError("media-tools extraction root differs from its contract")
@@ -313,7 +327,8 @@ def check_contents(root, platform, omissions):
             elif info.get("extract_path"):
                 check_archive(path, info["extract_path"], provider=is_provider_metadata,
                               home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None,
-                              media_platform=platform if name == "media-tools" else None)
+                              media_platform=platform if name == "media-tools" else None,
+                              engine_platform=platform if name == "llama-server" and platform == "aarch64-linux" else None)
             elif expected_install and expected_install.startswith("capsules/"):
                 raise ValueError(f"{name}: capsule artifact needs an extraction path")
     check_binary(regular_file(root / "artifacts", f"elastos-{platform}"), platform)
