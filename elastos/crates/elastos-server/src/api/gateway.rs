@@ -1214,6 +1214,9 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
+        .layer(Extension(ReleaseReadGate(Arc::new(
+            tokio::sync::Semaphore::new(1),
+        ))))
         .layer(axum::middleware::from_fn(refuse_content_api_resources))
         .layer(axum::middleware::from_fn_with_state(
             admission_state,

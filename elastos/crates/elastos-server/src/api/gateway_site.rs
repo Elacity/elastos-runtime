@@ -1,4 +1,196 @@
 use super::*;
+use crate::release_publication::Publication;
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
+
+#[derive(Deserialize)]
+struct PublicationReceipt {
+    publisher_did: String,
+    last_release_cid: String,
+    last_head_cid: String,
+    last_version: String,
+}
+
+/// One router admits one complete publication scan at a time.
+#[derive(Clone)]
+pub(super) struct ReleaseReadGate(pub(super) Arc<tokio::sync::Semaphore>);
+
+fn publication_open_at(parent: &File, name: &str, directory: bool) -> std::io::Result<File> {
+    let name = CString::new(name)?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn publication_directory(path: &std::path::Path) -> std::io::Result<File> {
+    use std::path::Component;
+    let mut directory = File::open("/")?;
+    if !path.is_absolute() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = name.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
+                directory = publication_open_at(&directory, name, true)?;
+            }
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        }
+    }
+    Ok(directory)
+}
+
+fn read_publication_receipt(root: &File) -> anyhow::Result<PublicationReceipt> {
+    let file = publication_open_at(root, "publish-state.json", false)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file()
+            && before.nlink() == 1
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.mode() & 0o022 == 0
+            && before.len() > 0
+            && before.len() <= 64 * 1024,
+        "unsafe publisher receipt"
+    );
+    let mut bytes = vec![0; before.len() as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+            before.mode(),
+            before.nlink()
+        ) == (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+            after.mode(),
+            after.nlink()
+        ),
+        "publisher receipt changed"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_release_publication(data_dir: &std::path::Path) -> Result<Publication, StatusCode> {
+    // Runtime owns data_dir. Normalize its OS alias (e.g. macOS /var) before
+    // the no-follow walk of the publication and its saved policy receipt.
+    let base = data_dir.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    })?;
+    let root_path = elastos_common::localhost::publisher_root_path(&base);
+    let root = publication_directory(&root_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    })?;
+    let validated = (|| -> anyhow::Result<Publication> {
+        let metadata = root.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
+            "unsafe publisher root"
+        );
+        // This pin is saved by the operator's publication transaction, rather
+        // than taken from the envelope that the gateway is about to verify.
+        let receipt = read_publication_receipt(&root)?;
+        let publication = Publication::open_published(&root_path, &receipt.publisher_did)?;
+        anyhow::ensure!(
+            receipt.last_release_cid == publication.release_cid()
+                && receipt.last_version == publication.version(),
+            "publisher receipt differs from signed set"
+        );
+        crate::update::verify_release_metadata_cid(
+            &receipt.last_head_cid,
+            publication.head_bytes(),
+        )?;
+        Ok(publication)
+    })();
+    validated.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+enum ReleaseFile {
+    Head,
+    Release,
+    Installer,
+    Artifact(String),
+}
+
+async fn signed_release_response(
+    state: GatewayState,
+    gate: ReleaseReadGate,
+    file: ReleaseFile,
+    media_type: &'static str,
+) -> Response {
+    let Ok(permit) = gate.0.try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release publication busy; retry later",
+        )
+            .into_response();
+    };
+    let data_dir = state.data_dir;
+    let result = tokio::task::spawn_blocking(move || {
+        // The worker owns this permit even if the awaiting HTTP task is cancelled.
+        let _permit = permit;
+        let publication = load_release_publication(&data_dir)?;
+        match file {
+            ReleaseFile::Head => Ok(publication.head_bytes().to_vec()),
+            ReleaseFile::Release => Ok(publication.release_bytes().to_vec()),
+            ReleaseFile::Installer => Ok(publication.installer_bytes().to_vec()),
+            ReleaseFile::Artifact(name) => {
+                if !publication
+                    .artifacts()
+                    .iter()
+                    .any(|record| record.name == name)
+                {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                publication
+                    .read_verified_artifact(&name)
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
+    })
+    .await
+    .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE));
+    match result {
+        Ok(bytes) => (StatusCode::OK, [("content-type", media_type)], bytes).into_response(),
+        Err(StatusCode::NOT_FOUND) => {
+            (StatusCode::NOT_FOUND, "Release file not found").into_response()
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release publication unavailable",
+        )
+            .into_response(),
+    }
+}
 
 pub(super) async fn sandbox_content_response(mut response: Response) -> Response {
     // User content has an opaque origin and keeps its scripts and form controls.
@@ -134,93 +326,45 @@ pub(super) async fn healthz() -> &'static str {
     "OK"
 }
 
-pub(super) async fn serve_release_manifest(State(state): State<GatewayState>) -> Response {
-    let path = publisher_release_manifest_path(&state.data_dir);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "release.json not found").into_response(),
-    }
+pub(super) async fn serve_release_manifest(
+    State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
+) -> Response {
+    signed_release_response(state, gate, ReleaseFile::Release, "application/json").await
 }
 
-pub(super) async fn serve_release_head(State(state): State<GatewayState>) -> Response {
-    let path = publisher_release_head_path(&state.data_dir);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "release-head.json not found").into_response(),
-    }
+pub(super) async fn serve_release_head(
+    State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
+) -> Response {
+    signed_release_response(state, gate, ReleaseFile::Head, "application/json").await
 }
 
 pub(super) async fn serve_artifact_file(
     State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
     Path(path): Path<String>,
 ) -> Response {
-    if let Err(msg) = validate_file_path(&path) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+    if path.is_empty()
+        || path.len() > 240
+        || path.starts_with('.')
+        || validate_file_path(&path).is_err()
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid artifact name").into_response();
     }
-
-    let artifacts_root = publisher_artifacts_path(&state.data_dir);
-    let requested = artifacts_root.join(&path);
-    let Ok(root_canonical) = tokio::fs::canonicalize(&artifacts_root).await else {
-        return (StatusCode::NOT_FOUND, "artifacts not found").into_response();
-    };
-    let Ok(requested_canonical) = tokio::fs::canonicalize(&requested).await else {
-        return (StatusCode::NOT_FOUND, "artifact not found").into_response();
-    };
-    if !requested_canonical.starts_with(&root_canonical) {
-        return (StatusCode::BAD_REQUEST, "Path traversal not allowed").into_response();
-    }
-
-    match tokio::fs::read(&requested_canonical).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", content_type(&path))],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "artifact not found").into_response(),
-    }
+    let media_type = content_type(&path);
+    signed_release_response(state, gate, ReleaseFile::Artifact(path), media_type).await
 }
 
 pub(super) async fn serve_install_script(
     State(state): State<GatewayState>,
-    headers: axum::http::HeaderMap,
+    Extension(gate): Extension<ReleaseReadGate>,
+    _headers: axum::http::HeaderMap,
 ) -> Response {
-    let path = publisher_install_script_path(&state.data_dir);
-    if let Ok(bytes) = tokio::fs::read(&path).await {
-        // Dynamically stamp the publisher gateway URL so `curl <gw>/install.sh | bash`
-        // automatically embeds this gateway for future `elastos update`.
-        let script = String::from_utf8_lossy(&bytes);
-        let stamped = if script.contains("__PUBLISHER_GATEWAY__") {
-            match effective_gateway_origin(&headers) {
-                Ok(origin) => script
-                    .replace("__PUBLISHER_GATEWAY__", origin.origin())
-                    .into_bytes(),
-                Err(_) if headers.get("host").is_none() => bytes,
-                Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response();
-                }
-            }
-        } else {
-            bytes
-        };
-        return (
-            StatusCode::OK,
-            [("content-type", "text/x-shellscript")],
-            stamped,
-        )
-            .into_response();
-    }
-    (StatusCode::NOT_FOUND, "install.sh not found").into_response()
+    signed_release_response(state, gate, ReleaseFile::Installer, "text/x-shellscript").await
 }
 
 pub(super) async fn serve_site_head_document(

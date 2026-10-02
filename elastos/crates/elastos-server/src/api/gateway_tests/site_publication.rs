@@ -1,4 +1,120 @@
 use super::*;
+use elastos_runtime::signature::{generate_keypair, SigningKey};
+use sha2::Digest as _;
+
+// This named fixture owns a disposable, memory-only key. Files contain only
+// signed public metadata and harmless candidate bytes; candidates stay inert.
+struct SignedGatewayPublication {
+    _temporary: tempfile::TempDir,
+    base: std::path::PathBuf,
+    root: std::path::PathBuf,
+    installer: Vec<u8>,
+    release: Vec<u8>,
+    head: Vec<u8>,
+    binary: Vec<u8>,
+}
+
+fn gateway_fixture_digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn gateway_fixture_cid(bytes: &[u8]) -> String {
+    let hash = cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest(bytes)).unwrap();
+    cid::Cid::new_v1(0x55, hash).to_string()
+}
+
+fn gateway_fixture_descriptor(bytes: &[u8]) -> Value {
+    json!({"cid":gateway_fixture_cid(bytes),"sha256":gateway_fixture_digest(bytes),"size":bytes.len()})
+}
+
+fn gateway_fixture_envelope(key: &SigningKey, domain: &str, payload: Value) -> Vec<u8> {
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(key, domain, &bytes);
+    serde_json::to_vec(&json!({"payload":payload,"signature":signature,"signer_did":signer_did}))
+        .unwrap()
+}
+
+impl SignedGatewayPublication {
+    fn new() -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let root = elastos_common::localhost::publisher_root_path(&base);
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let (key, _) = generate_keypair();
+        let did = crate::crypto::encode_signing_key_did(&key);
+        let binary =
+            b"#!/bin/sh\ncat /custodian/unopened-signing.pem > candidate-executed\n".to_vec();
+        let installer = b"#!/bin/sh\n# Frozen public bytes: __PUBLISHER_GATEWAY__\n".to_vec();
+        let support = b"public qualified support bytes";
+        let mut support_ref = gateway_fixture_descriptor(support);
+        support_ref["release_path"] = json!("home.tar.gz");
+        support_ref["checksum"] = json!(format!("sha256:{}", gateway_fixture_digest(support)));
+        support_ref.as_object_mut().unwrap().remove("sha256");
+        let components =
+            serde_json::to_vec(&json!({"schema":"elastos.components/v1","capsules":{},
+            "external":{"home":{"platforms":{"*":support_ref}}}}))
+            .unwrap();
+        let release = gateway_fixture_envelope(
+            &key,
+            "elastos.release.v1",
+            json!({
+            "schema":"elastos.release/v1","version":"0.7.1","channel":"canary",
+            "source":{"commit":"a".repeat(40),"tree":"b".repeat(40)},"released_at":1,
+            "prev_release_cid":null,"installer_sha256":gateway_fixture_digest(&installer),
+            "platforms":{"aarch64-darwin":{"binary":gateway_fixture_descriptor(&binary),
+                "components":gateway_fixture_descriptor(&components)}}}),
+        );
+        let head = gateway_fixture_envelope(
+            &key,
+            "elastos.release.head.v1",
+            json!({
+            "schema":"elastos.release.head/v1","version":"0.7.1","channel":"canary","signer_did":did,
+            "updated_at":2,"prev_head_cid":null,"latest_release_cid":gateway_fixture_cid(&release),
+            "release_sha256":gateway_fixture_digest(&release)}),
+        );
+        for (name, bytes) in [
+            ("install.sh", &installer),
+            ("release.json", &release),
+            ("release-head.json", &head),
+        ] {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        for (name, bytes) in [
+            ("elastos-aarch64-darwin", binary.as_slice()),
+            ("components-aarch64-darwin.json", components.as_slice()),
+            ("home.tar.gz", &support[..]),
+        ] {
+            std::fs::write(artifacts.join(name), bytes).unwrap();
+        }
+        std::fs::write(root.join("publish-state.json"),serde_json::to_vec(&json!({
+            "publisher_did":did,"last_release_cid":gateway_fixture_cid(&release),
+            "last_head_cid":gateway_fixture_cid(&head),"last_version":"0.7.1","last_published_at":2})).unwrap()).unwrap();
+        Self {
+            _temporary: temporary,
+            base,
+            root,
+            installer,
+            release,
+            head,
+            binary,
+        }
+    }
+
+    fn change_receipt(&self, field: &str, value: Value) {
+        let path = self.root.join("publish-state.json");
+        let mut receipt: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        receipt[field] = value;
+        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    }
+
+    async fn response(&self, path: &str) -> Response {
+        gateway_router(test_state(&self.base))
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+}
 
 #[test]
 fn test_content_type_mapping() {
@@ -357,17 +473,65 @@ async fn test_missing_file_404() {
 }
 
 #[tokio::test]
-async fn test_release_head_200() {
-    let dir = tempfile::tempdir().unwrap();
-    let head = r#"{"payload":{"schema":"elastos.release.head/v1"}}"#;
-    let publisher_root = publisher_release_head_path(dir.path());
-    std::fs::create_dir_all(publisher_root.parent().unwrap()).unwrap();
-    std::fs::write(publisher_root, head).unwrap();
+async fn test_signed_release_metadata_and_artifacts_200_exact_bytes() {
+    let fixture = SignedGatewayPublication::new();
+    for (path, expected, media_type) in [
+        (
+            "/release-head.json",
+            fixture.head.as_slice(),
+            "application/json",
+        ),
+        (
+            "/release.json",
+            fixture.release.as_slice(),
+            "application/json",
+        ),
+        (
+            "/install.sh",
+            fixture.installer.as_slice(),
+            "text/x-shellscript",
+        ),
+        (
+            "/artifacts/elastos-aarch64-darwin",
+            fixture.binary.as_slice(),
+            "application/octet-stream",
+        ),
+    ] {
+        let response = fixture.response(path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(response.headers().get("content-type").unwrap(), media_type);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected, "{path}");
+    }
+    assert!(!fixture.root.join("candidate-executed").exists());
+}
 
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
+#[tokio::test]
+async fn test_missing_release_publication_404() {
+    let temporary = tempfile::tempdir().unwrap();
+    for path in [
+        "/release-head.json",
+        "/release.json",
+        "/install.sh",
+        "/artifacts/elastos-aarch64-darwin",
+    ] {
+        let response = gateway_router(test_state(temporary.path()))
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
 
-    let resp = app
+#[tokio::test]
+async fn test_unsigned_release_publication_503() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = publisher_release_head_path(temporary.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, br#"{"payload":{"schema":"elastos.release.head/v1"}}"#).unwrap();
+    let response = gateway_router(test_state(temporary.path()))
         .oneshot(
             Request::builder()
                 .uri("/release-head.json")
@@ -376,140 +540,286 @@ async fn test_release_head_200() {
         )
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert_eq!(ct, "application/json");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
-async fn test_release_head_404() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
+async fn test_install_script_frozen_across_host_and_forwarded_headers() {
+    let fixture = SignedGatewayPublication::new();
+    // Call the handler directly so this test concerns signed byte ownership,
+    // while gateway origin admission keeps its own route-level test coverage.
+    for host in [
+        "localhost:61180",
+        "mirror.example.invalid",
+        "hostile.example.invalid",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        headers.insert(
+            "x-forwarded-host",
+            "changed.example.invalid".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let response = super::super::gateway_site::serve_install_script(
+            AxumState(test_state(&fixture.base)),
+            Extension(super::super::gateway_site::ReleaseReadGate(Arc::new(
+                tokio::sync::Semaphore::new(1),
+            ))),
+            headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), fixture.installer.as_slice());
+    }
+}
 
-    let resp = app
+#[tokio::test]
+async fn test_busy_release_read_refused_health_works_and_permit_restored() {
+    use super::super::gateway_site::{
+        healthz, serve_artifact_file, serve_install_script, serve_release_head,
+        serve_release_manifest, ReleaseReadGate,
+    };
+    let fixture = SignedGatewayPublication::new();
+    let gate = ReleaseReadGate(Arc::new(tokio::sync::Semaphore::new(1)));
+    let app = Router::new()
+        .route("/release-head.json", get(serve_release_head))
+        .route("/release.json", get(serve_release_manifest))
+        .route("/install.sh", get(serve_install_script))
+        .route("/artifacts/*path", get(serve_artifact_file))
+        .route("/healthz", get(healthz))
+        .layer(Extension(gate.clone()))
+        .with_state(test_state(&fixture.base));
+    let permit = gate.0.clone().try_acquire_owned().unwrap();
+    for path in [
+        "/release-head.json",
+        "/release.json",
+        "/install.sh",
+        "/artifacts/home.tar.gz",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"Release publication busy; retry later");
+    }
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri("/release-head.json")
+                .uri("/healthz")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(permit);
+    for path in ["/release-head.json", "/install.sh"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(gate.0.available_permits(), 1);
+    }
 }
 
 #[tokio::test]
-async fn test_release_json_200() {
-    let dir = tempfile::tempdir().unwrap();
-    let release = r#"{"payload":{"schema":"elastos.release/v1"}}"#;
-    let publisher_root = publisher_release_manifest_path(dir.path());
-    std::fs::create_dir_all(publisher_root.parent().unwrap()).unwrap();
-    std::fs::write(publisher_root, release).unwrap();
-
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/release.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert_eq!(ct, "application/json");
+async fn test_wrong_public_pin_receipt_cid_version_and_mixed_receipt_503() {
+    for field in [
+        "publisher_did",
+        "last_release_cid",
+        "last_head_cid",
+        "last_version",
+    ] {
+        let fixture = SignedGatewayPublication::new();
+        let (other, _) = generate_keypair();
+        let value = match field {
+            "publisher_did" => json!(crate::crypto::encode_signing_key_did(&other)),
+            "last_version" => json!("0.7.2"),
+            _ => json!(gateway_fixture_cid(b"different public metadata")),
+        };
+        fixture.change_receipt(field, value);
+        for path in [
+            "/release-head.json",
+            "/release.json",
+            "/install.sh",
+            "/artifacts/home.tar.gz",
+        ] {
+            assert_eq!(
+                fixture.response(path).await.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{field} {path}"
+            );
+        }
+    }
+    let old = SignedGatewayPublication::new();
+    let new = SignedGatewayPublication::new();
+    std::fs::copy(
+        old.root.join("publish-state.json"),
+        new.root.join("publish-state.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        new.response("/install.sh").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let fixture = SignedGatewayPublication::new();
+    fixture.change_receipt("last_head_cid", json!("malformed-cid"));
+    assert_eq!(
+        fixture.response("/release-head.json").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
-async fn test_install_sh_200() {
-    let dir = tempfile::tempdir().unwrap();
-    let install_path = publisher_install_script_path(dir.path());
-    std::fs::create_dir_all(install_path.parent().unwrap()).unwrap();
-    std::fs::write(install_path, "#!/bin/bash\necho hi").unwrap();
-
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/install.sh")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert_eq!(ct, "text/x-shellscript");
+async fn test_invalid_signature_metadata_and_artifact_tamper_503() {
+    for name in [
+        "release-head.json",
+        "release.json",
+        "install.sh",
+        "artifacts/elastos-aarch64-darwin",
+        "artifacts/home.tar.gz",
+    ] {
+        let fixture = SignedGatewayPublication::new();
+        std::fs::write(fixture.root.join(name), b"tampered public bytes").unwrap();
+        for path in [
+            "/release-head.json",
+            "/release.json",
+            "/install.sh",
+            "/artifacts/elastos-aarch64-darwin",
+        ] {
+            let response = fixture.response(path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{name} {path}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"Release publication unavailable");
+        }
+    }
+    let fixture = SignedGatewayPublication::new();
+    let mut head: Value = serde_json::from_slice(&fixture.head).unwrap();
+    head["signature"] = json!("00".repeat(64));
+    std::fs::write(
+        fixture.root.join("release-head.json"),
+        serde_json::to_vec(&head).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.response("/release-head.json").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
-async fn test_install_sh_404() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/install.sh")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+async fn test_unadvertised_and_stale_artifacts_404_and_nested_paths_400() {
+    let fixture = SignedGatewayPublication::new();
+    std::fs::write(fixture.root.join("artifacts/old-platform"), b"stale bytes").unwrap();
+    for path in [
+        "/artifacts/old-platform",
+        "/artifacts/unadvertised",
+        "/artifacts/install.sh",
+    ] {
+        assert_eq!(
+            fixture.response(path).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    for path in [
+        "/artifacts/sub/file",
+        "/artifacts/hidden..file",
+        "/artifacts/.hidden",
+    ] {
+        assert_eq!(
+            fixture.response(path).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn test_artifact_file_200() {
-    let dir = tempfile::tempdir().unwrap();
-    let artifacts_dir = publisher_artifacts_path(dir.path());
-    std::fs::create_dir_all(&artifacts_dir).unwrap();
-    std::fs::write(artifacts_dir.join("components-linux-amd64.json"), "{}").unwrap();
+async fn test_linked_receipt_metadata_and_artifacts_503() {
+    use std::os::unix::fs::symlink;
+    for name in [
+        "publish-state.json",
+        "release.json",
+        "install.sh",
+        "artifacts/home.tar.gz",
+    ] {
+        let fixture = SignedGatewayPublication::new();
+        let path = fixture.root.join(name);
+        let marker = fixture.base.join("public-marker");
+        std::fs::rename(&path, &marker).unwrap();
+        symlink(&marker, &path).unwrap();
+        assert_eq!(
+            fixture.response("/install.sh").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{name}"
+        );
+    }
+    let fixture = SignedGatewayPublication::new();
+    std::fs::hard_link(
+        fixture.root.join("publish-state.json"),
+        fixture.base.join("receipt-link"),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.response("/release.json").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for directory in ["artifacts", "publisher"] {
+        let fixture = SignedGatewayPublication::new();
+        let path = if directory == "publisher" {
+            fixture.root.clone()
+        } else {
+            fixture.root.join(directory)
+        };
+        let retained = fixture.base.join("retained-public-directory");
+        std::fs::rename(&path, &retained).unwrap();
+        symlink(&retained, &path).unwrap();
+        assert_eq!(
+            fixture.response("/install.sh").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{directory}"
+        );
+    }
+}
 
-    let state = test_state(dir.path());
-    let app = gateway_router(state);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/artifacts/components-linux-amd64.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert_eq!(ct, "application/json");
+#[tokio::test]
+async fn test_unsafe_or_oversized_receipt_503() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = SignedGatewayPublication::new();
+    let path = fixture.root.join("publish-state.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(
+        fixture.response("/release.json").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let fixture = SignedGatewayPublication::new();
+    std::fs::write(
+        fixture.root.join("publish-state.json"),
+        vec![b' '; 64 * 1024 + 1],
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.response("/install.sh").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
