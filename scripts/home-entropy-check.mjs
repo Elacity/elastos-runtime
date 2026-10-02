@@ -863,7 +863,10 @@ for (const [token, value] of new Map([
     !chatRoomStyle.includes("color: #f8fbff"),
     "Text on an accent fill must use --accent-ink, which flips with the chosen accent",
   );
-  const chatRoomIndex = read("capsules/chat-room/browser/index.html");
+  const chatRoomIndex = read("capsules/chat-room/browser/index.html") +
+  read("capsules/chat-room/browser/chat-room.js") +
+  read("capsules/chat-room/browser/chat-chrome.js") +
+  read("capsules/chat-room/browser/chat-access.js");
   assert(
     chatRoomIndex.includes('<link rel="stylesheet" href="./elastos-ui.css" />') &&
       chatRoomIndex.includes('<script src="./elastos-theme.js"></script>'),
@@ -989,7 +992,8 @@ assert(
 // would pin a copy of someone else's decision. The stronger rule: every name
 // it uses must resolve to a shared token, and it must name no colour of its
 // own. `just vendor-ui --check` guards the token sheet itself against drift.
-const inboxStyle = read("capsules/inbox/browser/index.html");
+const inboxStyle = read("capsules/inbox/browser/index.html") +
+  read("capsules/inbox/browser/inbox.js");
 for (const [token, value] of new Map([
   ["--bg", "var(--el-bg)"],
   ["--sidebar-bg", "var(--el-surface)"],
@@ -1026,7 +1030,8 @@ for (const [token, value] of new Map([
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
 const systemStyle = systemSettingsStyle;
-const system = read("capsules/system/browser/index.html");
+const system = read("capsules/system/browser/index.html") +
+  read("capsules/system/browser/system-tabs.js");
 const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
@@ -1411,10 +1416,14 @@ const linuxSourceHomeRestartSmoke = read(
   "scripts/linux-source-home-restart-smoke.sh",
 );
 const chatRoomUi = read("capsules/chat-room-ui/src/lib.rs");
-const chatRoomIndex = read("capsules/chat-room/browser/index.html");
+const chatRoomIndex = read("capsules/chat-room/browser/index.html") +
+  read("capsules/chat-room/browser/chat-room.js") +
+  read("capsules/chat-room/browser/chat-chrome.js") +
+  read("capsules/chat-room/browser/chat-access.js");
 const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
+  "elastos/crates/elastos-server/src/api/gateway_frontdoor.rs",
   "elastos/crates/elastos-server/src/api/gateway_collaboration_presence.rs",
   "elastos/crates/elastos-server/src/api/browser_sessions.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
@@ -5254,10 +5263,13 @@ assert(
   "Capsule interfaces must derive executable bindings from Runtime handlers, keep provider paths non-generic, and make Home CLI fail closed to the same projection",
 );
 
-const documents = read("capsules/documents/browser/index.html");
-const archiveManager = read("capsules/archive-manager/browser/index.html");
+const documents = read("capsules/documents/browser/index.html") +
+  read("capsules/documents/browser/documents.js");
+const archiveManager = read("capsules/archive-manager/browser/index.html") +
+  read("capsules/archive-manager/browser/archive-manager.js");
 const archiveManagerManifest = read("capsules/archive-manager/capsule.json");
-const inbox = read("capsules/inbox/browser/index.html");
+const inbox = read("capsules/inbox/browser/index.html") +
+  read("capsules/inbox/browser/inbox.js");
 const libraryIndex = read("capsules/library/browser/index.html");
 const libraryCss = read("capsules/library/browser/library.css");
 const libraryApp = read("capsules/library/browser/src/app.js");
@@ -5775,7 +5787,7 @@ const inboxInspectorApprovalBoundary = {
   ) &&
     gatewayTests.includes("missing_fresh_proof") &&
     gatewayTests.includes("inspect_action_rejects_stale_step_up_before_dispatch") &&
-    gatewayTests.includes('message.contains("auth session")') &&
+    gatewayTests.includes('message.contains("admitted host and caller")') &&
     gatewayTests.includes("other_inbox_token.as_str()") &&
     gatewayApi.includes("signed_step_up_is_exact_intent_and_single_use") &&
     gatewayApi.includes("token_rejects_expiry_mixed_schema_and_extra_envelope_fields"),
@@ -6625,7 +6637,7 @@ assert(
     gatewayApi.includes("Inbox launch token plus fresh same-principal passkey Home token") &&
     gatewayTests.includes("esp_initialize_describes_existing_projection_routes") &&
     gatewayTests.includes("esp_initialize_keeps_http_adapter_separate_from_authority_model") &&
-    gatewayTests.includes("esp_initialize_negotiates_schema_tags_without_authority") &&
+    gatewayTests.includes("esp_initialize_negotiates_schema_tags_without_granting_method_authority") &&
     gatewayTests.includes("esp_generic_invocation_executes_only_explicit_runtime_bindings") &&
     gatewayTests.includes("unsupported_esp_version") &&
     espDoc.includes("This endpoint is only a descriptor") &&
@@ -11159,9 +11171,9 @@ const iframeOriginBoundary = {
     !browserCapsulesApi.includes("CAPSULE_PUBLIC_ORIGIN") &&
     !browserCapsulesApi.includes("browser_capsule_origin_redirect"),
   gatewayAllowsOnlyScopedOpaqueCors:
-    gatewayApi.includes("async fn capsule_origin_cors(") &&
-    gatewayApi.includes("ACCESS_CONTROL_REQUEST_METHOD") &&
-    gatewayApi.includes("is_allowed_capsule_origin") &&
+    gatewayApi.includes("async fn gateway_admission(") &&
+    gatewayApi.includes("frontdoor.allows_host(headers)") &&
+    gatewayApi.includes("require_gateway_launch") &&
     gatewayTests.includes(
       "gateway_allows_opaque_capsule_preflight_without_granting_unrelated_origins",
     ),

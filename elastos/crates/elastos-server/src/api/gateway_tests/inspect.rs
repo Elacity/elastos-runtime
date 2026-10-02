@@ -731,7 +731,7 @@ async fn inspect_action_rejects_stale_step_up_before_dispatch() {
         .unwrap();
     let message = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(status, StatusCode::FORBIDDEN, "{message}");
-    assert!(message.contains("auth session"));
+    assert!(message.contains("admitted host and caller"));
     assert!(calls.lock().await.is_empty());
 }
 
