@@ -818,8 +818,8 @@ export function createLibraryDialog({
           <form data-protect-and-list-form aria-describedby="protect-and-list-summary protect-and-list-hint">
             <div>
               <p class="eyebrow">Protect and List</p>
-              <h2 id="protect-and-list-title" data-protect-and-list-object>${escapeHtml(object.name || "Video")}</h2>
-              <p class="subtitle">Review the listing terms before you submit them.</p>
+              <h2 id="protect-and-list-title" data-protect-and-list-object>${escapeHtml(object.name || "File")}</h2>
+              <p class="subtitle">Protect and list this file. Review the listing terms before you submit them.</p>
             </div>
             <label class="dialog-field">
               <span>Copies</span>
@@ -848,7 +848,7 @@ export function createLibraryDialog({
 
   function updateProtectAndListSummary(form) {
     if (!form) return;
-    const objectName = form.querySelector("[data-protect-and-list-object]")?.textContent || "video";
+    const objectName = form.querySelector("[data-protect-and-list-object]")?.textContent || "this file";
     const copies = String(form.elements?.copies?.value || "").trim();
     const price = String(form.elements?.price?.value || "").trim();
     const summary = form.querySelector("[data-protect-and-list-summary]");

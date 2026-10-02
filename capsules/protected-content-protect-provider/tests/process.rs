@@ -3,14 +3,16 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 use ed25519_dalek::SigningKey;
 use elastos_protected_content_contracts::{
-    CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1,
-    Digest32, NodeCustodyPublicKeyV1, NodePublicKey,
+    ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, NodeCustodyPublicKeyV1,
+    NodePublicKey,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectionSessionNodeV1,
+    ProtectionSessionNodeV1, ProviderFailureCodeV1,
 };
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 struct ProviderProcess {
     child: Child,
@@ -141,6 +143,37 @@ fn typed_ok_response(
 
 fn digest(seed: u8) -> Digest32 {
     Digest32::new([seed; 32])
+}
+
+fn assert_failure_code(response: serde_json::Value, expected: ProviderFailureCodeV1) {
+    let typed = typed_ok_response(response);
+    assert_eq!(
+        typed.status(),
+        ProtectProviderResponseStatusV1::Failure,
+        "expected a failure response"
+    );
+    assert_eq!(typed.failure_code(), Some(expected));
+}
+
+fn open_object_request(
+    session_id_seed: u8,
+    content_type: &str,
+    plaintext_bytes: u64,
+    nodes: Vec<ProtectionSessionNodeV1>,
+) -> ProtectProviderRequestV1 {
+    ProtectProviderRequestV1::new_open_object_protection_session(
+        digest(session_id_seed),
+        ContentAccessIdV1::new([0x41; 16]).unwrap(),
+        CustodyPoolIdentityV1::new(digest(0x41), 32).unwrap(),
+        CustodyEpochIdentityV1::new(digest(0x42), 32).unwrap(),
+        CustodyCommitteeAuthorizationIdentityV1::new(digest(0x43), 32).unwrap(),
+        2,
+        3,
+        content_type,
+        plaintext_bytes,
+        nodes,
+    )
+    .unwrap()
 }
 
 fn node_public_key(seed: u8) -> NodePublicKey {
@@ -412,6 +445,300 @@ fn process_open_segment_finalize_success_path_is_framed_and_bound() {
     );
     assert_eq!(envelope.manifest().threshold().required(), 2);
     assert_eq!(envelope.manifest().threshold().total(), 3);
+
+    // The object op on this (finalized, media-kind) session must be
+    // rejected as an invalid session before it ever reaches the finalized-
+    // response replay cache or the mandated encrypted_content comparison:
+    // otherwise it would return the media session's cached finalized
+    // response (a "success"-shaped reply) regardless of what identity is
+    // declared here.
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_finalize_object_protection_session(
+                Digest32::new(handle),
+                media_identity.encrypted_content(),
+            )
+            .unwrap(),
+        )),
+        ProviderFailureCodeV1::InvalidRequest,
+    );
+
+    process.shutdown_and_assert_clean();
+}
+
+#[test]
+fn object_session_open_three_chunks_finalize_round_trips() {
+    const CHUNK_BYTES: usize = 1_048_576;
+    let plaintext_bytes = u64::try_from(CHUNK_BYTES * 2 + CHUNK_BYTES / 2).unwrap();
+    let chunks = [
+        vec![0x11u8; CHUNK_BYTES],
+        vec![0x22u8; CHUNK_BYTES],
+        vec![0x33u8; CHUNK_BYTES / 2],
+    ];
+
+    let mut process = ProviderProcess::start();
+    let init = process.request_json(json!({"op": "init", "config": init_config()}));
+    assert_eq!(init["status"], "ok");
+
+    let open_request = open_object_request(0x91, "application/pdf", plaintext_bytes, nodes());
+    let opened = typed_ok_response(process.request_json(wrap_runtime_request(&open_request)));
+    assert_eq!(
+        opened.status(),
+        ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened,
+        "open failure_code={:?}",
+        opened.failure_code()
+    );
+    let framed_header = opened.framed_header().unwrap().to_vec();
+
+    // The Runtime side of the wire never gets the sealer's internal running
+    // hash; it independently re-derives the same identity from the public
+    // framed bytes the provider hands back (header prefix, then each framed
+    // chunk in order) using the same algorithm this provider's sealer uses.
+    let mut runtime_hasher = Sha256::new();
+    runtime_hasher.update(&framed_header);
+    let mut total_bytes = u64::try_from(framed_header.len()).unwrap();
+
+    let session_id = digest(0x91);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let response = typed_ok_response(
+            process.request_json(wrap_runtime_request(
+                &ProtectProviderRequestV1::new_protect_object_chunk(
+                    session_id,
+                    u32::try_from(index).unwrap(),
+                    chunk,
+                )
+                .unwrap(),
+            )),
+        );
+        assert_eq!(
+            response.status(),
+            ProtectProviderResponseStatusV1::ObjectChunkProtected,
+            "chunk {index} failure_code={:?}",
+            response.failure_code()
+        );
+        let framed_chunk = response.framed_chunk().unwrap().to_vec();
+        runtime_hasher.update(&framed_chunk);
+        total_bytes += u64::try_from(framed_chunk.len()).unwrap();
+    }
+
+    let runtime_side_identity = EncryptedContentIdentityV1::new(
+        Digest32::new(runtime_hasher.finalize().into()),
+        total_bytes,
+    )
+    .unwrap();
+
+    let finalized = typed_ok_response(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_finalize_object_protection_session(
+                session_id,
+                &runtime_side_identity,
+            )
+            .unwrap(),
+        )),
+    );
+    assert_eq!(
+        finalized.status(),
+        ProtectProviderResponseStatusV1::ObjectProtectionSessionFinalized,
+        "finalize failure_code={:?}",
+        finalized.failure_code()
+    );
+    let object_identity = finalized.object_identity().unwrap().unwrap();
+    assert_eq!(object_identity.encrypted_content(), &runtime_side_identity);
+    assert_eq!(object_identity.content_type(), "application/pdf");
+    assert_eq!(object_identity.plaintext_bytes(), plaintext_bytes);
+
+    let envelope = finalized.custody_envelope().unwrap().unwrap();
+    assert_eq!(
+        envelope.manifest().encrypted_content(),
+        object_identity.encrypted_content()
+    );
+    assert_eq!(
+        envelope.manifest().content_key_commitment(),
+        finalized.content_key_commitment().unwrap()
+    );
+    assert_eq!(envelope.manifest().threshold().required(), 2);
+    assert_eq!(envelope.manifest().threshold().total(), 3);
+
+    // A media op on an object session (identified by the same 32-byte
+    // session_id/handle keyspace) returns the invalid-session error rather
+    // than silently misinterpreting the session's stored state.
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_protect_media_segment(*session_id.as_bytes(), 0, b"x")
+                .unwrap(),
+        )),
+        ProviderFailureCodeV1::InvalidRequest,
+    );
+
+    process.shutdown_and_assert_clean();
+}
+
+#[test]
+fn object_session_wrong_chunk_order_cancels_session() {
+    const CHUNK_BYTES: usize = 1_048_576;
+    let plaintext_bytes = u64::try_from(CHUNK_BYTES * 2).unwrap();
+
+    let mut process = ProviderProcess::start();
+    let init = process.request_json(json!({"op": "init", "config": init_config()}));
+    assert_eq!(init["status"], "ok");
+
+    let open_request =
+        open_object_request(0x92, "application/octet-stream", plaintext_bytes, nodes());
+    let opened = typed_ok_response(process.request_json(wrap_runtime_request(&open_request)));
+    assert_eq!(
+        opened.status(),
+        ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened,
+        "open failure_code={:?}",
+        opened.failure_code()
+    );
+
+    let session_id = digest(0x92);
+    let wrong_order_chunk = vec![0xaau8; CHUNK_BYTES];
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_protect_object_chunk(session_id, 1, &wrong_order_chunk)
+                .unwrap(),
+        )),
+        ProviderFailureCodeV1::InvalidRequest,
+    );
+
+    // The ordering error must have cancelled the whole session, not merely
+    // rejected the one bad request: chunk 0 (which would be perfectly valid
+    // on a live, freshly opened session) now finds no session at all.
+    let first_chunk = vec![0xbbu8; CHUNK_BYTES];
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_protect_object_chunk(session_id, 0, &first_chunk)
+                .unwrap(),
+        )),
+        ProviderFailureCodeV1::HandleAbsent,
+    );
+
+    // The auto-cancel must also have cleared the stale open-replay cache
+    // entry: a byte-identical re-open of the same session_id must open a
+    // genuinely fresh session, not resurrect the cached response for the
+    // session that was just cancelled.
+    let reopened = typed_ok_response(process.request_json(wrap_runtime_request(&open_request)));
+    assert_eq!(
+        reopened.status(),
+        ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened,
+        "reopen failure_code={:?}",
+        reopened.failure_code()
+    );
+    let second_chunk = vec![0xddu8; CHUNK_BYTES];
+    let second_chunk_response = typed_ok_response(process.request_json(wrap_runtime_request(
+        &ProtectProviderRequestV1::new_protect_object_chunk(session_id, 0, &second_chunk).unwrap(),
+    )));
+    assert_eq!(
+        second_chunk_response.status(),
+        ProtectProviderResponseStatusV1::ObjectChunkProtected,
+        "chunk 0 on reopened session failure_code={:?}",
+        second_chunk_response.failure_code()
+    );
+
+    process.shutdown_and_assert_clean();
+}
+
+#[test]
+fn object_session_open_rejects_a_non_2_of_3_threshold() {
+    let mut process = ProviderProcess::start();
+    let init = process.request_json(json!({"op": "init", "config": init_config()}));
+    assert_eq!(init["status"], "ok");
+
+    // 3-of-3 with exactly 3 nodes passes the contract's own validation
+    // (nodes.len() == threshold_total), but provision_custody_envelope_for_exact_nodes
+    // hard-codes a 2-of-3 threshold internally regardless of what is asked
+    // for. Without an open-time check this would provision successfully and
+    // silently hand back a lower-than-requested threshold; it must instead
+    // be rejected here, at open, before any session or sealer is created.
+    let request = ProtectProviderRequestV1::new_open_object_protection_session(
+        digest(0x93),
+        ContentAccessIdV1::new([0x41; 16]).unwrap(),
+        CustodyPoolIdentityV1::new(digest(0x41), 32).unwrap(),
+        CustodyEpochIdentityV1::new(digest(0x42), 32).unwrap(),
+        CustodyCommitteeAuthorizationIdentityV1::new(digest(0x43), 32).unwrap(),
+        3,
+        3,
+        "application/octet-stream",
+        1_048_576,
+        nodes(),
+    )
+    .unwrap();
+
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(&request)),
+        ProviderFailureCodeV1::InvalidRequest,
+    );
+
+    process.shutdown_and_assert_clean();
+}
+
+#[test]
+fn object_session_finalize_rejects_mismatched_identity_without_provisioning() {
+    const CHUNK_BYTES: usize = 1_048_576;
+    let plaintext_bytes = u64::try_from(CHUNK_BYTES).unwrap();
+
+    let mut process = ProviderProcess::start();
+    let init = process.request_json(json!({"op": "init", "config": init_config()}));
+    assert_eq!(init["status"], "ok");
+
+    let open_request =
+        open_object_request(0x94, "application/octet-stream", plaintext_bytes, nodes());
+    let opened = typed_ok_response(process.request_json(wrap_runtime_request(&open_request)));
+    assert_eq!(
+        opened.status(),
+        ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened,
+        "open failure_code={:?}",
+        opened.failure_code()
+    );
+
+    let session_id = digest(0x94);
+    let chunk = vec![0xccu8; CHUNK_BYTES];
+    let chunk_response = typed_ok_response(process.request_json(wrap_runtime_request(
+        &ProtectProviderRequestV1::new_protect_object_chunk(session_id, 0, &chunk).unwrap(),
+    )));
+    assert_eq!(
+        chunk_response.status(),
+        ProtectProviderResponseStatusV1::ObjectChunkProtected,
+        "chunk failure_code={:?}",
+        chunk_response.failure_code()
+    );
+
+    // An identity that does not match what was actually sealed must be
+    // rejected before anything is provisioned.
+    let wrong_identity =
+        EncryptedContentIdentityV1::new(Digest32::new([0xffu8; 32]), plaintext_bytes).unwrap();
+    assert_failure_code(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_finalize_object_protection_session(
+                session_id,
+                &wrong_identity,
+            )
+            .unwrap(),
+        )),
+        ProviderFailureCodeV1::BindingMismatch,
+    );
+
+    // Nothing was provisioned: the mismatch must have cancelled the whole
+    // session, so even a second finalize attempt (with the same, still-
+    // wrong identity — there is no sealer left to retry into regardless of
+    // what is declared) finds the handle already closed rather than a
+    // lingering, retryable session — the same idempotent "already absent"
+    // vocabulary media's finalize arm uses for a closed handle, not a
+    // fresh failure.
+    let second_attempt = typed_ok_response(
+        process.request_json(wrap_runtime_request(
+            &ProtectProviderRequestV1::new_finalize_object_protection_session(
+                session_id,
+                &wrong_identity,
+            )
+            .unwrap(),
+        )),
+    );
+    assert_eq!(
+        second_attempt.status(),
+        ProtectProviderResponseStatusV1::ProtectionSessionAlreadyAbsent
+    );
 
     process.shutdown_and_assert_clean();
 }

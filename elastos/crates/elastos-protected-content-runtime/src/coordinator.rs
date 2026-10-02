@@ -896,9 +896,10 @@ mod tests {
         read_viewer_media_part, RuntimeContentAvailabilityRequirement, RuntimeDecryptProvider,
         RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome, RuntimeMintDraft,
         RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
-        RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerSessionInput,
-        RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
-        RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
+        RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerContentV1,
+        RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
+        RuntimePurchaseEffectAuthority, RuntimeVerifiedContentAvailability,
+        RuntimeVerifiedContentIdentityRootV1, RuntimeVerifiedPurchaseEffect,
     };
 
     const NOW: u64 = 2_000_000_000;
@@ -3134,7 +3135,7 @@ mod tests {
             NOW + 11,
             digest(0x7e),
             mint.draft().encrypted_content().clone(),
-            mint.draft().media_identity().media_manifest_root(),
+            RuntimeVerifiedContentIdentityRootV1::for_media(mint.draft().media_identity().unwrap()),
         )
         .unwrap()
     }
@@ -3336,6 +3337,17 @@ mod tests {
             )
             .map_err(|_| RuntimeProviderCallError::NoExactResult)
         }
+
+        // This fake is media-only (see the hardcoded `clear_init`/`clear_segment`
+        // fields above); no test in this module exercises the object viewer
+        // path, so this arm fails closed rather than fabricating a plaintext
+        // chunk response.
+        async fn read_viewer_object_chunk(
+            &self,
+            _request: &DecryptProviderRequestV1,
+        ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError> {
+            Err(RuntimeProviderCallError::NoExactResult)
+        }
     }
 
     #[tokio::test]
@@ -3430,8 +3442,10 @@ mod tests {
                 signed_runtime_release_operation: &allowed,
                 expected_terminal_issuer: terminal.statement().issuer(),
                 content_key_commitment: envelope.manifest().content_key_commitment(),
-                media_identity: available.draft().media_identity(),
-                protected_init_segment: &protected_init,
+                content: RuntimeOpenViewerContentV1::Media {
+                    media_identity: available.draft().media_identity().unwrap(),
+                    protected_init_segment: &protected_init,
+                },
                 signed_node_contributions: &contributions,
                 signed_terminal_receipt: &terminal,
                 now_unix_seconds: NOW + 10,

@@ -1797,6 +1797,7 @@ dependencies = [
  "elastos-model-contract",
  "elastos-namespace",
  "elastos-protected-content-contracts",
+ "elastos-protected-content-custody",
  "elastos-protected-content-provider-contracts",
  "elastos-protected-content-rights",
  "elastos-protected-content-runtime",

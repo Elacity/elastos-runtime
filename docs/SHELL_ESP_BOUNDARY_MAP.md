@@ -81,6 +81,9 @@ the System Inspector and shared `elastos/esp` projections are coherent.
   Exact-commit operator evidence is still required; no arbitrary third-party
   shell or shell-marketplace UX is claimed.
 - Shell marketplace is not implemented.
+- Marketplace exercises `object://…/buy` and `import_runtime_custody` through
+  the gateway provider proxy today; ESP capsule-side purchase orchestration
+  remains out of scope.
 - SSE projection stream as a required ESP transport is not product-ready.
 - Standing grants are not implemented or exposed by ESP v0.
 - Reach enforcement and reach halos are not implemented by ESP v0.

@@ -2021,6 +2021,7 @@ async function run() {
       "Download",
       "Compress to ZIP",
       "Publish",
+      "Protect and List...",
       "Cut",
       "Copy",
       "Delete",
@@ -2036,7 +2037,7 @@ async function run() {
       "Publish",
       "Protect and List...",
       "Properties",
-    ], "protected publish video menu");
+    ], "protected publish media menu");
     await clickMenu(page, "Protect and List...");
     await page.locator(".dialog-card").filter({ hasText: "Protect and List" }).first().waitFor();
     await page.locator('input[name="copies"]').fill("2");
