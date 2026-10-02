@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -866,6 +867,18 @@ class SourceRecordTest(unittest.TestCase):
                 git("checkout", "--", "Cargo.lock")
                 with self.assertRaisesRegex(ValueError, "identity changed"):
                     inputs.source_identity("e" * 40, tree)
+
+
+class ReleaseSignerInputTest(unittest.TestCase):
+    def test_custodian_refuses_hostile_inputs_without_running_candidates(self):
+        # CI's existing release-input gate runs these public-data/fake-backend
+        # cases with the same isolated interpreter flags as the signer.
+        script = Path(__file__).with_name("release-signer-test.py").resolve()
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(script)],
+            cwd=script.parent.parent, capture_output=True, text=True, timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
