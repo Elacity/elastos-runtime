@@ -178,6 +178,12 @@ done
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
 
+# Kubo is an external download (dist.ipfs.tech), not a first-party Carrier
+# component. Seed the pinned, checksum-verified release so an outage there
+# does not fail this Carrier smoke; setup then skips the Kubo download.
+"${REPO_ROOT}/scripts/seed-kubo-cache.sh" \
+    "${KUBO_CACHE_DIR:-${TEST_ROOT}/kubo-cache}" "${DATA_DIR}" "${SETUP_PLATFORM}"
+
 # `elastos serve` now fails closed unless localhost-provider is already
 # installed. Seed the one required host provider before starting the local
 # source runtime; the rest of the setup still proves Carrier-backed install.
