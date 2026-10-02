@@ -824,6 +824,25 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    #[ignore = "requires Playwright and Chromium; CI uses the content_sandbox_browser filter"]
+    async fn content_sandbox_browser_isolation_ui_truth() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/isolation-ui-truth-browser-smoke.mjs");
+        let mut command = tokio::process::Command::new("node");
+        command.arg(script).kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(90), command.output())
+            .await
+            .expect("isolation UI browser fixture timeout")
+            .expect("start isolation UI browser fixture");
+        assert!(
+            output.status.success(),
+            "isolation UI fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[derive(Default)]
     struct BindingProvider {
         calls: AtomicUsize,

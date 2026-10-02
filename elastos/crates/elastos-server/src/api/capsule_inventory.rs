@@ -531,6 +531,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn model_catalog_refuses_unknown_publisher_and_invalid_signatures() {
+        let (trust, bytes) = sign_model_catalog(&model_catalog_fixture());
+        assert_eq!(verify_model_catalog(&trust, &bytes, 2).unwrap().len(), 1);
+
+        let fixture_key = elastos_runtime::signature::SigningKey::from_bytes(&[8; 32]);
+        let (_, other_publisher) =
+            crate::crypto::domain_separated_sign(&fixture_key, MODEL_CATALOG_DOMAIN, b"fixture");
+        crate::crypto::decode_did_key(&other_publisher).unwrap();
+        let mut unknown_trust = trust.clone();
+        unknown_trust.publisher_dids = vec![other_publisher];
+        assert!(verify_model_catalog(&unknown_trust, &bytes, 2).is_err());
+
+        for signature in [String::new(), "g".repeat(128), "00".repeat(64)] {
+            let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+            envelope["signature"] = signature.into();
+            let altered = serde_json::to_vec(&envelope).unwrap();
+            let mut repinned = trust.clone();
+            repinned.head_cid = head_cid(&altered);
+            assert!(
+                verify_model_catalog(&repinned, &altered, 2).is_err(),
+                "a matching content pin cannot turn an invalid signature into publisher proof"
+            );
+        }
+    }
+
+    #[test]
     fn model_catalog_rejects_invalid_or_incomplete_closures() {
         for (pointer, value) in [
             ("/schema", serde_json::json!("unknown")),

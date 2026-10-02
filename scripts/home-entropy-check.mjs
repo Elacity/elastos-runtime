@@ -5147,8 +5147,11 @@ assert(
   "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
-  marketplaceUi.includes('capsule.cid ? "Verified app" : "Local app"') &&
+  marketplaceUi.includes('capsule.cid ? "Published app" : "Local app"') &&
     marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("Publisher verification unavailable") &&
+    marketplaceUi.includes("Declared author ·") &&
+    !marketplaceUi.includes("isFirstPartyPublisher") &&
     marketplaceUi.includes("Trust:") &&
     marketplaceUi.includes("Status:") &&
     marketplaceUi.includes("Available actions") &&

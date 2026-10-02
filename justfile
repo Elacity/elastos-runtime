@@ -201,6 +201,7 @@ product-ui-browser:
     node scripts/inbox-product-layout-smoke.mjs
     node scripts/archive-product-layout-smoke.mjs
     node scripts/marketplace-product-layout-smoke.mjs
+    node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
