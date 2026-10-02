@@ -2438,7 +2438,10 @@ fn launch_reconciliation_accepts_restart_persistent_terminal_cleanup_proof() {
     .unwrap();
 
     assert_eq!(response["status"], "ok");
-    assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(
+        response["data"]["state"], "terminal_post_effect_cleanup",
+        "{response}"
+    );
     assert_eq!(response["data"]["effects"]["page_acquired"], true);
     assert_eq!(response["data"]["effects"]["vm_acquired"], true);
 }

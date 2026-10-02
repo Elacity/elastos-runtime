@@ -1698,6 +1698,7 @@ pub(super) fn home_notifications_summary(
                 severity: home_notification_severity(entry.severity).to_string(),
                 read: entry.read,
                 created_at: entry.created_at,
+                passkey_approval: false,
             })
             .collect(),
     }

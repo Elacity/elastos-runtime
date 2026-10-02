@@ -839,6 +839,10 @@ struct HomeNotificationEntrySummary {
     severity: String,
     read: bool,
     created_at: u64,
+    /// A wallet approval Inbox can sign itself: a built-in wallet, after a
+    /// fresh passkey. Any other account is approved in Wallet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    passkey_approval: bool,
 }
 
 #[derive(Default, Serialize)]

@@ -97,9 +97,20 @@ pub(super) fn append_wallet_approval_notifications(
         } else {
             request.capsule_id.clone()
         };
+        let browser_account_access = request.intent == "browser_account_access";
+        let passkey_approval =
+            !browser_account_access && is_managed_wallet_proof_type(&request.proof_type);
+        // Runtime raises some requests itself (opening protected content); it
+        // is not an app Home can open, so the entry names no source app.
+        let source_app =
+            if request.capsule_id == crate::protected_content_runtime::RUNTIME_PROVIDER_ID {
+                String::new()
+            } else {
+                request.capsule_id.clone()
+            };
         notifications.entries.push(HomeNotificationEntrySummary {
             id: format!("wallet-approval-request:{}", request.request_id),
-            source_app: request.capsule_id.clone(),
+            source_app,
             kind: "wallet_approval_request".to_string(),
             title: wallet_approval_title(&request.intent),
             body: format!(
@@ -110,7 +121,7 @@ pub(super) fn append_wallet_approval_notifications(
                 app: WALLET_CAPSULE_ID.to_string(),
                 action_id: format!(
                     "{}:{}",
-                    if request.intent == "browser_account_access" {
+                    if browser_account_access {
                         "wallet-review-request"
                     } else {
                         "wallet-approve-request"
@@ -121,6 +132,7 @@ pub(super) fn append_wallet_approval_notifications(
             severity: "attention".to_string(),
             read: false,
             created_at: request.created_at,
+            passkey_approval,
         });
     }
 }
@@ -169,6 +181,7 @@ pub(super) fn append_runtime_capability_notifications(
             severity: "attention".to_string(),
             read: false,
             created_at: request.requested_at,
+            passkey_approval: false,
         });
     }
 }

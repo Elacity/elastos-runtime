@@ -51,6 +51,7 @@ test("the typed open state is read from the answer, never from its sentence", ()
     awaitsPerson: true,
     connectorId: "metamask",
     expiresAt: 1_000_290,
+    readyAt: 0,
   });
 
   // Refused: a state this reader has no way to wait through is not waited
@@ -357,4 +358,28 @@ test("a launch with nothing chosen explains where files come from, once", async 
   assert.match(world.statusText(), /Library/);
   assert.doesNotMatch(world.statusText(), /unavailable/i);
   assert.equal(empty.getState().failed, false);
+});
+
+test("a copy awaiting chain finality is waited through, with an estimate and no wallet ask", () => {
+  const now = 1_000_000;
+  const finalizing = readOpenProgress(
+    progressPayload({
+      stage: "finalizing",
+      resumable: true,
+      awaits_person: false,
+      connector_id: undefined,
+      approval_request_id: undefined,
+      expires_at: undefined,
+      ready_at: now + 7 * 60 + 5,
+    }),
+  );
+  assert.equal(finalizing.resumable, true);
+  assert.equal(finalizing.readyAt, now + 7 * 60 + 5);
+  const message = waitingMessage(finalizing, now);
+  assert.match(message, /finalized/);
+  assert.match(message, /about 8 min/);
+  assert.match(message, /opens on its own/);
+  assert.doesNotMatch(message, /Approve|Runtime|custody|release/i);
+  // Past the estimate, the wait reads as imminent rather than as a time gone by.
+  assert.match(waitingMessage(finalizing, now + 3600), /any moment/);
 });

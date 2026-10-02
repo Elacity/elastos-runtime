@@ -99,12 +99,15 @@ The source path has one operation sequence:
    mint instead of reporting work that happened earlier as work it just did,
    and a creator who has since switched wallets can see which account holds
    the listing.
-7. Marketplace reads bounded immutable listings. A buy request contains only
-   the mint identity; Runtime derives the buyer, account, effect, and Chain
-   authority.
-8. Before buy or open, Runtime verifies one fresh signed availability receipt
-   for the exact mint, content identity, CID, publisher, provider, policy,
-   replica count, and freshness window.
+7. Marketplace reads listing objects built by Runtime from the chain and the
+   asset's metadata folder. A buy request names the item, the seller and the
+   terms the buyer agreed to; Runtime re-reads those terms and answers
+   `terms_changed` rather than proceeding when they differ. Runtime derives
+   the buyer, account, effect, and Chain authority.
+8. Before open, and before a buy of an imported listing package (`buy`),
+   Runtime verifies one fresh signed availability receipt for the exact
+   mint, content identity, CID, publisher, provider, policy, replica count,
+   and freshness window.
 9. Library or Marketplace asks Home to launch the viewer the content calls for
    — `elacity-player` for media, `elacity-reader` for everything else — with an
    opaque, short-lived launch authority. Runtime binds the open to the
@@ -130,6 +133,69 @@ clear media, ciphertext staging, CEKs, shares, process details, and private
 routes inside their owned boundaries. Carrier transports only
 Runtime-selected remote custody traffic. Storage, provider, Carrier, and Chain
 topology stays private.
+
+### Buying from an offer
+
+Buying and reading are two workflows over two datasets. Buying from a live
+offer (`buy_offer`) never runs the read-side checks above: the access token
+exists on chain whether or not the file is retrievable, and the read-side
+checks answer "can this be opened?", never "can this be bought?". Buying an
+imported listing package (`buy`, the legacy path step 8 also names) still
+runs them — its terms are frozen into the package it imports rather than
+read fresh from a live offer.
+
+An item's key is `(chain_namespace, ledger, token_id)`; a KID is only an
+alias for it, trusted after `ipReference(kid)` returns that same tuple. An
+offer's key is `(operative, ACCESS_TOKEN, seller)`. A shared link names the
+asset only — `elastos://<metadata-folder-cid>` — and never a seller, so a
+link never favours one seller over another. The asset is the token's own
+metadata folder, and its shared `metadata.json` is the read dataset; the
+Runtime's own `manifest.json` in the same folder is never required to buy.
+
+The Runtime builds the listing object from the chain and that folder; the
+index (today the Elacity GraphQL endpoint) contributes an identifier and
+display text only, nothing the purchase relies on. Offers are read with the
+existing multi-source corroboration, every source pinned to the lowest
+finalized block among them; at most 32 sellers are read per item, and a
+listing states `offers_truncated` when there were more. A `buy_offer`
+request names the item, the asset URI, the seller and the terms the buyer
+agreed to. A purchase rests on the chain's terms only: Runtime verifies the
+item from the chain alone — `(ledger, token_id)` to a non-zero operative,
+and `tokenURI` to the asset folder the request names — and neither the
+shared `metadata.json` nor the KID binding gates it. When the fresh read disagrees, the answer is `terms_changed`
+with the current terms (`null` once the offer is sold out or gone), and no
+Wallet request is raised. A press naming a different seller or different
+terms than a recorded attempt already in flight does not drive that
+attempt: it answers `attempt_in_progress`, naming the recorded seller and
+terms, and raises no Wallet request either. Once that attempt's buy is
+confirmed, any press finishes it. A buyer holds at most one open purchase
+per item across both purchase paths at once — a `buy_offer` attempt
+refuses while a listing-package purchase for the same item is unresolved,
+and a listing-package `buy` refuses symmetrically; each answers
+`already_owned` when the other purchase is complete.
+
+Readability — whether the folder's own document carries a complete ElastOS
+protection entry — is advisory only. Every listing states it as `verified`
+(a `cenc:elastos-pq-hybrid-threshold-v1` entry with all four identities),
+`unverified` (any other ElastOS-scheme entry), `foreign` (no ElastOS-scheme
+entry) or `unknown` (Runtime could not read the document or confirm its KID
+binding now; the item's `kid` is then `null`). None of them blocks a
+purchase: a foreign item's access token is still valid on chain and still
+honoured by ela.city, and Marketplace keeps Buy enabled for an `unknown`
+item without saying where it opens. When a purchase cannot reach the market
+or the chain, Marketplace says so and the same Buy tries again; it keeps
+"The purchase did not finish." for a purchase that failed. After a market purchase completes, opening it reuses the same
+shared `metadata.json` the listing was built from — an adoption step builds
+the ordinary listing and purchase records the open path already consumes,
+so nothing in the open path itself changes. The purchase answers
+`adopted`, `foreign` or `pending`. A pending adoption runs again when this
+Home answers the completed purchase again or is asked for the owned copy;
+nothing reruns it on its own. Marketplace offers Download copy for such an
+item: it asks for the owned copy by its item (`download_owned_copy` with
+`{item}`), which reruns adoption and never pays. See
+[the market buy design](audits/2026-09-24-protected-content-market-buy-design.md)
+for the full architecture, wire shapes and the rulings made while it was
+implemented.
 
 ## Listing metadata
 
@@ -328,6 +394,52 @@ failure for content the way a conscripted replica can, and the exact
 three-replica requirement in the canonical path is satisfied by nodes that
 actually host that plane.
 
+### Key release waits for finality
+
+A custody node releases its share only on rights evidence read at the chain's
+`finalized` block. `latest` and `safe` are never accepted. The rule is part of
+the signed policy (`RightsObservationFinalityV1::Finalized`, see
+[the contract](PROTECTED_CONTENT_CONTRACTS_V1.md)), and the chain provider
+hard-codes it for every rights read that can lead to a release. There are two
+reasons:
+
+- A released key cannot be recalled. The evidence that justifies a release
+  must be state that can no longer be undone. On Base, `finalized` means the
+  Ethereum block that carries the L2 batch is finalized by Ethereum consensus.
+  `safe` means only that the batch is posted to Ethereum: an Ethereum reorg
+  before finality, combined with the sequencer posting different L2 history,
+  could still remove the mint or purchase that granted access.
+- The corroboration across RPC sources depends on it. Sources are pinned to
+  the lowest finalized block among them and must agree on its hash. That is
+  sound only because the finalized head never moves backwards. The `safe`
+  head can be reset after an Ethereum reorg.
+
+This has a visible cost. Access is readable at the chain head in the block
+that grants it, and the upfront ownership check reads the head, so a new mint
+or purchase shows as owned within seconds. Custody cannot release until the
+`finalized` block reaches that block. On Base, that is Ethereum finality (two
+epochs, about 13–15 minutes) plus batch posting: roughly 15–20 minutes after
+the transaction confirms.
+
+The open waits through that window instead of failing. For a copy confirmed
+less than an hour ago, before any Wallet request or custody call, it asks the
+chain provider the question custody will ask, at the `finalized` block. If
+access is not there yet but is at the head, the open answers the `finalizing`
+stage: resumable, nobody needs to act, with an estimated `ready_at`. The
+Reader and the Player keep asking every 15 seconds for up to 40 minutes and
+show the estimate. In every other case, including a chain read that fails,
+the open proceeds unchanged and custody gives its own answer. The wait never
+releases anything early; it only avoids a release attempt that would be
+refused.
+
+A release attempted inside the window anyway, for example one resumed from an
+earlier Wallet approval, still fails closed: every custody node logs
+`rights observed block_tag=finalized … outcome=unbound` and rejects with
+`unknown_protected_content_object`.
+
+The rule stays. Reading `safe` instead was considered and rejected: it would
+trade a guarantee that cannot be recalled for about 15 minutes of waiting.
+
 `CustodyEnvelopeV1` is private Runtime provisioning material. Runtime can
 carry the envelope but cannot open the node-sealed shares. Public metadata
 contains bounded identities, threshold and epoch facts, the CEK commitment,
@@ -479,5 +591,6 @@ reappears in `capsules/`, `components.json`, an install profile, or the
 capability mapping.
 
 Picture, document, text, 3D, book and comic viewers ship in
-`elacity-reader`. Global listing discovery and public custody governance are
-separate later work.
+`elacity-reader`. Global listing discovery is described in
+[Later: Marketplace discovery](audits/2026-09-24-protected-content-market-buy-design.md#later-marketplace-discovery).
+Public custody governance remains separate later work.

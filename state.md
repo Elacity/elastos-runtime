@@ -1799,6 +1799,35 @@ to real Base mainnet, because the RPC previously in use could not serve
 Anders has since approved Base mainnet for the bounded J5 acceptance journey;
 the proof driver and its receipt labels still assume the fork.
 
+### 0.7.1 rebase repairs
+
+Rebasing the protected-content stack onto the 0.7.1 release brought back
+three defects in the manual Home run, repaired in source on
+`temp/0.7.1-rebase-protected-content` on 2 October 2026:
+
+- A mint stopped at "Publish to storage". Model-content's Carrier
+  `import_object` forwarded every replica to the external placement service,
+  which on the custody harness was the unreachable placeholder
+  `https://replica.invalid/ensure`. An import now proves its own local pin;
+  the storage role runs `custody`, `chain` and `ipfs` only and the image no
+  longer ships `availability-provider`. A server test pins the import to
+  `local_pinned` with no placement request.
+- "Open MetaMask" did nothing when Wallet was opened from the rail. The rail
+  diverted connectors to a separate sheet; connectors now open as a window
+  from both the rail and the Wallet window, and the sheet is removed. The
+  Home shell regression smoke covers the single path and that every element
+  the rail looks up exists in the Home template.
+- Inbox offered a passkey Approve on an external-wallet request, which the
+  server then refused, and an Open for Runtime-raised requests with no app
+  behind it. Inbox entries now carry `passkey_approval` for built-in wallets
+  only, and Runtime-raised requests name no source app. A server test and
+  the Inbox behaviour smoke cover both cases.
+
+Not proven: none of the three has been re-run on an installed Home since the
+repair, and the custody containers have not been recreated on the rebuilt
+image. The approval toast still opens Inbox rather than the approval method;
+[TASKS.md](TASKS.md#protected-content-071-follow-up-42-48-49) tracks it.
+
 ## PR15 Extraction Ledger
 
 PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The

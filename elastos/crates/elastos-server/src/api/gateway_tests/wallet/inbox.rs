@@ -1,5 +1,62 @@
 use super::super::*;
 
+/// Inbox signs only with a built-in wallet, so a request for an external
+/// wallet account must not offer Approve there. It stays a pending wallet
+/// approval, so Home's toast and Wallet badge still count it. A request
+/// Runtime raised itself names no app to open.
+#[test]
+fn test_inbox_wallet_approval_offers_passkey_approval_only_for_built_in_wallets() {
+    let request =
+        |request_id: &str, capsule_id: &str, proof_type: &str, connector_id: Option<&str>| {
+            SystemWalletApprovalSummary {
+                request_id: request_id.to_string(),
+                status: "pending".to_string(),
+                intent: "publish_envelope".to_string(),
+                capsule_id: capsule_id.to_string(),
+                resource: "elastos://content/publish".to_string(),
+                reason: "Open protected content".to_string(),
+                account_id: format!("wallet:{request_id}"),
+                address: "0xabc".to_string(),
+                proof_type: proof_type.to_string(),
+                connector_id: connector_id.map(str::to_string),
+                review: None,
+                created_at: 10,
+                expires_at: 20,
+                completed_at: None,
+                transaction_hash: None,
+            }
+        };
+    let mut notifications = HomeNotificationsSummary::default();
+    append_wallet_approval_notifications(
+        &mut notifications,
+        vec![
+            request("built-in", "documents", "managed_evm", None),
+            request("external", "runtime", "siwe", Some("metamask")),
+        ],
+    );
+    let entries = serde_json::to_value(&notifications.entries).unwrap();
+
+    assert_eq!(entries[0]["passkey_approval"], true);
+    assert!(
+        entries[1].get("passkey_approval").is_none(),
+        "an external wallet request is approved in Wallet, not Inbox: {}",
+        entries[1]
+    );
+    assert_eq!(
+        entries[1]["action_ref"]["action_id"],
+        "wallet-approve-request:external"
+    );
+    assert_eq!(entries[0]["source_app"], "documents");
+    assert_eq!(
+        entries[1]["source_app"], "",
+        "Runtime is not an app Inbox can open"
+    );
+    assert_eq!(
+        entries[1]["body"],
+        "runtime requests wallet approval for Open protected content."
+    );
+}
+
 #[tokio::test]
 async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,6 +117,10 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     assert_eq!(
         summary_json["notifications"]["entries"][0]["source_app"],
         "documents"
+    );
+    assert_eq!(
+        summary_json["notifications"]["entries"][0]["passkey_approval"], true,
+        "a built-in wallet request is approvable in Inbox with a passkey"
     );
 
     let missing_fresh_token = app
