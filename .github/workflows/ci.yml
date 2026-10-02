@@ -23,6 +23,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Reviewed ARM64 archive pin, shared by the producer and every CI consumer.
+  CI_LLAMA_ARM64_SHA256: da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
   # Only merged code on develop or main saves caches. PR runs restore them but
@@ -75,6 +77,72 @@ jobs:
           python3 scripts/update-hop-compare-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
+
+  # One input for every ARM consumer. PRs restore their develop base's cache;
+  # only a develop push can save a verified recipe result in this namespace.
+  engine-llama-arm64:
+    name: engine-llama-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    needs: source-gate
+    container:
+      image: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_CONTAINER_IMAGE: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+      ENGINE_BUILD_TOOLS: build-essential cmake git ca-certificates curl binutils file python3
+      RECIPE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: install engine build tools
+        run: |
+          apt-get update -qq
+          read -r -a tools <<< "$ENGINE_BUILD_TOOLS"
+          apt-get install -y -qq --no-install-recommends "${tools[@]}"
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: bind engine cache to build recipe
+        id: engine-recipe
+        run: |
+          recipe_hash=$( {
+            cat scripts/build/build-llama-server-bundle.sh
+            printf '\n%s\n%s\n' "$BUILD_CONTAINER_IMAGE" "$ENGINE_BUILD_TOOLS"
+          } | sha256sum | cut -d ' ' -f 1)
+          echo "cache-key=develop-llama-arm64-${recipe_hash}" >> "$GITHUB_OUTPUT"
+      - name: restore pinned ARM64 engine
+        id: engine-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/llama-arm64-bundle
+          key: ${{ steps.engine-recipe.outputs.cache-key }}
+      - name: build and validate pinned ARM64 engine
+        id: engine-build
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
+      - name: verify accepted ARM64 engine archive
+        run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
+      - name: save pinned ARM64 engine
+        if: env.CI_USE_CACHE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && steps.engine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/llama-arm64-bundle
+          key: ${{ steps.engine-cache.outputs.cache-primary-key }}
+      - name: upload pinned ARM64 engine input
+        # Retain build receipts on a pin mismatch for review; dependent jobs
+        # require this job to succeed before they can consume the archive.
+        if: "!cancelled() && (steps.engine-cache.outputs.cache-hit == 'true' || steps.engine-build.outcome == 'success')"
+        uses: actions/upload-artifact@v5
+        with:
+          name: llama-arm64-bundle
+          path: ${{ runner.temp }}/llama-arm64-bundle/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   lint:
     name: lint
@@ -312,7 +380,7 @@ jobs:
     name: source-home-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    needs: source-gate
+    needs: [source-gate, engine-llama-arm64]
     strategy:
       fail-fast: false
       matrix:
@@ -369,7 +437,18 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: download pinned ARM64 engine input
+        if: matrix.os == 'ubuntu-24.04-arm'
+        uses: actions/download-artifact@v5
+        with:
+          name: llama-arm64-bundle
+          path: ${{ runner.temp }}/llama-arm64-bundle
+      - name: verify pinned ARM64 engine input
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: local-carrier setup smoke
+        env:
+          ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
