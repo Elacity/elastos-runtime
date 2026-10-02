@@ -2739,7 +2739,7 @@ mod tests {
     async fn staged_executable_refusals_preserve_installation_and_allow_corrected_retry() {
         let correct = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
         let components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}\n";
-        for (name, executable, error_marker) in [
+        let cases = [
             (
                 "wrong version",
                 b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n".as_slice(),
@@ -2791,119 +2791,163 @@ mod tests {
                 b"#!/bin/sh\nprintf '%05000d' 0\n".as_slice(),
                 "output limit",
             ),
-        ] {
-            let fixture = tempfile::tempdir().unwrap();
-            let data = fixture.path().join("data");
-            let binary = fixture.path().join("bin/elastos");
-            std::fs::create_dir_all(&data).unwrap();
-            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-            let old_binary = b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n";
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                binary.parent().unwrap(),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
-            std::fs::write(&binary, old_binary).unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let old_components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}";
-            std::fs::write(data.join("components.json"), old_components).unwrap();
-            let did = crate::crypto::encode_signing_key_did(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            );
-            let source: TrustedSource = serde_json::from_value(serde_json::json!({
-                "name": "fixture", "publisher_dids": [did], "channel": "stable",
-                "installed_version": "0.7.0", "install_path": binary
-            }))
-            .unwrap();
-            let mut sources = crate::sources::TrustedSourcesConfig::empty();
-            sources.upsert_source(source.clone());
-            save_trusted_sources(&data, &sources).unwrap();
-            let old_sources = std::fs::read(data.join("sources.json")).unwrap();
-            let preserved = [
-                ("config.json", b"owner configuration\n".as_slice()),
-                ("user-data.txt", b"owner data\n".as_slice()),
-            ];
-            for (path, bytes) in preserved {
-                std::fs::write(data.join(path), bytes).unwrap();
-            }
-
-            let error = apply_signed_executable_fixture(&data, &source, executable, components)
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains(error_marker),
-                "{name}: {error:#}"
-            );
-            assert_eq!(std::fs::read(&binary).unwrap(), old_binary, "{name}");
-            let restored = std::process::Command::new(&binary)
-                .arg("--version")
-                .output()
+        ];
+        for mode in [ApplyMode::Normal, ApplyMode::FrozenOffline] {
+            for (name, executable, error_marker) in cases {
+                let name = format!(
+                    "{}/{name}",
+                    match mode {
+                        ApplyMode::Normal => "normal",
+                        ApplyMode::FrozenOffline => "frozen offline",
+                    }
+                );
+                let fixture = tempfile::tempdir().unwrap();
+                let data = fixture.path().join("data");
+                let binary = fixture.path().join("bin/elastos");
+                std::fs::create_dir_all(&data).unwrap();
+                std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+                let old_binary = b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n";
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    binary.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o755),
+                )
                 .unwrap();
-            assert!(
-                restored.status.success(),
-                "{name}: previous executable failed"
-            );
-            assert_eq!(restored.stdout, b"elastos 0.7.0\n", "{name}");
-            assert_eq!(
-                std::fs::read(data.join("components.json")).unwrap(),
-                old_components,
-                "{name}"
-            );
-            assert_eq!(
-                std::fs::read(data.join("sources.json")).unwrap(),
-                old_sources,
-                "{name}"
-            );
-            assert!(
-                !binary
-                    .parent()
-                    .unwrap()
-                    .join(".elastos.upgrade.tmp")
-                    .exists(),
-                "{name}"
-            );
-            for (path, bytes) in preserved {
-                assert_eq!(
-                    std::fs::read(data.join(path)).unwrap(),
-                    bytes,
-                    "{name}: {path}"
+                std::fs::write(&binary, old_binary).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let old_components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}";
+                std::fs::write(data.join("components.json"), old_components).unwrap();
+                let did = crate::crypto::encode_signing_key_did(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 );
-            }
+                let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                    "name": "fixture", "publisher_dids": [did], "channel": "stable",
+                    "installed_version": "0.7.0", "install_path": binary
+                }))
+                .unwrap();
+                let mut sources = crate::sources::TrustedSourcesConfig::empty();
+                sources.upsert_source(source.clone());
+                save_trusted_sources(&data, &sources).unwrap();
+                let old_sources = std::fs::read(data.join("sources.json")).unwrap();
+                let assert_cleanup = || {
+                    assert!(
+                        !InstallTransaction::has_pending_recovery(&binary),
+                        "{name}: journal retained"
+                    );
+                    match mode {
+                        ApplyMode::Normal => {
+                            assert!(
+                                !binary
+                                    .parent()
+                                    .unwrap()
+                                    .join(".elastos.upgrade.tmp")
+                                    .exists(),
+                                "{name}: binary temp retained"
+                            );
+                            assert!(
+                                !data.join(".components.upgrade.tmp").exists(),
+                                "{name}: components temp retained"
+                            );
+                        }
+                        ApplyMode::FrozenOffline => {
+                            for parent in [
+                                binary.parent().unwrap().to_path_buf(),
+                                data.clone(),
+                                publisher_release_head_path(&data)
+                                    .parent()
+                                    .unwrap()
+                                    .to_path_buf(),
+                                publisher_release_manifest_path(&data)
+                                    .parent()
+                                    .unwrap()
+                                    .to_path_buf(),
+                            ] {
+                                for scratch in [".elastos.update-stage", ".elastos.update-rollback"]
+                                {
+                                    assert!(
+                                        !parent.join(scratch).exists(),
+                                        "{name}: {scratch} retained"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                };
+                let preserved = [
+                    ("config.json", b"owner configuration\n".as_slice()),
+                    ("user-data.txt", b"owner data\n".as_slice()),
+                ];
+                for (path, bytes) in preserved {
+                    std::fs::write(data.join(path), bytes).unwrap();
+                }
 
-            apply_signed_executable_fixture(&data, &source, correct, components)
-                .await
-                .unwrap_or_else(|error| panic!("{name}: corrected retry failed: {error:#}"));
-            assert_eq!(std::fs::read(&binary).unwrap(), correct, "{name}");
-            assert_eq!(
-                std::fs::read(data.join("components.json")).unwrap(),
-                components,
-                "{name}"
-            );
-            let updated = load_trusted_sources(&data).unwrap();
-            let updated_source = updated.default_source().unwrap();
-            assert_eq!(updated_source.installed_version, "0.7.1", "{name}");
-            assert_eq!(
-                PathBuf::from(&updated_source.install_path),
-                std::fs::canonicalize(binary.parent().unwrap())
-                    .unwrap()
-                    .join("elastos"),
-                "{name}"
-            );
-            assert!(
-                !binary
-                    .parent()
-                    .unwrap()
-                    .join(".elastos.upgrade.tmp")
-                    .exists(),
-                "{name}"
-            );
-            for (path, bytes) in preserved {
-                assert_eq!(
-                    std::fs::read(data.join(path)).unwrap(),
-                    bytes,
-                    "{name}: {path}"
+                let error =
+                    apply_signed_fixture_with_mode(&data, &source, executable, components, mode)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    error.to_string().contains(error_marker),
+                    "{name}: {error:#}"
                 );
+                assert_eq!(std::fs::read(&binary).unwrap(), old_binary, "{name}");
+                let restored = std::process::Command::new(&binary)
+                    .arg("--version")
+                    .output()
+                    .unwrap();
+                assert!(
+                    restored.status.success(),
+                    "{name}: previous executable failed"
+                );
+                assert_eq!(restored.stdout, b"elastos 0.7.0\n", "{name}");
+                assert_eq!(
+                    std::fs::read(data.join("components.json")).unwrap(),
+                    old_components,
+                    "{name}"
+                );
+                assert_eq!(
+                    std::fs::read(data.join("sources.json")).unwrap(),
+                    old_sources,
+                    "{name}"
+                );
+                assert_cleanup();
+                for (path, bytes) in preserved {
+                    assert_eq!(
+                        std::fs::read(data.join(path)).unwrap(),
+                        bytes,
+                        "{name}: {path}"
+                    );
+                }
+
+                apply_signed_fixture_with_mode(&data, &source, correct, components, mode)
+                    .await
+                    .unwrap_or_else(|error| panic!("{name}: corrected retry failed: {error:#}"));
+                assert_eq!(std::fs::read(&binary).unwrap(), correct, "{name}");
+                assert_eq!(
+                    std::fs::read(data.join("components.json")).unwrap(),
+                    components,
+                    "{name}"
+                );
+                let updated = load_trusted_sources(&data).unwrap();
+                let updated_source = updated.default_source().unwrap();
+                assert_eq!(updated_source.installed_version, "0.7.1", "{name}");
+                assert_eq!(
+                    PathBuf::from(&updated_source.install_path),
+                    match mode {
+                        ApplyMode::Normal => binary.clone(),
+                        ApplyMode::FrozenOffline => std::fs::canonicalize(binary.parent().unwrap())
+                            .unwrap()
+                            .join("elastos"),
+                    },
+                    "{name}"
+                );
+                assert_cleanup();
+                for (path, bytes) in preserved {
+                    assert_eq!(
+                        std::fs::read(data.join(path)).unwrap(),
+                        bytes,
+                        "{name}: {path}"
+                    );
+                }
             }
         }
     }
