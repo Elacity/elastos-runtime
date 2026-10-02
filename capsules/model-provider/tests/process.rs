@@ -198,7 +198,8 @@ fn create_local_run(provider: &mut ProviderProcess, label: &str) -> Value {
 fn create_local_prompt(provider: &mut ProviderProcess, label: &str, prompt: &str) -> Value {
     let input = json!({
         "schema": "elastos.model.input.text/v1",
-        "prompt": prompt
+        "prompt": prompt,
+        "max_output_tokens": 8
     });
     let create = provider.request(json!({
         "op": "runs_create",
@@ -735,7 +736,59 @@ fn installed_local_resource_lifecycle() {
         owned.remove(0);
         owned
     };
+    let write_result = |result: Value| {
+        if let Some(path) = std::env::var_os("ELASTOS_MODEL_RESOURCE_PROOF_RESULT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        }
+    };
+    let assert_lease_released = || {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = format!("/tmp/elastos-local-model-{}.lock", unsafe {
+            libc::geteuid()
+        });
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .unwrap();
+        assert_eq!(lease.metadata().unwrap().len(), 0);
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "finished provider retained account ownership"
+        );
+    };
     let mut first = init("first");
+    if std::env::var("ELASTOS_MODEL_RESOURCE_PROOF_LOW_MEMORY").as_deref() == Ok("1") {
+        let created = create_local_prompt(&mut first, "real-low-memory", "Say hello.");
+        let refused = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));
+        assert_eq!(refused["data"]["status"], "failed", "{refused}");
+        let error = &refused["data"]["terminal"]["error"];
+        assert_eq!(error["class"], "context_rejected", "{refused}");
+        assert_eq!(error["code"], "model_memory_unavailable", "{refused}");
+        assert_eq!(error["message"], "Free memory or select a smaller model.");
+        assert!(descendants(first.child.id()).is_empty());
+        first.shutdown();
+        let (stderr, overflow) = first
+            .stderr
+            .recv_timeout(PROCESS_DEADLINE)
+            .unwrap()
+            .unwrap();
+        assert!(!overflow, "refusal diagnostics exceeded fixture limit");
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(stderr.contains("stage=artifact_validation_completed "));
+        assert!(!stderr.contains("stage=guard_started "));
+        assert_lease_released();
+        write_result(json!({
+            "qualification":"low-memory","status":"passed",
+            "error_class":"context_rejected","error_code":"model_memory_unavailable",
+            "actionable_message":true,"guard_start_observed":false,
+            "final_descendants":0,"account_lease_released":true
+        }));
+        return;
+    }
     let mut second = init("second");
     let created = create_local_prompt(&mut first, "real-first", "Say hello.");
     let ready = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));
@@ -778,4 +831,10 @@ fn installed_local_resource_lifecycle() {
     for pid in owned {
         assert!(wait_for_process_exit(pid), "shutdown retained child {pid}");
     }
+    assert_lease_released();
+    write_result(json!({
+        "qualification":"lifecycle","status":"passed","reply":true,
+        "shared_busy":true,"idle_release":true,"crash_cleanup":true,"recovery":true,
+        "final_descendants":0,"account_lease_released":true
+    }));
 }

@@ -48,6 +48,9 @@ PY
     home)
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE"
         ;;
+    lifecycle)
+        python3 scripts/ci-local-resource-proof.py run "$ROOT" "$CI_HOME" "$DATA" "$EVIDENCE"
+        ;;
     summary)
         python3 - "$EVIDENCE" "$DATA" <<'PY'
 import json, os, subprocess, sys
@@ -59,8 +62,10 @@ commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(
 runtime = data / "bin/elastos"
 sha = digest(runtime) if runtime.is_file() else "unavailable: installation did not complete"
 results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run"}
+if sys.platform.startswith("linux"):
+    results.update(la04_low_memory="failed or not run", la04_lifecycle="failed or not run")
 elapsed = 0
-for name in ["installed-journeys.json"]:
+for name in ["installed-journeys.json", "la04-result.json"]:
     if (root / name).exists():
         row = json.loads((root / name).read_text())
         results.update(row.get("results", {}))
@@ -75,7 +80,9 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
     summary.write(f"\nRecorded journey execution time: {elapsed} seconds. Package identity and screenshots are in the journey artifact.\n")
+    if sys.platform.startswith("linux"):
+        summary.write("\nLA-04 records CPU admission and process lifecycle in finite units. Backend and Home peak-memory qualification needs separate proof.\n")
 PY
         ;;
-    *) echo "Usage: $0 prepare|home|summary" >&2; exit 2 ;;
+    *) echo "Usage: $0 prepare|home|lifecycle|summary" >&2; exit 2 ;;
 esac

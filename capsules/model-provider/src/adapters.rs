@@ -4537,7 +4537,7 @@ mod tests {
         cancel.send(true).unwrap();
         let result = tokio::time::timeout(
             Duration::from_millis(100),
-            run_queued_local_text_worker(&mut task),
+            run_queued_local_text_worker(&mut task, None),
         )
         .await
         .unwrap()
@@ -4552,7 +4552,7 @@ mod tests {
         assert!(updates_rx.try_recv().is_err());
         assert!(!engines.retains_artifacts().await);
         drop(active);
-        let result = run_queued_local_text_worker(&mut task).await.unwrap();
+        let result = run_queued_local_text_worker(&mut task, None).await.unwrap();
         assert!(matches!(
             result,
             ReconcileResult::Terminal {

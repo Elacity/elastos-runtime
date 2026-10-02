@@ -68,6 +68,7 @@ jobs:
       - name: release artifact source proofs
         run: |
           python3 scripts/ci-release-policy-test.py
+          python3 scripts/ci-local-resource-proof-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
@@ -412,6 +413,9 @@ jobs:
           node-version: '26'
       - name: installed Home and local reply journeys
         run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
+      - name: installed CPU admission and resource lifecycle
+        timeout-minutes: 35
+        run: scripts/ci-installed-journeys.sh lifecycle
       - name: installed journey summary
         if: always()
         run: scripts/ci-installed-journeys.sh summary
@@ -423,7 +427,6 @@ jobs:
           path: |
             ${{ runner.temp }}/source-home-journeys/*.json
             ${{ runner.temp }}/source-home-journeys/*.png
-            ${{ runner.temp }}/source-home-journeys/*.log
           retention-days: 7
           if-no-files-found: error
       # ARM PRs also need the archive for the Jetson compatibility check.
