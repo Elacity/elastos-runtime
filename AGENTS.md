@@ -16,16 +16,19 @@ are the only place for work status, acceptance criteria and proof.
   reviews and is merged. Until then, keep verified work open in QA / Review.
   Take the next unblocked task in that lane; starting it does not complete its
   predecessor. Keep blocked work open with its blocker in the issue.
-- While CI runs after a push, start or continue the next eligible issue in the
-  other lane. Keep the one-active-task limit in each lane. Read CI results when
-  they finish; do not watch or poll CI. If both lanes are blocked, record the
-  blockers in their issues.
+- Follow CI and installed journeys that you start to completion in the same
+  turn. While they run, continue eligible work in the other lane and keep the
+  one-active-task limit. Inspect the completed result, repair failures, and
+  verify the new candidate before handing back. An external blocker belongs
+  in the owning issue.
 - Run at most one heavy local build on this Mac at a time. Workers agree which
   issue owns that build before starting it. CI builds do not count toward this
   local limit. Continue reviews, source work or other light checks in parallel.
-- Update the owning GitHub issue before reporting progress. State what changed,
-  link the PR, and record the exact candidate, checks, results and remaining
-  work. The report names the issue, PR, proof and next issue.
+- Update the owning GitHub issue before reporting a state change. Routine
+  status notes and check-ins link the PR, CI run and review, then state the
+  result and remaining work. Keep exact source, tree and artifact identities
+  in installed-binary and release receipts, and in the private lifecycle
+  inventory. A routine status note uses those links instead of copied hashes.
 - Keep one work record. Do not create briefings, plans, gists or notes files.
   Existing `state.md`, `TASKS.md` and dated audits are historical references;
   move useful open work to its issue instead of maintaining a parallel queue.
@@ -67,9 +70,10 @@ are the only place for work status, acceptance criteria and proof.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
   review or deployed commit from fetched refs and target-host evidence before
   making either claim.
-- Treat any other local branch or target-host checkout as evidence only after
-  reporting its exact branch, commit, tree id, dirty status, and verification
-  command.
+- Verify the exact branch, commit, tree id, dirty status and command before
+  treating a local branch or target-host checkout as evidence. Keep these
+  identities in the lifecycle inventory or the installed-artifact receipt;
+  routine check-ins link the related PR, CI run and review.
 - Always report remote divergence. A local branch being green is not the same as
   `elacity/<branch>` being up to date.
 
@@ -211,12 +215,12 @@ target before acting.
 - **No approval needed:** fast-forward pushes to the branch of the active task
   or its existing draft PR; opening draft PRs; rerunning checks; reading logs.
   Report what was pushed, including the remote, branch, commits and check results.
-- **Standing task-merge permission:** merge a task PR into `develop`, or into
-  the base its issue names, when all required checks pass, one independent agent
-  review has passed with its findings resolved, every required human review in
-  Review And Commit Discipline approves, and its dependencies are integrated.
-  Check compatibility with the current base and report the PR, source and merge
-  commits, review and checks. Use a normal merge; history rewrite needs approval.
+- **Standing task-merge permission:** merge your task PR into `develop`, or
+  into the user-approved base named in its issue, when all current checks pass,
+  the independent reviews below pass, findings are resolved, dependencies are
+  integrated, and any explicit human acceptance gate passes. Check current-base
+  compatibility and report links to the merged PR, CI run and reviews. Use a
+  normal merge; history rewrite needs approval.
 - **Standing test-key permission:** create and use disposable keys and signatures
   for a named, isolated test fixture. Keep its trust store separate from real
   Homes and production keys. Record its owner and cleanup condition; keep private
@@ -226,7 +230,10 @@ target before acting.
   keys; changes on the seed or existing installed Homes; deleting branches;
   other secrets and credentials.
 
-Signing runs outside CI. Fork PRs and publication jobs use GitHub-hosted runners.
+The operator runs production signing with Anders's approval. Named isolated
+fixtures may generate disposable keys and signatures in CI; their trust stays
+separate from real Homes and production keys. Fork PRs and publication jobs use
+GitHub-hosted runners.
 
 These levels replace blanket push-approval requirements. Verification and the
 agreed publication scope still apply. Keep unrelated work and private operational
@@ -250,16 +257,21 @@ capsules, provider config, and `components.json`.
 - Keep review requests off draft PRs. When a PR leaves draft, request the
   required reviewers on GitHub yourself and name them in the report. Keep an
   existing request instead of sending a duplicate.
-- `irzhywau` is a required human reviewer for a PR that touches signing, update
-  checks, Inbox approvals, keys, sandboxing or isolation, seed publishing, or CI
-  and release workflows, and for each weekly release PR. When `irzhywau` is the
-  author, Anders reviews. Also name the feature owner when the task requires
-  that review. Other task PRs merge on green checks and one independent agent
-  review. Independent agent review and required human review are separate
-  evidence.
-- Review has at most two rounds. After two rounds, or after the same failure
-  twice, fix the product cause or escalate: review questions go to `irzhywau`,
-  scope questions to Anders. Ask before building new diagnostic tooling.
+- Each task change needs one independent development review marked PASS.
+  Security code, including gateway, auth, provider launchers, confinement,
+  signing, publish/update, install.sh and workflows, also needs a posted
+  `Independent adversarial review ... VERDICT: PASS` from a different model
+  family than its author. Codex authors run `elastos-pr-review <PR>` themselves
+  and verify that the posted verdict covers the current candidate.
+- Agents merge their own task PRs after the current checks and reviews pass.
+  Keep explicit human acceptance gates recorded in the owning issue. Request
+  `irzhywau` for security follow-up: he reviews merged security task PRs, and a
+  finding goes into an existing issue or a revert when it reopens a hole.
+  Weekly release PRs still need his approval before merge and tag; when he is
+  the author, Anders reviews. Also request the feature owner when required.
+- Use one development review round per coherent change. Resolve findings in
+  that round and fix their cause before requesting the current verdict. Scope
+  decisions belong to Anders. Ask before adding new diagnostic tooling.
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
 - Preserve commit history by default. Ask before amending, squashing, rebasing

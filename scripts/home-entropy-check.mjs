@@ -1858,10 +1858,18 @@ assert(
     agentsContract.includes("`develop` is the integration line") &&
     includesNormalized(agentsContract, "Fetch the current base before branching") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
-    agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
+    includesNormalized(agentsContract, "Verify the exact branch, commit, tree id, dirty status and command") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
     agentsContract.includes("explicit user approval before the mutation") &&
-    agentsContract.includes("WebRTC remote display"),
+    agentsContract.includes("WebRTC remote display") &&
+    includesNormalized(agentsContract, "Follow CI and installed journeys that you start to completion in the same turn") &&
+    includesNormalized(agentsContract, "status notes and check-ins link the PR, CI run and review") &&
+    includesNormalized(agentsContract, "Keep exact source, tree and artifact identities in installed-binary and release receipts") &&
+    includesNormalized(agentsContract, "Before deleting a duplicate ref, prove exact commit identity") &&
+    includesNormalized(agentsContract, "Before deleting a worktree, verify its status, untracked files, open files/processes, and protecting ref") &&
+    agentsContract.includes("VERDICT: PASS") &&
+    agentsContract.includes("different model") &&
+    agentsContract.includes("elastos-pr-review <PR>"),
   "Root AGENTS.md must preserve standing branch roles, fetched-base selection, target proof, public-live approval and Browser claim discipline",
 );
 assert(
