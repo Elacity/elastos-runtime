@@ -44,6 +44,7 @@ pub mod gateway_cmd;
 pub mod host_lock;
 pub mod init;
 pub mod inspect_provider;
+mod install_transaction;
 pub mod ipfs;
 pub(crate) mod jev_approval_lens;
 pub mod library;
