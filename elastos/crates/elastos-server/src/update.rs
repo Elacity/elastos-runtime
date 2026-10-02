@@ -481,7 +481,7 @@ fn verify_installed_binary_version_output(
         );
     }
 
-    if !combined.contains(expected_version) {
+    if stdout.trim() != format!("elastos {expected_version}") {
         anyhow::bail!(
             "Installed binary version mismatch at {}\n  Expected: {}\n  Got:      {}",
             bin_path.display(),
@@ -539,6 +539,36 @@ pub async fn run_update_for_data_dir(
     version: &str,
     auto_confirm: bool,
     force: bool,
+) -> anyhow::Result<()> {
+    run_update_for_data_dir_in_context(
+        data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+        crate::setup::FirstPartyCarrierContext::Setup,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_update_for_data_dir_in_context(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     let sources = load_trusted_sources(data_dir)?;
     let source = sources.default_source().cloned().ok_or_else(|| {
@@ -697,6 +727,7 @@ pub async fn run_update_for_data_dir(
         force,
         discovery_method,
         working_gateway.as_deref(),
+        carrier_context,
     )
     .await
 }
@@ -758,6 +789,7 @@ async fn run_upgrade_from_head(
     force: bool,
     discovery_method: &str,
     working_gateway: Option<&str>,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     // Admit the exact signed publication before check-only/version success or artifacts.
     if release_cid.is_empty() {
@@ -969,9 +1001,12 @@ async fn run_upgrade_from_head(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755))?;
     }
+    if let Err(error) = verify_installed_binary_version(&tmp_bin, version) {
+        std::fs::remove_file(&tmp_bin)?;
+        return Err(error);
+    }
     std::fs::rename(&tmp_bin, &bin_path)?;
     println!("  Installed binary: {}", bin_path.display());
-    verify_installed_binary_version(&bin_path, version)?;
     println!("  Installed binary verified (version ✓)");
 
     // 11. Atomic replace components.json
@@ -985,11 +1020,12 @@ async fn run_upgrade_from_head(
     std::fs::rename(&tmp_comp, &comp_path)?;
     println!("  Installed components: {}", comp_path.display());
 
-    let refreshed_components = crate::setup::refresh_installed_components_for_update(
+    let refreshed_components = crate::setup::refresh_installed_components_for_update_in_context(
         data_dir,
         old_components.as_deref(),
         &comp_data,
         &component_platform,
+        carrier_context,
     )
     .await?;
     if refreshed_components.is_empty() {
@@ -1633,6 +1669,7 @@ mod tests {
             false,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await;
         assert!(result
@@ -1656,6 +1693,7 @@ mod tests {
             true,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap();
@@ -1711,6 +1749,7 @@ mod tests {
             false,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap_err();
@@ -1869,6 +1908,7 @@ mod tests {
                         false,
                         "test",
                         gateway_transport.then_some(gateway.as_str()),
+                        crate::setup::FirstPartyCarrierContext::Setup,
                     )
                     .await;
                     server.abort();
@@ -1959,6 +1999,204 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    async fn apply_signed_executable_fixture(
+        data_dir: &Path,
+        source: &TrustedSource,
+        executable: &[u8],
+        components: &[u8],
+    ) -> anyhow::Result<()> {
+        use sha2::Digest;
+
+        let binary_cid = raw_cid(executable);
+        let components_cid = raw_cid(components);
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+                "platforms": {(detect_release_platform()): {
+                    "binary": {
+                        "cid": binary_cid, "sha256": hex::encode(sha2::Sha256::digest(executable)),
+                        "size": executable.len()
+                    },
+                    "components": {
+                        "cid": components_cid, "sha256": hex::encode(sha2::Sha256::digest(components)),
+                        "size": components.len()
+                    }
+                }}
+            }),
+            "elastos.release.v1",
+        );
+        let release_cid = raw_cid(&release);
+        let head_bytes = binding_envelope(binding_head(&release), "elastos.release.head.v1");
+        let head_cid = raw_cid(&head_bytes);
+        let head = verify_release_envelope(
+            &head_bytes,
+            "elastos.release.head.v1",
+            &source.publisher_dids[0],
+        )?;
+        let artifacts = std::collections::HashMap::from([
+            (release_cid.clone(), release),
+            (binary_cid, executable.to_vec()),
+            (components_cid, components.to_vec()),
+        ]);
+        let fetch: FetchFn = Box::new(move |cid, gateways| {
+            assert!(gateways.is_empty(), "fixture must use only its CID fetcher");
+            let bytes = artifacts.get(&cid).expect("unexpected fixture CID").clone();
+            Box::pin(async move { Ok(bytes) })
+        });
+        run_upgrade_from_head(
+            &fetch,
+            &head,
+            &head_bytes,
+            Some(&head_cid),
+            "0.7.1",
+            &release_cid,
+            None,
+            &source.installed_version,
+            source,
+            data_dir,
+            false,
+            &[],
+            true,
+            false,
+            "fixture",
+            None,
+            crate::setup::FirstPartyCarrierContext::Setup,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_executable_refusals_preserve_installation_and_allow_corrected_retry() {
+        let correct = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
+        let components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}\n";
+        for (name, executable, error_marker) in [
+            (
+                "wrong version",
+                b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n".as_slice(),
+                "version mismatch",
+            ),
+            (
+                "version substring",
+                b"#!/bin/sh\nprintf 'elastos 0.7.10\\n'\n".as_slice(),
+                "version mismatch",
+            ),
+            (
+                "prefixed version",
+                b"#!/bin/sh\nprintf 'prefix elastos 0.7.1\\n'\n".as_slice(),
+                "version mismatch",
+            ),
+            (
+                "stderr-only version",
+                b"#!/bin/sh\nprintf 'elastos 0.7.1\\n' >&2\n".as_slice(),
+                "version mismatch",
+            ),
+            (
+                "nonzero exit with matching stdout",
+                b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\nexit 23\n".as_slice(),
+                "version check failed",
+            ),
+            (
+                "loader refusal",
+                b"#!/nonexistent-elastos-fixture-interpreter\n".as_slice(),
+                "failed to run installed binary",
+            ),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let data = fixture.path().join("data");
+            let binary = fixture.path().join("bin/elastos");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            let old_binary = b"previous installed executable\n";
+            std::fs::write(&binary, old_binary).unwrap();
+            let old_components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}";
+            std::fs::write(data.join("components.json"), old_components).unwrap();
+            let did = crate::crypto::encode_signing_key_did(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            );
+            let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                "name": "fixture", "publisher_dids": [did], "channel": "stable",
+                "installed_version": "0.7.0", "install_path": binary
+            }))
+            .unwrap();
+            let mut sources = crate::sources::TrustedSourcesConfig::empty();
+            sources.upsert_source(source.clone());
+            save_trusted_sources(&data, &sources).unwrap();
+            let old_sources = std::fs::read(data.join("sources.json")).unwrap();
+            let preserved = [
+                ("config.json", b"owner configuration\n".as_slice()),
+                ("user-data.txt", b"owner data\n".as_slice()),
+            ];
+            for (path, bytes) in preserved {
+                std::fs::write(data.join(path), bytes).unwrap();
+            }
+
+            let error = apply_signed_executable_fixture(&data, &source, executable, components)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(error_marker),
+                "{name}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&binary).unwrap(), old_binary, "{name}");
+            assert_eq!(
+                std::fs::read(data.join("components.json")).unwrap(),
+                old_components,
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read(data.join("sources.json")).unwrap(),
+                old_sources,
+                "{name}"
+            );
+            assert!(
+                !binary
+                    .parent()
+                    .unwrap()
+                    .join(".elastos.upgrade.tmp")
+                    .exists(),
+                "{name}"
+            );
+            for (path, bytes) in preserved {
+                assert_eq!(
+                    std::fs::read(data.join(path)).unwrap(),
+                    bytes,
+                    "{name}: {path}"
+                );
+            }
+
+            apply_signed_executable_fixture(&data, &source, correct, components)
+                .await
+                .unwrap_or_else(|error| panic!("{name}: corrected retry failed: {error:#}"));
+            assert_eq!(std::fs::read(&binary).unwrap(), correct, "{name}");
+            assert_eq!(
+                std::fs::read(data.join("components.json")).unwrap(),
+                components,
+                "{name}"
+            );
+            let updated = load_trusted_sources(&data).unwrap();
+            let updated_source = updated.default_source().unwrap();
+            assert_eq!(updated_source.installed_version, "0.7.1", "{name}");
+            assert_eq!(updated_source.install_path, source.install_path, "{name}");
+            assert!(
+                !binary
+                    .parent()
+                    .unwrap()
+                    .join(".elastos.upgrade.tmp")
+                    .exists(),
+                "{name}"
+            );
+            for (path, bytes) in preserved {
+                assert_eq!(
+                    std::fs::read(data.join(path)).unwrap(),
+                    bytes,
+                    "{name}: {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_verify_installed_binary_version_accepts_matching_output() {
         let bin = Path::new("/tmp/mock-elastos");
@@ -1977,6 +2215,32 @@ mod tests {
         assert!(msg.contains("Installed binary version mismatch"));
         assert!(msg.contains("Expected: 0.1.0"));
         assert!(msg.contains("elastos 0.0.9"));
+    }
+
+    #[test]
+    fn test_verify_installed_binary_version_requires_exact_stdout() {
+        let bin = Path::new("/tmp/mock-elastos");
+        for stdout in [
+            b"elastos 0.1.00\n".as_slice(),
+            b"elastos 0.1.0-extra\n".as_slice(),
+            b"other 0.1.0\n".as_slice(),
+            b"prefix elastos 0.1.0\n".as_slice(),
+            b"elastos 0.1.0\nextra\n".as_slice(),
+            b"\xffelastos 0.1.0\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(
+                verify_installed_binary_version_output(
+                    bin,
+                    "0.1.0",
+                    true,
+                    stdout,
+                    b"elastos 0.1.0\n",
+                )
+                .is_err(),
+                "unexpected version output: {stdout:?}",
+            );
+        }
     }
 
     #[test]

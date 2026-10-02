@@ -39,10 +39,26 @@ mkdir -p "$CACHE_DIR"
 TARBALL="${CACHE_DIR}/kubo-${PLATFORM}.tar.gz"
 
 if [[ ! -f "$TARBALL" ]]; then
-    echo "[seed-kubo] downloading ${KUBO_URL}"
-    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-        --connect-timeout 30 --max-time 300 \
-        -o "${TARBALL}.partial" "$KUBO_URL"
+    # Kubo publishes byte-identical release tarballs on GitHub. When
+    # dist.ipfs.tech is unreachable, fetch the same file name from the same
+    # Kubo release there; the pinned checksum below still decides.
+    MIRROR_URL=""
+    if [[ "$KUBO_URL" =~ ^https://dist\.ipfs\.tech/kubo/(v[^/]+)/([^/]+)$ ]]; then
+        MIRROR_URL="https://github.com/ipfs/kubo/releases/download/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+    fetched=false
+    for url in "$KUBO_URL" ${MIRROR_URL:+"$MIRROR_URL"}; do
+        echo "[seed-kubo] downloading ${url}"
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 300 \
+            -o "${TARBALL}.partial" "$url"; then
+            fetched=true
+            break
+        fi
+        echo "[seed-kubo] download failed: ${url}" >&2
+        rm -f "${TARBALL}.partial"
+    done
+    [[ "$fetched" == true ]] || { echo "[seed-kubo] no source reachable" >&2; exit 1; }
     mv "${TARBALL}.partial" "$TARBALL"
 else
     echo "[seed-kubo] using cached ${TARBALL}"
