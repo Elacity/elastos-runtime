@@ -453,6 +453,10 @@ fn write_frontdoor_browser_fixture(data_dir: &std::path::Path, repo: &std::path:
         &repo.join("capsules/home/browser"),
         &data_dir.join("capsules/home/browser"),
     );
+    copy_operator_site(
+        &repo.join("capsules/chat-room/browser"),
+        &data_dir.join("capsules/chat-room/browser"),
+    );
     let root = data_dir.join("capsules/assistant/browser");
     let html = "<!doctype html><title>Hostile app fixture</title><script src=\"./probe.js\" defer></script><a id=\"escape\" href=\"/apps/assistant/extra.html\" target=\"_blank\">Open app document</a>";
     for name in ["index.html", "extra.html"] {

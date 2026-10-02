@@ -6,18 +6,20 @@
 
     const chatLaunchParams = new URLSearchParams(window.location.search);
     const chatHomeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
-    const homeNavigation = createHomeNavigationClient({ homeToken: chatHomeToken,
-      homeOrigin: chatLaunchParams.get("home_origin") || "" });
-    globalThis.elastosChatNavigation = (query) => homeNavigation.setQuery(query);
-    const homeClipboard = createHomeClipboardClient({
-      targetId: "chat-room",
-      homeOrigin: chatLaunchParams.get("home_origin") || "",
-      homeToken: chatHomeToken,
-    });
-    homeClipboard.start();
-    globalThis.elastosChatCopyInvite = (text) => homeClipboard.writeText(text, {
-      purpose: "conversation.invite",
-    });
-    init({
-      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260804a", import.meta.url),
-    });
+    if (chatHomeToken) {
+      const homeNavigation = createHomeNavigationClient({ homeToken: chatHomeToken,
+        homeOrigin: chatLaunchParams.get("home_origin") || "" });
+      globalThis.elastosChatNavigation = (query) => homeNavigation.setQuery(query);
+      const homeClipboard = createHomeClipboardClient({
+        targetId: "chat-room",
+        homeOrigin: chatLaunchParams.get("home_origin") || "",
+        homeToken: chatHomeToken,
+      });
+      homeClipboard.start();
+      globalThis.elastosChatCopyInvite = (text) => homeClipboard.writeText(text, {
+        purpose: "conversation.invite",
+      });
+      init({
+        module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260804a", import.meta.url),
+      });
+    }

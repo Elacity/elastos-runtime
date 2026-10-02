@@ -265,7 +265,35 @@ async function checkFrontdoor(browser, context, page) {
   const anonymous = await browser.newContext();
   try {
     const home = await anonymous.newPage();
-    await home.goto(`${origin}/home/`);
+    const unsignedChatRequests = [];
+    const recordUnsignedChatRequest = request => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith('/api/') || path.endsWith('.wasm')) unsignedChatRequests.push(path);
+    };
+    home.on('request', recordUnsignedChatRequest);
+    const chatResponse = await home.goto(`${origin}/apps/chat-room/?home_origin=https%3A%2F%2Fforeign.example`);
+    assert.equal(chatResponse.status(), 200);
+    const chatPolicy = chatResponse.headers()['content-security-policy'];
+    assert.ok(chatPolicy?.startsWith('sandbox ') && !chatPolicy.includes('allow-same-origin'),
+      'direct Chat keeps an opaque response sandbox');
+    assert.equal(await home.locator('#chat-open-home').isVisible(), true);
+    assert.equal(await home.locator('#chat-open-home').getAttribute('href'), '/home/');
+    assert.equal(await home.locator('#chat-open-home').getAttribute('target'), '_self');
+    assert.equal(await home.locator('#browser-access-form').count(), 0);
+    assert.match(await home.locator('#browser-access-stage').innerText(), /Sign in to Home, then open Chat\./);
+    assert.deepEqual(unsignedChatRequests, [], 'unsigned Chat starts neither WASM nor private API requests');
+    home.off('request', recordUnsignedChatRequest);
+    const unsignedSummary = await anonymous.request.get(`${origin}/api/apps/chat-room/summary`);
+    assert.equal(unsignedSummary.status(), 403, 'anonymous Chat summary remains private');
+    const unsignedJoin = await anonymous.request.post(`${origin}/api/browser/session/request`, {
+      data: { display_name: 'Recovery fixture', capabilities: ['room.access'] },
+    });
+    assert.equal(unsignedJoin.status(), 403, 'anonymous guest admission remains refused');
+    await Promise.all([
+      home.waitForURL(`${origin}/home/`),
+      home.locator('#chat-open-home').click(),
+    ]);
+    assert.equal(anonymous.pages().length, 1, 'Open Home recovers in the same window');
     await home.waitForFunction(() => {
       const unlock = document.querySelector('#home-unlock');
       return unlock && !unlock.hidden && ['#home-unlock-primary', '#home-unlock-person'].some(selector => {
