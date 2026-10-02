@@ -270,28 +270,37 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
         mac_steps = steps("source-home-macos")
         names = [step.splitlines()[0] for step in mac_steps]
-        generate = names.index("name: generate disposable signed refusal fixture")
-        prove = names.index("name: prove installer and Carrier update refusals")
+        generate = names.index("name: generate disposable signed install and update fixture")
+        prove = names.index("name: prove install and Carrier update hop and refusals")
+        build = names.index("name: build two actual Runtime versions")
+        capacity = names.index("name: reserve hosted Mac build and fixture capacity")
+        self.assertLess(capacity, names.index("name: source-home into isolated MAC_TEST_HOME"))
+        self.assertIn("prepare-ci-disk", mac_steps[capacity])
+        self.assertEqual(build + 1, generate)
+        self.assertIn("build-ci-hop", mac_steps[build])
+        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[build])
         self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
         self.assertEqual(prove, generate + 1)
         self.assertNotIn("if:", mac_steps[generate])
         self.assertNotIn("if:", mac_steps[prove])
-        self.assertIn("generate-refusals", mac_steps[generate])
-        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[generate])
+        self.assertIn("generate-ci-hop", mac_steps[generate])
+        self.assertIn('--runtime "$CI_HOP_ROOT/build-inputs/elastos-old"', mac_steps[generate])
+        self.assertIn('--next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new"', mac_steps[generate])
+        self.assertIn('--build-receipt "$CI_HOP_ROOT/build-inputs/build.json"', mac_steps[generate])
         self.assertIn('--support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos"', mac_steps[generate])
-        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-refusals", mac_steps[prove])
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal", mac_steps[prove])
         self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', mac_steps[prove])
-        self.assertIn('python3 scripts/update-hop-compare.py run "$REFUSAL_ROOT/package/fixture.json"', mac_steps[prove])
+        self.assertIn('python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json"', mac_steps[prove])
         for step in mac_steps[generate:prove + 1]:
             self.assertNotIn("FIXTURE_ARTIFACT_ID", step)
             self.assertNotIn("GH_TOKEN", step)
             self.assertNotIn("inputs.", step)
-        upload = mac_steps[names.index("name: retain the safe refusal receipt")]
-        self.assertEqual(field(upload, "path"), "${{ env.REFUSAL_ROOT }}/package/results/result.json")
-        self.assertEqual(field(upload, "name"), "retain the safe refusal receipt")
-        self.assertIn("name: macos-cli-update-refusal-receipt", upload)
+        upload = mac_steps[names.index("name: retain the safe CI hop receipt")]
+        self.assertEqual(field(upload, "path"), "${{ env.CI_HOP_ROOT }}/package/results/result.json")
+        self.assertEqual(field(upload, "name"), "retain the safe CI hop receipt")
+        self.assertIn("name: macos-cli-update-hop-receipt", upload)
         self.assertIn("if: always()", upload)
-        cleanup = mac_steps[names.index("name: remove stopped refusal fixture files")]
+        cleanup = mac_steps[names.index("name: remove stopped CI hop fixture files")]
         self.assertIn("get('cleanup', {}).get('passed')", cleanup)
         self.assertIn("shutil.rmtree(root)", cleanup)
 

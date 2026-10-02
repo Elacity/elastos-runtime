@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -41,6 +42,70 @@ HOLDER_DID = public_did(bytes.fromhex(HOLDER_NODE))
 def public_ticket(node=HOLDER_NODE):
     document = {"topic": None, "endpoints": [{"id": node, "addrs": [{"Ip": "127.0.0.1:4433"}]}]}
     return base64.b32encode(json.dumps(document).encode()).decode().lower().rstrip("=")
+
+
+class CiCapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.apps = self.root / "Applications"
+        self.apps.mkdir()
+        for name in observer.CI_XCODE_APPS:
+            (self.apps / name).mkdir()
+        self.active = self.apps / "Xcode_15.4.app"
+        self.override = self.apps / "Xcode_16.2.app"
+
+    def test_reclaim_preserves_both_selected_apps_and_measures_each_deletion(self):
+        removed = []
+        def remove(path):
+            removed.append(path.name)
+            path.rmdir()
+        def measure():
+            return SimpleNamespace(total=1000, free=100 + 100 * len(removed))
+        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100, measure, remove)
+        self.assertEqual(removed, ["Xcode_15.0.1.app", "Xcode_15.1.app"])
+        self.assertEqual(receipt["free_bytes_after"], 300)
+        self.assertEqual(receipt["planned_growth_bytes"], 100)
+        self.assertTrue(self.active.is_dir() and self.override.is_dir())
+        self.assertTrue((self.apps / "Xcode_15.2.app").exists())
+
+    def test_alias_and_unlisted_apps_are_preserved_and_shortfall_fails_closed(self):
+        candidate = self.apps / "Xcode_15.0.1.app"
+        candidate.rmdir()
+        candidate.symlink_to(self.active, target_is_directory=True)
+        (self.apps / "Xcode_99.app").mkdir()
+        removed = []
+        def remove(path):
+            removed.append(path.name)
+            path.rmdir()
+        with self.assertRaisesRegex(ValueError, "capacity unavailable: free=100 total=1000 planned_growth=100"):
+            observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100,
+                                      lambda: SimpleNamespace(total=1000, free=100), remove)
+        self.assertNotIn(candidate.name, removed)
+        self.assertTrue(candidate.is_symlink() and (self.apps / "Xcode_99.app").exists())
+
+    def test_reclaim_refuses_unexpected_selected_ancestry_and_symlink_roots(self):
+        outside = self.root / "Xcode_15.4.app"
+        outside.mkdir()
+        measure, remove = lambda: SimpleNamespace(total=1000, free=100), lambda path: path.rmdir()
+        with self.assertRaisesRegex(ValueError, "selected Xcode ancestry"):
+            observer.cli_reclaim_xcode(self.apps, {outside}, 100, measure, remove)
+        alias = self.root / "alias"
+        alias.symlink_to(self.apps, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "physical Xcode"):
+            observer.cli_reclaim_xcode(alias, {self.active}, 100, measure, remove)
+
+    def test_public_reclaim_refuses_local_execution_and_path_override(self):
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}), \
+             patch.object(observer.sys, "platform", "darwin"), patch.object(observer.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="anders")), \
+             patch.object(observer.subprocess, "run") as process, self.assertRaisesRegex(ValueError, "disposable hosted Mac"):
+            observer.cli_prepare_ci_disk()
+        process.assert_not_called()
+        with patch.object(observer.sys, "argv", ["observer", "prepare-ci-disk", str(self.apps)]), \
+             patch.object(observer, "cli_prepare_ci_disk") as prepare, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(observer.main(), 2)
+        prepare.assert_not_called()
 
 
 class HolderTransportTests(unittest.TestCase):
@@ -236,7 +301,7 @@ class CliFixtureTests(unittest.TestCase):
         self.root = Path(self.directory.name).resolve()
         self.manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": observer.CLI_MODE,
                          "reference": "github-actions:test/repo:123", "approval": "isolated observer self-test",
-                         "proof_scope": "ci-refusals", "proof_kind": "harness-self-test", "source": {"commit": "a" * 40, "tree": "b" * 40},
+                         "proof_scope": "ci-rehearsal", "proof_kind": "harness-self-test", "source": {"commit": "a" * 40, "tree": "b" * 40},
                          "old": {"version": "0.7.1-rc.1", "source": {"commit": "c" * 40, "tree": "d" * 40}},
                          "new": {"version": "0.7.1-rc.2", "source": {"commit": "e" * 40, "tree": "f" * 40}},
                          "channel": "canary", "signer_did": "did:key:zfixture", "platform": "aarch64-darwin",
@@ -293,12 +358,16 @@ class CliFixtureTests(unittest.TestCase):
         self.manifest["consumer"] = {"files": {"config/test.json": add("consumer-config.json", {"test": True}),
                                                  "state/value": add("consumer-state", b"preserve data"),
                                                  "capsules/test/entry.wasm": add("qualified-support", b"qualified support")}}
+        self.manifest["build"] = add("build.json", {"schema": "elastos.update-hop.build/v1", "source": self.manifest["source"],
+            "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"], "status": "passed", "cleanup": {"passed": True},
+            **{name: {"source": self.manifest[name]["source"], "version": self.manifest[name]["version"], "sha256": self.manifest["files"][relative]["sha256"],
+                      "version_environment": self.manifest[name]["version"]} for name, relative in (("old", old_bin), ("new", new_bin))}})
         self.manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules"]}
         self.config = {"schema": self.manifest["schema"], "mode": observer.CLI_MODE, "root": str(self.root),
                        "immutable": {"reference": self.manifest["reference"], "manifest": "manifest.json"}}
         self.freeze()
         self.env = patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": self.config["immutable"]["sha256"],
-                                                    "ELASTOS_CI_FIXTURE_REFERENCE": self.manifest["reference"], "ELASTOS_CI_REQUIRE_REAL_RUNTIME": "0", "ELASTOS_CI_FIXTURE_SCOPE": "ci-refusals"})
+                                                    "ELASTOS_CI_FIXTURE_REFERENCE": self.manifest["reference"], "ELASTOS_CI_REQUIRE_REAL_RUNTIME": "0", "ELASTOS_CI_FIXTURE_SCOPE": "ci-rehearsal"})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -337,12 +406,29 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(result["proof_scope"], "production-positive")
         self.assertEqual([argv[1:] for argv, _ in calls if argv[1] == "update"],
-                         [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
+                         [["update", "--check"], ["update"], ["update"]])
         self.assertEqual(set(result["paths"]["m2-discovery"]["checks"]), {"check", "apply", "repeat"})
 
     def test_disposable_package_cannot_enter_real_positive_admission(self):
         observer.os.environ["ELASTOS_CI_FIXTURE_SCOPE"] = "production-positive"
         with self.assertRaisesRegex(ValueError, "proof scope differs"):
+            self.admit()
+
+    def test_disposable_hop_requires_two_binary_hashes_and_compiled_version_receipt(self):
+        pub = self.manifest["publications"]["new"]
+        original = pub["binary"]
+        pub["binary"] = self.manifest["publications"]["old"]["binary"]
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "artifact CID/size|artifact hash|different old/new"):
+            self.admit()
+        pub["binary"] = original
+        build_path = self.root / self.manifest["build"]
+        build = observer.cli_json(build_path)
+        build["new"]["version_environment"] = self.manifest["old"]["version"]
+        relative = self.add("wrong-build.json", build)
+        self.manifest["build"] = relative
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "compiled version input"):
             self.admit()
 
     def test_admission_requires_complete_public_package_and_independent_pin(self):
@@ -481,6 +567,14 @@ class CliFixtureTests(unittest.TestCase):
         # This proves observer admission only, and reports harness-self-test.
         native = self.root / "native"
         native.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16)
+        next_runtime = self.root / "next-runtime"
+        next_runtime.write_bytes(native.read_bytes() + b"next version")
+        build_receipt = self.root / "build-receipt.json"
+        source = {"commit": "a" * 40, "tree": "a" * 40}
+        observer.write(build_receipt, {"schema": "elastos.update-hop.build/v1", "source": source,
+            "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
+            "status": "passed", "cleanup": {"passed": True}, **{name: {"source": source, "version": version,
+            "sha256": observer.digest(path), "version_environment": version} for name, path, version in (("old", native, "0.7.1"), ("new", next_runtime, "0.7.2"))}})
         support = self.root / "support"
         (support / "bin").mkdir(parents=True)
         for name in ("ipfs-provider", "kubo"):
@@ -490,9 +584,9 @@ class CliFixtureTests(unittest.TestCase):
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
         def command(argv, **kwargs):
-            if Path(argv[0]).name == "elastos":
+            if Path(argv[0]).name in ("elastos", "elastos-next"):
                 if argv[1] == "--version":
-                    return subprocess.CompletedProcess(argv, 0, b"elastos 0.7.1\n", b"")
+                    return subprocess.CompletedProcess(argv, 0, b"elastos 0.7.2\n" if Path(argv[0]).name == "elastos-next" else b"elastos 0.7.1\n", b"")
                 self.assertEqual(argv[1], "sign-payload")
                 key = Path(argv[argv.index("--key") + 1])
                 key_paths.append(key)
@@ -512,7 +606,7 @@ class CliFixtureTests(unittest.TestCase):
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
              patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
              patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"):
-            receipt = observer.cli_generate_refusals(generated, native, support)
+            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support)
         self.assertTrue(receipt["keys_removed"])
         self.assertTrue(key_paths)
         self.assertTrue(all(not path.exists() for path in key_paths))
@@ -529,7 +623,62 @@ class CliFixtureTests(unittest.TestCase):
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
-            observer.cli_generate_refusals(self.root / "generated", self.root / "missing", self.root)
+            observer.cli_generate_hop(self.root / "generated", self.root / "missing", self.root / "missing", self.root / "missing", self.root)
+
+    def test_hop_builder_preserves_n_and_compiles_n_plus_one_with_version_input(self):
+        runtime = self.root / "built-runtime"
+        header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
+        runtime.write_bytes(header + b"N")
+        destination = self.root / "build-inputs"
+        calls = []
+        def command(manager, argv, env, cwd, label, timeout):
+            calls.append((argv, env, timeout))
+            stdout = b""
+            if label == "old-version":
+                stdout = b"elastos 0.7.1-dev\n"
+            elif label == "build-next":
+                self.assertEqual(env["ELASTOS_RELEASE_VERSION"], "0.7.2")
+                self.assertEqual(timeout, 900)
+                runtime.write_bytes(header + b"N+1")
+            else:
+                stdout = b"elastos 0.7.2\n"
+            (destination / (label + ".stdout")).write_bytes(stdout)
+            (destination / (label + ".stderr")).write_bytes(b"")
+            return {"exit": 0}
+        def git(argv, **kwargs):
+            return "" if argv[1] == "status" else "a" * 40 + "\n"
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
+             patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}):
+            receipt = observer.cli_build_hop(destination, runtime)
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual((destination / "elastos-old").read_bytes(), header + b"N")
+        self.assertEqual((destination / "elastos-new").read_bytes(), header + b"N+1")
+        self.assertEqual(receipt["new"]["version_environment"], "0.7.2")
+        self.assertEqual(receipt["new"]["sha256"], observer.digest(destination / "elastos-new"))
+        self.assertEqual(calls[1][0], receipt["command"])
+
+    def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
+        runtime = self.root / "built-runtime"
+        original = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
+        runtime.write_bytes(original)
+        destination = self.root / "build-inputs"
+        def command(manager, argv, env, cwd, label, timeout):
+            (destination / (label + ".stdout")).write_bytes(b"elastos 0.7.1-dev\n" if label == "old-version" else b"")
+            (destination / (label + ".stderr")).write_bytes(b"")
+            return {"exit": 0 if label == "old-version" else 124}
+        def git(argv, **kwargs):
+            return "" if argv[1] == "status" else "a" * 40 + "\n"
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
+             patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
+             self.assertRaisesRegex(ValueError, "next Runtime build failed"):
+            observer.cli_build_hop(destination, runtime)
+        receipt = observer.cli_json(destination / "build.json")
+        self.assertEqual(receipt["status"], "failed")
+        self.assertTrue(receipt["cleanup"]["passed"])
+        self.assertEqual((destination / "elastos-old").read_bytes(), original)
+        self.assertFalse((destination / "elastos-new").exists())
 
     def test_generator_command_failure_removes_keys_and_repository(self):
         support = self.root / "support"
@@ -547,7 +696,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
              patch.object(observer.subprocess, "run", side_effect=failed), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"), \
              self.assertRaisesRegex(ValueError, "disposable fixture command failed"):
-            observer.cli_generate_refusals(generated, runtime, support)
+            observer.cli_generate_hop(generated, runtime, runtime, runtime, support)
         self.assertFalse((generated / "generator").exists())
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
@@ -698,7 +847,7 @@ class CliFixtureTests(unittest.TestCase):
         first_gateway = next(index for index, (argv, _) in enumerate(calls) if argv[1] == "gateway")
         self.assertLess(holder_identity, first_gateway)
         updates = [argv[1:] for argv, _ in calls if argv[1] == "update"]
-        self.assertEqual(updates, [["update", "--check"], ["update", "--yes"], ["update", "--check"], ["update", "--yes"], *([["update", "--yes"]] * 3)])
+        self.assertEqual(updates, [["update", "--check"], ["update"], ["update"], ["update", "--check"], ["update"], ["update", "--check"], ["update"], *([["update"]] * 3)])
         self.assertTrue(all("XDG_DATA_HOME" not in env for _, env in calls))
         self.assertTrue(all("--gateway" not in argv and "source" not in argv for argv, _ in calls))
         for selector in ("m1-install", "m2-discovery"):

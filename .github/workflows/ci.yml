@@ -543,6 +543,9 @@ jobs:
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
+      - name: reserve hosted Mac build and fixture capacity
+        timeout-minutes: 10
+        run: python3 scripts/update-hop-compare.py prepare-ci-disk
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -590,41 +593,49 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
-      - name: generate disposable signed refusal fixture
+      - name: build two actual Runtime versions
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
+          test ! -e "$CI_HOP_ROOT"
+          mkdir -p "$CI_HOP_ROOT"
+          echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
+          python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
+            --runtime "$PWD/elastos/target/release/elastos"
+      - name: generate disposable signed install and update fixture
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          REFUSAL_ROOT="$HOME/.local/share/elastos-ci-update-refusals"
-          test ! -e "$REFUSAL_ROOT"
-          mkdir -p "$REFUSAL_ROOT"
-          echo "REFUSAL_ROOT=$REFUSAL_ROOT" >> "$GITHUB_ENV"
-          python3 scripts/update-hop-compare.py generate-refusals "$REFUSAL_ROOT/package" \
-            --runtime "$PWD/elastos/target/release/elastos" \
+          python3 scripts/update-hop-compare.py generate-ci-hop "$CI_HOP_ROOT/package" \
+            --runtime "$CI_HOP_ROOT/build-inputs/elastos-old" \
+            --next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new" \
+            --build-receipt "$CI_HOP_ROOT/build-inputs/build.json" \
             --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
-            > "$REFUSAL_ROOT/generation.json"
-      - name: prove installer and Carrier update refusals
+            > "$CI_HOP_ROOT/generation.json"
+      - name: prove install and Carrier update hop and refusals
         timeout-minutes: 20
         env:
-          ELASTOS_CI_FIXTURE_SCOPE: ci-refusals
+          ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal
           ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
         run: |
           set -euo pipefail
-          export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$REFUSAL_ROOT/generation.json")"
-          python3 scripts/update-hop-compare.py inspect "$REFUSAL_ROOT/package/fixture.json"
-          python3 scripts/update-hop-compare.py run "$REFUSAL_ROOT/package/fixture.json" "$REFUSAL_ROOT/package/results"
-      - name: retain the safe refusal receipt
+          export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$CI_HOP_ROOT/generation.json")"
+          python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
+          python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
+      - name: retain the safe CI hop receipt
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: macos-cli-update-refusal-receipt
-          path: ${{ env.REFUSAL_ROOT }}/package/results/result.json
+          name: macos-cli-update-hop-receipt
+          path: ${{ env.CI_HOP_ROOT }}/package/results/result.json
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
-      - name: remove stopped refusal fixture files
-        if: always() && env.REFUSAL_ROOT != ''
+      - name: remove stopped CI hop fixture files
+        if: always() && env.CI_HOP_ROOT != ''
         run: |
-          python3 -I - "$REFUSAL_ROOT" <<'PY'
+          python3 -I - "$CI_HOP_ROOT" <<'PY'
           import json, pathlib, shutil, sys
           root = pathlib.Path(sys.argv[1])
           result = root / 'package/results/result.json'
@@ -632,6 +643,9 @@ jobs:
               raise SystemExit('refusal cleanup was incomplete; disposable runner retains files until teardown')
           if not result.exists() and (root / 'package/results').exists():
               raise SystemExit('refusal cleanup receipt is missing; disposable runner retains files until teardown')
+          build = root / 'build-inputs/build.json'
+          if (root / 'build-inputs').exists() and (not build.exists() or not json.loads(build.read_text()).get('cleanup', {}).get('passed')):
+              raise SystemExit('hop builder cleanup is incomplete; disposable runner retains files until teardown')
           shutil.rmtree(root)
           PY
       # Packages are uploaded only for tags, main and dispatch runs; PR runs

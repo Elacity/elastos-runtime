@@ -48,13 +48,15 @@ is closed: each payload file occurs once and symlinks/hard links are refused.
 
 `proof_scope` defaults to production-positive: `publications` has old/new and
 both selectors have empty refusals. The independently pinned operator package
-owns real M1/M2 acceptance. CI generates a separate `ci-refusals` package with
-old and wrong-signer-head, wrong-signer-release, tampered-binary, wrong-platform
+owns real M1/M2 acceptance. CI generates a separate `ci-rehearsal` package with
+old/new and wrong-signer-head, wrong-signer-release, tampered-binary, wrong-platform
 and wrong-version. Each maps head, release, receipt, binary, components and
 catalogue to inventoried paths. Receipt bytes contain last_head_cid and
 last_release_cid. Metadata CIDs and signed envelope digests bind exact bytes.
-CI negative envelopes have valid signatures from fresh disposable keys. Their
-advertised next version is a refusal input; it supplies no positive update proof.
+CI signs both actual native Runtime versions with one disposable key. The existing
+build.rs version input produces N+1 from the same source and intermediates;
+the build receipt binds source, version environment, command and both binary hashes.
+The same isolated fixture also contains correctly signed refusal inputs.
 `selectors` uses m1-install/old and m2-discovery/new with the same refusal list.
 
 `holder.files` maps Home-relative destinations to inventoried public payload
@@ -70,7 +72,7 @@ files. `preserve` has nonempty config, data and support lists of data-relative
 paths. Additional named groups are permitted. CI also preserves its generated
 identity. Package mappings refuse private identity keys.
 The operator owns real release signing and publication. Native Mac CI creates
-and removes refusal signing keys through generate-refusals, using Runtime's
+and removes disposable signing keys through generate-ci-hop, using Runtime's
 sign-payload command and offline Kubo content from the existing Mac build.
 Each scope has its own frozen installer, holder, consumers and receipt.
 Frozen installer defaults pin signer_did and leave
@@ -90,6 +92,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import pwd
 import re
 import shutil
 import signal
@@ -448,7 +451,7 @@ def run(config, output):
                     need(command("controller", ["node", "peer", "add", "--did", target["did"], "--ticket", target["connect_ticket"]], "controller-peer") == 0, "controller peer admission failed")
                     actor, args = "controller", ["node", "update", "--peer", target["did"], "--apply", "--yes", "--json"]
                 else:
-                    actor, args = role, ["update", "--yes"]
+                    actor, args = role, ["update"]
                 before = observe(role, host, role + "-version-before")
                 need(before["binary_version"] == "elastos " + config["old"]["version"], "old binary version differs")
                 stage = "apply"
@@ -519,9 +522,10 @@ def run(config, output):
 
 CLI_MODE = "cli-install-update"
 CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", "wrong-platform", "wrong-version")
-CLI_PHASES = ("old", *CLI_REFUSALS)
+CLI_PHASES = ("old", "new", *CLI_REFUSALS)
 CLI_DATA = "Library/Application Support/elastos"
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
+CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("15.0.1", "15.1", "15.2", "15.3", "15.4", "16.1", "16.2"))
 
 
 def cli_path(root, relative):
@@ -644,9 +648,9 @@ def cli_admit(config):
          and manifest["reference"] == reference, "fixture manifest identity differs")
     need(isinstance(manifest["approval"], str) and manifest["approval"].strip(), "fixture approval required")
     scope = manifest.get("proof_scope", "production-positive")
-    need(scope in ("production-positive", "ci-refusals") and
+    need(scope in ("production-positive", "ci-rehearsal") and
          scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
-    refusals = CLI_REFUSALS if scope == "ci-refusals" else ()
+    refusals = CLI_REFUSALS if scope == "ci-rehearsal" else ()
     need(manifest["proof_kind"] in ("real-runtime", "harness-self-test"), "unknown proof kind")
     need(os.environ.get("ELASTOS_CI_REQUIRE_REAL_RUNTIME") != "1" or manifest["proof_kind"] == "real-runtime", "hosted acceptance requires real-runtime fixture")
     need(sys.platform == "darwin" or manifest["proof_kind"] == "harness-self-test", "CLI installed proof requires native Mac")
@@ -708,11 +712,19 @@ def cli_admit(config):
         cli_signature(installer, cli_path(root, publication["catalogue"]), "elastos.model.catalog.v1", catalog_signer, env)
     old = manifest["publications"]["old"]
     new = manifest["publications"].get("new", old)
-    if not refusals:
-        need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
-    else:
+    need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
+    if refusals:
         wrong_version = manifest["publications"]["wrong-version"]
         need(manifest["files"][wrong_version["binary"]]["sha256"] == manifest["files"][old["binary"]]["sha256"], "wrong-version must retain the baseline Runtime bytes")
+        need(manifest["build"] in manifest["files"], "compiled CI hop receipt required")
+        build = cli_json(cli_path(root, manifest["build"]))
+        need(build["schema"] == "elastos.update-hop.build/v1" and build["status"] == "passed"
+             and build["cleanup"]["passed"] and build["source"] == manifest["source"]
+             and build["command"] == ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"], "compiled CI hop provenance differs")
+        for name, publication in (("old", old), ("new", new)):
+            need(build[name]["source"] == manifest[name]["source"] and build[name]["version"] == manifest[name]["version"]
+                 and build[name]["sha256"] == manifest["files"][publication["binary"]]["sha256"], "compiled CI Runtime receipt differs")
+        need(build["new"]["version_environment"] == manifest["new"]["version"], "next compiled version input differs")
     for key in ("components", "catalogue"):
         need(all(manifest["files"][publication[key]]["sha256"] == manifest["files"][new[key]]["sha256"]
                  for publication in manifest["publications"].values()), "qualified support bytes changed")
@@ -791,18 +803,153 @@ def cli_inspect(config):
             "selectors": manifest["selectors"], "installed_proof": "pending real command results"}
 
 
-def cli_generate_refusals(root, runtime, support_home):
-    """Generate CI-only signed negatives with the actual Runtime signing command."""
+def cli_reclaim_xcode(applications, protected, growth, measure, remove):
+    """Internal helper permits bounded fixture roots in compile-free tests."""
+    need(applications.is_dir() and applications.resolve() == applications and not applications.is_symlink(), "physical Xcode application root required")
+    need(protected and all(path.is_dir() and path.resolve() == path and path.parent == applications
+                          and path.name in CI_XCODE_APPS for path in protected), "selected Xcode ancestry differs")
+    removed = []
+    disk = measure()
+    before = disk.free
+    for name in CI_XCODE_APPS:
+        if (disk.free - growth) / disk.total >= .15:
+            break
+        path = applications / name
+        if not path.exists() or path.is_symlink() or path in protected:
+            continue
+        need(path.is_dir() and path.resolve() == path and path.parent == applications, "reclaim Xcode ancestry differs")
+        remove(path)
+        need(not path.exists() and all(retained.is_dir() for retained in protected), "Xcode reclaim or preservation failed")
+        disk = measure()
+        removed.append({"app": name, "free_bytes_after": disk.free})
+    need((disk.free - growth) / disk.total >= .15,
+         "hosted Mac capacity unavailable: free=" + str(disk.free) + " total=" + str(disk.total) + " planned_growth=" + str(growth))
+    return {"status": "ready", "retained": sorted(path.name for path in protected), "removed": removed,
+            "free_bytes_before": before, "free_bytes_after": disk.free, "total_bytes": disk.total, "planned_growth_bytes": growth}
+
+
+def cli_prepare_ci_disk():
+    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+         and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted" and sys.platform == "darwin"
+         and pwd.getpwuid(os.geteuid()).pw_name == "runner", "capacity reclaim requires a disposable hosted Mac runner")
+    checkout = Path(__file__).resolve().parents[1]
+    workspace_root = Path("/Users/runner/work")
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", ""))
+    need(checkout.is_relative_to(workspace_root) and Path.cwd().resolve() == checkout
+         and runner_temp.is_absolute() and runner_temp.is_dir() and runner_temp.resolve() == runner_temp
+         and runner_temp.is_relative_to(workspace_root), "hosted runner workspace ancestry differs")
+    applications = Path("/Applications")
+
+    def query(argv):
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+        need(proc.returncode == 0 and proc.stdout.strip(), "selected Xcode query failed")
+        return proc.stdout.strip()
+
+    selected = query(["/usr/bin/xcode-select", "-p"])
+    sdk = query(["/usr/bin/xcrun", "--show-sdk-path"])
+
+    def app(path):
+        need(Path(path).is_absolute(), "selected Xcode path must be absolute")
+        physical = Path(path).resolve(strict=True)
+        need(physical.is_relative_to(applications) and len(physical.relative_to(applications).parts) >= 1, "selected Xcode must belong to Applications")
+        return applications / physical.relative_to(applications).parts[0]
+
+    protected = {app(selected), app(sdk)}
+    if os.environ.get("DEVELOPER_DIR"):
+        protected.add(app(os.environ["DEVELOPER_DIR"]))
+    alias = applications / "Xcode.app"
+    if alias.exists():
+        protected.add(app(str(alias)))
+
+    def remove(path):
+        need(query(["/usr/bin/xcode-select", "-p"]) == selected
+             and query(["/usr/bin/xcrun", "--show-sdk-path"]) == sdk, "selected Xcode changed before reclaim")
+        # du measures the allowlisted bundle; free space is measured again after
+        # the fixed argv deletion. No shell expansion or user path is involved.
+        size = query(["/usr/bin/du", "-sk", str(path)])
+        need(re.fullmatch(r"[0-9]+\s+" + re.escape(str(path)), size) is not None, "Xcode size measurement differs")
+        # The root-owned remover has its own deadline. Runner credentials cannot
+        # reliably signal root children through sudo on every hosted image.
+        program = "import shutil,signal,sys; signal.alarm(180); shutil.rmtree(sys.argv[1])"
+        proc = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-c", program, str(path)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=185, check=False)
+        need(proc.returncode == 0, "allowlisted Xcode reclaim failed")
+
+    receipt = cli_reclaim_xcode(applications, protected, 20 * 1024**3,
+                                lambda: shutil.disk_usage(checkout), remove)
+    need(query(["/usr/bin/xcode-select", "-p"]) == selected
+         and query(["/usr/bin/xcrun", "--show-sdk-path"]) == sdk, "selected Xcode changed after reclaim")
+    receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
+    return receipt
+
+
+def cli_build_hop(root, runtime):
+    """Compile N+1 through the existing build.rs version input; keep actual N."""
+    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+         and sys.platform == "darwin", "disposable hop build requires native Mac CI")
+    need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
+         and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable build root required")
+    need(runtime.is_file() and not runtime.is_symlink(), "built Runtime input is unavailable")
+    disk = shutil.disk_usage(root.parent)
+    need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
+    need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(), "hop build requires a clean admitted source")
+    root.mkdir(mode=0o700)
+    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+              for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
+    old = root / "elastos-old"
+    shutil.copyfile(runtime, old)
+    old.chmod(0o755)
+    release_platform = "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin"
+    cli_macho(old, release_platform)
+    processes = CliProcesses(root)
+    command = ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"]
+    receipt = {"schema": "elastos.update-hop.build/v1", "source": source, "command": command, "status": "failed"}
+    try:
+        reply = processes.command([str(old), "--version"], cli_environment(root), root, "old-version", timeout=15)
+        version = processes.text("old-version")
+        match = re.fullmatch(r"elastos (\d+)\.(\d+)\.(\d+)([^\s]*)\n", version)
+        need(reply["exit"] == 0 and not processes.text("old-version", "stderr") and match is not None,
+             "built Runtime exact version unavailable")
+        old_version = version.removeprefix("elastos ").strip()
+        new_version = ".".join([match[1], match[2], str(int(match[3]) + 1)])
+        receipt["old"] = {"version": old_version, "sha256": digest(old), "source": source,
+                          "version_environment": os.environ.get("ELASTOS_RELEASE_VERSION")}
+        env = dict(os.environ)
+        env["ELASTOS_RELEASE_VERSION"] = new_version
+        built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", "build-next", timeout=900)
+        need(built["exit"] == 0, "next Runtime build failed")
+        new = root / "elastos-new"
+        shutil.copyfile(runtime, new)
+        new.chmod(0o755)
+        cli_macho(new, release_platform)
+        reply = processes.command([str(new), "--version"], cli_environment(root), root, "new-version", timeout=15)
+        need(reply["exit"] == 0 and processes.text("new-version") == "elastos " + new_version + "\n"
+             and not processes.text("new-version", "stderr") and digest(new) != digest(old), "next Runtime exact version or bytes differ")
+        receipt["new"] = {"version": new_version, "sha256": digest(new), "source": source, "version_environment": new_version}
+        need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+             and all(subprocess.check_output(["git", "rev-parse", ref], text=True).strip() == source[key]
+                     for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))), "hop source changed during build")
+        receipt["status"] = "passed"
+    finally:
+        receipt["cleanup"] = processes.cleanup()
+        receipt["cleanup"]["passed"] = not receipt["cleanup"]["errors"]
+        write(root / "build.json", receipt)
+    need(receipt["cleanup"]["passed"], "hop builder cleanup failed")
+    return receipt
+
+
+def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
+    """Generate a disposable signed positive hop and refusal set in CI."""
     need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
          and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
-    for path in (runtime, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
+    for path in (runtime, next_runtime, build_receipt, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
         need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
     disk = shutil.disk_usage(root.parent)
     # Two Runtime copies plus their CID blocks, native support, package copies
     # and seven isolated installed Homes fit within this conservative bound.
-    growth = 12 * (2 * runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
+    growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
                                                    for name in ("ipfs-provider", "kubo")))
     need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
     root.mkdir(mode=0o700)
@@ -811,9 +958,9 @@ def cli_generate_refusals(root, runtime, support_home):
     source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
               for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
     manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": CLI_MODE,
-                "proof_scope": "ci-refusals", "proof_kind": "real-runtime",
-                "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5958719048",
-                "reference": "ci-refusals:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
+                "proof_scope": "ci-rehearsal", "proof_kind": "real-runtime",
+                "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5961095676",
+                "reference": "ci-rehearsal:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
                 "source": source, "channel": "canary", "platform": "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin",
                 "files": {}, "publications": {}, "holder": {"files": {}, "content": {}},
                 "selectors": {name: {"positive": positive, "refusals": list(CLI_REFUSALS)}
@@ -834,6 +981,8 @@ def cli_generate_refusals(root, runtime, support_home):
         return relative
 
     runtime_relative = add("elastos", runtime, 0o755)
+    next_relative = add("elastos-next", next_runtime, 0o755)
+    manifest["build"] = add("build.json", build_receipt)
     runtime_copy = root / runtime_relative
     kubo_relative = add("kubo", support_home / "bin/kubo", 0o755)
     provider_relative = add("ipfs-provider", support_home / "bin/ipfs-provider", 0o755)
@@ -885,12 +1034,20 @@ def cli_generate_refusals(root, runtime, support_home):
                          "profiles": {}, "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
         content(components)
         content(runtime_relative)
+        content(next_relative)
         version_output = execute([str(runtime_copy), "--version"]).decode()
         match = re.fullmatch(r"elastos (\d+)\.(\d+)\.(\d+)([^\s]*)\n", version_output)
         need(match is not None, "built Runtime exact version unavailable")
         old_version = version_output.removeprefix("elastos ").strip()
-        new_version = ".".join([match[1], match[2], str(int(match[3]) + 1)]) + "-ci-refusal"
-        manifest["old"], manifest["new"] = ({"version": version, "source": source} for version in (old_version, new_version))
+        new_version = ".".join([match[1], match[2], str(int(match[3]) + 1)])
+        need(execute([str(root / next_relative), "--version"]).decode() == "elastos " + new_version + "\n", "next Runtime must be a real compiled N+1")
+        build = cli_json(build_receipt)
+        need(build["status"] == "passed" and build["cleanup"]["passed"] and build["source"] == source, "hop build receipt differs")
+        for name, relative, version in (("old", runtime_relative, old_version), ("new", next_relative, new_version)):
+            need(build[name]["sha256"] == manifest["files"][relative]["sha256"] and build[name]["version"] == version
+                 and build[name]["source"] == source, "hop build Runtime binding differs")
+            manifest[name] = {"version": version, "source": source, "binary_sha256": build[name]["sha256"],
+                              "version_environment": build[name]["version_environment"]}
         tampered = add("tampered-elastos", runtime_copy, 0o755)
         with (root / tampered).open("ab") as stream:
             stream.write(b"disposable refusal bytes")
@@ -902,7 +1059,7 @@ def cli_generate_refusals(root, runtime, support_home):
             return {"cid": item["cid"], "sha256": item["sha256"], "size": item["bytes"]}
 
         for phase in CLI_PHASES:
-            binary_relative = tampered if phase == "tampered-binary" else runtime_relative
+            binary_relative = tampered if phase == "tampered-binary" else runtime_relative if phase in ("old", "wrong-version") else next_relative
             binary_binding = binding(binary_relative)
             if phase == "tampered-binary":
                 binary_binding["sha256"] = manifest["files"][runtime_relative]["sha256"]
@@ -938,7 +1095,7 @@ def cli_generate_refusals(root, runtime, support_home):
         config = {"schema": manifest["schema"], "mode": CLI_MODE, "root": str(root),
                   "immutable": {"reference": manifest["reference"], "manifest": "manifest.json", "sha256": digest(root / "manifest.json")}}
         write(root / "fixture.json", config)
-        return {"status": "generated", "proof_scope": "ci-refusals", "manifest_sha256": config["immutable"]["sha256"],
+        return {"status": "generated", "proof_scope": "ci-rehearsal", "manifest_sha256": config["immutable"]["sha256"],
                 "source": source, "signer_did": manifest["signer_did"], "keys_removed": True}
     finally:
         shutil.rmtree(scratch)
@@ -1193,6 +1350,8 @@ def cli_run(config, output):
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
               "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}}
+    if manifest.get("build"):
+        result["build"] = cli_json(cli_path(root, manifest["build"]))
     holder = output / "homes/holder"
     holder.mkdir(mode=0o700, parents=True)
     holder_data = holder / CLI_DATA
@@ -1325,21 +1484,21 @@ def cli_run(config, output):
         prepare(consumer, "main")
         before = cli_state(manifest, consumer)
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
-        if result["proof_scope"] == "production-positive":
+        if result["proof_scope"] in ("production-positive", "ci-rehearsal"):
             phase("new")
             result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
             reply = command(consumer, ["update", "--check"], "m2-check")
             need(cli_success(processes, "m2-check", reply) and "Discovery: Carrier" in processes.text("m2-check")
                  and cli_state(manifest, consumer) == before, "plain Carrier check failed or changed files")
             result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
-            reply = command(consumer, ["update", "--yes"], "m2-apply")
+            reply = command(consumer, ["update"], "m2-apply")
             need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
             after = verify(consumer, "new", "m2-version")
             expected_sources = json.loads(json.dumps(before["sources"]))
             expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
             need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
             result["paths"]["m2-discovery"]["checks"]["apply"] = {"status": "passed", **reply}
-            reply = command(consumer, ["update", "--yes"], "m2-repeat")
+            reply = command(consumer, ["update"], "m2-repeat")
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
             result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
@@ -1369,7 +1528,7 @@ def cli_run(config, output):
                 result["paths"]["m2-discovery"]["checks"][case + "-check"] = check_refusal
                 need(check_refusal["status"] == "passed", "Carrier check refusal boundary differs")
             label = "m2-" + case
-            reply = command(target, ["update", "--yes"], label)
+            reply = command(target, ["update"], label)
             refusal = cli_refusal(case, reply, processes.text(label), processes.text(label, "stderr"), cli_state(manifest, target) == original)
             result["paths"]["m2-discovery"]["checks"][case] = refusal
             need(refusal["status"] == "passed", "plain update refusal boundary differs")
@@ -1407,20 +1566,31 @@ def cli_run(config, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("operation", choices=("inspect", "run", "compare", "generate-refusals"))
-    parser.add_argument("input", type=Path)
+    parser.add_argument("operation", choices=("inspect", "run", "compare", "prepare-ci-disk", "build-ci-hop", "generate-ci-hop"))
+    parser.add_argument("input", type=Path, nargs="?")
     parser.add_argument("output", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, help="physical downloaded CLI fixture root")
     parser.add_argument("--runtime", type=Path, help="built Runtime for CI refusal generation")
+    parser.add_argument("--next-runtime", type=Path, help="compiled N+1 Runtime for CI hop generation")
+    parser.add_argument("--build-receipt", type=Path, help="exact CI Runtime build receipt")
     parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("terminated")))
     try:
-        if args.operation == "generate-refusals":
-            need(args.runtime is not None and args.support_home is not None and args.output is None and args.root is None,
-                 "refusal generation requires Runtime and support-home inputs")
-            print(json.dumps(cli_generate_refusals(args.input, args.runtime, args.support_home)))
+        if args.operation == "prepare-ci-disk":
+            need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.build_receipt, args.support_home)), "hosted capacity operation has fixed inputs")
+            print(json.dumps(cli_prepare_ci_disk()))
+            return 0
+        need(args.input is not None, "fixture input required")
+        if args.operation == "build-ci-hop":
+            need(args.runtime is not None and args.output is None and args.root is None, "hop build requires a Runtime input")
+            print(json.dumps(cli_build_hop(args.input, args.runtime)))
+            return 0
+        if args.operation == "generate-ci-hop":
+            need(all(path is not None for path in (args.runtime, args.next_runtime, args.build_receipt, args.support_home)) and args.output is None and args.root is None,
+                 "hop generation requires both Runtimes, build receipt and support-home inputs")
+            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home)))
             return 0
         value = read(args.input)
         if args.root is not None:
