@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -464,6 +465,175 @@ class CliFixtureTests(unittest.TestCase):
         if hasattr(self, "env"):
             observer.os.environ["ELASTOS_CI_FIXTURE_MANIFEST_SHA256"] = self.config["immutable"]["sha256"]
 
+    def copy_fixture(self):
+        source = self.add("copy-readme", b"public Kubo block store readme", 0o600)
+        destination = self.root / "copy-home"
+        target = destination / "ipfs-repo/blocks/_README"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"original Kubo readme")
+        target.chmod(0o444)
+        return source, destination, target
+
+    def test_copy_atomically_replaces_owned_readonly_kubo_readme(self):
+        source, destination, target = self.copy_fixture()
+        original_inode = target.stat().st_ino
+        observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+        self.assertEqual(target.read_bytes(), (self.root / source).read_bytes())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertNotEqual(target.stat().st_ino, original_inode)
+        self.assertEqual(list(target.parent.glob(".elastos-fixture-copy-*")), [])
+
+    def test_copy_source_and_copied_hash_failures_preserve_original_and_cleanup(self):
+        source, destination, target = self.copy_fixture()
+        original = target.stat()
+        for corrupt_source in (True, False):
+            with self.subTest(corrupt_source=corrupt_source):
+                if corrupt_source:
+                    (self.root / source).write_bytes(b"changed source")
+                    operation = contextlib.nullcontext()
+                else:
+                    (self.root / source).write_bytes(b"public Kubo block store readme")
+                    operation = patch.object(observer.shutil, "copyfileobj", side_effect=lambda _, output: output.write(b"wrong copy"))
+                with operation, self.assertRaisesRegex(ValueError, "fixture changed before copy|copied fixture bytes differ"):
+                    observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+                self.assertEqual(target.read_bytes(), b"original Kubo readme")
+                self.assertEqual(target.stat().st_ino, original.st_ino)
+                self.assertEqual(target.stat().st_mode, original.st_mode)
+                self.assertEqual(list(target.parent.glob(".elastos-fixture-copy-*")), [])
+
+    def test_copy_refuses_symlink_parent_and_nonregular_targets(self):
+        source, destination, target = self.copy_fixture()
+        target.unlink()
+        for kind in ("symlink", "directory", "fifo", "parent-symlink"):
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    target.symlink_to(self.root / source)
+                elif kind == "directory":
+                    target.mkdir()
+                elif kind == "fifo":
+                    os.mkfifo(target)
+                else:
+                    target.parent.rmdir()
+                    target.parent.symlink_to(self.root / "payload", target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "symlink|escapes fixture root|owned regular file"):
+                    observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+                if kind == "directory":
+                    target.rmdir()
+                elif kind == "parent-symlink":
+                    target.parent.unlink()
+                    target.parent.mkdir()
+                else:
+                    target.unlink()
+                self.assertEqual((self.root / source).read_bytes(), b"public Kubo block store readme")
+                self.assertEqual(list(destination.rglob(".elastos-fixture-copy-*")), [])
+
+    def test_copy_refuses_foreign_owned_target_or_parent(self):
+        source, destination, target = self.copy_fixture()
+        lstat = Path.lstat
+        for foreign in (target, target.parent):
+            def ownership(path):
+                info = lstat(path)
+                if path == foreign:
+                    return SimpleNamespace(st_uid=os.geteuid() + 1, st_mode=info.st_mode)
+                return info
+            with self.subTest(foreign=foreign.name), patch.object(Path, "lstat", ownership), self.assertRaisesRegex(ValueError, "owned"):
+                observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+            self.assertEqual(target.read_bytes(), b"original Kubo readme")
+            self.assertEqual(list(target.parent.glob(".elastos-fixture-copy-*")), [])
+
+    def test_copy_error_cleans_temporary_and_preserves_original(self):
+        source, destination, target = self.copy_fixture()
+        with patch.object(observer.shutil, "copyfileobj", side_effect=OSError("copy interrupted")), self.assertRaisesRegex(OSError, "copy interrupted"):
+            observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+        self.assertEqual(target.read_bytes(), b"original Kubo readme")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o444)
+        self.assertEqual(list(target.parent.glob(".elastos-fixture-copy-*")), [])
+
+    def test_copy_preserves_target_replaced_during_preparation(self):
+        source, destination, target = self.copy_fixture()
+        copy = shutil.copyfileobj
+        def replace_target(input_stream, output):
+            copy(input_stream, output)
+            changed = target.with_name("changed")
+            changed.write_bytes(b"new owner-written target")
+            os.replace(changed, target)
+        with patch.object(observer.shutil, "copyfileobj", side_effect=replace_target), self.assertRaisesRegex(ValueError, "target changed before replacement"):
+            observer.cli_copy(self.root, self.manifest, {"ipfs-repo/blocks/_README": source}, destination)
+        self.assertEqual(target.read_bytes(), b"new owner-written target")
+        self.assertEqual(list(target.parent.glob(".elastos-fixture-copy-*")), [])
+
+    def coordination_fixture(self):
+        home = self.root / "coordination-home"
+        directory = home / observer.CLI_DATA
+        directory.mkdir(parents=True)
+        binary = home / ".local/bin/elastos"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"old")
+        for name in ("components.json", "model-catalog.json"):
+            observer.write(directory / name, {})
+        observer.write(directory / "sources.json", {"default_source": "default", "sources": [{}]})
+        observer.cli_copy(self.root, self.manifest, self.manifest["consumer"]["files"], directory)
+        lock = directory / "host-process.lock"
+        observer.write(lock, {"pid": 12345, "role": "principal-root-upgrade", "addr": "offline"})
+        lock.chmod(0o600)
+        return home, lock
+
+    def test_coordination_pid_change_is_separate_from_user_data_and_other_locks(self):
+        home, lock = self.coordination_fixture()
+        other = lock.with_name("user.lock")
+        other.write_bytes(b"user data")
+        before = observer.cli_state(self.manifest, home)
+        observer.write(lock, {"pid": 54321, "role": "principal-root-upgrade", "addr": "offline"})
+        after = observer.cli_state(self.manifest, home)
+        self.assertNotEqual(before["coordination"], after["coordination"])
+        self.assertEqual(before["data"], after["data"])
+        self.assertEqual(after["coordination"]["status"], "released")
+        self.assertNotIn("host-process.lock", after["data"])
+        self.assertIn("user.lock", after["data"])
+        other.write_bytes(b"changed user data")
+        self.assertNotEqual(after["data"], observer.cli_state(self.manifest, home)["data"])
+
+    def test_coordination_refuses_held_flock(self):
+        home, lock = self.coordination_fixture()
+        with lock.open("rb") as owner:
+            observer.fcntl.flock(owner, observer.fcntl.LOCK_EX | observer.fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError, "lock is held"):
+                observer.cli_state(self.manifest, home)
+        self.assertEqual(observer.cli_coordination(home)["status"], "released")
+
+    def test_coordination_refuses_malformed_metadata_and_unsafe_mode(self):
+        home, lock = self.coordination_fixture()
+        valid = {"pid": 12345, "role": "principal-root-upgrade", "addr": "offline"}
+        malformed = [{**valid, "pid": value} for value in (True, 0, -1, "12345", 0x100000000)]
+        malformed += [{**valid, "role": "gateway"}, {**valid, "addr": "127.0.0.1:1"}, {**valid, "extra": True}, {"pid": 12345}]
+        for metadata in malformed:
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(ValueError, "metadata differs"):
+                observer.write(lock, metadata)
+                observer.cli_state(self.manifest, home)
+        lock.write_text('{"pid":1,"pid":2,"role":"principal-root-upgrade","addr":"offline"}')
+        with self.assertRaisesRegex(ValueError, "repeats a field"):
+            observer.cli_state(self.manifest, home)
+        observer.write(lock, valid)
+        lock.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "file mode differs"):
+            observer.cli_state(self.manifest, home)
+
+    def test_coordination_refuses_symlink_and_foreign_owned_file(self):
+        home, lock = self.coordination_fixture()
+        original = lock.with_name("original")
+        lock.rename(original)
+        lock.symlink_to(original)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            observer.cli_state(self.manifest, home)
+        lock.unlink()
+        original.rename(lock)
+        lstat = Path.lstat
+        def foreign_owner(path):
+            info = lstat(path)
+            return SimpleNamespace(st_uid=os.geteuid() + 1, st_mode=info.st_mode) if path == lock else info
+        with patch.object(Path, "lstat", foreign_owner), self.assertRaisesRegex(ValueError, "owned regular file"):
+            observer.cli_state(self.manifest, home)
+
     def admit(self):
         with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature") as signatures:
             admitted = observer.cli_admit(self.config)
@@ -788,7 +958,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
-                 config_drift=False):
+                 config_drift=False, user_data_drift=False, coordination_pid_drift=False):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
@@ -858,6 +1028,9 @@ class CliFixtureTests(unittest.TestCase):
                                 stdout = "Verifying release signature"
                     elif argv[0] == "/bin/bash":
                         copy_publication(self.home, name, first=True, gateway=kwargs["env"]["ELASTOS_PUBLISHER_GATEWAY"])
+                        lock = self.home / observer.CLI_DATA / "host-process.lock"
+                        observer.write(lock, {"pid": self.pid + 100000, "role": "principal-root-upgrade", "addr": "offline"})
+                        lock.chmod(0o600)
                     elif args[-1] == "--check":
                         stdout = "Discovery: Carrier"
                     else:
@@ -866,6 +1039,10 @@ class CliFixtureTests(unittest.TestCase):
                             stdout = "Installed release is up to date."
                         else:
                             copy_publication(self.home, "new")
+                            observer.write(self.home / observer.CLI_DATA / "host-process.lock",
+                                           {"pid": self.pid + int(coordination_pid_drift), "role": "principal-root-upgrade", "addr": "offline"})
+                            if user_data_drift:
+                                (self.home / observer.CLI_DATA / "state/value").write_bytes(b"unexpected user data change")
                             stdout, stderr = "Discovery: Carrier", apply_stderr
                     if http_fallback and args[0] == "update":
                         import http.client
@@ -927,6 +1104,11 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(result["cleanup"]["passed"])
         self.assertTrue(all(entry["clean"] for entry in result["holder_output"]))
         self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+        coordination = result["coordination"]
+        self.assertNotEqual(coordination["m1-install"]["pid"], result["paths"]["m1-install"]["checks"]["positive"]["pid"])
+        self.assertNotEqual(coordination["m1-install"]["pid"], coordination["m2-apply"]["pid"])
+        self.assertEqual(coordination["m2-apply"]["pid"], result["paths"]["m2-discovery"]["checks"]["apply"]["pid"])
+        self.assertEqual(coordination["m2-repeat"], coordination["m2-apply"])
         holder_config = self.root / "results/homes/holder" / observer.CLI_DATA / "config.toml"
         self.assertRegex(holder_config.read_text(), r'^carrier_bind_addr = "127\.0\.0\.1:[1-9][0-9]*"\ngateway_public_publisher_bootstrap = true\n$')
         self.assertEqual(holder_config.stat().st_mode & 0o777, 0o600)
@@ -939,6 +1121,18 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(all("--gateway" not in argv and "source" not in argv for argv, _ in calls))
         for selector in ("m1-install", "m2-discovery"):
             self.assertTrue(set(observer.CLI_REFUSALS) <= set(result["paths"][selector]["checks"]))
+
+    def test_runner_rejects_changed_user_data_despite_valid_coordination(self):
+        code, _, result = self.fake_run(user_data_drift=True)
+        self.assertEqual(code, 1)
+        self.assertIn("config/data/support preservation differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_coordination_pid_unbound_to_apply_command(self):
+        code, _, result = self.fake_run(coordination_pid_drift=True)
+        self.assertEqual(code, 1)
+        self.assertIn("coordination PID differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
 
     def test_holder_identity_mismatch_stops_before_install_and_cleans_up(self):
         code, calls, result = self.fake_run(bootstrap_fields={"node_id": "f" * 64})

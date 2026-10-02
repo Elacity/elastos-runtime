@@ -71,6 +71,9 @@ approved publication to the existing Publisher paths while it is stopped.
 files. `preserve` has nonempty config, data and support lists of data-relative
 paths. Additional named groups are permitted. CI also preserves its generated
 identity. Package mappings refuse private identity keys.
+Consumer host-process.lock is Runtime coordination, with exact offline upgrade
+metadata and released ownership checked after commands and in snapshots. M2 apply
+binds its recorded PID to the owned command; user data and support remain separate.
 The operator owns real release signing and publication. Native Mac CI creates
 and removes disposable signing keys through generate-ci-hop, using Runtime's
 sign-payload command and offline Kubo content from the existing Mac build.
@@ -97,8 +100,10 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -1174,7 +1179,7 @@ class CliProcesses:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
             code = 124
-        return {"exit": code, "elapsed_ms": round((time.monotonic() - started) * 1000),
+        return {"exit": code, "pid": proc.pid, "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "stdout_sha256": digest(self.output / (label + ".stdout")),
                 "stderr_sha256": digest(self.output / (label + ".stderr"))}
 
@@ -1309,26 +1314,88 @@ class CliBootstrap:
         need(not self.thread.is_alive(), "installer bootstrap server survived cleanup")
 
 
+def cli_copy_target(destination, relative):
+    target = cli_path(destination, relative)
+    parent = target.parent
+    while True:
+        if parent.exists():
+            info = parent.lstat()
+            need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid(), "copy parent must be an owned directory")
+        if parent == destination:
+            break
+        parent = parent.parent
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target, None
+    need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid(), "copy target must be an owned regular file")
+    return target, (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
+
+
 def cli_copy(root, manifest, mapping, destination):
     for relative, source_relative in mapping.items():
-        source_path, target = cli_path(root, source_relative), cli_path(destination, relative)
+        source_path = cli_path(root, source_relative)
+        target, original = cli_copy_target(destination, relative)
         binding = manifest["files"][source_relative]
+        need(stat.S_ISREG(source_path.lstat().st_mode), "copy source must be a regular file")
         need(digest(source_path) == binding["sha256"], "fixture changed before copy")
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        shutil.copyfile(source_path, target)
-        target.chmod(binding["mode"])
-        need(digest(target) == binding["sha256"], "copied fixture bytes differ")
+        need(cli_copy_target(destination, relative)[1] == original, "copy target changed before preparation")
+        descriptor, temporary = tempfile.mkstemp(prefix=".elastos-fixture-copy-", dir=target.parent)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as output, source_path.open("rb") as source:
+                shutil.copyfileobj(source, output)
+                os.fchmod(output.fileno(), binding["mode"])
+            info = temporary.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                 and stat.S_IMODE(info.st_mode) == binding["mode"], "copied fixture ownership/mode differs")
+            need(digest(temporary) == binding["sha256"], "copied fixture bytes differ")
+            need(cli_copy_target(destination, relative)[1] == original, "copy target changed before replacement")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def cli_coordination(home_path, required=True):
+    path, original = cli_copy_target(home_path, CLI_DATA + "/host-process.lock")
+    if original is None:
+        need(not required, "Runtime coordination file absent")
+        return {"status": "absent"}
+    need(stat.S_IMODE(original[2]) == 0o600, "Runtime coordination file mode differs")
+    with path.open("rb") as stream:
+        info = os.fstat(stream.fileno())
+        need((info.st_dev, info.st_ino, info.st_mode, info.st_uid) == original, "Runtime coordination file changed during inspection")
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("Runtime coordination lock is held") from error
+        try:
+            raw = stream.read(4097)
+            need(len(raw) <= 4096, "Runtime coordination metadata exceeds its bound")
+            def unique_fields(pairs):
+                need(len(dict(pairs)) == len(pairs), "Runtime coordination metadata repeats a field")
+                return dict(pairs)
+            metadata = json.loads(raw, object_pairs_hook=unique_fields)
+            need(isinstance(metadata, dict) and set(metadata) == {"pid", "role", "addr"}
+                 and type(metadata["pid"]) is int and 0 < metadata["pid"] <= 0xffffffff
+                 and metadata["role"] == "principal-root-upgrade" and metadata["addr"] == "offline",
+                 "Runtime coordination metadata differs")
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+    return {"status": "released", **metadata}
 
 
 def cli_state(manifest, home_path):
     directory = home_path / CLI_DATA
+    coordination = cli_coordination(home_path)
     sources = cli_json(directory / "sources.json")
     need(sources["default_source"] == "default" and len(sources["sources"]) == 1, "one installer-owned source required")
     return {"binary": digest(home_path / ".local/bin/elastos"),
             "components": digest(directory / "components.json"),
-            "catalogue": digest(directory / "model-catalog.json"), "sources": sources,
+            "catalogue": digest(directory / "model-catalog.json"), "sources": sources, "coordination": coordination,
             "data": {relative: binding for relative, binding in (files(directory) or {}).items()
-                     if relative not in ("sources.json", "components.json", "model-catalog.json", CLI_PUBLISHER + "/release-head.json", CLI_PUBLISHER + "/release.json")
+                     if relative not in ("sources.json", "components.json", "model-catalog.json", "host-process.lock", CLI_PUBLISHER + "/release-head.json", CLI_PUBLISHER + "/release.json")
                      and not relative.startswith("backups/principal-root-upgrade-")},
             "preserved": {key: {relative: files(cli_path(directory, relative)) for relative in paths}
                           for key, paths in manifest["preserve"].items()}}
@@ -1389,7 +1456,7 @@ def cli_run(config, output):
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
-              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}}
+              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}, "coordination": {}}
     if manifest.get("build"):
         result["build"] = cli_json(cli_path(root, manifest["build"]))
     holder = output / "homes/holder"
@@ -1402,8 +1469,11 @@ def cli_run(config, output):
     holder_labels, holder_config_text = [], None
 
     def command(home_path, args, label):
-        return processes.command([str(home_path / ".local/bin/elastos"), *args],
-                                 cli_environment(home_path), home_path, label)
+        reply = processes.command([str(home_path / ".local/bin/elastos"), *args],
+                                  cli_environment(home_path), home_path, label)
+        if home_path != holder:
+            result["coordination"][label] = cli_coordination(home_path)
+        return reply
 
     def track(home_path, mapping):
         for relative, source_relative in mapping.items():
@@ -1454,7 +1524,9 @@ def cli_run(config, output):
                    ELASTOS_SOURCE_CONNECT_TICKET=bootstrap["ticket"], ELASTOS_PUBLISHER_NODE_ID=bootstrap["node_id"])
         installer_bootstrap.enabled = True
         try:
-            return processes.command(["/bin/bash", str(installer), "--install-only"], env, home_path, label, timeout=180)
+            reply = processes.command(["/bin/bash", str(installer), "--install-only"], env, home_path, label, timeout=180)
+            result["coordination"][label] = cli_coordination(home_path, required=reply["exit"] == 0)
+            return reply
         finally:
             installer_bootstrap.enabled = False
 
@@ -1533,7 +1605,9 @@ def cli_run(config, output):
             result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
             reply = command(consumer, ["update"], "m2-apply")
             need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
+            need(result["coordination"]["m2-apply"]["pid"] == reply["pid"], "apply coordination PID differs from its owned command")
             after = verify(consumer, "new", "m2-version")
+            need(after["coordination"] == result["coordination"]["m2-apply"], "version command changed Runtime coordination metadata")
             expected_sources = json.loads(json.dumps(before["sources"]))
             expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
             need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
