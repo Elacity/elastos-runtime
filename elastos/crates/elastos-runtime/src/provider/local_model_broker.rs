@@ -314,12 +314,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broker = dir.path().join("broker.sock");
         let engine = dir.path().join("engine.sock");
+        // The broker writes headers and body separately. Consume the complete
+        // request before closing so unread input cannot reset the response.
         let mut child = tokio::process::Command::new("/usr/bin/python3")
             .arg("-c")
             .arg(r"import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(2)
 for _ in range(2):
- c,_=s.accept(); request=c.recv(4096); body=b'ok' if request.startswith(b'GET /v1/models ') else b'counted' if request.startswith(b'POST /v1/chat/completions/input_tokens ') else b'wrong'; c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body); c.close()")
+ c,_=s.accept()
+ with c.makefile('rb') as stream:
+  request=stream.readline(); length=0
+  while True:
+   line=stream.readline()
+   if line==b'\r\n': break
+   if not line: raise RuntimeError('truncated request headers')
+   if line.lower().startswith(b'content-length:'): length=int(line.split(b':',1)[1])
+  if len(stream.read(length))!=length: raise RuntimeError('truncated request body')
+ body=b'ok' if request.startswith(b'GET /v1/models ') else b'counted' if request.startswith(b'POST /v1/chat/completions/input_tokens ') else b'wrong'; c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body); c.close()")
             .arg(&engine)
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

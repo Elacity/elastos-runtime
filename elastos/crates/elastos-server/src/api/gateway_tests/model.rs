@@ -1780,6 +1780,531 @@ async fn owner_inbox_retains_hosted_route_history_and_ends_exact_decision() {
     assert_eq!(summary["notifications"]["attention_count"], 261);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn owner_inbox_end_keeps_competing_decision_from_cancelling_without_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let app = gateway_router(test_state(dir.path()));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let scope = crate::api::model_provider_egress_decision::EgressScope {
+        offer_id: "validation:venice".into(),
+        effect: "validate_models".into(),
+        method: "GET".into(),
+        url: "http://127.0.0.1:9998/models".into(),
+        origin: "http://127.0.0.1:9998".into(),
+        recipient: "127.0.0.1".into(),
+        payer: "this Home".into(),
+        provider: "Venice".into(),
+        purpose: "Load hosted model choices".into(),
+        configuration_id: "b".repeat(64),
+    };
+    let id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    let held =
+        crate::api::model_provider_egress::hold_admission_for_test(dir.path(), &scope.offer_id)
+            .await;
+    let end_action = format!("model-egress-end:{id}");
+    let deny_action = format!("model-egress-deny:{id}");
+    let mut end = Box::pin(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &end_action)),
+    );
+    if let Ok(response) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut end).await
+    {
+        let (status, body) = status_json(response.unwrap()).await;
+        panic!("End returned before admission released: {status} {body}");
+    }
+    let mut deny = Box::pin(app.oneshot(inbox_action_request(inbox_token, &deny_action)));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut deny)
+            .await
+            .is_err()
+    );
+    drop(held);
+    let (status, body) = status_json(end.await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(deny.await.unwrap().status(), StatusCode::OK);
+    let history = crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap();
+    let history = serde_json::to_value(history).unwrap();
+    assert_eq!(history[0]["status"], "ended");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn owner_end_commits_before_cancellation_and_failed_write_preserves_send() {
+    use crate::api::model_provider_egress::{fetch_validation, ValidationEndpoint};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct ImmutableDecision(std::path::PathBuf);
+    impl Drop for ImmutableDecision {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    for fail_write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        crate::api::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+        let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+        let app = gateway_router(test_state(dir.path()));
+        let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let fixtures = dir
+            .path()
+            .join("providers/model-provider/validate-fixtures.json");
+        std::fs::write(
+            &fixtures,
+            json!({
+                "openrouter_models_url":format!("http://127.0.0.1:{port}/models"),
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixtures, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            &authority.proof_binding_id
+        )
+        .await
+        .is_err());
+        let history = || {
+            serde_json::to_value(
+                crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap(),
+            )
+            .unwrap()
+        };
+        let id = history()[0]["id"].as_str().unwrap().to_string();
+        crate::api::model_provider_egress_decision::approve(
+            dir.path(),
+            &id,
+            &authority.proof_binding_id,
+        )
+        .unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let sink_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut first = [0u8; 1];
+            socket.read_exact(&mut first).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+        });
+        let send = fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            &authority.proof_binding_id,
+        );
+        let end = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let held = if fail_write {
+                None
+            } else {
+                Some(
+                    crate::api::model_provider_egress::hold_admission_for_test(
+                        dir.path(),
+                        "validation:openrouter",
+                    )
+                    .await,
+                )
+            };
+            let immutable = if fail_write {
+                let path = dir
+                    .path()
+                    .join("providers/model-provider/egress-decisions.json");
+                let cleanup = ImmutableDecision(path.clone());
+                assert!(std::process::Command::new("/usr/bin/chflags")
+                    .arg("uchg")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success());
+                Some(cleanup)
+            } else {
+                None
+            };
+            let mut action = Box::pin(app.oneshot(inbox_action_request(
+                token,
+                &format!("model-egress-end:{id}"),
+            )));
+            if fail_write {
+                let response = tokio::time::timeout(std::time::Duration::from_secs(1), &mut action)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!response.status().is_success());
+                assert_eq!(history()[0]["status"], "approved");
+            } else {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut action)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(history()[0]["status"], "ended");
+                drop(action); // The client leaves while committed End drains admission.
+                assert_eq!(history()[0]["status"], "ended");
+            }
+            drop(immutable);
+            drop(held);
+            release_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(send, end);
+        if fail_write {
+            let (status, body) = result.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"{}");
+        } else {
+            assert!(result.is_err());
+        }
+        sink_task.await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn system_hosted_mutations_recheck_revoked_admin_after_waits() {
+    for (action, wait) in [
+        ("revoke", "setup"),
+        ("revoke", "transition"),
+        ("delete", "setup"),
+        ("delete", "transition"),
+        ("delete", "sharing"),
+        ("discard", "setup"),
+        ("discard", "transition"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let id = format!("model:hosted-{}", "a".repeat(32));
+        crate::api::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id":id,"adapter":{"kind":"open_ai_compatible_text",
+                    "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                    "api_key":"fixture-secret","model":"fixture/model",
+                    "hosted":{"backend_provider_label":"OpenRouter"}}
+            })],
+        )
+        .unwrap();
+        // Materialize the fixture credential before taking byte snapshots.
+        crate::api::load_model_provider_operator_offers(dir.path()).unwrap();
+        if action == "discard" {
+            crate::api::model_provider_config::stage_hosted_key(
+                dir.path(),
+                crate::api::HostedAiProvider::OpenRouter,
+                &id,
+                "staged-fixture-key",
+            )
+            .unwrap();
+        }
+        let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+        let app = gateway_router(test_state(dir.path()));
+        let before =
+            std::fs::read(dir.path().join("providers/model-provider/config.json")).unwrap();
+        let setup = if wait == "setup" {
+            Some(
+                super::super::gateway_home_system_ai_provider::hosted_setup_gate()
+                    .lock()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let transition = if wait == "transition" {
+            Some(
+                crate::api::model_provider_egress_decision::transition_gate()
+                    .lock()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let sharing = if wait == "sharing" {
+            Some(
+                super::super::gateway_model_service::model_share_gate()
+                    .write()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let request = test_browser_request("localhost:61180", "null")
+            .method(if matches!(action, "delete" | "discard") {
+                "DELETE"
+            } else {
+                "POST"
+            })
+            .uri(match action {
+                "delete" => "/api/apps/system/ai-provider",
+                "discard" => "/api/apps/system/ai-provider/staged",
+                _ => "/api/apps/system/approval-lens/revoke",
+            })
+            .header("x-elastos-home-token", authority.system_token.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"id":id}).to_string()))
+            .unwrap();
+        let mut pending = Box::pin(app.oneshot(request));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        crate::auth::revoke_passkey_binding(
+            dir.path(),
+            &authority.proof_binding_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+        drop(setup);
+        drop(transition);
+        drop(sharing);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_eq!(
+            std::fs::read(dir.path().join("providers/model-provider/config.json")).unwrap(),
+            before
+        );
+        assert!(
+            crate::api::model_provider_config::read_hosted_secret(dir.path(), &id)
+                .unwrap()
+                .is_some()
+        );
+        if action == "discard" {
+            assert!(crate::api::model_provider_config::staged_hosted_key_present(dir.path(), &id));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn staged_discard_without_staged_key_preserves_saved_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = format!("model:hosted-{}", "a".repeat(32));
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![json!({
+            "id":id,"adapter":{"kind":"open_ai_compatible_text",
+                "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                "api_key":"fixture-secret","model":"fixture/model",
+                "hosted":{"backend_provider_label":"OpenRouter"}}
+        })],
+    )
+    .unwrap();
+    crate::api::load_model_provider_operator_offers(dir.path()).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let scope = crate::api::model_provider_egress_decision::EgressScope {
+        offer_id: id.clone(),
+        effect: "text_generate".into(),
+        method: "POST".into(),
+        url: "https://openrouter.ai/api/v1/chat/completions".into(),
+        origin: "https://openrouter.ai".into(),
+        recipient: "openrouter.ai".into(),
+        payer: "this Home".into(),
+        provider: "OpenRouter".into(),
+        purpose: "Generate fixture text".into(),
+        configuration_id: "b".repeat(64),
+    };
+    let pending = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    crate::api::model_provider_egress_decision::approve(
+        dir.path(),
+        &pending,
+        &authority.proof_binding_id,
+    )
+    .unwrap();
+    let request = test_browser_request("localhost:61180", "null")
+        .method("DELETE")
+        .uri("/api/apps/system/ai-provider/staged")
+        .header("x-elastos-home-token", authority.system_token)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"id":id}).to_string()))
+        .unwrap();
+    let response = gateway_router(test_state(dir.path()))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(crate::api::model_provider_egress_decision::active(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .is_ok());
+    assert!(
+        crate::api::model_provider_config::read_hosted_secret(dir.path(), &id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn system_delete_and_discard_drain_committed_authority_before_cleanup() {
+    for (discard, decision, revoke) in [
+        (false, false, false),
+        (false, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let id = format!("model:hosted-{}", "a".repeat(32));
+        crate::api::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id":id,"adapter":{"kind":"open_ai_compatible_text",
+                    "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                    "api_key":"fixture-secret","model":"fixture/model",
+                    "hosted":{"backend_provider_label":"OpenRouter"}}
+            })],
+        )
+        .unwrap();
+        crate::api::load_model_provider_operator_offers(dir.path()).unwrap();
+        if discard {
+            crate::api::model_provider_config::stage_hosted_key(
+                dir.path(),
+                crate::api::HostedAiProvider::OpenRouter,
+                &id,
+                "staged-fixture-key",
+            )
+            .unwrap();
+        }
+        let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+        if decision {
+            let scope = crate::api::model_provider_egress_decision::EgressScope {
+                offer_id: id.clone(),
+                effect: "text_generate".into(),
+                method: "POST".into(),
+                url: "https://openrouter.ai/api/v1/chat/completions".into(),
+                origin: "https://openrouter.ai".into(),
+                recipient: "openrouter.ai".into(),
+                payer: "this Home".into(),
+                provider: "OpenRouter".into(),
+                purpose: "Generate fixture text".into(),
+                configuration_id: "b".repeat(64),
+            };
+            let pending = crate::api::model_provider_egress_decision::request(
+                dir.path(),
+                &scope,
+                Some(&authority.proof_binding_id),
+            )
+            .unwrap();
+            crate::api::model_provider_egress_decision::approve(
+                dir.path(),
+                &pending,
+                &authority.proof_binding_id,
+            )
+            .unwrap();
+        }
+        let held =
+            crate::api::model_provider_egress::hold_admission_for_test(dir.path(), &id).await;
+        let app = gateway_router(test_state(dir.path()));
+        let request = test_browser_request("localhost:61180", "null")
+            .method("DELETE")
+            .uri(if discard {
+                "/api/apps/system/ai-provider/staged"
+            } else {
+                "/api/apps/system/ai-provider"
+            })
+            .header("x-elastos-home-token", authority.system_token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"id":id}).to_string()))
+            .unwrap();
+        let mut action = Box::pin(app.oneshot(request));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    response = &mut action => panic!("mutation returned before admission drained: {:?}", response.unwrap().status()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        let committed = if decision {
+                            let history = serde_json::to_value(
+                                crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap(),
+                            ).unwrap();
+                            history[0]["status"] == "ended"
+                        } else {
+                            crate::api::load_model_provider_operator_offers(dir.path()).unwrap().is_empty()
+                        };
+                        if committed { break; }
+                    }
+                }
+            }
+        }).await.unwrap();
+        if decision {
+            let history = serde_json::to_value(
+                crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history[0]["status"], "ended");
+        } else {
+            assert!(crate::api::load_model_provider_operator_offers(dir.path())
+                .unwrap()
+                .is_empty());
+        }
+        // The committed change is already draining admission, before key cleanup or refresh.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            crate::api::model_provider_egress::hold_admission_for_test(dir.path(), &id),
+        )
+        .await
+        .is_err());
+        assert!(
+            crate::api::model_provider_config::read_hosted_secret(dir.path(), &id)
+                .unwrap()
+                .is_some()
+        );
+        if discard {
+            assert!(crate::api::model_provider_config::staged_hosted_key_present(dir.path(), &id));
+        }
+        if revoke {
+            crate::auth::revoke_passkey_binding(
+                dir.path(),
+                &authority.proof_binding_id,
+                crate::auth::now_ts(),
+            )
+            .unwrap();
+            drop(held);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(1), action)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!response.status().is_success());
+            assert!(
+                crate::api::model_provider_config::read_hosted_secret(dir.path(), &id)
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            drop(action); // Cancellation leaves the committed authority change in place.
+            drop(held);
+        }
+    }
+}
+
 #[tokio::test]
 async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let dir = tempfile::tempdir().unwrap();
