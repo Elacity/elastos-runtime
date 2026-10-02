@@ -2211,6 +2211,34 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn source_add_cli_keeps_omitted_channel_distinct_from_explicit_stable() {
+        let args = [
+            "elastos",
+            "source",
+            "add",
+            "--name",
+            "fixture",
+            "--publisher",
+            "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z",
+        ];
+        for (extra, expected) in [
+            (Vec::new(), None),
+            (vec!["--channel", "stable"], Some("stable")),
+        ] {
+            let mut input = args.to_vec();
+            input.extend(extra);
+            let cli = super::Cli::try_parse_from(input).unwrap();
+            let Some(super::Commands::Source(super::sources::SourceCommand::Add {
+                channel, ..
+            })) = cli.command
+            else {
+                panic!("expected source add");
+            };
+            assert_eq!(channel.as_deref(), expected);
+        }
+    }
+
+    #[test]
     fn publish_release_cli_accepts_repeated_platform_inputs() {
         let args = [
             "elastos",
