@@ -119,6 +119,17 @@ def validate_arm_package_dependency(source):
                 raise AssertionError("ARM compatibility check requires its packaged archive")
 
 
+def validate_installed_greeting_limit(source):
+    # Read the actual runs_create request's flat input literal; reject shape changes.
+    request, = re.findall(
+        r'(?ms)^  const created = await request\(assistant, "/api/provider/model/runs_create", \{\n'
+        r'(.*?)^  \}\);', source)
+    input_literal, = re.findall(r'input: \{([^{}]*)\}', request)
+    limits = re.findall(r'(?:^|,)\s*max_output_tokens:\s*([0-9]+)\s*(?=,|$)', input_literal)
+    if len(limits) != 1 or not 0 < int(limits[0]) <= 8:
+        raise AssertionError("installed greeting requires 1 through 8 output tokens")
+
+
 class ReleasePolicyTests(unittest.TestCase):
     def test_package_guards_preserve_arm_proof_and_skip_other_pr_archives(self):
         for job, platform in (("source-home-linux", "ubuntu-24.04"),
@@ -242,6 +253,19 @@ class ReleasePolicyTests(unittest.TestCase):
 
 
 class InstalledJourneyTests(unittest.TestCase):
+    def test_installed_greeting_has_a_small_explicit_output_allowance(self):
+        source = (WORKFLOW.parents[2] / "scripts/ci-installed-home-journey.mjs").read_text()
+        validate_installed_greeting_limit(source)
+
+    def test_missing_zero_and_oversized_greeting_allowances_are_refused(self):
+        source = (WORKFLOW.parents[2] / "scripts/ci-installed-home-journey.mjs").read_text()
+        allowance = "max_output_tokens: 8"
+        self.assertEqual(source.count(allowance), 1)
+        for replacement in ("", "max_output_tokens: 0", "max_output_tokens: 9",
+                            "max_output_tokens: 1024"):
+            with self.subTest(allowance=replacement), self.assertRaises(AssertionError):
+                validate_installed_greeting_limit(source.replace(allowance, replacement))
+
     def fixture(self, root, platform):
         home = root / "home"
         data = home / ("Library/Application Support/elastos" if platform == "macos"
@@ -252,6 +276,7 @@ class InstalledJourneyTests(unittest.TestCase):
         evidence.mkdir()
         runtime = data / "bin/elastos"
         runtime.write_bytes(b"installed fixture Runtime")
+        (data / "bin/model-provider").write_bytes(b"installed fixture model provider")
         receipt = {"source": {"commit": "c" * 40}, "runtime": {
             "installed_sha256": "sha256:" + hashlib.sha256(runtime.read_bytes()).hexdigest()}}
         (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
@@ -300,9 +325,12 @@ class InstalledJourneyTests(unittest.TestCase):
                     self.assertEqual(env["PATH"], "/fixture-tools")
                 self.stop.assert_called_once_with(child.pid, signal.SIGTERM)
                 child.wait.assert_called_once_with(timeout=15)
+                record = json.loads((evidence / "installed-journeys.json").read_text())
+                self.assertEqual(record["installed_model_provider_sha256"],
+                                 hashlib.sha256((data / "bin/model-provider").read_bytes()).hexdigest())
 
     def test_receipt_hash_and_disk_refuse_launch(self):
-        for failure in ("receipt", "hash", "disk"):
+        for failure in ("receipt", "hash", "provider", "disk"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 home, data, evidence, receipt = self.fixture(Path(temp), "macos")
                 if failure == "receipt":
@@ -310,7 +338,11 @@ class InstalledJourneyTests(unittest.TestCase):
                     (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
                 elif failure == "hash":
                     (data / "bin/elastos").write_bytes(b"changed fixture Runtime")
-                with self.assertRaises(RuntimeError if failure == "disk" else AssertionError):
+                elif failure == "provider":
+                    (data / "bin/model-provider").unlink()
+                expected = (RuntimeError if failure == "disk" else
+                            FileNotFoundError if failure == "provider" else AssertionError)
+                with self.assertRaises(expected):
                     self.execute(home, data, evidence, available=11 if failure == "disk" else 20)
                 self.gateway.assert_not_called()
                 self.node.assert_not_called()

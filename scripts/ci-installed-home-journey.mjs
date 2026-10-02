@@ -101,7 +101,7 @@ try {
   const assistant = await app("assistant");
   const created = await request(assistant, "/api/provider/model/runs_create", {
     offer_id: offer, operation: "text.generate", request_id: `ci-reply-${randomUUID()}`,
-    input: { schema: MODEL_TEXT_INPUT_SCHEMA, prompt: "Say hello in one sentence." },
+    input: { schema: MODEL_TEXT_INPUT_SCHEMA, prompt: "Say hello in one sentence.", max_output_tokens: 8 },
   });
   assert.equal(created.status, "ok");
   const run_id = created.data.run_id;

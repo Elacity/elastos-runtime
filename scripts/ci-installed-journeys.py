@@ -39,6 +39,7 @@ def run(home, data, evidence):
     assert runtime_sha == receipt["runtime"]["installed_sha256"].removeprefix("sha256:")
     record = {"candidate": candidate, "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
               "installed_runtime_sha256": runtime_sha, "installation_receipt_sha256": digest(data / "receipts/source-home-installation.json"),
+              "installed_model_provider_sha256": digest(data / "bin/model-provider"),
               "fixture_components_sha256": digest(data / "components.json"), "results": {}}
     record["disk_before"] = disk_observation(data)
     (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
