@@ -719,6 +719,37 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
                 with self.assertRaises(ValueError):
                     inputs.check_archive(path)
 
+    def test_arm64_engine_archive_requires_native_executable_and_libraries(self):
+        path = self.root / "llama-arm64.tar.gz"
+
+        def write_archive(server, library):
+            with tarfile.open(path, "w:gz") as archive:
+                for name, payload in (("llama-b10516/llama-server", server),
+                                      ("llama-b10516/libllama.so", library)):
+                    if payload is None:
+                        continue
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(payload)
+                    entry.mode = 0o755
+                    archive.addfile(entry, io.BytesIO(payload))
+
+        arm64 = binary("aarch64-linux")
+        x86 = binary("x86_64-linux")
+        write_archive(arm64, arm64)
+        inputs.check_archive(path, "llama-b10516", engine_platform="aarch64-linux")
+        for server, library in ((x86, arm64), (arm64, x86), (None, arm64), (arm64, None)):
+            with self.subTest(server=server is not None, library=library == arm64):
+                write_archive(server, library)
+                with self.assertRaises(ValueError):
+                    inputs.check_archive(path, "llama-b10516", engine_platform="aarch64-linux")
+        path.write_bytes(archive_bytes([
+            ("other/llama-server", arm64, None),
+            ("llama-b10516/llama-server", arm64, None),
+            ("llama-b10516/libllama.so", arm64, None),
+        ]))
+        with self.assertRaisesRegex(ValueError, "escapes its archive root"):
+            inputs.check_archive(path, "llama-b10516", engine_platform="aarch64-linux")
+
     def test_supported_component_cannot_be_omitted(self):
         root = self.bundles["aarch64-darwin"]
         receipt = json.loads((root / "platform-input.json").read_text())

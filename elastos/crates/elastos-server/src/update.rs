@@ -540,6 +540,36 @@ pub async fn run_update_for_data_dir(
     auto_confirm: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    run_update_for_data_dir_in_context(
+        data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+        crate::setup::FirstPartyCarrierContext::Setup,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_update_for_data_dir_in_context(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+) -> anyhow::Result<()> {
     let sources = load_trusted_sources(data_dir)?;
     let source = sources.default_source().cloned().ok_or_else(|| {
         anyhow::anyhow!("No trusted source configured. Run `elastos source add ...` first.")
@@ -697,6 +727,7 @@ pub async fn run_update_for_data_dir(
         force,
         discovery_method,
         working_gateway.as_deref(),
+        carrier_context,
     )
     .await
 }
@@ -758,6 +789,7 @@ async fn run_upgrade_from_head(
     force: bool,
     discovery_method: &str,
     working_gateway: Option<&str>,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     // Admit the exact signed publication before check-only/version success or artifacts.
     if release_cid.is_empty() {
@@ -985,11 +1017,12 @@ async fn run_upgrade_from_head(
     std::fs::rename(&tmp_comp, &comp_path)?;
     println!("  Installed components: {}", comp_path.display());
 
-    let refreshed_components = crate::setup::refresh_installed_components_for_update(
+    let refreshed_components = crate::setup::refresh_installed_components_for_update_in_context(
         data_dir,
         old_components.as_deref(),
         &comp_data,
         &component_platform,
+        carrier_context,
     )
     .await?;
     if refreshed_components.is_empty() {
@@ -1633,6 +1666,7 @@ mod tests {
             false,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await;
         assert!(result
@@ -1656,6 +1690,7 @@ mod tests {
             true,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap();
@@ -1711,6 +1746,7 @@ mod tests {
             false,
             "fixture",
             None,
+            crate::setup::FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap_err();
@@ -1869,6 +1905,7 @@ mod tests {
                         false,
                         "test",
                         gateway_transport.then_some(gateway.as_str()),
+                        crate::setup::FirstPartyCarrierContext::Setup,
                     )
                     .await;
                     server.abort();
