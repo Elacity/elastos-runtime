@@ -74,6 +74,16 @@ def run_metrics(stages, acknowledgements):
             or terminal[0]["elapsed_ms"] > values["terminal_applied"]
             or terminal[0]["elapsed_ms"] - terminal[0]["duration_ms"] < values["generation_completed"]):
         return {"status": "incomplete"}
+    previous_end = values["first_delta"]
+    for row in delta:
+        end = row["elapsed_ms"]
+        start = end - row["duration_ms"]
+        if (start < previous_end or end > values["generation_completed"]
+                or start < values["stream_completed"] < end):
+            return {"status": "incomplete"}
+        previous_end = end
+    if terminal[0]["elapsed_ms"] - terminal[0]["duration_ms"] < previous_end:
+        return {"status": "incomplete"}
     engine_ready = [row["elapsed_ms"] for row in stages if row["stage"] == "engine_ready"]
     if len(engine_ready) != 1:
         return {"status": "incomplete"}
@@ -101,7 +111,12 @@ def run_metrics(stages, acknowledgements):
 def timing_spread(records, expected_runs):
     """Only complete, same-candidate installed passes form a timing series."""
     metrics = [row.get("model_timing", {}).get("durations", {}) for row in records]
+    identities = {"candidate": 40, "source_tree": 40,
+                  "installed_runtime_sha256": 64, "installed_model_provider_sha256": 64}
     if (len(records) != expected_runs or not records
+            or any(not isinstance(row.get(field), str)
+                   or re.fullmatch(r"[0-9a-f]{%d}" % length, row[field]) is None
+                   for row in records for field, length in identities.items())
             or len({(row.get("candidate"), row.get("source_tree"),
                      row.get("installed_runtime_sha256"), row.get("installed_model_provider_sha256"))
                     for row in records}) != 1
@@ -112,7 +127,9 @@ def timing_spread(records, expected_runs):
               "acknowledgement_total_ms", "delta_acknowledgement_ms", "terminal_acknowledgement_ms", "terminal_applied_ms"]
     spread = {}
     for field in fields:
-        values = [row[field] for row in metrics]
+        values = [row.get(field) for row in metrics]
+        if any(type(value) is not int or not 0 <= value <= 3_600_000 for value in values):
+            return {"status": "incomplete", "expected_runs": expected_runs, "recorded_runs": len(records)}
         spread[field] = {"values": values, "min": min(values), "max": max(values),
                          "spread": max(values) - min(values)}
     return {"status": "complete", "expected_runs": expected_runs, "recorded_runs": len(records),

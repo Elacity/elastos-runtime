@@ -612,8 +612,25 @@ class InstalledModelTimingTests(unittest.TestCase):
             self.assertEqual(self.timing["acknowledgement_timings"](log), [
                 {"kind": "delta", "outcome": "applied", "elapsed_ms": 800, "duration_ms": 50}])
 
+    def test_acknowledgements_outside_generation_or_in_wrong_order_are_refused(self):
+        for failure in ("after_terminal", "before_generation", "overlap", "reversed", "across_stream"):
+            stages, ack = self.timing_fixture()
+            if failure == "after_terminal":
+                ack.insert(2, {"kind": "delta", "outcome": "applied",
+                               "elapsed_ms": 300000, "duration_ms": 200000})
+            elif failure == "before_generation":
+                ack[0].update(elapsed_ms=100, duration_ms=50)
+            elif failure == "overlap":
+                ack[1].update(elapsed_ms=1010, duration_ms=250)
+            elif failure == "reversed":
+                ack[0], ack[1] = ack[1], ack[0]
+            else:
+                ack[1].update(elapsed_ms=1020, duration_ms=30)
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["run_metrics"](stages, ack)["status"], "incomplete")
+
     def test_spread_requires_three_same_candidate_installed_passes(self):
-        row = {"candidate": "c" * 40, "source_tree": "t" * 40,
+        row = {"candidate": "c" * 40, "source_tree": "d" * 40,
                "installed_runtime_sha256": "a" * 64, "installed_model_provider_sha256": "b" * 64,
                "results": {"installed_runtime_reply": "passed"},
                "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
@@ -633,6 +650,19 @@ class InstalledModelTimingTests(unittest.TestCase):
             else:
                 altered[1]["model_timing"]["durations"]["status"] = "incomplete"
             with self.subTest(failure=failure):
+                self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+
+        for field in ("candidate", "source_tree", "installed_runtime_sha256", "installed_model_provider_sha256"):
+            for value in (None, "", "not-a-digest"):
+                altered = json.loads(json.dumps(rows))
+                for record in altered:
+                    record[field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+        for value in (None, -1, "500", True, 3600001):
+            altered = json.loads(json.dumps(rows))
+            altered[1]["model_timing"]["durations"]["generation_wall_ms"] = value
+            with self.subTest(value=value):
                 self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
 
     def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
