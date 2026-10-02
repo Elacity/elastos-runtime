@@ -6,7 +6,7 @@ use elastos_server::operator_control::{
     gather_local_node_status, remove_peer, request_remote_room_approve, request_remote_room_deny,
     request_remote_room_open, request_remote_room_read, request_remote_status,
     request_remote_update_apply, request_remote_update_check, supported_actions, upsert_peer,
-    OperatorPeer, OperatorRoomOpen,
+    OperatorPeer, OperatorPeerIpfs, OperatorRoomOpen,
 };
 use elastos_server::room_service::{ApprovalOutcome, DenyOutcome, RoomSummary};
 use elastos_server::sources::default_data_dir;
@@ -149,8 +149,21 @@ async fn run_peer(data_dir: &Path, cmd: crate::NodePeerCommand) -> anyhow::Resul
             label,
             ticket,
             allow,
+            provides,
+            ipfs_peer_id,
+            ipfs_addr,
             json,
         } => {
+            // A multiaddr without the PeerID it belongs to cannot be turned
+            // into a peering entry, and guessing the identity from an address
+            // is exactly the mistake this rejects.
+            let ipfs_peer = match (ipfs_peer_id, ipfs_addr.is_empty()) {
+                (Some(id), _) => Some(OperatorPeerIpfs { id, addrs: ipfs_addr }),
+                (None, true) => None,
+                (None, false) => anyhow::bail!(
+                    "--ipfs-addr needs the node it belongs to. Re-run with --ipfs-peer-id <12D3Koo...>, or drop --ipfs-addr."
+                ),
+            };
             let peer = upsert_peer(
                 data_dir,
                 OperatorPeer {
@@ -158,6 +171,8 @@ async fn run_peer(data_dir: &Path, cmd: crate::NodePeerCommand) -> anyhow::Resul
                     label: label.unwrap_or_default(),
                     connect_ticket: ticket.unwrap_or_default(),
                     allow,
+                    provides,
+                    ipfs_peer,
                 },
             )?;
             if json {
@@ -414,6 +429,25 @@ fn print_peer_summary(prefix: &str, peer: &OperatorPeer) {
             peer.allow.join(", ")
         }
     );
+    println!(
+        "Provides:       {}",
+        if peer.provides.is_empty() {
+            "not declared".to_string()
+        } else {
+            peer.provides.join(", ")
+        }
+    );
+    if let Some(ipfs_peer) = peer.ipfs_peer.as_ref() {
+        println!("IPFS peer id:   {}", ipfs_peer.id);
+        println!(
+            "IPFS addrs:     {}",
+            if ipfs_peer.addrs.is_empty() {
+                "none (peer by id)".to_string()
+            } else {
+                ipfs_peer.addrs.join(", ")
+            }
+        );
+    }
 }
 
 fn print_remote_room_summary(peer_did: &str, summary: &RoomSummary) {

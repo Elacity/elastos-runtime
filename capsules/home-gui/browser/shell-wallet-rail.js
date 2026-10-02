@@ -171,11 +171,6 @@ function finePointerHoverAvailable() {
   return !window.matchMedia?.("(hover: none), (pointer: coarse)")?.matches;
 }
 
-function connectorSheetOpen() {
-  const connectorSheet = document.querySelector("#connector-sheet");
-  return Boolean(connectorSheet && !connectorSheet.hidden);
-}
-
 function clearEdgeOpenTimer() {
   if (edgeOpenTimer) {
     window.clearTimeout(edgeOpenTimer);
@@ -262,7 +257,7 @@ function bindEdgeReveal() {
         return;
       }
       lastPointerClientX = event.clientX;
-      if (!walletRailAvailable() || connectorSheetOpen()) {
+      if (!walletRailAvailable()) {
         clearEdgeOpenTimer();
         return;
       }
@@ -273,7 +268,7 @@ function bindEdgeReveal() {
         if (!walletRailOpen() && !edgeOpenTimer) {
           edgeOpenTimer = window.setTimeout(() => {
             edgeOpenTimer = 0;
-            if (!walletRailAvailable() || connectorSheetOpen() || walletRailOpen()) {
+            if (!walletRailAvailable() || walletRailOpen()) {
               return;
             }
             openedByEdgeHover = true;
@@ -722,11 +717,6 @@ function bindOutsideDismiss() {
   outsideDismissBound = true;
   document.addEventListener("pointerdown", (event) => {
     if (!walletRailOpen() || rail.contains(event.target)) {
-      return;
-    }
-    // The connector ceremony sheet sits above the rail — ignore outside
-    // dismiss while it is open (and never treat sheet clicks as outside).
-    if (connectorSheetOpen()) {
       return;
     }
     openedByEdgeHover = false;

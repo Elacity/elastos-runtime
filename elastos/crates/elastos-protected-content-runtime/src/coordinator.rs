@@ -23,10 +23,44 @@ use crate::{
     RuntimeReleaseTerminalResult,
 };
 
+/// Why a provider call did not yield an exact result, classified by whether the
+/// provider can have had a durable effect.
+///
+/// A caller holding a journal has to decide, on failure, whether to record a
+/// terminal abort. That decision turns on one question — could the provider have
+/// acted? — and only some failures answer it. A custody node that refuses
+/// *before* its durable write and one that fails *after* it can return the same
+/// transport-level shape, so a variant here claims "without effect" only where
+/// the provider contract guarantees the refusal precedes any write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RuntimeProviderCallError {
+    /// The call never left this Runtime: the request could not be encoded. No
+    /// provider saw it, so none can have acted on it.
+    #[error("provider call was not dispatched")]
+    NotDispatched,
+    /// The provider answered and refused with a code its contract emits only
+    /// before any durable write. The effect is provably absent.
+    #[error("provider refused the request without acting")]
+    RefusedWithoutEffect,
+    /// The call left this Runtime and no usable answer came back, or the answer
+    /// carries a code that spans both acted and did-not-act paths. The effect is
+    /// unknown and must never be assumed absent.
     #[error("provider call did not return an exact result")]
     NoExactResult,
+}
+
+impl RuntimeProviderCallError {
+    /// Whether this failure proves the provider did not act.
+    ///
+    /// `false` means unknown, never "it acted". A caller may only skip a
+    /// terminal abort when this is `true`.
+    #[must_use]
+    pub const fn proves_no_effect(self) -> bool {
+        match self {
+            Self::NotDispatched | Self::RefusedWithoutEffect => true,
+            Self::NoExactResult => false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -850,7 +884,6 @@ mod tests {
     use std::sync::Mutex;
 
     use ed25519_dalek::{Signer as _, SigningKey};
-    use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
         ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
@@ -1281,9 +1314,7 @@ mod tests {
             )
             .unwrap();
             let (signature, recovery_id) = wallet_key(wallet_seed)
-                .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                    &request.canonical_bytes().unwrap(),
-                ))
+                .sign_prehash_recoverable(&request.signing_hash().unwrap())
                 .unwrap();
             let mut signature_bytes = signature.to_bytes().to_vec();
             signature_bytes.push(recovery_id.to_byte());

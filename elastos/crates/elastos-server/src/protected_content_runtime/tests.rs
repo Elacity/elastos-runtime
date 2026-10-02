@@ -1429,16 +1429,23 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
     let creator_listing = creator_view["listings"][0].as_object().unwrap();
     assert_eq!(
         creator_listing.keys().cloned().collect::<Vec<_>>(),
+        // The same list lives in `capsules/marketplace/browser/src/listing.js`
+        // as LISTING_KEYS. The shelf parses these exactly, so a field added
+        // here and forgotten there is refused in front of a person.
         vec![
             "access_state",
             "availability",
             "codecs",
+            "content_kind",
             "display_name",
+            "listing_uri",
+            "metadata_cid",
             "mime_type",
             "mint_id",
             "pay_token",
             "price",
             "published_at",
+            "purchase_in_flight",
             "quantity",
             "schema",
             "seller_address",
@@ -1446,6 +1453,16 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
         ]
     );
     assert_eq!(creator_listing["display_name"], "protected-video.mp4");
+    assert!(
+        creator_listing["listing_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("elastos://")),
+        "a listing names the address a creator passes on"
+    );
+    assert_eq!(
+        creator_listing["purchase_in_flight"], false,
+        "nobody is part way through buying this"
+    );
     assert_eq!(creator_listing["mime_type"], MEDIA_MIME_TYPE_V1);
     assert_eq!(creator_listing["codecs"], MEDIA_CODECS_V1);
     assert_eq!(creator_listing["quantity"], "0x2");
@@ -1478,11 +1495,21 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
         other_view["listings"][0]["availability"],
         expected_availability
     );
+    // `metadata_cid` used to be on this list and is deliberately off it now.
+    //
+    // It is not private: the mint writes `ipfs://<metadata_cid>/metadata.json`
+    // as the media token's URI, so it is on chain for anyone to read, and the
+    // document it names is published for marketplaces to fetch. Withholding it
+    // from this Home's own shelf bought nothing and cost the shelf its titles
+    // and covers, which live in that document.
+    //
+    // `token_uri` stays hidden even so: the bare CID is what a surface needs
+    // to ask this Home's `/ipfs/` route for, and a URI is a second spelling of
+    // the same fact that a consumer would have to parse to use.
     for hidden in [
         "publisher_principal_id",
         "content_id",
         "cid",
-        "metadata_cid",
         "token_uri",
         "chain_namespace",
         "network",
@@ -2397,6 +2424,57 @@ fn load_profile_did_for_test(data_dir: &Path, principal_id: &str) -> String {
 }
 
 #[cfg(unix)]
+/// Every purchase written before minted copies existed spells the acquiring
+/// transaction `buy_stage` and carries no `acquisition`. Those records are on
+/// real disks, so they must keep loading, and must keep reading as bought --
+/// the field was renamed because a minted copy records its mint there, not
+/// because the old records meant anything different.
+#[test]
+fn a_purchase_written_before_minted_copies_still_loads_as_bought() {
+    let legacy = serde_json::json!({
+        "schema": super::RUNTIME_PURCHASE_SCHEMA_V1,
+        "principal_id": "person:local:legacy-buyer",
+        "profile_did": "did:key:z6MklegacybuyerprofiledidZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "mint_id": "11".repeat(32),
+        "content_id": "22".repeat(16),
+        "cid": "bafylegacycontent",
+        "listing_sha256": format!("sha256:{}", "33".repeat(32)),
+        "seller_address": "0x0000000000000000000000000000000000000011",
+        "chain_namespace": "eip155:8453",
+        "network": "base-mainnet",
+        "ledger": "0x0000000000000000000000000000000000000022",
+        "token_id": "0x77",
+        "operative": "0x00000000000000000000000000000000000000dd",
+        "price": "0x5",
+        "pay_token": "0x0000000000000000000000000000000000000000",
+        "availability_receipt_digest": format!("sha256:{}", "44".repeat(32)),
+        "account_id": "wallet-account-legacy",
+        "address": "0x00000000000000000000000000000000000000ee",
+        "buy_stage": {
+            "stage": "buy",
+            "effect_id": "runtime-effect:11111111111111111111111111111111",
+            "approval_request_id": "wallet-request:11111111111111111111111111111111",
+            "request_sha256": format!("sha256:{}", "ac".repeat(32)),
+            "chain_namespace": "eip155:8453",
+            "network": "base-mainnet",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value": "0x1",
+            "data": "0x1234",
+        },
+        "progress": { "state": "pending" },
+        "created_at": 1_700_000_000u64,
+        "updated_at": 1_700_000_000u64,
+    });
+    let decoded: super::RuntimeCustodyPurchaseRecord =
+        serde_json::from_value(legacy).expect("a legacy purchase record must still decode");
+    assert_eq!(
+        decoded.acquisition,
+        super::RuntimeCustodyAcquisitionV1::Bought
+    );
+    assert_eq!(decoded.acquisition_stage.stage, "buy");
+    assert_eq!(decoded.acquisition_stage.value, "0x1");
+}
+
 fn persist_runtime_custody_purchase_for_mint(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -2448,7 +2526,9 @@ fn persist_runtime_custody_purchase_for_mint(
         account_id: "wallet-account-alpha".to_string(),
         address: wallet_address_hex(wallet(7)),
         approval_stage: None,
-        buy_stage: RuntimeCustodyPurchaseStageRecord {
+        acquisition: super::RuntimeCustodyAcquisitionV1::Bought,
+        capsule_uri: None,
+        acquisition_stage: RuntimeCustodyPurchaseStageRecord {
             stage: "buy".to_string(),
             effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
             approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
@@ -2478,7 +2558,7 @@ fn persist_runtime_custody_purchase_for_mint(
                     observed_at: now,
                 },
                 confirmed_at: now,
-                bought_at: now,
+                acquired_at: now,
             },
         },
         created_at: now,
@@ -2651,9 +2731,7 @@ fn release_operation_assembly_input(
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -2939,9 +3017,7 @@ fn make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -3425,6 +3501,7 @@ fn provisioned_process_custody_node_for_issuer(
         adapter: RuntimeCustodyRegistryAdapter::new(
             registry.clone(),
             elastos_runtime::provider::ProviderInvocationTransport::Local,
+            super::RuntimeCustodyCallDiagnostics::default(),
         ),
         registry,
         provisioned,
@@ -3479,6 +3556,7 @@ fn provisioned_process_custody_node(
         adapter: RuntimeCustodyRegistryAdapter::new(
             registry.clone(),
             elastos_runtime::provider::ProviderInvocationTransport::Local,
+            super::RuntimeCustodyCallDiagnostics::default(),
         ),
         registry,
         provisioned,
@@ -5483,7 +5561,9 @@ fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) 
         account_id: "wallet-account-fixture".to_string(),
         address: wallet_address_hex(wallet(7)),
         approval_stage: None,
-        buy_stage: RuntimeCustodyPurchaseStageRecord {
+        acquisition: super::RuntimeCustodyAcquisitionV1::Bought,
+        capsule_uri: None,
+        acquisition_stage: RuntimeCustodyPurchaseStageRecord {
             stage: "buy".to_string(),
             effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
             approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
@@ -5518,7 +5598,7 @@ fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) 
                     observed_at: 1,
                 },
                 confirmed_at: 1,
-                bought_at: 1,
+                acquired_at: 1,
             },
         },
         created_at: 1,
@@ -6445,6 +6525,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
     let request = RightsProviderRequestV1::new_evaluate(node_public_key(1), &operation).unwrap();
 
@@ -6510,6 +6591,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
     let request =
         CustodyProviderRequestV1::new_release_contribution(&operation, &decision).unwrap();
@@ -6570,6 +6652,7 @@ async fn runtime_custody_registry_adapter_process_happy_path_uses_public_provisi
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
 
     let provision_request =
@@ -7317,8 +7400,12 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     }
     let mint_journal = RuntimeMintJournal::new(mint_root.clone());
     let custody_provisioned = mint_journal.load(mint_draft.mint_id()).unwrap();
-    assert!(custody_provisioned.any_effect_started());
     assert!(custody_provisioned.all_receipts_present());
+    assert_eq!(
+        custody_provisioned.uncertain_node_count(),
+        0,
+        "every node answered with a receipt, so none is left possibly holding a share"
+    );
     assert_eq!(custody_provisioned.accepted_orphans().len(), 3);
     let sealed_share_bytes = envelope.stored_shares()[0].canonical_bytes().unwrap();
     assert!(!any_file_contains(&mint_root, &sealed_share_bytes));
@@ -8420,6 +8507,7 @@ fn media_preparation_source_input(
     principal_id: &str,
 ) -> RuntimeCustodyLibrarySourceInput {
     RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: format!(
             "{}/Documents/source.mp4",
             crate::auth::principal_localhost_root(principal_id)
@@ -8430,7 +8518,9 @@ fn media_preparation_source_input(
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         source_storage: "protected_principal_root".to_string(),
     }
 }
@@ -8700,6 +8790,7 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-composition".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8708,7 +8799,9 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
             wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
             creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
-            price: "0x5".to_string(),
+            price: "5".to_string(),
+            channel: "0x0000000000000000000000000000000000000022".to_string(),
+            pay_token: String::new(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -8754,6 +8847,7 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-device-key".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8762,7 +8856,9 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
             wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
             creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
-            price: "0x5".to_string(),
+            price: "5".to_string(),
+            channel: "0x0000000000000000000000000000000000000022".to_string(),
+            pay_token: String::new(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -8801,6 +8897,7 @@ fn library_publish_test_routes(
 fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublishInput {
     let (clear_init_segment, clear_segments) = clear_media_components(0x41);
     RuntimeCustodyLibraryPublishInput {
+        listing: None,
         object_uri: "localhost://Users/test/Documents/media".to_string(),
         principal_id: principal_id.to_string(),
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8809,7 +8906,9 @@ fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublis
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         clear_init_segment,
         clear_segments,
         source_storage: "plain_localhost_root".to_string(),
@@ -9128,7 +9227,16 @@ async fn runtime_custody_library_publish_adopts_completed_mint_after_lost_comple
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_custody_library_publish_requires_reconciliation_for_partial_settled_mint() {
+/// A settled attempt that provisioned nothing durable and recorded no
+/// availability can neither be rolled forward nor adopted, and its intent
+/// settled before any draft existed. Keeping either of them makes the object
+/// permanently unmintable, because the intent's identity is the object path.
+///
+/// This attempt still fails -- there is nothing to hand back -- but it leaves
+/// nothing behind, so the creator's next attempt on that file starts from
+/// nothing rather than meeting the same wall forever. Observed on Base: a node
+/// restart mid-publish, and the file could not be minted again at all.
+async fn runtime_custody_library_publish_clears_a_partial_settled_mint_so_the_object_mints_again() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
@@ -9140,23 +9248,41 @@ async fn runtime_custody_library_publish_requires_reconciliation_for_partial_set
     let error =
         publish_runtime_custody_library_object(&data_dir, Arc::new(ProviderRegistry::new()), input)
             .await
-            .expect_err(
-                "partially provisioned settled mint work must fail closed for reconciliation",
-            );
+            .expect_err("a settled attempt with nothing durable cannot be handed back");
     assert!(
         error
             .to_string()
-            .contains(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE),
+            .contains(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE),
         "{error}"
     );
 
-    let intent = runtime_mint_journal(&data_dir)
-        .load_intent(request_id)
-        .unwrap();
-    assert!(intent.protect_terminal_before_draft());
-    assert_eq!(intent.completed_mint_id(), None);
-    let record = runtime_mint_journal(&data_dir).load(mint_id).unwrap();
-    assert_eq!(record.custody_terminal(), None);
+    // Both are gone: nothing is left for the next attempt to collide with.
+    assert!(
+        runtime_mint_journal(&data_dir).load(mint_id).is_err(),
+        "the unfinishable record must be discarded"
+    );
+    assert!(
+        runtime_mint_journal(&data_dir)
+            .load_intent(request_id)
+            .is_err(),
+        "the unmintable intent must be discarded"
+    );
+
+    // The object is mintable again: the next attempt gets past the wall that
+    // used to be permanent, and fails for want of providers instead.
+    let retried = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        library_publish_test_input("person:local:runtime-custody-partial-settled"),
+    )
+    .await
+    .expect_err("no providers are registered, so the fresh attempt still cannot finish");
+    assert!(
+        !retried
+            .to_string()
+            .contains(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE),
+        "a cleared object must no longer abort before it starts: {retried}"
+    );
 }
 
 #[cfg(unix)]
@@ -9307,6 +9433,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     )
     .unwrap();
     let source = RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: retry_object_uri.clone(),
         principal_id: retry_principal.to_string(),
         source_file_path: source_file_path.clone(),
@@ -9314,7 +9441,9 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         source_storage: "plain_localhost_root".to_string(),
     };
     let preparation = RuntimeMediaPreparationRecord::new(
@@ -10400,7 +10529,11 @@ impl Provider for LibraryReleaseWalletProvider {
         let key = WalletSigningKey::from_slice(&[7; 32])
             .map_err(|error| ProviderError::Provider(error.to_string()))?;
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(&rights_bytes))
+            .sign_prehash_recoverable(
+                &rights_request
+                    .signing_hash()
+                    .map_err(|error| ProviderError::Provider(format!("{error:?}")))?,
+            )
             .map_err(|error| ProviderError::Provider(error.to_string()))?;
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -10432,6 +10565,12 @@ impl Provider for LibraryReleaseWalletProvider {
 /// real wallet-provider answers with).
 struct ManagedReleaseWalletProvider {
     approved: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Requests the person has confirmed but whose signature has not come back
+    /// yet. This is the real `approved` state an external wallet sits in
+    /// between the person pressing Confirm and the connector posting the
+    /// signature, and it answers `requires_approval: false` with no signed
+    /// result -- the shape that once read as a hard failure.
+    confirmed_awaiting_signature: std::sync::Mutex<std::collections::HashSet<String>>,
     seen: std::sync::Mutex<Vec<String>>,
 }
 
@@ -10439,12 +10578,21 @@ impl ManagedReleaseWalletProvider {
     fn new() -> Self {
         Self {
             approved: std::sync::Mutex::new(std::collections::HashSet::new()),
+            confirmed_awaiting_signature: std::sync::Mutex::new(std::collections::HashSet::new()),
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn approve(&self, request_id: &str) {
         self.approved.lock().unwrap().insert(request_id.to_string());
+    }
+
+    /// The person has confirmed; the connector has not answered yet.
+    fn confirm_awaiting_signature(&self, request_id: &str) {
+        self.confirmed_awaiting_signature
+            .lock()
+            .unwrap()
+            .insert(request_id.to_string());
     }
 
     fn seen_request_ids(&self) -> Vec<String> {
@@ -10481,6 +10629,11 @@ impl Provider for ManagedReleaseWalletProvider {
             .lock()
             .unwrap()
             .push(wallet_request.request_id.clone());
+        let awaiting_signature = self
+            .confirmed_awaiting_signature
+            .lock()
+            .unwrap()
+            .contains(&wallet_request.request_id);
         let approved = self
             .approved
             .lock()
@@ -10490,7 +10643,18 @@ impl Provider for ManagedReleaseWalletProvider {
             "schema": "elastos.wallet.approval_request/v1",
             "request_id": wallet_request.request_id,
             "intent": "protected_content_rights_signature",
-            "status": if approved { "completed" } else { "pending" },
+            "status": if approved {
+                "completed"
+            } else if awaiting_signature {
+                "approved"
+            } else {
+                "pending"
+            },
+            // The Wallet names the account the approval belongs to. A managed
+            // account completes in place, so the open reports that nobody has
+            // to go anywhere; an external one would carry its connector here.
+            "proof_type": "managed_evm",
+            "connector_id": Value::Null,
         });
         let data = if approved {
             let (account_id, canonical_rights_request_hex) = match &wallet_request.operation {
@@ -10513,9 +10677,11 @@ impl Provider for ManagedReleaseWalletProvider {
             let key = WalletSigningKey::from_slice(&[7; 32])
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
             let (signature, recovery_id) = key
-                .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                    &rights_bytes,
-                ))
+                .sign_prehash_recoverable(
+                    &rights_request
+                        .signing_hash()
+                        .map_err(|error| ProviderError::Provider(format!("{error:?}")))?,
+                )
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
             let mut signature_bytes = signature.to_bytes().to_vec();
             signature_bytes.push(recovery_id.to_byte());
@@ -10538,7 +10704,10 @@ impl Provider for ManagedReleaseWalletProvider {
         } else {
             json!({
                 "approval_request": approval_request,
-                "requires_approval": true,
+                // False once the person has confirmed, exactly as the real
+                // wallet answers: `requires_approval` is `status == Pending`
+                // alone, so the approved gap reports false with no signature.
+                "requires_approval": !awaiting_signature,
                 "signature": Value::Null,
             })
         };
@@ -10623,7 +10792,15 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         super::RuntimeReleaseWalletOutcome::PendingApproval {
             request_bytes,
             approval_request_id,
-        } => (request_bytes, approval_request_id),
+            external_signer,
+            connector_id,
+        } => {
+            // Read from the approval record rather than assumed, so a viewer
+            // can say whose turn it is.
+            assert!(!external_signer);
+            assert_eq!(connector_id, None);
+            (request_bytes, approval_request_id)
+        }
         super::RuntimeReleaseWalletOutcome::Signed { .. } => panic!("expected pending approval"),
     };
     let decoded = WalletProviderRequestV2::decode_at(&request_bytes, now).unwrap();
@@ -10645,6 +10822,7 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         super::RuntimeReleaseWalletOutcome::PendingApproval {
             request_bytes: replayed,
             approval_request_id: replayed_id,
+            ..
         } => {
             assert_eq!(replayed, request_bytes);
             assert_eq!(replayed_id, approval_request_id);
@@ -10667,6 +10845,41 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         foreign.unwrap_err().to_string(),
         super::RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE
     );
+
+    // Confirmed, but the signature has not come back yet. This is the state an
+    // external wallet sits in between the person pressing Confirm and the
+    // connector posting the signature, and the Wallet answers it with
+    // `requires_approval: false` and no signed result, because that flag is
+    // `status == Pending` alone. Reading the flag by itself made the release
+    // treat a state that was about to succeed as a finished approval carrying
+    // no signature, and fail closed. A viewer polling every two seconds lands
+    // in this gap reliably, so a person saw their own approval become an error.
+    wallet.confirm_awaiting_signature(&approval_request_id);
+    match super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient,
+        invocation(),
+        Some(&request_bytes),
+        now,
+    )
+    .await
+    .unwrap()
+    {
+        super::RuntimeReleaseWalletOutcome::PendingApproval {
+            request_bytes: replayed,
+            approval_request_id: replayed_id,
+            ..
+        } => {
+            // Still the same approval and the same request: the release waits
+            // rather than raising a second one.
+            assert_eq!(replayed, request_bytes);
+            assert_eq!(replayed_id, approval_request_id);
+        }
+        super::RuntimeReleaseWalletOutcome::Signed { .. } => {
+            panic!("a confirmed approval whose signature has not arrived is not signed")
+        }
+    }
 
     // Approved: the exact replay yields the signed rights for the SAME
     // request, decoded out of the Wallet's approval envelope.
@@ -10692,7 +10905,10 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
     super::wallet_signed_rights_from_bytes(&signed_request_bytes, &response_bytes).unwrap();
     assert_eq!(
         wallet.seen_request_ids(),
-        vec![approval_request_id.clone(); 3],
+        // Four shots now: pending, pending replay, the confirmed-but-unsigned
+        // gap, and the signed replay. All four carry the same request id,
+        // which is the point -- a wait never raises a second approval.
+        vec![approval_request_id.clone(); 4],
         "every shot replayed the identical wallet request"
     );
 }
@@ -13739,6 +13955,37 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
         record.lifecycle_status,
         super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
     );
+
+    // An open that never reaches a signature must not fetch the same content
+    // twice.
+    //
+    // `open_runtime_custody_viewer` runs top to bottom on every call, and a
+    // viewer re-issues the identical open every couple of seconds while a
+    // person reads their wallet prompt. The viewer session's own fetch used to
+    // sit before the wallet was asked, on top of the fetch the freshness check
+    // already performs, so the content was pulled and re-hashed twice before
+    // the prompt appeared and twice again on every poll of the wait.
+    //
+    // The session's fetch now sits after the signature. This test fails at the
+    // wallet, which is the step it moved behind, so a repeated path here means
+    // the ordering has regressed. The freshness check's own fetches remain and
+    // are the dominant pre-prompt cost; they are not what this pins.
+    let fetched: Vec<String> = harness
+        .content_provider
+        .requests()
+        .await
+        .iter()
+        .filter(|request| request["op"] == "fetch")
+        .map(|request| request["path"].as_str().unwrap_or("?").to_string())
+        .collect();
+    let mut unique = fetched.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        fetched.len(),
+        unique.len(),
+        "an open that fails at the wallet fetched the same content twice: {fetched:?}"
+    );
 }
 
 /// Session binding v3 admits two viewer capsules, so admission alone no longer
@@ -14377,4 +14624,202 @@ fn object_chunk_admission_bounds_the_request_by_the_chunk_count() {
         .is_err());
     // A previously released chunk is still refused by the ordering rule.
     assert!(record.require_object_chunk_index(0, CHUNK_COUNT).is_err());
+}
+
+/// The two codes the custody capsule emits only from paths that precede its
+/// durable write. Everything else — `backend_unavailable` above all, which the
+/// capsule returns both for a refusal before the write and for a failure after
+/// it — must stay uncertain.
+#[test]
+fn custody_refusal_codes_claim_no_effect_only_where_the_capsule_proves_it() {
+    for code in ["invalid_request", "provisioning_refused", "rights_denied"] {
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::RefusedWithoutEffect,
+            "{code} is emitted only before the durable write"
+        );
+    }
+    for code in ["backend_unavailable", "invalid_config", "unknown", ""] {
+        // `backend_unavailable` is the one that matters here: the capsule
+        // returns it both for a refusal before the write and for a failure
+        // after it.
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::NoExactResult,
+            "{code} spans acted and did-not-act paths"
+        );
+    }
+}
+
+/// A reply that never arrived is not a node that never acted: the capsule can
+/// complete its write and then fail to answer.
+#[test]
+fn a_missing_or_malformed_custody_reply_is_effect_uncertain() {
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::NotCompleted {
+                detail: "transport closed".to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::MalformedResponse {
+                detail: "custody provider provision_node_share response is missing status"
+                    .to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+}
+
+/// Widening the typed layer must not change a single message the
+/// string-returning callers have always produced.
+#[test]
+fn classified_failures_format_exactly_as_before() {
+    assert_eq!(
+        super::ProviderInvocationFailure::NotCompleted {
+            detail: "boom".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share invocation failed: boom"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::Refused {
+            code: "rights_denied".to_string(),
+            message: "no".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share rejected the request: rights_denied: no"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::MalformedResponse {
+            detail: "custody provider provision_node_share response is missing data".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share response is missing data"
+    );
+}
+
+/// A listing says what kind of item it is, and both kinds publish one shape.
+///
+/// `runtime_custody_listings_project_public_summary_and_access_state` carries
+/// the canonical key list for a media row; the same list lives in
+/// `capsules/marketplace/browser/src/listing.js` as LISTING_KEYS, and the
+/// Marketplace parser refuses any row that does not match it exactly. That is
+/// the pair that had drifted: the producer gained an availability
+/// `receipt_digest` and the consumer did not, so every protected row was
+/// refused in front of a person for twenty-four days.
+///
+/// What that test does not cover is an object. This one does, and it holds the
+/// two kinds to one shape rather than repeating the list.
+#[test]
+fn listing_summary_names_the_kind_and_publishes_one_shape_for_both() {
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("a summary is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let media = runtime_custody_listing_record_for_test(
+        Digest32::new([0x7a; 32]),
+        "person:local:creator",
+        "clip.mp4",
+        NOW,
+    );
+    let media_summary =
+        super::runtime_custody_listing_summary(temp.path(), "person:local:buyer", &media).unwrap();
+    assert_eq!(media_summary["content_kind"], "media");
+    assert_eq!(media_summary["access_state"], "available");
+
+    let (_, package) = object_listing_package_for_test(0x7b);
+    let object = super::RuntimeCustodyListingRecord {
+        origin: super::RuntimeCustodyListingOrigin::LocalCreator {
+            principal_id: "person:local:creator".to_string(),
+            listing_uri: format!("elastos://{}", ContentAvailabilityTestProvider::CID),
+            package_sha256: hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&package).unwrap(),
+            )),
+        },
+        package,
+        ..media
+    };
+    // Read as the creator who listed it, which is the other access state the
+    // shelf renders and the one that never offers a Buy control.
+    let object_summary =
+        super::runtime_custody_listing_summary(temp.path(), "person:local:creator", &object)
+            .unwrap();
+    assert_eq!(
+        sorted_keys(&object_summary),
+        sorted_keys(&media_summary),
+        "a shelf parses one row shape, whatever kind the item is"
+    );
+    assert_eq!(
+        sorted_keys(&object_summary["availability"]),
+        sorted_keys(&media_summary["availability"])
+    );
+    assert_eq!(object_summary["content_kind"], "object");
+    assert_eq!(object_summary["mime_type"], "application/pdf");
+    assert_eq!(
+        object_summary["codecs"], "",
+        "an object declares no codecs, and the shelf accepts that as its answer"
+    );
+    assert_eq!(
+        object_summary["access_state"], "creator",
+        "the creator of a listing is never offered their own item to buy"
+    );
+}
+
+/// The kind a listing announces and the viewer the open path admits are two
+/// readings of one decision. They are separate functions, so this holds them
+/// to the same answer for both variants; a third spelling of either word would
+/// let a shelf offer an item to a viewer Runtime will refuse.
+#[test]
+fn a_listing_announces_the_kind_the_open_path_enforces() {
+    let media = RuntimeContentIdentityV1::Media(
+        mint_draft_for_composition_journal_test()
+            .media_identity()
+            .unwrap()
+            .clone(),
+    );
+    assert_eq!(
+        super::runtime_custody_content_kind(&media),
+        super::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA
+    );
+    assert_eq!(
+        super::expected_runtime_custody_viewer_capsule(&media),
+        super::ELACITY_PLAYER_CAPSULE_ID
+    );
+
+    let (object_identity, _) = object_listing_package_for_test(0x7c);
+    let object = RuntimeContentIdentityV1::Object(object_identity);
+    assert_eq!(
+        super::runtime_custody_content_kind(&object),
+        super::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT
+    );
+    assert_eq!(
+        super::expected_runtime_custody_viewer_capsule(&object),
+        super::ELACITY_READER_CAPSULE_ID
+    );
 }

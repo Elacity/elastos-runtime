@@ -9,7 +9,6 @@ use custody_provider::{
     PROVISIONING_SCHEMA_V1,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
-use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
     CustodyCommitteeAuthorizationStatementV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
@@ -342,9 +341,7 @@ fn signed_rights_request(
     .unwrap();
     let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
     let (signature, recovery_id) = key
-        .sign_prehash_recoverable(&ethereum_signed_message_hash(
-            &request.canonical_bytes().unwrap(),
-        ))
+        .sign_prehash_recoverable(&request.signing_hash().unwrap())
         .unwrap();
     let mut signature_bytes = signature.to_bytes().to_vec();
     signature_bytes.push(recovery_id.to_byte());
@@ -530,13 +527,27 @@ fn signed_provisioning_with_runtime_seed(
     record: &CustodyNodeProvisioningRecordV1,
     runtime_seed: u8,
 ) -> SignedRuntimeCustodyProvisioningV1 {
+    signed_provisioning_valid_between(
+        record,
+        runtime_seed,
+        issued_unix_seconds(),
+        expires_unix_seconds(),
+    )
+}
+
+fn signed_provisioning_valid_between(
+    record: &CustodyNodeProvisioningRecordV1,
+    runtime_seed: u8,
+    issued_unix_seconds: u64,
+    expires_unix_seconds: u64,
+) -> SignedRuntimeCustodyProvisioningV1 {
     let runtime_key = node_signing_key(runtime_seed);
     let statement = RuntimeCustodyProvisioningStatementV1::new(
         RuntimeOperationIssuerKeyV1::new(runtime_key.verifying_key().to_bytes()).unwrap(),
         record.record_identity().unwrap(),
         RuntimeCustodyProvisioningIdV1::new(digest(0xa5)).unwrap(),
-        issued_unix_seconds(),
-        expires_unix_seconds(),
+        issued_unix_seconds,
+        expires_unix_seconds,
     )
     .unwrap();
     SignedRuntimeCustodyProvisioningV1::new(
@@ -846,6 +857,68 @@ fn custody_provider_process_keeps_provisioning_issuer_while_buyer_runtime_releas
     assert!(!wrong_signing_response.contains("0x02"));
     wrong_signing.stop();
 }
+
+/// The caller's abort decision reads this code. A statement that expired while
+/// the mint was still protecting is refused before the share store is touched —
+/// at request validation, which answers `invalid_request` — so the capsule must
+/// report it with a code that means "not stored", never `backend_unavailable`,
+/// which it also returns from paths that fail after the durable write.
+///
+/// The assertion is membership rather than one exact string on purpose: what
+/// must hold is that the code is one the Runtime treats as proof of no write,
+/// whichever layer refuses. Moving expiry down to the store later would change
+/// the code to `provisioning_refused` and this test should still pass.
+#[test]
+fn custody_provider_process_names_a_pre_write_refusal_so_the_caller_can_keep_the_mint() {
+    let temp = tempfile::tempdir().unwrap();
+    let init_request = prepare_config(temp.path());
+    let base_path = Path::new(init_request["config"]["base_path"].as_str().unwrap());
+    let provider_node = load_provisioned_provider_node(base_path);
+    let record = provisioning_record_with_provider(&provider_node);
+    let expired = signed_provisioning_valid_between(
+        &record,
+        0x42,
+        now_unix_seconds().saturating_sub(600),
+        now_unix_seconds().saturating_sub(540),
+    );
+    let expired_request =
+        CustodyProviderRequestV1::new_provision_node_share(&record, &expired).unwrap();
+
+    let mut provider = ProviderProcess::start();
+    assert_eq!(provider.request(init_request)["status"], "ok");
+    let response = provider.request(request_value(&expired_request));
+    let rendered = serde_json::to_string(&response).unwrap();
+
+    assert_eq!(response["status"], "error", "{rendered}");
+    assert_ne!(
+        response["code"], "backend_unavailable",
+        "an expired statement is refused before the write and must not be reported \
+         with the code that also covers failures after it: {rendered}"
+    );
+    assert!(
+        CUSTODY_PRE_WRITE_REFUSAL_CODES.contains(&response["code"].as_str().unwrap_or_default()),
+        "unexpected code for a pre-write refusal: {rendered}"
+    );
+    assert!(!rendered.contains(temp.path().to_str().unwrap()));
+    assert!(!rendered.contains("sealed_share"));
+
+    // The same record with a live statement still provisions, so the refusal
+    // above was the expiry and not the record.
+    let live_request =
+        CustodyProviderRequestV1::new_provision_node_share(&record, &signed_provisioning(&record))
+            .unwrap();
+    assert_eq!(
+        provider.request(request_value(&live_request))["status"],
+        "ok"
+    );
+    provider.stop();
+}
+
+/// The codes the Runtime's own closed list treats as proof that nothing was
+/// stored, kept here so a change on either side breaks a test rather than
+/// silently downgrading a recoverable mint to a dead one.
+const CUSTODY_PRE_WRITE_REFUSAL_CODES: [&str; 3] =
+    ["invalid_request", "provisioning_refused", "rights_denied"];
 
 #[test]
 fn custody_provider_process_shutdown_exits_while_stdin_remains_open() {

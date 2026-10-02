@@ -5,7 +5,6 @@ use x_wing::kem::{Decapsulator as _, KeyExport as _};
 use x_wing::TryKeyInit as _;
 
 use crate::CencFmp4MediaIdentityV1;
-use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
     CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
@@ -411,9 +410,7 @@ pub(crate) fn make_signed_runtime_release_operation_for_envelope_and_seed(
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());

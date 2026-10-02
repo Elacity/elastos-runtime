@@ -329,7 +329,6 @@ jobs:
               - 'scripts/protected-content-installed-static-audit.py'
               - 'scripts/custody-harness-ci-smoke.sh'
               - 'capsules/custody-provider/**'
-              - 'capsules/availability-provider/**'
               - 'capsules/ipfs-provider/**'
               - 'elastos/crates/elastos-protected-content-*/**'
               # Targeted, not the whole elastos-server crate (which would

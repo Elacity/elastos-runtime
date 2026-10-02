@@ -369,7 +369,8 @@ class PrepareWorkerTest(unittest.TestCase):
         stale.write_bytes(b"stale ignored source renderer")
         data = self.root / "source-home-data"
         env = {**self.env, "ROOT": str(self.repo), "DATA_DIR": str(data),
-               "CARGO_TARGET_DIR": str(self.root / "built")}
+               "CARGO_TARGET_DIR": str(self.root / "built"),
+               "SOURCE_HOME_CARGO_PROFILE_DIR": "release"}
         result = self.command("/bin/bash", "-euc", functions +
                               "\nAPP_CAPSULES=(home-cli)\ninstall_app_capsules\n", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)

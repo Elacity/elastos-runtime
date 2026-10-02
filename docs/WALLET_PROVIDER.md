@@ -178,9 +178,15 @@ For built-in EVM transaction requests, wallet-provider only signs
 chain-provider with `transaction_type=eip155_legacy`, nonce, gas price, gas
 limit, chain ID, from, to, value, and data already bound. Incomplete or
 cross-chain transaction intents fail closed before an approval request is
-created. External wallet transaction signing remains connector-owned; a normal
-MetaMask SIWE link is not treated as transaction-signing support until the
-connector has a real transaction handoff.
+created. External wallet transaction signing remains connector-owned: Runtime
+never holds the key and never signs on the account's behalf. What decides
+whether an account can back a transaction is `signing_available`, not its proof
+type. A connector-linked `siwe` account reports `signing_available=true`
+because the connector carries a real typed transaction handoff, so it is a
+usable transaction default; an external account with no linked connector
+reports `false` and is refused before any effect is raised. Callers must gate
+on `signing_available` alone — gating on the proof type as well would reject a
+linked external wallet that can in fact sign.
 
 For built-in Bitcoin proof requests, wallet-provider only signs
 `elastos.wallet.bitcoin_bip322_request/v1` payloads that bind the managed

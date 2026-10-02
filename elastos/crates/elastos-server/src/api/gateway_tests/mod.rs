@@ -878,6 +878,7 @@ mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
 mod content_sandbox;
+mod creator_channels;
 mod documents;
 mod esp;
 mod frontdoor;
@@ -888,6 +889,7 @@ mod home_agent;
 mod home_system;
 mod inspect;
 mod library;
+mod market_directory;
 mod marketplace;
 mod model;
 #[cfg(target_os = "macos")]

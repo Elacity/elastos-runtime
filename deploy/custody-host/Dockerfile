@@ -7,13 +7,14 @@
 # happens on the playback runtime, never here. That keeps this image's own
 # build needs to exactly 4 binaries: the `elastos` runtime plus the 3 native
 # providers it hosts standalone (`elastos run custody-provider --with
-# availability-provider --with ipfs-provider`) -- the latter two so this
-# container also serves as a content-replica peer. The replica plane
-# (ipfs-provider's Kubo-backed add/pin path) hard-depends on a `kubo` binary
-# it does not build itself (capsules/ipfs-provider/src/main.rs:372
-# ensure_kubo(); find_kubo_binary at :1296 has no in-process fallback), so a
-# 5th binary -- kubo, fetched pre-built rather than compiled -- ships too;
-# see the builder stage's "Kubo" section below.
+# ipfs-provider --with chain-provider`) -- ipfs-provider so this container
+# also serves as a content-replica peer. A replica placed here is proven by
+# its own verified local pin, so no external availability plane ships. The
+# replica plane (ipfs-provider's Kubo-backed add/pin path) hard-depends on a
+# `kubo` binary it does not build itself (capsules/ipfs-provider/src/main.rs
+# ensure_kubo(); find_kubo_binary has no in-process fallback), so a 5th
+# binary -- kubo, fetched pre-built rather than compiled -- ships too; see
+# the builder stage's "Kubo" section below.
 #
 # Deliberately NOT built via scripts/setup-source-home.sh: that installs
 # ~30 unrelated binaries and 33 app capsules for the full-home topology.
@@ -77,9 +78,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/src/target-build,uid=10001,gid=10001 \
     cargo build --release --manifest-path capsules/custody-provider/Cargo.toml
-RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
-    --mount=type=cache,target=/src/target-build,uid=10001,gid=10001 \
-    cargo build --release --manifest-path capsules/availability-provider/Cargo.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/src/target-build,uid=10001,gid=10001 \
     cargo build --release --manifest-path capsules/ipfs-provider/Cargo.toml
@@ -155,7 +153,6 @@ mkdir -p "${data_root}/bin"
 for pair in \
     "elastos/target/release/elastos:elastos" \
     "capsules/custody-provider/target/release/custody-provider:custody-provider" \
-    "capsules/availability-provider/target/release/availability-provider:availability-provider" \
     "capsules/ipfs-provider/target/release/ipfs-provider:ipfs-provider" \
     "capsules/chain-provider/target/release/chain-provider:chain-provider" \
 ; do
@@ -198,25 +195,21 @@ cp "/usr/lib/${libgcc_triplet}/libdl.so.2" /tmp/libdl.so.2
 jq \
     --arg platform "linux-${TARGETARCH}" \
     --arg cs_custody "sha256:$(sha256sum "${data_root}/bin/custody-provider" | cut -d' ' -f1)" \
-    --arg cs_availability "sha256:$(sha256sum "${data_root}/bin/availability-provider" | cut -d' ' -f1)" \
     --arg cs_ipfs "sha256:$(sha256sum "${data_root}/bin/ipfs-provider" | cut -d' ' -f1)" \
     --arg cs_chain "sha256:$(sha256sum "${data_root}/bin/chain-provider" | cut -d' ' -f1)" \
     --argjson sz_custody "$(stat -c %s "${data_root}/bin/custody-provider")" \
-    --argjson sz_availability "$(stat -c %s "${data_root}/bin/availability-provider")" \
     --argjson sz_ipfs "$(stat -c %s "${data_root}/bin/ipfs-provider")" \
     --argjson sz_chain "$(stat -c %s "${data_root}/bin/chain-provider")" \
     '
       .external["custody-provider"].platforms[$platform].checksum = $cs_custody
       | .external["custody-provider"].platforms[$platform].size = $sz_custody
-      | .external["availability-provider"].platforms[$platform].checksum = $cs_availability
-      | .external["availability-provider"].platforms[$platform].size = $sz_availability
       | .external["ipfs-provider"].platforms[$platform].checksum = $cs_ipfs
       | .external["ipfs-provider"].platforms[$platform].size = $sz_ipfs
       | .external["chain-provider"].platforms[$platform].checksum = $cs_chain
       | .external["chain-provider"].platforms[$platform].size = $sz_chain
       | .profiles["custody-host"] = {
           "description": "Components installed on a slim standalone custody-host container (shard-holder plus the chain rights-evidence plane it settles releases against; no media/decrypt planes)",
-          "components": ["custody-provider", "availability-provider", "ipfs-provider", "chain-provider"]
+          "components": ["custody-provider", "ipfs-provider", "chain-provider"]
         }
     ' /src/components.json > "${data_root}/components.json"
 chmod 0600 "${data_root}/components.json"

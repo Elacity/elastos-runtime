@@ -343,6 +343,9 @@ export function createWalletAccountActions({
   }
 
   function onDocumentClick(event) {
+    // Serves the signers section's own open buttons. The pending-requests node
+    // has its own handler for the buttons it renders and stops the click
+    // there, so one click never reaches both.
     const openMethod = event.target && event.target.closest("[data-wallet-open-method]");
     if (openMethod) {
       openApprovalMethod(readText(openMethod.dataset.walletOpenMethod));
