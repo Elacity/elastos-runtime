@@ -261,6 +261,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn('python3 scripts/update-hop-compare.py run "$FIXTURE_ROOT/package/fixture.json"', job)
         upload, = [step for step in steps("macos-cli-update-fixture") if "actions/upload-artifact@" in step]
         self.assertEqual(field(upload, "path"), "${{ env.FIXTURE_ROOT }}/package/results/result.json")
+        self.assertEqual(field(upload, "include-hidden-files"), "true")
         self.assertNotIn("--gateway", job)
 
     def test_cli_fixture_archive_refuses_escape_symlink_and_duplicate_entries(self):

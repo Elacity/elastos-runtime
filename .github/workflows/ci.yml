@@ -697,6 +697,7 @@ jobs:
         with:
           name: macos-cli-update-fixture-receipt
           path: ${{ env.FIXTURE_ROOT }}/package/results/result.json
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
       - name: remove stopped fixture files
