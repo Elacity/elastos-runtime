@@ -24,6 +24,7 @@ const workspace = await import("../capsules/assistant/browser/agent-workspace.js
 const sessions = await import("../capsules/assistant/browser/agent-sessions.js");
 const defer = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
 const terminal = (kind) => ({ events: [{ sequence: 1, kind, terminal: true, data: kind === "output" ? { schema: "elastos.model.output.text/v1", text: "Done" } : {} }], next_cursor: 1, has_more: false });
+const fixtureContext = { context_window_tokens: 4096, max_output_tokens: 1024 };
 
 test("content intent survives missing catalog and overlapping refresh; hosted replacement is deliberate", async t => {
   t.after(() => live.selectLiveOffer(""));
@@ -307,7 +308,7 @@ async function fixture(cancelReject = false, saved = null) {
     const body = JSON.parse(init.body);
     calls.push({ op, body });
     let data;
-    if (op === "offers_list") data = { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] };
+    if (op === "offers_list") data = { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext }] };
     else if (op === "runs_create") data = { run_id: "run-fixture", sequence_cursor: 0 };
     else if (op === "runs_get") data = { run_id: "run-fixture", status: "running" };
     else if (op === "runs_events") data = await events.promise;
@@ -375,7 +376,7 @@ test("an immediately failed create settles without polling events", async () => 
     const op = new URL(url).pathname.split("/").pop();
     calls.push(op);
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-full", sequence_cursor: 0, status: "failed",
@@ -397,7 +398,7 @@ test("a retained unknown create settles from the create view without polling", a
     const op = new URL(url).pathname.split("/").pop();
     calls.push(op);
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-pruned", sequence_cursor: 0, status: "settlement_unknown",
@@ -447,7 +448,7 @@ test("an attached poll at cursor 7 settles from a retained terminal event", asyn
     const body = init?.body ? JSON.parse(init.body) : null;
     calls.push({ op, body });
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-attached", sequence_cursor: 7, status: "running",
@@ -477,7 +478,7 @@ test("a completed pruned journal states that live output was not retained", asyn
     const op = new URL(url).pathname.split("/").pop();
     calls.push(op);
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-completed-pruned", sequence_cursor: 0, status: "completed",
@@ -504,7 +505,7 @@ test("an attached poll of a completed pruned journal states that output was not 
     const body = init?.body ? JSON.parse(init.body) : null;
     calls.push({ op, body });
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-completed-events", sequence_cursor: 2, status: "running",
@@ -609,7 +610,7 @@ for (const mode of ["lost_response", "invalid_json", "missing_run_id", "invalid_
   globalThis.fetch = async (url, init) => {
     const op = new URL(url).pathname.split("/").pop();
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     assert.equal(op, "runs_create");
     const body = JSON.parse(init.body);
@@ -794,7 +795,7 @@ async function runUnretainedLiveTurn(t, { create, eventsPages = [] }) {
     if (op === "offers_list") {
       offerLists += 1;
       return { ok: true, json: async () => ({ offers: [
-        { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+        { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
       ] }) };
     }
     if (op === "runs_create") return { ok: true, json: async () => create };
@@ -889,7 +890,7 @@ test("immediate failed create shows the provider result and restores it after sa
     const op = new URL(url).pathname.split("/").pop();
     calls.push(op);
     if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
     ] }) };
     if (op === "runs_create") return { ok: true, json: async () => ({
       run_id: "run-overflow", sequence_cursor: 2, status: "failed",
@@ -1115,7 +1116,7 @@ test("actual composer preserves draft for missing runs and unknown acceptance un
     calls.push({ op, body: JSON.parse(init.body) });
     if (op === "runs_get") return { ok: false, status: 404, json: async () => ({ code: "run_not_found", message: "model run not found" }) };
     return { ok: true, json: async () => op === "offers_list"
-      ? { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] }
+      ? { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext }] }
       : op === "runs_create" ? { run_id: "new-draft-run", sequence_cursor: 0 } : terminal("settlement_unknown") };
   };
   const draft = { text: "new unsent prompt", parts: [{ id: "attachment", kind: "file", name: "notes.txt", text: "reference" }] };
@@ -1182,7 +1183,7 @@ test("only a matching fresh invocation refusal settles a failed create", async (
     globalThis.fetch = async (url, init) => {
       const op = new URL(url).pathname.split("/").pop();
       if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
-        { id: offerId, title: "Fixture", operation: "text.generate", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+        { id: offerId, title: "Fixture", operation: "text.generate", input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext },
       ] }) };
       if (op !== "runs_create") throw new Error(`unexpected ${op}`);
       const body = JSON.parse(init.body); calls.push(body);

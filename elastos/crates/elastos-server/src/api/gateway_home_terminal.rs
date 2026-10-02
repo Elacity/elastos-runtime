@@ -60,6 +60,36 @@ pub(super) struct HomeTerminalStreamQuery {
     ticket: Option<String>,
 }
 
+pub(super) async fn admitted_terminal_ticket(path: &str, query: Option<&str>) -> bool {
+    let Some(path) = path.strip_prefix("/api/apps/home-cli/terminal/sessions/") else {
+        return false;
+    };
+    let Some((session_id, operation)) = path.split_once('/') else {
+        return false;
+    };
+    if !matches!(operation, "events" | "input") {
+        return false;
+    }
+    let mut tickets = url::form_urlencoded::parse(query.unwrap_or("").as_bytes())
+        .filter(|(key, _)| key == "ticket");
+    let Some((_, ticket)) = tickets.next() else {
+        return false;
+    };
+    if tickets.next().is_some() {
+        return false;
+    }
+    if let Some(session) = home_terminal_session(session_id).await {
+        return ticket.as_ref()
+            == if operation == "events" {
+                session.stream_ticket.as_str()
+            } else {
+                session.input_ticket.as_str()
+            };
+    }
+    operation == "events"
+        && archived_home_terminal_replay(session_id, Some(&ticket), None, now_unix_ms()).is_some()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HomeTerminalResizeRequest {

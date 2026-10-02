@@ -141,6 +141,17 @@ The provider binds these facts before dispatch:
 Secrets, raw provider credentials, and private endpoint details do not belong in
 the session journal or App-visible result.
 
+For a local llama offer, `offers_list` includes `context.context_window_tokens`
+for one engine slot and `context.max_output_tokens` for the selected profile.
+Assistant packs against these values. For local llama offers only, a text/v1 or
+text/v2 input can include `max_output_tokens`; Runtime binds that value in the
+input hash. Hosted offers reject this field with `context_rejected`. An omitted
+value uses the local profile limit. Before generation, the provider asks the pinned
+engine to count the exact chat request with its template and special tokens.
+It sends generation only when the counted input and requested answer fit the
+slot. The offer's input and output byte policies remain separate transport
+bounds.
+
 ## Stream lifecycle
 
 A model request follows one observable lifecycle:

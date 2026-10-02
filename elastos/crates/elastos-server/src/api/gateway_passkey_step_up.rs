@@ -267,14 +267,8 @@ async fn passkey_step_up_begin_inner(
         anyhow::bail!("original passkey credential is unavailable");
     }
     let mut options = manager.begin_authentication(&ceremony_id, &rp.id)?;
-    options
-        .public_key
-        .allow_credentials
-        .retain(|credential| credential.id == pending.credential_id);
-    if options.public_key.allow_credentials.len() != 1 {
-        manager.cancel_challenge(&ceremony_id);
-        anyhow::bail!("original passkey credential is unavailable");
-    }
+    // The original launch and stored credential are already checked above.
+    // Anonymous begin options keep IDs private; step-up selects this binding.
     options.public_key.allow_credentials = vec![CredentialDescriptor {
         type_: "public-key".to_string(),
         id: pending.credential_id.clone(),
@@ -1517,6 +1511,27 @@ mod tests {
     #[tokio::test]
     async fn begin_limits_authentication_to_original_passkey_and_cancel_is_one_shot() {
         let fixture = fixture();
+        let mut store = IdentityStore::new(fixture.data_dir.path()).unwrap();
+        store.load().unwrap();
+        store.add_credential(StoredCredential {
+            credential_id: "other-account-credential".to_string(),
+            public_key: "other-account-public-key".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+        store.save().unwrap();
+        {
+            let manager = fixture.state.identity_manager().unwrap();
+            let mut manager = manager.lock().await;
+            let anonymous = manager
+                .begin_authentication("anonymous-login", "localhost")
+                .unwrap();
+            assert!(anonymous.public_key.allow_credentials.is_empty());
+            let encoded = serde_json::to_string(&anonymous).unwrap();
+            assert!(!encoded.contains(&fixture.credential_id));
+            assert!(!encoded.contains("other-account-credential"));
+            assert!(manager.cancel_challenge("anonymous-login"));
+        }
         let begin = passkey_step_up_begin_inner(
             &fixture.state,
             &fixture.host_headers,

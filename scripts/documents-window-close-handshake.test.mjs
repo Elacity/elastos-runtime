@@ -10,7 +10,7 @@ const shellWindowsSource = fs.readFileSync(
   "utf8",
 );
 const documentsSource = fs.readFileSync(
-  new URL("../capsules/documents/browser/index.html", import.meta.url),
+  new URL("../capsules/documents/browser/documents.js", import.meta.url),
   "utf8",
 );
 

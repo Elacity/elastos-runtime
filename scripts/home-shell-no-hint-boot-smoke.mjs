@@ -274,6 +274,7 @@ function summaryFor(activeShell) {
 
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
+  getElementById(id) { return this.querySelector(`#${id}`); },
   activeElement: null,
   body: elementForSelector("body"),
   documentElement: elementForSelector("html"),
