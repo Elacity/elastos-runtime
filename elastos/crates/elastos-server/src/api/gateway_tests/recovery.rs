@@ -461,6 +461,7 @@ async fn import_raw_full_recovery_bundle_with_terminal_retry(
 async fn test_legacy_recovery_kit_routes_are_absent() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
 
     for path in [
         "/api/auth/recovery/create",
@@ -470,9 +471,10 @@ async fn test_legacy_recovery_kit_routes_are_absent() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
                     .method("POST")
                     .uri(path)
+                    .header("x-elastos-home-token", &authority.home_token)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),

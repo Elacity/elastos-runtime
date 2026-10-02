@@ -23,21 +23,6 @@ const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_ASSET_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_OPAQUE_ORIGIN: &str = "null";
-pub(super) fn is_allowed_capsule_origin(origin: &axum::http::HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    if origin == BROWSER_CAPSULE_OPAQUE_ORIGIN {
-        return true;
-    }
-    match url::Url::parse(origin) {
-        Ok(url) => matches!(
-            url.host_str(),
-            Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
-        ),
-        Err(_) => false,
-    }
-}
 
 struct BrowserCapsule {
     root: PathBuf,
@@ -264,7 +249,10 @@ async fn serve_browser_capsule_asset(
             BROWSER_CAPSULE_ASSET_CORP
         };
 
-    let is_document = relative_path == capsule.entrypoint;
+    let is_document = matches!(
+        content_type(relative_path),
+        "text/html; charset=utf-8" | "application/xhtml+xml" | "image/svg+xml"
+    );
     let cache_control = browser_capsule_cache_control(relative_path, raw_query);
     let etag = browser_capsule_versioned_static_asset(relative_path, raw_query)
         .then(|| browser_capsule_etag(&bytes));
@@ -292,6 +280,15 @@ async fn serve_browser_capsule_asset(
             );
             headers.insert("referrer-policy", "no-referrer".parse().unwrap());
             headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            if is_document {
+                if let Some(policy) = shell_content_security_policy(
+                    request_headers,
+                    app,
+                    relative_path == capsule.entrypoint,
+                ) {
+                    headers.insert("content-security-policy", policy.parse().unwrap());
+                }
+            }
             return response;
         }
     }
@@ -318,19 +315,22 @@ async fn serve_browser_capsule_asset(
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     if is_document {
-        if let Some(policy) = shell_content_security_policy(request_headers, app) {
+        if let Some(policy) =
+            shell_content_security_policy(request_headers, app, relative_path == capsule.entrypoint)
+        {
             headers.insert("content-security-policy", policy.parse().unwrap());
         }
     }
     response
 }
 
-fn shell_content_security_policy(headers: &axum::http::HeaderMap, app: &str) -> Option<String> {
-    if app != super::gateway::HOME_CAPSULE_ID && !super::gateway::is_trusted_home_shell_id(app) {
-        return None;
-    }
+fn shell_content_security_policy(
+    headers: &axum::http::HeaderMap,
+    app: &str,
+    entrypoint: bool,
+) -> Option<String> {
     let home_source = home_document_origin(headers)?;
-    let is_home_host = app == super::gateway::HOME_CAPSULE_ID;
+    let is_home_host = app == super::gateway::HOME_CAPSULE_ID && entrypoint;
     let frame_ancestors = if is_home_host {
         "'none'".to_string()
     } else {
@@ -344,13 +344,23 @@ fn shell_content_security_policy(headers: &axum::http::HeaderMap, app: &str) -> 
             format!("{home_source} 'unsafe-inline'"),
         )
     };
-    let connect_source = if app == super::gateway::HOME_CLI_SHELL_ID {
+    let connect_source = if !is_home_host {
         format!("{default_source} {}", home_websocket_origin(&home_source)?)
     } else {
         default_source.clone()
     };
+    let sandbox = if is_home_host {
+        ""
+    } else {
+        "sandbox allow-scripts allow-forms allow-popups allow-downloads; "
+    };
+    let script_source = if is_home_host {
+        "'self'"
+    } else {
+        "'self' 'wasm-unsafe-eval'"
+    };
     Some(format!(
-        "default-src {default_source}; script-src {default_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
+        "{sandbox}default-src {default_source}; script-src {script_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
     ))
 }
 
@@ -944,6 +954,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cached_svg_documents_keep_the_opaque_script_policy_on_revalidation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "test-browser", "Browser test", "app");
+        fs::write(
+            data_dir.path().join("capsules/test-browser/probe.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script href="probe.js"/></svg>"#,
+        )
+        .unwrap();
+        let mut headers = test_request_headers();
+        let first = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("probe.svg"),
+            Some("v=browser-fixture"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let policy = first.headers()["content-security-policy"].clone();
+        assert!(policy.to_str().unwrap().starts_with("sandbox "));
+        assert!(!policy.to_str().unwrap().contains("allow-same-origin"));
+        headers.insert("if-none-match", first.headers()["etag"].clone());
+        let cached = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("probe.svg"),
+            Some("v=browser-fixture"),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(cached.headers()["content-security-policy"], policy);
+    }
+
     #[test]
     fn resolves_installed_data_browser_capsule() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -1082,14 +1127,10 @@ mod tests {
                 .unwrap();
             assert!(csp.contains("frame-src http://localhost:61180"));
             assert!(csp.contains("frame-ancestors http://localhost:61180"));
-            assert!(csp.contains("script-src http://localhost:61180"));
-            assert!(!csp.contains("script-src 'self'"));
-            if shell == "home-cli" {
-                assert!(csp.contains("connect-src http://localhost:61180 ws://localhost:61180"));
-            } else {
-                assert!(csp.contains("connect-src http://localhost:61180;"));
-                assert!(!csp.contains("ws://localhost:61180"));
-            }
+            assert!(csp.contains("script-src 'self'"));
+            assert!(csp.starts_with("sandbox "));
+            assert!(!csp.contains("allow-same-origin"));
+            assert!(csp.contains("connect-src http://localhost:61180 ws://localhost:61180"));
         }
     }
 

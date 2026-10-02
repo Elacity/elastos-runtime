@@ -9,11 +9,12 @@ const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const chatIndexPath = resolve(repoRoot, "capsules/chat-room/browser/index.html");
 const source = readFileSync(chatIndexPath, "utf8");
 
-function extractInlineScript(needle) {
-  const blocks = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  const match = blocks.find((entry) => entry[1].includes(needle));
-  assert(match, `missing inline script for ${needle}`);
-  return match[1];
+function extractScript(needle) {
+  const scripts = [...source.matchAll(/<script src="\.\/([^"?]+)(?:\?[^"]*)?"><\/script>/g)]
+    .map((entry) => readFileSync(resolve(repoRoot, "capsules/chat-room/browser", entry[1]), "utf8"));
+  const script = scripts.find((entry) => entry.includes(needle));
+  assert(script, `missing script for ${needle}`);
+  return script;
 }
 
 class FakeElement {
@@ -189,9 +190,54 @@ function plainJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function checkChatStartup() {
+  const startup = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8")
+    .replace(/^[ \t]*import\b[\s\S]*?;/gm, "")
+    .replaceAll("import.meta.url", JSON.stringify("http://home.example/apps/chat-room/chat-room.js"));
+  for (const token of ["", "chat-test-token"]) {
+    const env = createEnvironment();
+    const calls = [];
+    env.context.window.location.hash = token ? `#home_token=${token}` : "";
+    Object.assign(env.context, {
+      URL,
+      createHomeNavigationClient(options) {
+        calls.push({ type: "navigation", options });
+        return { setQuery(query) { calls.push({ type: "query", query }); } };
+      },
+      createHomeClipboardClient(options) {
+        calls.push({ type: "clipboard", options });
+        return {
+          start() { calls.push({ type: "clipboard-start" }); },
+          writeText(text, options) { calls.push({ type: "copy", text, options }); },
+        };
+      },
+      init(options) { calls.push({ type: "wasm", url: options.module_or_path.href }); },
+    });
+    vm.runInContext(startup, env.context);
+    if (!token) {
+      assert.deepEqual(calls, [], "Unsigned Chat must keep bridge and WASM startup inactive");
+      continue;
+    }
+    assert.deepEqual(calls.map(call => call.type), ["navigation", "clipboard", "clipboard-start", "wasm"]);
+    assert.equal(calls[0].options.homeToken, token);
+    assert.equal(calls[1].options.homeToken, token);
+    assert.equal(calls[1].options.targetId, "chat-room");
+    assert.equal(calls[3].url, "http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=chat-room-ui-20260804a");
+    env.context.elastosChatNavigation({ conversation_id: "fixture" });
+    env.context.elastosChatCopyInvite("fixture-invite");
+    assert.deepEqual(plainJson(calls.slice(4)), [
+      { type: "query", query: { conversation_id: "fixture" } },
+      { type: "copy", text: "fixture-invite", options: { purpose: "conversation.invite" } },
+    ]);
+  }
+  assert.match(source, /id="chat-open-home" href="\/home\/" target="_self"/);
+  assert(!source.includes('id="browser-access-form"'), "Direct Chat must replace its unavailable guest form with Home recovery");
+}
+
 function main() {
-  const accessModeScript = extractInlineScript("data-room-access-mode");
-  const behaviorScript = extractInlineScript("function announceHomeChrome()");
+  checkChatStartup();
+  const accessModeScript = extractScript("data-room-access-mode");
+  const behaviorScript = extractScript("function announceHomeChrome()");
   const env = createEnvironment();
 
   vm.runInContext(accessModeScript, env.context);
@@ -285,7 +331,7 @@ function main() {
   const accessSectionClose = source.indexOf("</section>", accessSectionIndex);
   assert(accessSectionIndex >= 0 && inviteIndex > accessSectionIndex && inviteIndex < accessSectionClose, "Invite creation must stay inside the current access section");
 
-  console.log("PASS chat Home menu, compact rail, and multiline composer behavior");
+  console.log("PASS Chat Home recovery, signed startup, Home menu, compact rail, and multiline composer behavior");
 }
 
 main();

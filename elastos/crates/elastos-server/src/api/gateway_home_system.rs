@@ -5569,7 +5569,7 @@ fn require_home_active_shell_token_context(
     require_home_active_shell_update_token_context(data_dir, headers)
 }
 
-fn require_home_active_shell_wallet_authority(
+pub(super) fn require_home_active_shell_wallet_authority(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<RuntimeWalletAuthority> {
