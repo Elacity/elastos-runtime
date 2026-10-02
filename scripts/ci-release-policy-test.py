@@ -249,7 +249,8 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_engine_build_receipt_uses_the_checked_out_recipe_commit(self):
         build, = [step for step in steps("engine-llama-arm64") if "id: engine-build" in step]
-        self.assertIn('export RECIPE_COMMIT="$(git rev-parse HEAD)"', build)
+        self.assertIn('RECIPE_COMMIT="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)"', build)
+        self.assertIn('export RECIPE_COMMIT\n', build)
         self.assertNotIn("RECIPE_COMMIT: ${{ github.sha }}", JOBS["engine-llama-arm64"])
 
     def test_engine_consumers_gate_the_current_run_input_with_shared_pin(self):

@@ -24,7 +24,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   # Reviewed ARM64 archive pin, shared by the producer and every CI consumer.
-  CI_LLAMA_ARM64_SHA256: da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205
+  CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
   # Only merged code on develop or main saves caches. PR runs restore them but
@@ -123,7 +123,8 @@ jobs:
         id: engine-build
         if: steps.engine-cache.outputs.cache-hit != 'true'
         run: |
-          export RECIPE_COMMIT="$(git rev-parse HEAD)"
+          RECIPE_COMMIT="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)"
+          export RECIPE_COMMIT
           bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
       - name: verify accepted ARM64 engine archive
         run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
