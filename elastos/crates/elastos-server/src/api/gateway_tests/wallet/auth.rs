@@ -67,7 +67,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -92,8 +92,8 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
     let message = challenge_json["challenge"]["message"].as_str().unwrap();
-    assert!(message.contains("https://elastos.elacitylabs.com wants you to sign in"));
-    assert!(message.contains("URI: https://elastos.elacitylabs.com/home/"));
+    assert!(message.contains("http://localhost:61180 wants you to sign in"));
+    assert!(message.contains("URI: http://localhost:61180/home/"));
     assert!(message.contains("elastos://auth/challenge/"));
     assert!(message.contains("elastos://wallet/account/link"));
     assert!(message.contains(&format!("elastos://principal/{}", authority.principal_id)));
@@ -102,7 +102,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let verified = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
@@ -305,12 +305,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         )
         .await
         .unwrap();
-    assert_eq!(standard.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(standard.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["authority"]["signed_in"], false);
+    assert_eq!(standard.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -405,7 +400,7 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -435,7 +430,7 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
 
     let verified = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
@@ -498,7 +493,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         let challenge = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+                test_browser_request("localhost:61180", "http://localhost:61180")
                     .method("POST")
                     .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                     .header(CONTENT_TYPE, "application/json")
@@ -528,7 +523,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         let verified = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+                test_browser_request("localhost:61180", "http://localhost:61180")
                     .method("POST")
                     .uri("/api/apps/home/wallet-connector/evm/link/verify")
                     .header(CONTENT_TYPE, "application/json")
@@ -655,7 +650,7 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -683,7 +678,7 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
 
     let verified = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
@@ -740,7 +735,7 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
 
     let response = app
         .oneshot(
-            test_browser_request("127.0.0.1:8090", "http://127.0.0.1:8090")
+            test_browser_request("127.0.0.1:61180", "http://127.0.0.1:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -765,8 +760,8 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let message = json["challenge"]["message"].as_str().unwrap();
-    assert!(message.contains("http://127.0.0.1:8090 wants you to sign in"));
-    assert!(message.contains("URI: http://127.0.0.1:8090/home/"));
+    assert!(message.contains("http://127.0.0.1:61180 wants you to sign in"));
+    assert!(message.contains("URI: http://127.0.0.1:61180/home/"));
 }
 
 #[tokio::test]
@@ -779,7 +774,7 @@ async fn test_evm_wallet_link_rejects_system_token_without_connector() {
 
     let response = app
         .oneshot(
-            test_browser_request("elastos.local", "null")
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -806,7 +801,7 @@ async fn test_btc_wallet_link_rejects_system_token_without_connector() {
 
     let response = app
         .oneshot(
-            test_browser_request("elastos.local", "null")
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/btc/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -836,7 +831,7 @@ async fn test_wallet_token_cannot_link_bip322_account() {
 
     let response = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/btc/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -858,7 +853,7 @@ async fn test_wallet_token_cannot_link_bip322_account() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        text.contains("home launch token is not authorized for this provider"),
+        text.contains("admitted host and caller"),
         "response: {text}"
     );
 }
@@ -879,7 +874,7 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/bitcoin/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -904,12 +899,12 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
     let message = challenge_json["challenge"]["message"].as_str().unwrap();
-    assert!(message.contains("URI: https://elastos.elacitylabs.com/home/"));
+    assert!(message.contains("URI: http://localhost:61180/home/"));
 
     let verified = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/bitcoin/link/verify")
                 .header(CONTENT_TYPE, "application/json")
@@ -995,7 +990,7 @@ async fn test_evm_auth_challenge_is_single_use() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.local", "https://elastos.local")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -1025,7 +1020,7 @@ async fn test_evm_auth_challenge_is_single_use() {
         let response = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.local", "https://elastos.local")
+                test_browser_request("localhost:61180", "http://localhost:61180")
                     .method("POST")
                     .uri("/api/apps/home/wallet-connector/evm/link/verify")
                     .header(CONTENT_TYPE, "application/json")
@@ -1051,31 +1046,39 @@ async fn test_evm_auth_challenge_is_single_use() {
 #[tokio::test]
 async fn test_evm_auth_challenge_rejects_client_supplied_origin_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let signing_key = EvmSigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/evm/challenge")
-                .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
-                .body(Body::from(
-                    json!({
-                        "address": address,
-                        "chain_id": 20,
-                        "domain": "evil.example"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json!({
+        "address": address,
+        "chain_id": 20,
+        "domain": "evil.example"
+    })
+    .to_string();
+    for (token, expected_status) in [
+        (None, StatusCode::FORBIDDEN),
+        (
+            Some(authority.home_token.as_str()),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let mut request = test_browser_request("localhost:61180", "http://localhost:61180")
+            .method("POST")
+            .uri("/api/auth/evm/challenge")
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header("x-elastos-home-token", token);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
+    assert!(wallet_provider.requests.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -1093,7 +1096,7 @@ async fn test_evm_auth_challenge_requires_wallet_provider() {
 
     let response = app
         .oneshot(
-            test_browser_request("elastos.local", "https://elastos.local")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
@@ -1124,17 +1127,17 @@ async fn test_evm_auth_challenge_requires_wallet_provider() {
 #[tokio::test]
 async fn test_evm_auth_challenge_requires_passkey_front_door() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let signing_key = EvmSigningKey::from_bytes((&[14u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
                 .body(Body::from(
                     json!({
                         "address": address,
@@ -1152,5 +1155,6 @@ async fn test_evm_auth_challenge_requires_passkey_front_door() {
         .await
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("missing home launch token"));
+    assert!(text.contains("Gateway request requires an admitted host and caller"));
+    assert!(wallet_provider.requests.lock().await.is_empty());
 }

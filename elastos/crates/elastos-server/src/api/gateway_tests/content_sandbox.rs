@@ -316,8 +316,8 @@ async fn content_sandbox_opaque_cookie_requests_require_explicit_launch_authorit
         .unwrap();
     assert_eq!(
         bootstrap.status(),
-        StatusCode::OK,
-        "same-origin Home bootstrap remains public"
+        StatusCode::FORBIDDEN,
+        "Home summary now requires its signed session"
     );
     for role in [
         crate::auth::RuntimePrincipalRole::Admin,
@@ -447,6 +447,57 @@ fn copy_operator_site(source: &std::path::Path, destination: &std::path::Path) {
     }
 }
 
+fn write_frontdoor_browser_fixture(data_dir: &std::path::Path, repo: &std::path::Path) {
+    // The real host boot must recover from anonymous API admission failures.
+    copy_operator_site(
+        &repo.join("capsules/home/browser"),
+        &data_dir.join("capsules/home/browser"),
+    );
+    copy_operator_site(
+        &repo.join("capsules/chat-room/browser"),
+        &data_dir.join("capsules/chat-room/browser"),
+    );
+    let root = data_dir.join("capsules/assistant/browser");
+    let html = "<!doctype html><title>Hostile app fixture</title><script src=\"./probe.js\" defer></script><a id=\"escape\" href=\"/apps/assistant/extra.html\" target=\"_blank\">Open app document</a>";
+    for name in ["index.html", "extra.html"] {
+        std::fs::write(root.join(name), html).unwrap();
+    }
+    std::fs::write(root.join("extra.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><script href="probe.js"/><rect width="16" height="16" fill="green"/></svg>"#).unwrap();
+    std::fs::write(
+        root.join("probe.js"),
+        r#"
+window.appProbe = { script: true, reads: {}, requests: [] };
+appProbe.compilation = { wasm: false, javascript: 'allowed' };
+try {
+  appProbe.compilation.wasm = new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])) instanceof WebAssembly.Module;
+} catch (error) { appProbe.compilation.wasmError = error.name; }
+try { new Function('return 1')(); }
+catch (error) { appProbe.compilation.javascript = error.name; }
+for (const [name, read] of Object.entries({
+  cookie: () => document.cookie,
+  storage: () => localStorage.getItem('runtime-sandbox-sentinel')
+})) {
+  try { appProbe.reads[name] = { value: read(), denied: false }; }
+  catch (error) { appProbe.reads[name] = { denied: error.name === 'SecurityError' }; }
+}
+window.runAppRequests = async token => {
+  const results = [];
+  for (const path of ['/api/apps/assistant/workspace', '/api/apps/home/summary']) {
+    try {
+      const response = await fetch(path, { credentials: token ? 'omit' : 'include',
+        headers: token ? { 'x-elastos-home-token': token } : {} });
+      results.push({ path, status: response.status, body: await response.text() });
+    } catch (error) { results.push({ path, failed: error.name }); }
+  }
+  appProbe.requests = results;
+  return results;
+};
+appProbe.ready = true;
+"#,
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires Playwright and Chromium; CI runs this browser boundary regression"]
 async fn content_sandbox_browser() {
@@ -456,20 +507,26 @@ async fn content_sandbox_browser() {
     write_content_fixture(&site_root);
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     copy_operator_site(&repo.join("website/elastos"), &site_root.join("operator"));
-    let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_name(dir.path(), Some("browser-sandbox-fixture"));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let state = test_state(dir.path());
+    write_frontdoor_browser_fixture(dir.path(), &repo);
+    let assistant_token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router_with_api_url(state, format!("http://{addr}"));
     let mut headers = HeaderMap::new();
     headers.insert(HOST, addr.to_string().parse().unwrap());
     let cookie_name = home_session_cookie_name(&headers).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await
     });
     let mut command = tokio::process::Command::new("node");
     command
@@ -478,6 +535,8 @@ async fn content_sandbox_browser() {
         .env("ELASTOS_CONTENT_SANDBOX_CID", TEST_CIDV1)
         .env("ELASTOS_CONTENT_SANDBOX_COOKIE_NAME", cookie_name)
         .env("ELASTOS_CONTENT_SANDBOX_COOKIE_VALUE", authority.home_token)
+        .env("ELASTOS_FRONTDOOR_FIXTURE", "1")
+        .env("ELASTOS_FRONTDOOR_APP_TOKEN", assistant_token)
         .kill_on_drop(true);
     let result = tokio::time::timeout(std::time::Duration::from_secs(90), command.output()).await;
     let _ = shutdown_tx.send(());
