@@ -1868,7 +1868,11 @@ assert(
     includesNormalized(agentsContract, "Before deleting a duplicate ref, prove exact commit identity") &&
     includesNormalized(agentsContract, "Before deleting a worktree, verify its status, untracked files, open files/processes, and protecting ref") &&
     agentsContract.includes("VERDICT: PASS") &&
-    agentsContract.includes("different model") &&
+    includesNormalized(agentsContract, "Each task change needs one independent development review marked PASS") &&
+    includesNormalized(agentsContract, "from a different model family than its author") &&
+    includesNormalized(agentsContract, "verify that the posted verdict covers the current candidate") &&
+    includesNormalized(agentsContract, "Weekly release PRs still need his approval before merge and tag; when he is the author, Anders reviews") &&
+    includesNormalized(agentsContract, "`irzhywau` for security follow-up: he reviews merged security task PRs") &&
     agentsContract.includes("elastos-pr-review <PR>"),
   "Root AGENTS.md must preserve standing branch roles, fetched-base selection, target proof, public-live approval and Browser claim discipline",
 );
