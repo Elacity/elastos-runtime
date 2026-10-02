@@ -1459,6 +1459,39 @@ fn local_model_engine_receipt_args<'a>(
     ))
 }
 
+/// A read-only confinement boundary, separate from engine verification and
+/// offer admission. It can precede installation of the exact pinned bundle.
+#[cfg(target_os = "macos")]
+pub(crate) fn local_model_engine_confinement_bundle(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(component) = manifest.external.get("llama-server") else {
+        return Ok(None);
+    };
+    let platform = detect_platform();
+    let Some(info) = component.platforms.get(&platform) else {
+        return Ok(None);
+    };
+    let (version, checksum, _) = local_model_engine_receipt_args(component, info)?;
+    anyhow::ensure!(
+        Path::new(version).components().count() == 1
+            && Path::new(version)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && checksum.strip_prefix("sha256:").is_some_and(
+                |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+        "local model engine pin is invalid"
+    );
+    let expected = format!("libexec/llama.cpp/{version}/{platform}");
+    anyhow::ensure!(
+        resolve_install_path(component, Some(info)) == Some(expected.as_str()),
+        "local model engine confinement path is invalid"
+    );
+    Ok(Some(data_dir.canonicalize()?.join(expected)))
+}
+
 #[cfg(unix)]
 #[derive(PartialEq)]
 pub(crate) struct LocalModelEngineIdentity {
@@ -3571,6 +3604,43 @@ mod tests {
         assert_eq!(
             fs::read(data.join("bin/effect")).unwrap(),
             b"other component"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn model_confinement_predeclares_only_current_pinned_engine_bundle() {
+        let manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let mut manifest = load_manifest_from_path(&manifest_path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bundle = local_model_engine_confinement_bundle(root.path(), &manifest)
+            .unwrap()
+            .unwrap();
+        assert!(!bundle.exists(), "predeclaration must precede installation");
+        let platform = detect_platform();
+        let version = manifest.external["llama-server"].version.as_ref().unwrap();
+        assert_eq!(
+            bundle,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join(format!("libexec/llama.cpp/{version}/{platform}"))
+        );
+        let info = manifest
+            .external
+            .get_mut("llama-server")
+            .unwrap()
+            .platforms
+            .get_mut(&platform)
+            .unwrap();
+        info.install_path = Some("providers/model-provider".into());
+        assert!(local_model_engine_confinement_bundle(root.path(), &manifest).is_err());
+        manifest.external.remove("llama-server");
+        assert!(
+            local_model_engine_confinement_bundle(root.path(), &manifest)
+                .unwrap()
+                .is_none()
         );
     }
 
