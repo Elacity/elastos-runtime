@@ -190,29 +190,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: env.CI_USE_CACHE == 'true'
         with:
-          # Registry/index cache only: this job never builds the elastos
-          # workspace, and the capsule build artifacts live in the shared
-          # intermediate build dir cached below.
+          # Registry/index cache only. The capsule build artifacts (about
+          # 2.3 GB) are not cached: this job finishes well inside the
+          # source-home critical path, and the develop caches that set wall
+          # time must fit the 10 GB repository cap.
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
-      # The capsule workspaces overlap almost entirely in dependencies, so
-      # `just test-capsules` builds them into one shared target dir; caching
-      # it turns every warm run's dependency builds into fingerprint checks.
-      # The key rotates with any capsule lockfile or toolchain change, which
-      # bounds stale-artifact growth under the restore-keys fallback.
-      - name: restore capsule build artifacts
-        id: capsules-cache
-        if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          # The shared intermediates (root .cargo/config.toml build-dir);
-          # final artifacts stay in each capsule's own small target dir.
-          path: target-build
-          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            capsules-bd-target-${{ runner.os }}-
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
       - name: test own-workspace capsules
@@ -225,13 +210,6 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
-      # Saved only from develop or main, so PR runs never write shared caches.
-      - name: save capsule build artifacts
-        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.capsules-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: target-build
-          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the

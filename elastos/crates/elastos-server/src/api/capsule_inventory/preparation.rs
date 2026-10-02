@@ -24,6 +24,7 @@ const MAX_RECORDS: usize = 64;
 const RESERVATION_SECONDS: u64 = 3600;
 const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CAPACITY_WINDOW_BYTES: u64 = 1024 * 1024;
+const ADMITTED_MODEL_CONTEXT_SIZE: u32 = 4096;
 
 // Static checkpoints retain a useful cause after cleanup without retaining
 // provider text, host paths, credentials or media bytes in the inventory.
@@ -2285,7 +2286,7 @@ fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Val
         _ => anyhow::bail!("admitted model host profile is unavailable"),
     };
     Ok(serde_json::json!({
-        "context_size":4096, "parallel":1, "threads":threads, "batch_threads":threads,
+        "context_size":ADMITTED_MODEL_CONTEXT_SIZE, "parallel":1, "threads":threads, "batch_threads":threads,
         "gpu_layers":gpu_layers, "health_timeout_ms":120000,
         "shutdown_timeout_ms":5000, "enable_thinking":false
     }))
@@ -2442,7 +2443,8 @@ impl ModelActivation {
 }
 
 // The saved activation binds execution identity and policy. The live provider
-// owns wire-schema capabilities; old descriptors keep their original bytes.
+// owns wire-schema capabilities and reports context limits for that profile;
+// old descriptors keep their original bytes.
 fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
     let mut identity = actual.clone();
     let Some(object) = identity.as_object_mut() else {
@@ -2461,6 +2463,18 @@ fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value)
             || schemas.iter().any(|schema| {
                 schema != elastos_model_contract::TEXT_INPUT_V1_SCHEMA
                     && schema != elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            })
+        {
+            return false;
+        }
+    }
+    if let Some(context) = object.remove("context") {
+        // Every admitted startup profile has one slot. These public limits
+        // describe its settings without adding fields to the saved descriptor.
+        if context
+            != serde_json::json!({
+                "context_window_tokens":ADMITTED_MODEL_CONTEXT_SIZE,
+                "max_output_tokens":(ADMITTED_MODEL_CONTEXT_SIZE / 4).clamp(1, 1024)
             })
         {
             return false;
@@ -3576,7 +3590,23 @@ mod tests {
                 let mut live = expected.clone();
                 live["input_schemas"] = schemas;
                 assert!(model_offer_matches(&live, &expected));
+                live["context"] = serde_json::json!({
+                    "context_window_tokens":4096,"max_output_tokens":1024
+                });
+                assert!(model_offer_matches(&live, &expected));
                 live["policy"]["input_bytes_limit"] = serde_json::json!(1);
+                assert!(!model_offer_matches(&live, &expected));
+            }
+            for context in [
+                serde_json::json!(null),
+                serde_json::json!({}),
+                serde_json::json!({"context_window_tokens":8192,"max_output_tokens":1024}),
+                serde_json::json!({"context_window_tokens":4096,"max_output_tokens":4096}),
+                serde_json::json!({"context_window_tokens":"4096","max_output_tokens":1024}),
+                serde_json::json!({"context_window_tokens":4096,"max_output_tokens":1024,"adapter":{}}),
+            ] {
+                let mut live = expected.clone();
+                live["context"] = context;
                 assert!(!model_offer_matches(&live, &expected));
             }
             for schemas in [
@@ -3624,6 +3654,9 @@ mod tests {
                 elastos_model_contract::TEXT_INPUT_V2_SCHEMA
             ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            offer["context"] = serde_json::json!({
+                "context_window_tokens":4096,"max_output_tokens":1024
+            });
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
                 "protocol_version":"elastos.model-provider/v1",
@@ -3781,6 +3814,9 @@ mod tests {
                 elastos_model_contract::TEXT_INPUT_V2_SCHEMA
             ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            offer["context"] = serde_json::json!({
+                "context_window_tokens":4096,"max_output_tokens":1024
+            });
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
                 "protocol_version":"elastos.model-provider/v1", "offers":[offer.clone()],
@@ -5785,6 +5821,9 @@ mod tests {
                 Some(&record.operation_id),
             )
             .await;
+            // Explicit Use keeps A. Release that intent before capacity pressure
+            // may select A for retirement after the catalog moves to B.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             // A remains active in this real provider after the one-entry signed
             // catalog moves to B. Its retirement cannot use B's catalog facts.
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -6708,6 +6747,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/v1/chat/completions/input_tokens':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'input_tokens': 1}).encode())
+            return
         assert self.path == '/v1/chat/completions' and body['model'] == alias
         assert body['chat_template_kwargs'] == {'enable_thinking': False}
         prompt = body['messages'][0]['content']
@@ -6895,6 +6939,8 @@ server.serve_forever()
                 )
                 .await
                 .unwrap();
+            // Let pressure reach the unknown-run gate rather than the Keep gate.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
             let next_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
             next_catalog["entries"][0]["cid"] = serde_json::json!(next_cid);
