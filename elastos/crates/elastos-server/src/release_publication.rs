@@ -1210,7 +1210,11 @@ mod tests {
                 let output = fixture.parent.join("published");
                 fixture.open().unwrap().snapshot_into(&output).unwrap();
                 let publication = Publication::open_published(&output, &fixture.did).unwrap();
-                let path = output.join(name);
+                let path = if name.is_empty() {
+                    output.clone()
+                } else {
+                    output.join(name)
+                };
                 if replacement == "mode" {
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                         .unwrap();
