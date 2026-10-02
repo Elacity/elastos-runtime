@@ -3725,7 +3725,7 @@ mod tests {
             for _ in 0..2 {
                 let request = Request::builder()
                     .uri("/api/capsules/catalog")
-                    .header("host", "localhost:61180")
+                    .header("host", "localhost")
                     .header("origin", "null")
                     .header("x-elastos-home-token", &token)
                     .body(Body::empty())
@@ -3919,7 +3919,7 @@ mod tests {
         ) -> (axum::http::StatusCode, serde_json::Value) {
             use tower::ServiceExt as _;
             let request = axum::http::Request::builder()
-                .header("host", "localhost:61180")
+                .header("host", "localhost")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .header("content-type", "application/json");
@@ -4163,10 +4163,17 @@ mod tests {
             provider.hold.store(true, Ordering::Release);
             let request_app = app.clone();
             let request_token = token.clone();
-            let request = tokio::spawn(async move {
+            // JoinSet aborts held fixture requests if an assertion fails.
+            let mut requests = tokio::task::JoinSet::new();
+            requests.spawn(async move {
                 readiness_catalog_request(&request_app, &request_token, None).await
             });
-            provider.entered.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             // This succeeds while the read is held: no inventory/worker lock spans provider I/O.
             retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
             let config_path = root.path().join("components.json");
@@ -4175,7 +4182,12 @@ mod tests {
                 config["model_catalog"]["publisher_dids"] = serde_json::json!([])
             });
             provider.release.notify_one();
-            let (status, catalog) = request.await.unwrap();
+            let (status, catalog) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
             assert_eq!(status, axum::http::StatusCode::OK);
             assert_eq!(catalog["model_catalog_state"], "unavailable");
             assert!(catalog["capsules"]
@@ -4189,13 +4201,23 @@ mod tests {
                 .iter()
                 .any(|r| r["cid"] == record.package_cid));
             std::fs::write(config_path, original).unwrap();
-            let request =
-                tokio::spawn(async move { readiness_catalog_request(&app, &token, None).await });
-            provider.entered.notified().await;
+            requests.spawn(async move { readiness_catalog_request(&app, &token, None).await });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             crate::auth::revoke_session_grant(root.path(), &context().session_id, now().unwrap())
                 .unwrap();
             provider.release.notify_one();
-            assert_eq!(request.await.unwrap().0, axum::http::StatusCode::FORBIDDEN);
+            let (status, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]

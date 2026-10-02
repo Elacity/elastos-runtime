@@ -9,6 +9,8 @@ let signedSummary = false;
 let resolvePresenceHeartbeat = null;
 let presenceResponseMode = "pending";
 let credentialGetCount = 0;
+const credentialRequests = [];
+let credentialFailure = null;
 
 class FakeClassList {
   constructor() {
@@ -202,8 +204,10 @@ Object.defineProperty(globalThis, "navigator", {
   configurable: true,
   value: {
     credentials: {
-      async get() {
+      async get(request) {
+        credentialRequests.push(request);
         credentialGetCount += 1;
+        if (credentialFailure) throw credentialFailure;
         return null;
       },
     },
@@ -215,7 +219,7 @@ globalThis.window = {
   atob: (value) => Buffer.from(String(value), "base64").toString("binary"),
   btoa: (value) => Buffer.from(String(value), "binary").toString("base64"),
   crypto: { randomUUID: () => "home-shell-auth-gate-smoke" },
-  location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" },
+  location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180", hostname: "localhost" },
   localStorage: { getItem: () => null, removeItem() {}, setItem() {} },
   matchMedia: () => ({ matches: false }),
   performance: { now: () => Date.now() },
@@ -392,6 +396,52 @@ assert(
   credentialGetCount === 1,
   "auth gate did not reach navigator.credentials.get after the explicit lock-face click",
 );
+
+assert(credentialRequests[0].publicKey.allowCredentials.length === 0, "ordinary sign-in changed discovery");
+assert(elementForSelector("#home-older-key-action").hidden === false,
+  "older key action is missing with guest registration disabled");
+const pause = () => new Promise(resolve => setTimeout(resolve, 0));
+const hintInput = elementForSelector("#home-passkey-hint");
+const hint = { schema: "elastos.passkey.hint/v1", credential_id: "AQID", rp_id: "localhost" };
+elementForSelector("#home-older-key-action").click();
+assert(elementForSelector(".home-unlock-card").hidden === false, "older key input stays hidden behind lock face");
+assert(elementForSelector("#home-passkey-hint-panel").hidden === false, "older key input missing");
+const begins = () => requests.filter(request => request.url.endsWith("authenticate/begin")).length;
+for (const invalid of ["", "private-invalid-json", JSON.stringify({ ...hint, credential_id: "AB" }),
+  JSON.stringify({ ...hint, rp_id: "localhost:61180" }), JSON.stringify({ ...hint, extra: "private-extra" }), "x".repeat(1801)]) {
+  hintInput.value = invalid;
+  const before = begins();
+  elementForSelector("#home-unlock-primary").click();
+  await pause();
+  assert(hintInput.value === "", "invalid hint survived attempt");
+  assert(begins() === before, "invalid hint reached the gateway");
+  assert(!elementForSelector("#home-unlock-status").textContent.includes("private-"), "hint reflected in error");
+}
+hintInput.value = JSON.stringify({ ...hint, rp_id: "other.example" });
+elementForSelector("#home-unlock-primary").click();
+await pause();
+assert(credentialGetCount === 1, "wrong RP reached authenticator");
+assert(hintInput.value === "", "wrong RP hint survived attempt");
+hintInput.value = JSON.stringify(hint);
+credentialFailure = new Error("private-AQID-authenticator-error");
+elementForSelector("#home-unlock-primary").click();
+await pause();
+credentialFailure = null;
+assert(credentialGetCount === 2, "valid hint did not reach authenticator");
+assert(hintInput.value === "", "valid hint survived attempt");
+assert(credentialRequests[1].publicKey.allowCredentials.length === 1, "hint did not select exactly one key");
+assert(Buffer.from(credentialRequests[1].publicKey.allowCredentials[0].id).toString("hex") === "010203", "hint selected wrong key");
+assert(!elementForSelector("#home-unlock-status").textContent.includes("AQID"), "authenticator reflected ID");
+assert(requests.filter(request => request.url.endsWith("authenticate/begin")).every(request => request.body === null), "hint sent in anonymous begin");
+hintInput.value = JSON.stringify(hint);
+elementForSelector("#home-passkey-hint-cancel").click();
+assert(hintInput.value === "", "hint survived cancel");
+assert(elementForSelector("#home-passkey-hint-panel").hidden === true, "cancel left recovery panel visible");
+elementForSelector("#home-older-key-action").click();
+hintInput.value = JSON.stringify(hint);
+for (const listener of windowListeners.get("pagehide") || []) listener();
+assert(hintInput.value === "", "hint survived pagehide");
+elementForSelector("#home-passkey-hint-cancel").click();
 
 for (const listener of windowListeners.get("message") || []) {
   listener({

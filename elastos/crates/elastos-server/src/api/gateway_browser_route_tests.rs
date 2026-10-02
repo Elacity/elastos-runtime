@@ -3601,7 +3601,7 @@ async fn test_browser_typed_data_sign_queues_wallet_inbox_approval() {
 }
 
 #[tokio::test]
-async fn test_browser_wallet_approval_routes_allow_remote_page_preflight() {
+async fn test_browser_wallet_approval_routes_refuse_remote_page_preflight() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
 
@@ -3621,26 +3621,11 @@ async fn test_browser_wallet_approval_routes_allow_remote_page_preflight() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|value| value.to_str().ok()),
-        Some("https://ela.city")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("access-control-allow-methods")
-            .and_then(|value| value.to_str().ok()),
-        Some("GET, POST, OPTIONS")
-    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(response
         .headers()
-        .get("access-control-allow-headers")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("x-elastos-home-token")));
+        .get("access-control-allow-origin")
+        .is_none());
 }
 
 struct DelayedFirstRawProvider {
