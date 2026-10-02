@@ -6,12 +6,15 @@ import io
 import json
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import textwrap
 import unittest
+import warnings
+import zipfile
 from unittest import mock
 
 
@@ -216,6 +219,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
             "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
+            "macos-cli-update-fixture": ("macos-cli-update-fixture", "macos-14"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
         self.assertEqual(set(JOBS), set(expected))
@@ -230,6 +234,133 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-capsules", "source-home-linux", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+    def test_cli_fixture_job_requires_an_explicit_dispatch_and_pinned_manifest(self):
+        job = JOBS["macos-cli-update-fixture"]
+        guard = field(job, "if")
+        for event in ("push", "pull_request", "workflow_dispatch"):
+            for artifact in ("", "123"):
+                with self.subTest(event=event, artifact=artifact):
+                    self.assertEqual(evaluate(guard, {
+                        "github.event_name": event,
+                        "inputs.cli_update_fixture_artifact_id": artifact,
+                    }), event == "workflow_dispatch" and bool(artifact))
+        self.assertNotRegex(job, CACHE_RE)
+        self.assertIn("persist-credentials: false", job)
+        self.assertNotIn("GH_TOKEN", job.split("    steps:", 1)[0])
+        fetch, = [step for step in steps("macos-cli-update-fixture")
+                  if step.startswith("name: fetch the immutable signed fixture\n")]
+        self.assertIn("GH_TOKEN: ${{ github.token }}", fetch)
+        self.assertEqual(job.count("GH_TOKEN:"), 1)
+        self.assertIn("ELASTOS_CI_FIXTURE_MANIFEST_SHA256:", job)
+        self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', job)
+        self.assertIn('[[ "$ELASTOS_CI_FIXTURE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]', job)
+        self.assertIn('[[ "$FIXTURE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]', job)
+        self.assertIn('info[\'expired\']', job)
+        self.assertIn("stat.S_ISLNK(mode)", job)
+        self.assertIn("(disk.free - size) / disk.total < .15", job)
+        self.assertIn('python3 scripts/update-hop-compare.py inspect "$FIXTURE_ROOT/package/fixture.json"', job)
+        self.assertIn('python3 scripts/update-hop-compare.py run "$FIXTURE_ROOT/package/fixture.json"', job)
+        upload, = [step for step in steps("macos-cli-update-fixture") if "actions/upload-artifact@" in step]
+        self.assertEqual(field(upload, "path"), "${{ env.FIXTURE_ROOT }}/package/results/result.json")
+        self.assertEqual(field(upload, "include-hidden-files"), "true")
+        self.assertNotIn("--gateway", job)
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: production-positive", job)
+
+    def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
+        mac_steps = steps("source-home-macos")
+        names = [step.splitlines()[0] for step in mac_steps]
+        generate = names.index("name: generate disposable signed install and update fixture")
+        prove = names.index("name: prove install and Carrier update hop and refusals")
+        build = names.index("name: build two actual Runtime versions")
+        capacity = names.index("name: reserve hosted Mac build and fixture capacity")
+        self.assertLess(capacity, names.index("name: source-home into isolated MAC_TEST_HOME"))
+        self.assertIn("prepare-ci-disk", mac_steps[capacity])
+        self.assertEqual(build + 1, generate)
+        self.assertIn("build-ci-hop", mac_steps[build])
+        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[build])
+        self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
+        self.assertEqual(prove, generate + 1)
+        self.assertNotIn("if:", mac_steps[generate])
+        self.assertNotIn("if:", mac_steps[prove])
+        self.assertIn("generate-ci-hop", mac_steps[generate])
+        self.assertIn('--runtime "$CI_HOP_ROOT/build-inputs/elastos-old"', mac_steps[generate])
+        self.assertIn('--next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new"', mac_steps[generate])
+        self.assertIn('--build-receipt "$CI_HOP_ROOT/build-inputs/build.json"', mac_steps[generate])
+        self.assertIn('--support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos"', mac_steps[generate])
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal", mac_steps[prove])
+        self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', mac_steps[prove])
+        self.assertIn('python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json"', mac_steps[prove])
+        for step in mac_steps[generate:prove + 1]:
+            self.assertNotIn("FIXTURE_ARTIFACT_ID", step)
+            self.assertNotIn("GH_TOKEN", step)
+            self.assertNotIn("inputs.", step)
+        upload = mac_steps[names.index("name: retain the safe CI hop receipt")]
+        self.assertEqual(field(upload, "path"), "${{ env.CI_HOP_ROOT }}/package/results/result.json")
+        self.assertEqual(field(upload, "name"), "retain the safe CI hop receipt")
+        self.assertIn("name: macos-cli-update-hop-receipt", upload)
+        self.assertIn("if: always()", upload)
+        cleanup = mac_steps[names.index("name: remove stopped CI hop fixture files")]
+        self.assertIn("get('cleanup', {}).get('passed')", cleanup)
+        self.assertIn("shutil.rmtree(root)", cleanup)
+
+    def test_cli_fixture_archive_refuses_escape_symlink_and_duplicate_entries(self):
+        fetch, = [step for step in steps("macos-cli-update-fixture")
+                  if step.startswith("name: fetch the immutable signed fixture\n")]
+        shell = textwrap.dedent(fetch.split("        run: |\n", 1)[1])
+        scripts = re.findall(r"(?ms)^ *python3 - .*? <<'PY'\n(.*?)^ *PY$", shell)
+        extract = textwrap.dedent(next(script for script in scripts if "zipfile.ZipFile" in script))
+        for case in ("valid", "escape", "absolute", "backslash", "symlink", "duplicate", "forged-receipt", "noncanonical"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package = root / "package"
+                package.mkdir()
+                preserved = root / "outside"
+                preserved.write_bytes(b"preserved operator bytes")
+                archive = root / "input.zip"
+                with warnings.catch_warnings(), zipfile.ZipFile(archive, "w") as target:
+                    warnings.simplefilter("ignore", UserWarning)
+                    name = {"escape": "../outside", "absolute": str(preserved),
+                            "backslash": "..\\outside", "forged-receipt": "results/result.json",
+                            "noncanonical": "payload//input"}.get(case, "fixture.json")
+                    if case == "symlink":
+                        info = zipfile.ZipInfo(name)
+                        info.create_system = 3
+                        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                        target.writestr(info, "../outside")
+                    else:
+                        target.writestr(name, b"verified fixture input")
+                    if case == "duplicate":
+                        target.writestr(name, b"second input")
+                result = subprocess.run([sys.executable, "-c", extract, str(archive), str(package)],
+                                        capture_output=True, text=True)
+                self.assertEqual(preserved.read_bytes(), b"preserved operator bytes")
+                if case == "valid":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((package / "fixture.json").read_bytes(), b"verified fixture input")
+                    self.assertEqual((package / "fixture.json").stat().st_mode & 0o777, 0o600)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unsafe entry", result.stderr)
+                    self.assertEqual(list(package.iterdir()), [])
+
+    def test_cli_fixture_cleanup_requires_an_owned_process_receipt(self):
+        cleanup, = [step for step in steps("macos-cli-update-fixture")
+                    if step.startswith("name: remove stopped fixture files\n")]
+        shell = textwrap.dedent(cleanup.split("        run: |\n", 1)[1])
+        script, = re.findall(r"(?ms)^ *python3 - .*? <<'PY'\n(.*?)^ *PY$", shell)
+        script = textwrap.dedent(script)
+        for receipt in (None, False, True):
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "fixture"
+                results = root / "package/results"
+                results.mkdir(parents=True)
+                if receipt is not None:
+                    (results / "result.json").write_text(json.dumps({"cleanup": {"passed": receipt}}))
+                result = subprocess.run([sys.executable, "-c", script, str(root)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, receipt is True)
+                self.assertEqual(root.exists(), receipt is not True)
 
     def test_engine_cache_has_exact_recipe_key_and_develop_only_writers(self):
         restore, = [step for step in steps("engine-llama-arm64") if "actions/cache/restore@" in step]

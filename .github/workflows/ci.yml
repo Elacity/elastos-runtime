@@ -7,6 +7,14 @@ on:
         description: "Git ref to check out and test"
         required: false
         default: ""
+      cli_update_fixture_artifact_id:
+        description: "Operator-approved immutable signed fixture artifact ID"
+        required: false
+        default: ""
+      cli_update_fixture_manifest_sha256:
+        description: "Operator-approved fixture manifest SHA-256"
+        required: false
+        default: ""
   push:
     # develop pushes keep the shared build caches warm for every PR into develop.
     branches: [main, develop]
@@ -535,6 +543,9 @@ jobs:
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
+      - name: reserve hosted Mac build and fixture capacity
+        timeout-minutes: 10
+        run: python3 scripts/update-hop-compare.py prepare-ci-disk
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -582,6 +593,61 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: build two actual Runtime versions
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
+          test ! -e "$CI_HOP_ROOT"
+          mkdir -p "$CI_HOP_ROOT"
+          echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
+          python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
+            --runtime "$PWD/elastos/target/release/elastos"
+      - name: generate disposable signed install and update fixture
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py generate-ci-hop "$CI_HOP_ROOT/package" \
+            --runtime "$CI_HOP_ROOT/build-inputs/elastos-old" \
+            --next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new" \
+            --build-receipt "$CI_HOP_ROOT/build-inputs/build.json" \
+            --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
+            > "$CI_HOP_ROOT/generation.json"
+      - name: prove install and Carrier update hop and refusals
+        timeout-minutes: 20
+        env:
+          ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal
+          ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
+        run: |
+          set -euo pipefail
+          export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$CI_HOP_ROOT/generation.json")"
+          python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
+          python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
+      - name: retain the safe CI hop receipt
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-cli-update-hop-receipt
+          path: ${{ env.CI_HOP_ROOT }}/package/results/result.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: remove stopped CI hop fixture files
+        if: always() && env.CI_HOP_ROOT != ''
+        run: |
+          python3 -I - "$CI_HOP_ROOT" <<'PY'
+          import json, pathlib, shutil, sys
+          root = pathlib.Path(sys.argv[1])
+          result = root / 'package/results/result.json'
+          if result.exists() and not json.loads(result.read_text()).get('cleanup', {}).get('passed'):
+              raise SystemExit('refusal cleanup was incomplete; disposable runner retains files until teardown')
+          if not result.exists() and (root / 'package/results').exists():
+              raise SystemExit('refusal cleanup receipt is missing; disposable runner retains files until teardown')
+          build = root / 'build-inputs/build.json'
+          if (root / 'build-inputs').exists() and (not build.exists() or not json.loads(build.read_text()).get('cleanup', {}).get('passed')):
+              raise SystemExit('hop builder cleanup is incomplete; disposable runner retains files until teardown')
+          shutil.rmtree(root)
+          PY
       # Packages are uploaded only for tags, main and dispatch runs; PR runs
       # already proved the release build through setup-source-home.
       - name: build and package release binaries
@@ -607,6 +673,105 @@ jobs:
           path: ${{ runner.temp }}/source-home-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+  # Signed bytes come from the operator. This job installs them into a fresh
+  # disposable Home and uses the existing Carrier client for one update hop.
+  macos-cli-update-fixture:
+    name: macos-cli-update-fixture
+    if: github.event_name == 'workflow_dispatch' && inputs.cli_update_fixture_artifact_id != ''
+    runs-on: macos-14
+    timeout-minutes: 45
+    needs: source-gate
+    env:
+      FIXTURE_ARTIFACT_ID: ${{ inputs.cli_update_fixture_artifact_id }}
+      ELASTOS_CI_FIXTURE_MANIFEST_SHA256: ${{ inputs.cli_update_fixture_manifest_sha256 }}
+      ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
+      ELASTOS_CI_FIXTURE_SCOPE: production-positive
+      FIXTURE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: fetch the immutable signed fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$(uname -m)" == arm64 ]]
+          [[ "$FIXTURE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ELASTOS_CI_FIXTURE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          FIXTURE_ROOT="$HOME/.local/share/elastos-ci-update-fixture"
+          [[ ! -e "$FIXTURE_ROOT" ]]
+          mkdir -p "$FIXTURE_ROOT/package"
+          echo "FIXTURE_ROOT=$FIXTURE_ROOT" >> "$GITHUB_ENV"
+          echo "ELASTOS_CI_FIXTURE_REFERENCE=github-actions:${FIXTURE_REPOSITORY}:${FIXTURE_ARTIFACT_ID}" >> "$GITHUB_ENV"
+          gh api "repos/${FIXTURE_REPOSITORY}/actions/artifacts/${FIXTURE_ARTIFACT_ID}" > "$FIXTURE_ROOT/artifact.json"
+          python3 - "$FIXTURE_ROOT/artifact.json" <<'PY'
+          import json, os, pathlib, shutil, sys
+          info = json.load(open(sys.argv[1]))
+          if info['id'] != int(os.environ['FIXTURE_ARTIFACT_ID']) or info['expired']:
+              raise SystemExit('fixture artifact identity is unavailable')
+          if not 0 < info['size_in_bytes'] <= 3 * 1024**3:
+              raise SystemExit('fixture artifact size is outside the bounded input')
+          disk = shutil.disk_usage(pathlib.Path(sys.argv[1]).parent)
+          if (disk.free - info['size_in_bytes'] - 3 * 1024**3) / disk.total < .15:
+              raise SystemExit('fixture download would breach the bounded disk reserve')
+          PY
+          gh api "repos/${FIXTURE_REPOSITORY}/actions/artifacts/${FIXTURE_ARTIFACT_ID}/zip" > "$FIXTURE_ROOT/input.zip"
+          python3 - "$FIXTURE_ROOT/input.zip" "$FIXTURE_ROOT/package" <<'PY'
+          import os, pathlib, shutil, stat, sys, zipfile
+          root = pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              items = archive.infolist()
+              size = sum(item.file_size for item in items)
+              disk = shutil.disk_usage(root)
+              if len(items) > 50000 or size > 3 * 1024**3 or (disk.free - size) / disk.total < .15:
+                  raise SystemExit('fixture would breach the bounded disk reserve')
+              seen = set()
+              for item in items:
+                  path = pathlib.PurePosixPath(item.filename)
+                  mode = item.external_attr >> 16
+                  if (not item.filename or path.is_absolute() or '..' in path.parts
+                          or str(path) != item.filename.rstrip('/')
+                          or (item.filename not in ('fixture.json', 'manifest.json', 'payload/')
+                              and not item.filename.startswith('payload/'))
+                          or '\\' in item.filename or any(ord(c) < 32 for c in item.filename)
+                          or stat.S_ISLNK(mode) or item.filename in seen):
+                      raise SystemExit('fixture archive contains an unsafe entry')
+                  seen.add(item.filename)
+              archive.extractall(root)
+          for path in root.rglob('*'):
+              path.chmod(0o700 if path.is_dir() else 0o600)
+          PY
+      - name: install and update through Carrier
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py inspect "$FIXTURE_ROOT/package/fixture.json" --root "$FIXTURE_ROOT/package"
+          python3 scripts/update-hop-compare.py run "$FIXTURE_ROOT/package/fixture.json" "$FIXTURE_ROOT/package/results" --root "$FIXTURE_ROOT/package"
+      - name: retain the safe journey receipt
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-cli-update-fixture-receipt
+          path: ${{ env.FIXTURE_ROOT }}/package/results/result.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: remove stopped fixture files
+        if: always() && env.FIXTURE_ROOT != ''
+        run: |
+          python3 - "$FIXTURE_ROOT" <<'PY'
+          import json, pathlib, shutil, sys
+          root = pathlib.Path(sys.argv[1])
+          result = root / 'package/results/result.json'
+          if result.exists() and not json.loads(result.read_text()).get('cleanup', {}).get('passed'):
+              raise SystemExit('fixture cleanup was incomplete; disposable runner retains files until teardown')
+          if not result.exists() and (root / 'package/results').exists():
+              raise SystemExit('fixture cleanup receipt is missing; disposable runner retains files until teardown')
+          shutil.rmtree(root)
+          PY
 
   # Publish a GitHub Release for v* tags, attaching the per-architecture
   # binary packages built by the source-home jobs. Only runs when every
