@@ -90,6 +90,7 @@ pinned_field() {
 detect_platform() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) echo "linux-amd64" ;;
+        Linux-aarch64 | Linux-arm64) echo "linux-arm64" ;;
         Darwin-arm64) echo "darwin-arm64" ;;
         *) die "no Runtime-owned model host profile for $(uname -s)-$(uname -m)" ;;
     esac
