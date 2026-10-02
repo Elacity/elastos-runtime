@@ -8,12 +8,14 @@ on:
         required: false
         default: ""
   push:
-    branches: [main]
+    # develop pushes keep the shared build caches warm for every PR into develop.
+    branches: [main, develop]
     tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -22,6 +24,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # An explicit dispatch ref may select a tag independently of the workflow ref.
+  CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
+  # Only merged code on develop or main saves caches. PR runs restore them but
+  # never save, so one PR cannot evict every other PR's cache (10 GB repo cap)
+  # or write a cache that later runs trust.
+  CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -59,11 +67,14 @@ jobs:
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |
+          python3 scripts/ci-release-policy-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
           python3 scripts/prepare-release-platform-test.py
           python3 scripts/media-tools-build-test.py
+          python3 scripts/verify-linux-arm64-package-test.py
+          python3 scripts/update-hop-compare-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
 
@@ -80,11 +91,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
@@ -102,16 +115,20 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The three provider workspaces are release-built from cold on every
       # run otherwise; with the cache restored, cargo only re-fingerprints
       # the workspace members and reuses every dependency artifact.
-      - name: cache provider build artifacts
-        uses: actions/cache@v4
+      - name: restore provider build artifacts
+        id: providers-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@v4
         with:
           path: |
             capsules/protected-content-protect-provider/target
@@ -125,6 +142,15 @@ jobs:
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
           cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
+      - name: save provider build artifacts
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            capsules/protected-content-protect-provider/target
+            capsules/protected-content-decrypt-provider/target
+            capsules/custody-provider/target
+          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo test
         working-directory: elastos
         env:
@@ -148,6 +174,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           # Registry/index cache only: this job never builds the elastos
           # workspace, and the capsule build artifacts live in the shared
@@ -155,13 +182,16 @@ jobs:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The capsule workspaces overlap almost entirely in dependencies, so
       # `just test-capsules` builds them into one shared target dir; caching
       # it turns every warm run's dependency builds into fingerprint checks.
       # The key rotates with any capsule lockfile or toolchain change, which
       # bounds stale-artifact growth under the restore-keys fallback.
-      - name: cache capsule build artifacts
-        uses: actions/cache@v4
+      - name: restore capsule build artifacts
+        id: capsules-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@v4
         with:
           # The shared intermediates (root .cargo/config.toml build-dir);
           # final artifacts stay in each capsule's own small target dir.
@@ -181,6 +211,13 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+      # Saved only from develop or main, so PR runs never write shared caches.
+      - name: save capsule build artifacts
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.capsules-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target-build
+          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
@@ -250,12 +287,13 @@ jobs:
       # Builds the host `elastos` binary the smoke script itself invokes
       # (identity show, node peer add, node status) -- same cache shape as
       # the test-elastos/lint jobs above.
-      - if: steps.should-run.outputs.run == 'true'
+      - if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-custody-smoke-bd
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
         uses: docker/setup-buildx-action@v3
       # Pre-warms the custody-host image's BuildKit layer cache via the GHA
@@ -265,11 +303,14 @@ jobs:
       - name: pre-build custody-host image (GHA layer cache)
         if: steps.should-run.outputs.run == 'true'
         run: |
+          cache_args=()
+          if [[ "${CI_USE_CACHE}" == "true" ]]; then
+            cache_args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+          fi
           docker buildx build \
             -f deploy/custody-host/Dockerfile \
             -t elastos-custody-host:latest \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+            "${cache_args[@]}" \
             --load \
             .
       - name: custody harness smoke
@@ -292,14 +333,19 @@ jobs:
   # packaging the binaries for its architecture — no separate cold
   # build-release job is needed.
   source-home-linux:
-    name: source-home-linux (${{ matrix.os }})
+    name: source-home-linux (${{ matrix.check_name || matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: source-gate
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # Jetson's Ubuntu 22.04 host provides glibc 2.35.
+        os: [ubuntu-24.04, ubuntu-22.04-arm]
+        include:
+          # Keep the established check name; os controls the build and artifact.
+          - os: ubuntu-22.04-arm
+            check_name: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
@@ -311,28 +357,33 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
+      # A stalled mirror once held this step until the 90-minute job limit.
       - name: install host prerequisites
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: ${{ matrix.os == 'ubuntu-22.04-arm' && '0' || '1' }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           USER_HOME="${HOME}"
-          SOURCE_HOME="${RUNNER_TEMP}/elastos-source-home"
+          SOURCE_HOME="${HOME}/.elastos-ci/source-home"
           mkdir -p "${SOURCE_HOME}"
           export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
@@ -348,17 +399,71 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: fetch pinned Jetson engine archive
+        if: matrix.os == 'ubuntu-22.04-arm'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 36501810782 \
+            --repo Elacity/elastos-runtime \
+            --name llama-b10516-ubuntu22.04-arm64-cpu-36501810782-1 \
+            --dir "${RUNNER_TEMP}/llama-arm64-bundle"
+          echo 'da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205  llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz' \
+            | (cd "${RUNNER_TEMP}/llama-arm64-bundle" && sha256sum --check -)
       - name: local-carrier setup smoke
+        env:
+          ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
-          scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+          ELASTOS_LOCAL_TEST_ROOT="${HOME}/.elastos-ci/carrier-fixture" scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+      # Playwright 1.59.1's archive extractor hangs on Node 26 (#40724).
+      # Keep the pinned operator protocol; use Node 24 only for installation.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: prepare pinned installed model journey
+        timeout-minutes: 15
+        run: |
+          scripts/ci-installed-journeys.sh prepare
+          npm install --ignore-scripts --no-package-lock --prefix elastos/tools/browser-playwright-engine
+          PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" elastos/tools/browser-playwright-engine/node_modules/.bin/playwright install --with-deps chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: installed Home and local reply journeys
+        run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
+      - name: installed journey summary
+        if: always()
+        run: scripts/ci-installed-journeys.sh summary
+      - name: upload installed journey proof
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: installed-journeys-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/source-home-journeys/*.json
+            ${{ runner.temp }}/source-home-journeys/*.png
+            ${{ runner.temp }}/source-home-journeys/*.log
+          retention-days: 7
+          if-no-files-found: error
+      # ARM PRs also need the archive for the Jetson compatibility check.
+      # Other PR jobs already proved the release build through setup-source-home.
       - name: build and package release binaries
+        if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
           cargo build --manifest-path elastos/Cargo.toml --workspace --release
           scripts/package-release-binaries.sh
+      - name: verify Jetson release compatibility
+        if: matrix.os == 'ubuntu-22.04-arm'
+        run: |
+          python3 scripts/verify-linux-arm64-package.py elastos-runtime-linux-arm64.tar.gz \
+            --source-commit "$(git rev-parse HEAD)" \
+            --source-tree "$(git rev-parse HEAD^{tree})" \
+            --receipt elastos-runtime-linux-arm64.receipt.json
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v5
@@ -367,6 +472,7 @@ jobs:
           path: |
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
+            elastos-runtime-*.receipt.json
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@v5
@@ -392,16 +498,19 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
+          save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
       # skips the download entirely (ELACITY-2308).
       - name: cache kubo release
+        if: env.CI_USE_CACHE == 'true'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/kubo-cache
@@ -411,23 +520,88 @@ jobs:
           set -euo pipefail
           scripts/seed-kubo-cache.sh \
             "${RUNNER_TEMP}/kubo-cache" \
-            "${RUNNER_TEMP}/elastos-mac-test-home/Library/Application Support/elastos" \
+            "${HOME}/.elastos-ci/source-home/Library/Application Support/elastos" \
             darwin-arm64
-      - name: require 16 GiB free disk
+      - name: reclaim unused stock Xcode and require build headroom
         run: |
           set -euo pipefail
-          df -Pk .
-          df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
+          python3 - <<'PYCODE'
+          import json, os, re, shutil, stat, subprocess
+          from pathlib import Path
+
+          def unused_xcodes(applications, selected):
+              applications = applications.resolve(strict=True)
+              protected = set()
+              for path in selected:
+                  resolved = path.resolve(strict=True)
+                  for bundle in (resolved, *resolved.parents):
+                      if bundle.parent == applications and bundle.suffix == ".app":
+                          protected.add(bundle)
+                          break
+              return sorted(path for path in applications.iterdir()
+                            if re.fullmatch(r"Xcode_[0-9]+(?:\.[0-9]+)*\.app", path.name)
+                            and not path.is_symlink() and path.is_dir()
+                            and path.resolve(strict=True) not in protected)
+
+          def identity(path):
+              value = path.lstat()
+              return value.st_dev, value.st_ino, value.st_mode
+
+          def selected_xcodes():
+              selected = [Path(subprocess.check_output(["xcode-select", "-p"], text=True).strip())]
+              if os.environ.get("DEVELOPER_DIR"):
+                  selected.append(Path(os.environ["DEVELOPER_DIR"]))
+              generic = Path("/Applications/Xcode.app")
+              if generic.exists() or generic.is_symlink():
+                  selected.append(generic)
+              return selected
+
+          if (os.environ.get("GITHUB_ACTIONS"), os.environ.get("RUNNER_ENVIRONMENT"),
+              os.environ.get("RUNNER_OS")) != ("true", "github-hosted", "macOS"):
+              raise SystemExit("stock Xcode reclaim requires a GitHub-hosted Mac")
+          applications = Path("/Applications")
+          root_identity = identity(applications)
+          if not stat.S_ISDIR(root_identity[2]):
+              raise SystemExit("/Applications must be a physical directory")
+          selected = selected_xcodes()
+          candidates = {path: identity(path) for path in unused_xcodes(applications, selected)}
+          usage = shutil.disk_usage(".")
+          # setup-source-home documents a roughly 10 GiB cold-build footprint.
+          # Leave 12 GiB for that build and retain 12% for installed journeys.
+          required = max((usage.total * 15 + 99) // 100,
+                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          print(json.dumps({"stage": "before", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required,
+                            "selected": [str(path.resolve(strict=True)) for path in selected],
+                            "unused_stock_xcode": [path.name for path in candidates]}), flush=True)
+          for path in candidates:
+              if usage.free >= required:
+                  break
+              still_unused = unused_xcodes(applications, selected_xcodes())
+              if identity(applications) != root_identity or identity(path) != candidates[path]:
+                  raise SystemExit("stock Xcode reclaim scope identity changed")
+              if not stat.S_ISDIR(identity(path)[2]) or path not in still_unused:
+                  raise SystemExit("stock Xcode reclaim candidate became protected or changed type")
+              print("Reclaim unused stock Xcode: " + path.name, flush=True)
+              subprocess.run(["sudo", "rm", "-rf", "--", str(path)], check=True)
+              usage = shutil.disk_usage(".")
+          print(json.dumps({"stage": "after", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required}), flush=True)
+          if usage.free < required:
+              raise SystemExit("stock Xcode reclaim did not provide build headroom")
+          PYCODE
       - name: install host prerequisites
+        timeout-minutes: 15
         run: brew install e2fsprogs coturn ffmpeg
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: "1"
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           USER_HOME="${HOME}"
-          MAC_TEST_HOME="${RUNNER_TEMP}/elastos-mac-test-home"
+          MAC_TEST_HOME="${HOME}/.elastos-ci/source-home"
           mkdir -p "${MAC_TEST_HOME}"
           export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
@@ -439,10 +613,52 @@ jobs:
             install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
           done
           export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
+          python3 - <<'PYCODE'
+          import json, shutil
+          usage = shutil.disk_usage(".")
+          required = max((usage.total * 15 + 99) // 100,
+                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          print(json.dumps({"stage": "before_source_home", "total_bytes": usage.total,
+                            "available_bytes": usage.free, "required_bytes": required}), flush=True)
+          if usage.free < required:
+              raise SystemExit("source-home build headroom is unavailable after host prerequisites")
+          PYCODE
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      # Use the same bounded installer runtime as the Linux jobs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: prepare pinned installed model journey
+        timeout-minutes: 15
+        run: |
+          scripts/ci-installed-journeys.sh prepare
+          npm install --ignore-scripts --no-package-lock --prefix elastos/tools/browser-playwright-engine
+          PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" elastos/tools/browser-playwright-engine/node_modules/.bin/playwright install chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: installed Home and local reply journeys
+        run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
+      - name: installed journey summary
+        if: always()
+        run: scripts/ci-installed-journeys.sh summary
+      - name: upload installed journey proof
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: installed-journeys-macos-14
+          path: |
+            ${{ runner.temp }}/source-home-journeys/*.json
+            ${{ runner.temp }}/source-home-journeys/*.png
+            ${{ runner.temp }}/source-home-journeys/*.log
+          retention-days: 7
+          if-no-files-found: error
+      # Packages are uploaded only for tags, main and dispatch runs; PR runs
+      # already proved the release build through setup-source-home.
       - name: build and package release binaries
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
@@ -472,7 +688,7 @@ jobs:
     name: publish-github-release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - lint
       - test-elastos

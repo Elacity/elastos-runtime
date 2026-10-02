@@ -780,6 +780,7 @@ mod private_request_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn private_request_write_failure_kills_and_reaps_child() {
         let marker = std::env::temp_dir().join(format!(
             "elastos-browser-private-request-{}-{}",
@@ -796,7 +797,7 @@ mod private_request_tests {
             ])
             .arg(&marker)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
@@ -814,9 +815,15 @@ mod private_request_tests {
             );
         }
 
+        // A pipe read end forces a write error independently of inherited readers.
+        let read_end: std::os::fd::OwnedFd = child.stdout.take().unwrap().into();
+        child.stdin = Some(read_end.into());
         let result = write_private_supervisor_request(&mut child, b"private request");
 
-        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("private request write failed"));
         assert!(child.try_wait().unwrap().is_some());
         let _ = fs::remove_file(marker);
     }

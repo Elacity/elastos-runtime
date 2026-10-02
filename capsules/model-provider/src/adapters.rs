@@ -8,7 +8,7 @@ use crate::contract::{
     RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
-use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
+use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault, LocalTiming, LocalTimingStage};
 use elastos_model_contract::decisions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1480,30 +1480,53 @@ fn cancel_local_text(
 }
 
 async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
-    let result = match run_queued_local_text_worker(&mut task).await {
+    let timing =
+        matches!(&task.backend, LocalTextBackend::LocalLlama { .. }).then(LocalTiming::start);
+    if let Some(timing) = &timing {
+        timing.record(LocalTimingStage::RunStarted);
+    }
+    let result = match run_queued_local_text_worker(&mut task, timing.as_ref()).await {
         Ok(result) => result,
-        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => return true,
-        Err(fault) => ReconcileResult::Terminal {
-            events: Vec::new(),
-            status: match fault.error.class {
-                ErrorClass::Cancelled => RunStatus::Cancelled,
-                ErrorClass::SettlementUnknown => RunStatus::SettlementUnknown,
-                _ => RunStatus::Failed,
-            },
-            output: None,
-            error: Some(fault.error),
-            backend_report: None,
-        },
+        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => {
+            if let Some(timing) = &timing {
+                timing.record(LocalTimingStage::RunTimeout);
+            }
+            return true;
+        }
+        Err(fault) => {
+            if let Some(timing) = &timing {
+                timing.record(LocalTimingStage::RunFailed);
+            }
+            ReconcileResult::Terminal {
+                events: Vec::new(),
+                status: match fault.error.class {
+                    ErrorClass::Cancelled => RunStatus::Cancelled,
+                    ErrorClass::SettlementUnknown => RunStatus::SettlementUnknown,
+                    _ => RunStatus::Failed,
+                },
+                output: None,
+                error: Some(fault.error),
+                backend_report: None,
+            }
+        }
     };
+    let applied = send_worker_apply_update(
+        &task.run_id,
+        task.generation,
+        WorkerApplyGuard::None,
+        result,
+        &task.updates,
+    )
+    .await;
+    if let (Some(timing), Err(fault)) = (&timing, &applied) {
+        timing.record(if fault.error.class == ErrorClass::BackendTimeout {
+            LocalTimingStage::RunTimeout
+        } else {
+            LocalTimingStage::RunFailed
+        });
+    }
     matches!(
-        send_worker_apply_update(
-            &task.run_id,
-            task.generation,
-            WorkerApplyGuard::None,
-            result,
-            &task.updates,
-        )
-        .await,
+        applied,
         Err(AdapterFault {
             error: RunError {
                 class: ErrorClass::BackendTimeout,
@@ -1516,12 +1539,13 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
 
 async fn run_queued_local_text_worker(
     task: &mut LocalTextWorkerTask,
+    timing: Option<&LocalTiming>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
     let (engines, offer_id) = match &task.backend {
         LocalTextBackend::LocalLlama {
             engines, offer_id, ..
         } => (engines.clone(), offer_id.clone()),
-        _ => return run_local_text_worker_inner(task).await,
+        _ => return run_local_text_worker_with_timing(task, timing).await,
     };
     let mut cancel = task.cancel_rx.clone();
     // The single execution permit covers startup, generation, and uncertain-stop
@@ -1542,7 +1566,7 @@ async fn run_queued_local_text_worker(
     let mut result = tokio::select! {
         biased;
         _ = cancel.wait_for(|cancelled| *cancelled) => Ok(worker_settlement_unknown_result()),
-        result = run_local_text_worker_inner(task) => result,
+        result = run_local_text_worker_with_timing(task, timing) => result,
     };
     if !matches!(
         &result,
@@ -1793,8 +1817,16 @@ async fn run_http_artifact_status_worker_inner(
     parse_http_job_status_result(value, offer, state, poll_interval_ms)
 }
 
+#[cfg(test)]
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    run_local_text_worker_with_timing(task, None).await
+}
+
+async fn run_local_text_worker_with_timing(
+    task: &mut LocalTextWorkerTask,
+    timing: Option<&LocalTiming>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
     if !matches!(&task.backend, LocalTextBackend::LocalLlama { .. }) {
         require_external_http_containment(task.hosted_socket.as_deref())?;
@@ -1914,6 +1946,9 @@ async fn run_local_text_worker_inner(
             .post(count_url)
             .header("content-type", "application/json")
             .json(&body);
+        if let Some(timing) = timing {
+            timing.record(LocalTimingStage::InputTokensStarted);
+        }
         let counted = tokio::select! {
             _ = task.cancel_rx.changed() => return Ok(worker_settlement_unknown_result()),
             response = count_request.send() => response.map_err(|err| map_text_reqwest_failure(err, true))?,
@@ -1934,6 +1969,9 @@ async fn run_local_text_worker_inner(
                     "missing chat input token count",
                 )
             })?;
+        if let Some(timing) = timing {
+            timing.record(LocalTimingStage::InputTokensCompleted);
+        }
         let output_tokens = body["max_tokens"].as_u64().unwrap_or(0);
         if input_tokens.saturating_add(output_tokens) >= u64::from(context_window_tokens) {
             return Err(AdapterFault::context(
@@ -1979,6 +2017,9 @@ async fn run_local_text_worker_inner(
         }
         builder
     };
+    if let Some(timing) = timing {
+        timing.record(LocalTimingStage::GenerationStarted);
+    }
     let response = tokio::select! {
         _ = task.cancel_rx.changed() => {
             // Closing a local or hosted HTTP stream does not confirm backend stop.
@@ -1994,6 +2035,7 @@ async fn run_local_text_worker_inner(
     let mut line = Vec::new();
     let mut event_data = Vec::new();
     let mut stream_state = LocalTextStreamState::new();
+    let mut first_delta_seen = false;
     let mut done = false;
     let mut flush_timer = tokio::time::interval_at(
         tokio::time::Instant::now() + LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
@@ -2063,6 +2105,12 @@ async fn run_local_text_worker_inner(
                 match parsed {
                     ParsedTextStreamEvent::Delta(delta) if !delta.is_empty() => {
                         append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
+                        if !first_delta_seen {
+                            if let Some(timing) = timing {
+                                timing.record(LocalTimingStage::FirstDelta);
+                            }
+                            first_delta_seen = true;
+                        }
                         if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES
                             || local_text_event_bytes(&stream_state.delta_buffer)?
                                 >= task.offer.policy.event_bytes_limit
@@ -2118,6 +2166,9 @@ async fn run_local_text_worker_inner(
         "text": stream_state.output_text,
     });
     sanitize_output(&output, &task.offer)?;
+    if let Some(timing) = timing {
+        timing.record(LocalTimingStage::GenerationCompleted);
+    }
     Ok(ReconcileResult::Terminal {
         events: Vec::new(),
         status: RunStatus::Completed,
