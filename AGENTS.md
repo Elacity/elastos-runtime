@@ -267,6 +267,7 @@ capsules, provider config, and `components.json`.
   Keep explicit human acceptance gates recorded in the owning issue. Request
   `irzhywau` for security follow-up: he reviews merged security task PRs, and a
   finding goes into an existing issue or a revert when it reopens a hole.
+  When he authors a security task PR, Anders conducts the follow-up review.
   Weekly release PRs still need his approval before merge and tag; when he is
   the author, Anders reviews. Also request the feature owner when required.
 - Use one development review round per coherent change. Resolve findings in

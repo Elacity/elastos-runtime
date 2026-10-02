@@ -1873,6 +1873,7 @@ assert(
     includesNormalized(agentsContract, "verify that the posted verdict covers the current candidate") &&
     includesNormalized(agentsContract, "Weekly release PRs still need his approval before merge and tag; when he is the author, Anders reviews") &&
     includesNormalized(agentsContract, "`irzhywau` for security follow-up: he reviews merged security task PRs") &&
+    includesNormalized(agentsContract, "When he authors a security task PR, Anders conducts the follow-up review") &&
     agentsContract.includes("elastos-pr-review <PR>"),
   "Root AGENTS.md must preserve standing branch roles, fetched-base selection, target proof, public-live approval and Browser claim discipline",
 );
