@@ -1202,5 +1202,18 @@ class ReleaseSignerInputTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class InstallerAdmissionTest(unittest.TestCase):
+    def test_installer_refused_cases_run_in_the_release_source_gate(self):
+        # Keep installer admission in the existing CI entry point. All Homes,
+        # transports, binaries and signing seeds in this suite are unit fixtures.
+        script = Path(__file__).with_name("install-bootstrap-test.py").resolve()
+        result = subprocess.run(
+            [sys.executable, str(script), "--bash", "/bin/bash"],
+            cwd=script.parent.parent, capture_output=True, text=True, timeout=180,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
