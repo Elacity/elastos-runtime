@@ -66,7 +66,7 @@ export async function exerciseNavigationConsumers(makeClient) {
     document: { querySelector: () => ({}) }, parentUri: () => "localhost://Users/fixture",
     showWorkspace() {}, async hydrateDestinationRoots() {}, announceHomeChrome() {},
   });
-  const archiveSource = read("capsules/archive-manager/browser/index.html");
+  const archiveSource = read("capsules/archive-manager/browser/archive-manager.js");
   vm.runInContext(["openLibraryObject", "hydrateStatOnly", "hydrateArchiveEntries"].map(name => selectionFunction(archiveSource, name)).join("\n"), archive);
   await archive.openLibraryObject({ uri: archive.objectUri });
   assert.deepEqual(reports["archive-manager"], { objectUri: archive.objectUri });
@@ -145,7 +145,7 @@ export async function exerciseNavigationConsumers(makeClient) {
 
   // Rust owns the guarded Chat selection. This exact bridge consumes its JSON;
   // the native regression covers the producer with current/stale guards.
-  const chatSource = read("capsules/chat-room/browser/index.html");
+  const chatSource = read("capsules/chat-room/browser/chat-room.js");
   const chat = vm.createContext({ globalThis: {}, homeNavigation: client("chat-room") });
   const bridge = chatSource.match(/globalThis\.elastosChatNavigation =[^;]+;/);
   assert.ok(bridge, "Chat must connect the actual Rust selector to Home navigation");
