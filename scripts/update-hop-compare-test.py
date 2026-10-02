@@ -2,6 +2,8 @@
 """Observer regressions with mocked processes and transport; no Runtime Homes."""
 
 import contextlib
+import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -167,6 +169,383 @@ class TargetIdentityTests(unittest.TestCase):
         calls, result = self.run_observer("did:key:operator", local_did="")
         self.assertFalse(any(role == "operator" and args[0] == "gateway" for role, args in calls))
         self.assertIn("identity unavailable", result["paths"]["operator"]["reason"])
+
+
+class CliFixtureTests(unittest.TestCase):
+    """Public byte fixtures and process fakes prove observer behavior only."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": observer.CLI_MODE,
+                         "reference": "github-actions:test/repo:123", "approval": "isolated observer self-test",
+                         "proof_kind": "harness-self-test", "source": {"commit": "a" * 40, "tree": "b" * 40},
+                         "old": {"version": "0.7.1-rc.1", "source": {"commit": "c" * 40, "tree": "d" * 40}},
+                         "new": {"version": "0.7.1-rc.2", "source": {"commit": "e" * 40, "tree": "f" * 40}},
+                         "channel": "canary", "signer_did": "did:key:zfixture", "platform": "aarch64-darwin",
+                         "files": {}, "publications": {}, "selectors": {
+                             "m1-install": {"positive": "old", "refusals": list(observer.CLI_REFUSALS)},
+                             "m2-discovery": {"positive": "new", "refusals": list(observer.CLI_REFUSALS)}}}
+        def add(name, content, mode=0o600, cid=True):
+            relative = "payload/" + name
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            raw = json.dumps(content, sort_keys=True).encode() if isinstance(content, dict) else content
+            path.write_bytes(raw)
+            binding = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "mode": mode}
+            if cid:
+                binding["cid"] = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("=")
+            self.manifest["files"][relative] = binding
+            return relative
+        self.add = add
+        signer = self.manifest["signer_did"]
+        self.manifest["installer"] = add("install.sh", b"frozen test bytes", cid=False)
+        catalogue = add("catalogue.json", {"signer_did": "did:key:zcatalog", "signature": "00" * 64,
+                                              "payload": {"schema": "elastos.model.catalog/v1"}})
+        components = add("components.json", {"capsules": {"test": {"cid": "qualified"}}, "external": {},
+                                                "model_catalog": {"head_cid": self.manifest["files"][catalogue]["cid"],
+                                                                  "publisher_dids": ["did:key:zcatalog"]}})
+        old_bin, new_bin, bad_bin = (add(name, value, 0o755) for name, value in
+                                    (("old-bin", b"old"), ("new-bin", b"new"), ("bad-bin", b"bad")))
+        for phase in observer.CLI_PHASES:
+            bin_path = old_bin if phase == "old" else bad_bin if phase == "tampered-binary" else new_bin
+            def binding(relative):
+                return {key: self.manifest["files"][relative][key] for key in ("cid", "sha256")} | {"size": self.manifest["files"][relative]["bytes"]}
+            binary_binding = binding(bin_path)
+            if phase == "tampered-binary":
+                binary_binding["sha256"] = self.manifest["files"][new_bin]["sha256"]
+            payload = {"schema": "elastos.release/v1", "channel": "canary",
+                       "version": self.manifest["old" if phase == "old" else "new"]["version"],
+                       "platforms": {"aarch64-darwin": {"binary": binary_binding, "components": binding(components)}}}
+            release = add(phase + "/release.json", {"payload": payload, "signature": "00" * 64,
+                                                   "signer_did": "did:key:zother" if phase == "wrong-signer-release" else signer})
+            head = add(phase + "/head.json", {"payload": {"schema": "elastos.release.head/v1", "channel": "canary", "version": payload["version"],
+                                                         "latest_release_cid": self.manifest["files"][release]["cid"], "release_sha256": self.manifest["files"][release]["sha256"]},
+                                             "signature": "00" * 64, "signer_did": "did:key:zother" if phase == "wrong-signer-head" else signer})
+            receipt = add(phase + "/receipt.json", {"last_head_cid": self.manifest["files"][head]["cid"], "last_release_cid": self.manifest["files"][release]["cid"]}, cid=False)
+            self.manifest["publications"][phase] = {"head": head, "release": release, "receipt": receipt,
+                                                     "binary": bin_path, "components": components, "catalogue": catalogue}
+        self.manifest["holder"] = {"files": {".local/bin/elastos": old_bin, observer.CLI_DATA + "/components.json": components,
+                                               observer.CLI_DATA + "/bin/ipfs-provider": add("ipfs-provider", b"provider", 0o755),
+                                               observer.CLI_DATA + "/bin/kubo": add("kubo", b"kubo", 0o755),
+                                               observer.CLI_DATA + "/ipfs-repo/blocks/fixture": add("public-block", b"public block")}, "content": {}}
+        for publication in self.manifest["publications"].values():
+            for key in ("head", "release", "binary", "components", "catalogue"):
+                relative = publication[key]
+                self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+        self.manifest["consumer"] = {"files": {"config/test.json": add("consumer-config.json", {"test": True}),
+                                                 "state/value": add("consumer-state", b"preserve data"),
+                                                 "capsules/test/entry.wasm": add("qualified-support", b"qualified support")}}
+        self.manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules"]}
+        self.config = {"schema": self.manifest["schema"], "mode": observer.CLI_MODE, "root": str(self.root),
+                       "immutable": {"reference": self.manifest["reference"], "manifest": "manifest.json"}}
+        self.freeze()
+        self.env = patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": self.config["immutable"]["sha256"],
+                                                    "ELASTOS_CI_FIXTURE_REFERENCE": self.manifest["reference"], "ELASTOS_CI_REQUIRE_REAL_RUNTIME": "0"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def freeze(self):
+        observer.write(self.root / "manifest.json", self.manifest)
+        self.config["immutable"]["sha256"] = observer.digest(self.root / "manifest.json")
+        if hasattr(self, "env"):
+            observer.os.environ["ELASTOS_CI_FIXTURE_MANIFEST_SHA256"] = self.config["immutable"]["sha256"]
+
+    def admit(self):
+        with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature") as signatures:
+            admitted = observer.cli_admit(self.config)
+            self.assertEqual(signatures.call_count, 15)
+            return admitted
+
+    def test_admission_requires_complete_public_package_and_independent_pin(self):
+        self.assertEqual(self.admit()["proof_kind"], "harness-self-test")
+        observer.os.environ["ELASTOS_CI_FIXTURE_MANIFEST_SHA256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "independently pinned"):
+            observer.cli_admit(self.config)
+
+    def test_payload_parity_extra_files_and_symlinks_are_refused(self):
+        path = self.root / self.manifest["installer"]
+        original = path.read_bytes()
+        path.write_bytes(b"altered")
+        with self.assertRaisesRegex(ValueError, "size differs|hash differs"):
+            self.admit()
+        path.write_bytes(original)
+        extra = self.root / "payload/extra"
+        extra.write_text("unlisted")
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.admit()
+        extra.unlink()
+        path.unlink()
+        path.symlink_to(self.root / "payload/kubo")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.admit()
+
+    def test_outer_retrieval_cannot_repin_inner_snapshot_or_mock_proof(self):
+        observer.os.environ["ELASTOS_CI_FIXTURE_REFERENCE"] = "github-actions:test/repo:456"
+        self.admit()
+        self.config["immutable"]["reference"] = "fixture:substituted"
+        with self.assertRaisesRegex(ValueError, "manifest identity"):
+            self.admit()
+        self.config["immutable"]["reference"] = self.manifest["reference"]
+        observer.os.environ["ELASTOS_CI_REQUIRE_REAL_RUNTIME"] = "1"
+        with self.assertRaisesRegex(ValueError, "requires real-runtime"):
+            self.admit()
+
+    def test_actual_signature_helper_and_native_binary_admission_refuse_stubs(self):
+        with self.assertRaisesRegex(ValueError, "signature invalid"):
+            observer.cli_signature(Path(__file__).with_name("install.sh"),
+                                   self.root / self.manifest["publications"]["old"]["head"],
+                                   "elastos.release.head.v1", self.manifest["signer_did"], observer.cli_environment(self.root))
+        with self.assertRaisesRegex(ValueError, "Mach-O"):
+            observer.cli_macho(self.root / self.manifest["publications"]["old"]["binary"], "aarch64-darwin")
+        native = self.root / "header-only"
+        native.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16)
+        observer.cli_macho(native, "aarch64-darwin")
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            observer.cli_macho(native, "x86_64-darwin")
+
+    def test_cleanup_does_not_signal_recycled_historic_process_groups(self):
+        class Exited:
+            pid, returncode = 30000, 0
+            def poll(self):
+                return 0
+            def wait(self, timeout=None):
+                return 0
+        manager = observer.CliProcesses(self.root)
+        manager.processes = [Exited()]
+        unrelated = {"pid": 30001, "parent": 1, "group": 30000, "command": "/unowned/process"}
+        with patch.object(observer, "cli_census", return_value=[unrelated]), patch.object(observer.os, "killpg") as groups, patch.object(observer.os, "kill") as pids, patch.object(observer.time, "sleep"):
+            cleanup = manager.cleanup()
+        groups.assert_not_called()
+        pids.assert_not_called()
+        self.assertTrue(cleanup["errors"])
+
+    def test_cleanup_stops_verified_orphan_root_and_its_group_children(self):
+        manager = observer.CliProcesses(self.root)
+        executable = self.root / "payload/kubo"
+        manager.roots[str(executable)] = {observer.digest(executable)}
+        rows = [{"pid": 31000, "parent": 1, "group": 31000, "command": str(executable)},
+                {"pid": 31001, "parent": 31000, "group": 31000, "command": "/usr/bin/owned-child"}]
+        def kill(pid, sig):
+            rows[:] = [row for row in rows if row["pid"] != pid]
+        with patch.object(observer, "cli_census", side_effect=lambda: list(rows)), patch.object(observer.os, "kill", side_effect=kill) as pids, patch.object(observer.time, "sleep"):
+            cleanup = manager.cleanup()
+        self.assertEqual({call.args[0] for call in pids.call_args_list}, {31000, 31001})
+        self.assertEqual(cleanup["remaining_pids"], [])
+        self.assertFalse(cleanup["errors"])
+
+    def test_paths_private_json_and_phase_mapping_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "noncanonical"):
+            observer.cli_path(self.root, "payload/../outside")
+        relative = self.add("kubo-config.json", {"Identity": {"PrivKey": "private operator material"}})
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "private key"):
+            self.admit()
+        (self.root / relative).unlink()
+        del self.manifest["files"][relative]
+        self.manifest["selectors"]["m2-discovery"]["positive"] = "old"
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "phase mapping"):
+            self.admit()
+
+    def test_wrong_signer_and_receipt_admission_cannot_skip_verification(self):
+        with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature", side_effect=ValueError("fixture envelope signature invalid")):
+            with self.assertRaisesRegex(ValueError, "signature invalid"):
+                observer.cli_admit(self.config)
+        self.manifest["publications"]["wrong-signer-head"] = self.manifest["publications"]["new"]
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "signer phase"):
+            self.admit()
+
+    def test_refusal_requires_exact_boundary_unchanged_files_and_real_failure(self):
+        failure = {"exit": 1}
+        self.assertEqual(observer.cli_refusal("wrong-signer-head", failure, "Checking for updates", "Carrier connection failed", True)["status"], "failed")
+        self.assertEqual(observer.cli_refusal("wrong-signer-release", failure, "Fetching release:", "Signer DID mismatch", True)["status"], "passed")
+        self.assertEqual(observer.cli_refusal("wrong-signer-head", failure, "Fetching release:", "Signer DID mismatch", True)["status"], "failed")
+        for code, unchanged in ((0, True), (124, True), (1, False)):
+            self.assertEqual(observer.cli_refusal("tampered-binary", {"exit": code}, "Downloading binary", "SHA-256 mismatch", unchanged)["status"], "failed")
+        self.assertEqual(observer.cli_refusal("tampered-binary", failure, "Downloading binary\nDownloading components", "SHA-256 mismatch", True)["status"], "failed")
+
+    def fake_run(self, apply_stderr="", bootstrap_did="did:key:holder", cleanup_error=False,
+                 holder_stderr="", holder_shutdown_stderr="", http_fallback=False):
+        manifest, root, calls, processes = self.manifest, self.root, [], []
+        holder_data = root / "results/homes/holder" / observer.CLI_DATA
+        def phase():
+            actual = observer.digest(holder_data / observer.CLI_PUBLISHER / "release-head.json")
+            return next(name for name, pub in manifest["publications"].items() if manifest["files"][pub["head"]]["sha256"] == actual)
+        def copy_publication(home_path, name, first=False, gateway=""):
+            pub = manifest["publications"][name]
+            directory = home_path / observer.CLI_DATA
+            directory.mkdir(parents=True, exist_ok=True)
+            for key, target in (("binary", home_path / ".local/bin/elastos"), ("components", directory / "components.json"), ("catalogue", directory / "model-catalog.json")):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((root / pub[key]).read_bytes())
+            if first:
+                source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": "fixture-ticket",
+                          "publisher_node_id": "f" * 64, "install_path": str(home_path / ".local/bin/elastos"), "installed_version": manifest[name]["version"], "head_cid": "", "gateways": [gateway]}
+                observer.write(directory / "sources.json", {"default_source": "default", "sources": [source]})
+            else:
+                sources = observer.read(directory / "sources.json")
+                sources["sources"][0].update(installed_version=manifest[name]["version"], head_cid=manifest["files"][pub["head"]]["cid"])
+                observer.write(directory / "sources.json", sources)
+        class Process:
+            def __init__(self, argv, **kwargs):
+                self.argv, self.home = argv, Path(kwargs["cwd"])
+                self.stderr = kwargs["stderr"]
+                self.pid, self.returncode = 20000 + len(processes), 0
+                calls.append((argv, kwargs["env"]))
+                processes.append(self)
+                stdout, stderr = "", ""
+                args = argv[1:]
+                if args[0] == "gateway":
+                    self.returncode = None
+                    stderr = holder_stderr
+                elif args[:2] == ["node", "info"]:
+                    key = self.home / observer.CLI_DATA / "identity/device.key"
+                    key.parent.mkdir(parents=True, exist_ok=True)
+                    key.write_bytes(b"observer fake identity bytes only")
+                    stdout = json.dumps({"did": "did:key:holder" if self.home.name == "holder" else "did:key:consumer"})
+                elif argv[0].endswith("/kubo"):
+                    Path(kwargs["env"]["IPFS_PATH"]).mkdir(parents=True)
+                elif argv[0] == "/bin/bash" or args[0] == "update":
+                    name = phase()
+                    if name in observer.CLI_REFUSALS:
+                        self.returncode = 1
+                        if name == "tampered-binary":
+                            stdout, stderr = "Downloading binary", "SHA-256 mismatch"
+                        else:
+                            stdout = "Fetching release:" if name == "wrong-signer-release" else "Checking for updates"
+                            stderr = "Envelope signer differs from the pinned maintainer DID" if argv[0] == "/bin/bash" else "Signer DID mismatch"
+                            if argv[0] == "/bin/bash" and name == "wrong-signer-release":
+                                stdout = "Verifying release signature"
+                    elif argv[0] == "/bin/bash":
+                        copy_publication(self.home, name, first=True, gateway=kwargs["env"]["ELASTOS_PUBLISHER_GATEWAY"])
+                    elif args[-1] == "--check":
+                        stdout = "Discovery: Carrier"
+                    else:
+                        current = observer.read(self.home / observer.CLI_DATA / "sources.json")["sources"][0]["installed_version"]
+                        if current == manifest["new"]["version"]:
+                            stdout = "Installed release is up to date."
+                        else:
+                            copy_publication(self.home, "new")
+                            stdout, stderr = "Discovery: Carrier", apply_stderr
+                    if http_fallback and args[0] == "update":
+                        import http.client
+                        gateway = observer.read(self.home / observer.CLI_DATA / "sources.json")["sources"][0]["gateways"][0]
+                        connection = http.client.HTTPConnection(gateway.removeprefix("http://"), timeout=5)
+                        connection.request("GET", "/release.json")
+                        connection.getresponse().read()
+                        connection.close()
+                elif args == ["--version"]:
+                    value = (self.home / ".local/bin/elastos").read_bytes()
+                    stdout = "elastos " + manifest["old" if value == b"old" else "new"]["version"] + "\n"
+                kwargs["stdout"].write(stdout.encode())
+                kwargs["stderr"].write(stderr.encode())
+                kwargs["stdout"].flush()
+                kwargs["stderr"].flush()
+            def poll(self):
+                return self.returncode
+            def wait(self, timeout=None):
+                return self.returncode
+        def stop(pid, sig):
+            proc = next(proc for proc in processes if proc.pid == pid)
+            if proc.argv[1] == "gateway" and holder_shutdown_stderr:
+                proc.stderr.write(holder_shutdown_stderr.encode())
+                proc.stderr.flush()
+            proc.returncode = 0
+        def census():
+            if cleanup_error:
+                raise OSError("fixture process census unavailable")
+            return [{"pid": proc.pid, "parent": 0, "group": proc.pid, "command": " ".join(proc.argv)} for proc in processes if proc.poll() is None]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(observer, "cli_admit", return_value=manifest))
+            stack.enter_context(patch.object(observer.subprocess, "Popen", Process))
+            stack.enter_context(patch.object(observer, "cli_census", side_effect=census))
+            stack.enter_context(patch.object(observer.os, "killpg", side_effect=stop))
+            stack.enter_context(patch.object(observer.os, "kill", side_effect=stop))
+            stack.enter_context(patch.object(observer.time, "sleep"))
+            stack.enter_context(patch.object(observer, "health", side_effect=lambda _: any(proc.poll() is None for proc in processes)))
+            stack.enter_context(patch.object(observer, "lock_state", side_effect=lambda _: "held" if any(proc.poll() is None for proc in processes) else "released"))
+            opener = stack.enter_context(patch.object(observer.urllib.request, "build_opener"))
+            opener.return_value.open.side_effect = lambda *args, **kwargs: io.BytesIO(json.dumps({"schema": "elastos.carrier.bootstrap/v1", "role": "publisher", "did": bootstrap_did, "ticket": "fixture-ticket", "node_id": "f" * 64}).encode())
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = observer.cli_run(self.config, self.root / "results")
+        return code, calls, observer.read(self.root / "results/result.json")
+
+    def test_actual_runner_orders_fresh_install_plain_check_apply_repeat_and_all_refusals(self):
+        code, calls, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["proof_kind"], "harness-self-test")
+        self.assertTrue(result["cleanup"]["passed"])
+        self.assertTrue(all(entry["clean"] for entry in result["holder_output"]))
+        self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+        updates = [argv[1:] for argv, _ in calls if argv[1] == "update"]
+        self.assertEqual(updates[:3], [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
+        self.assertEqual(updates[3:], [["update", "--yes"]] * 3)
+        self.assertTrue(all("XDG_DATA_HOME" not in env for _, env in calls))
+        self.assertTrue(all("--gateway" not in argv and "source" not in argv for argv, _ in calls))
+        for selector in ("m1-install", "m2-discovery"):
+            self.assertTrue(set(observer.CLI_REFUSALS) <= set(result["paths"][selector]["checks"]))
+
+    def test_holder_identity_mismatch_stops_before_install_and_cleans_up(self):
+        code, calls, result = self.fake_run(bootstrap_did="did:key:unowned")
+        self.assertEqual(code, 1)
+        self.assertFalse(any(argv[0] == "/bin/bash" for argv, _ in calls))
+        self.assertIn("transport identity", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_zero_exit_with_endpoint_drop_and_cleanup_failure_cannot_pass(self):
+        code, _, result = self.fake_run(apply_stderr="ERROR ungraceful endpoint drop")
+        self.assertEqual(code, 1)
+        self.assertIn("Carrier apply failed", result["failure"])
+
+    def test_cleanup_census_failure_keeps_result_failed(self):
+        code, _, result = self.fake_run(cleanup_error=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(result["cleanup"]["passed"])
+
+    def test_holder_endpoint_error_after_success_cannot_pass(self):
+        code, _, result = self.fake_run(holder_stderr="ERROR ungraceful endpoint drop")
+        self.assertEqual(code, 1)
+        self.assertTrue(all(path["status"] == "passed" for path in result["paths"].values()))
+        self.assertFalse(result["cleanup"]["passed"])
+        self.assertTrue(result["transport"]["installer_bootstrap_closed"])
+        self.assertIn("holder output", result["cleanup"]["errors"][0])
+
+    def test_holder_shutdown_error_cannot_pass(self):
+        code, _, result = self.fake_run(holder_shutdown_stderr="ERROR ungraceful endpoint drop")
+        self.assertEqual(code, 1)
+        self.assertFalse(result["cleanup"]["passed"])
+
+    def test_correct_reply_via_http_fallback_cannot_pass(self):
+        code, _, result = self.fake_run(http_fallback=True)
+        self.assertEqual(code, 1)
+        self.assertGreater(result["transport"]["m2_http_fallback_requests"], 0)
+        self.assertIn("HTTP fallback", result["cleanup"]["errors"][0])
+
+    def test_bootstrap_serves_only_admitted_m1_bytes_then_refuses_m2(self):
+        import http.client
+        server = observer.CliBootstrap(self.root, self.manifest)
+        try:
+            server.publication = self.manifest["publications"]["old"]
+            server.enabled = True
+            connection = http.client.HTTPConnection(server.url.removeprefix("http://"), timeout=5)
+            connection.request("GET", "/release.json")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), (self.root / server.publication["release"]).read_bytes())
+            connection.close()
+            server.enabled = False
+            connection = http.client.HTTPConnection(server.url.removeprefix("http://"), timeout=5)
+            connection.request("GET", "/release.json")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 503)
+            response.read()
+            connection.close()
+            self.assertEqual(server.fallback_requests, 1)
+        finally:
+            server.close()
 
 
 if __name__ == "__main__":
