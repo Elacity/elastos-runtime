@@ -367,7 +367,7 @@ check_required 'edge_binding_path' elastos/crates/elastos-server/src/api/gateway
 check_required 'edge_site_head_path' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must resolve signed site-head state through Edge'
 check_required 'publisher_site_release_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist named releases under Publisher state'
 check_required 'edge_release_channel_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist release channels under Edge state'
-check_required 'Publication::open_published\(&root_path, &receipt\.publisher_did\)' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must validate Publisher bytes against the saved public pin'
+check_required 'Publication::open_published\(&context\.key\.root_path, &receipt\.publisher_did\)' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must validate Publisher bytes against the saved public pin'
 check_required 'last_release_cid == publication\.release_cid\(\)' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must bind the saved release receipt to the signed set'
 check_required 'crate::update::verify_release_metadata_cid\(' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must verify the saved head CID against exact signed bytes'
 check_required 'verify_release_envelope\(&head, "elastos\.release\.head\.v1", pinned_did\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must verify the signed head against the independent pin'
