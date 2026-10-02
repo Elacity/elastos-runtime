@@ -478,10 +478,10 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
-      # Packages are uploaded only for tags, main and dispatch runs; PR runs
-      # already proved the release build through setup-source-home.
+      # ARM PRs also need the package for the Jetson compatibility gate.
+      # Uploads remain limited to tags, main and dispatch runs.
       - name: build and package release binaries
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.

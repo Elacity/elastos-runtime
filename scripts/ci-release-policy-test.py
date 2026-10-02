@@ -42,7 +42,7 @@ def evaluate(expression, context):
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    expression = re.sub(r"(?:github|inputs|env|steps)\.[\w.-]+",
+    expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
     return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
 
@@ -102,6 +102,22 @@ def validate_cache_guards(source):
                     raise AssertionError(f"cache guard permits uncached build in {job}")
 
 
+def validate_jetson_package_lifecycle(source):
+    job_steps = steps("source-home-linux", jobs(source))
+    package, = [step for step in job_steps if step.startswith("name: build and package release binaries\n")]
+    verify, = [step for step in job_steps if step.startswith("name: verify Jetson release compatibility\n")]
+    if job_steps.index(package) >= job_steps.index(verify):
+        raise AssertionError("Jetson verification requires an earlier package step")
+    if "scripts/package-release-binaries.sh" not in package:
+        raise AssertionError("Jetson verification requires the package producer")
+    for event, ref, ref_type, override, _, _ in CASES:
+        for runner in ("ubuntu-24.04", "ubuntu-22.04-arm"):
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override, "matrix.os": runner}
+            if evaluate(field(verify, "if"), context) and not evaluate(field(package, "if"), context):
+                raise AssertionError(f"Jetson verification lacks its package on {event} {runner}")
+
+
 class ReleasePolicyTests(unittest.TestCase):
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
@@ -129,6 +145,17 @@ class ReleasePolicyTests(unittest.TestCase):
                                                      if job == "engine-llama-arm64" else save)
                         self.assertEqual(evaluate(field(step, "if"), context), expected,
                                          f"cache guard in {job}")
+
+    def test_jetson_package_exists_before_verification_on_every_event(self):
+        validate_jetson_package_lifecycle(SOURCE)
+        guard = "if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'"
+        self.assertIn(guard, JOBS["source-home-linux"])
+        regressed = SOURCE.replace(guard, "if: github.event_name != 'pull_request'", 1)
+        with self.assertRaisesRegex(AssertionError, "lacks its package on pull_request ubuntu-22.04-arm"):
+            validate_jetson_package_lifecycle(regressed)
+        omitted = SOURCE.replace("scripts/package-release-binaries.sh", "echo package omitted", 1)
+        with self.assertRaisesRegex(AssertionError, "requires the package producer"):
+            validate_jetson_package_lifecycle(omitted)
 
     def test_pull_requests_never_save_shared_caches(self):
         for job in JOBS:
