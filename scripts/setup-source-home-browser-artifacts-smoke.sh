@@ -164,7 +164,7 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
                     package(package_source, "darwin-arm64", next_archive, next_metadata, "test/image.tar.gz")
                     raise AssertionError("package resource bound was ignored")
                 except ValueError as error:
-                    assert ("package bound" if failure == "size" else "10%") in str(error)
+                    assert ("package bound" if failure == "size" else "out of disk space") in str(error)
             assert not next_archive.exists() and not next_metadata.exists()
             assert not list(next_archive.parent.glob(".browser-image-*"))
             assert (archive.read_bytes(), metadata.read_bytes()) == before_package

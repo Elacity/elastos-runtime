@@ -2,9 +2,8 @@
 //!
 //! This crate is deliberately source-only. It owns durable Runtime release and
 //! mint journal state plus typed Runtime-to-provider seams. It does not expose
-//! CEKs, shares, routes, endpoints, Carrier topology, Library UI, or product
-//! cutover behavior. Provider registration stays inactive and must not replace
-//! the provisional `key`/`rights` product routes.
+//! CEKs, shares, routes, endpoints, Carrier topology, or Library UI.
+//! Registration of the Runtime-only provider targets lives in elastos-server.
 
 mod coordinator;
 mod journal;

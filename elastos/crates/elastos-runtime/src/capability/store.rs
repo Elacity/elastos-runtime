@@ -163,20 +163,6 @@ impl CapabilityStore {
         revoked.contains(token_id)
     }
 
-    /// Get all revoked token IDs
-    pub async fn get_revoked_tokens(&self) -> Vec<TokenId> {
-        let revoked = self.revoked_tokens.read().await;
-        revoked.iter().copied().collect()
-    }
-
-    /// Clear old use counts (tokens that are no longer valid)
-    ///
-    /// Call periodically to prevent unbounded growth.
-    pub async fn cleanup_use_counts(&self, valid_tokens: &HashSet<TokenId>) {
-        let mut counts = self.use_counts.write().await;
-        counts.retain(|id, _| valid_tokens.contains(id));
-    }
-
     /// Persist state to disk
     pub async fn persist(&self) -> std::io::Result<()> {
         if let Some(path) = &self.storage_path {

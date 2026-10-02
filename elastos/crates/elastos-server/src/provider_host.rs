@@ -143,7 +143,7 @@ impl ProviderPlane {
                 // The unprovisioned case is already named precisely by
                 // `check_prerequisites`; anything left here is a spawn or
                 // handshake failure that must speak for itself.
-                elastos_server::protected_content_runtime::register_inactive_custody_provider(
+                elastos_server::protected_content_runtime::register_custody_provider(
                     registry,
                     binary_path,
                     data_dir,

@@ -12,8 +12,6 @@
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 
 use crate::capsule::CapsuleId;
 
@@ -124,81 +122,6 @@ impl CapsuleIoBridge {
                 None
             }
         }
-    }
-
-    /// Run the I/O bridge with async readers/writers
-    ///
-    /// This spawns tasks to handle bidirectional communication.
-    pub async fn run_async<R, W>(
-        self: Arc<Self>,
-        reader: R,
-        mut writer: W,
-        mut shutdown_rx: mpsc::Receiver<()>,
-    ) where
-        R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
-        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut lines = reader.lines();
-
-        loop {
-            tokio::select! {
-                // Check for shutdown signal
-                _ = shutdown_rx.recv() => {
-                    tracing::debug!("I/O bridge for {} received shutdown signal", self.capsule_id);
-                    break;
-                }
-
-                // Read next line from capsule
-                line_result = lines.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            if let Some(response_json) = self.process_line(&line).await {
-                                // Write response back to capsule
-                                if let Err(e) = writer.write_all(response_json.as_bytes()).await {
-                                    tracing::error!(
-                                        "Failed to write response to capsule {}: {}",
-                                        self.capsule_id,
-                                        e
-                                    );
-                                    break;
-                                }
-                                if let Err(e) = writer.write_all(b"\n").await {
-                                    tracing::error!(
-                                        "Failed to write newline to capsule {}: {}",
-                                        self.capsule_id,
-                                        e
-                                    );
-                                    break;
-                                }
-                                if let Err(e) = writer.flush().await {
-                                    tracing::error!(
-                                        "Failed to flush response to capsule {}: {}",
-                                        self.capsule_id,
-                                        e
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // EOF - capsule closed stdout
-                            tracing::debug!("Capsule {} closed stdout", self.capsule_id);
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Error reading from capsule {}: {}",
-                                self.capsule_id,
-                                e
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        tracing::debug!("I/O bridge for {} exiting", self.capsule_id);
     }
 
     /// Process multiple lines and return responses

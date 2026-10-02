@@ -35,16 +35,6 @@ impl IpfsProvider {
         }
     }
 
-    /// Create a provider that uses a public gateway (read-only)
-    pub fn with_gateway(gateway_url: impl Into<String>, cache: Arc<ContentCache>) -> Self {
-        Self {
-            api_url: gateway_url.into(),
-            client: reqwest::Client::new(),
-            cache,
-            gateway_mode: true,
-        }
-    }
-
     /// Check if the IPFS node is reachable
     pub async fn is_available(&self) -> bool {
         if self.gateway_mode {

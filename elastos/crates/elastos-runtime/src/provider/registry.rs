@@ -623,10 +623,6 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "browser-engine",
     "wallet",
     "library",
-    "drm",
-    "rights",
-    "key",
-    "decrypt",
     "inspect",
     "availability",
     "block-graph",
@@ -1486,10 +1482,7 @@ impl ProviderRegistry {
             || observation.capacity_bytes == 0
             || observation.available_bytes > observation.capacity_bytes
             || observation.required_bytes != required_bytes
-            || observation
-                .available_bytes
-                .checked_sub(required_bytes)
-                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
+            || observation.available_bytes < required_bytes
         {
             return Err(private_ipfs_unavailable());
         }
@@ -3367,7 +3360,8 @@ mod tests {
             provider.requests.lock().await.as_slice(),
             &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
         );
-        assert!(registry.check_local_ipfs_capacity(11).await.is_err());
+        // The fixture volume has 110 bytes free.
+        assert!(registry.check_local_ipfs_capacity(111).await.is_err());
         let valid = serde_json::json!({"status":"ok","data":{
             "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
         }});
@@ -3379,7 +3373,6 @@ mod tests {
             ("volume_id", serde_json::json!(0)),
             ("volume_id", serde_json::json!("private-repo-path")),
             ("capacity_bytes", serde_json::json!(0)),
-            ("capacity_bytes", serde_json::json!(1001)),
             ("available_bytes", serde_json::json!(1001)),
             ("available_bytes", serde_json::json!(9)),
             ("required_bytes", serde_json::json!(11)),
@@ -3389,6 +3382,15 @@ mod tests {
             let mut response = valid.clone();
             response["data"][field] = value;
             malformed.push(response);
+        }
+        // No share of the volume is held back: an import that fits is admitted
+        // however little space it leaves.
+        for (capacity, available) in [(1001, 110), (1000, 10)] {
+            let mut fits = valid.clone();
+            fits["data"]["capacity_bytes"] = serde_json::json!(capacity);
+            fits["data"]["available_bytes"] = serde_json::json!(available);
+            *provider.response.lock().await = Some(fits);
+            assert!(registry.check_local_ipfs_capacity(10).await.is_ok());
         }
         let mut missing = valid.clone();
         missing["data"].as_object_mut().unwrap().remove("volume_id");
@@ -4510,10 +4512,6 @@ mod tests {
             "chain",
             "model",
             "wallet",
-            "drm",
-            "rights",
-            "key",
-            "decrypt",
             "availability",
             "block-graph",
             "object",
@@ -4534,7 +4532,7 @@ mod tests {
     async fn runtime_only_targets_coexist_without_capsule_resource_exposure() {
         let registry = ProviderRegistry::new();
         registry
-            .register_sub_provider("decrypt", Arc::new(RawMockProvider))
+            .register_sub_provider("library", Arc::new(RawMockProvider))
             .await
             .unwrap();
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
@@ -4544,10 +4542,10 @@ mod tests {
                 .unwrap();
         }
 
-        let provisional = registry
+        let capsule_scheme = registry
             .invoke_provider(ProviderInvocation {
                 source: "runtime".to_string(),
-                target: "decrypt".to_string(),
+                target: "library".to_string(),
                 op: "status".to_string(),
                 request: serde_json::json!({"op":"status"}),
                 transfer: ProviderTransfer::Json,
@@ -4558,11 +4556,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            provisional["data"]["runtime_invocation"]["target"],
-            "decrypt"
+            capsule_scheme["data"]["runtime_invocation"]["target"],
+            "library"
         );
-        assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
-        assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
+        assert_eq!(registry.sub_provider_schemes().await, vec!["library"]);
+        assert!(!registry.has_ready_runtime_provider_target("library").await);
         let registrations = registry.registrations().await;
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
             let protected = registry
@@ -4615,7 +4613,7 @@ mod tests {
     async fn unregister_api_enforces_provider_target_class() {
         let registry = ProviderRegistry::new();
         registry
-            .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
+            .register_sub_provider("library", Arc::new(MockProvider::new()))
             .await
             .unwrap();
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
@@ -4645,7 +4643,7 @@ mod tests {
         }
 
         let wrong_runtime_api = registry
-            .unregister_runtime_provider_target("decrypt")
+            .unregister_runtime_provider_target("library")
             .await
             .unwrap_err();
         assert!(wrong_runtime_api
@@ -4654,7 +4652,7 @@ mod tests {
         assert!(matches!(
             registry
                 .route(
-                    "elastos://decrypt/probe",
+                    "elastos://library/probe",
                     "capsule:test",
                     ResourceAction::Write,
                     Some(b"still-registered".to_vec()),

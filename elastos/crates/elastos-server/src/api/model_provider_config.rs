@@ -1216,21 +1216,6 @@ pub(super) fn archive_hosted_egress_decision(
         fs::File::open(&directory)?.sync_all()?;
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        let name = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
-        let mut volume = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        anyhow::ensure!(
-            unsafe { libc::statvfs(name.as_ptr(), volume.as_mut_ptr()) } == 0,
-            "failed to inspect hosted egress history volume"
-        );
-        let volume = unsafe { volume.assume_init() };
-        anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
-            "hosted egress history disk reserve reached"
-        );
-    }
     let stage = directory.join(format!(
         ".{file_name}.{:016x}.tmp",
         rand::thread_rng().next_u64()

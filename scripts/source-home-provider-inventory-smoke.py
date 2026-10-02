@@ -28,13 +28,7 @@ REQUIRED_PROVIDER_RUNTIMES = (
     "protected-content-protect-provider",
     "protected-content-decrypt-provider",
 )
-RETAINED_RELEASE_PROVIDERS = (
-    "operator-drive-adapter",
-    "drm-provider",
-    "rights-provider",
-    "key-provider",
-    "decrypt-provider",
-)
+RETAINED_RELEASE_PROVIDERS = ("operator-drive-adapter",)
 
 
 def assert_provider_names_and_loops(setup_text: str) -> None:
@@ -309,14 +303,14 @@ def run_retained_provider_stamp_smoke(setup_text: str, components: dict) -> None
         assert stamp_once().returncode == 0
         assert installed.read_bytes() == first
 
-        (bin_dir / "drm-provider").write_bytes(b"changed provider bytes")
+        (bin_dir / "operator-drive-adapter").write_bytes(b"changed provider bytes")
         result = stamp_once()
         assert result.returncode != 0 and "does not match its prior" in result.stderr
         assert installed.read_bytes() == first
 
-        (bin_dir / "drm-provider").write_bytes(b"drm-provider-installed\n")
+        (bin_dir / "operator-drive-adapter").write_bytes(b"operator-drive-adapter-installed\n")
         stripped = json.loads(installed.read_text())
-        stripped["external"]["drm-provider"]["platforms"]["linux-amd64"].update(
+        stripped["external"]["operator-drive-adapter"]["platforms"]["linux-amd64"].update(
             checksum="", size=0, cid="",
         )
         installed.write_text(json.dumps(stripped))

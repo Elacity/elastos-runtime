@@ -27,10 +27,6 @@ run() {
     fi
 }
 
-disk_safe() {
-    df -Pk . | awk 'NR == 2 { exit !($4 * 10 >= $2) }'
-}
-
 run node-26 bash -c '[[ "$(node -p "process.versions.node.split(\".\")[0]")" == 26 ]]'
 run rust-1.91 bash -c '[[ "$(rustc --version)" == "rustc 1.91.0 "* ]]'
 run diff-check git diff --check
@@ -51,26 +47,10 @@ run media-tools python3 scripts/media-tools-build-test.py
 run update-hop python3 scripts/update-hop-compare-test.py
 run browser-close node --test scripts/browser-window-close-handshake.test.mjs
 
-if ! disk_safe; then
-    printf '\nDisk reserve below 10%%; Rust checks unavailable.\n'
-    results+=("lint:unavailable" "test-elastos:unavailable" "test-capsules:unavailable")
-    failed=1
-else
-    export RUSTFLAGS='-D warnings'
-    run lint just lint
-    if disk_safe; then
-        run test-elastos just test-elastos
-    else
-        results+=("test-elastos:unavailable")
-        failed=1
-    fi
-    if disk_safe; then
-        run test-capsules env RUST_TEST_THREADS=1 just test-capsules
-    else
-        results+=("test-capsules:unavailable")
-        failed=1
-    fi
-fi
+export RUSTFLAGS='-D warnings'
+run lint just lint
+run test-elastos just test-elastos
+run test-capsules env RUST_TEST_THREADS=1 just test-capsules
 
 if [[ "$(uname -s)" != Linux ]]; then
     printf '\nLinux source checks: unavailable on this host. GitHub CI must verify them.\n'

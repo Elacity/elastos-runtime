@@ -731,7 +731,11 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
 }
 
 fn disk_budget(needed: u64, available: u64, total: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available.saturating_sub(total / 10), "Browser image preparation needs {needed} bytes while keeping 10% free space; free disk space and retry (previous set preserved)");
+    ensure!(
+        total > 0 && available <= total,
+        "Browser image free-space check returned an invalid volume"
+    );
+    ensure!(needed <= available, "Browser image preparation needs {needed} bytes but {available} are free; free disk space and retry (previous set preserved)");
     Ok(())
 }
 
@@ -1175,8 +1179,9 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 199, 1000).is_err());
-        assert!(disk_budget(100, 200, 1000).is_ok());
+        // No share of the volume is held back: the image needs only to fit.
+        assert!(disk_budget(100, 99, 1000).is_err());
+        assert!(disk_budget(100, 100, 1000).is_ok());
     }
 
     #[test]

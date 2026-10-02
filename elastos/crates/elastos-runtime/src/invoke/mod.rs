@@ -179,19 +179,19 @@ mod tests {
     #[test]
     fn provider_operation_plan_reflects_authority_union() {
         let authority = authority(json!({
-            "reason": "release content keys",
+            "reason": "read and manage stored objects",
             "capabilities": [
-                { "resource": "elastos://key/*", "actions": ["read"], "operations": ["release"] },
-                { "resource": "elastos://decrypt/*", "actions": ["execute", "admin"], "operations": ["release"] }
+                { "resource": "elastos://object/*", "actions": ["read"], "operations": ["fetch"] },
+                { "resource": "elastos://ipfs/*", "actions": ["execute", "admin"], "operations": ["fetch"] }
             ],
-            "audit_events": ["key.release.denied", "key.release.granted"]
+            "audit_events": ["object.fetch.denied", "object.fetch.granted"]
         }));
-        let plan = plan_provider_operation(&authority, "release").unwrap();
+        let plan = plan_provider_operation(&authority, "fetch").unwrap();
         assert_eq!(
             plan.resources,
             vec![
-                "elastos://key/*".to_string(),
-                "elastos://decrypt/*".to_string()
+                "elastos://object/*".to_string(),
+                "elastos://ipfs/*".to_string()
             ]
         );
         assert_eq!(
@@ -201,7 +201,7 @@ mod tests {
         assert!(plan
             .audit_events
             .iter()
-            .any(|event| event == "key.release.denied"));
+            .any(|event| event == "object.fetch.denied"));
     }
 
     #[test]
@@ -209,12 +209,12 @@ mod tests {
         let authority = authority(json!({
             "reason": "x",
             "capabilities": [
-                { "resource": "elastos://key/*", "actions": ["teleport"], "operations": ["release"] }
+                { "resource": "elastos://object/*", "actions": ["teleport"], "operations": ["fetch"] }
             ],
-            "audit_events": ["key.release.denied"]
+            "audit_events": ["object.fetch.denied"]
         }));
         assert_eq!(
-            plan_provider_operation(&authority, "release").unwrap_err(),
+            plan_provider_operation(&authority, "fetch").unwrap_err(),
             InvokeError::UnknownDeclaredAction("teleport".to_string())
         );
     }

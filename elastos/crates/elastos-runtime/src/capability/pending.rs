@@ -420,23 +420,6 @@ impl PendingRequestStore {
             .collect()
     }
 
-    /// List pending requests for a specific session
-    pub async fn list_session_pending(&self, session_id: &str) -> Vec<PendingCapabilityRequest> {
-        let session_requests = self.session_requests.read().await;
-        let requests = self.requests.read().await;
-
-        session_requests
-            .get(session_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| requests.get(id))
-                    .filter(|r| r.is_pending())
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Clean up expired requests
     ///
     /// Returns the number of requests cleaned up

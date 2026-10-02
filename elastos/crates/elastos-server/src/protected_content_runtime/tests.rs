@@ -60,8 +60,8 @@ use super::{
     load_runtime_media_provider_bridge_config,
     load_runtime_protected_content_chain_provider_config, prepare_runtime_custody_library_source,
     prepare_runtime_media_provider_prerequisite, publish_runtime_custody_library_object,
-    publish_runtime_custody_library_source, register_inactive_custody_provider,
-    register_inactive_custody_runtime_provider_target, register_protect_provider,
+    publish_runtime_custody_library_source, register_custody_provider,
+    register_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
     runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
@@ -4259,7 +4259,7 @@ impl ProtectedStartupProvider {
     ) -> anyhow::Result<()> {
         match self {
             Self::Protect => register_protect_provider(registry, binary).await,
-            Self::Custody => register_inactive_custody_provider(registry, binary, data_dir).await,
+            Self::Custody => register_custody_provider(registry, binary, data_dir).await,
             Self::Decrypt => {
                 register_protected_content_decrypt_provider(
                     registry,
@@ -5619,18 +5619,21 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 #[tokio::test]
-async fn runtime_invokes_custody_not_the_provisional_key_route() {
+async fn runtime_invokes_custody_target_not_any_capsule_sub_provider() {
     let registry = Arc::new(ProviderRegistry::new());
     let custody = RecordingProvider::new(
         "custody",
         json!({"status": "ok", "data": {"echo": "custody"}}),
     );
-    let key = RecordingProvider::new("key", json!({"status": "ok", "data": {"echo": "key"}}));
+    let key = RecordingProvider::new(
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
+    );
     registry
-        .register_sub_provider("key", key.clone())
+        .register_sub_provider("library", key.clone())
         .await
         .unwrap();
-    register_inactive_custody_runtime_provider_target(registry.as_ref(), custody.clone())
+    register_custody_runtime_provider_target(registry.as_ref(), custody.clone())
         .await
         .unwrap();
 
@@ -5673,7 +5676,7 @@ async fn runtime_custody_invoke_fails_closed_on_provider_errors() {
         "custody",
         json!({"status": "error", "code": "invalid_request"}),
     );
-    register_inactive_custody_runtime_provider_target(registry.as_ref(), custody)
+    register_custody_runtime_provider_target(registry.as_ref(), custody)
         .await
         .unwrap();
     let err = invoke_json_provider(
@@ -5702,24 +5705,30 @@ fn unresolved_release_scan_is_empty_without_creating_state() {
 }
 
 #[tokio::test]
-async fn inactive_custody_registration_does_not_replace_key() {
+async fn custody_target_registration_adds_no_capsule_sub_provider_scheme() {
     let registry = Arc::new(ProviderRegistry::new());
     let custody = RecordingProvider::new(
         "custody",
         json!({"status": "ok", "data": {"echo": "custody"}}),
     );
-    let key = RecordingProvider::new("key", json!({"status": "ok", "data": {"echo": "key"}}));
-    registry.register_sub_provider("key", key).await.unwrap();
-    register_inactive_custody_runtime_provider_target(&registry, custody)
+    let key = RecordingProvider::new(
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
+    );
+    registry
+        .register_sub_provider("library", key)
+        .await
+        .unwrap();
+    register_custody_runtime_provider_target(&registry, custody)
         .await
         .unwrap();
     let mut schemes = registry.sub_provider_schemes().await;
     schemes.sort();
-    assert_eq!(schemes, vec!["key".to_string()]);
+    assert_eq!(schemes, vec!["library".to_string()]);
 }
 
 #[tokio::test]
-async fn runtime_rights_adapter_invokes_chain_not_the_provisional_rights_route() {
+async fn runtime_rights_adapter_invokes_chain_not_any_capsule_sub_provider() {
     let registry = Arc::new(ProviderRegistry::new());
     let chain = RecordingProvider::new(
         "chain",
@@ -5731,11 +5740,11 @@ async fn runtime_rights_adapter_invokes_chain_not_the_provisional_rights_route()
         }),
     );
     let rights = RecordingProvider::new(
-        "rights",
-        json!({"status": "ok", "data": {"echo": "rights"}}),
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
     );
     registry
-        .register_sub_provider("rights", rights.clone())
+        .register_sub_provider("library", rights.clone())
         .await
         .unwrap();
     registry
@@ -5787,12 +5796,12 @@ async fn runtime_rights_adapter_invokes_chain_not_the_provisional_rights_route()
 
     let mut schemes = registry.sub_provider_schemes().await;
     schemes.sort();
-    assert_eq!(schemes, vec!["chain".to_string(), "rights".to_string()]);
+    assert_eq!(schemes, vec!["chain".to_string(), "library".to_string()]);
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth() {
+async fn custody_registration_passes_only_base_path_and_no_extra_truth() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
@@ -5801,7 +5810,7 @@ async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth(
     let (binary, _pid_file, request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
     assert!(registry.sub_provider_schemes().await.is_empty());
@@ -5847,7 +5856,7 @@ async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_wrapper_rejects_public_private_op_and_evidence_injection() {
+async fn custody_wrapper_rejects_public_private_op_and_evidence_injection() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
@@ -5855,7 +5864,7 @@ async fn inactive_custody_wrapper_rejects_public_private_op_and_evidence_injecti
     let (binary, _pid_file, request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
 
@@ -5926,7 +5935,7 @@ async fn inactive_custody_wrapper_rejects_public_private_op_and_evidence_injecti
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
+async fn custody_wrapper_status_surface_matches_public_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
@@ -5934,7 +5943,7 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
     let (binary, _pid_file, _request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
 
@@ -5976,7 +5985,7 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
 }
 
 #[cfg(unix)]
-fn inactive_custody_runtime_envelope(op: &str, transport: &str) -> Value {
+fn custody_runtime_envelope(op: &str, transport: &str) -> Value {
     let carrier = if transport == "carrier-provider-plane" {
         let endpoint = iroh::SecretKey::from_bytes(&[0x51; 32]).public();
         json!({
@@ -6012,10 +6021,7 @@ fn inactive_custody_runtime_envelope(op: &str, transport: &str) -> Value {
 }
 
 #[cfg(unix)]
-async fn spawn_inactive_custody_wrapper_for_test(
-    binary: &Path,
-    data_dir: &Path,
-) -> InactiveCustodyProvider {
+async fn spawn_custody_wrapper_for_test(binary: &Path, data_dir: &Path) -> InactiveCustodyProvider {
     let state_root = inactive_custody_state_root(data_dir);
     let bridge = ProviderBridge::spawn(
         binary,
@@ -6034,19 +6040,19 @@ async fn spawn_inactive_custody_wrapper_for_test(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_wrapper_accepts_local_and_carrier_envelopes() {
+async fn custody_wrapper_accepts_local_and_carrier_envelopes() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     owner_only_dir(&inactive_custody_state_root(&data_dir));
     let (binary, _pid_file, request_log) = write_mock_custody_provider(temp.path());
-    let provider = spawn_inactive_custody_wrapper_for_test(&binary, &data_dir).await;
+    let provider = spawn_custody_wrapper_for_test(&binary, &data_dir).await;
 
     for transport in ["runtime-local-provider-plane", "carrier-provider-plane"] {
         let response = provider
             .send_raw(&json!({
                 "op": "release_contribution",
-                "_runtime_invocation": inactive_custody_runtime_envelope(
+                "_runtime_invocation": custody_runtime_envelope(
                     "release_contribution",
                     transport,
                 ),
@@ -6073,18 +6079,18 @@ async fn inactive_custody_wrapper_accepts_local_and_carrier_envelopes() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier_data() {
+async fn custody_wrapper_rejects_invalid_transport_and_injected_carrier_data() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     owner_only_dir(&inactive_custody_state_root(&data_dir));
     let (binary, _pid_file, _request_log) = write_mock_custody_provider(temp.path());
-    let provider = spawn_inactive_custody_wrapper_for_test(&binary, &data_dir).await;
+    let provider = spawn_custody_wrapper_for_test(&binary, &data_dir).await;
 
     let invalid_transport = provider
         .send_raw(&json!({
             "op": "release_contribution",
-            "_runtime_invocation": inactive_custody_runtime_envelope(
+            "_runtime_invocation": custody_runtime_envelope(
                 "release_contribution",
                 "unsupported-provider-plane",
             ),
@@ -6098,7 +6104,7 @@ async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier
     let injected_carrier = provider
         .send_raw(&json!({
             "op": "release_contribution",
-            "_runtime_invocation": inactive_custody_runtime_envelope(
+            "_runtime_invocation": custody_runtime_envelope(
                 "release_contribution",
                 "carrier-provider-plane",
             ),
@@ -6143,7 +6149,7 @@ async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier
             }),
         ),
     ] {
-        let mut envelope = inactive_custody_runtime_envelope("release_contribution", transport);
+        let mut envelope = custody_runtime_envelope("release_contribution", transport);
         envelope["carrier"] = carrier;
         let error = provider
             .send_raw(&json!({
@@ -6172,16 +6178,16 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
                 .unwrap(),
         ),
     );
-    let provisional = RecordingProvider::new(
-        "rights",
-        ok_provider_response(json!({"echo": "provisional"})),
+    let unrelated = RecordingProvider::new(
+        "library",
+        ok_provider_response(json!({"echo": "unrelated-capsule-provider"})),
     );
     registry
         .register_runtime_provider_target(CUSTODY_PROVIDER_ID, custody.clone())
         .await
         .unwrap();
     registry
-        .register_sub_provider("rights", provisional.clone())
+        .register_sub_provider("library", unrelated.clone())
         .await
         .unwrap();
 
@@ -6198,7 +6204,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     );
     let custody_requests = custody.requests().await;
     assert_eq!(custody_requests.len(), 1);
-    assert!(provisional.requests().await.is_empty());
+    assert!(unrelated.requests().await.is_empty());
     let recorded = &custody_requests[0];
     assert_eq!(recorded["op"], "evaluate");
     assert_eq!(
@@ -6237,14 +6243,16 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
             .unwrap(),
         ),
     );
-    let provisional =
-        RecordingProvider::new("key", ok_provider_response(json!({"echo": "provisional"})));
+    let unrelated = RecordingProvider::new(
+        "library",
+        ok_provider_response(json!({"echo": "unrelated-capsule-provider"})),
+    );
     registry
         .register_runtime_provider_target(CUSTODY_PROVIDER_ID, custody.clone())
         .await
         .unwrap();
     registry
-        .register_sub_provider("key", provisional.clone())
+        .register_sub_provider("library", unrelated.clone())
         .await
         .unwrap();
 
@@ -6262,7 +6270,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     );
     let custody_requests = custody.requests().await;
     assert_eq!(custody_requests.len(), 1);
-    assert!(provisional.requests().await.is_empty());
+    assert!(unrelated.requests().await.is_empty());
     let recorded = &custody_requests[0];
     assert_eq!(recorded["op"], "release_contribution");
     assert_eq!(
@@ -6293,7 +6301,7 @@ async fn runtime_custody_registry_adapter_process_happy_path_uses_public_provisi
     let provisioned = provision_custody_node_public_receipt(&binary, &state_root, 0x21);
 
     let registry = Arc::new(ProviderRegistry::new());
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
 
@@ -6444,13 +6452,13 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
     let node2 = provisioned_process_custody_node(&binary, &temp_root, "node-2", 0x21, digest(0xa2));
     let node3 = provisioned_process_custody_node(&binary, &temp_root, "node-3", 0x21, digest(0xa3));
 
-    register_inactive_custody_provider(&node1.registry, &binary, &temp_root.join("node-1"))
+    register_custody_provider(&node1.registry, &binary, &temp_root.join("node-1"))
         .await
         .unwrap();
-    register_inactive_custody_provider(&node2.registry, &binary, &temp_root.join("node-2"))
+    register_custody_provider(&node2.registry, &binary, &temp_root.join("node-2"))
         .await
         .unwrap();
-    register_inactive_custody_provider(&node3.registry, &binary, &temp_root.join("node-3"))
+    register_custody_provider(&node3.registry, &binary, &temp_root.join("node-3"))
         .await
         .unwrap();
 
@@ -6817,13 +6825,13 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let node3 =
         provisioned_process_custody_node(&custody_binary, &temp_root, "node-3", 0x21, digest(0xa3));
 
-    register_inactive_custody_provider(&node1.registry, &custody_binary, &temp_root.join("node-1"))
+    register_custody_provider(&node1.registry, &custody_binary, &temp_root.join("node-1"))
         .await
         .unwrap();
-    register_inactive_custody_provider(&node2.registry, &custody_binary, &temp_root.join("node-2"))
+    register_custody_provider(&node2.registry, &custody_binary, &temp_root.join("node-2"))
         .await
         .unwrap();
-    register_inactive_custody_provider(&node3.registry, &custody_binary, &temp_root.join("node-3"))
+    register_custody_provider(&node3.registry, &custody_binary, &temp_root.join("node-3"))
         .await
         .unwrap();
 
@@ -7499,14 +7507,14 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
 
 #[cfg(unix)]
 #[tokio::test]
-async fn inactive_custody_registration_rejects_missing_or_unsafe_root_before_provider_use() {
+async fn custody_registration_rejects_missing_or_unsafe_root_before_provider_use() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("missing-data");
     owner_only_dir(&data_dir);
     let (binary, pid_file, request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    let error = register_inactive_custody_provider(&registry, &binary, &data_dir)
+    let error = register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("missing or unsafe"));
@@ -7519,7 +7527,7 @@ async fn inactive_custody_registration_rejects_missing_or_unsafe_root_before_pro
     let unsafe_root = inactive_custody_state_root(&unsafe_data_dir);
     owner_only_dir(&unsafe_root);
     fs::set_permissions(&unsafe_root, fs::Permissions::from_mode(0o755)).unwrap();
-    let error = register_inactive_custody_provider(&registry, &binary, &unsafe_data_dir)
+    let error = register_custody_provider(&registry, &binary, &unsafe_data_dir)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("missing or unsafe"));
@@ -7538,7 +7546,7 @@ async fn inactive_custody_registry_unregisters_shutdowns_and_restarts_bridge() {
     let (binary, pid_file, _request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
     let first_pid = read_pid(&pid_file);
@@ -7549,7 +7557,7 @@ async fn inactive_custody_registry_unregisters_shutdowns_and_restarts_bridge() {
         .unwrap();
     assert!(!process_is_running(first_pid));
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
     let second_pid = read_pid(&pid_file);
@@ -7581,12 +7589,12 @@ async fn inactive_custody_duplicate_registration_rejects_and_settles_rejected_ch
     let (binary, pid_file, _request_log) = write_mock_custody_provider(temp.path());
     let registry = Arc::new(ProviderRegistry::new());
 
-    register_inactive_custody_provider(&registry, &binary, &data_dir)
+    register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
     let first_pid = read_pid(&pid_file);
 
-    let error = register_inactive_custody_provider(&registry, &binary, &data_dir)
+    let error = register_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap_err();
     assert!(error
@@ -7753,11 +7761,11 @@ async fn protected_content_decrypt_duplicate_and_restart_settle_exact_processes(
 async fn runtime_rights_adapter_fails_closed_without_chain_and_does_not_call_rights() {
     let registry = Arc::new(ProviderRegistry::new());
     let rights = RecordingProvider::new(
-        "rights",
-        json!({"status": "ok", "data": {"echo": "rights"}}),
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
     );
     registry
-        .register_sub_provider("rights", rights.clone())
+        .register_sub_provider("library", rights.clone())
         .await
         .unwrap();
     let err = invoke_json_provider(
@@ -7775,7 +7783,7 @@ async fn runtime_rights_adapter_fails_closed_without_chain_and_does_not_call_rig
     assert!(rights.requests().await.is_empty());
     let mut schemes = registry.sub_provider_schemes().await;
     schemes.sort();
-    assert_eq!(schemes, vec!["rights".to_string()]);
+    assert_eq!(schemes, vec!["library".to_string()]);
 }
 
 #[tokio::test]
@@ -7796,13 +7804,16 @@ async fn decrypt_registry_adapter_dispatches_prepare_recipient_exactly_once() {
             .unwrap(),
         ),
     );
-    let drm = RecordingProvider::new("drm", json!({"status": "ok", "data": {"echo": "drm"}}));
+    let drm = RecordingProvider::new(
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
+    );
     registry
         .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     registry
-        .register_sub_provider("drm", drm.clone())
+        .register_sub_provider("library", drm.clone())
         .await
         .unwrap();
     let adapter = RuntimeDecryptRegistryAdapter::new(registry.clone());
@@ -7839,13 +7850,16 @@ async fn decrypt_registry_adapter_dispatches_open_viewer_session_exactly_once() 
             .unwrap(),
         ),
     );
-    let key = RecordingProvider::new("key", json!({"status": "ok", "data": {"echo": "key"}}));
+    let key = RecordingProvider::new(
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
+    );
     registry
         .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     registry
-        .register_sub_provider("key", key.clone())
+        .register_sub_provider("library", key.clone())
         .await
         .unwrap();
     let adapter = RuntimeDecryptRegistryAdapter::new(registry.clone());
@@ -8016,12 +8030,14 @@ async fn decrypt_registry_adapter_fails_closed_on_provider_status_and_data_error
 }
 
 #[tokio::test]
-async fn decrypt_registry_adapter_fails_closed_without_registered_decrypt_provider() {
+async fn decrypt_registry_adapter_fails_closed_without_registered_decrypt_target() {
     let registry = Arc::new(ProviderRegistry::new());
-    let provisional =
-        RecordingProvider::new("drm", json!({"status": "ok", "data": {"echo": "drm"}}));
+    let unrelated = RecordingProvider::new(
+        "library",
+        json!({"status": "ok", "data": {"echo": "unrelated-capsule-provider"}}),
+    );
     registry
-        .register_sub_provider("drm", provisional.clone())
+        .register_sub_provider("library", unrelated.clone())
         .await
         .unwrap();
     let adapter = RuntimeDecryptRegistryAdapter::new(registry);
@@ -8030,7 +8046,7 @@ async fn decrypt_registry_adapter_fails_closed_without_registered_decrypt_provid
         RuntimeDecryptProvider::prepare_recipient(&adapter, &request).await,
         Err(RuntimeProviderCallError::NoExactResult)
     );
-    assert!(provisional.requests().await.is_empty());
+    assert!(unrelated.requests().await.is_empty());
 }
 
 #[test]
@@ -12805,27 +12821,15 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
             .await
             .unwrap();
     }
-    register_inactive_custody_provider(
-        &node1.registry,
-        &custody_binary,
-        &nodes_root.join("node-1"),
-    )
-    .await
-    .unwrap();
-    register_inactive_custody_provider(
-        &node2.registry,
-        &custody_binary,
-        &nodes_root.join("node-2"),
-    )
-    .await
-    .unwrap();
-    register_inactive_custody_provider(
-        &node3.registry,
-        &custody_binary,
-        &nodes_root.join("node-3"),
-    )
-    .await
-    .unwrap();
+    register_custody_provider(&node1.registry, &custody_binary, &nodes_root.join("node-1"))
+        .await
+        .unwrap();
+    register_custody_provider(&node2.registry, &custody_binary, &nodes_root.join("node-2"))
+        .await
+        .unwrap();
+    register_custody_provider(&node3.registry, &custody_binary, &nodes_root.join("node-3"))
+        .await
+        .unwrap();
 
     let epoch = signed_custody_epoch_for_node_keys([
         (

@@ -33,10 +33,6 @@ impl PreparedFetchedCapsule {
     pub fn manifest(&self) -> &CapsuleManifest {
         &self.manifest
     }
-
-    pub fn into_manifest(self) -> CapsuleManifest {
-        self.manifest
-    }
 }
 
 pub fn prepare_fetched_capsule(

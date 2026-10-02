@@ -1167,10 +1167,6 @@ impl WalletProviderRequestV2 {
         Ok(())
     }
 
-    pub fn operation_kind(&self) -> WalletOperationKind {
-        self.operation.kind()
-    }
-
     pub fn is_effectful(&self) -> bool {
         self.operation.is_effectful()
     }
