@@ -9,6 +9,7 @@ mod content_cmd;
 mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
+mod identity_passkey_hint;
 mod init_cmd;
 mod node_cmd;
 mod provider_host;
@@ -1131,6 +1132,18 @@ pub(crate) enum IdentityCommand {
         rp_id: String,
         #[arg(long, default_value_t = 300)]
         expires_in: u64,
+    },
+    /// Print one private hint for an existing older security key (read-only)
+    PasskeyHint {
+        /// Exact public account name; combine with other selectors if ambiguous
+        #[arg(long)]
+        account: Option<String>,
+        /// Exact existing principal ID
+        #[arg(long)]
+        principal: Option<String>,
+        /// Exact relying-party ID
+        #[arg(long)]
+        rp_id: Option<String>,
     },
     /// Manage the profile nickname
     #[command(subcommand)]

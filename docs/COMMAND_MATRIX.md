@@ -70,6 +70,14 @@ them when the policy refuses access. It also checks the policy before each
 input message. Home CLI shows a refusal with host operator guidance and a
 Return to Desktop button. The host CLI `elastos home` remains available.
 
+The host operator sets accepted public gateway authorities with
+`elastos config set gateway_allowed_hosts '["home.example.com"]'`, then restarts
+the gateway. Each authority includes its port when it uses a non-default port.
+The gateway also accepts its configured bind authority and exact-port loopback
+aliases. A public publisher can expose the Carrier ticket and node ID with
+`elastos config set gateway_public_publisher_bootstrap true`; its publisher
+bootstrap omits the Runtime DID. The default bootstrap requires caller authority.
+
 ## Trust, content, and publishing
 
 | Command family | Class | Included behavior |

@@ -405,18 +405,26 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(unsigned_summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(unsigned_summary.into_body(), usize::MAX)
+    assert_eq!(unsigned_summary.status(), StatusCode::FORBIDDEN);
+
+    let sign_in = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/auth/passkey/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["authority"]["signed_in"], false);
+    assert_eq!(sign_in.status(), StatusCode::OK);
 
     let cookie_name = home_session_cookie_name(
         test_browser_request("localhost:61180", "http://localhost:61180")
@@ -452,6 +460,7 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
@@ -513,6 +522,11 @@ async fn test_home_entry_redirects_preserve_bookmarks_and_capsule_roots() {
 #[tokio::test]
 async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"gateway_allowed_hosts = ["localhost:8090", "elastos.elacitylabs.com"]"#,
+    )
+    .unwrap();
     let app = gateway_router(test_state(dir.path()));
     std::fs::write(
         dir.path()
@@ -568,8 +582,13 @@ async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
             assert_eq!(home.headers()["x-content-type-options"], "nosniff");
             if home_path.ends_with('/') || home_path.ends_with(".html") {
                 let csp = home.headers()["content-security-policy"].to_str().unwrap();
+                assert!(csp.contains("default-src 'self'"));
+                assert!(csp.contains("script-src 'self'"));
+                assert!(csp.contains("style-src 'self'"));
                 assert!(csp.contains("connect-src 'self'"));
                 assert!(csp.contains("frame-ancestors 'none'"));
+                assert!(!csp.contains("sandbox"));
+                assert!(!csp.contains("'unsafe-inline'"));
             }
             let home_body = axum::body::to_bytes(home.into_body(), usize::MAX)
                 .await
@@ -755,7 +774,7 @@ async fn test_home_cli_terminal_developer_mode_policy_matrix() {
                     let contract = app
                         .clone()
                         .oneshot(
-                            Request::builder()
+                            test_browser_request("localhost:61180", "null")
                                 .uri("/api/apps/home-cli/terminal/contract")
                                 .header("x-elastos-home-token", &token)
                                 .body(Body::empty())
@@ -855,6 +874,7 @@ async fn assert_terminal_routes_refused(app: &axum::Router, token: &str) {
                         .header("x-elastos-home-token", token)
                         .header(CONTENT_TYPE, "application/json")
                         .header("access-control-request-method", "POST")
+                        .header("access-control-request-headers", "x-elastos-home-token")
                         .body(Body::from(body))
                         .unwrap(),
                 )
@@ -910,8 +930,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let contract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/home-cli/terminal/contract")
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1039,10 +1060,11 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let bad_events = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/apps/home-cli/terminal/sessions/{session_id}/events?ticket=wrong"
                 ))
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1053,8 +1075,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let non_websocket_input = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(input_socket_url)
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1396,15 +1419,22 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let public = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(public.status(), StatusCode::OK);
-    let public_body = axum::body::to_bytes(public.into_body(), usize::MAX)
+    assert_eq!(public.status(), StatusCode::FORBIDDEN);
+    // The signed-out read model stays private and keeps empty account facts.
+    let signed_out_model = gateway_home_system::home_summary(
+        State(library_test_state(dir.path()).await),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let public_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let public_payload: serde_json::Value = serde_json::from_slice(&public_body).unwrap();
@@ -5514,17 +5544,33 @@ fn system_runtime_activity_filters_attach_noise() {
 async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let before = file_snapshot(dir.path());
 
     for uri in [
         "/api/apps/system/identity/handle",
         "/api/apps/system/identity/profile-card",
     ] {
+        let unsigned = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"owner"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::FORBIDDEN, "{uri}");
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri(uri)
+                    .header("x-elastos-home-token", &authority.system_token)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"display_name":"owner"}"#))
                     .unwrap(),
@@ -5541,11 +5587,12 @@ async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state()
             response.status()
         );
     }
+    assert_eq!(file_snapshot(dir.path()), before);
     assert!(
         crate::collaboration_profile_authority::load_profile_authority(
             dir.path(),
-            "person:local:missing",
-            &crate::auth::principal_localhost_root("person:local:missing"),
+            &authority.principal_id,
+            &crate::auth::principal_localhost_root(&authority.principal_id),
         )
         .unwrap()
         .is_none()
@@ -6935,15 +6982,18 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         authority.principal_id
     );
 
-    let (status, wrong_origin_shell_summary) = home_test_get_json(
-        &app,
-        "/api/apps/home/summary",
-        &home_cli_token,
-        "http://localhost:61180",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(wrong_origin_shell_summary["authority"]["signed_in"], false);
+    let wrong_origin_shell_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", &home_cli_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin_shell_summary.status(), StatusCode::FORBIDDEN);
 
     let catalog = app
         .clone()
@@ -6974,9 +7024,10 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let esp_initialize = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", &home_cli_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"esp_version":"0","accepts":["elastos.capsules.catalog/v1"]}"#,
@@ -7015,10 +7066,20 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
-    let (status, native_regular_summary) =
-        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &regular_token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(native_regular_summary["authority"]["signed_in"], false);
+    let native_regular_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", &regular_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_regular_summary.status(), StatusCode::FORBIDDEN);
+
     let catalog_rejected = app
         .clone()
         .oneshot(
@@ -8692,8 +8753,12 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
         )
         .await
         .unwrap();
-    assert_eq!(unsigned.status(), StatusCode::OK);
-    let unsigned_body = axum::body::to_bytes(unsigned.into_body(), usize::MAX)
+    assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+    // Unit-test the fixed signed-out projection independently of API admission.
+    let signed_out_model =
+        gateway_home_system::home_summary(State(test_state(dir.path())), HeaderMap::new()).await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let unsigned_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let unsigned_payload: serde_json::Value = serde_json::from_slice(&unsigned_body).unwrap();

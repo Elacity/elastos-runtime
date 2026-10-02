@@ -193,6 +193,7 @@ product-ui-source:
     node scripts/archive-product-behavior-smoke.mjs
     node scripts/marketplace-product-behavior-smoke.mjs
     node scripts/documents-product-behavior-smoke.mjs
+    node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
 

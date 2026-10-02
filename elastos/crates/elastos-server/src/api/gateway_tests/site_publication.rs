@@ -515,6 +515,11 @@ async fn test_artifact_file_200() {
 #[tokio::test]
 async fn test_domain_binding_serves_bound_root() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "gateway_allowed_hosts = [\"docs.example.com\"]\n",
+    )
+    .unwrap();
     let public_site = dir.path().join("Public").join("docs");
     std::fs::create_dir_all(&public_site).unwrap();
     std::fs::write(public_site.join("index.html"), "<html>bound site</html>").unwrap();

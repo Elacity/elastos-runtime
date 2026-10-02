@@ -38,6 +38,11 @@ fn updated_config(contents: &str, key: &str, value: &str) -> anyhow::Result<Stri
             .parse::<bool>()
             .context("developer_mode requires true or false")?;
     }
+    if key == "gateway_public_publisher_bootstrap" {
+        value
+            .parse::<bool>()
+            .context("gateway_public_publisher_bootstrap requires true or false")?;
+    }
     if key == "carrier_bind_addr" {
         value
             .parse::<std::net::SocketAddr>()
@@ -46,7 +51,27 @@ fn updated_config(contents: &str, key: &str, value: &str) -> anyhow::Result<Stri
     let mut table: toml::Table = contents
         .parse()
         .context("Invalid config.toml; existing settings preserved")?;
-    let toml_val = if let Ok(b) = value.parse::<bool>() {
+    let toml_val = if key == "gateway_allowed_hosts" {
+        let hosts: Vec<String> = serde_json::from_str(value)
+            .context("gateway_allowed_hosts requires a JSON array of authorities")?;
+        if hosts.len() > 32 {
+            anyhow::bail!("gateway_allowed_hosts exceeds 32 names");
+        }
+        for host in &hosts {
+            let authority = host
+                .parse::<axum::http::uri::Authority>()
+                .context("invalid gateway host")?;
+            if host.trim() != host
+                || host.contains(['/', '@', '?', '#'])
+                || authority.host().ends_with('.')
+                || authority.host().contains('%')
+                || authority.as_str() != authority.host() && authority.port_u16().is_none()
+            {
+                anyhow::bail!("invalid gateway host");
+            }
+        }
+        toml::Value::Array(hosts.into_iter().map(toml::Value::String).collect())
+    } else if let Ok(b) = value.parse::<bool>() {
         toml::Value::Boolean(b)
     } else if let Ok(n) = value.parse::<i64>() {
         toml::Value::Integer(n)
@@ -89,6 +114,50 @@ mod tests {
         for invalid in ["1", "yes", "True", ""] {
             assert!(super::updated_config("", "developer_mode", invalid).is_err());
         }
+    }
+
+    #[test]
+    fn gateway_hosts_are_explicit_authorities_and_preserve_other_settings() {
+        let updated = super::updated_config(
+            "dev_mode = true\n",
+            "gateway_allowed_hosts",
+            r#"["home.example.test", "127.0.0.1:61180", "[::1]:61180"]"#,
+        )
+        .unwrap();
+        let table: toml::Table = updated.parse().unwrap();
+        assert_eq!(table["dev_mode"].as_bool(), Some(true));
+        assert_eq!(table["gateway_allowed_hosts"].as_array().unwrap().len(), 3);
+        for invalid in [
+            r#"["https://home.example.test"]"#,
+            r#"["home.example.test."]"#,
+            r#"["user@home.example.test"]"#,
+            r#"["home.example.test:99999"]"#,
+            r#"[" home.example.test"]"#,
+            r#"[1]"#,
+        ] {
+            assert!(
+                super::updated_config("dev_mode = true", "gateway_allowed_hosts", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let too_many = serde_json::to_string(&vec!["home.example.test"; 33]).unwrap();
+        assert!(super::updated_config("", "gateway_allowed_hosts", &too_many).is_err());
+    }
+
+    #[test]
+    fn public_publisher_bootstrap_requires_an_explicit_boolean() {
+        for value in ["yes", "1", "TRUE", ""] {
+            assert!(
+                super::updated_config("", "gateway_public_publisher_bootstrap", value).is_err()
+            );
+        }
+        let updated =
+            super::updated_config("", "gateway_public_publisher_bootstrap", "true").unwrap();
+        let table: toml::Table = updated.parse().unwrap();
+        assert_eq!(
+            table["gateway_public_publisher_bootstrap"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

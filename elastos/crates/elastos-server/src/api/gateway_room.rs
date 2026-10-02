@@ -303,8 +303,19 @@ pub(super) struct CarrierBootstrapQuery {
 
 pub(super) async fn gateway_carrier_bootstrap(
     State(state): State<GatewayState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: HeaderMap,
     Query(query): Query<CarrierBootstrapQuery>,
 ) -> Response {
+    let public =
+        gateway_frontdoor::public_publisher_bootstrap(&state.data_dir, uri.path(), uri.query());
+    if !public && gateway_home_token::require_gateway_launch(&state.data_dir, &headers).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            "Carrier bootstrap requires an authorized caller",
+        )
+            .into_response();
+    }
     let publisher_bootstrap = carrier_bootstrap_query_requests_publisher(&query);
     let bootstrap = if publisher_bootstrap {
         match gateway_provider_carrier_bootstrap(&state).await {
@@ -320,25 +331,18 @@ pub(super) async fn gateway_carrier_bootstrap(
             },
         }
     };
-    let did = elastos_identity::load_or_create_did(&state.data_dir)
-        .ok()
-        .map(|(_, did)| did)
-        .unwrap_or_default();
+    let mut body = serde_json::json!({
+        "schema": "elastos.carrier.bootstrap/v1", "transport": "carrier",
+        "ticket": bootstrap.ticket, "node_id": bootstrap.node_id,
+        "role": if publisher_bootstrap { "publisher" } else { "runtime" }, "generated_at": now_ts(),
+    });
+    if !public {
+        body["did"] = serde_json::Value::String(
+            load_existing_gateway_runtime_did(&state.data_dir).unwrap_or_default(),
+        );
+    }
 
-    (
-        StatusCode::OK,
-        [(CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({
-            "schema": "elastos.carrier.bootstrap/v1",
-            "transport": "carrier",
-            "ticket": bootstrap.ticket,
-            "node_id": bootstrap.node_id,
-            "did": did,
-            "role": if publisher_bootstrap { "publisher" } else { "runtime" },
-            "generated_at": now_ts(),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, [(CACHE_CONTROL, "no-store")], Json(body)).into_response()
 }
 
 fn carrier_bootstrap_query_requests_publisher(query: &CarrierBootstrapQuery) -> bool {
