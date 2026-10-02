@@ -1454,8 +1454,8 @@
         },
         "linux-arm64": {
           "release_path": "llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz",
-          "checksum": "sha256:da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205",
-          "size": 6670788,
+          "checksum": "sha256:a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8",
+          "size": 6665019,
           "extract_path": "llama-b10516",
           "install_path": "libexec/llama.cpp/b10516/linux-arm64",
           "binary_path": "llama-server"

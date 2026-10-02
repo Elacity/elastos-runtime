@@ -1,5 +1,48 @@
 use super::*;
 
+pub(super) async fn sandbox_content_response(mut response: Response) -> Response {
+    // User content has an opaque origin and keeps its scripts and form controls.
+    // Its scripts cannot use the gateway's opaque-app CORS path to read APIs.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "sandbox allow-scripts allow-forms allow-popups; connect-src 'none'",
+        ),
+    );
+    response
+}
+
+pub(super) async fn refuse_content_api_resources(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let opaque_or_cross_site = headers.get("origin").is_some_and(|value| value == "null")
+        || headers
+            .get("sec-fetch-site")
+            .is_some_and(|value| value == "cross-site");
+    let resource_or_navigation = headers
+        .get("sec-fetch-dest")
+        .is_some_and(|value| value != "empty")
+        || headers
+            .get("sec-fetch-mode")
+            .is_some_and(|value| value == "navigate");
+    // Content can use forms and links, but API documents and resource loads
+    // cross the opaque boundary. App fetches and ticketed streams retain their
+    // own capability checks; untrusted content's CSP blocks those connections.
+    if request.uri().path().starts_with("/api/apps/")
+        && opaque_or_cross_site
+        && resource_or_navigation
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "API resource access requires an app connection",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Debug, Deserialize)]
 struct EdgeBinding {
     target: String,
