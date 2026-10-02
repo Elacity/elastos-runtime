@@ -1147,11 +1147,11 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
 PY
 info "Saved trusted source config to ${DATA_DIR}/sources.json"
 
-CONSUMED_RELEASE_ROOT="${DATA_DIR}/updates/consumed"
-mkdir -p "${CONSUMED_RELEASE_ROOT}"
-cp "${TMPDIR}/release-head.json" "${CONSUMED_RELEASE_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${CONSUMED_RELEASE_ROOT}/release.json"
-info "Saved consumed release metadata for future upgrades"
+PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
+mkdir -p "${PUBLISHER_ROOT}"
+cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
+cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
+info "Saved publisher metadata for future upgrades"
 
 # ── Complete installation ─────────────────────────────────────────────
 
