@@ -55,6 +55,7 @@ pub mod ownership;
 pub mod protected_content_config;
 pub mod protected_content_runtime;
 pub mod provider_resource;
+pub mod release_publication;
 pub mod resource_bridge;
 pub mod room_service;
 pub mod runtime;

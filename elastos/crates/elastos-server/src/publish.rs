@@ -1,7 +1,6 @@
 use anyhow::Context;
 use elastos_common::localhost::{publisher_publish_state_path, publisher_root_path};
 use elastos_common::{CapsuleManifest, RequirementKind};
-use elastos_runtime::signature::{self, generate_keypair};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -154,6 +153,11 @@ pub(crate) struct PublishReleaseOptions {
     pub(crate) cross: Option<String>,
     pub(crate) capsules: Vec<String>,
     pub(crate) platform_inputs: Vec<String>,
+    pub(crate) preview_platform: Option<String>,
+    pub(crate) prepare_only: Option<PathBuf>,
+    pub(crate) signed_publication: Option<PathBuf>,
+    pub(crate) publisher_did: Option<String>,
+    pub(crate) allow_signer_rotation: bool,
     pub(crate) key: Option<PathBuf>,
     pub(crate) dry_run: bool,
     pub(crate) preflight_only: bool,
@@ -167,6 +171,8 @@ pub(crate) struct PublishReleaseOptions {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct PublishState {
+    #[serde(default)]
+    publisher_did: Option<String>,
     #[serde(default)]
     last_release_cid: Option<String>,
     #[serde(default)]
@@ -243,25 +249,23 @@ struct ReleaseHeadPayload {
     release_object_cid: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct PublishKey {
-    path: PathBuf,
-    signer_did: String,
-}
-
-#[derive(Debug, Clone)]
-struct PublishKeyPreview {
-    path: PathBuf,
-    signer_did: Option<String>,
-}
-
 pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> anyhow::Result<()> {
     let workspace_root = workspace_root();
+    validate_prepare_options(&options)?;
     validate_platform_input_options(&options)?;
+    if options.signed_publication.is_some() {
+        return run_signed_publication(options, &workspace_root).await;
+    }
+    if options.prepare_only.is_none() && !options.dry_run && !options.preflight_only {
+        anyhow::bail!("Publish the separately signed set with --signed-publication and --publisher-did, or prepare inert inputs with --prepare-only");
+    }
     if !options.platform_inputs.is_empty() {
         let caller_dir =
             std::env::current_dir().context("Failed to resolve the caller directory")?;
         resolve_platform_input_paths(&mut options.platform_inputs, &caller_dir)?;
+        if let Some(output) = &mut options.prepare_only {
+            *output = caller_dir.join(&*output);
+        }
     }
     let (available_capsules, selected_capsules) = if options.platform_inputs.is_empty() {
         let manifests = load_capsule_manifests(&workspace_root)?;
@@ -278,10 +282,8 @@ pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> a
     let previous_state = load_publish_state(&state_path)?;
 
     if options.dry_run {
-        let key = inspect_release_key(options.key.as_deref())?;
         print_publish_plan(
             &options,
-            &key,
             &state_path,
             &previous_state,
             &available_capsules,
@@ -296,245 +298,357 @@ pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> a
         return Ok(());
     }
 
-    let key = load_or_create_release_key(options.key.as_deref())?;
-    let source_bootstrap = discover_source_connect_ticket().await;
-    if bootstrap_required(&options, &source_bootstrap) {
-        anyhow::bail!(
-            "publish requires a stamped trusted-source Carrier bootstrap; start or refresh a local ElastOS runtime first, or re-run with --allow-no-bootstrap only for local-only testing"
+    if let Some(output) = &options.prepare_only {
+        if output.exists() || output.symlink_metadata().is_ok() {
+            anyhow::bail!("Unsigned signing-input output already exists");
+        }
+        let mut command = Command::new("bash");
+        command
+            .arg(workspace_root.join("scripts/publish-release.sh"))
+            .arg("--version")
+            .arg(&options.version)
+            .arg("--channel")
+            .arg(&options.channel)
+            .arg("--prepare-only")
+            .arg(output)
+            .arg("--publisher-did")
+            .arg(
+                options
+                    .publisher_did
+                    .as_deref()
+                    .context("Public signer DID required")?,
+            )
+            .env("ELASTOS_PUBLISH_STATE_DIR", publish_state_dir(&data_dir))
+            .current_dir(&workspace_root);
+        append_publish_selection_args(&mut command, &options, &selected_capsules);
+        if let Some(provider) = &options.ipfs_provider_bin {
+            command.arg("--ipfs-provider-bin").arg(provider);
+        }
+        let status = command
+            .status()
+            .context("Failed to prepare unsigned signing input")?;
+        if !status.success() {
+            anyhow::bail!(
+                "Unsigned signing-input preparation exited with status {}",
+                status
+            );
+        }
+        return Ok(());
+    }
+
+    anyhow::bail!("The custodian tool owns release signing; publish its frozen output")
+}
+
+async fn run_signed_publication(
+    options: PublishReleaseOptions,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
+    use elastos_server::release_publication::Publication;
+
+    validate_release_channel(&options.channel)?;
+    let caller_dir = std::env::current_dir()?;
+    let input = caller_dir.join(
+        options
+            .signed_publication
+            .as_ref()
+            .context("Signed publication required")?,
+    );
+    let signer = options
+        .publisher_did
+        .as_deref()
+        .context("Public signer DID required")?;
+    let publication = Publication::open_flat(&input, signer)?;
+    anyhow::ensure!(
+        publication.version() == options.version && publication.channel() == options.channel,
+        "The signed set differs from the requested version or channel"
+    );
+    let data_dir = elastos_server::sources::default_data_dir();
+    let state_path = publish_state_path(&data_dir);
+    let previous = load_publish_state(&state_path)?;
+    let needs_confirmation =
+        publication_pin_change(&previous, signer, options.allow_signer_rotation)?;
+    validate_publication_chain(
+        &previous,
+        publication.head_bytes(),
+        publication.release_bytes(),
+        publication.release_cid(),
+    )?;
+    if options.dry_run {
+        println!(
+            "Frozen signed publication {} on {} as {}",
+            options.version, options.channel, signer
         );
-    }
-    let script_path = workspace_root.join("scripts/publish-release.sh");
-    if !script_path.is_file() {
-        anyhow::bail!("Publish script not found at {}", script_path.display());
-    }
-
-    let state_dir = publish_state_dir(&data_dir);
-    std::fs::create_dir_all(&state_dir)?;
-
-    println!("ElastOS publish-release");
-    println!("  Version:   {}", options.version);
-    println!("  Channel:   {}", options.channel);
-    println!("  Profile:   {}", options.profile);
-    println!("  Signer:    {}", key.signer_did);
-    match &source_bootstrap {
-        Ok(Some(_)) => println!("  Bootstrap: publisher ticket auto-stamped"),
-        Ok(None) => println!("  Bootstrap: unavailable (no running local runtime ticket)"),
-        Err(error) => println!("  Bootstrap: unavailable ({})", error),
-    }
-    print_publish_selection(&options, &selected_capsules);
-    if let Some(cross) = &options.cross {
-        println!("  Cross:     {}", cross);
-    }
-    println!("  Key path:  {}", key.path.display());
-    println!("  State dir: {}", state_dir.display());
-    println!();
-
-    let mut cmd = Command::new("bash");
-    cmd.arg(script_path);
-    cmd.arg("--version").arg(&options.version);
-    cmd.arg("--channel").arg(&options.channel);
-    cmd.arg("--key").arg(&key.path);
-    append_publish_selection_args(&mut cmd, &options, &selected_capsules);
-    cmd.env("ELASTOS_PUBLISH_STATE_DIR", &state_dir);
-    if let Ok(Some(ticket)) = &source_bootstrap {
-        cmd.env("ELASTOS_SOURCE_CONNECT_TICKET", ticket);
-    }
-    if options.allow_no_bootstrap {
-        cmd.env("ELASTOS_ALLOW_NO_BOOTSTRAP", "1");
-    }
-    cmd.current_dir(&workspace_root);
-
-    if options.skip_build {
-        cmd.arg("--skip-build");
-    }
-    if options.skip_rootfs {
-        cmd.arg("--skip-rootfs");
-    }
-    if let Some(cross) = &options.cross {
-        cmd.arg("--cross").arg(cross);
-    }
-    if let Some(ipfs_provider_bin) = &options.ipfs_provider_bin {
-        cmd.arg("--ipfs-provider-bin").arg(ipfs_provider_bin);
-    }
-    if options.public_url {
-        if options.public_with_sudo {
-            cmd.arg("--public-with-sudo");
+        println!(
+            "{} admitted artifacts; CID import and publication are pending",
+            publication.artifacts().len()
+        );
+        if needs_confirmation {
+            println!("The complete public DID must be confirmed before changing the saved pin");
         }
-        cmd.arg("--gateway-addr").arg(&options.gateway_addr);
-        cmd.arg("--public-timeout")
-            .arg(options.public_timeout.to_string());
-    } else {
-        cmd.arg("--no-public-url");
+        return Ok(());
+    }
+    let provider = options
+        .ipfs_provider_bin
+        .clone()
+        .or_else(|| find_ipfs_provider_binary(workspace_root))
+        .context("A qualified ipfs-provider binary is required; pass --ipfs-provider-bin")?;
+    anyhow::ensure!(
+        is_executable_file(&provider),
+        "ipfs-provider must be an executable file"
+    );
+    let script = workspace_root.join("scripts/publish-release.sh");
+    anyhow::ensure!(script.is_file(), "The publication helper is required");
+    if options.preflight_only {
+        println!("Frozen signed publication admission and provider preflight passed");
+        return Ok(());
+    }
+    if needs_confirmation {
+        use std::io::Write;
+        print!("Change the saved release signer to {signer}. Type this complete DID to confirm, or press Enter to cancel: ");
+        std::io::stdout().flush()?;
+        confirm_publication_pin(signer, &mut std::io::stdin().lock())?;
     }
 
-    let status = cmd
-        .status()
-        .context("Failed to launch publish-release.sh")?;
-    if !status.success() {
-        anyhow::bail!("publish-release.sh exited with status {}", status);
-    }
-
-    // Re-verify signatures on artifacts produced by the bash script.
-    // Consumer-side verification is the primary trust boundary, but this
-    // defense-in-depth check catches corrupt or unsigned artifacts before
-    // they are announced to peers.
-    let artifacts_dir = workspace_root.join("artifacts");
-    let release_json_path = artifacts_dir.join("release.json");
-    let head_json_path = artifacts_dir.join("release-head.json");
-    if release_json_path.is_file() {
-        let release_bytes = std::fs::read(&release_json_path)
-            .context("Failed to read artifacts/release.json for verification")?;
-        elastos_server::crypto::verify_release_envelope(
-            &release_bytes,
-            "elastos.release.v1",
-            &key.signer_did,
-        )
-        .context("release.json signature verification failed after publish")?;
-    }
-    if head_json_path.is_file() {
-        let head_bytes = std::fs::read(&head_json_path)
-            .context("Failed to read artifacts/release-head.json for verification")?;
-        elastos_server::crypto::verify_release_envelope(
-            &head_bytes,
-            "elastos.release.head.v1",
-            &key.signer_did,
-        )
-        .context("release-head.json signature verification failed after publish")?;
-    }
-
-    let mut next_state = previous_state;
-    next_state.last_release_cid = read_state_value(&state_dir.join("last-release-cid"))?;
-    next_state.last_head_cid = read_state_value(&state_dir.join("last-release-head-cid"))?;
-    next_state.last_version = Some(options.version);
-    next_state.last_published_at = Some(now_unix()?);
-    save_publish_state(&state_path, &next_state)?;
-
-    if let (Some(release_cid), Some(head_cid)) = (
-        next_state.last_release_cid.as_deref(),
-        next_state.last_head_cid.as_deref(),
-    ) {
-        let artifacts_dir = workspace_root.join("artifacts");
-        let current_entry =
-            build_release_ledger_entry(&artifacts_dir, release_cid, head_cid, &selected_capsules)?;
-        let ledger_path = release_ledger_path(&data_dir);
-        let mut ledger = load_release_ledger(&ledger_path)?;
-        let previous_entry = ledger
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| {
-                entry.channel == current_entry.channel && entry.head_cid != current_entry.head_cid
-            })
-            .cloned();
-        ledger.upsert(current_entry.clone());
-        save_release_ledger(&ledger_path, &ledger)?;
-        print_release_diff_summary(&current_entry, previous_entry.as_ref(), &ledger_path);
-        let notes = operator_release_notes(&current_entry, previous_entry.as_ref());
-        if !notes.is_empty() {
-            println!("  Notes:");
-            for note in notes {
-                println!("    - {}", note);
-            }
-        }
-        match announce_release_head(&current_entry).await {
-            Ok(topics) => println!("  Gossip:  announced on {}", topics.join(", ")),
-            Err(error) => eprintln!("  Gossip skipped: {}", error),
+    // Candidate files are read only through held descriptors. The separate
+    // publication host executes its provider against this verified snapshot.
+    std::fs::create_dir_all(&data_dir)?;
+    let data_dir = data_dir.canonicalize()?;
+    let scratch = tempfile::Builder::new()
+        .prefix(".release-import-")
+        .tempdir_in(&data_dir)?;
+    let snapshot = scratch.path().join("snapshot");
+    publication.snapshot_into(&snapshot)?;
+    let frozen = Publication::open_published(&snapshot, signer)?;
+    for artifact in frozen.artifacts() {
+        let actual =
+            import_publication_file(&provider, &snapshot.join("artifacts").join(&artifact.name))
+                .await?;
+        if actual != artifact.cid && cid::Cid::try_from(artifact.cid.as_str())?.codec() == 0x55 {
+            // The catalogue's signed pin is a raw block. The existing provider
+            // imports files as UnixFS; publish the bounded raw block through
+            // that provider's own local Kubo endpoint as well.
+            anyhow::ensure!(
+                artifact.size <= 2 * 1024 * 1024,
+                "Raw publication block exceeds its bounded import size"
+            );
+            let bytes = frozen.read_verified_artifact(&artifact.name)?;
+            let raw = import_publication_raw_block(&provider, &artifact.name, bytes).await?;
+            require_import_cid(&raw, &artifact.cid)?;
+        } else {
+            require_import_cid(&actual, &artifact.cid)?;
         }
     }
+    let release_cid = import_publication_file(&provider, &snapshot.join("release.json")).await?;
+    require_import_cid(&release_cid, publication.release_cid())?;
+    let head_cid = import_publication_file(&provider, &snapshot.join("release-head.json")).await?;
+    elastos_server::update::verify_release_metadata_cid(&head_cid, publication.head_bytes())?;
+    let state = PublishState {
+        publisher_did: Some(signer.to_owned()),
+        last_release_cid: Some(release_cid.clone()),
+        last_head_cid: Some(head_cid.clone()),
+        last_version: Some(options.version.clone()),
+        last_published_at: Some(now_unix()?),
+    };
+    let state_file = scratch.path().join("publish-state.json");
+    std::fs::write(&state_file, serde_json::to_vec_pretty(&state)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let checked = Publication::open_published(&snapshot, signer)?;
+    anyhow::ensure!(
+        checked.head_bytes() == publication.head_bytes()
+            && checked.release_bytes() == publication.release_bytes(),
+        "Frozen metadata changed during import"
+    );
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg("source \"$1\"; export_release_publication \"$2\" \"$3/release-head.json\" \"$3/release.json\" \"$3/install.sh\" \"$3/artifacts\" \"$4\"")
+        .arg("publish-signed-set")
+        .arg(&script)
+        .arg(publish_state_dir(&data_dir))
+        .arg(&snapshot)
+        .arg(&state_file)
+        .current_dir(workspace_root)
+        .status().context("Failed to commit the frozen publication")?;
+    anyhow::ensure!(
+        status.success(),
+        "Frozen publication promotion failed; inspect the helper's recovery result"
+    );
 
+    // The public pin and CID receipt are part of the head-last publication
+    // transaction. Ledger and gossip are derived, retryable work after commit.
+    let entry = build_release_ledger_entry(&snapshot, &release_cid, &head_cid, &[])?;
+    let ledger_path = release_ledger_path(&data_dir);
+    let mut ledger = load_release_ledger(&ledger_path)?;
+    let earlier = ledger
+        .entries
+        .iter()
+        .rev()
+        .find(|item| item.channel == entry.channel && item.head_cid != entry.head_cid)
+        .cloned();
+    ledger.upsert(entry.clone());
+    save_release_ledger(&ledger_path, &ledger)
+        .context("The signed set is committed; retry publication to record its ledger")?;
+    print_release_diff_summary(&entry, earlier.as_ref(), &ledger_path);
+    match announce_release_head(&entry).await {
+        Ok(topics) => println!("Release head announced on {}", topics.join(", ")),
+        Err(error) => anyhow::bail!(
+            "The signed set is committed; retry publication to announce its head: {error}"
+        ),
+    }
     Ok(())
 }
 
-fn bootstrap_required(
-    options: &PublishReleaseOptions,
-    source_bootstrap: &anyhow::Result<Option<String>>,
-) -> bool {
-    if options.allow_no_bootstrap || options.dry_run || options.preflight_only {
-        return false;
-    }
-    !matches!(source_bootstrap, Ok(Some(ticket)) if !ticket.trim().is_empty())
-}
-
-async fn discover_source_connect_ticket() -> anyhow::Result<Option<String>> {
-    // Get ticket from the running runtime's built-in Carrier (via HTTP API).
-    // No peer-provider spawn — Carrier is built into the runtime.
-    discover_source_connect_ticket_from_runtime().await
-}
-
-async fn discover_source_connect_ticket_from_runtime() -> anyhow::Result<Option<String>> {
-    let data_dir = elastos_server::sources::default_data_dir();
-    let coords_path = super::runtime_control::runtime_coord_path(&data_dir);
-    let Some(coords) = super::runtime_control::read_runtime_coords(&coords_path).await else {
-        return Ok(None);
+fn publication_pin_change(
+    state: &PublishState,
+    candidate: &str,
+    allow: bool,
+) -> anyhow::Result<bool> {
+    validate_public_signer_did(candidate)?;
+    let changing = match state.publisher_did.as_deref() {
+        Some(previous) => previous != candidate,
+        None => state.last_release_cid.is_some() || state.last_head_cid.is_some(),
     };
-
-    let expected_version = env!("ELASTOS_VERSION");
-    let actual_version = runtime_version_from_runtime_api(&coords.api_url)
-        .await
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "trusted-source runtime health unavailable at {}. Refresh the canonical source runtime before publish.",
-                coords.api_url
-            )
-        })?;
-    let expected_dev_version = format!("{}-dev", expected_version);
-    if actual_version != expected_version && actual_version != expected_dev_version {
-        anyhow::bail!(
-            "trusted-source runtime is stale (running {}, expected {} or {}). Refresh the canonical source runtime before publish.",
-            actual_version,
-            expected_version,
-            expected_dev_version
-        );
-    }
-
-    let tokens = super::runtime_control::attach_to_runtime(&coords).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let response = client
-        .post(format!("{}/api/provider/peer/get_ticket", coords.api_url))
-        .bearer_auth(&tokens.shell_token)
-        .json(&serde_json::json!({}))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "live runtime peer ticket request failed ({})",
-            response.status()
-        );
-    }
-    let body: serde_json::Value = response.json().await?;
-    if body["status"].as_str() == Some("error") {
-        anyhow::bail!(
-            "live runtime peer ticket request failed: {}",
-            body["message"].as_str().unwrap_or("unknown error")
-        );
-    }
-    Ok(body
-        .get("data")
-        .and_then(|v| v.get("ticket"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
+    anyhow::ensure!(!changing || allow, "Saved public signer pin differs or legacy publication lacks a pin; use --allow-signer-rotation for an approved change");
+    Ok(changing)
 }
 
-async fn runtime_version_from_runtime_api(api_url: &str) -> Option<String> {
-    let api_base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(api_url).ok()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let resp = client
-        .get(api_base.join("/api/health").ok()?)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+fn confirm_publication_pin(signer: &str, input: &mut impl std::io::BufRead) -> anyhow::Result<()> {
+    let mut answer = String::new();
+    let mut bounded = std::io::Read::take(input, 512);
+    std::io::BufRead::read_line(&mut bounded, &mut answer)?;
+    anyhow::ensure!(
+        answer.trim_end_matches(['\r', '\n']) == signer,
+        "Public signer change cancelled; the saved pin and publication stay intact"
+    );
+    Ok(())
+}
+
+fn validate_publication_chain(
+    state: &PublishState,
+    head_bytes: &[u8],
+    release_bytes: &[u8],
+    release_cid: &str,
+) -> anyhow::Result<()> {
+    let head: serde_json::Value = serde_json::from_slice(head_bytes)?;
+    let release: serde_json::Value = serde_json::from_slice(release_bytes)?;
+    // Repeating the exact committed release is allowed so the operator can
+    // finish derived ledger/gossip work after a transport failure.
+    if state.last_release_cid.as_deref() == Some(release_cid) {
+        let saved_head = state
+            .last_head_cid
+            .as_deref()
+            .context("Committed release lacks its head CID receipt")?;
+        elastos_server::update::verify_release_metadata_cid(saved_head, head_bytes)?;
+        return Ok(());
     }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("version")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    anyhow::ensure!(
+        head["payload"]["prev_head_cid"].as_str() == state.last_head_cid.as_deref(),
+        "Signed head does not continue the saved publication receipt"
+    );
+    anyhow::ensure!(
+        release["payload"]["prev_release_cid"].as_str() == state.last_release_cid.as_deref(),
+        "Signed release does not continue the saved publication receipt"
+    );
+    Ok(())
+}
+
+fn require_import_cid(actual: &str, expected: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual == expected,
+        "Imported CID differs from its signed reference"
+    );
+    Ok(())
+}
+
+async fn import_publication_file(provider: &Path, file: &Path) -> anyhow::Result<String> {
+    let response = publication_provider_request(
+        provider,
+        serde_json::json!({"op":"add_path", "path":file, "pin":true}),
+    )
+    .await?;
+    let cid = response["data"]["cid"]
+        .as_str()
+        .context("IPFS import receipt lacks a CID")?;
+    let _ = cid::Cid::try_from(cid).context("IPFS import receipt has an invalid CID")?;
+    Ok(cid.to_owned())
+}
+
+async fn import_publication_raw_block(
+    provider: &Path,
+    name: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        bytes.len() <= 2 * 1024 * 1024,
+        "Raw publication block exceeds its bounded import size"
+    );
+    let status = publication_provider_request(provider, serde_json::json!({"op":"status"})).await?;
+    let endpoint = status["data"]["api_endpoint"]
+        .as_str()
+        .context("Qualified Kubo API endpoint missing")?;
+    let base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(endpoint)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_owned());
+    let response = client
+        .post(base.join("/api/v0/block/put")?)
+        .query(&[
+            ("cid-codec", "raw"),
+            ("mhtype", "sha2-256"),
+            ("pin", "true"),
+        ])
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await?
+        .error_for_status()?;
+    let receipt: serde_json::Value = response.json().await?;
+    Ok(receipt["Key"]
+        .as_str()
+        .context("Raw block import receipt lacks its CID")?
+        .to_owned())
+}
+
+async fn publication_provider_request(
+    provider: &Path,
+    operation: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(provider)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Cannot start the qualified IPFS import provider")?;
+    let request = format!("{{\"op\":\"init\",\"config\":{{}}}}\n{operation}\n");
+    let mut input = child.stdin.take().context("Provider stdin missing")?;
+    input.write_all(request.as_bytes()).await?;
+    input.shutdown().await?;
+    drop(input);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        child.wait_with_output(),
+    )
+    .await
+    .context("IPFS import exceeded its five-minute limit")??;
+    anyhow::ensure!(output.status.success(), "IPFS provider import failed");
+    let last = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.is_empty())
+        .context("IPFS provider returned no import receipt")?;
+    let response: serde_json::Value = serde_json::from_slice(last)?;
+    anyhow::ensure!(
+        response["status"].as_str() == Some("ok"),
+        "IPFS provider refused import"
+    );
+    Ok(response)
 }
 
 fn workspace_root() -> PathBuf {
@@ -575,73 +689,41 @@ fn release_ledger_path(data_dir: &Path) -> PathBuf {
     data_dir.join("releases").join("cids.json")
 }
 
-fn release_key_path(default_override: Option<&Path>) -> PathBuf {
-    default_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| elastos_server::sources::default_data_dir().join("release-key.hex"))
-}
-
-fn load_or_create_release_key(path_override: Option<&Path>) -> anyhow::Result<PublishKey> {
-    let path = release_key_path(path_override);
-    if path.exists() {
-        let hex_str = std::fs::read_to_string(&path)?;
-        let bytes = hex::decode(hex_str.trim())
-            .map_err(|e| anyhow::anyhow!("Invalid release signing key: {}", e))?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Release signing key must be 32 bytes"))?;
-        let signing_key = signature::SigningKey::from_bytes(&arr);
-        return Ok(PublishKey {
-            signer_did: elastos_server::crypto::encode_signing_key_did(&signing_key),
-            path,
-        });
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let (signing_key, verifying_key) = generate_keypair();
-    std::fs::write(&path, hex::encode(signing_key.to_bytes()))?;
+fn load_publish_state(path: &Path) -> anyhow::Result<PublishState> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-
-    Ok(PublishKey {
-        signer_did: elastos_server::crypto::encode_did_key(&verifying_key)?,
-        path,
-    })
-}
-
-fn inspect_release_key(path_override: Option<&Path>) -> anyhow::Result<PublishKeyPreview> {
-    let path = release_key_path(path_override);
-    if !path.exists() {
-        return Ok(PublishKeyPreview {
-            path,
-            signer_did: None,
-        });
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PublishState::default())
+        }
+        Err(error) => return Err(error).context("Cannot read the saved public publication pin"),
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Publication state must be a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o022 == 0,
+            "Publication state must be owner-controlled with one link"
+        );
     }
-
-    let hex_str = std::fs::read_to_string(&path)?;
-    let bytes = hex::decode(hex_str.trim())
-        .map_err(|e| anyhow::anyhow!("Invalid release signing key: {}", e))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Release signing key must be 32 bytes"))?;
-    let signing_key = signature::SigningKey::from_bytes(&arr);
-    Ok(PublishKeyPreview {
-        signer_did: Some(elastos_server::crypto::encode_signing_key_did(&signing_key)),
-        path,
-    })
-}
-
-fn load_publish_state(path: &Path) -> anyhow::Result<PublishState> {
-    if !path.exists() {
-        return Ok(PublishState::default());
-    }
-    let data = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&data)?)
+    let mut data = Vec::new();
+    file.take(64 * 1024 + 1).read_to_end(&mut data)?;
+    anyhow::ensure!(data.len() <= 64 * 1024, "Publication state is too large");
+    Ok(serde_json::from_slice(&data)?)
 }
 
 fn default_release_ledger_schema() -> String {
@@ -689,6 +771,7 @@ fn save_release_ledger(path: &Path, ledger: &ReleaseLedger) -> anyhow::Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn save_publish_state(path: &Path, state: &PublishState) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -932,6 +1015,9 @@ fn validate_publish_inputs(
         for input in &options.platform_inputs {
             command.arg("--input").arg(input);
         }
+        if let Some(platform) = &options.preview_platform {
+            command.arg("--preview-platform").arg(platform);
+        }
         let output = command
             .output()
             .context("Failed to validate prepared release platform inputs")?;
@@ -1023,7 +1109,85 @@ fn validate_publish_inputs(
     Ok(())
 }
 
+fn validate_prepare_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
+    if options.key.is_some() {
+        anyhow::bail!("The separate custodian tool owns release keys; publish-release accepts public data only");
+    }
+    if options.allow_no_bootstrap {
+        anyhow::bail!("The approved signing input owns the frozen public bootstrap; omit --allow-no-bootstrap");
+    }
+    if options.signed_publication.is_some() {
+        if options.prepare_only.is_some()
+            || !options.platform_inputs.is_empty()
+            || options.preview_platform.is_some()
+            || options.skip_build
+            || options.skip_rootfs
+            || options.cross.is_some()
+            || !options.capsules.is_empty()
+            || options.profile != "home"
+            || options.public_url
+            || options.public_with_sudo
+        {
+            anyhow::bail!("Signed publication consumes the custodian's complete frozen set; omit build, capsule and public-URL options");
+        }
+        validate_public_signer_did(
+            options
+                .publisher_did
+                .as_deref()
+                .context("--signed-publication requires --publisher-did")?,
+        )?;
+        return Ok(());
+    }
+    if options.allow_signer_rotation {
+        anyhow::bail!("--allow-signer-rotation requires --signed-publication");
+    }
+    if options.prepare_only.is_some() {
+        if options.platform_inputs.is_empty()
+            || options.key.is_some()
+            || options.public_url
+            || options.public_with_sudo
+        {
+            anyhow::bail!("Unsigned preparation requires native inputs and public signer data; the custodian owns signing");
+        }
+        let did = options
+            .publisher_did
+            .as_deref()
+            .context("--prepare-only requires --publisher-did")?;
+        validate_public_signer_did(did)?;
+    } else if options.publisher_did.is_some() {
+        anyhow::bail!("--publisher-did requires --prepare-only");
+    }
+    Ok(())
+}
+
+fn validate_public_signer_did(did: &str) -> anyhow::Result<()> {
+    let key = elastos_server::crypto::decode_did_key(did)?;
+    anyhow::ensure!(
+        elastos_server::crypto::encode_did_key(&key)? == did,
+        "Canonical public Ed25519 signer DID required"
+    );
+    Ok(())
+}
+
 fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
+    if let Some(platform) = &options.preview_platform {
+        if platform != "aarch64-darwin" {
+            anyhow::bail!("--preview-platform supports aarch64-darwin only");
+        }
+        if options.channel != "canary" {
+            anyhow::bail!("--preview-platform requires --channel canary");
+        }
+        if !options.dry_run && !options.preflight_only && options.prepare_only.is_none() {
+            anyhow::bail!(
+                "--preview-platform requires --prepare-only, --dry-run or --preflight-only"
+            );
+        }
+        if options.platform_inputs.len() != 1 {
+            anyhow::bail!(
+                "--preview-platform requires exactly one --platform-input aarch64-darwin=DIR"
+            );
+        }
+    }
     if options.platform_inputs.is_empty() {
         return Ok(());
     }
@@ -1044,7 +1208,13 @@ fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::R
             anyhow::bail!("--platform-input requires each supported platform exactly once: x86_64-linux, aarch64-linux, aarch64-darwin");
         }
     }
-    if supplied.len() < 2 {
+    if let Some(platform) = &options.preview_platform {
+        if !supplied.contains(platform.as_str()) {
+            anyhow::bail!(
+                "--preview-platform requires exactly one --platform-input aarch64-darwin=DIR"
+            );
+        }
+    } else if supplied.len() < 2 {
         anyhow::bail!("--platform-input requires at least two platforms: x86_64-linux, aarch64-linux, aarch64-darwin");
     }
     Ok(())
@@ -1076,6 +1246,9 @@ fn append_publish_selection_args(
         for input in &options.platform_inputs {
             command.arg("--platform-input").arg(input);
         }
+        if let Some(platform) = &options.preview_platform {
+            command.arg("--preview-platform").arg(platform);
+        }
     }
 }
 
@@ -1084,6 +1257,9 @@ fn print_publish_selection(options: &PublishReleaseOptions, selected_capsules: &
         println!("  Capsules:  {}", selected_capsules.join(", "));
     } else {
         println!("  Mode:      import verified native Home platform inputs");
+        if let Some(platform) = &options.preview_platform {
+            println!("  Preview:   {platform} on canary (operator publication)");
+        }
         for input in &options.platform_inputs {
             println!("  Input:     {}", input);
         }
@@ -1110,7 +1286,6 @@ fn cross_build_details(arch: &str, ws_root: &Path) -> anyhow::Result<CrossBuildD
 struct PublishPreflight {
     script_path: PathBuf,
     ipfs_provider_bin: Option<PathBuf>,
-    key_path: PathBuf,
     selected_capsules: Vec<String>,
     available_tools: Vec<String>,
 }
@@ -1186,7 +1361,6 @@ fn run_publish_preflight(
     Ok(PublishPreflight {
         script_path,
         ipfs_provider_bin,
-        key_path: release_key_path(options.key.as_deref()),
         selected_capsules: selected_capsules.to_vec(),
         available_tools,
     })
@@ -1256,7 +1430,12 @@ fn print_preflight_report(options: &PublishReleaseOptions, preflight: &PublishPr
     println!("  Channel:   {}", options.channel);
     println!("  Profile:   {}", options.profile);
     println!("  Script:    {}", preflight.script_path.display());
-    println!("  Key path:  {}", preflight.key_path.display());
+    if let Some(output) = &options.prepare_only {
+        println!("  Unsigned input: {}", output.display());
+        println!("  Signing: separately installed custodian tool");
+    } else {
+        println!("  Signing: separately installed custodian tool");
+    }
     println!(
         "  IPFS bin:  {}",
         preflight
@@ -1271,93 +1450,6 @@ fn print_preflight_report(options: &PublishReleaseOptions, preflight: &PublishPr
     }
     println!("  Tools:     {}", preflight.available_tools.join(", "));
     println!("  Result:    preflight passed");
-}
-
-fn operator_release_notes(
-    current: &ReleaseLedgerEntry,
-    previous: Option<&ReleaseLedgerEntry>,
-) -> Vec<String> {
-    let mut notes = Vec::new();
-    if let Some(commit) = current_git_commit() {
-        notes.push(format!("commit {}", commit));
-    }
-
-    for (platform_name, platform) in &current.platforms {
-        let changed = changed_capsules(
-            previous
-                .and_then(|entry| entry.platforms.get(platform_name))
-                .map(|entry| &entry.capsules),
-            &platform.capsules,
-        );
-        if !changed.is_empty() {
-            notes.push(format!(
-                "{} changed capsules: {}",
-                platform_name,
-                changed.join(", ")
-            ));
-        }
-    }
-
-    if current
-        .selected_capsules
-        .iter()
-        .any(|name| name == "chat-room")
-    {
-        notes.push("retest chat keyboard input, history persistence, and peer sync".to_string());
-    }
-    if current
-        .selected_capsules
-        .iter()
-        .any(|name| matches!(name.as_str(), "shell" | "localhost-provider"))
-    {
-        notes.push("retest shell launch path and multi-peer chat connectivity".to_string());
-    }
-    if current
-        .selected_capsules
-        .iter()
-        .any(|name| matches!(name.as_str(), "ipfs-provider" | "tunnel-provider"))
-    {
-        notes.push("retest install/update flow and public installer URL path".to_string());
-    }
-    if current
-        .selected_capsules
-        .iter()
-        .any(|name| name == "did-provider")
-    {
-        notes.push("retest DID/provider auth flows used by update verification".to_string());
-    }
-
-    notes
-}
-
-fn current_git_commit() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let commit = String::from_utf8(output.stdout).ok()?;
-    let commit = commit.trim();
-    if commit.is_empty() {
-        None
-    } else {
-        Some(commit.to_string())
-    }
-}
-
-fn read_state_value(path: &Path) -> anyhow::Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let value = std::fs::read_to_string(path)?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
-    }
 }
 
 fn build_release_ledger_entry(
@@ -1423,7 +1515,12 @@ fn build_release_ledger_entry(
 }
 
 fn components_artifact_path(artifacts_dir: &Path, platform: &str) -> PathBuf {
-    artifacts_dir.join(format!("components-{platform}.json"))
+    let root = if artifacts_dir.join("artifacts").is_dir() {
+        artifacts_dir.join("artifacts")
+    } else {
+        artifacts_dir.to_owned()
+    };
+    root.join(format!("components-{platform}.json"))
 }
 
 fn print_release_diff_summary(
@@ -1573,7 +1670,6 @@ fn now_unix() -> anyhow::Result<u64> {
 
 fn print_publish_plan(
     options: &PublishReleaseOptions,
-    key: &PublishKeyPreview,
     state_path: &Path,
     previous_state: &PublishState,
     available_capsules: &[String],
@@ -1585,11 +1681,17 @@ fn print_publish_plan(
     println!("  Profile:   {}", options.profile);
     println!(
         "  Signer:    {}",
-        key.signer_did
+        options
+            .publisher_did
             .as_deref()
-            .unwrap_or("(will be generated on first real publish)")
+            .unwrap_or("(operator supplies the public DID)")
     );
-    println!("  Key path:  {}", key.path.display());
+    if let Some(output) = &options.prepare_only {
+        println!("  Unsigned input: {}", output.display());
+        println!("  Signing: separately installed custodian tool");
+    } else {
+        println!("  Signing: separately installed custodian tool");
+    }
     print_publish_selection(options, selected_capsules);
     if options.platform_inputs.is_empty() {
         println!("  Available: {}", available_capsules.join(", "));
@@ -1682,12 +1784,12 @@ fn print_publish_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_publish_selection_args, bootstrap_required, build_release_ledger_entry,
-        changed_capsules, discover_available_capsules, load_publish_state, operator_release_notes,
-        publish_profile_capsules, release_discovery_topics, resolve_platform_input_paths,
-        save_publish_state, select_capsules, source_discovery_uri, validate_platform_input_options,
-        validate_publish_inputs, validate_publishable_manifest, PublishReleaseOptions,
-        PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
+        append_publish_selection_args, build_release_ledger_entry, changed_capsules,
+        discover_available_capsules, load_publish_state, publish_profile_capsules,
+        release_discovery_topics, resolve_platform_input_paths, save_publish_state,
+        select_capsules, source_discovery_uri, validate_platform_input_options,
+        validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
+        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
         DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
@@ -1709,6 +1811,11 @@ mod tests {
                 .iter()
                 .map(|platform| format!("{platform}=/prepared/{platform}"))
                 .collect(),
+            preview_platform: None,
+            prepare_only: None,
+            signed_publication: None,
+            allow_signer_rotation: false,
+            publisher_did: None,
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -1760,6 +1867,125 @@ mod tests {
             }
             assert!(validate_platform_input_options(&options).is_err(), "{flag}");
         }
+    }
+
+    fn preview_options() -> PublishReleaseOptions {
+        let mut options = platform_input_options();
+        options.channel = "canary".to_string();
+        options.platform_inputs = vec!["aarch64-darwin=/prepared/mac".to_string()];
+        options.preview_platform = Some("aarch64-darwin".to_string());
+        options.dry_run = true;
+        options
+    }
+
+    #[test]
+    fn test_platform_input_unsigned_preparation_keeps_custodian_key_boundary() {
+        let mut options = preview_options();
+        options.dry_run = false;
+        options.prepare_only = Some("/prepared/unsigned".into());
+        options.publisher_did =
+            Some("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw".to_string());
+        validate_prepare_options(&options).unwrap();
+        validate_platform_input_options(&options).unwrap();
+        for refusal in [
+            "key",
+            "publisher",
+            "invalid-did",
+            "noncanonical-did",
+            "inputs",
+            "public-url",
+            "sudo",
+        ] {
+            let mut invalid = options.clone();
+            match refusal {
+                "key" => invalid.key = Some("/custodian/unopened.pem".into()),
+                "publisher" => invalid.publisher_did = None,
+                "invalid-did" => {
+                    invalid.publisher_did = Some("did:web:example.invalid".to_string())
+                }
+                "noncanonical-did" => {
+                    invalid.publisher_did =
+                        Some(format!(" {}", options.publisher_did.as_deref().unwrap()))
+                }
+                "inputs" => invalid.platform_inputs.clear(),
+                "public-url" => invalid.public_url = true,
+                "sudo" => invalid.public_with_sudo = true,
+                _ => unreachable!(),
+            }
+            assert!(validate_prepare_options(&invalid).is_err(), "{refusal}");
+        }
+        options.prepare_only = None;
+        assert!(validate_prepare_options(&options).is_err());
+    }
+
+    #[test]
+    fn test_platform_input_preview_accepts_only_canary_mac_inspection() {
+        let options = preview_options();
+        validate_platform_input_options(&options).unwrap();
+        let mut preflight = options.clone();
+        preflight.dry_run = false;
+        preflight.preflight_only = true;
+        validate_platform_input_options(&preflight).unwrap();
+        for case in [
+            "publication",
+            "stable",
+            "unsupported",
+            "absent",
+            "mixed",
+            "wrong-input",
+            "malformed",
+            "skip-build",
+            "skip-rootfs",
+            "cross",
+            "capsules",
+            "profile",
+        ] {
+            let mut invalid = options.clone();
+            match case {
+                "publication" => invalid.dry_run = false,
+                "stable" => invalid.channel = "stable".to_string(),
+                "unsupported" => invalid.preview_platform = Some("aarch64-linux".to_string()),
+                "absent" => invalid.platform_inputs.clear(),
+                "mixed" => invalid
+                    .platform_inputs
+                    .push("x86_64-linux=/prepared/linux".to_string()),
+                "wrong-input" => {
+                    invalid.platform_inputs[0] = "aarch64-linux=/prepared/linux".to_string()
+                }
+                "malformed" => invalid.platform_inputs[0] = "aarch64-darwin=".to_string(),
+                "skip-build" => invalid.skip_build = true,
+                "skip-rootfs" => invalid.skip_rootfs = true,
+                "cross" => invalid.cross = Some("aarch64".to_string()),
+                "capsules" => invalid.capsules = vec!["home".to_string()],
+                "profile" => invalid.profile = "demo".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(validate_platform_input_options(&invalid).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn test_platform_input_preview_arguments_reach_publisher_and_input_admission() {
+        let options = preview_options();
+        let mut command = std::process::Command::new("bash");
+        append_publish_selection_args(&mut command, &options, &[]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--platform-input",
+                "aarch64-darwin=/prepared/mac",
+                "--preview-platform",
+                "aarch64-darwin"
+            ]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("scripts")).unwrap();
+        std::fs::write(
+            temp.path().join("scripts/release-platform-input.py"),
+            "import sys\nassert sys.argv[1:] == ['validate-inputs', '--version', '0.7.1', '--input', 'aarch64-darwin=/prepared/mac', '--preview-platform', 'aarch64-darwin']\n",
+        ).unwrap();
+        validate_publish_inputs(&options, temp.path(), &[]).unwrap();
     }
 
     #[test]
@@ -1823,29 +2049,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_platform_input_validation_precedes_signing_key_creation() {
+    async fn key_option_is_refused_before_platform_reads_or_key_creation() {
         let temp = tempfile::tempdir().unwrap();
         let key = temp.path().join("publisher/key");
-        let mut options = platform_input_options();
-        options.key = Some(key.clone());
-        options.platform_inputs = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
-            .iter()
-            .map(|platform| format!("{platform}={}", temp.path().join(platform).display()))
-            .collect();
-        let error = super::run_publish_release(options).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Prepared release platform input validation failed"),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("input root must be a regular directory"),
-            "{error}"
-        );
-        assert!(!key.parent().unwrap().exists());
+        for dry_run in [false, true] {
+            let mut options = platform_input_options();
+            options.dry_run = dry_run;
+            options.key = Some(key.clone());
+            options.platform_inputs = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
+                .iter()
+                .map(|platform| format!("{platform}={}", temp.path().join(platform).display()))
+                .collect();
+            let error = super::run_publish_release(options).await.unwrap_err();
+            assert!(error.to_string().contains("custodian"), "{error}");
+            assert!(!key.parent().unwrap().exists());
+        }
     }
 
     fn test_manifest(name: &str, capsule_requires: &[&str]) -> CapsuleManifest {
@@ -2017,11 +2235,464 @@ mod tests {
         assert!(selected.contains(&"availability-provider".to_string()));
     }
 
+    #[cfg(unix)]
+    fn import_provider_fixture(
+        root: &Path,
+        receipt: serde_json::Value,
+        status: u8,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let provider = root.join("fixture-provider");
+        let body = format!(
+            "#!/bin/sh\nIFS= read -r init || exit 94\nIFS= read -r operation || exit 95\nprintf '%s\\n' \"$init\" \"$operation\" > \"$0.requests\"\ncat <<'PUBLIC_FIXTURE_RECEIPT'\n{receipt}\nPUBLIC_FIXTURE_RECEIPT\nexit {status}\n"
+        );
+        std::fs::write(&provider, body).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        provider
+    }
+
+    #[cfg(unix)]
+    fn import_fixture_requests(provider: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(provider.with_extension("requests"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn import_fixture_raw_cid(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let hash =
+            cid::multihash::Multihash::<64>::wrap(0x12, &sha2::Sha256::digest(bytes)).unwrap();
+        cid::Cid::new_v1(0x55, hash).to_string()
+    }
+
+    #[cfg(unix)]
+    async fn raw_import_api_fixture(
+        receipt: serde_json::Value,
+        redirect: bool,
+    ) -> (String, tokio::task::JoinHandle<(Vec<u8>, bool)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("Location: {endpoint}/unexpected-follow\r\n");
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "import closed before its headers arrived");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() < 32 * 1024, "fixture request exceeds its limit");
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let length: usize = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                }).expect("multipart import must state its length");
+                assert!(header_end + length < 32 * 1024);
+                while request.len() < header_end + length {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "import closed before its body arrived");
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let body = serde_json::to_vec(&receipt).unwrap();
+                let status = if redirect { "302 Found" } else { "200 OK" };
+                let redirect_header = if redirect { location.as_str() } else { "" };
+                let response = format!("HTTP/1.1 {status}\r\n{redirect_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+                socket.shutdown().await.unwrap();
+                drop(socket);
+                let followed = redirect && tokio::time::timeout(
+                    std::time::Duration::from_millis(500), listener.accept()
+                ).await.is_ok();
+                (request, followed)
+            }).await.expect("mock import connection exceeded five seconds")
+        });
+        (endpoint, task)
+    }
+
+    #[cfg(unix)]
+    async fn finish_raw_import_api(
+        mut task: tokio::task::JoinHandle<(Vec<u8>, bool)>,
+    ) -> (Vec<u8>, bool) {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await {
+            Ok(result) => result.expect("mock import server failed"),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("mock import server join exceeded five seconds");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_file_import_accepts_the_provider_cid_and_pinned_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("public artifact with spaces");
+        std::fs::write(&file, b"public fixture").unwrap();
+        let cid = import_fixture_raw_cid(b"public fixture");
+        let provider = import_provider_fixture(
+            temp.path(),
+            serde_json::json!({"status":"ok","data":{"cid":cid}}),
+            0,
+        );
+        let imported = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::import_publication_file(&provider, &file),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(imported, cid);
+        super::require_import_cid(&imported, &cid).unwrap();
+        assert_eq!(
+            import_fixture_requests(&provider),
+            vec![
+                serde_json::json!({"op":"init","config":{}}),
+                serde_json::json!({"op":"add_path","path":file,"pin":true}),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_file_import_refuses_provider_failure_and_invalid_cid_receipts() {
+        for (receipt, status, expected) in [
+            (
+                serde_json::json!({"status":"ok","data":{}}),
+                7,
+                "provider import failed",
+            ),
+            (
+                serde_json::json!({"status":"error","message":"fixture refusal"}),
+                0,
+                "provider refused import",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{}}),
+                0,
+                "receipt lacks a CID",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{"cid":42}}),
+                0,
+                "receipt lacks a CID",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{"cid":"invalid-cid"}}),
+                0,
+                "receipt has an invalid CID",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join("public artifact");
+            std::fs::write(&file, b"public fixture").unwrap();
+            let provider = import_provider_fixture(temp.path(), receipt, status);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::import_publication_file(&provider, &file),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_publication_import_refuses_provider_failure_and_remote_endpoint() {
+        for (receipt, expected) in [
+            (
+                serde_json::json!({"status":"error"}),
+                "provider refused import",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{}}),
+                "API endpoint missing",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{"api_endpoint":"http://192.0.2.1:5001"}}),
+                "non-loopback",
+            ),
+            (
+                serde_json::json!({"status":"ok","data":{"api_endpoint":"https://example.invalid"}}),
+                "non-loopback",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = import_provider_fixture(temp.path(), receipt, 0);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::import_publication_raw_block(
+                    &provider,
+                    "model-catalog.json",
+                    b"public catalog".to_vec(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                import_fixture_requests(&provider),
+                vec![
+                    serde_json::json!({"op":"init","config":{}}),
+                    serde_json::json!({"op":"status"})
+                ]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_publication_catalog_import_posts_exact_bytes_and_raw_cid_parameters() {
+        let catalog = br#"{"payload":{"schema":"elastos.model.catalog/v1","entries":[]}}"#;
+        let expected = import_fixture_raw_cid(catalog);
+        let (endpoint, server) =
+            raw_import_api_fixture(serde_json::json!({"Key":expected}), false).await;
+        let temp = tempfile::tempdir().unwrap();
+        let provider = import_provider_fixture(
+            temp.path(),
+            serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
+            0,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::import_publication_raw_block(&provider, "model-catalog.json", catalog.to_vec()),
+        )
+        .await
+        .unwrap();
+        let (request, followed) = finish_raw_import_api(server).await;
+        let actual = result.unwrap();
+        super::require_import_cid(&actual, &expected).unwrap();
+        assert!(!followed);
+        let text = std::str::from_utf8(&request).unwrap();
+        let mut first_line = text.lines().next().unwrap().split_whitespace();
+        assert_eq!(first_line.next(), Some("POST"));
+        let target =
+            url::Url::parse(&format!("http://fixture{}", first_line.next().unwrap())).unwrap();
+        assert_eq!(target.path(), "/api/v0/block/put");
+        let parameters: BTreeMap<_, _> = target
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        assert_eq!(
+            parameters,
+            BTreeMap::from([
+                ("cid-codec".to_owned(), "raw".to_owned()),
+                ("mhtype".to_owned(), "sha2-256".to_owned()),
+                ("pin".to_owned(), "true".to_owned()),
+            ])
+        );
+        assert!(text
+            .to_ascii_lowercase()
+            .contains("multipart/form-data; boundary="));
+        assert!(text
+            .to_ascii_lowercase()
+            .contains("name=\"file\"; filename=\"model-catalog.json\""));
+        let (headers, _) = text.split_once("\r\n\r\n").unwrap();
+        let content_type = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-type").then_some(value)
+            })
+            .unwrap();
+        let boundary = content_type
+            .split_once("boundary=")
+            .unwrap()
+            .1
+            .trim()
+            .trim_matches('"');
+        let multipart = &request[headers.len() + 4..];
+        let file_start = multipart
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let trailer = format!("\r\n--{boundary}--\r\n");
+        let uploaded = multipart[file_start..]
+            .strip_suffix(trailer.as_bytes())
+            .unwrap();
+        assert_eq!(uploaded, &catalog[..]);
+        assert_eq!(
+            import_fixture_requests(&provider)[1],
+            serde_json::json!({"op":"status"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_publication_import_refuses_missing_and_changed_cid_receipts() {
+        let bytes = b"public catalog";
+        let expected = import_fixture_raw_cid(bytes);
+        for receipt in [
+            serde_json::json!({}),
+            serde_json::json!({"Key":"invalid-cid"}),
+            serde_json::json!({"Key":import_fixture_raw_cid(b"other bytes")}),
+        ] {
+            let (endpoint, server) = raw_import_api_fixture(receipt.clone(), false).await;
+            let temp = tempfile::tempdir().unwrap();
+            let provider = import_provider_fixture(
+                temp.path(),
+                serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
+                0,
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::import_publication_raw_block(
+                    &provider,
+                    "model-catalog.json",
+                    bytes.to_vec(),
+                ),
+            )
+            .await
+            .unwrap();
+            finish_raw_import_api(server).await;
+            if receipt.get("Key").is_none() {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("receipt lacks its CID"));
+            } else {
+                assert!(super::require_import_cid(&result.unwrap(), &expected).is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_publication_import_keeps_redirects_on_the_first_loopback_endpoint() {
+        let (endpoint, server) =
+            raw_import_api_fixture(serde_json::json!({"redirect":"required"}), true).await;
+        let temp = tempfile::tempdir().unwrap();
+        let provider = import_provider_fixture(
+            temp.path(),
+            serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
+            0,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::import_publication_raw_block(
+                &provider,
+                "model-catalog.json",
+                b"public catalog".to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        let (_, followed) = finish_raw_import_api(server).await;
+        assert!(result.is_err());
+        assert!(!followed, "raw import followed a loopback redirect");
+    }
+
+    #[test]
+    fn saved_public_pin_changes_require_approval_and_exact_confirmation() {
+        let old = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
+        let new = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publish-state.json");
+        let state = PublishState {
+            publisher_did: Some(old.to_owned()),
+            ..Default::default()
+        };
+        save_publish_state(&path, &state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(super::publication_pin_change(&state, new, false).is_err());
+        assert!(super::publication_pin_change(&state, "did:key:invalid", true).is_err());
+        assert!(!super::publication_pin_change(&state, old, false).unwrap());
+        assert!(super::publication_pin_change(&state, new, true).unwrap());
+        for answer in [
+            String::new(),
+            "\n".to_owned(),
+            format!("{old}\n"),
+            format!(" {new}\n"),
+            "x".repeat(1024),
+        ] {
+            assert!(
+                super::confirm_publication_pin(new, &mut std::io::Cursor::new(answer)).is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        super::confirm_publication_pin(new, &mut std::io::Cursor::new(format!("{new}\n"))).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let legacy = PublishState {
+            last_release_cid: Some("existing-release".to_owned()),
+            ..Default::default()
+        };
+        assert!(super::publication_pin_change(&legacy, new, false).is_err());
+        assert!(super::publication_pin_change(&legacy, new, true).unwrap());
+        assert!(!super::publication_pin_change(&PublishState::default(), new, false).unwrap());
+    }
+
+    #[test]
+    fn publication_receipt_refuses_changed_cids_and_broken_previous_links() {
+        let state = PublishState {
+            last_release_cid: Some("previous-release".to_owned()),
+            last_head_cid: Some("previous-head".to_owned()),
+            ..Default::default()
+        };
+        let head =
+            serde_json::to_vec(&serde_json::json!({"payload":{"prev_head_cid":"previous-head"}}))
+                .unwrap();
+        let release = serde_json::to_vec(
+            &serde_json::json!({"payload":{"prev_release_cid":"previous-release"}}),
+        )
+        .unwrap();
+        super::validate_publication_chain(&state, &head, &release, "next-release").unwrap();
+        assert!(super::validate_publication_chain(
+            &state,
+            br#"{"payload":{"prev_head_cid":null}}"#,
+            &release,
+            "next-release"
+        )
+        .is_err());
+        assert!(super::validate_publication_chain(
+            &state,
+            &head,
+            br#"{"payload":{"prev_release_cid":null}}"#,
+            "next-release"
+        )
+        .is_err());
+        assert!(super::require_import_cid("changed-cid", "signed-cid").is_err());
+        super::require_import_cid("signed-cid", "signed-cid").unwrap();
+        assert!(
+            super::validate_publication_chain(&state, &head, &release, "previous-release").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publisher_pin_receipt_refuses_links_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-state.json");
+        save_publish_state(&real, &PublishState::default()).unwrap();
+        let link = dir.path().join("publish-state.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(load_publish_state(&link).is_err());
+        std::fs::remove_file(link).unwrap();
+        std::fs::write(&real, vec![b' '; 65537]).unwrap();
+        assert!(load_publish_state(&real).is_err());
+        assert!(load_publish_state(dir.path()).is_err());
+    }
+
     #[test]
     fn test_publish_state_round_trip() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("publish-state.json");
         let state = PublishState {
+            publisher_did: Some("did:key:fixture".to_string()),
             last_release_cid: Some("release-cid".to_string()),
             last_head_cid: Some("head-cid".to_string()),
             last_version: Some("0.11.0".to_string()),
@@ -2212,6 +2883,11 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
+            prepare_only: None,
+            signed_publication: None,
+            allow_signer_rotation: false,
+            publisher_did: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2242,6 +2918,11 @@ mod tests {
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
+            prepare_only: None,
+            signed_publication: None,
+            allow_signer_rotation: false,
+            publisher_did: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2294,6 +2975,11 @@ mod tests {
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
+            prepare_only: None,
+            signed_publication: None,
+            allow_signer_rotation: false,
+            publisher_did: None,
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2312,66 +2998,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_required_for_publish_without_ticket() {
-        let options = PublishReleaseOptions {
-            version: "0.11.0".to_string(),
-            channel: "stable".to_string(),
-            profile: "demo".to_string(),
-            skip_build: false,
-            skip_rootfs: false,
-            cross: None,
-            capsules: Vec::new(),
-            platform_inputs: Vec::new(),
-            key: None,
-            dry_run: false,
-            preflight_only: false,
-            public_url: false,
-            public_with_sudo: false,
-            gateway_addr: "127.0.0.1:8090".to_string(),
-            public_timeout: 60,
-            ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
-        };
-        assert!(bootstrap_required(&options, &Ok(None)));
-        assert!(bootstrap_required(
-            &options,
-            &Err(anyhow::anyhow!("ticket unavailable"))
-        ));
-        assert!(!bootstrap_required(
-            &options,
-            &Ok(Some("ticket".to_string()))
-        ));
-    }
-
-    #[test]
-    fn test_bootstrap_requirement_can_be_opted_out() {
-        let mut options = PublishReleaseOptions {
-            version: "0.11.0".to_string(),
-            channel: "stable".to_string(),
-            profile: "demo".to_string(),
-            skip_build: false,
-            skip_rootfs: false,
-            cross: None,
-            capsules: Vec::new(),
-            platform_inputs: Vec::new(),
-            key: None,
-            dry_run: false,
-            preflight_only: false,
-            public_url: false,
-            public_with_sudo: false,
-            gateway_addr: "127.0.0.1:8090".to_string(),
-            public_timeout: 60,
-            ipfs_provider_bin: None,
-            allow_no_bootstrap: true,
-        };
-        assert!(!bootstrap_required(&options, &Ok(None)));
-
-        options.allow_no_bootstrap = false;
-        options.channel = "canary".to_string();
-        assert!(bootstrap_required(&options, &Ok(None)));
-    }
-
-    #[test]
     fn test_validate_publish_inputs_rejects_unknown_channel() {
         let temp = tempfile::tempdir().unwrap();
         let options = PublishReleaseOptions {
@@ -2383,6 +3009,11 @@ mod tests {
             cross: None,
             capsules: Vec::new(),
             platform_inputs: Vec::new(),
+            preview_platform: None,
+            prepare_only: None,
+            signed_publication: None,
+            allow_signer_rotation: false,
+            publisher_did: None,
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -2396,58 +3027,5 @@ mod tests {
         let err =
             validate_publish_inputs(&options, temp.path(), &["chat".to_string()]).unwrap_err();
         assert!(err.to_string().contains("Allowed channels"));
-    }
-
-    #[test]
-    fn test_operator_release_notes_flag_chat_room_and_update_risks() {
-        let current = ReleaseLedgerEntry {
-            version: "0.11.0".to_string(),
-            channel: "stable".to_string(),
-            release_cid: "release-cid".to_string(),
-            release_object_cid: Some("release-object-cid".to_string()),
-            head_cid: "head-cid".to_string(),
-            published_at: 42,
-            signer_did: "did:key:z6Mktest".to_string(),
-            selected_capsules: vec![
-                "chat-room".to_string(),
-                "peer-provider".to_string(),
-                "ipfs-provider".to_string(),
-            ],
-            platforms: BTreeMap::from([(
-                "x86_64-linux".to_string(),
-                ReleaseLedgerPlatform {
-                    binary_cid: "bin".to_string(),
-                    components_cid: "components".to_string(),
-                    capsules: BTreeMap::from([
-                        ("chat-room".to_string(), "cid-chat-2".to_string()),
-                        ("peer-provider".to_string(), "cid-peer-1".to_string()),
-                    ]),
-                },
-            )]),
-        };
-        let previous = ReleaseLedgerEntry {
-            version: "0.10.0".to_string(),
-            channel: "stable".to_string(),
-            release_cid: "old-release".to_string(),
-            release_object_cid: None,
-            head_cid: "old-head".to_string(),
-            published_at: 1,
-            signer_did: "did:key:z6Mktest".to_string(),
-            selected_capsules: vec!["chat-room".to_string()],
-            platforms: BTreeMap::from([(
-                "x86_64-linux".to_string(),
-                ReleaseLedgerPlatform {
-                    binary_cid: "old-bin".to_string(),
-                    components_cid: "old-components".to_string(),
-                    capsules: BTreeMap::from([("chat-room".to_string(), "cid-chat-1".to_string())]),
-                },
-            )]),
-        };
-        let notes = operator_release_notes(&current, Some(&previous));
-        assert!(notes.iter().any(|note| note.contains("changed capsules")));
-        assert!(notes.iter().any(|note| note.contains("keyboard input")));
-        assert!(notes
-            .iter()
-            .any(|note| note.contains("install/update flow")));
     }
 }

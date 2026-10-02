@@ -2,6 +2,7 @@
 """Run the preparation worker with real packaging/receipts and fake native builds."""
 
 import json
+import base64
 import hashlib
 import io
 import os
@@ -122,7 +123,7 @@ class PrepareWorkerTest(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="release-worker-fixture-")
         self.addCleanup(self.scratch.cleanup)
-        self.root = Path(self.scratch.name)
+        self.root = Path(self.scratch.name).resolve()
         self.repo = self.root / "source"
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
@@ -253,12 +254,154 @@ class PrepareWorkerTest(unittest.TestCase):
             result = self.command(*command)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def prepare(self, name="prepared", env=None):
+    def prepare(self, name="prepared", env=None, version="0.7.1", reuse_support=None):
         output = self.root / name
+        reuse = ["--reuse-support", str(reuse_support)] if reuse_support is not None else []
         result = self.command("/bin/bash", "scripts/prepare-release-platform.sh",
-                              "--version", "0.7.1", "--output", str(output), env=env)
+                              "--version", version, "--output", str(output), *reuse, env=env)
         self.assertEqual(list(self.root.glob(".release-platform.*")), [], "temporary sibling leaked")
         return output, result
+
+    def qualified_support_input(self, name="m1", env=None):
+        catalog = b'{"payload":{"schema":"elastos.model.catalog/v1","entries":[]}}\n'
+        (self.repo / "model-catalog.json").write_bytes(catalog)
+        template_path = self.repo / "components.json"
+        template = json.loads(template_path.read_text())
+        template["model_catalog"] = {
+            "head_cid": "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(catalog).digest()).decode().lower().rstrip("="),
+            "publisher_dids": ["did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"],
+        }
+        template_path.write_text(json.dumps(template))
+        self.commit("public catalogue fixture")
+        output, result = self.prepare(name, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return output
+
+    def clear_build_logs(self):
+        for name in ("cargo.log", "media.log", "audit.log"):
+            (self.root / name).unlink(missing_ok=True)
+
+    def runtime_version_change(self):
+        (self.repo / "elastos/runtime-fixture.txt").write_text("M2 Runtime source and embedded version")
+        self.commit("M2 Runtime fixture")
+
+    def test_reuse_support_changes_only_runtime_and_preserves_original_receipt(self):
+        m1 = self.qualified_support_input()
+        receipt_bytes = (m1 / "platform-input.json").read_bytes()
+        original = json.loads(receipt_bytes)
+        self.runtime_version_change()
+        self.clear_build_logs()
+        relative_input = os.path.relpath(m1, self.repo)
+        m2, result = self.prepare("m2", version="0.7.2", reuse_support=relative_input)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = json.loads((m2 / "platform-input.json").read_text())
+        self.assertEqual(current["version"], "0.7.2")
+        self.assertNotEqual(current["source"]["commit"], original["source"]["commit"])
+        self.assertEqual(current["source"]["commit"], self.command("git", "rev-parse", "HEAD").stdout.strip())
+        self.assertEqual((m2 / "support-input.json").read_bytes(), receipt_bytes)
+        self.assertEqual(current["support_origin"], {
+            "receipt_path": "support-input.json", "sha256": hashlib.sha256(receipt_bytes).hexdigest()})
+        self.assertEqual(current["files"]["support-input.json"]["sha256"], hashlib.sha256(receipt_bytes).hexdigest())
+        self.assertEqual(current["files"]["support-input.json"]["size"], len(receipt_bytes))
+        runtime = "artifacts/elastos-aarch64-darwin"
+        self.assertNotEqual((m1 / runtime).read_bytes(), (m2 / runtime).read_bytes())
+        self.assertTrue((m2 / runtime).read_bytes().endswith(b"0.7.2"))
+        for name, record in original["files"].items():
+            if name == runtime:
+                continue
+            self.assertEqual((m2 / name).read_bytes(), (m1 / name).read_bytes(), name)
+            self.assertEqual(current["files"][name], record, name)
+        self.assertEqual(current["omitted_platform_components"], original["omitted_platform_components"])
+        self.assertEqual(current["build_command"][-2:], ["--reuse-support", "<input>"])
+        calls = [json.loads(line) for line in (self.root / "cargo.log").read_text().splitlines()]
+        builds = [entry for entry in calls if entry["args"][0] == "build"]
+        self.assertEqual(len(builds), 1)
+        self.assertIn("elastos-server", builds[0]["args"])
+        self.assertEqual(builds[0]["args"][-2:], ["--bin", "elastos"])
+        self.assertFalse((self.root / "media.log").exists())
+        verified = self.command("python3", "scripts/release-platform-input.py", "verify", str(m2))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_reuse_support_refuses_before_cargo_and_cleans_owned_stage(self):
+        m1 = self.qualified_support_input()
+        original_template = (self.repo / "components.json").read_bytes()
+        self.runtime_version_change()
+        for concern in ("template", "platform", "artifact", "same-version"):
+            with self.subTest(concern=concern):
+                candidate = self.root / ("m1-" + concern)
+                shutil.copytree(m1, candidate)
+                version = "0.7.2"
+                if concern == "template":
+                    changed = json.loads(original_template)
+                    changed["profiles"]["home"]["components"].append("another-component")
+                    (self.repo / "components.json").write_text(json.dumps(changed))
+                    self.commit("incompatible support template fixture")
+                elif concern == "platform":
+                    path = candidate / "platform-input.json"
+                    receipt = json.loads(path.read_text())
+                    receipt["platform"] = "x86_64-linux"
+                    path.write_text(json.dumps(receipt))
+                elif concern == "artifact":
+                    (candidate / "artifacts/home.tar.gz").write_bytes(b"tampered public support")
+                else:
+                    version = "0.7.1"
+                self.clear_build_logs()
+                output, result = self.prepare("refused-" + concern, version=version, reuse_support=candidate)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(output.exists())
+                self.assertFalse((self.root / "cargo.log").exists(), result.stdout + result.stderr)
+                self.assertFalse((self.root / "media.log").exists())
+                self.assertFalse((self.root / "audit.log").exists())
+                if concern == "template":
+                    (self.repo / "components.json").write_bytes(original_template)
+                    self.commit("restore exact support template fixture")
+
+    def test_arm64_reuse_skips_external_bundle_and_support_lock_prerequisites(self):
+        for name in LINUX_ONLY:
+            (self.repo / "capsules" / name / "Cargo.lock").write_text("version = 4\n")
+        self.commit("reviewed Linux fixture locks")
+        env = {**self.env, "MOCK_OS": "Linux", "MOCK_ARCH": "aarch64"}
+        m1 = self.qualified_support_input(env=env)
+        for name in ["home-cli", *self.native]:
+            (self.repo / "capsules" / name / "Cargo.lock").unlink(missing_ok=True)
+        self.runtime_version_change()
+        self.clear_build_logs()
+        env = {key: value for key, value in env.items() if key != "ELASTOS_LLAMA_ARM64_BUNDLE"}
+        m2, result = self.prepare("arm-m2", env=env, version="0.7.2", reuse_support=m1)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("components.json", "components-template.json", "artifacts/model-catalog.json",
+                     "artifacts/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"):
+            self.assertEqual((m2 / name).read_bytes(), (m1 / name).read_bytes(), name)
+        calls = [json.loads(line) for line in (self.root / "cargo.log").read_text().splitlines()]
+        builds = [entry for entry in calls if entry["args"][0] == "build"]
+        self.assertEqual(len(builds), 1)
+        locations = [entry["args"][-1] for entry in calls if entry["args"][0] == "locate-project"]
+        self.assertEqual(locations, ["elastos/Cargo.toml"])
+        self.assertFalse((self.root / "media.log").exists())
+        self.assertIn("--platform aarch64-linux", (self.root / "audit.log").read_text())
+
+    def test_reuse_support_build_failure_preserves_m1_and_cleans_owned_stage(self):
+        m1 = self.qualified_support_input()
+        original = {str(path.relative_to(m1)): path.read_bytes() for path in m1.rglob("*") if path.is_file()}
+        self.runtime_version_change()
+        output, result = self.prepare("failed-m2", version="0.7.2", reuse_support=m1,
+                                      env={**self.env, "FAIL_BUILD": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+        self.assertEqual({str(path.relative_to(m1)): path.read_bytes() for path in m1.rglob("*") if path.is_file()}, original)
+
+    def test_reuse_support_keeps_current_runtime_lock_prerequisite(self):
+        m1 = self.qualified_support_input()
+        (self.repo / "elastos/Cargo.lock").unlink()
+        self.runtime_version_change()
+        self.clear_build_logs()
+        output, result = self.prepare("runtime-lock-refused", version="0.7.2", reuse_support=m1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("elastos/Cargo.lock (elastos)", result.stderr)
+        self.assertFalse(output.exists())
+        calls = [json.loads(line)["args"][0] for line in (self.root / "cargo.log").read_text().splitlines()]
+        self.assertNotIn("build", calls)
+        self.assertFalse((self.root / "media.log").exists())
 
     def assert_media_archive(self, output, platform, setup_platform):
         manifest = json.loads((output / "components.json").read_text())
