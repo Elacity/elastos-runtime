@@ -1010,12 +1010,26 @@ async fn setup_server_infrastructure_impl(
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((mut model_config, worker)) => {
                     #[cfg(target_os = "macos")]
-                    let bridge_result =
-                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
-                            .await
-                            .map(|(bridge, sockets, vacant, config, listener)| {
+                    let bridge_result = async {
+                        let root = Path::new(&model_config.base_path);
+                        let bundle = api::model_provider_engine_bundle(root).map_err(|_| {
+                            provider::bridge::BridgeError::InitFailed(
+                                "model engine confinement unavailable".into(),
+                            )
+                        })?;
+                        provider::ProviderBridge::spawn_confined_model_with_engine_bundle(
+                            &path,
+                            model_config.clone(),
+                            bundle.as_deref(),
+                        )
+                        .await
+                        .map(
+                            |(bridge, sockets, vacant, config, listener)| {
                                 (bridge, Some((sockets, vacant)), config, Some(listener))
-                            });
+                            },
+                        )
+                    }
+                    .await;
                     #[cfg(target_os = "linux")]
                     let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
                         &path,

@@ -3115,7 +3115,6 @@ mod tests {
         use elastos_runtime::provider::bridge::{
             ProviderConfig, ProviderRequest, ProviderResponse,
         };
-        use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let proof = admin_proof(dir.path());
@@ -3206,63 +3205,27 @@ mod tests {
             Some((&run_id, request_id)),
         );
 
-        let script = dir.path().join("synthetic-provider.py");
-        fs::write(&script, r#"#!/usr/bin/python3
-import json, socket, sys
-extra = None
-for line in sys.stdin:
-    request = json.loads(line)
-    if request['op'] == 'init':
-        extra = request['config']['extra']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'runs_create':
-        approved_input = request['input']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'exists':
-        messages = json.loads(json.dumps(approved_input.get('messages', [{'role':'user','content':approved_input.get('prompt')}])))
-        path = request['path']
-        if path == 'altered':
-            messages[-1]['content'] = 'changed text'
-        elif path == 'extra-message':
-            messages.append({'role':'user','content':'extra'})
-        elif path == 'extra-field':
-            messages[0]['name'] = 'hidden'
-        elif path == 'changed-role':
-            messages[0]['role'] = 'assistant'
-        elif path == 'swapped':
-            messages[0], messages[1] = messages[1], messages[0]
-        body = json.dumps({'model':'fixture/model','stream':True,'max_tokens':32,
-                           'messages':messages}).encode()
-        if request['path'] in ('raised-cap', 'missing-cap'):
-            payload = json.loads(body)
-            if request['path'] == 'raised-cap':
-                payload['max_tokens'] = 33
-            else:
-                del payload['max_tokens']
-            body = json.dumps(payload).encode()
-        headers = ('POST /v1/hosted-effect HTTP/1.1\r\nHost: runtime.invalid\r\n'
-                   'Content-Type: application/json\r\nContent-Length: %d\r\n'
-                   'X-Elastos-Offer-Id: %s\r\nX-Elastos-Effect: text\r\n'
-                   'X-Elastos-Run-Id: %s\r\nX-Elastos-Request-Id: %s\r\n\r\n') % (
-                   len(body), extra['fixture_offer_id'], extra['fixture_run_id'], extra['fixture_request_id'])
-        with socket.socket(socket.AF_UNIX) as client:
-            client.connect(extra['runtime_hosted_socket'])
-            client.sendall(headers.encode() + body)
-            status = client.recv(1024).split(b'\r\n', 1)[0].decode()
-        print(json.dumps({'status':'ok','data':{'http_status':status}}), flush=True)
-    elif request['op'] == 'shutdown':
-        print('{"status":"ok"}', flush=True)
-        break
-"#).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let source = base.join("hosted-effect-probe.c");
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/hosted_effect_probe.c"),
+        )
+        .unwrap();
+        let script = base.join("hosted-effect-probe");
+        assert!(std::process::Command::new("/usr/bin/clang")
+            .args(["-O2", "-Wall", "-Wextra", "-o"])
+            .arg(&script)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
         let config = ProviderConfig {
-            extra: json!({
-                "offers":[], "fixture_offer_id":offer_id, "fixture_run_id":run_id,
-                "fixture_request_id":request_id,
-            }),
+            base_path: base.to_string_lossy().into_owned(),
+            extra: json!({"offers":[], "journal_dir":base.join("providers/model-provider/journal")}),
             ..Default::default()
         };
-        let (bridge, _, _, _, hosted_listener) =
+        let (bridge, _, _, confined_config, hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
@@ -3305,9 +3268,35 @@ for line in sys.stdin:
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
             }
         });
-        let probe = |path: &str| ProviderRequest::Exists {
-            path: path.into(),
-            token: String::new(),
+        let hosted_socket = confined_config.extra["runtime_hosted_socket"]
+            .as_str()
+            .unwrap();
+        let probe = |kind: &str| {
+            let mut probe_messages = messages.clone();
+            let array = probe_messages.as_array_mut().unwrap();
+            match kind {
+                "altered" => array.last_mut().unwrap()["content"] = json!("changed text"),
+                "extra-message" => array.push(json!({"role":"user","content":"extra"})),
+                "extra-field" => array[0]["name"] = json!("hidden"),
+                "changed-role" => array[0]["role"] = json!("assistant"),
+                "swapped" => array.swap(0, 1),
+                _ => {}
+            }
+            let mut body = json!({"model":"fixture/model","stream":true,
+                "max_tokens":32,"messages":probe_messages});
+            if kind == "raised-cap" {
+                body["max_tokens"] = json!(33);
+            }
+            if kind == "missing-cap" {
+                body.as_object_mut().unwrap().remove("max_tokens");
+            }
+            ProviderRequest::Exists {
+                path: format!(
+                    "{hosted_socket}|{offer_id}|{run_id}|{request_id}|{}",
+                    hex::encode(serde_json::to_vec(&body).unwrap())
+                ),
+                token: String::new(),
+            }
         };
         let changed = bridge.request(probe("altered")).await.unwrap();
         let ProviderResponse::Ok {
