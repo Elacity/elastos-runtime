@@ -14,9 +14,12 @@ automatically a stable end-user command.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
-- `publish-release.sh` is the low-level release publisher. Use
-  `elastos publish-release --version <version> --dry-run` for read-only planning;
-  the low-level script rejects that flag before side effects.
+- `publish-release.sh` prepares unsigned native release inputs. Use
+  `elastos publish-release --version <version> --dry-run` for read-only planning.
+  Runtime imports frozen signed output through `--signed-publication`.
+- `release-signer.py` is the separately installed custodian tool. The operator
+  pins its interpreter, OpenSSL and source, and owns all release-key access.
+  The existing release-input CI suite runs its refused-case tests.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
   manifest exports, native/guest target selection and the staged artifact gate
   without signing or uploading. CI and `just verify` run these checks.
@@ -46,7 +49,7 @@ builder. It supports Linux x86_64, Linux ARM64 and macOS Apple silicon. Choose
 an absent output directory outside the checkout:
 
 ```sh
-scripts/prepare-release-platform.sh --version 0.7.1 --output /path/to/new-platform-input
+scripts/prepare-release-platform.sh --version VERSION --output /path/to/new-platform-input
 python3 scripts/release-platform-input.py verify /path/to/new-platform-input
 ```
 
@@ -77,6 +80,26 @@ Publisher import, signing and promotion follow this preparation boundary and
 remain separate release work. These commands perform local file operations;
 the builds can fetch Cargo dependencies. Keep their output through candidate
 review, then remove it after adoption or abandonment.
+
+For a staged update that keeps its support inventory fixed, prepare the next
+Runtime with the first version's verified native input:
+
+```sh
+scripts/prepare-release-platform.sh --version NEXT_VERSION \
+  --reuse-support /path/to/first-platform-input --output /path/to/next-platform-input
+python3 scripts/release-platform-input.py verify /path/to/next-platform-input
+```
+
+This path builds only Runtime. It copies the exact component manifest, provider,
+capsule and catalogue files from the first input. Both inputs use the same
+platform and component template. The next receipt binds its Runtime source and
+version, and `support_origin` binds the first receipt stored as
+`support-input.json`. Use an original native input as the support source; a
+receipt that already reuses support is refused. Keep both receipts with the
+staging handoff so the operator can verify the support's original qualification.
+Use the same installer source blob and public bootstrap stamps for both signed
+sets to keep their installer bytes fixed. Signing and publication still follow
+the separate operator procedure below.
 
 ## Public-install proof
 
@@ -220,3 +243,96 @@ for the explicit simulation boundary and the operator flow it supports.
 - Keep installed mode explicit where a command supports both source and
   installed paths.
 - Keep host-specific secrets and private maintenance commands outside the repo.
+
+## Signing and publication ownership
+
+Builders prepare inert inputs. The custodian signs their approved hashes. The
+publication host imports that frozen output and announces it through Carrier.
+Each host has a separate account and role; the publication host receives the
+public DID and signed files.
+
+The key-free builder checks that the prepared Runtime's `--version` prints
+exactly `elastos VERSION` on stdout with empty stderr, and records its hash.
+Candidate executables run in that builder account; the custodian receives
+inert files. Pin the publication Runtime and provider paths and hashes, and
+retain the reviewed source checkout that supplies the Runtime's compiled-in
+helper paths. Use isolated builder and publication accounts with approved
+state; unsigned preparation also imports files through its selected provider.
+
+For a canary on Apple silicon, the builder can prepare one qualified native
+input. Run this from the reviewed source checkout, with an absent output
+directory outside it:
+
+```sh
+ELASTOS_PUBLISHER_GATEWAY=https://staging.example.invalid \
+ELASTOS_PUBLISHER_NODE_ID=HOLDER_NODE_ID \
+ELASTOS_SOURCE_CONNECT_TICKET=HOLDER_TICKET \
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --platform-input aarch64-darwin=/path/to/native-input \
+  --preview-platform aarch64-darwin --prepare-only /path/to/unsigned-input \
+  --publisher-did DID --ipfs-provider-bin /path/to/qualified-ipfs-provider
+```
+
+Select the staging HTTPS origin and public holder node/ticket before preparation;
+the same installer stamps remain fixed across the two staged versions.
+
+The resulting `signing-input.json` binds the source commit/tree, artifact
+hashes, sizes and CIDs, release data and public installer stamps. The operator
+records its SHA-256 in a protected policy outside the input directory. That
+policy also pins the repository, exact source `commit` and `tree`, version,
+channel, public DID, file/total quotas and the trusted Python, OpenSSL and
+signer tool paths and SHA-256 hashes. For `canary`, the policy pins the current
+remote `develop` head in `develop_oid`; the source commit must be that head or
+its ancestor. For `stable` and `jetson-test`, the policy pins `tag` as `vVERSION`
+and `tag_oid` as the remote tag object; the tagged source commit must belong to
+`main`. The signer selects these fixed repository branches from the channel.
+
+Before approving a canary policy, the operator verifies the exact candidate
+commit/tree against its merged pull request on GitHub and the successful
+required checks for that commit. The installed signer also comes from a
+reviewed commit merged into `develop` with successful required checks. The
+operator verifies its source commit/tree and installed file hash, and records
+the canonical GitHub pull request and check links in the owning issue. The
+protected policy approval carries this review and CI acceptance; the signer's
+GitHub source checks prove commit/tree identity and branch membership. Anders
+approves each canary signing and publication. The operator alone
+sets the protected Ed25519 PEM key path. Use the signer from its installed,
+reviewed path, with a clean environment and its pinned Python:
+
+```sh
+env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+  --policy /path/to/operator-policy.json --input-root /path/to/unsigned-input \
+  --output-root /path/to/new-signed-set
+```
+
+The tool verifies the pinned remote `develop` head and candidate ancestry for
+canary, or the approved remote version tag and `main` ancestry for the other
+channels. A moved `develop` head requires a fresh operator policy approval.
+The tool reads candidate files as data and asks the operator to confirm the
+complete public signer DID before signing. It fetches the installer template
+from that approved tree. Its frozen installer keeps `HEAD_CID` empty to avoid
+a hash cycle; the signed head binds the final
+release CID and installer hash. Carrier holder identity and ticket remain
+public transport inputs, separate from the signer identity.
+
+On the publication host, inspect the frozen set before committing it:
+
+```sh
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID --dry-run
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID \
+  --ipfs-provider-bin /path/to/qualified-ipfs-provider
+```
+
+A saved pin change requires `--allow-signer-rotation` and confirmation of the
+complete public DID. Include the flag in both the dry-run and import commands
+when the saved pin changes. Runtime verifies signatures, exact artifact hashes and
+imported CIDs, promotes the public pin and files before the head, and restores
+the prior set if promotion fails. A complete rollback removes the backup links
+and commits the original signed head again, so cached HTTP reads can admit the
+restored set. A restoration, cleanup or final-head failure reports incomplete
+recovery and retains the attempt directory for operator inspection. A committed
+set can be retried to finish its ledger and Carrier announcement. The HTTP
+gateway serves each release file when the saved public pin and complete signed
+set agree; `install.sh` stays byte-identical across gateway hosts.
