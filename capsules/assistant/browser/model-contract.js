@@ -285,7 +285,9 @@ export function textOfferRows(offers, backendReports = {}) {
       label: offer.title,
       detail: offerRowDetail(offer, facts),
       streamOutput: offer.stream_output === true,
+      routeKind: offerRouteKind(offer),
       inputSchemas: Array.isArray(offer.input_schemas) ? [...offer.input_schemas] : [],
+      context: offer.context && typeof offer.context === "object" ? { ...offer.context } : null,
       selectionFacts: facts,
     };
   });
@@ -315,29 +317,33 @@ export function transcriptPrompt(messages) {
   return lines.join("\n\n");
 }
 
-export function textRunCreateBody({ offer, messages, requestId }) {
+export function textRunCreateBody({ offer, messages, requestId, maxOutputTokens = null }) {
   if (!offer || typeof offer.offerId !== "string" || typeof offer.operation !== "string") {
     throw contractError("no_offer", "no text model offer selected");
   }
   if (typeof requestId !== "string" || requestId.trim() === "") {
     throw contractError("no_request_id", "run request needs a request id");
   }
+  const input = offer.inputSchemas?.includes(MODEL_TEXT_INPUT_V2_SCHEMA)
+    ? {
+        schema: MODEL_TEXT_INPUT_V2_SCHEMA,
+        messages: messages.map(({ role, content }) => ({
+          role: role === "agent" ? "assistant" : role,
+          content,
+        })),
+      }
+    : {
+        schema: MODEL_TEXT_INPUT_SCHEMA,
+        prompt: transcriptPrompt(messages),
+      };
+  if (offer.context && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0) {
+    input.max_output_tokens = maxOutputTokens;
+  }
   return {
     offer_id: offer.offerId,
     operation: offer.operation,
     request_id: requestId,
-    input: offer.inputSchemas?.includes(MODEL_TEXT_INPUT_V2_SCHEMA)
-      ? {
-          schema: MODEL_TEXT_INPUT_V2_SCHEMA,
-          messages: messages.map(({ role, content }) => ({
-            role: role === "agent" ? "assistant" : role,
-            content,
-          })),
-        }
-      : {
-          schema: MODEL_TEXT_INPUT_SCHEMA,
-          prompt: transcriptPrompt(messages),
-        },
+    input,
   };
 }
 

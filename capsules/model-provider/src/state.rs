@@ -907,6 +907,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let current_summary = offer.execution_summary();
         let mut recorded_summary = run.offer.clone();
         recorded_summary.input_schemas.clear();
+        recorded_summary.context = None;
         let current_hash = offer.execution_binding_hash().map_err(|err| {
             ProviderFault::internal(format!(
                 "failed to derive model execution binding hash: {err}"

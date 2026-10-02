@@ -687,6 +687,46 @@ async function run() {
         assert(item.check(preview), `Documents parser did not preserve ${item.label}. Got ${JSON.stringify({ item, preview })}`);
       }
 
+      const hostileText = '<img src=x onerror="globalThis.markdownInjection=1"><script>globalThis.markdownInjection=1</script>';
+      const hostileMarkdown = [
+        ["fence-language", '```js" onmouseover="globalThis.markdownInjection=1">' + hostileText + "\nbody\n```"],
+        ["fence-body", "```js\n" + hostileText + "\n```"],
+        ["paragraph", hostileText],
+        ["heading", "# " + hostileText],
+        ["quote", "> " + hostileText],
+        ["unordered-item", "- " + hostileText],
+        ["ordered-item", "1. " + hostileText],
+        ["task-label", "- [ ] " + hostileText],
+        ["table-heading", "| " + hostileText + " |\n| --- |\n| safe |"],
+        ["table-cell", "| safe |\n| --- |\n| " + hostileText + " |"],
+        ["inline-code", "`" + hostileText + "`"],
+        ["strong", "**" + hostileText + "**"],
+        ["emphasis", "*" + hostileText + "*"],
+        ["link-label", "[" + hostileText + "](https://example.test/)"],
+        ["image-label", "![" + hostileText + "](https://example.test/image.png)"],
+        ["link-url", '[label](https://example.test/" onmouseover="globalThis.markdownInjection=1)' ],
+        ["image-url", '![label](https://example.test/" onerror="globalThis.markdownInjection=1)' ],
+        ["link-scheme", "[label](javascript:globalThis.markdownInjection=1)"],
+        ["image-scheme", "![label](data:text/html,<script>globalThis.markdownInjection=1</script>)"],
+      ];
+      for (const [field, markdown] of hostileMarkdown) {
+        const marker = "markdown-safety-" + field;
+        await parserPage.locator("#editor").fill(markdown + "\n\n" + marker);
+        await parserPage.waitForFunction((value) => document.getElementById("preview")?.textContent.includes(value), marker);
+        const result = await parserPage.evaluate(() => {
+          const preview = document.getElementById("preview");
+          const nodes = [...preview.querySelectorAll("*")];
+          return {
+            injectedElements: preview.querySelectorAll("script, img, iframe, svg, object, embed").length,
+            eventAttributes: nodes.flatMap((node) => [...node.attributes].filter((attribute) => /^on/i.test(attribute.name)).map((attribute) => attribute.name)),
+            unsafeUrls: [...preview.querySelectorAll("a")].map((link) => link.getAttribute("href")).filter((href) => /^(javascript|data|vbscript):/i.test(href)),
+            executed: globalThis.markdownInjection === 1,
+          };
+        });
+        assert(result.injectedElements === 0 && result.eventAttributes.length === 0 && result.unsafeUrls.length === 0 && !result.executed,
+          `Documents ${field} created executable DOM: ${JSON.stringify(result)}`);
+      }
+
       await parserPage.locator("#editor").fill("# ");
       await parserPage.waitForFunction(() => (document.getElementById("preview")?.textContent || "").includes("# "));
 

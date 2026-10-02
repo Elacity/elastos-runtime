@@ -190,6 +190,7 @@ function clearLaunchedAppContexts() {
 }
 
 function enterHostAuthGate() {
+  document.body.dataset.homeAuthority = "unsigned";
   stopHomePresenceHeartbeat();
   shellState.activeShellRootLaunchSeq += 1;
   resetActiveShellReadyState();

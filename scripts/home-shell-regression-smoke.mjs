@@ -2601,7 +2601,7 @@ await openHybrid("documents", { query: { doc: "did:document-c" } });
 const documentWindows = [...shellCore.shellState.windows.values()];
 const originalDocumentTokens = documentWindows.map((entry) =>
   new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash);
-const documentsSource = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const documentsSource = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const navigationFunction = (source, name) => {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert(start >= 0, `Documents function missing: ${name}`);

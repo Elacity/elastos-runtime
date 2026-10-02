@@ -412,6 +412,10 @@ impl LocalLlamaSettings {
             MAX_LOCAL_LLAMA_PARALLEL,
             "local llama parallel",
         )?;
+        anyhow::ensure!(
+            self.context_size / self.parallel >= 128,
+            "local llama context_size must provide at least 128 tokens per slot"
+        );
         validate_nonzero_bounded(self.threads, MAX_LOCAL_LLAMA_THREADS, "local llama threads")?;
         validate_nonzero_bounded(
             self.batch_threads,
@@ -579,6 +583,15 @@ impl ConfiguredOffer {
             output_modalities: self.output_modalities.clone(),
             stream_output: self.adapter.stream_output(),
             policy: self.policy.summary(),
+            context: match &self.adapter {
+                AdapterConfig::LocalLlamaCppText { settings, .. } => {
+                    Some(crate::contract::LocalContextLimits {
+                        context_window_tokens: settings.context_size / settings.parallel,
+                        max_output_tokens: local_output_token_limit(settings),
+                    })
+                }
+                _ => None,
+            },
             hosted,
         }
     }
@@ -588,6 +601,7 @@ impl ConfiguredOffer {
     pub fn execution_summary(&self) -> OfferSummary {
         let mut summary = self.summary();
         summary.input_schemas.clear();
+        summary.context = None;
         summary
     }
 
@@ -709,6 +723,12 @@ impl ConfiguredOffer {
         validate_local_artifact(bridge, engine, true, "local llama engine")?;
         validate_local_artifact(bridge, model, false, "local llama model")
     }
+}
+
+pub(crate) fn local_output_token_limit(settings: &LocalLlamaSettings) -> u32 {
+    // Keep a conservative answer slice in each server slot. Output bytes have
+    // their own independent transport bound.
+    (settings.context_size / settings.parallel / 4).clamp(1, 1_024)
 }
 
 pub fn journal_root(base_path: &str, configured: Option<&str>) -> Result<PathBuf> {
@@ -1259,6 +1279,27 @@ mod tests {
             vec![elastos_model_contract::TEXT_INPUT_V1_SCHEMA]
         );
         assert_ne!(responses.execution_binding_hash().unwrap(), legacy_hash);
+    }
+
+    #[test]
+    fn local_context_summary_uses_one_slot_and_rejects_unusable_profiles() {
+        let mut offer = local_llama_offer(Path::new("/tmp/engine"), Path::new("/tmp/model"));
+        let original_revision = offer.execution_binding_hash().unwrap();
+        let limits = offer.summary().context.unwrap();
+        assert_eq!(limits.context_window_tokens, 4_096);
+        assert_eq!(limits.max_output_tokens, 1_024);
+        if let AdapterConfig::LocalLlamaCppText { settings, .. } = &mut offer.adapter {
+            settings.parallel = 16;
+            assert_eq!(settings.context_size / settings.parallel, 256);
+            settings.validate().unwrap();
+            settings.parallel = 64;
+            assert!(settings.validate().is_err());
+            settings.parallel = 16;
+        }
+        let limits = offer.summary().context.unwrap();
+        assert_eq!(limits.context_window_tokens, 256);
+        assert_eq!(limits.max_output_tokens, 64);
+        assert_ne!(offer.execution_binding_hash().unwrap(), original_revision);
     }
 
     #[test]

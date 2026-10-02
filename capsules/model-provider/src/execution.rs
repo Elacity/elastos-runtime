@@ -3233,6 +3233,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hosted_text_rejects_requested_output_limit_before_dispatch() {
+        let server = start_server(vec![]);
+        let v1 = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+            "prompt": "hello",
+            "max_output_tokens": 64,
+        });
+        let v2 = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+            "messages": [{"role":"user","content":"hello"}],
+            "max_output_tokens": 64,
+        });
+        for (offer, input) in [
+            (local_text_offer(&server.base_url), v1.clone()),
+            (local_text_offer(&server.base_url), v2),
+            (responses_text_offer(&server.base_url), v1),
+        ] {
+            let root = temp_root("hosted-output-limit");
+            let mut provider = ProviderCoordinatorHandle::start();
+            init_provider(&provider, &root, vec![offer.clone()]);
+            let binding = create_binding("request:hosted-output-limit", &offer, &input);
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed", "{terminal:#}");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["code"], "context_rejected",
+                "{terminal:#}"
+            );
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["message"],
+                "model output request is not supported by this offer"
+            );
+            provider.shutdown_on_eof();
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_counts_template_before_generation_and_bounds_output() {
+        let root = temp_root("local-llama-context-budget");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let limits = offer.summary().context.unwrap();
+        assert_eq!(limits.context_window_tokens, 256);
+        assert_eq!(limits.max_output_tokens, 64);
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let accepted_input = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+            "messages": [
+                {"role":"system","content":"Keep the roles."},
+                {"role":"user","content":"日本語 🌎"},
+            ],
+            "max_output_tokens": 32,
+        });
+        let accepted_binding = create_binding("request:budget-unicode", &offer, &accepted_input);
+        let accepted = create_run(&provider, &offer, &accepted_binding, &accepted_input);
+        let accepted_run = accepted["data"]["run_id"].as_str().unwrap();
+        let terminal =
+            wait_for_terminal(&provider, accepted_run, &access_binding(&accepted_binding));
+        assert_eq!(terminal["data"]["status"], "completed", "{terminal:#}");
+        let first_events = fake_llama_events(&events);
+        let count_index = first_events
+            .iter()
+            .position(|line| line.starts_with("count:"))
+            .unwrap();
+        let request_index = first_events
+            .iter()
+            .position(|line| line == "request:Keep the roles.")
+            .unwrap();
+        assert!(count_index < request_index);
+        assert!(first_events.iter().any(|line| line == "max_tokens:32"));
+        let prompt_tokens: u32 = first_events[count_index]["count:".len()..].parse().unwrap();
+        assert!(prompt_tokens + 32 < limits.context_window_tokens);
+
+        let long_input = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+            "messages": [{"role":"user","content":"x".repeat(200)}],
+            "max_output_tokens": 64,
+        });
+        let long_binding = create_binding("request:budget-long", &offer, &long_input);
+        let long_run = create_run(&provider, &offer, &long_binding, &long_input);
+        let long_terminal = wait_for_terminal(
+            &provider,
+            long_run["data"]["run_id"].as_str().unwrap(),
+            &access_binding(&long_binding),
+        );
+        assert_eq!(
+            long_terminal["data"]["terminal"]["error"]["code"],
+            "context_rejected"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("request:"))
+                .count(),
+            1
+        );
+
+        let excessive_input = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+            "messages": [{"role":"user","content":"short"}],
+            "max_output_tokens": 65,
+        });
+        let excessive_binding =
+            create_binding("request:budget-excessive", &offer, &excessive_input);
+        let excessive = create_run(&provider, &offer, &excessive_binding, &excessive_input);
+        assert_eq!(
+            excessive["data"]["terminal"]["error"]["code"],
+            "context_rejected"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("request:"))
+                .count(),
+            1
+        );
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_missing_count_fails_before_generation() {
+        let root = temp_root("local-llama-missing-count");
+        let (offer, events, root) = local_llama_offer(&root, "incomplete_count");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+        let input = text_input("hello");
+        let binding = create_binding("request:missing-count", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(terminal["data"]["status"], "failed");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("request:"))
+                .count(),
+            0
+        );
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_stop_interrupts_stalled_count_body() {
+        let root = temp_root("local-llama-stalled-count");
+        let (offer, events, root) = local_llama_offer(&root, "stalled_count");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+        let input = text_input("hello");
+        let binding = create_binding("request:stalled-count", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        wait_for_fake_llama_event(&events, "count_body_started");
+        let started = Instant::now();
+        let _ = cancel_run(&provider, run_id, &access_binding(&binding));
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(terminal["data"]["status"], "settlement_unknown");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("request:"))
+                .count(),
+            0
+        );
+        provider.shutdown_on_eof();
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_llama_streams_concurrent_runs_reuses_child_and_guards_refresh() {
