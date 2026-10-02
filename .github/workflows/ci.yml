@@ -228,6 +228,22 @@ jobs:
         run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: install content boundary browser fixture
+        timeout-minutes: 5
+        env:
+          DEBUG: pw:install
+        run: |
+          # 1.60 fixes ZIP extraction hanging on Node 26 (Playwright #40747).
+          npm install --prefix "${RUNNER_TEMP}/content-sandbox-browser" --no-save --package-lock=false playwright@1.60.0
+          "${RUNNER_TEMP}/content-sandbox-browser/node_modules/.bin/playwright" install chromium --with-deps --only-shell
+      - name: gateway content sandbox browser regression
+        working-directory: elastos
+        env:
+          ELASTOS_PLAYWRIGHT_MODULE: ${{ runner.temp }}/content-sandbox-browser/node_modules/playwright/index.mjs
+        run: cargo test -p elastos-server content_sandbox_browser -- --ignored --nocapture
 
   test-capsules:
     name: test-capsules
