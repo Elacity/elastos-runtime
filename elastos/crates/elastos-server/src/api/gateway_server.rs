@@ -373,83 +373,105 @@ mod trusted_gateway_tests {
             )
             .await
         });
-        let home = tokio::time::timeout(Duration::from_secs(5), ready_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(home, format!("http://{addr}/home/"));
-        let owner = crate::runtime_control::gateway_children::Owner::read(&data).unwrap();
-        let managed_coords_path = data.join("runtime-coords-home.json");
-        let (mut managed, managed_helper_pid) =
-            crate::runtime_control::gateway_children::test_child(&owner, &managed_coords_path)
-                .await;
-        let managed_pid = managed.child.id();
-        managed.ready();
-        drop(managed);
-        let unrelated = crate::api::server::HostHelperProcess {
-            name: "unrelated runtime fixture",
-            child: std::process::Command::new("sleep")
-                .arg("60")
-                .spawn()
-                .unwrap(),
-        };
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(format!("http://{addr}/healthz"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-
-        // A late startup failure after binding must still leave the callback untouched.
-        let duplicate = start_gateway_server_with_ready(
-            &unused_localhost_address(),
-            None,
-            GatewayCollaborationContext::default(),
-            data.join("cache"),
-            data.clone(),
-            Some(unexpected_ready),
-        )
-        .await
-        .unwrap_err();
-        assert!(duplicate
-            .to_string()
-            .contains("already running for this data root"));
-
-        // Expect:100 proves Axum started reading this streaming request body.
-        // Keep it incomplete while shutdown begins, as an SSE/WebSocket client
-        // likewise keeps an in-flight connection alive after the listener closes.
-        let mut streaming = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        streaming
-            .write_all(format!(
-                "POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"
-            ).as_bytes())
-            .await
-            .unwrap();
-        let mut interim = [0; 128];
-        let length = tokio::time::timeout(Duration::from_secs(2), streaming.read(&mut interim))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
-        streaming.write_all(b"{").await.unwrap();
-        let coords_path = data.join("gateway-runtime-coords.json");
-        assert!(coords_path.is_file());
-        let coords: crate::runtime_control::RuntimeCoords =
-            serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
-        let control_addr = coords.api_url.strip_prefix("http://").unwrap();
-        let mut control_stream = tokio::net::TcpStream::connect(control_addr).await.unwrap();
-        control_stream.write_all(format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
-        let length =
-            tokio::time::timeout(Duration::from_secs(2), control_stream.read(&mut interim))
+        let journey_data = data.clone();
+        let journey_addr = addr.clone();
+        // A joined task returns assertion failures so gateway cleanup still runs.
+        let journey = tokio::spawn(async move {
+            let data = journey_data;
+            let addr = journey_addr;
+            let home = tokio::time::timeout(Duration::from_secs(5), ready_rx)
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
+            assert_eq!(home, format!("http://{addr}/home/"));
+            let home_url = url::Url::parse(&home).unwrap();
+            let authority = home_url.authority();
+            let origin = home_url.origin().ascii_serialization();
+            let owner = crate::runtime_control::gateway_children::Owner::read(&data).unwrap();
+            let managed_coords_path = data.join("runtime-coords-home.json");
+            let (mut managed, managed_helper_pid) =
+                crate::runtime_control::gateway_children::test_child(&owner, &managed_coords_path)
+                    .await;
+            let managed_pid = managed.child.id();
+            managed.ready();
+            drop(managed);
+            let unrelated = crate::api::server::HostHelperProcess {
+                name: "unrelated runtime fixture",
+                child: std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            };
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(home_url.join("/healthz").unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-        stop_tx.send(()).unwrap();
+            // A late startup failure after binding must still leave the callback untouched.
+            let duplicate = start_gateway_server_with_ready(
+                &unused_localhost_address(),
+                None,
+                GatewayCollaborationContext::default(),
+                data.join("cache"),
+                data.clone(),
+                Some(unexpected_ready),
+            )
+            .await
+            .unwrap_err();
+            assert!(duplicate
+                .to_string()
+                .contains("already running for this data root"));
+
+            // Expect:100 proves Axum started reading this streaming request body.
+            // Keep it incomplete while shutdown begins, as an SSE/WebSocket client
+            // likewise keeps an in-flight connection alive after the listener closes.
+            let mut streaming = tokio::net::TcpStream::connect(authority).await.unwrap();
+            streaming
+                .write_all(format!(
+                    "POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {authority}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"
+                ).as_bytes())
+                .await
+                .unwrap();
+            let mut interim = [0; 128];
+            let length = tokio::time::timeout(Duration::from_secs(2), streaming.read(&mut interim))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
+            streaming.write_all(b"{").await.unwrap();
+            let coords_path = data.join("gateway-runtime-coords.json");
+            assert!(coords_path.is_file());
+            let coords: crate::runtime_control::RuntimeCoords =
+                serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
+            let control_addr = coords.api_url.strip_prefix("http://").unwrap();
+            let mut control_stream = tokio::net::TcpStream::connect(control_addr).await.unwrap();
+            control_stream.write_all(format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
+            let length =
+                tokio::time::timeout(Duration::from_secs(2), control_stream.read(&mut interim))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
+
+            (
+                streaming,
+                control_stream,
+                interim,
+                coords_path,
+                managed_pid,
+                managed_helper_pid,
+                unrelated,
+            )
+        })
+        .await;
+
+        let _ = stop_tx.send(());
         let mut server = server;
         let stopped = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
         if stopped.is_err() {
@@ -458,6 +480,15 @@ mod trusted_gateway_tests {
             panic!("gateway shutdown waited for a client stream to close");
         }
         stopped.unwrap().unwrap().unwrap();
+        let (
+            mut streaming,
+            mut control_stream,
+            mut interim,
+            coords_path,
+            managed_pid,
+            managed_helper_pid,
+            unrelated,
+        ) = journey.unwrap();
         let control_closed =
             tokio::time::timeout(Duration::from_secs(1), control_stream.read(&mut interim))
                 .await
