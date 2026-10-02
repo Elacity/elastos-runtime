@@ -542,11 +542,18 @@ def cli_environment(home_path):
 
 
 def cli_installer_metadata(installer, env):
-    command = 'source "$1"; printf "%s\\n%s\\n" "$MAINTAINER_DID" "$HEAD_CID"'
-    proc = subprocess.run(["/bin/bash", "-c", command, "fixture", str(installer)],
-                          env=env, capture_output=True, timeout=15, check=False)
-    need(proc.returncode == 0, "frozen installer metadata unavailable")
-    return proc.stdout.decode().splitlines()
+    # The stamped defaults live inside the executable guard; sourcing skips it.
+    # Read the two literal defaults without running any installer action.
+    text = installer.read_text()
+    values = []
+    for variable in ("MAINTAINER_DID", "HEAD_CID"):
+        need("ELASTOS_" + variable not in env, "fixture trust override is unavailable")
+        matches = re.findall(r'^' + variable + r'="\$\{ELASTOS_' + variable +
+                             r':-([^$\\"\r\n}]*)\}"$', text, re.M)
+        need(len(matches) == 1, "frozen installer literal trust default unavailable")
+        value = matches[0]
+        values.append("" if value == "__" + variable + "__" else value)
+    return values
 
 
 def cli_signature(installer, envelope, domain, signer, env):

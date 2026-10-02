@@ -245,6 +245,11 @@ class ReleasePolicyTests(unittest.TestCase):
                     }), event == "workflow_dispatch" and bool(artifact))
         self.assertNotRegex(job, CACHE_RE)
         self.assertIn("persist-credentials: false", job)
+        self.assertNotIn("GH_TOKEN", job.split("    steps:", 1)[0])
+        fetch, = [step for step in steps("macos-cli-update-fixture")
+                  if step.startswith("name: fetch the immutable signed fixture\n")]
+        self.assertIn("GH_TOKEN: ${{ github.token }}", fetch)
+        self.assertEqual(job.count("GH_TOKEN:"), 1)
         self.assertIn("ELASTOS_CI_FIXTURE_MANIFEST_SHA256:", job)
         self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', job)
         self.assertIn('[[ "$ELASTOS_CI_FIXTURE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]', job)
@@ -264,7 +269,7 @@ class ReleasePolicyTests(unittest.TestCase):
         shell = textwrap.dedent(fetch.split("        run: |\n", 1)[1])
         scripts = re.findall(r"(?ms)^ *python3 - .*? <<'PY'\n(.*?)^ *PY$", shell)
         extract = textwrap.dedent(next(script for script in scripts if "zipfile.ZipFile" in script))
-        for case in ("valid", "escape", "absolute", "backslash", "symlink", "duplicate"):
+        for case in ("valid", "escape", "absolute", "backslash", "symlink", "duplicate", "forged-receipt", "noncanonical"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 package = root / "package"
@@ -275,7 +280,8 @@ class ReleasePolicyTests(unittest.TestCase):
                 with warnings.catch_warnings(), zipfile.ZipFile(archive, "w") as target:
                     warnings.simplefilter("ignore", UserWarning)
                     name = {"escape": "../outside", "absolute": str(preserved),
-                            "backslash": "..\\outside"}.get(case, "fixture.json")
+                            "backslash": "..\\outside", "forged-receipt": "results/result.json",
+                            "noncanonical": "payload//input"}.get(case, "fixture.json")
                     if case == "symlink":
                         info = zipfile.ZipInfo(name)
                         info.create_system = 3

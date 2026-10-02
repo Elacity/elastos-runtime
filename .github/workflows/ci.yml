@@ -629,13 +629,14 @@ jobs:
       ELASTOS_CI_FIXTURE_MANIFEST_SHA256: ${{ inputs.cli_update_fixture_manifest_sha256 }}
       ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
       FIXTURE_REPOSITORY: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: fetch the immutable signed fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
@@ -674,6 +675,9 @@ jobs:
                   path = pathlib.PurePosixPath(item.filename)
                   mode = item.external_attr >> 16
                   if (not item.filename or path.is_absolute() or '..' in path.parts
+                          or str(path) != item.filename.rstrip('/')
+                          or (item.filename not in ('fixture.json', 'manifest.json', 'payload/')
+                              and not item.filename.startswith('payload/'))
                           or '\\' in item.filename or any(ord(c) < 32 for c in item.filename)
                           or stat.S_ISLNK(mode) or item.filename in seen):
                       raise SystemExit('fixture archive contains an unsafe entry')

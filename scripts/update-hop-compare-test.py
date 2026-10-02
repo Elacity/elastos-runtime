@@ -305,6 +305,22 @@ class CliFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "architecture"):
             observer.cli_macho(native, "x86_64-darwin")
 
+    def test_stamped_real_installer_defaults_are_read_without_execution(self):
+        actual = Path(__file__).with_name("install.sh").read_text()
+        installer = self.root / "stamped-install.sh"
+        stamped = actual.replace("__MAINTAINER_DID__", self.manifest["signer_did"]).replace("__HEAD_CID__", "")
+        installer.write_text(stamped)
+        self.assertEqual(observer.cli_installer_metadata(installer, observer.cli_environment(self.root)),
+                         [self.manifest["signer_did"], ""])
+        installer.write_text(stamped.replace('HEAD_CID="${ELASTOS_HEAD_CID:-}"',
+                                            'HEAD_CID="${ELASTOS_HEAD_CID:-pinned-head}"'))
+        self.assertEqual(observer.cli_installer_metadata(installer, {})[1], "pinned-head")
+        with self.assertRaisesRegex(ValueError, "trust override"):
+            observer.cli_installer_metadata(installer, {"ELASTOS_HEAD_CID": ""})
+        installer.write_text(stamped + '\nMAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-substituted}"\n')
+        with self.assertRaisesRegex(ValueError, "literal trust default"):
+            observer.cli_installer_metadata(installer, {})
+
     def test_cleanup_does_not_signal_recycled_historic_process_groups(self):
         class Exited:
             pid, returncode = 30000, 0
