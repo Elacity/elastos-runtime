@@ -2,12 +2,14 @@
 """Check CI release/cache decisions without builds, Docker, or publication."""
 import os
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -442,6 +444,120 @@ class ReleasePolicyTests(unittest.TestCase):
                     else:
                         with self.assertRaises(AssertionError):
                             exec(compile(validator, "engine ELF validator", "exec"), {})
+
+
+class CustodyKuboDownloadTests(unittest.TestCase):
+    """Execute the Dockerfile's download gate with local transport fixtures."""
+
+    def setUp(self):
+        self.source = (WORKFLOW.parents[2] / "deploy/custody-host/Dockerfile").read_text()
+        self.version = re.search(r"(?m)^ARG KUBO_VERSION=(\S+)$", self.source)[1]
+        self.script = self.source.split("ARG KUBO_VERSION=", 1)[1].split("RUN <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+        self.pins = dict(re.findall(r'(amd64|arm64)\) kubo_sha256="([0-9a-f]{64})"', self.script))
+        self.assertEqual(self.version, "v0.42.0")
+        self.assertEqual(self.pins, {
+            "amd64": "284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e",
+            "arm64": "edc6f485ab623f9327bf2ad7aa7a29d84c87c72f1e2584376a77240134a96e69"})
+
+    def run_gate(self, arch="amd64", primary="valid", mirror="valid"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "fixture.tar.gz"
+            binary = b"local Kubo download fixture"
+            with tarfile.open(archive, "w:gz") as tar:
+                entry = tarfile.TarInfo("kubo/ipfs")
+                entry.size = len(binary)
+                tar.addfile(entry, io.BytesIO(binary))
+            fixture_pin = hashlib.sha256(archive.read_bytes()).hexdigest()
+            # Only this in-memory test copy uses the small fixture checksum.
+            # setUp separately enforces both exact production pins above.
+            script = self.script
+            for pin in self.pins.values():
+                script = script.replace(pin, fixture_pin)
+            script = script.replace("/tmp", str(root))
+            shims = root / "shims"
+            shims.mkdir()
+            curl = shims / "curl"
+            curl.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''\
+                import json, os, pathlib, sys
+                args = sys.argv[1:]
+                out = pathlib.Path(args[args.index("-o") + 1])
+                url = args[-1]
+                route = "PRIMARY" if url.startswith("https://dist.ipfs.tech/") else "MIRROR"
+                existed = out.exists()
+                with open(os.environ["FIXTURE_EVENTS"], "a") as log:
+                    log.write(json.dumps({"args": args, "route": route, "existing": existed}) + "\\n")
+                response = os.environ["FIXTURE_" + route]
+                out.write_bytes(pathlib.Path(os.environ["FIXTURE_ARCHIVE"]).read_bytes()
+                                if response == "valid" else b"failed or corrupt transport bytes")
+                sys.exit(22 if response == "failed" else 0)
+                '''))
+            curl.chmod(0o700)
+            strip = shims / "strip"
+            strip.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_STRIP"\n')
+            strip.chmod(0o700)
+            tar = shims / "tar"
+            tar.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_TAR"\nexec /usr/bin/tar "$@"\n')
+            tar.chmod(0o700)
+            env = {**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+                   "KUBO_VERSION": self.version, "TARGETARCH": arch,
+                   "FIXTURE_PRIMARY": primary, "FIXTURE_MIRROR": mirror,
+                   "FIXTURE_EVENTS": str(root / "events"), "FIXTURE_STRIP": str(root / "strip-log"),
+                   "FIXTURE_TAR": str(root / "tar-log"),
+                   "FIXTURE_ARCHIVE": str(archive)}
+            result = subprocess.run(["/bin/sh", "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            events = [json.loads(line) for line in (root / "events").read_text().splitlines()] if (root / "events").exists() else []
+            installed = (root / "kubo-binary").read_bytes() if (root / "kubo-binary").exists() else None
+            stripped = (root / "strip-log").exists()
+            archive_left = (root / f"kubo_{self.version}_linux-{arch}.tar.gz").exists()
+            mode = (root / "kubo-binary").stat().st_mode & 0o777 if installed else None
+            self.assertEqual((root / "tar-log").exists(), result.returncode == 0,
+                             "refused input must stop before archive extraction")
+            return result, events, installed, stripped, archive_left, mode
+
+    def test_primary_and_byte_identical_fallback_keep_platform_and_install_gate(self):
+        for arch in ("amd64", "arm64"):
+            for primary in ("valid", "failed"):
+                with self.subTest(arch=arch, primary=primary):
+                    result, events, installed, stripped, archive_left, mode = self.run_gate(arch, primary)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(installed, b"local Kubo download fixture")
+                    self.assertTrue(stripped)
+                    self.assertFalse(archive_left)
+                    self.assertEqual(mode, 0o755)
+                    routes = ["PRIMARY"] if primary == "valid" else ["PRIMARY", "MIRROR"]
+                    self.assertEqual([event["route"] for event in events], routes)
+                    tarball = f"kubo_{self.version}_linux-{arch}.tar.gz"
+                    urls = [f"https://dist.ipfs.tech/kubo/{self.version}/{tarball}",
+                            f"https://github.com/ipfs/kubo/releases/download/{self.version}/{tarball}"]
+                    self.assertEqual([event["args"][-1] for event in events], urls[:len(events)])
+                    for event in events:
+                        self.assertEqual(event["args"][:5], ["-fsSL", "--connect-timeout", "30", "--max-time", "300"])
+                    if primary == "failed":
+                        self.assertFalse(events[1]["existing"], "failed primary bytes must be removed before fallback")
+
+    def test_bad_checksum_or_unreachable_routes_refuse_extraction_and_install(self):
+        for arch in ("amd64", "arm64"):
+            for primary, mirror, routes in (("corrupt", "valid", ["PRIMARY"]),
+                                             ("failed", "corrupt", ["PRIMARY", "MIRROR"]),
+                                             ("failed", "failed", ["PRIMARY", "MIRROR"])):
+                with self.subTest(arch=arch, primary=primary, mirror=mirror):
+                    result, events, installed, stripped, _, _ = self.run_gate(arch, primary, mirror)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual([event["route"] for event in events], routes)
+                    self.assertIsNone(installed)
+                    self.assertFalse(stripped)
+                    if mirror != "failed":
+                        self.assertIn("FAILED", result.stdout)
+
+    def test_unsupported_architecture_refuses_every_download(self):
+        result, events, installed, stripped, _, _ = self.run_gate("riscv64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported TARGETARCH", result.stderr)
+        self.assertEqual(events, [])
+        self.assertIsNone(installed)
+        self.assertFalse(stripped)
 
 
 if __name__ == "__main__":

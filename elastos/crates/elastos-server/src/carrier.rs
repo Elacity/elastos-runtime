@@ -8143,7 +8143,7 @@ impl CarrierClient {
     }
 
     /// Finish a short-lived client without closing a Runtime-owned endpoint.
-    async fn close(self) {
+    pub async fn close(&self) {
         if self.owns_endpoint {
             self._endpoint.close().await;
         }
@@ -10609,6 +10609,64 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         runtime.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_close_keeps_borrowed_runtime_endpoint_usable() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let runtime = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            for _ in 0..2 {
+                let (mut send, recv) = connection.accept_bi().await.unwrap();
+                let mut reader = BufReader::new(recv);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                    "artifact"
+                );
+                send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                send.write_all(b"fixture").await.unwrap();
+                send.finish().unwrap();
+            }
+            connection.closed().await
+        });
+        let client = CarrierClient::connect_known_endpoint(&runtime, address, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client.fetch_file("artifact"))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fixture"
+        );
+        client.close().await;
+        assert!(!runtime.is_closed());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client.fetch_file("artifact"))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fixture"
+        );
+        drop(client);
+        runtime.close().await;
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
         server.close().await;
     }
 
