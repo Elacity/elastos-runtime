@@ -1494,14 +1494,18 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
             }
         }
     };
-    let applied = send_worker_apply_update(
+    let applied = send_worker_apply_update_with_timing(
         &task.run_id,
         task.generation,
         WorkerApplyGuard::None,
         result,
         &task.updates,
+        timing.as_ref(),
     )
     .await;
+    if let (Some(timing), Ok(())) = (&timing, &applied) {
+        timing.record(LocalTimingStage::TerminalApplied);
+    }
     if let (Some(timing), Err(fault)) = (&timing, &applied) {
         timing.record(if fault.error.class == ErrorClass::BackendTimeout {
             LocalTimingStage::RunTimeout
@@ -1962,7 +1966,7 @@ async fn run_local_text_worker_with_timing(
             _ = flush_timer.tick(), if timed_flushes < LOCAL_TEXT_TIMED_FLUSH_LIMIT
                 && !stream_state.delta_buffer.is_empty() => {
                 flush_local_text_delta(&task.offer, &task.run_id, task.generation,
-                    &task.updates, &mut stream_state.delta_buffer).await?;
+                    &task.updates, &mut stream_state.delta_buffer, timing).await?;
                 timed_flushes += 1;
                 continue;
             }
@@ -2031,11 +2035,15 @@ async fn run_local_text_worker_with_timing(
                                 task.generation,
                                 &task.updates,
                                 &mut stream_state.delta_buffer,
+                                timing,
                             )
                             .await?;
                         }
                     }
                     ParsedTextStreamEvent::Completed => {
+                        if let Some(timing) = timing {
+                            timing.record(LocalTimingStage::StreamCompleted);
+                        }
                         done = true;
                         break;
                     }
@@ -2069,6 +2077,7 @@ async fn run_local_text_worker_with_timing(
         task.generation,
         &task.updates,
         &mut stream_state.delta_buffer,
+        timing,
     )
     .await?;
     let output = json!({
@@ -2314,6 +2323,7 @@ async fn flush_local_text_delta(
     generation: u64,
     updates: &mpsc::Sender<WorkerUpdate>,
     delta_buffer: &mut String,
+    timing: Option<&LocalTiming>,
 ) -> std::result::Result<(), AdapterFault> {
     if delta_buffer.is_empty() {
         return Ok(());
@@ -2323,7 +2333,7 @@ async fn flush_local_text_delta(
     while !remaining.is_empty() {
         let end = local_text_chunk_end(remaining, offer.policy.event_bytes_limit)?;
         let delta_event = json!({ "text": &remaining[..end] });
-        send_worker_apply_update(
+        send_worker_apply_update_with_timing(
             run_id,
             generation,
             WorkerApplyGuard::None,
@@ -2336,6 +2346,7 @@ async fn flush_local_text_delta(
                 status: RunStatus::Running,
             },
             updates,
+            timing,
         )
         .await?;
         // Only an applied acknowledgement permits the next chunk.
@@ -2554,6 +2565,19 @@ async fn send_worker_apply_update(
     result: ReconcileResult,
     updates: &mpsc::Sender<WorkerUpdate>,
 ) -> std::result::Result<(), AdapterFault> {
+    send_worker_apply_update_with_timing(run_id, generation, guard, result, updates, None).await
+}
+
+async fn send_worker_apply_update_with_timing(
+    run_id: &str,
+    generation: u64,
+    guard: WorkerApplyGuard,
+    result: ReconcileResult,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    timing: Option<&LocalTiming>,
+) -> std::result::Result<(), AdapterFault> {
+    let started = std::time::Instant::now();
+    let terminal = matches!(&result, ReconcileResult::Terminal { .. });
     let (acknowledge, ack_rx) = oneshot::channel();
     updates
         .send(WorkerUpdate::Apply {
@@ -2565,7 +2589,19 @@ async fn send_worker_apply_update(
         })
         .await
         .map_err(|_| worker_control_lost_fault("worker update channel was dropped"))?;
-    match ack_rx.await {
+    let acknowledgement = ack_rx.await;
+    if let Some(timing) = timing {
+        let outcome = match &acknowledgement {
+            Ok(WorkerApplyAck::Applied) => "applied",
+            Ok(WorkerApplyAck::Rejected) => "rejected",
+            Ok(WorkerApplyAck::TimedOut) => "timeout",
+            Err(_) => "control_lost",
+        };
+        // Applied follows the coordinator's durable reconcile/store_run. Include
+        // channel wait and coordinator work in the acknowledgement duration.
+        timing.acknowledgement(terminal, outcome, started);
+    }
+    match acknowledgement {
         Ok(WorkerApplyAck::Applied) => Ok(()),
         Ok(WorkerApplyAck::Rejected) => Err(worker_update_rejected_fault()),
         Ok(WorkerApplyAck::TimedOut) => Err(AdapterFault::timeout(
@@ -4914,8 +4950,15 @@ mod tests {
                 .build()
                 .unwrap();
             let result = runtime.block_on(async move {
-                flush_local_text_delta(&offer, "run-rejected", 1, &update_tx, &mut delta_buffer)
-                    .await
+                flush_local_text_delta(
+                    &offer,
+                    "run-rejected",
+                    1,
+                    &update_tx,
+                    &mut delta_buffer,
+                    None,
+                )
+                .await
             });
             result_tx.send(result).unwrap();
         });

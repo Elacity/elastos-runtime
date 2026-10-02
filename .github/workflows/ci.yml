@@ -639,8 +639,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
-      - name: installed Home and local reply journeys
-        run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home
+      - name: three fresh installed Home and local reply journeys
+        run: PLAYWRIGHT_BROWSERS_PATH="${HOME}/.elastos-ci/playwright" scripts/ci-installed-journeys.sh home-repeat
       - name: installed journey summary
         if: always()
         run: scripts/ci-installed-journeys.sh summary
@@ -650,8 +650,8 @@ jobs:
         with:
           name: installed-journeys-macos-14
           path: |
-            ${{ runner.temp }}/source-home-journeys/*.json
-            ${{ runner.temp }}/source-home-journeys/*.png
+            ${{ runner.temp }}/source-home-journeys/**/*.json
+            ${{ runner.temp }}/source-home-journeys/**/*.png
             ${{ runner.temp }}/source-home-journeys/*.log
           retention-days: 7
           if-no-files-found: error

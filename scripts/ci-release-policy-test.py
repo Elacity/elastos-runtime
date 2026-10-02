@@ -8,6 +8,7 @@ import re
 import runpy
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -291,6 +292,13 @@ class InstalledJourneyTests(unittest.TestCase):
         response.__enter__.return_value.status = 200
 
         def node_journey(*args, **kwargs):
+            stages = [("run_started", 2), ("engine_ready", 400), ("generation_started", 500),
+                      ("first_delta", 600), ("stream_completed", 1000),
+                      ("generation_completed", 1020), ("terminal_applied", 1030)]
+            (home / "journey-runtime.private.log").write_text("".join(
+                f"[model-provider] local timing stage={name} elapsed_ms={value}\n" for name, value in stages)
+                + "[model-provider] local acknowledgement kind=delta outcome=applied elapsed_ms=1020 duration_ms=20\n"
+                + "[model-provider] local acknowledgement kind=terminal outcome=applied elapsed_ms=1030 duration_ms=10\n")
             (evidence / "home-journey.json").write_text(json.dumps({"results": {
                 "home_screenshots": "passed", "model_package_admission": "passed",
                 "installed_runtime_reply": "passed"}}))
@@ -323,6 +331,7 @@ class InstalledJourneyTests(unittest.TestCase):
                     self.assertEqual(env["HOME"], str(home))
                     self.assertEqual(Path(env["XDG_DATA_HOME"]) / "elastos", data)
                     self.assertEqual(env["PATH"], "/fixture-tools")
+                    self.assertEqual(env["ELASTOS_MODEL_TIMING_DIAGNOSTICS"], "1")
                 self.stop.assert_called_once_with(child.pid, signal.SIGTERM)
                 child.wait.assert_called_once_with(timeout=15)
                 record = json.loads((evidence / "installed-journeys.json").read_text())
@@ -348,6 +357,63 @@ class InstalledJourneyTests(unittest.TestCase):
                 self.node.assert_not_called()
                 self.stop.assert_not_called()
 
+    def test_fresh_fixture_preserves_artifacts_and_refuses_existing_home(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, _, _ = self.fixture(Path(temp), "macos")
+            (data / "passkeys.json").write_text("private fixture identity")
+            (data / "model-provider").mkdir()
+            (data / "model-provider/journal").write_text("old run")
+            target_home = Path(temp) / "fresh"
+            target = journey["fresh_fixture"](home, data, target_home)
+            self.assertEqual((target / "bin/model-provider").read_bytes(), (data / "bin/model-provider").read_bytes())
+            self.assertEqual((target / "receipts/source-home-installation.json").read_bytes(),
+                             (data / "receipts/source-home-installation.json").read_bytes())
+            self.assertFalse((target / "passkeys.json").exists())
+            self.assertFalse((target / "model-provider").exists())
+            with self.assertRaises(FileExistsError):
+                journey["fresh_fixture"](home, data, target_home)
+            with mock.patch.dict(journey["fresh_fixture"].__globals__, {"disk_observation": lambda _: {
+                    "capacity_bytes": 100, "available_bytes": 14}}):
+                low_disk_home = Path(temp) / "low-disk"
+                with self.assertRaisesRegex(RuntimeError, "15% free disk"):
+                    journey["fresh_fixture"](home, data, low_disk_home)
+                self.assertFalse(low_disk_home.exists())
+
+    def test_three_runs_use_distinct_fresh_state_and_continue_after_one_failed_run(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        for first_fails in (False, True):
+            with self.subTest(first_fails=first_fails), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "macos")
+                calls = []
+                def one_run(run_home, run_data, run_evidence):
+                    calls.append((run_home, run_data, run_evidence))
+                    (run_data / "passkeys.json").write_text("owned run state")
+                    if first_fails and len(calls) == 1:
+                        raise RuntimeError("fixture reply failed")
+                with mock.patch.dict(journey["repeat"].__globals__, {"run": one_run}), \
+                        mock.patch.object(subprocess, "run") as prepare:
+                    if first_fails:
+                        with self.assertRaisesRegex(RuntimeError, "1 installed Mac timing journeys failed"):
+                            journey["repeat"](home, data, evidence, 3)
+                    else:
+                        journey["repeat"](home, data, evidence, 3)
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(len({row[0] for row in calls}), 3)
+                self.assertEqual(len({row[1] for row in calls}), 3)
+                self.assertEqual(len({row[2] for row in calls}), 3)
+                self.assertEqual(prepare.call_count, 3)
+                for index, (_, run_data, _) in enumerate(calls):
+                    self.assertEqual(prepare.call_args_list[index].args[0][2], str(run_data))
+                self.assertFalse((data / "passkeys.json").exists())
+
+    def test_mac_workflow_runs_three_fresh_journeys_and_uploads_their_receipts(self):
+        self.assertIn("scripts/ci-installed-journeys.sh home-repeat", JOBS["source-home-macos"])
+        source = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
+        self.assertIn('"$EVIDENCE" --repeat 3', source)
+        self.assertIn("source-home-journeys/**/*.json", JOBS["source-home-macos"])
+        self.assertIn("source-home-journeys/**/*.png", JOBS["source-home-macos"])
+
 
 class InstalledModelTimingTests(unittest.TestCase):
     def setUp(self):
@@ -369,6 +435,127 @@ class InstalledModelTimingTests(unittest.TestCase):
                 {"stage": "engine_ready", "elapsed_ms": 123},
                 {"stage": "run_timeout", "elapsed_ms": 120000},
             ])
+
+    def timing_fixture(self):
+        stages = [{"stage": name, "elapsed_ms": value} for name, value in [
+            ("run_started", 2), ("engine_ready", 400), ("generation_started", 500),
+            ("first_delta", 600), ("stream_completed", 1000),
+            ("generation_completed", 1020), ("terminal_applied", 1030)]]
+        acknowledgements = [
+            {"kind": "delta", "outcome": "applied", "elapsed_ms": 800, "duration_ms": 50},
+            {"kind": "delta", "outcome": "applied", "elapsed_ms": 1020, "duration_ms": 20},
+            {"kind": "terminal", "outcome": "applied", "elapsed_ms": 1030, "duration_ms": 10}]
+        return stages, acknowledgements
+
+    def test_generation_excludes_only_delta_waits_before_stream_terminal(self):
+        result = self.timing["run_metrics"](*self.timing_fixture())
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["generation_wall_ms"], 500)
+        self.assertEqual(result["generation_excluding_acknowledgement_ms"], 450)
+        self.assertEqual(result["delta_acknowledgement_count"], 2)
+        self.assertEqual(result["delta_acknowledgement_ms"], 70)
+        self.assertEqual(result["delta_acknowledgement_max_ms"], 50)
+        self.assertEqual(result["terminal_acknowledgement_ms"], 10)
+        self.assertEqual(result["acknowledgement_total_ms"], 80)
+
+    def test_incomplete_rejected_duplicate_reversed_and_timeout_timings_are_refused(self):
+        for failure in ("missing", "rejected", "duplicate", "reversed", "timeout", "terminal", "overlap"):
+            stages, ack = self.timing_fixture()
+            if failure == "missing":
+                stages.pop()
+            elif failure == "rejected":
+                ack[0]["outcome"] = "rejected"
+            elif failure == "duplicate":
+                stages.append(stages[0])
+            elif failure == "reversed":
+                stages[3]["elapsed_ms"] = 1100
+            elif failure == "timeout":
+                stages.append({"stage": "run_timeout", "elapsed_ms": 120000})
+            elif failure == "terminal":
+                ack.pop()
+            else:
+                ack[-1]["duration_ms"] = 100
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["run_metrics"](stages, ack)["status"], "incomplete")
+
+    def test_ack_receipt_refuses_private_fields_unknown_outcomes_and_invalid_durations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "private.log"
+            valid = "[model-provider] local acknowledgement kind=delta outcome=applied elapsed_ms=800 duration_ms=50"
+            log.write_text("\n".join([valid, valid + " private=/operator/key",
+                valid.replace("applied", "private_outcome"), valid.replace("duration_ms=50", "duration_ms=801"),
+                valid.replace("elapsed_ms=800", "elapsed_ms=3600001"),
+                valid.replace("duration_ms=50", "duration_ms=-1")]))
+            self.assertEqual(self.timing["acknowledgement_timings"](log), [
+                {"kind": "delta", "outcome": "applied", "elapsed_ms": 800, "duration_ms": 50}])
+
+    def test_spread_requires_three_same_candidate_installed_passes(self):
+        row = {"candidate": "c" * 40, "source_tree": "t" * 40,
+               "installed_runtime_sha256": "a" * 64, "installed_model_provider_sha256": "b" * 64,
+               "results": {"installed_runtime_reply": "passed"},
+               "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
+        rows = [json.loads(json.dumps(row)) for _ in range(3)]
+        rows[1]["model_timing"]["durations"]["engine_ready_ms"] = 300
+        rows[2]["model_timing"]["durations"]["engine_ready_ms"] = 450
+        spread = self.timing["timing_spread"](rows, 3)
+        self.assertEqual(spread["durations_ms"]["engine_ready_ms"],
+                         {"values": [400, 300, 450], "min": 300, "max": 450, "spread": 150})
+        self.assertEqual(self.timing["timing_spread"](rows[:2], 3)["status"], "incomplete")
+        for failure in ("candidate", "reply", "timing"):
+            altered = json.loads(json.dumps(rows))
+            if failure == "candidate":
+                altered[1]["installed_model_provider_sha256"] = "different"
+            elif failure == "reply":
+                altered[1]["results"]["installed_runtime_reply"] = "failed"
+            else:
+                altered[1]["model_timing"]["durations"]["status"] = "incomplete"
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+
+    def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
+        shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
+        source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+        for failure in (None, "missing", "candidate", "reply"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                (data / "bin").mkdir(parents=True)
+                runtime = data / "bin/elastos"
+                runtime.write_bytes(b"installed fixture Runtime")
+                row = {"candidate": "c" * 40, "source_tree": "d" * 40,
+                       "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                       "installed_model_provider_sha256": "b" * 64,
+                       "results": {name: "passed" for name in ["home_screenshots", "model_package_admission", "installed_runtime_reply"]},
+                       "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
+                for index in range(1, 4):
+                    if failure == "missing" and index == 3:
+                        continue
+                    value = json.loads(json.dumps(row))
+                    if failure == "candidate":
+                        value["candidate"] = "a" * 40
+                    if failure == "reply" and index == 1:
+                        value["results"]["installed_runtime_reply"] = "failed"
+                    evidence = root / f"run-{index}"
+                    evidence.mkdir()
+                    (evidence / "installed-journeys.json").write_text(json.dumps(value))
+                with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
+                        mock.patch.object(sys, "platform", "darwin"), \
+                        mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), \
+                        mock.patch.object(subprocess, "check_output", return_value="c" * 40 + "\n"):
+                    if failure:
+                        with self.assertRaises(SystemExit):
+                            exec(compile(source, "installed-summary", "exec"), {})
+                    else:
+                        exec(compile(source, "installed-summary", "exec"), {})
+                result = json.loads((root / "core-summary.json").read_text())
+                self.assertEqual(result["model_timing_spread"]["status"], "incomplete" if failure else "complete")
+                if failure == "reply":
+                    self.assertEqual(result["results"]["installed_runtime_reply"], "failed or not run")
+                summary = (root / "summary.md").read_text()
+                self.assertIn("OS file cache can warm", summary)
+                if not failure:
+                    self.assertIn("acknowledgement_total_ms", summary)
+                    self.assertIn("Delta Applied count", summary)
 
     def test_probe_refuses_wrong_alias_malformed_and_oversize_responses(self):
         alias = "a" * 32

@@ -16,7 +16,7 @@ STAGES = {
     "guard_started", "guard_initialized", "engine_ready", "engine_timeout",
     "engine_failed", "run_started", "input_tokens_started",
     "input_tokens_completed", "generation_started", "first_delta",
-    "generation_completed", "run_timeout", "run_failed",
+    "stream_completed", "generation_completed", "terminal_applied", "run_timeout", "run_failed",
 }
 STAGE_LINE = re.compile(r"\[model-provider\] local timing stage=([a-z_]+) elapsed_ms=([0-9]{1,10})\s*\Z")
 
@@ -31,6 +31,92 @@ def stage_timings(log):
                 if len(result) == 512:
                     break
     return result
+
+
+ACK_LINE = re.compile(r"\[model-provider\] local acknowledgement kind=(delta|terminal) outcome=(applied|rejected|timeout|control_lost) elapsed_ms=([0-9]{1,10}) duration_ms=([0-9]{1,10})\s*\Z")
+
+
+def acknowledgement_timings(log):
+    result = []
+    with log.open(errors="replace") as lines:
+        for line in lines:
+            match = ACK_LINE.fullmatch(line)
+            if match and 0 <= int(match[4]) <= int(match[3]) <= 3_600_000:
+                result.append({"kind": match[1], "outcome": match[2],
+                               "elapsed_ms": int(match[3]), "duration_ms": int(match[4])})
+                if len(result) == 512:
+                    break
+    return result
+
+
+def run_metrics(stages, acknowledgements):
+    """Worker clock starts before engine validation; endpoint clock is separate.
+
+    Generation excludes delta Applied wait, which includes coordinator queue,
+    reconciliation and durable storage. It still includes HTTP/stream handling.
+    Stream completion is provider receipt of the backend terminal marker.
+    """
+    names = ["run_started", "generation_started", "first_delta", "stream_completed",
+             "generation_completed", "terminal_applied"]
+    values = {}
+    for name in names:
+        matches = [row["elapsed_ms"] for row in stages if row["stage"] == name]
+        if len(matches) != 1:
+            return {"status": "incomplete"}
+        values[name] = matches[0]
+    sequence = [values[name] for name in names]
+    delta = [row for row in acknowledgements if row["kind"] == "delta"]
+    terminal = [row for row in acknowledgements if row["kind"] == "terminal"]
+    if (sequence != sorted(sequence) or sequence[-1] > 120_000
+            or any(row["stage"] in {"run_failed", "run_timeout"} for row in stages)
+            or not delta or len(terminal) != 1
+            or any(row["outcome"] != "applied" for row in acknowledgements)
+            or terminal[0]["elapsed_ms"] > values["terminal_applied"]
+            or terminal[0]["elapsed_ms"] - terminal[0]["duration_ms"] < values["generation_completed"]):
+        return {"status": "incomplete"}
+    engine_ready = [row["elapsed_ms"] for row in stages if row["stage"] == "engine_ready"]
+    if len(engine_ready) != 1:
+        return {"status": "incomplete"}
+    generation_wall = values["stream_completed"] - values["generation_started"]
+    during_generation = sum(row["duration_ms"] for row in delta
+                            if row["elapsed_ms"] <= values["stream_completed"])
+    if during_generation > generation_wall:
+        return {"status": "incomplete"}
+    return {"status": "complete", "clock_origin": "local_text_worker_start",
+            "generation_endpoint": "provider_received_stream_terminal_marker",
+            "acknowledgement_owner": "model_provider_coordinator_durable_apply",
+            "engine_clock_origin": "local_llama_endpoint_start",
+            "engine_ready_ms": engine_ready[0],
+            "generation_wall_ms": generation_wall,
+            "generation_excluding_acknowledgement_ms": generation_wall - during_generation,
+            "delta_acknowledgement_count": len(delta),
+            "delta_acknowledgement_ms": sum(row["duration_ms"] for row in delta),
+            "delta_acknowledgement_max_ms": max(row["duration_ms"] for row in delta),
+            "acknowledgement_total_ms": sum(row["duration_ms"] for row in acknowledgements),
+            "terminal_acknowledgement_count": 1,
+            "terminal_acknowledgement_ms": terminal[0]["duration_ms"],
+            "terminal_applied_ms": values["terminal_applied"]}
+
+
+def timing_spread(records, expected_runs):
+    """Only complete, same-candidate installed passes form a timing series."""
+    metrics = [row.get("model_timing", {}).get("durations", {}) for row in records]
+    if (len(records) != expected_runs or not records
+            or len({(row.get("candidate"), row.get("source_tree"),
+                     row.get("installed_runtime_sha256"), row.get("installed_model_provider_sha256"))
+                    for row in records}) != 1
+            or any(row.get("results", {}).get("installed_runtime_reply") != "passed" for row in records)
+            or any(row.get("status") != "complete" for row in metrics)):
+        return {"status": "incomplete", "expected_runs": expected_runs, "recorded_runs": len(records)}
+    fields = ["engine_ready_ms", "generation_wall_ms", "generation_excluding_acknowledgement_ms",
+              "acknowledgement_total_ms", "delta_acknowledgement_ms", "terminal_acknowledgement_ms", "terminal_applied_ms"]
+    spread = {}
+    for field in fields:
+        values = [row[field] for row in metrics]
+        spread[field] = {"values": values, "min": min(values), "max": max(values),
+                         "spread": max(values) - min(values)}
+    return {"status": "complete", "expected_runs": expected_runs, "recorded_runs": len(records),
+            "durations_ms": spread}
 
 
 def owned_engine(rows, gateway_pid, data):
