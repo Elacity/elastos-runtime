@@ -297,7 +297,10 @@ elastos publish-release --version VERSION --channel canary \
 A saved pin change requires `--allow-signer-rotation` and confirmation of the
 complete public DID. Runtime verifies signatures, exact artifact hashes and
 imported CIDs, promotes the public pin and files before the head, and restores
-the prior set if promotion fails. A committed set can be retried to finish its
-ledger and Carrier announcement. The gateway serves each release file only
-when the saved public pin and complete signed set agree; `install.sh` stays
-byte-identical across gateway hosts.
+the prior set if promotion fails. A complete rollback removes the backup links
+and commits the original signed head again, so cached HTTP reads can admit the
+restored set. A restoration, cleanup or final-head failure reports incomplete
+recovery and retains the attempt directory for operator inspection. A committed
+set can be retried to finish its ledger and Carrier announcement. The HTTP
+gateway serves each release file when the saved public pin and complete signed
+set agree; `install.sh` stays byte-identical across gateway hosts.

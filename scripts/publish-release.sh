@@ -1323,6 +1323,9 @@ from pathlib import Path
 root, head, release, install, artifacts, state = (Path(path) for path in sys.argv[1:])
 required = sum(path.stat().st_size for path in artifacts.iterdir())
 required += sum(path.stat().st_size for path in (head, release, install, state))
+previous_head = root / "release-head.json"
+if previous_head.is_file():
+    required += previous_head.stat().st_size
 while not root.exists():
     root = root.parent
 disk = shutil.disk_usage(root)
@@ -1333,6 +1336,7 @@ PY
 
 stage_release_publication() {
     local scratch="$1" head="$2" release="$3" install="$4" artifact_dir="$5" state="$6"
+    local publisher_root="$7"
     local source
     mkdir -p "${scratch}/staged/artifacts" "${scratch}/previous/artifacts" || return
     for source in "${artifact_dir}"/*; do
@@ -1342,6 +1346,9 @@ stage_release_publication() {
     copy_release_publication_file "$release" "${scratch}/staged/release.json" || return
     copy_release_publication_file "$state" "${scratch}/staged/publish-state.json" || return
     copy_release_publication_file "$head" "${scratch}/staged/release-head.json" || return
+    if [[ -f "${publisher_root}/release-head.json" ]]; then
+        copy_release_publication_file "${publisher_root}/release-head.json" "${scratch}/recovered-head.json" || return
+    fi
 }
 
 # The current file keeps a hard link under the attempt's scratch so a failed
@@ -1383,7 +1390,15 @@ restore_release_publication() {
             rm -f "${publisher_root}/${relative}" || status=1
         fi
     done < "${scratch}/promoted"
-    return "$status"
+    [[ "$status" -eq 0 ]] || return "$status"
+    # Remove every backup link before the final head activates the restored set.
+    # A fresh inode makes a refused gateway snapshot run admission again.
+    rm -rf "${scratch}/previous" || return
+    if [[ -f "${scratch}/recovered-head.json" ]]; then
+        cmp -s "${scratch}/recovered-head.json" "${publisher_root}/release-head.json" || return
+        mv -f "${scratch}/recovered-head.json" "${publisher_root}/release-head.json" || return
+    fi
+    return 0
 }
 
 export_release_publication() {
@@ -1399,16 +1414,15 @@ export_release_publication() {
         fi
     done
     scratch=$(mktemp -d "${publisher_root}/.publish-release.XXXXXX") || return
-    if ! stage_release_publication "$scratch" "$head" "$release" "$install" "$artifact_dir" "$state"; then
+    if ! stage_release_publication "$scratch" "$head" "$release" "$install" "$artifact_dir" "$state" "$publisher_root"; then
         rm -rf "$scratch"
         die "Failed to stage the release publication set; the current publication is unchanged"
     fi
     if ! promote_release_publication "$scratch" "$publisher_root"; then
-        if restore_release_publication "$scratch" "$publisher_root"; then
-            rm -rf "$scratch"
+        if restore_release_publication "$scratch" "$publisher_root" && rm -rf "$scratch"; then
             die "Failed to promote the release publication set; the previous publication was restored"
         fi
-        die "Failed to promote the release publication set and could not restore every previous file; inspect ${scratch}"
+        die "Failed to promote the release publication set and could not complete recovery; inspect ${scratch}"
     fi
     rm -rf "$scratch"
 }

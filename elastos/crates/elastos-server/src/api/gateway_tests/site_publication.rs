@@ -738,6 +738,60 @@ async fn test_cached_publication_tamper_refused_until_new_receipt_commit() {
 }
 
 #[tokio::test]
+async fn test_restored_publication_reactivates_after_backup_cleanup_and_head_commit() {
+    use super::super::gateway_site::ReleaseReadGate;
+    let fixture = SignedGatewayPublication::new();
+    let gate = ReleaseReadGate::new();
+    let app = publication_test_router(&fixture, gate.clone());
+    let request = || {
+        Request::builder()
+            .uri("/release-head.json")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let binary = fixture.root.join("artifacts/elastos-aarch64-darwin");
+    let backup = fixture.base.join("rollback-binary");
+    std::fs::hard_link(&binary, &backup).unwrap();
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    std::fs::remove_file(backup).unwrap();
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let head = fixture.root.join("release-head.json");
+    let recovered = fixture.root.join("recovered-head.json");
+    std::fs::write(&recovered, &fixture.head).unwrap();
+    std::fs::rename(recovered, head).unwrap();
+    for (route, expected) in [
+        ("/release-head.json", &fixture.head),
+        ("/install.sh", &fixture.installer),
+        ("/artifacts/elastos-aarch64-darwin", &fixture.binary),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_slice());
+    }
+    assert_eq!(
+        gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test]
 async fn test_receipt_before_head_refusal_recovers_on_final_head_commit() {
     use super::super::gateway_site::ReleaseReadGate;
     let old = SignedGatewayPublication::new();

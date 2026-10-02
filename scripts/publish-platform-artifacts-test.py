@@ -28,6 +28,13 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def publication_stamp(path):
+    """The gateway cache identity excludes access time."""
+    metadata = path.stat()
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+            metadata.st_ctime_ns, metadata.st_mode, metadata.st_nlink)
+
+
 def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
     """Write a tiny three-platform publication set and return the served files it advertises."""
     artifacts = prepared / "artifacts"
@@ -535,6 +542,7 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             prepared = root / "prepared"
             publication_fixture(prepared, salt=b" next")
             required = sum(path.stat().st_size for path in prepared.rglob("*") if path.is_file())
+            required += (publisher / "release-head.json").stat().st_size
             for free in (14_000_000, 15_000_000, 15_000_000 + required - 1):
                 with self.subTest(free=free):
                     result = self.run_publication_export(prepared, publisher, disk_free=free)
@@ -759,6 +767,8 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             "state-short-write": 'cp() { case "$1" in */publish-state.json) printf short > "$2";; *) command cp "$@";; esac; }\n',
             "copy-error": 'cp() { case "$1" in */release.json) return 93;; esac; command cp "$@"; }\n',
             "short-write": 'cp() { case "$1" in */elastos-aarch64-linux) printf short > "$2";; *) command cp "$@";; esac; }\n',
+            "recovery-head-copy-error": 'cp() { case "$2" in */recovered-head.json) return 93;; esac; command cp "$@"; }\n',
+            "recovery-head-short-write": 'cp() { case "$2" in */recovered-head.json) printf short > "$2";; *) command cp "$@";; esac; }\n',
         }
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -790,11 +800,13 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                 "install.sh", "release.json", "publish-state.json", "release-head.json"]
             for boundary in boundaries:
                 with self.subTest(boundary=boundary):
+                    head_before = publication_stamp(publisher / "release-head.json")
                     result = self.run_publication_export(root / "prepared", publisher,
                         'mv() { case "$2" in */staged/%s) return 93;; esac; command mv "$@"; }\n' % boundary)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("the previous publication was restored", result.stderr)
                     self.assertEqual(snapshot(publisher), before)
+                    self.assertNotEqual(publication_stamp(publisher / "release-head.json"), head_before)
             with self.subTest(boundary="state rename reports failure after replacement"):
                 result = self.run_publication_export(root / "prepared", publisher,
                     'mv() { case "$2" in */staged/publish-state.json) command mv "$@"; return 93;; esac; command mv "$@"; }\n')
@@ -808,11 +820,13 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                 self.assertEqual(snapshot(publisher), before)
             with self.subTest(boundary="restore itself fails"):
                 # The attempt keeps its scratch, which still holds the previous bytes it could not put back.
+                head_before = publication_stamp(publisher / "release-head.json")
                 result = self.run_publication_export(root / "prepared", publisher,
                     'mv() { case "$2" in */staged/release.json|*/previous/artifacts/home.tar.gz) return 93;; esac;'
                     ' command mv "$@"; }\n')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("could not restore every previous file", result.stderr)
+                self.assertIn("could not complete recovery", result.stderr)
+                self.assertEqual(publication_stamp(publisher / "release-head.json"), head_before)
                 after = snapshot(publisher)
                 scratch = sorted(key for key in after if key.startswith(".publish-release."))
                 self.assertTrue(scratch)
@@ -845,15 +859,17 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             expected = served_view(publication_fixture(root / "prepared", salt=b" next"))
             for relative in ("artifacts/home.tar.gz", "release.json", "publish-state.json", "release-head.json"):
                 with self.subTest(pending_record=relative):
+                    head_before = publication_stamp(publisher / "release-head.json")
                     result = self.run_publication_export(root / "prepared", publisher, pending % relative)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("the previous publication was restored", result.stderr)
                     self.assertEqual(snapshot(publisher), before)
+                    self.assertNotEqual(publication_stamp(publisher / "release-head.json"), head_before)
             with self.subTest(pending_record="restore of an earlier file fails"):
                 result = self.run_publication_export(root / "prepared", publisher, pending % "release.json" +
                     'mv() { case "$2" in */previous/artifacts/home.tar.gz) return 93;; esac; command mv "$@"; }\n')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("could not restore every previous file", result.stderr)
+                self.assertIn("could not complete recovery", result.stderr)
                 after = snapshot(publisher)
                 scratch = sorted(key for key in after if key.startswith(".publish-release."))
                 kept = [key for key in scratch if key.endswith("/previous/artifacts/home.tar.gz")]
@@ -861,6 +877,89 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                 self.assertEqual({key: value for key, value in after.items() if key not in scratch},
                                  {**before, "artifacts/home.tar.gz": expected["artifacts/home.tar.gz"]})
                 self.assertEqual(after["release-head.json"], before["release-head.json"])
+
+    def test_rollback_recommits_prior_head_after_single_link_restoration(self):
+        # The first backup link already makes the admitted artifact unsafe,
+        # while the receipt/head cache key still belongs to the prior set.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, prepared, publisher = (root / name for name in ("previous", "prepared", "publisher"))
+            files = publication_fixture(previous, salt=b" previous")
+            publication_fixture(prepared, salt=b" next")
+            self.assertEqual(self.run_publication_export(previous, publisher).returncode, 0)
+            before = snapshot(publisher)
+            head = publisher / "release-head.json"
+            receipt = publisher / "publish-state.json"
+            receipt_before = publication_stamp(receipt)
+            first = sorted(name for name in files if name.startswith("artifacts/"))[0]
+            events = root / "events"
+            stub = '''
+export TEST_PREVIOUS="%s" TEST_PUBLISHER="%s" TEST_EVENTS="%s"
+mv() {
+    case "$2" in
+        */staged/%s)
+            command python3 -c 'import os; from pathlib import Path
+root = Path(os.environ["TEST_PUBLISHER"])
+assert (root / "%s").stat().st_nlink == 2
+assert (root / "release-head.json").stat().st_nlink == 1
+assert (root / "publish-state.json").stat().st_nlink == 1
+with open(os.environ["TEST_EVENTS"], "a") as log: log.write("single-link refusal\\n")' || return
+            return 93;;
+        */recovered-head.json)
+            command python3 -c 'import os; from pathlib import Path
+root, previous = (Path(os.environ[name]) for name in ("TEST_PUBLISHER", "TEST_PREVIOUS"))
+for path in previous.rglob("*"):
+    if path.is_file():
+        restored = root / path.relative_to(previous)
+        assert restored.read_bytes() == path.read_bytes()
+        assert restored.stat().st_nlink == 1
+assert not any(root.glob(".publish-release.*/previous"))
+with open(os.environ["TEST_EVENTS"], "a") as log: log.write("complete restore before head commit\\n")' || return;;
+    esac
+    command mv "$@"
+}
+''' % (previous, publisher, events, first, first)
+            with head.open("rb") as held_head:
+                old_inode = os.fstat(held_head.fileno()).st_ino
+                result = self.run_publication_export(prepared, publisher, stub)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("the previous publication was restored", result.stderr)
+                self.assertNotEqual(head.stat().st_ino, old_inode)
+            self.assertEqual(snapshot(publisher), before)
+            self.assertEqual(publication_stamp(receipt), receipt_before)
+            self.assertEqual(events.read_text().splitlines(),
+                             ["single-link refusal", "complete restore before head commit"])
+
+    def test_rollback_recovery_failures_keep_evidence_and_report_incomplete(self):
+        failures = {
+            "backup-link-cleanup": 'rm() { case "$2" in */previous) return 93;; esac; command rm "$@"; }\n',
+            "head-byte-comparison": 'cmp() { case "$2" in */recovered-head.json) return 93;; esac; command cmp "$@"; }\n',
+            "head-reactivation": 'mv() { case "$2" in */recovered-head.json) return 93;; esac; command mv "$@"; }\n',
+            "head-reactivation-reports-failure": 'mv() { case "$2" in */recovered-head.json) command mv "$@"; return 93;; esac; command mv "$@"; }\n',
+            "final-scratch-cleanup": 'rm() { case "$2" in */previous) command rm "$@";; */.publish-release.*) return 93;; *) command rm "$@";; esac; }\n',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, prepared = root / "previous", root / "prepared"
+            files = publication_fixture(previous, salt=b" previous")
+            publication_fixture(prepared, salt=b" next")
+            first = sorted(name for name in files if name.startswith("artifacts/"))[0]
+            for name, failure in failures.items():
+                with self.subTest(failure=name):
+                    publisher = root / name
+                    self.assertEqual(self.run_publication_export(previous, publisher).returncode, 0)
+                    old_head = publication_stamp(publisher / "release-head.json")
+                    # Failure before the first rename also covers an unchanged
+                    # live inode which still shares its pending backup link.
+                    fail_promotion = 'promote_release_publication() { ln "$2/%s" "$1/previous/%s"; printf "%%s\\n" "%s" > "$1/promoted"; return 93; }\n' % (first, first, first)
+                    result = self.run_publication_export(prepared, publisher, failure + fail_promotion)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("could not complete recovery", result.stderr)
+                    self.assertTrue(list(publisher.glob(".publish-release.*")))
+                    self.assertEqual({key: value for key, value in snapshot(publisher).items()
+                                      if not key.startswith(".publish-release.")}, served_view(files))
+                    if name in ("backup-link-cleanup", "head-byte-comparison", "head-reactivation"):
+                        self.assertEqual(publication_stamp(publisher / "release-head.json"), old_head)
 
     def test_killed_promotion_leaves_old_head_over_mixed_artifacts_until_retry(self):
         # A shell error rolls back; a killed process does not. Per-file renames are
