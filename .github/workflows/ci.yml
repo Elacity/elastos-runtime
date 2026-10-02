@@ -94,7 +94,6 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       BUILD_CONTAINER_IMAGE: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
       ENGINE_BUILD_TOOLS: build-essential cmake git ca-certificates curl binutils file python3
-      RECIPE_COMMIT: ${{ github.sha }}
     steps:
       - name: install engine build tools
         run: |
@@ -123,7 +122,9 @@ jobs:
       - name: build and validate pinned ARM64 engine
         id: engine-build
         if: steps.engine-cache.outputs.cache-hit != 'true'
-        run: bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
+        run: |
+          export RECIPE_COMMIT="$(git rev-parse HEAD)"
+          bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
       - name: verify accepted ARM64 engine archive
         run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: save pinned ARM64 engine
