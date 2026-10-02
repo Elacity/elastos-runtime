@@ -17,6 +17,14 @@ device or profile key requires a new identity. Source checks and installed
 product proof are separate gates. The public demo remains paused until its
 approved deployment passes the reopening gate.
 
+### Changed
+
+Execution descriptors use `web-projection` for browser code and `native-provider`
+for native providers. Legacy third-party manifests that combine `type: wasm`
+with `execution.mode: web-projection` fail validation and need corrected
+metadata. Third-party executable capsules remain unavailable until their
+publisher, package approval and revocation gates are accepted.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for
