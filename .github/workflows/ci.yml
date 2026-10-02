@@ -215,14 +215,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      # Saved straight after install: the smokes may fail, and actions/cache
-      # only saves when the whole job succeeds.
-      - name: restore Playwright browsers
-        id: playwright-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('elastos/tools/browser-playwright-engine/package-lock.json') }}
       - name: install browser layout smoke tools
         timeout-minutes: 10
         run: |
@@ -230,12 +222,6 @@ jobs:
           sudo apt-get install -y just
           npm ci --prefix elastos/tools/browser-playwright-engine
           npx --prefix elastos/tools/browser-playwright-engine playwright install --with-deps chromium
-      - name: save Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
