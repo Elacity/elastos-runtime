@@ -46,15 +46,16 @@ and new {version,source:{commit,tree}}, and files mapping every payload-relative
 path (including the `payload/` prefix) to {bytes,sha256,mode,cid?}. The inventory
 is closed: each payload file occurs once and symlinks/hard links are refused.
 
-`publications` has old, new, wrong-signer-head, wrong-signer-release and
-tampered-binary. Each maps head, release, receipt, binary, components and
+`proof_scope` defaults to production-positive: `publications` has old/new and
+both selectors have empty refusals. The independently pinned operator package
+owns real M1/M2 acceptance. CI generates a separate `ci-refusals` package with
+old and wrong-signer-head, wrong-signer-release, tampered-binary, wrong-platform
+and wrong-version. Each maps head, release, receipt, binary, components and
 catalogue to inventoried paths. Receipt bytes contain last_head_cid and
 last_release_cid. Metadata CIDs and signed envelope digests bind exact bytes.
-The negative envelopes are valid signatures: their selected boundary alone
-differs (head signer, release signer, or signed binary hash).
-`selectors` is exactly {"m1-install":{"positive":"old","refusals":[
-"wrong-signer-head","wrong-signer-release","tampered-binary"]},
-"m2-discovery":{"positive":"new","refusals":[the same three names]}}.
+CI negative envelopes have valid signatures from fresh disposable keys. Their
+advertised next version is a refusal input; it supplies no positive update proof.
+`selectors` uses m1-install/old and m2-discovery/new with the same refusal list.
 
 `holder.files` maps Home-relative destinations to inventoried public payload
 paths, including .local/bin/elastos, native components.json, bin/ipfs-provider,
@@ -68,8 +69,11 @@ approved publication to the existing Publisher paths while it is stopped.
 files. `preserve` has nonempty config, data and support lists of data-relative
 paths. Additional named groups are permitted. CI also preserves its generated
 identity. Package mappings refuse private identity keys.
-The operator owns release signing and publication; CI creates disposable
-Carrier identities only. Frozen installer defaults pin signer_did and leave
+The operator owns real release signing and publication. Native Mac CI creates
+and removes refusal signing keys through generate-refusals, using Runtime's
+sign-payload command and offline Kubo content from the existing Mac build.
+Each scope has its own frozen installer, holder, consumers and receipt.
+Frozen installer defaults pin signer_did and leave
 HEAD_CID blank. Atomic runtime ticket/node overrides select the local holder.
 Run performs both selectors, retains private split output and data, and checks
 all owned process groups and verified holder/consumer executable roots during
@@ -514,8 +518,8 @@ def run(config, output):
 
 
 CLI_MODE = "cli-install-update"
-CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary")
-CLI_PHASES = ("old", "new", *CLI_REFUSALS)
+CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", "wrong-platform", "wrong-version")
+CLI_PHASES = ("old", *CLI_REFUSALS)
 CLI_DATA = "Library/Application Support/elastos"
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
 
@@ -639,6 +643,10 @@ def cli_admit(config):
     need(manifest["schema"] == config["schema"] and manifest["mode"] == CLI_MODE
          and manifest["reference"] == reference, "fixture manifest identity differs")
     need(isinstance(manifest["approval"], str) and manifest["approval"].strip(), "fixture approval required")
+    scope = manifest.get("proof_scope", "production-positive")
+    need(scope in ("production-positive", "ci-refusals") and
+         scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
+    refusals = CLI_REFUSALS if scope == "ci-refusals" else ()
     need(manifest["proof_kind"] in ("real-runtime", "harness-self-test"), "unknown proof kind")
     need(os.environ.get("ELASTOS_CI_REQUIRE_REAL_RUNTIME") != "1" or manifest["proof_kind"] == "real-runtime", "hosted acceptance requires real-runtime fixture")
     need(sys.platform == "darwin" or manifest["proof_kind"] == "harness-self-test", "CLI installed proof requires native Mac")
@@ -660,8 +668,8 @@ def cli_admit(config):
     selectors = manifest["selectors"]
     need(set(selectors) == {"m1-install", "m2-discovery"}, "fixed CLI selectors required")
     for selector, positive in (("m1-install", "old"), ("m2-discovery", "new")):
-        need(selectors[selector] == {"positive": positive, "refusals": list(CLI_REFUSALS)}, "selector phase mapping differs")
-    need(set(manifest["publications"]) == set(CLI_PHASES), "complete positive/refusal publication set required")
+        need(selectors[selector] == {"positive": positive, "refusals": list(refusals)}, "selector phase mapping differs")
+    need(set(manifest["publications"]) == (set(CLI_PHASES) if refusals else {"old", "new"}), "complete scoped publication set required")
     for phase, publication in manifest["publications"].items():
         need(set(publication) == {"head", "release", "receipt", "binary", "components", "catalogue"}, "publication snapshot incomplete")
         need(all(relative in manifest["files"] for relative in publication.values()), "publication bytes missing from inventory")
@@ -681,7 +689,13 @@ def cli_admit(config):
         need(head["payload"]["latest_release_cid"] == release_binding["cid"]
              and head["payload"]["release_sha256"] == release_binding["sha256"], "head release binding differs")
         for key in ("binary", "components"):
-            declared = release["payload"]["platforms"][manifest["platform"]][key]
+            platforms = release["payload"]["platforms"]
+            selected = manifest["platform"]
+            if phase == "wrong-platform":
+                need(selected not in platforms and len(platforms) == 1, "wrong-platform boundary differs")
+                selected = next(iter(platforms))
+                need(selected in ("aarch64-darwin", "x86_64-darwin"), "wrong-platform fixture is not a Mac release")
+            declared = platforms[selected][key]
             actual = manifest["files"][publication[key]]
             need(declared["cid"] == actual["cid"] and declared["size"] == actual["bytes"], "release artifact CID/size differs")
             need((declared["sha256"] != actual["sha256"]) == (phase == "tampered-binary" and key == "binary"), "release artifact hash phase differs")
@@ -692,8 +706,13 @@ def cli_admit(config):
              and catalog_signer in components["model_catalog"]["publisher_dids"], "catalogue trust binding differs")
         cli_metadata_cid(catalogue["cid"], cli_path(root, publication["catalogue"]).read_bytes())
         cli_signature(installer, cli_path(root, publication["catalogue"]), "elastos.model.catalog.v1", catalog_signer, env)
-    old, new = (manifest["publications"][phase] for phase in ("old", "new"))
-    need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
+    old = manifest["publications"]["old"]
+    new = manifest["publications"].get("new", old)
+    if not refusals:
+        need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
+    else:
+        wrong_version = manifest["publications"]["wrong-version"]
+        need(manifest["files"][wrong_version["binary"]]["sha256"] == manifest["files"][old["binary"]]["sha256"], "wrong-version must retain the baseline Runtime bytes")
     for key in ("components", "catalogue"):
         need(all(manifest["files"][publication[key]]["sha256"] == manifest["files"][new[key]]["sha256"]
                  for publication in manifest["publications"].values()), "qualified support bytes changed")
@@ -766,9 +785,163 @@ def cli_safe_error(error):
 def cli_inspect(config):
     manifest = cli_admit(config)
     return {"mode": CLI_MODE, "status": "admitted", "proof_kind": manifest["proof_kind"],
+            "proof_scope": manifest.get("proof_scope", "production-positive"),
             "manifest_sha256": config["immutable"]["sha256"], "source": manifest["source"],
             "reference": manifest["reference"], "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
             "selectors": manifest["selectors"], "installed_proof": "pending real command results"}
+
+
+def cli_generate_refusals(root, runtime, support_home):
+    """Generate CI-only signed negatives with the actual Runtime signing command."""
+    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+         and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
+    need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
+         and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
+    for path in (runtime, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
+        need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
+    disk = shutil.disk_usage(root.parent)
+    # Two Runtime copies plus their CID blocks, native support, package copies
+    # and seven isolated installed Homes fit within this conservative bound.
+    growth = 12 * (2 * runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
+                                                   for name in ("ipfs-provider", "kubo")))
+    need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
+    root.mkdir(mode=0o700)
+    scratch = root / "generator"
+    scratch.mkdir(mode=0o700)
+    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+              for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
+    manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": CLI_MODE,
+                "proof_scope": "ci-refusals", "proof_kind": "real-runtime",
+                "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5958719048",
+                "reference": "ci-refusals:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
+                "source": source, "channel": "canary", "platform": "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin",
+                "files": {}, "publications": {}, "holder": {"files": {}, "content": {}},
+                "selectors": {name: {"positive": positive, "refusals": list(CLI_REFUSALS)}
+                              for name, positive in (("m1-install", "old"), ("m2-discovery", "new"))}}
+
+    def add(name, content, mode=0o600):
+        relative = "payload/" + name
+        path = cli_path(root, relative)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if isinstance(content, Path):
+            shutil.copyfile(content, path)
+        elif isinstance(content, dict):
+            write(path, content)
+        else:
+            path.write_bytes(content)
+        path.chmod(mode)
+        manifest["files"][relative] = {"bytes": path.stat().st_size, "sha256": digest(path), "mode": mode}
+        return relative
+
+    runtime_relative = add("elastos", runtime, 0o755)
+    runtime_copy = root / runtime_relative
+    kubo_relative = add("kubo", support_home / "bin/kubo", 0o755)
+    provider_relative = add("ipfs-provider", support_home / "bin/ipfs-provider", 0o755)
+    env = cli_environment(scratch)
+    env["IPFS_PATH"] = str(scratch / "ipfs-repo")
+
+    def execute(argv, payload=None):
+        proc = subprocess.run(argv, input=payload, capture_output=True, env=env, timeout=120, check=False)
+        need(proc.returncode == 0, "disposable fixture command failed")
+        return proc.stdout
+
+    def sign(payload, domain, key):
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        reply = json.loads(execute([str(runtime_copy), "sign-payload", "--domain", domain, "--key", str(key)], canonical))
+        return {"payload": payload, "signature": reply["signature"], "signer_did": reply["signer_did"]}
+
+    def content(relative, raw=False):
+        cid = execute([str(root / kubo_relative), "add", "--offline", "-Q", "--cid-version=1",
+                       "--raw-leaves=" + str(raw).lower(), str(root / relative)]).decode().strip()
+        manifest["files"][relative]["cid"] = cid
+        manifest["holder"]["content"][cid] = relative
+        return cid
+
+    try:
+        keys = [scratch / (name + ".key") for name in ("approved", "other")]
+        for key in keys:
+            key.write_text(os.urandom(32).hex())
+            key.chmod(0o600)
+        execute([str(root / kubo_relative), "init", "--profile=test"])
+        catalogue_envelope = sign({"schema": "elastos.model.catalog/v1", "entries": []}, "elastos.model.catalog.v1", keys[0])
+        manifest["signer_did"] = catalogue_envelope["signer_did"]
+        catalogue = add("catalogue.json", catalogue_envelope)
+        content(catalogue, raw=True)
+        component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
+        qualified = cli_json(support_home / "components.json")
+        external = {}
+        for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
+            descriptor = qualified["external"][name]
+            if name == "ipfs-provider":
+                need(descriptor["platforms"][component_platform]["checksum"] == "sha256:" + manifest["files"][relative]["sha256"], "built support checksum differs")
+            # Source-home verifies Kubo's archive pin. The disposable package pins
+            # the installed executable bytes and exposes only local Carrier content.
+            external[name] = {"install_path": "bin/" + name, "platforms": {component_platform: {
+                "checksum": "sha256:" + manifest["files"][relative]["sha256"],
+                "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name}}}
+            if "provider_runtime" in descriptor:
+                external[name]["provider_runtime"] = descriptor["provider_runtime"]
+        components = add("components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
+                         "profiles": {}, "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
+        content(components)
+        content(runtime_relative)
+        version_output = execute([str(runtime_copy), "--version"]).decode()
+        match = re.fullmatch(r"elastos (\d+)\.(\d+)\.(\d+)([^\s]*)\n", version_output)
+        need(match is not None, "built Runtime exact version unavailable")
+        old_version = version_output.removeprefix("elastos ").strip()
+        new_version = ".".join([match[1], match[2], str(int(match[3]) + 1)]) + "-ci-refusal"
+        manifest["old"], manifest["new"] = ({"version": version, "source": source} for version in (old_version, new_version))
+        tampered = add("tampered-elastos", runtime_copy, 0o755)
+        with (root / tampered).open("ab") as stream:
+            stream.write(b"disposable refusal bytes")
+        manifest["files"][tampered].update(bytes=(root / tampered).stat().st_size, sha256=digest(root / tampered))
+        content(tampered)
+
+        def binding(relative):
+            item = manifest["files"][relative]
+            return {"cid": item["cid"], "sha256": item["sha256"], "size": item["bytes"]}
+
+        for phase in CLI_PHASES:
+            binary_relative = tampered if phase == "tampered-binary" else runtime_relative
+            binary_binding = binding(binary_relative)
+            if phase == "tampered-binary":
+                binary_binding["sha256"] = manifest["files"][runtime_relative]["sha256"]
+            release_platform = manifest["platform"]
+            if phase == "wrong-platform":
+                release_platform = "x86_64-darwin" if release_platform == "aarch64-darwin" else "aarch64-darwin"
+            version = old_version if phase == "old" else new_version
+            release_payload = {"schema": "elastos.release/v1", "channel": "canary", "version": version,
+                               "platforms": {release_platform: {"binary": binary_binding, "components": binding(components)}}}
+            release = add(phase + "/release.json", sign(release_payload, "elastos.release.v1", keys[phase == "wrong-signer-release"]))
+            content(release)
+            head_payload = {"schema": "elastos.release.head/v1", "channel": "canary", "version": version,
+                            "latest_release_cid": manifest["files"][release]["cid"], "release_sha256": digest(root / release), "updated_at": 1}
+            head = add(phase + "/head.json", sign(head_payload, "elastos.release.head.v1", keys[phase == "wrong-signer-head"]))
+            content(head)
+            receipt = add(phase + "/receipt.json", {"last_head_cid": manifest["files"][head]["cid"], "last_release_cid": manifest["files"][release]["cid"]})
+            manifest["publications"][phase] = {"head": head, "release": release, "receipt": receipt, "binary": binary_relative, "components": components, "catalogue": catalogue}
+        installer = Path(__file__).with_name("install.sh").read_text()
+        need(installer.count('__MAINTAINER_DID__') == 1 and installer.count('__HEAD_CID__') == 1, "installer stamp placeholders differ")
+        manifest["installer"] = add("install.sh", installer.replace('__MAINTAINER_DID__', manifest["signer_did"]).replace('__HEAD_CID__', '').encode())
+        manifest["holder"]["files"] = {".local/bin/elastos": runtime_relative, CLI_DATA + "/components.json": components,
+                                         CLI_DATA + "/bin/ipfs-provider": provider_relative, CLI_DATA + "/bin/kubo": kubo_relative}
+        for folder in ("blocks", "datastore"):
+            for path in sorted((scratch / "ipfs-repo" / folder).rglob("*")):
+                if path.is_file():
+                    relative = str(path.relative_to(scratch / "ipfs-repo"))
+                    manifest["holder"]["files"][CLI_DATA + "/ipfs-repo/" + relative] = add("repository/" + relative, path)
+        manifest["consumer"] = {"files": {"config/fixture.json": add("consumer/config.json", {"owner": "isolated CI refusal test"}),
+                                           "state/sentinel": add("consumer/state", b"preserve user data"),
+                                           "capsules/sentinel/data": add("consumer/support", b"preserve support")}}
+        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules"]}
+        write(root / "manifest.json", manifest)
+        config = {"schema": manifest["schema"], "mode": CLI_MODE, "root": str(root),
+                  "immutable": {"reference": manifest["reference"], "manifest": "manifest.json", "sha256": digest(root / "manifest.json")}}
+        write(root / "fixture.json", config)
+        return {"status": "generated", "proof_scope": "ci-refusals", "manifest_sha256": config["immutable"]["sha256"],
+                "source": source, "signer_did": manifest["signer_did"], "keys_removed": True}
+    finally:
+        shutil.rmtree(scratch)
 
 
 def cli_census():
@@ -965,11 +1138,14 @@ def cli_state(manifest, home_path):
 
 
 def cli_refusal(case, command, stdout, stderr, unchanged):
-    boundary = "SHA-256" if case == "tampered-binary" else "sign"
-    text = stdout + "\n" + stderr
+    boundary = {"tampered-binary": "SHA-256", "wrong-platform": "platform", "wrong-version": "version"}.get(case, "sign")
     # An unavailable holder, invalid CID or an unrelated failure is not a refusal proof.
     if case == "tampered-binary":
         evidence = "SHA-256 mismatch" in stderr and "Downloading binary" in stdout and "Downloading components" not in stdout and "Binary verified" not in stdout
+    elif case == "wrong-platform":
+        evidence = ("No release available for platform:" in stderr or "No binary CID for platform" in stderr) and "Downloading binary" not in stdout
+    elif case == "wrong-version":
+        evidence = ("Downloaded binary version mismatch" in stderr or "Installed binary version mismatch" in stderr) and "Downloading binary" in stdout
     else:
         evidence = ("Signer DID mismatch" in stderr or "Envelope signer differs from the pinned maintainer DID" in stderr)
         release_reached = "Fetching release:" in stdout or "Verifying release signature" in stdout
@@ -1011,6 +1187,7 @@ def cli_run(config, output):
     processes = CliProcesses(output)
     result = {"schema": "elastos.update-hop.result/v1", "mode": CLI_MODE,
               "proof_kind": manifest["proof_kind"], "approval": manifest["approval"],
+              "proof_scope": manifest.get("proof_scope", "production-positive"),
               "signer_did": manifest["signer_did"], "channel": manifest["channel"],
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
@@ -1139,7 +1316,7 @@ def cli_run(config, output):
         consumer = output / "homes/cli"
         consumer.mkdir(mode=0o700)
         main_bin = str(consumer / ".local/bin/elastos")
-        processes.roots[main_bin] = {manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("old", "new")}
+        processes.roots[main_bin] = {manifest["files"][publication["binary"]]["sha256"] for publication in manifest["publications"].values()}
         result["paths"]["m1-install"] = {"status": "failed", "checks": {}}
         reply = install(consumer, "m1-install")
         need(cli_success(processes, "m1-install", reply), "fresh installer failed")
@@ -1147,24 +1324,26 @@ def cli_run(config, output):
         result["paths"]["m1-install"]["checks"]["positive"] = {"status": "passed", **reply}
         prepare(consumer, "main")
         before = cli_state(manifest, consumer)
-        phase("new")
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
-        reply = command(consumer, ["update", "--check"], "m2-check")
-        need(cli_success(processes, "m2-check", reply) and "Discovery: Carrier" in processes.text("m2-check")
-             and cli_state(manifest, consumer) == before, "plain Carrier check failed or changed files")
-        result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
-        reply = command(consumer, ["update", "--yes"], "m2-apply")
-        need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
-        after = verify(consumer, "new", "m2-version")
-        expected_sources = json.loads(json.dumps(before["sources"]))
-        expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
-        need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
-        result["paths"]["m2-discovery"]["checks"]["apply"] = {"status": "passed", **reply}
-        reply = command(consumer, ["update", "--yes"], "m2-repeat")
-        need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
-             and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
-        result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
-        for case in CLI_REFUSALS:
+        if result["proof_scope"] == "production-positive":
+            phase("new")
+            result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
+            reply = command(consumer, ["update", "--check"], "m2-check")
+            need(cli_success(processes, "m2-check", reply) and "Discovery: Carrier" in processes.text("m2-check")
+                 and cli_state(manifest, consumer) == before, "plain Carrier check failed or changed files")
+            result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
+            reply = command(consumer, ["update", "--yes"], "m2-apply")
+            need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
+            after = verify(consumer, "new", "m2-version")
+            expected_sources = json.loads(json.dumps(before["sources"]))
+            expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
+            need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
+            result["paths"]["m2-discovery"]["checks"]["apply"] = {"status": "passed", **reply}
+            reply = command(consumer, ["update", "--yes"], "m2-repeat")
+            need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
+                 and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
+            result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
+        for case in manifest["selectors"]["m1-install"]["refusals"]:
             phase(case)
             fresh = output / ("homes/m1-" + case)
             fresh.mkdir(mode=0o700)
@@ -1183,6 +1362,12 @@ def cli_run(config, output):
             prepare(target, "seed-" + case)
             original = cli_state(manifest, target)
             phase(case)
+            if case.startswith("wrong-signer-"):
+                check_label = "m2-check-" + case
+                check_reply = command(target, ["update", "--check"], check_label)
+                check_refusal = cli_refusal(case, check_reply, processes.text(check_label), processes.text(check_label, "stderr"), cli_state(manifest, target) == original)
+                result["paths"]["m2-discovery"]["checks"][case + "-check"] = check_refusal
+                need(check_refusal["status"] == "passed", "Carrier check refusal boundary differs")
             label = "m2-" + case
             reply = command(target, ["update", "--yes"], label)
             refusal = cli_refusal(case, reply, processes.text(label), processes.text(label, "stderr"), cli_state(manifest, target) == original)
@@ -1222,14 +1407,21 @@ def cli_run(config, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("operation", choices=("inspect", "run", "compare"))
+    parser.add_argument("operation", choices=("inspect", "run", "compare", "generate-refusals"))
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, help="physical downloaded CLI fixture root")
+    parser.add_argument("--runtime", type=Path, help="built Runtime for CI refusal generation")
+    parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("terminated")))
     try:
+        if args.operation == "generate-refusals":
+            need(args.runtime is not None and args.support_home is not None and args.output is None and args.root is None,
+                 "refusal generation requires Runtime and support-home inputs")
+            print(json.dumps(cli_generate_refusals(args.input, args.runtime, args.support_home)))
+            return 0
         value = read(args.input)
         if args.root is not None:
             need(value.get("mode") == CLI_MODE, "--root applies only to CLI fixtures")

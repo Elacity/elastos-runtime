@@ -265,6 +265,35 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(field(upload, "path"), "${{ env.FIXTURE_ROOT }}/package/results/result.json")
         self.assertEqual(field(upload, "include-hidden-files"), "true")
         self.assertNotIn("--gateway", job)
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: production-positive", job)
+
+    def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
+        mac_steps = steps("source-home-macos")
+        names = [step.splitlines()[0] for step in mac_steps]
+        generate = names.index("name: generate disposable signed refusal fixture")
+        prove = names.index("name: prove installer and Carrier update refusals")
+        self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
+        self.assertEqual(prove, generate + 1)
+        self.assertNotIn("if:", mac_steps[generate])
+        self.assertNotIn("if:", mac_steps[prove])
+        self.assertIn("generate-refusals", mac_steps[generate])
+        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[generate])
+        self.assertIn('--support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos"', mac_steps[generate])
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-refusals", mac_steps[prove])
+        self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', mac_steps[prove])
+        self.assertIn('python3 scripts/update-hop-compare.py run "$REFUSAL_ROOT/package/fixture.json"', mac_steps[prove])
+        for step in mac_steps[generate:prove + 1]:
+            self.assertNotIn("FIXTURE_ARTIFACT_ID", step)
+            self.assertNotIn("GH_TOKEN", step)
+            self.assertNotIn("inputs.", step)
+        upload = mac_steps[names.index("name: retain the safe refusal receipt")]
+        self.assertEqual(field(upload, "path"), "${{ env.REFUSAL_ROOT }}/package/results/result.json")
+        self.assertEqual(field(upload, "name"), "retain the safe refusal receipt")
+        self.assertIn("name: macos-cli-update-refusal-receipt", upload)
+        self.assertIn("if: always()", upload)
+        cleanup = mac_steps[names.index("name: remove stopped refusal fixture files")]
+        self.assertIn("get('cleanup', {}).get('passed')", cleanup)
+        self.assertIn("shutil.rmtree(root)", cleanup)
 
     def test_cli_fixture_archive_refuses_escape_symlink_and_duplicate_entries(self):
         fetch, = [step for step in steps("macos-cli-update-fixture")

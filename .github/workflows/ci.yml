@@ -590,6 +590,50 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: generate disposable signed refusal fixture
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          REFUSAL_ROOT="$HOME/.local/share/elastos-ci-update-refusals"
+          test ! -e "$REFUSAL_ROOT"
+          mkdir -p "$REFUSAL_ROOT"
+          echo "REFUSAL_ROOT=$REFUSAL_ROOT" >> "$GITHUB_ENV"
+          python3 scripts/update-hop-compare.py generate-refusals "$REFUSAL_ROOT/package" \
+            --runtime "$PWD/elastos/target/release/elastos" \
+            --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
+            > "$REFUSAL_ROOT/generation.json"
+      - name: prove installer and Carrier update refusals
+        timeout-minutes: 20
+        env:
+          ELASTOS_CI_FIXTURE_SCOPE: ci-refusals
+          ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
+        run: |
+          set -euo pipefail
+          export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$REFUSAL_ROOT/generation.json")"
+          python3 scripts/update-hop-compare.py inspect "$REFUSAL_ROOT/package/fixture.json"
+          python3 scripts/update-hop-compare.py run "$REFUSAL_ROOT/package/fixture.json" "$REFUSAL_ROOT/package/results"
+      - name: retain the safe refusal receipt
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-cli-update-refusal-receipt
+          path: ${{ env.REFUSAL_ROOT }}/package/results/result.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: remove stopped refusal fixture files
+        if: always() && env.REFUSAL_ROOT != ''
+        run: |
+          python3 -I - "$REFUSAL_ROOT" <<'PY'
+          import json, pathlib, shutil, sys
+          root = pathlib.Path(sys.argv[1])
+          result = root / 'package/results/result.json'
+          if result.exists() and not json.loads(result.read_text()).get('cleanup', {}).get('passed'):
+              raise SystemExit('refusal cleanup was incomplete; disposable runner retains files until teardown')
+          if not result.exists() and (root / 'package/results').exists():
+              raise SystemExit('refusal cleanup receipt is missing; disposable runner retains files until teardown')
+          shutil.rmtree(root)
+          PY
       # Packages are uploaded only for tags, main and dispatch runs; PR runs
       # already proved the release build through setup-source-home.
       - name: build and package release binaries
@@ -628,6 +672,7 @@ jobs:
       FIXTURE_ARTIFACT_ID: ${{ inputs.cli_update_fixture_artifact_id }}
       ELASTOS_CI_FIXTURE_MANIFEST_SHA256: ${{ inputs.cli_update_fixture_manifest_sha256 }}
       ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
+      ELASTOS_CI_FIXTURE_SCOPE: production-positive
       FIXTURE_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v5

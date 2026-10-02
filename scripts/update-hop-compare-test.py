@@ -11,12 +11,16 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("observer", Path(__file__).with_name("update-hop-compare.py"))
 observer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(observer)
+signing_spec = importlib.util.spec_from_file_location("installer_fixture", Path(__file__).with_name("install-bootstrap-test.py"))
+signing_fixture = importlib.util.module_from_spec(signing_spec)
+signing_spec.loader.exec_module(signing_fixture)
 
 
 HOLDER_NODE = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
@@ -232,7 +236,7 @@ class CliFixtureTests(unittest.TestCase):
         self.root = Path(self.directory.name).resolve()
         self.manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": observer.CLI_MODE,
                          "reference": "github-actions:test/repo:123", "approval": "isolated observer self-test",
-                         "proof_kind": "harness-self-test", "source": {"commit": "a" * 40, "tree": "b" * 40},
+                         "proof_scope": "ci-refusals", "proof_kind": "harness-self-test", "source": {"commit": "a" * 40, "tree": "b" * 40},
                          "old": {"version": "0.7.1-rc.1", "source": {"commit": "c" * 40, "tree": "d" * 40}},
                          "new": {"version": "0.7.1-rc.2", "source": {"commit": "e" * 40, "tree": "f" * 40}},
                          "channel": "canary", "signer_did": "did:key:zfixture", "platform": "aarch64-darwin",
@@ -261,7 +265,7 @@ class CliFixtureTests(unittest.TestCase):
         old_bin, new_bin, bad_bin = (add(name, value, 0o755) for name, value in
                                     (("old-bin", b"old"), ("new-bin", b"new"), ("bad-bin", b"bad")))
         for phase in observer.CLI_PHASES:
-            bin_path = old_bin if phase == "old" else bad_bin if phase == "tampered-binary" else new_bin
+            bin_path = old_bin if phase in ("old", "wrong-version") else bad_bin if phase == "tampered-binary" else new_bin
             def binding(relative):
                 return {key: self.manifest["files"][relative][key] for key in ("cid", "sha256")} | {"size": self.manifest["files"][relative]["bytes"]}
             binary_binding = binding(bin_path)
@@ -269,7 +273,7 @@ class CliFixtureTests(unittest.TestCase):
                 binary_binding["sha256"] = self.manifest["files"][new_bin]["sha256"]
             payload = {"schema": "elastos.release/v1", "channel": "canary",
                        "version": self.manifest["old" if phase == "old" else "new"]["version"],
-                       "platforms": {"aarch64-darwin": {"binary": binary_binding, "components": binding(components)}}}
+                       "platforms": {"x86_64-darwin" if phase == "wrong-platform" else "aarch64-darwin": {"binary": binary_binding, "components": binding(components)}}}
             release = add(phase + "/release.json", {"payload": payload, "signature": "00" * 64,
                                                    "signer_did": "did:key:zother" if phase == "wrong-signer-release" else signer})
             head = add(phase + "/head.json", {"payload": {"schema": "elastos.release.head/v1", "channel": "canary", "version": payload["version"],
@@ -294,7 +298,7 @@ class CliFixtureTests(unittest.TestCase):
                        "immutable": {"reference": self.manifest["reference"], "manifest": "manifest.json"}}
         self.freeze()
         self.env = patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": self.config["immutable"]["sha256"],
-                                                    "ELASTOS_CI_FIXTURE_REFERENCE": self.manifest["reference"], "ELASTOS_CI_REQUIRE_REAL_RUNTIME": "0"})
+                                                    "ELASTOS_CI_FIXTURE_REFERENCE": self.manifest["reference"], "ELASTOS_CI_REQUIRE_REAL_RUNTIME": "0", "ELASTOS_CI_FIXTURE_SCOPE": "ci-refusals"})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -307,8 +311,39 @@ class CliFixtureTests(unittest.TestCase):
     def admit(self):
         with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature") as signatures:
             admitted = observer.cli_admit(self.config)
-            self.assertEqual(signatures.call_count, 15)
+            self.assertEqual(signatures.call_count, 3 * len(self.manifest["publications"]))
             return admitted
+
+    def positive(self):
+        self.manifest["proof_scope"] = "production-positive"
+        self.manifest["publications"] = {"old": self.manifest["publications"]["old"],
+                                          "new": self.manifest["publications"]["wrong-signer-head"].copy()}
+        pub = self.manifest["publications"]["new"]
+        head = observer.cli_json(self.root / pub["head"])
+        head["signer_did"] = self.manifest["signer_did"]
+        pub["head"] = self.add("positive/head.json", head)
+        pub["receipt"] = self.add("positive/receipt.json", {"last_head_cid": self.manifest["files"][pub["head"]]["cid"],
+                                                            "last_release_cid": self.manifest["files"][pub["release"]]["cid"]}, cid=False)
+        self.manifest["holder"]["content"][self.manifest["files"][pub["head"]]["cid"]] = pub["head"]
+        for selector in self.manifest["selectors"].values():
+            selector["refusals"] = []
+        observer.os.environ["ELASTOS_CI_FIXTURE_SCOPE"] = "production-positive"
+        self.freeze()
+
+    def test_real_positive_scope_admits_without_negative_signing_inputs(self):
+        self.positive()
+        self.assertEqual(self.admit()["proof_scope"], "production-positive")
+        code, calls, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["proof_scope"], "production-positive")
+        self.assertEqual([argv[1:] for argv, _ in calls if argv[1] == "update"],
+                         [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
+        self.assertEqual(set(result["paths"]["m2-discovery"]["checks"]), {"check", "apply", "repeat"})
+
+    def test_disposable_package_cannot_enter_real_positive_admission(self):
+        observer.os.environ["ELASTOS_CI_FIXTURE_SCOPE"] = "production-positive"
+        with self.assertRaisesRegex(ValueError, "proof scope differs"):
+            self.admit()
 
     def test_admission_requires_complete_public_package_and_independent_pin(self):
         self.assertEqual(self.admit()["proof_kind"], "harness-self-test")
@@ -421,7 +456,7 @@ class CliFixtureTests(unittest.TestCase):
         with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature", side_effect=ValueError("fixture envelope signature invalid")):
             with self.assertRaisesRegex(ValueError, "signature invalid"):
                 observer.cli_admit(self.config)
-        self.manifest["publications"]["wrong-signer-head"] = self.manifest["publications"]["new"]
+        self.manifest["publications"]["wrong-signer-head"] = self.manifest["publications"]["wrong-version"]
         self.freeze()
         with self.assertRaisesRegex(ValueError, "signer phase"):
             self.admit()
@@ -434,6 +469,86 @@ class CliFixtureTests(unittest.TestCase):
         for code, unchanged in ((0, True), (124, True), (1, False)):
             self.assertEqual(observer.cli_refusal("tampered-binary", {"exit": code}, "Downloading binary", "SHA-256 mismatch", unchanged)["status"], "failed")
         self.assertEqual(observer.cli_refusal("tampered-binary", failure, "Downloading binary\nDownloading components", "SHA-256 mismatch", True)["status"], "failed")
+        for case, stdout, stderr in (("wrong-platform", "Fetching release:", "No binary CID for platform aarch64-darwin"),
+                                     ("wrong-version", "Downloading binary\nDownloading components", "Installed binary version mismatch")):
+            self.assertEqual(observer.cli_refusal(case, failure, stdout, stderr, True)["status"], "passed")
+            for changed_stdout, changed_stderr, unchanged in ((stdout, "Carrier connection failed", True), (stdout, stderr, False)):
+                self.assertEqual(observer.cli_refusal(case, failure, changed_stdout, changed_stderr, unchanged)["status"], "failed")
+
+    def test_generator_uses_explicit_disposable_keys_and_real_signature_admission(self):
+        # Fake command delivery exercises generation; existing RFC 8032 test
+        # signing supplies valid signatures to the actual installer verifier.
+        # This proves observer admission only, and reports harness-self-test.
+        native = self.root / "native"
+        native.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16)
+        support = self.root / "support"
+        (support / "bin").mkdir(parents=True)
+        for name in ("ipfs-provider", "kubo"):
+            (support / "bin" / name).write_bytes(name.encode())
+        observer.write(support / "components.json", {"external": {name: {"platforms": {"darwin-arm64": {
+            "checksum": "sha256:" + observer.digest(support / "bin" / name)}}} for name in ("ipfs-provider", "kubo")}})
+        generated = self.root / "generated"
+        real_run, key_paths = observer.subprocess.run, []
+        def command(argv, **kwargs):
+            if Path(argv[0]).name == "elastos":
+                if argv[1] == "--version":
+                    return subprocess.CompletedProcess(argv, 0, b"elastos 0.7.1\n", b"")
+                self.assertEqual(argv[1], "sign-payload")
+                key = Path(argv[argv.index("--key") + 1])
+                key_paths.append(key)
+                self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+                signed = signing_fixture.sign_envelope(json.loads(kwargs["input"]), argv[argv.index("--domain") + 1], bytes.fromhex(key.read_text()))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({field: signed[field] for field in ("signature", "signer_did")}).encode(), b"")
+            if Path(argv[0]).name == "kubo":
+                repo = Path(kwargs["env"]["IPFS_PATH"])
+                if argv[1] == "init":
+                    (repo / "blocks").mkdir(parents=True)
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                raw = Path(argv[-1]).read_bytes()
+                cid = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("=")
+                (repo / "blocks" / cid).write_bytes(raw)
+                return subprocess.CompletedProcess(argv, 0, (cid + "\n").encode(), b"")
+            return real_run(argv, **kwargs)
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+             patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
+             patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"):
+            receipt = observer.cli_generate_refusals(generated, native, support)
+        self.assertTrue(receipt["keys_removed"])
+        self.assertTrue(key_paths)
+        self.assertTrue(all(not path.exists() for path in key_paths))
+        self.assertFalse((generated / "generator").exists())
+        generated_manifest = observer.cli_json(generated / "manifest.json")
+        self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
+        self.assertNotEqual(generated_manifest["signer_did"], observer.cli_json(generated / generated_manifest["publications"]["wrong-signer-head"]["head"])["signer_did"])
+        generated_manifest["proof_kind"] = "harness-self-test"
+        observer.write(generated / "manifest.json", generated_manifest)
+        config = observer.cli_json(generated / "fixture.json")
+        config["immutable"]["sha256"] = observer.digest(generated / "manifest.json")
+        with patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": config["immutable"]["sha256"], "ELASTOS_CI_FIXTURE_REFERENCE": ""}):
+            self.assertEqual(observer.cli_admit(config)["proof_kind"], "harness-self-test")
+
+    def test_generator_refuses_operator_or_non_ci_signing(self):
+        with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
+            observer.cli_generate_refusals(self.root / "generated", self.root / "missing", self.root)
+
+    def test_generator_command_failure_removes_keys_and_repository(self):
+        support = self.root / "support"
+        (support / "bin").mkdir(parents=True)
+        for name in ("ipfs-provider", "kubo"):
+            (support / "bin" / name).write_bytes(name.encode())
+        runtime = self.root / "runtime"
+        runtime.write_bytes(b"Runtime command substitute")
+        generated = self.root / "generated"
+        def failed(argv, **kwargs):
+            self.assertTrue((generated / "generator/approved.key").is_file())
+            self.assertTrue((generated / "generator/other.key").is_file())
+            return subprocess.CompletedProcess(argv, 1, b"", b"private command error stays out of receipts")
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+             patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
+             patch.object(observer.subprocess, "run", side_effect=failed), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"), \
+             self.assertRaisesRegex(ValueError, "disposable fixture command failed"):
+            observer.cli_generate_refusals(generated, runtime, support)
+        self.assertFalse((generated / "generator").exists())
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
@@ -496,6 +611,10 @@ class CliFixtureTests(unittest.TestCase):
                         self.returncode = 1
                         if name == "tampered-binary":
                             stdout, stderr = "Downloading binary", "SHA-256 mismatch"
+                        elif name == "wrong-platform":
+                            stdout, stderr = "Fetching release:", "No release available for platform:" if argv[0] == "/bin/bash" else "No binary CID for platform"
+                        elif name == "wrong-version":
+                            stdout, stderr = "Downloading binary\nDownloading components", "Downloaded binary version mismatch" if argv[0] == "/bin/bash" else "Installed binary version mismatch"
                         else:
                             stdout = "Fetching release:" if name == "wrong-signer-release" else "Checking for updates"
                             stderr = "Envelope signer differs from the pinned maintainer DID" if argv[0] == "/bin/bash" else "Signer DID mismatch"
@@ -579,8 +698,7 @@ class CliFixtureTests(unittest.TestCase):
         first_gateway = next(index for index, (argv, _) in enumerate(calls) if argv[1] == "gateway")
         self.assertLess(holder_identity, first_gateway)
         updates = [argv[1:] for argv, _ in calls if argv[1] == "update"]
-        self.assertEqual(updates[:3], [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
-        self.assertEqual(updates[3:], [["update", "--yes"]] * 3)
+        self.assertEqual(updates, [["update", "--check"], ["update", "--yes"], ["update", "--check"], ["update", "--yes"], *([["update", "--yes"]] * 3)])
         self.assertTrue(all("XDG_DATA_HOME" not in env for _, env in calls))
         self.assertTrue(all("--gateway" not in argv and "source" not in argv for argv, _ in calls))
         for selector in ("m1-install", "m2-discovery"):
@@ -641,6 +759,7 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(result["cleanup"]["passed"])
 
     def test_zero_exit_with_endpoint_drop_and_cleanup_failure_cannot_pass(self):
+        self.positive()
         code, _, result = self.fake_run(apply_stderr="ERROR ungraceful endpoint drop")
         self.assertEqual(code, 1)
         self.assertIn("Carrier apply failed", result["failure"])
