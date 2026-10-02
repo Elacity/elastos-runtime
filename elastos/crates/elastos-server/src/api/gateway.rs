@@ -1212,7 +1212,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/apps/:app/*path",
             get(super::browser_capsules::serve_browser_app_asset),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
         .layer(axum::middleware::from_fn(refuse_content_api_resources))
         .layer(axum::middleware::from_fn_with_state(
@@ -1220,6 +1220,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             gateway_frontdoor::gateway_admission,
         ))
         .layer(Extension(frontdoor))
+        // Terminal policy also gates browser preflight before its early response.
+        .layer(axum::middleware::from_fn_with_state(
+            state.data_dir.clone(),
+            home_cli_terminal_access,
+        ))
 }
 
 // ---------------------------------------------------------------------------
