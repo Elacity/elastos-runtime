@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import subprocess
+import shutil
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -79,9 +80,12 @@ class CiCapacityTests(unittest.TestCase):
         def remove(path):
             removed.append(path.name)
             path.rmdir()
-        with self.assertRaisesRegex(ValueError, "capacity unavailable: free=100 total=1000 planned_growth=100"):
-            observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100,
-                                      lambda: SimpleNamespace(total=1000, free=100), remove)
+        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100,
+                                             lambda: SimpleNamespace(total=1000, free=100), remove)
+        self.assertEqual(receipt["status"], "unavailable")
+        self.assertEqual(receipt["free_bytes_before"], 100)
+        self.assertEqual(receipt["free_bytes_after"], 100)
+        self.assertEqual([entry["app"] for entry in receipt["removed"]], removed)
         self.assertNotIn(candidate.name, removed)
         self.assertTrue(candidate.is_symlink() and (self.apps / "Xcode_99.app").exists())
 
@@ -106,6 +110,89 @@ class CiCapacityTests(unittest.TestCase):
              patch.object(observer, "cli_prepare_ci_disk") as prepare, contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(observer.main(), 2)
         prepare.assert_not_called()
+
+    def android(self):
+        runner_home = self.root / "runner"
+        sdk = runner_home / "Library/Android/sdk"
+        sdk.mkdir(parents=True)
+        (sdk / "unused-tool").write_bytes(b"unused CI Android tool")
+        (sdk.parent / "keep-user-data").write_bytes(b"keep parent")
+        (sdk.parent / "sdk-old").mkdir()
+        return runner_home, sdk
+
+    def receipt(self):
+        return {"status": "unavailable", "retained": [self.active.name, self.override.name], "removed": [],
+                "free_bytes_before": 100, "free_bytes_after": 100, "total_bytes": 1000, "planned_growth_bytes": 100}
+
+    def test_android_reclaim_uses_exact_sdk_and_preserves_apple_tools_and_siblings(self):
+        runner_home, sdk = self.android()
+        removed = []
+        def remove(path):
+            self.assertEqual(path, sdk)
+            removed.append(path)
+            shutil.rmtree(path)
+            return 300
+        def measure():
+            return SimpleNamespace(total=1000, free=100 if not removed else 400)
+        receipt = observer.cli_reclaim_android(runner_home, observer.os.geteuid(), self.receipt(), measure, remove)
+        self.assertEqual(receipt["status"], "ready")
+        self.assertEqual(receipt["removed"], [{"tool": "runner Android SDK", "allocated_bytes": 300, "free_bytes_before": 100, "free_bytes_after": 400}])
+        self.assertTrue(self.active.is_dir() and self.override.is_dir())
+        self.assertTrue((sdk.parent / "keep-user-data").is_file() and (sdk.parent / "sdk-old").is_dir())
+
+    def test_android_already_ready_needs_no_delete_or_ancestry_probe(self):
+        receipt = self.receipt()
+        receipt["status"] = "ready"
+        with patch.object(observer.Path, "stat", side_effect=AssertionError("unexpected path probe")):
+            result = observer.cli_reclaim_android(self.root / "absent", -1, receipt,
+                                                  lambda: self.fail("unexpected measure"), lambda _: self.fail("unexpected delete"))
+        self.assertIs(result, receipt)
+
+    def test_android_symlink_parent_and_foreign_sdk_owner_are_refused(self):
+        runner_home, sdk = self.android()
+        for kind in ("foreign owner", "SDK symlink", "parent symlink"):
+            with self.subTest(kind=kind), contextlib.ExitStack() as stack:
+                if kind == "foreign owner":
+                    real_stat = Path.stat
+                    def foreign(path, *args, **kwargs):
+                        actual = real_stat(path, *args, **kwargs)
+                        return SimpleNamespace(st_uid=actual.st_uid + 1, st_mode=actual.st_mode) if path == sdk else actual
+                    stack.enter_context(patch.object(observer.Path, "stat", foreign))
+                else:
+                    selected = sdk if kind == "SDK symlink" else sdk.parent
+                    target = selected.with_name(selected.name + "-moved")
+                    selected.rename(target)
+                    selected.symlink_to(target, target_is_directory=True)
+                    stack.callback(lambda path=selected, saved=target: (path.unlink(), saved.rename(path)))
+                with self.assertRaisesRegex(ValueError, "Android SDK ancestry or owner"):
+                    observer.cli_reclaim_android(runner_home, observer.os.geteuid(), self.receipt(),
+                                                lambda: SimpleNamespace(total=1000, free=100), lambda _: self.fail("unexpected delete"))
+
+    def test_android_runner_home_owner_and_nonhosted_execution_are_refused(self):
+        runner_home, sdk = self.android()
+        with self.assertRaisesRegex(ValueError, "runner home ancestry or owner"):
+            observer.cli_reclaim_android(runner_home, observer.os.geteuid() + 1, self.receipt(),
+                                        lambda: SimpleNamespace(total=1000, free=100), lambda _: self.fail("unexpected delete"))
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted"}), \
+             patch.object(observer.sys, "platform", "darwin"), patch.object(observer.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="runner")), \
+             patch.object(observer.subprocess, "run") as process, self.assertRaisesRegex(ValueError, "disposable hosted Mac"):
+            observer.cli_prepare_ci_disk()
+        process.assert_not_called()
+
+    def test_android_shortfall_keeps_the_measured_unavailable_receipt(self):
+        runner_home, sdk = self.android()
+        receipt = observer.cli_reclaim_android(runner_home, observer.os.geteuid(), self.receipt(),
+                                               lambda: SimpleNamespace(total=1000, free=100), shutil.rmtree)
+        self.assertEqual(receipt["status"], "unavailable")
+        self.assertEqual(receipt["free_bytes_after"], 100)
+        self.assertEqual(len(receipt["removed"]), 1)
+        error = ValueError("hosted Mac capacity unavailable")
+        error.capacity = receipt
+        stderr = io.StringIO()
+        with patch.object(observer.sys, "argv", ["observer", "prepare-ci-disk"]), \
+             patch.object(observer, "cli_prepare_ci_disk", side_effect=error), contextlib.redirect_stderr(stderr):
+            self.assertEqual(observer.main(), 2)
+        self.assertEqual(json.loads(stderr.getvalue())["capacity"], receipt)
 
 
 class HolderTransportTests(unittest.TestCase):

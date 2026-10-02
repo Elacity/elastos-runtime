@@ -818,14 +818,40 @@ def cli_reclaim_xcode(applications, protected, growth, measure, remove):
         if not path.exists() or path.is_symlink() or path in protected:
             continue
         need(path.is_dir() and path.resolve() == path and path.parent == applications, "reclaim Xcode ancestry differs")
-        remove(path)
+        allocated = remove(path)
         need(not path.exists() and all(retained.is_dir() for retained in protected), "Xcode reclaim or preservation failed")
         disk = measure()
-        removed.append({"app": name, "free_bytes_after": disk.free})
-    need((disk.free - growth) / disk.total >= .15,
-         "hosted Mac capacity unavailable: free=" + str(disk.free) + " total=" + str(disk.total) + " planned_growth=" + str(growth))
-    return {"status": "ready", "retained": sorted(path.name for path in protected), "removed": removed,
+        removed.append({"app": name, "allocated_bytes": allocated, "free_bytes_after": disk.free})
+    return {"status": "ready" if (disk.free - growth) / disk.total >= .15 else "unavailable",
+            "retained": sorted(path.name for path in protected), "removed": removed,
             "free_bytes_before": before, "free_bytes_after": disk.free, "total_bytes": disk.total, "planned_growth_bytes": growth}
+
+
+def cli_reclaim_android(runner_home, runner_uid, receipt, measure, remove):
+    """Internal helper allows test homes; public CI uses one fixed SDK path."""
+    if receipt["status"] == "ready":
+        return receipt
+    need(runner_home.is_absolute() and runner_home.is_dir() and runner_home.resolve() == runner_home
+         and not runner_home.is_symlink() and runner_home.stat().st_uid == runner_uid,
+         "Android SDK runner home ancestry or owner differs")
+    sdk = runner_home / "Library/Android/sdk"
+    if not sdk.exists() and not sdk.is_symlink():
+        return receipt
+    for path in (runner_home / "Library", runner_home / "Library/Android", sdk):
+        need(path.is_dir() and not path.is_symlink() and path.resolve() == path
+             and path.stat().st_uid == runner_uid and path.is_relative_to(runner_home),
+             "Android SDK ancestry or owner differs")
+    before = measure()
+    if (before.free - receipt["planned_growth_bytes"]) / before.total >= .15:
+        receipt.update(status="ready", free_bytes_after=before.free, total_bytes=before.total)
+        return receipt
+    allocated = remove(sdk)
+    need(not sdk.exists() and runner_home.is_dir() and (runner_home / "Library/Android").is_dir(), "Android SDK reclaim exceeded its owned directory")
+    disk = measure()
+    receipt["removed"].append({"tool": "runner Android SDK", "allocated_bytes": allocated, "free_bytes_before": before.free, "free_bytes_after": disk.free})
+    receipt.update(status="ready" if (disk.free - receipt["planned_growth_bytes"]) / disk.total >= .15 else "unavailable",
+                   free_bytes_after=disk.free, total_bytes=disk.total)
+    return receipt
 
 
 def cli_prepare_ci_disk():
@@ -839,6 +865,8 @@ def cli_prepare_ci_disk():
          and runner_temp.is_absolute() and runner_temp.is_dir() and runner_temp.resolve() == runner_temp
          and runner_temp.is_relative_to(workspace_root), "hosted runner workspace ancestry differs")
     applications = Path("/Applications")
+    runner_home = Path("/Users/runner")
+    android_sdk = runner_home / "Library/Android/sdk"
 
     def query(argv):
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
@@ -862,24 +890,36 @@ def cli_prepare_ci_disk():
         protected.add(app(str(alias)))
 
     def remove(path):
+        need(path.resolve() == path and not path.is_symlink() and
+             (path == android_sdk or path.parent == applications and path.name in CI_XCODE_APPS and path not in protected),
+             "hosted tool reclaim target differs")
         need(query(["/usr/bin/xcode-select", "-p"]) == selected
              and query(["/usr/bin/xcrun", "--show-sdk-path"]) == sdk, "selected Xcode changed before reclaim")
         # du measures the allowlisted bundle; free space is measured again after
         # the fixed argv deletion. No shell expansion or user path is involved.
         size = query(["/usr/bin/du", "-sk", str(path)])
-        need(re.fullmatch(r"[0-9]+\s+" + re.escape(str(path)), size) is not None, "Xcode size measurement differs")
+        need(re.fullmatch(r"[0-9]+\s+" + re.escape(str(path)), size) is not None, "hosted tool size measurement differs")
         # The root-owned remover has its own deadline. Runner credentials cannot
         # reliably signal root children through sudo on every hosted image.
         program = "import shutil,signal,sys; signal.alarm(180); shutil.rmtree(sys.argv[1])"
         proc = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-c", program, str(path)],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=185, check=False)
-        need(proc.returncode == 0, "allowlisted Xcode reclaim failed")
+        need(proc.returncode == 0, "allowlisted hosted tool reclaim failed")
+        return int(size.split()[0]) * 1024
 
     receipt = cli_reclaim_xcode(applications, protected, 20 * 1024**3,
                                 lambda: shutil.disk_usage(checkout), remove)
-    need(query(["/usr/bin/xcode-select", "-p"]) == selected
-         and query(["/usr/bin/xcrun", "--show-sdk-path"]) == sdk, "selected Xcode changed after reclaim")
     receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
+    try:
+        receipt = cli_reclaim_android(runner_home, os.geteuid(), receipt,
+                                       lambda: shutil.disk_usage(checkout), remove)
+        need(query(["/usr/bin/xcode-select", "-p"]) == selected
+             and query(["/usr/bin/xcrun", "--show-sdk-path"]) == sdk, "selected Xcode changed after reclaim")
+        need(receipt["status"] == "ready",
+             "hosted Mac capacity unavailable: free=" + str(receipt["free_bytes_after"]) + " total=" + str(receipt["total_bytes"]) + " planned_growth=" + str(receipt["planned_growth_bytes"]))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        error.capacity = receipt
+        raise
     return receipt
 
 
@@ -1603,7 +1643,10 @@ def main():
         return 0
     except (OSError, ValueError, TypeError, KeyError, StopIteration, subprocess.SubprocessError) as error:
         reason = cli_safe_error(error) if isinstance(locals().get("value"), dict) and value.get("mode") == CLI_MODE else str(error)
-        print(json.dumps({"status": "unavailable", "reason": reason}), file=sys.stderr)
+        result = {"status": "unavailable", "reason": reason}
+        if hasattr(error, "capacity"):
+            result["capacity"] = error.capacity
+        print(json.dumps(result), file=sys.stderr)
         return 2
 
 
