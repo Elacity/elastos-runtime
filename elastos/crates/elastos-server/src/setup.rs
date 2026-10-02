@@ -516,6 +516,7 @@ async fn run_with_data_dir(
                 comp,
                 &platform,
                 &ipfs_gateways,
+                FirstPartyCarrierContext::Setup,
             )
             .await?;
             changed = true;
@@ -978,6 +979,7 @@ async fn ensure_provider_capsule_metadata_component(
     component: &Component,
     platform: &str,
     ipfs_gateways: &[ElastosFetchPath],
+    carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     let Some(metadata) = component.capsule_metadata.as_ref() else {
         return Ok(());
@@ -1014,7 +1016,7 @@ async fn ensure_provider_capsule_metadata_component(
         platform_info,
         &dest,
         ipfs_gateways,
-        FirstPartyCarrierContext::Setup,
+        carrier_context,
     )
     .await?;
     write_platform_cache_metadata(platform_info, &dest)?;
@@ -2556,6 +2558,23 @@ pub async fn refresh_installed_components_for_update(
     new_components: &[u8],
     platform: &str,
 ) -> anyhow::Result<Vec<String>> {
+    refresh_installed_components_for_update_in_context(
+        data_dir,
+        old_components,
+        new_components,
+        platform,
+        FirstPartyCarrierContext::Setup,
+    )
+    .await
+}
+
+pub(crate) async fn refresh_installed_components_for_update_in_context(
+    data_dir: &Path,
+    old_components: Option<&[u8]>,
+    new_components: &[u8],
+    platform: &str,
+    carrier_context: FirstPartyCarrierContext,
+) -> anyhow::Result<Vec<String>> {
     let new_manifest: ComponentsManifest = serde_json::from_slice(new_components)?;
     let Some(old_bytes) = old_components else {
         return Ok(Vec::new());
@@ -2627,7 +2646,7 @@ pub async fn refresh_installed_components_for_update(
             new_platform_info,
             &dest,
             &gateways,
-            FirstPartyCarrierContext::Setup,
+            carrier_context,
         )
         .await?;
         write_cache_metadata(
@@ -2663,6 +2682,7 @@ pub async fn refresh_installed_components_for_update(
             new_component,
             platform,
             &gateways,
+            carrier_context,
         )
         .await?;
         refreshed.push(name.clone());
@@ -2755,6 +2775,20 @@ pub(crate) enum FirstPartyCarrierContext {
     Runtime,
 }
 
+fn first_party_carrier_bind_addr(
+    data_dir: &Path,
+    context: FirstPartyCarrierContext,
+) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    Ok(
+        crate::carrier::configured_carrier_bind_addr(data_dir)?.map(|mut address| {
+            if matches!(context, FirstPartyCarrierContext::Runtime) {
+                address.set_port(0);
+            }
+            address
+        }),
+    )
+}
+
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
     release_path: &str,
@@ -2764,12 +2798,7 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .default_source()
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
-    let bind_addr = crate::carrier::configured_carrier_bind_addr(data_dir)?.map(|mut address| {
-        if matches!(context, FirstPartyCarrierContext::Runtime) {
-            address.set_port(0);
-        }
-        address
-    });
+    let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
     crate::carrier::fetch_file_from_trusted_source_bound(&source, release_path, 15, 30, bind_addr)
         .await
 }
@@ -2787,6 +2816,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
             platform_info,
             dest,
             &detect_platform(),
+            context,
         )
         .await;
     }

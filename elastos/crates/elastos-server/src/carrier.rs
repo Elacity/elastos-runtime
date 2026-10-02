@@ -73,7 +73,7 @@ use crate::sources::{
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
 #[path = "carrier_file.rs"]
 mod file_transfer;
-pub(crate) use file_transfer::fetch_file_from_trusted_source_to;
+pub(crate) use file_transfer::fetch_file_from_trusted_source_to_bound;
 #[path = "carrier_exit.rs"]
 mod browser_exit;
 pub(crate) use browser_exit::{
@@ -10410,7 +10410,7 @@ pub(crate) mod tests {
         sources.sources.push(source);
         crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
         let good_checksum = format!("sha256:{:x}", Sha256::digest(b"fixture"));
-        let manifest = serde_json::from_value(serde_json::json!({
+        let manifest: crate::setup::ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
                 "good-fixture": {"install_path": "good-fixture", "platforms": {
                     "*": {"release_path": "artifact", "checksum": good_checksum}
@@ -10422,30 +10422,88 @@ pub(crate) mod tests {
             "profiles": {}
         }))
         .unwrap();
-        let mut supervisor = crate::supervisor::Supervisor::new(dir.path().to_path_buf(), manifest);
+        let mut supervisor =
+            crate::supervisor::Supervisor::new(dir.path().to_path_buf(), manifest.clone());
         supervisor.set_carrier_endpoint(runtime.clone());
+        let capsule = serde_json::to_vec(&serde_json::json!({
+            "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "good-fixture",
+            "role": "provider", "type": "microvm", "entrypoint": "provider",
+            "icon": "icons", "provides": "elastos://fixture/*",
+            "authority": {
+                "reason": "Isolated Carrier update fixture.",
+                "capabilities": [{"resource": "elastos://fixture/*", "actions": ["read"], "operations": ["status"]}],
+                "audit_events": ["fixture.read"]
+            }
+        })).unwrap();
+        let capsule_manifest: elastos_common::CapsuleManifest =
+            serde_json::from_slice(&capsule).unwrap();
+        capsule_manifest.validate().unwrap();
+        let mut bundle = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (path, bytes) in std::iter::once(("good-fixture/capsule.json".to_string(), capsule))
+            .chain([32, 64, 128, 256].into_iter().map(|size| {
+                (
+                    format!("good-fixture/icons/icon-{size}.png"),
+                    b"fixture-icon".to_vec(),
+                )
+            }))
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            bundle
+                .append_data(&mut header, path, bytes.as_slice())
+                .unwrap();
+        }
+        let metadata = bundle.into_inner().unwrap().finish().unwrap();
+        let old_components = serde_json::to_vec(&manifest).unwrap();
+        let mut update_manifest = manifest.clone();
+        let updated = update_manifest.external.get_mut("good-fixture").unwrap();
+        updated.version = Some("new-fixture".into());
+        updated.capsule_metadata = Some(serde_json::from_value(serde_json::json!({
+            "install_path": "capsules/good-fixture", "platforms": {"*": {
+                "release_path": "metadata.tar.gz", "extract_path": "good-fixture",
+                "checksum": format!("sha256:{:x}", Sha256::digest(&metadata)), "size": metadata.len()
+            }}
+        })).unwrap());
+        let new_components = serde_json::to_vec(&update_manifest).unwrap();
         let server_endpoint = server.clone();
         let serving = tokio::spawn(async move {
-            for index in 0..3 {
+            for index in 0..5 {
                 let incoming = server_endpoint.accept().await.unwrap();
                 let iroh::endpoint::IncomingAddr::Ip(client_addr) = incoming.remote_addr() else {
                     panic!("fixture fetch must use the configured loopback IP");
                 };
                 assert_eq!(client_addr.ip(), bind_addr.ip());
-                assert_eq!(client_addr == bind_addr, index == 2);
+                assert_eq!(client_addr == bind_addr, index == 4);
                 let conn = incoming.await.unwrap();
-                assert_eq!(conn.remote_id() == runtime_id, index == 2);
+                assert_eq!(conn.remote_id() == runtime_id, index == 4);
                 let (mut send, recv) = conn.accept_bi().await.unwrap();
                 let mut request = String::new();
                 BufReader::new(recv).read_line(&mut request).await.unwrap();
+                let path = if index == 3 {
+                    "metadata.tar.gz"
+                } else {
+                    "artifact"
+                };
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
-                    "artifact"
+                    path
                 );
-                send.write_all(&7u64.to_be_bytes()).await.unwrap();
-                send.write_all(b"fixture").await.unwrap();
+                let bytes = if index == 3 {
+                    metadata.as_slice()
+                } else {
+                    b"fixture"
+                };
+                send.write_all(&(bytes.len() as u64).to_be_bytes())
+                    .await
+                    .unwrap();
+                send.write_all(bytes).await.unwrap();
                 send.finish().unwrap();
-                if index < 2 {
+                if index < 4 {
                     assert!(matches!(
                         conn.closed().await,
                         iroh::endpoint::ConnectionError::ApplicationClosed(_)
@@ -10489,6 +10547,44 @@ pub(crate) mod tests {
             assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
             assert!(std::net::UdpSocket::bind(bind_addr).is_err());
         }
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::setup::refresh_installed_components_for_update(
+                dir.path(),
+                Some(&old_components),
+                &new_components,
+                "*",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains(&bind_addr.to_string()));
+        assert_eq!(
+            std::fs::read(dir.path().join("good-fixture")).unwrap(),
+            b"fixture"
+        );
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::setup::refresh_installed_components_for_update_in_context(
+                dir.path(),
+                Some(&old_components),
+                &new_components,
+                "*",
+                crate::setup::FirstPartyCarrierContext::Runtime,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(refreshed, vec!["good-fixture"]);
+        assert!(dir
+            .path()
+            .join("capsules/good-fixture/capsule.json")
+            .is_file());
+        assert!(!runtime.is_closed());
+        assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
+        assert!(std::net::UdpSocket::bind(bind_addr).is_err());
         // A real request on the owner's endpoint proves its transport stays usable.
         let client = CarrierClient::connect_known_endpoint(&runtime, address, 5)
             .await
