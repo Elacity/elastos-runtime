@@ -103,6 +103,12 @@ class SignerTests(unittest.TestCase):
         self.no_process = mock.patch.object(S.subprocess, "run", side_effect=AssertionError("real subprocess refused in tests"))
         self.no_process.start()
         self.addCleanup(self.no_process.stop)
+        # Unit fixtures use a deterministic healthy volume. The dedicated quota
+        # case below overrides this with a full volume to prove the real guard.
+        disk = mock.patch.object(S.shutil, "disk_usage", return_value=SimpleNamespace(
+            total=100 * 1024**3, free=50 * 1024**3))
+        disk.start()
+        self.addCleanup(disk.stop)
 
     def approve_manifest(self):
         data = S.json_bytes(self.manifest)
