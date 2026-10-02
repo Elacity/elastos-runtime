@@ -4,7 +4,8 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validHostedReceipt } from "./website-claims.mjs";
+import { createHash } from "node:crypto";
+import { validHostedReceipt, validIsolationClaims } from "./website-claims.mjs";
 const HOME_PATH = "/home/";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -19,24 +20,29 @@ function check(name, run) {
   catch (error) { throw new Error(`${name}: ${error.message}`, { cause: error }); }
 }
 
-check("facts identify source and dated evidence", () => {
-  assert.equal(facts.schema, "elastos.website.claims/v1");
-  assert.match(facts.reviewed_at, /^\d{4}-\d{2}-\d{2}$/);
-  assert.match(facts.candidate.base_ref, /^upstream\/.+-dev$/);
-  assert.match(facts.candidate.base_commit, /^[a-f0-9]{40}$/);
-  assert.ok(facts.candidate.evidence.includes(`/${facts.candidate.base_commit}/state.md`));
-  assert.match(facts.public_observation.observed_at, /^\d{4}-\d{2}-\d{2}$/);
-  for (const key of ["release_head_sha256", "release_sha256", "installer_sha256"]) assert.match(facts.public_observation[key], /^[a-f0-9]{64}$/);
-  assert.deepEqual(facts.public_observation.evidence, ["/release-head.json", "/release.json", "/install.sh"]);
-  if (facts.hosted.status === "verified") assert.ok(validHostedReceipt(facts.hosted, new URL(facts.hosted.target).origin), "hosted version needs a dated deployment receipt");
-  else assert.equal(facts.hosted.status, "unverified");
+check("facts state current isolation and issue-owned evidence", () => {
+  assert.equal(facts.schema, "elastos.website.claims/v2");
+  assert.equal(facts.candidate.status, "source-only");
+  assert.equal(facts.candidate.evidence, "https://github.com/Elacity/elastos-runtime/issues/170");
+  assert.ok(validIsolationClaims(facts.isolation), "false isolation claim");
+  if (facts.hosted.status === "verified") {
+    const accepted = facts.accepted_installation;
+    assert.ok(accepted && accepted.status === "accepted", "accepted installed evidence is required");
+    const expected = { ...accepted, site_index_sha256: createHash("sha256").update(html).digest("hex") };
+    assert.ok(validHostedReceipt(facts.hosted, new URL(facts.hosted.target).origin, Date.now(), expected),
+      "hosted receipt is expired or mismatches accepted source or site artifacts");
+  } else {
+    assert.equal(facts.hosted.status, "paused");
+    assert.equal(facts.hosted.evidence, "https://github.com/Elacity/elastos-runtime/issues/174");
+    assert.equal(facts.accepted_installation, undefined, "paused source does not carry accepted installed proof");
+  }
 });
 
 check("visitor content stays useful without release services", () => {
   assert.ok(html.includes('href="#install"'), "visitors need a device installation path");
   assert.ok(html.includes('src="./site.js"'), "platform selection and copy use a local script");
-  assert.ok(html.includes('id="copy-install" disabled'), "keep copying unavailable until 0.7.1 installation is verified");
-  assert.ok(html.includes("0.7.1 installer coming soon."));
+  assert.ok(html.includes('id="copy-install" disabled'), "keep copying unavailable until release installation is verified");
+  assert.ok(html.includes("Installation awaits accepted release proof."));
   assert.ok(html.includes('aria-label="Installation command" hidden'), "reveal command only with the verified installer");
   assert.ok(!/0\.1\.2|Mac download in preparation|guest access is open/.test(html));
   assert.ok(!/xcode-select|ELASTOS_SOURCE_HOME|git clone/.test(html), "source build steps belong in the developer guide");
@@ -59,7 +65,6 @@ function checkLink(value, asset = false) {
     assert.ok(url.pathname.startsWith("/Elacity/elastos-runtime"));
     const pinned = url.pathname.match(/^\/Elacity\/elastos-runtime\/blob\/([a-f0-9]{40})\/(.+)$/);
     if (pinned) {
-      assert.equal(pinned[1], facts.candidate.base_commit);
       if (!pinnedFiles.has(pinned[2])) pinnedFiles.set(pinned[2], execFileSync("git", ["show", `${pinned[1]}:${pinned[2]}`], { cwd: repo, encoding: "utf8" }));
       if (url.hash) {
         const headings = [...pinnedFiles.get(pinned[2]).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => slug(match[1]));
@@ -81,13 +86,24 @@ check("page and evidence links resolve", () => {
   for (const match of html.matchAll(/\b(href|src)="([^"]+)"/g)) checkLink(match[2], match[1] === "src");
   for (const match of css.matchAll(/url\(["']?([^"')]+)["']?\)/g)) checkLink(match[1], true);
   checkLink(facts.candidate.evidence);
-  for (const journey of facts.journeys) checkLink(journey.evidence);
+  checkLink(facts.isolation.evidence);
   if (facts.hosted.evidence) checkLink(facts.hosted.evidence);
 });
 
-check("the primary action opens Home on this server", () => {
-  assert.match(html, new RegExp(`id="open-home" href="${HOME_PATH}"`));
-  assert.ok(!html.includes('href="http://localhost'), "local source examples stay separate from the primary link");
+check("the paused demo has no Home launch action", () => {
+  assert.ok(!html.includes(`href="${HOME_PATH}"`), "public demo remains paused");
+  assert.ok(html.includes("Public demo paused"));
+  assert.ok(html.includes("This describes the source boundary after the required changes pass integration."));
+  assert.ok(html.includes('href="#isolation"'));
+});
+
+check("isolation copy states the current boundary and proof scope", () => {
+  for (const phrase of ["opaque sandboxed frames", "Home can currently obtain every app's capability",
+    "operating-system processes", "Only the model provider is partly confined",
+    "Keys are stored next to the data", "Full backups contain all keys", "seed operator can read",
+    "stolen device or profile key requires a new identity", "integrated and tested together",
+    "Accepted installed proof binds the exact Runtime"]) assert.ok(html.includes(phrase), phrase);
+  assert.ok(!/zero ambient authority|every app runs as a sandboxed capsule|fully isolated providers/i.test(html));
 });
 
 check("copy and claims describe evidence honestly", () => {

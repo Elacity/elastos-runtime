@@ -1,13 +1,37 @@
 # ElastOS architecture
 
 This document describes the intended system architecture. For current behavior,
-proof level, and command expectations, see [state.md](../state.md) and
+proof level, see [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+For command expectations, see
 [COMMAND_MATRIX.md](COMMAND_MATRIX.md). Verified security findings belong in
-[SECURITY.md](../SECURITY.md), and open work belongs in [TASKS.md](../TASKS.md).
+[SECURITY.md](../SECURITY.md), and open work belongs in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
 
 ## Architectural direction
 
-ElastOS keeps the trusted Runtime small. Ordinary executable capsules run
+The target keeps the trusted Runtime small. Ordinary executable capsules run
 without ambient authority and request scoped effects through Runtime-owned
 capability checks. Providers implement service and protocol behavior outside
 the trusted core. Content hashes establish integrity, not publisher identity,
@@ -62,9 +86,10 @@ candidate's bounded People discovery uses the same Runtime-owned path. Wider
 discovery rendezvous and the old Services remote-Exit social/contact path remain
 separate work.
 
-Sequencing and incomplete work belong in [ROADMAP.md](../ROADMAP.md) and
-[TASKS.md](../TASKS.md). This document defines the following authority
-and recovery invariants:
+The owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+record sequencing, incomplete work and acceptance. [ROADMAP.md](../ROADMAP.md)
+describes direction. This document defines the following authority and recovery
+invariants:
 
 - A passkey proves local principal authority. It is not a DID, wallet key,
   decryption key, or source of ambient administrator authority.
@@ -77,7 +102,8 @@ and recovery invariants:
   revoke replaced sessions, and leave an audit trail. It must not fall back to
   a device-global key.
 - Protection configured, root encrypted, and root recoverable are separate
-  claims. Current coverage and exclusions belong in [state.md](../state.md).
+  claims. Current coverage and exclusions belong in the owning
+  [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 ### Identity and object claims
 
@@ -119,7 +145,7 @@ Home front door and active shell projection
     |
 Runtime launch and orchestration authority
     |
-isolated executable capsule instance
+executable capsule instance (boundary depends on substrate)
     |
     +-- Component ----------------> ElastOS Bus ------------+
     |                                                      |
@@ -141,7 +167,8 @@ isolated executable capsule instance
                                            local host adapter or Runtime-selected Carrier route
 ```
 
-Ordinary executable capsules run in isolated environments. Their manifests
+The target isolates ordinary executable capsules from host authority. Their
+manifests
 declare an execution or data contract but grant no authority. Exact fields and
 accepted combinations belong in [CAPSULE_AUTHORING.md](CAPSULE_AUTHORING.md).
 The Capsule Runtime contract binds an artifact, session, capabilities,
@@ -177,7 +204,8 @@ separate capsule contracts or support claims.
 Capsules depend on the Capsule Runtime contract, not a presentation host. A web
 projection declares its browser entrypoint and projection metadata; the host
 adapter decides how to present it. See [INSTALL.md](INSTALL.md) and
-[state.md](../state.md) for current platform evidence.
+the owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+for accepted platform evidence.
 
 Keep these concerns separate:
 
@@ -209,7 +237,7 @@ core.
 
 ### Layer 2: Home host and shell projections
 
-Home owns the user-facing sign-in boundary and presents Runtime facts through
+Runtime owns sign-in authority. Home presents sign-in and Runtime facts through
 shell projections. A shell role is descriptive; it grants no authority.
 Runtime admits installed identities and checks each requested effect. See
 [HOME_SHELL_HOST_CONTRACT.md](HOME_SHELL_HOST_CONTRACT.md) for the current
@@ -361,7 +389,7 @@ policy and validate every requested effect.
 |-------|------------|
 | Content hash | Integrity of the referenced bytes |
 | Signature | Control of a signing key; publisher policy identifies the trusted signer |
-| Sandbox | Isolation between executions |
+| Browser sandbox | Opaque app frames; Home still has cross-app capability authority |
 | Capabilities | Authority for a checked resource operation |
 | Encryption | Confidentiality only for content covered by the relevant key contract |
 

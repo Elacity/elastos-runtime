@@ -4,6 +4,19 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Isolation status
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+sets the acceptance gates. Apps use opaque browser sandbox frames and Runtime
+capability checks after the S0 changes are integrated and tested together.
+Home can still obtain every app's capability. Providers run as operating-system
+processes; only the model provider is partly confined. Keys remain beside the
+data they protect, and full backups contain all keys. The seed operator can
+read stored data, wallet keys and recovery phrases. Recovery from a stolen
+device or profile key requires a new identity. Source checks and installed
+product proof are separate gates. The public demo remains paused until its
+approved deployment passes the reopening gate.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for
@@ -14,6 +27,18 @@ update channel do not change. An earlier signed preview build also reports
 `0.7.1`; it is older code, and the next signed release replaces it. The first
 release for users is planned as 0.8.0, and issues #83 to #93 track what it
 still needs.
+
+### Isolation status
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records limits found after this developer snapshot. In the published snapshot,
+Home and apps share the Runtime's origin, Home can obtain every app's capability,
+and the web Terminal runs commands as the host user. Providers run as
+operating-system processes, with only partial model-provider confinement.
+Opaque content frames, tighter front-door checks and a Terminal disabled by
+default are source work that needs integration, review and installed proof.
+This snapshot does not establish the complete isolation target. A stolen device
+or profile key requires a new identity.
 
 ### Added
 - Local models: signed model catalogue metadata, verified model content that

@@ -5,8 +5,31 @@
 manifest fields and supported combinations.
 
 For system context, see the [repository README](../README.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md). [state.md](../state.md) records verified
-implementation status, and [TASKS.md](../TASKS.md) records open work.
+[ARCHITECTURE.md](ARCHITECTURE.md). [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+record accepted implementation proof and open work.
+
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
 
 ## Core model
 
@@ -22,7 +45,7 @@ five.
 
 | Layer | Meaning |
 | --- | --- |
-| Artifact | Immutable manifest-and-payload closure, normally named by content ID. A verified signature authenticates its publisher; provenance records describe claimed lineage. |
+| Artifact | Immutable manifest-and-payload closure, normally named by content ID. A valid signature proves control of its signing key; Runtime publisher policy establishes publisher trust. Provenance records describe claimed lineage. |
 | Runtime contract | Declared execution or data contract. Component artifacts name a versioned ABI and Bus surface. Host adapters remain below it. |
 | Instance | For executable artifacts, one admitted execution bound to a session, capabilities, resources, and substrate. User-scoped authority also binds a verified principal. |
 | State | Mutable principal, app, or shared data stored outside the immutable artifact. |
@@ -66,16 +89,17 @@ reply alone does not establish working sandbox support.
 
 The [shared state contract](STORAGE_AND_ACCESS.md#shared-application-state)
 defines checkpoints and handoff when execution and durable storage are on
-different nodes. Current accepted placements remain in state.md and the release
-plan; broad placement support is a target, not a claim of hardware qualification.
+different nodes. The owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+record accepted placement proof. Broad placement support remains a target;
+each host needs its own qualification.
 
 ## Isolation boundary
 
 Runtime admits an executable artifact for a session and binds the instance to
 declared resources and capabilities. User-scoped authority also requires a
-verified principal. The instance does not inherit host files,
-sockets, credentials, routes, or provider internals. Mutable state enters
-through capability-scoped object and WebSpace contracts.
+verified principal. The target gives ordinary instances access to mutable state
+through capability-scoped object and WebSpace contracts. The current web-frame
+and native-provider boundaries are described above.
 
 Roles, package types, ABI fields, provider declarations, and rejected
 combinations belong to [Capsule authoring](CAPSULE_AUTHORING.md).
@@ -105,7 +129,8 @@ adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
 The Component fixture and authoring template test this contract. Product App
-migration requires its own evidence, recorded in [state.md](../state.md).
+migration requires its own evidence in the owning
+[GitHub issue](https://github.com/Elacity/elastos-runtime/issues).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,
@@ -114,7 +139,8 @@ SDK behavior, role restrictions, and validation rules belong to
 authority belong to the
 [Home shell host contract](HOME_SHELL_HOST_CONTRACT.md).
 
-A provider may hold DID signing material only when its declared namespace,
+The target permits a provider to hold DID signing material only when its declared
+namespace,
 registered identity, and Runtime policy grant that narrow role. The provider
 role alone grants nothing. Ordinary capsules instead request typed signing
 intents such as `sign_chat_message`; they do not receive arbitrary
@@ -125,9 +151,10 @@ intents such as `sign_chat_message`; they do not receive arbitrary
 Components request effects through typed, capability-secured Bus resources.
 Web projections use narrow, capsule-scoped Runtime adapters. Data capsules
 carry no execution authority. Provider capsules declare a narrow `provides`
-namespace and auditable authority metadata. Operator trust in a provider does
-not grant user authority. A provider that needs principal data must use the
-corresponding capability path.
+namespace and auditable authority metadata. The target separates operator trust
+from user authority. A provider that needs
+principal data uses the corresponding capability path. Current native
+processes can retain host-account access beyond that declaration.
 
 The Runtime, Bus, and provider ownership rule is normative in
 [PRINCIPLES.md](../PRINCIPLES.md). Trust domains and network compatibility

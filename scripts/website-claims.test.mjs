@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validHostedReceipt } from "./website-claims.mjs";
+import { readFileSync } from "node:fs";
+import { validHostedReceipt, validIsolationClaims, HOSTED_RECEIPT_MAX_AGE_MS } from "./website-claims.mjs";
 
 const origin = "https://elastos.example";
 const observedAt = "2026-09-10T12:00:00Z";
@@ -12,24 +13,27 @@ const hostedReceipt = {
   observed_at: observedAt, target: `${origin}/`, evidence: "/claims.json",
 };
 
+const expected = { ...hostedReceipt };
+const valid = (receipt, target = origin, time = now, artifacts = expected) => validHostedReceipt(receipt, target, time, artifacts);
+
 test("a hosted version requires its own complete dated deployment receipt", () => {
   for (const hosted of [null, { status: "unverified" }, { status: "verified", version: "0.7.1" }]) {
-    assert.equal(validHostedReceipt(hosted, origin, now), false);
+    assert.equal(valid(hosted), false);
   }
-  assert.equal(validHostedReceipt(hostedReceipt, origin, now), true);
+  assert.equal(valid(hostedReceipt), true);
   for (const key of Object.keys(hostedReceipt)) {
     const incomplete = { ...hostedReceipt };
     delete incomplete[key];
-    assert.equal(validHostedReceipt(incomplete, origin, now), false, key);
+    assert.equal(valid(incomplete), false, key);
   }
 });
 
 test("a hosted receipt belongs to the exact server and its own evidence file", () => {
   for (const value of ["https://another.example", "http://elastos.example", undefined]) {
-    assert.equal(validHostedReceipt(hostedReceipt, value, now), false);
+    assert.equal(validHostedReceipt(hostedReceipt, value, now, expected), false);
   }
   for (const evidence of ["https://another.example/claims.json", "//another.example/claims.json", "/claims.json?old", "/release.json"]) {
-    assert.equal(validHostedReceipt({ ...hostedReceipt, evidence }, origin, now), false);
+    assert.equal(valid({ ...hostedReceipt, evidence }), false);
   }
 });
 
@@ -40,5 +44,31 @@ test("future observations and malformed source/artifact identities remain unveri
     { observed_at: "2026-09-10" }, { source_tree: "bad" }, { source_commit: "bad" },
     { binary_sha256: "bad" }, { components_sha256: "bad" }, { home_index_sha256: "bad" },
     { site_index_sha256: "bad" }, { version: "latest" }, { version: ["0.7.0-dev"] }, { status: "unverified" },
-  ]) assert.equal(validHostedReceipt({ ...hostedReceipt, ...change }, origin, now), false);
+  ]) assert.equal(valid({ ...hostedReceipt, ...change }), false);
+});
+
+
+test("expired receipts and identities outside accepted installation stay unverified", () => {
+  const observed = Date.parse(observedAt);
+  assert.equal(valid(hostedReceipt, origin, observed + HOSTED_RECEIPT_MAX_AGE_MS), true);
+  assert.equal(valid(hostedReceipt, origin, observed + HOSTED_RECEIPT_MAX_AGE_MS + 1), false);
+  assert.equal(valid(hostedReceipt, origin, NaN), false);
+  assert.equal(validHostedReceipt(hostedReceipt, origin, now), false);
+  assert.equal(valid({ ...hostedReceipt, fully_isolated: true }), false);
+  for (const key of ["version", "source_commit", "source_tree", "binary_sha256", "components_sha256", "home_index_sha256", "site_index_sha256"]) {
+    const mismatch = { ...expected, [key]: key === "version" ? "0.7.1" : "1".repeat(key.startsWith("source_") ? 40 : 64) };
+    assert.equal(valid(hostedReceipt, origin, now, mismatch), false, key);
+    const incomplete = { ...expected };
+    delete incomplete[key];
+    assert.equal(valid(hostedReceipt, origin, now, incomplete), false, key);
+  }
+});
+
+test("isolation claims refuse stronger guarantees than the source boundary", () => {
+  const facts = JSON.parse(readFileSync(new URL("../website/elastos/claims.json", import.meta.url)));
+  assert.equal(validIsolationClaims(facts.isolation), true);
+  for (const [key, value] of Object.entries({ apps: "all-wasm", home: "delegation-only", providers: "fully-confined", stolen_device_key: "same-identity-recovery", stored_keys: "hardware-protected", seed_operator: "cannot-read", proof: "live-accepted" })) {
+    assert.equal(validIsolationClaims({ ...facts.isolation, [key]: value }), false, key);
+  }
+  assert.equal(validIsolationClaims({ ...facts.isolation, fully_isolated: true }), false);
 });

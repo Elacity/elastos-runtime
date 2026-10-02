@@ -4,6 +4,42 @@
 
 If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
 
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
+
+## Trust and stored keys
+
+Runtime trusts its own operating-system account and root. Code with either
+account's access can use the stored keys. The user's browser, extensions,
+physical access, a stolen Recovery Kit or passkey authenticator, and hardware
+key protection are outside this isolation claim. A stolen device or profile key
+requires a new identity. Independent code review remains a development gate.
+
+Keys are stored next to the data they protect. Full data-home backups include
+all keys. The seed operator can read data, wallet keys and recovery phrases
+stored on the seed. Encryption on that server does not isolate these secrets
+from its operator. Keep sensitive data on a Home whose operator you trust.
+
 ## Open Findings
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
@@ -47,7 +83,7 @@ the Carrier integration task is tracked in [deferred work](docs/DEFERRED_WORK.md
 
 ## Resolved Findings
 
-These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
+These findings are resolved in source but remain listed as security history because they shaped the runtime contract.
 
 ### I/O bridge parse-size check
 
@@ -61,13 +97,11 @@ not close the read-time framing gap above.
 
 ## Architecture
 
-The runtime enforces a capability-based security model:
-
-- **Capsules** run sandboxed (WASM or microVM) with zero ambient authority
-- **Capability tokens** are Ed25519-signed by the runtime and validated on every resource access
-- **12-point token validation** covers version, signature, issuer, caller, action, resource, epoch, revocation, timing, use-count, and classification
-- **Audit events** are emitted at every security-critical operation
-- **Carrier** authenticates transport endpoints. Runtime verifies product
-  identity and signed message authority before exposing typed app projections.
+Runtime validates signed capability tokens against the caller, action,
+resource, epoch, revocation and token constraints. It checks principal and
+session authority separately. Carrier authenticates transport endpoints;
+Runtime verifies product identity and signed message authority before exposing
+typed app projections. These checks complement the current browser boundary
+and do not establish provider process confinement or a separate Home authority.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full trust model.

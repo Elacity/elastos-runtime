@@ -4,9 +4,33 @@ ElastOS is a local-first runtime for Apps and services. Runtime checks the
 authority of each caller before allowing an effect. People sign in to Home
 with passkeys.
 
-For released versions, supported installation targets and known limitations,
-see [state.md](state.md). A source checkout and a published installation have
+For release history, see [elastos/CHANGELOG.md](elastos/CHANGELOG.md).
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own current
+acceptance and verification. A source checkout and a published installation have
 separate artifact identities and verification records.
+
+## Current isolation and target boundary
+
+Apps run as web projections in the browser's opaque sandboxed frames. Runtime
+checks their capability tokens before it performs an effect. Home can currently
+obtain every app's capability, so a compromised Home can reach those apps'
+authority. The target gives Home only delegation and gives each app a separate,
+revocable capability inside its frame. The web Terminal is disabled by default
+after the terminal gate is integrated. If an owner enables it, Terminal runs
+commands as the host user through a host process. Treat that choice as trusted
+operator access.
+
+Providers run as operating-system processes. Only the model provider is partly
+confined; a provider declaration does not prove host isolation. Complete provider
+confinement and Runtime-owned key custody are target behavior. Recovery from a
+stolen device key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe a source candidate. Accepted
+installation proof binds the exact Runtime, components and app assets to the
+journeys tested on that device. An installed version label alone proves neither
+artifact parity nor isolation. These statements require the content sandbox,
+front-door and disabled-terminal changes to be integrated and tested together.
 
 ## Install from the publisher
 
@@ -16,7 +40,9 @@ The public installer looks up signed releases for Linux x86_64/aarch64 and macOS
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-The installer installs Runtime, sets up the Home profile, and opens Home. Keep
+The source installer installs Runtime, sets up the Home profile, and opens Home.
+The published installer and signed release have their own acceptance evidence
+in GitHub issues. Keep
 the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
 later run `elastos` from a new shell. You do not need a separate `elastos serve`
 process for this path. Home is the user-facing front door to the managed
@@ -44,8 +70,9 @@ build, and capsule development. Run `just verify` before handing off a change.
 
 ## System model
 
-Runtime is the trusted core. Home and shells show state and collect intent, but
-they cannot grant themselves authority. Executable capsules request effects
+Runtime is the trusted core. Home and shells show state and collect intent.
+The target limits their authority to Runtime-approved delegation. Executable
+capsules request effects
 through typed Runtime resources. Components use ElastOS Bus. Web projections
 use narrow, capsule-scoped Runtime adapters. Both enter Runtime's authority and
 routing boundary. Runtime handles core operations directly and selects a
@@ -73,12 +100,13 @@ admission is a separate, node-local verification decision. See the
 
 ## Status and verification
 
-Use [state.md](state.md) as the authority for current behavior and known gaps.
-It distinguishes implemented behavior from source-only paths and unverified
-product claims. Browser source and proof tooling alone do not establish
+Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for current
+behavior, proof and open gaps. They distinguish source checks from accepted
+installed journeys. Browser source and proof tooling alone do not establish
 complete Browser product support.
 
-Use [TASKS.md](TASKS.md) for open work, [ROADMAP.md](ROADMAP.md) for future
+Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for open work,
+[ROADMAP.md](ROADMAP.md) for future
 direction, and [elastos/CHANGELOG.md](elastos/CHANGELOG.md) for release history.
 
 For command ownership across Home and operator lanes, see the [command
@@ -98,7 +126,7 @@ elastos-runtime/
 
 - [Getting started](docs/GETTING_STARTED.md): install, build, and create a capsule
 - [Documentation map](docs/README.md): complete guide and contract index
-- [State](state.md): verified behavior and known gaps
+- [Isolation plan](https://github.com/Elacity/elastos-runtime/issues/173): current boundaries and acceptance gates
 - [Principles](PRINCIPLES.md): decision constraints
 - [Architecture](docs/ARCHITECTURE.md): trust and responsibility boundaries
 - [Capsule authoring](docs/CAPSULE_AUTHORING.md): supported Component and web-projection paths
