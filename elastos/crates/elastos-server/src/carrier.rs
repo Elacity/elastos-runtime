@@ -10503,6 +10503,14 @@ pub(crate) mod tests {
                     .unwrap();
                 send.write_all(bytes).await.unwrap();
                 send.finish().unwrap();
+                if index == 4 {
+                    // Keep the final fixture connection alive until its queued
+                    // reply has reached the owner's borrowed client.
+                    tokio::time::timeout(Duration::from_secs(2), send.stopped())
+                        .await
+                        .expect("owner reply must finish before fixture connection release")
+                        .ok();
+                }
                 if index < 4 {
                     assert!(matches!(
                         conn.closed().await,
