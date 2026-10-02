@@ -673,7 +673,6 @@ async fn test_concurrent_release_reads_wait_health_works_and_scan_once() {
 async fn test_cached_publication_tamper_refused_until_new_receipt_commit() {
     use super::super::gateway_site::ReleaseReadGate;
     for name in [
-        "release-head.json",
         "release.json",
         "install.sh",
         "artifacts/elastos-aarch64-darwin",
@@ -736,6 +735,58 @@ async fn test_cached_publication_tamper_refused_until_new_receipt_commit() {
             2
         );
     }
+}
+
+#[tokio::test]
+async fn test_receipt_before_head_refusal_recovers_on_final_head_commit() {
+    use super::super::gateway_site::ReleaseReadGate;
+    let old = SignedGatewayPublication::new();
+    let new = SignedGatewayPublication::new();
+    let gate = ReleaseReadGate::new();
+    let app = publication_test_router(&old, gate.clone());
+    let request = || {
+        Request::builder()
+            .uri("/release-head.json")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    for name in [
+        "release.json",
+        "install.sh",
+        "publish-state.json",
+        "artifacts/elastos-aarch64-darwin",
+        "artifacts/components-aarch64-darwin.json",
+        "artifacts/home.tar.gz",
+    ] {
+        std::fs::copy(new.root.join(name), old.root.join(name)).unwrap();
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_eq!(
+        gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    let staged_head = old.root.join("next-head.json");
+    std::fs::write(&staged_head, &new.head).unwrap();
+    std::fs::rename(staged_head, old.root.join("release-head.json")).unwrap();
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), new.head.as_slice());
+    assert_eq!(
+        gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
 }
 
 #[tokio::test]

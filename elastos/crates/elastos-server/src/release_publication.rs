@@ -48,8 +48,8 @@ pub struct Publication {
     root_path: PathBuf,
     _root: File,
     _artifact_directory: File,
-    root_stamp: StatStamp,
-    artifact_directory_stamp: StatStamp,
+    root_stamp: DirectoryStamp,
+    artifact_directory_stamp: DirectoryStamp,
     metadata_files: [AdmittedMetadata; 3],
     published: bool,
     version: String,
@@ -255,6 +255,12 @@ impl Publication {
             artifacts,
         };
         publication.unchanged()?;
+        if !published {
+            ensure!(
+                directory_names(&publication._artifact_directory)? == names,
+                "flat publication namespace changed"
+            );
+        }
         Ok(publication)
     }
 
@@ -337,10 +343,21 @@ impl Publication {
             );
         }
         self.held_unchanged()?;
+        let root = directory(&self.root_path)?;
         ensure!(
-            directory_stamp(&directory(&self.root_path)?)? == self.root_stamp,
+            directory_stamp(&root)? == self.root_stamp,
             "publication root changed during check"
         );
+        if self.published {
+            ensure!(
+                directory_stamp(&open_at(
+                    &root,
+                    "artifacts",
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                )?)? == self.artifact_directory_stamp,
+                "publication artifact directory changed during check"
+            );
+        }
         Ok(())
     }
 
@@ -743,10 +760,27 @@ fn stamp(file: &File) -> Result<StatStamp> {
     Ok(StatStamp::from_metadata(&m))
 }
 
-fn directory_stamp(file: &File) -> Result<StatStamp> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryStamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn directory_stamp(file: &File) -> Result<DirectoryStamp> {
     let m = file.metadata()?;
     ensure!(m.is_dir(), "publication directory type changed");
-    Ok(StatStamp::from_metadata(&m))
+    // Publisher bookkeeping and historical entries share these directories;
+    // directory ownership and identity bind the signed files' namespace.
+    Ok(DirectoryStamp {
+        dev: m.dev(),
+        ino: m.ino(),
+        mode: m.mode(),
+        uid: m.uid(),
+        gid: m.gid(),
+    })
 }
 
 fn admitted_metadata(dir: &File, name: &str, limit: u64) -> Result<(AdmittedMetadata, Vec<u8>)> {
@@ -1081,6 +1115,36 @@ mod tests {
         assert_eq!(STREAM_READS.with(|reads| reads.get()), reads);
         publication.read_verified_artifact("home.tar.gz").unwrap();
         assert!(STREAM_READS.with(|reads| reads.get()) > reads);
+    }
+
+    #[test]
+    fn published_cache_accepts_ledger_updates_and_unadvertised_history_without_hash_reads() {
+        let fixture = PublicPublicationFixture::new();
+        let output = fixture.parent.join("published");
+        fixture.open().unwrap().snapshot_into(&output).unwrap();
+        let publication = Publication::open_published(&output, &fixture.did).unwrap();
+        let reads = STREAM_READS.with(|reads| reads.get());
+        let ledger = output.join("release-ledger.json");
+        std::fs::write(&ledger, br#"{"receipts":[]}"#).unwrap();
+        publication.unchanged_published().unwrap();
+        let next_ledger = output.join("release-ledger.next");
+        std::fs::write(&next_ledger, br#"{"receipts":["public receipt"]}"#).unwrap();
+        std::fs::rename(&next_ledger, &ledger).unwrap();
+        std::fs::write(
+            output.join("artifacts/historical-runtime"),
+            b"public historical bytes",
+        )
+        .unwrap();
+        publication.unchanged_published().unwrap();
+        assert_eq!(STREAM_READS.with(|reads| reads.get()), reads);
+        assert_eq!(
+            publication.read_verified_artifact("home.tar.gz").unwrap(),
+            b"public qualified support archive"
+        );
+        assert!(STREAM_READS.with(|reads| reads.get()) > reads);
+        assert!(publication
+            .read_verified_artifact("historical-runtime")
+            .is_err());
     }
 
     #[test]

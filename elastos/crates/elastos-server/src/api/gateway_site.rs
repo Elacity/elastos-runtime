@@ -13,7 +13,7 @@ struct PublicationReceipt {
     last_version: String,
 }
 
-// A receipt commit admits one verified snapshot. Later reads check identities
+// A receipt and final head admit one verified snapshot. Later reads check identities
 // and hash only the requested artifact. Concurrent requests wait their turn.
 #[derive(Clone)]
 pub(super) struct ReleaseReadGate {
@@ -54,19 +54,22 @@ fn receipt_stamp(metadata: &std::fs::Metadata) -> ReceiptStamp {
 struct PublicationKey {
     root_path: std::path::PathBuf,
     receipt_stamp: ReceiptStamp,
+    head_stamp: ReceiptStamp,
 }
 
 struct PublicationContext {
     key: PublicationKey,
     receipt: PublicationReceipt,
     receipt_file: File,
+    head_file: File,
 }
 
 struct CachedPublication {
     key: PublicationKey,
     // Retaining the receipt descriptor prevents inode reuse for this cache key.
     _receipt_file: File,
-    // A changed snapshot stays refused until the publisher commits its receipt.
+    _head_file: File,
+    // A changed snapshot stays refused until the receipt or final head changes.
     publication: Option<Publication>,
 }
 
@@ -152,13 +155,23 @@ fn publication_context(data_dir: &std::path::Path) -> Result<PublicationContext,
             "unsafe publisher root"
         );
         let (receipt, receipt_file, stamp) = read_publication_receipt(&root)?;
+        // Receipt promotion precedes the head. Its final identity activates the
+        // new set even when a request refused the intermediate mixed snapshot.
+        let head_file = publication_open_at(&root, "release-head.json", false)?;
+        let head = head_file.metadata()?;
+        anyhow::ensure!(
+            head.is_file() && head.nlink() == 1 && head.len() > 0 && head.len() <= 256 * 1024,
+            "unsafe publication head"
+        );
         Ok(PublicationContext {
             key: PublicationKey {
                 root_path,
                 receipt_stamp: stamp,
+                head_stamp: receipt_stamp(&head),
             },
             receipt,
             receipt_file,
+            head_file,
         })
     })();
     validated.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
@@ -214,6 +227,7 @@ async fn signed_release_response(
             *cache = Some(CachedPublication {
                 key: context.key,
                 _receipt_file: context.receipt_file,
+                _head_file: context.head_file,
                 publication,
             });
         }
