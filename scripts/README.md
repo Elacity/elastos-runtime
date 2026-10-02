@@ -251,16 +251,30 @@ publication host imports that frozen output and announces it through Carrier.
 Each host has a separate account and role; the publication host receives the
 public DID and signed files.
 
+The key-free builder checks that the prepared Runtime's `--version` prints
+exactly `elastos VERSION` on stdout with empty stderr, and records its hash.
+Candidate executables run in that builder account; the custodian receives
+inert files. Pin the publication Runtime and provider paths and hashes, and
+retain the reviewed source checkout that supplies the Runtime's compiled-in
+helper paths. Use isolated builder and publication accounts with approved
+state; unsigned preparation also imports files through its selected provider.
+
 For a canary on Apple silicon, the builder can prepare one qualified native
 input. Run this from the reviewed source checkout, with an absent output
 directory outside it:
 
 ```sh
-elastos publish-release --version VERSION --channel canary \
+ELASTOS_PUBLISHER_GATEWAY=https://staging.example.invalid \
+ELASTOS_PUBLISHER_NODE_ID=HOLDER_NODE_ID \
+ELASTOS_SOURCE_CONNECT_TICKET=HOLDER_TICKET \
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
   --platform-input aarch64-darwin=/path/to/native-input \
   --preview-platform aarch64-darwin --prepare-only /path/to/unsigned-input \
-  --publisher-did DID
+  --publisher-did DID --ipfs-provider-bin /path/to/qualified-ipfs-provider
 ```
+
+Select the staging HTTPS origin and public holder node/ticket before preparation;
+the same installer stamps remain fixed across the two staged versions.
 
 The resulting `signing-input.json` binds the source commit/tree, artifact
 hashes, sizes and CIDs, release data and public installer stamps. The operator
@@ -295,23 +309,25 @@ The tool verifies the pinned remote `develop` head and candidate ancestry for
 canary, or the approved remote version tag and `main` ancestry for the other
 channels. A moved `develop` head requires a fresh operator policy approval.
 The tool reads candidate files as data and asks the operator to confirm the
-source before signing. It fetches the installer template from that approved
-tree. Its frozen installer keeps `HEAD_CID` empty to avoid a hash cycle; the signed head binds the final
+complete public signer DID before signing. It fetches the installer template
+from that approved tree. Its frozen installer keeps `HEAD_CID` empty to avoid
+a hash cycle; the signed head binds the final
 release CID and installer hash. Carrier holder identity and ticket remain
 public transport inputs, separate from the signer identity.
 
 On the publication host, inspect the frozen set before committing it:
 
 ```sh
-elastos publish-release --version VERSION --channel canary \
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
   --signed-publication /path/to/new-signed-set --publisher-did DID --dry-run
-elastos publish-release --version VERSION --channel canary \
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
   --signed-publication /path/to/new-signed-set --publisher-did DID \
   --ipfs-provider-bin /path/to/qualified-ipfs-provider
 ```
 
 A saved pin change requires `--allow-signer-rotation` and confirmation of the
-complete public DID. Runtime verifies signatures, exact artifact hashes and
+complete public DID. Include the flag in both the dry-run and import commands
+when the saved pin changes. Runtime verifies signatures, exact artifact hashes and
 imported CIDs, promotes the public pin and files before the head, and restores
 the prior set if promotion fails. A complete rollback removes the backup links
 and commits the original signed head again, so cached HTTP reads can admit the
