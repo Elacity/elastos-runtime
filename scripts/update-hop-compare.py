@@ -978,6 +978,31 @@ def cli_refusal(case, command, stdout, stderr, unchanged):
             "boundary": boundary, "preserved": unchanged, **command}
 
 
+def cli_holder_node_id(did):
+    """Decode canonical did:key spelling to Carrier key bytes; Runtime validates keys."""
+    error = "holder DID requires one canonical Ed25519 did:key encoding"
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    need(isinstance(did, str) and len(did) == 56 and did.startswith("did:key:z6Mk")
+         and all(char in alphabet for char in did[9:]), error)
+    number = 0
+    for char in did[9:]:
+        number = number * 58 + alphabet.index(char)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    need(len(raw) == 34 and raw[:2] == b"\xed\x01", error)
+    return raw[2:].hex()
+
+
+def cli_holder_bootstrap(current, node_id):
+    need(isinstance(current, dict) and current.get("schema") == "elastos.carrier.bootstrap/v1"
+         and current.get("transport") == "carrier" and current.get("role") == "publisher"
+         and current.get("node_id") == node_id, "holder transport identity differs")
+    ticket = current.get("ticket")
+    need(isinstance(ticket, str) and 0 < len(ticket) <= 65536
+         and re.fullmatch(r"[a-zA-Z2-7]+", ticket) and len(ticket) % 8 in (0, 2, 4, 5, 7),
+         "holder ticket encoding invalid")
+    # Runtime owns ticket decoding and authenticated Carrier connection checks.
+
+
 def cli_run(config, output):
     manifest = cli_admit(config)
     root = Path(config["root"])
@@ -998,7 +1023,7 @@ def cli_run(config, output):
     installer = cli_path(root, manifest["installer"])
     host, bootstrap, port, installer_bootstrap, carrier_port = None, None, None, None, None
     holder_config = holder_data / "config.toml"
-    holder_labels = []
+    holder_labels, holder_config_text = [], None
 
     def command(home_path, args, label):
         return processes.command([str(home_path / ".local/bin/elastos"), *args],
@@ -1041,9 +1066,7 @@ def cli_run(config, output):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(f"http://127.0.0.1:{port}/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=5) as response:
             current = json.load(response)
-        need(current["schema"] == "elastos.carrier.bootstrap/v1" and current["role"] == "publisher"
-             and current["did"] == holder_did and current["did"] != manifest["signer_did"]
-             and current["ticket"] and re.fullmatch(r"[0-9a-f]{64}", current["node_id"]), "holder transport identity differs")
+        cli_holder_bootstrap(current, holder_node_id)
         if bootstrap is not None:
             need(current["node_id"] == bootstrap["node_id"], "holder node changed between phases")
         bootstrap = current
@@ -1093,7 +1116,9 @@ def cli_run(config, output):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.bind(("127.0.0.1", 0))
             carrier_port = probe.getsockname()[1]
-        holder_config.write_text('carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n')
+        holder_config_text = ('carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n'
+                              'gateway_public_publisher_bootstrap = true\n')
+        holder_config.write_text(holder_config_text)
         holder_config.chmod(0o600)
         track(holder, manifest["holder"]["files"])
         kubo_env = cli_environment(holder)
@@ -1104,6 +1129,7 @@ def cli_run(config, output):
         identity = command(holder, ["node", "info", "--json"], "holder-identity")
         need(identity["exit"] == 0, "disposable holder identity failed")
         holder_did = cli_json(output / "holder-identity.stdout")["did"]
+        holder_node_id = cli_holder_node_id(holder_did)
         need(holder_did != manifest["signer_did"], "holder and signer identities coincide")
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
@@ -1183,7 +1209,7 @@ def cli_run(config, output):
             need(digest(root / "manifest.json") == config["immutable"]["sha256"], "manifest changed during run")
             need(lock_state(holder_data / "host-process.lock") != "held" and (port is None or not health(port)), "holder remains active after cleanup")
             if carrier_port is not None:
-                need(holder_config.read_text() == 'carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n',
+                need(holder_config.read_text() == holder_config_text and holder_config.stat().st_mode & 0o777 == 0o600,
                      "holder transport configuration changed")
         except (OSError, ValueError, KeyError) as error:
             result["cleanup"]["errors"].append(cli_safe_error(error))

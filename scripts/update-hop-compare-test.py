@@ -19,6 +19,58 @@ observer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(observer)
 
 
+HOLDER_NODE = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+
+
+def public_did(key):
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    number, encoded = int.from_bytes(b"\xed\x01" + key, "big"), ""
+    while number:
+        number, digit = divmod(number, 58)
+        encoded = alphabet[digit] + encoded
+    return "did:key:z" + encoded
+
+
+HOLDER_DID = public_did(bytes.fromhex(HOLDER_NODE))
+
+
+def public_ticket(node=HOLDER_NODE):
+    document = {"topic": None, "endpoints": [{"id": node, "addrs": [{"Ip": "127.0.0.1:4433"}]}]}
+    return base64.b32encode(json.dumps(document).encode()).decode().lower().rstrip("=")
+
+
+class HolderTransportTests(unittest.TestCase):
+    def test_canonical_public_did_derives_carrier_node_bytes(self):
+        self.assertEqual(observer.cli_holder_node_id(HOLDER_DID), HOLDER_NODE)
+        # A second public RFC 8032 vector exercises the other compressed sign bit.
+        node = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+        self.assertEqual(observer.cli_holder_node_id(public_did(bytes.fromhex(node))), node)
+
+    def test_canonical_did_refuses_aliases_wrong_codec_and_malformed_encoding(self):
+        values = [None, {}, "did:key:holder", HOLDER_DID + "1", HOLDER_DID.replace("z6Mk", "z6Mm"),
+                  HOLDER_DID[:-1] + "0", "did:key:z1" + HOLDER_DID[9:],
+                  public_did(bytes.fromhex(HOLDER_NODE)[:-1]), public_did(bytes.fromhex(HOLDER_NODE) + b"\0")]
+        for value in values:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "canonical Ed25519"):
+                observer.cli_holder_node_id(value)
+
+    def test_public_bootstrap_shape_has_no_did_and_binds_owned_node(self):
+        public = {"schema": "elastos.carrier.bootstrap/v1", "transport": "carrier", "role": "publisher",
+                  "node_id": HOLDER_NODE, "ticket": public_ticket(), "generated_at": 1}
+        observer.cli_holder_bootstrap(public, HOLDER_NODE)
+        for key, value in [("schema", None), ("schema", "other"), ("transport", "other"), ("role", "runtime"),
+                           ("node_id", None), ("node_id", 123), ("node_id", "f" * 64), ("node_id", HOLDER_NODE.upper()),
+                           ("ticket", None), ("ticket", 123), ("ticket", ""), ("ticket", "invalid-ticket"),
+                           ("ticket", "a"), ("ticket", "a" * 65537)]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                observer.cli_holder_bootstrap({**public, key: value}, HOLDER_NODE)
+        for key in ("schema", "transport", "role", "node_id", "ticket"):
+            missing = dict(public)
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                observer.cli_holder_bootstrap(missing, HOLDER_NODE)
+
+
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
         self.config = {"old": {"version": "0.7.1-rc.1"},
@@ -383,10 +435,13 @@ class CliFixtureTests(unittest.TestCase):
             self.assertEqual(observer.cli_refusal("tampered-binary", {"exit": code}, "Downloading binary", "SHA-256 mismatch", unchanged)["status"], "failed")
         self.assertEqual(observer.cli_refusal("tampered-binary", failure, "Downloading binary\nDownloading components", "SHA-256 mismatch", True)["status"], "failed")
 
-    def fake_run(self, apply_stderr="", bootstrap_did="did:key:holder", cleanup_error=False,
-                 holder_stderr="", holder_shutdown_stderr="", http_fallback=False):
+    def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
+                 cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
+                 config_drift=False):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
+        bootstrap_calls = 0
+        initial_holder_config = None
         def phase():
             actual = observer.digest(holder_data / observer.CLI_PUBLISHER / "release-head.json")
             return next(name for name, pub in manifest["publications"].items() if manifest["files"][pub["head"]]["sha256"] == actual)
@@ -398,8 +453,8 @@ class CliFixtureTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((root / pub[key]).read_bytes())
             if first:
-                source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": "fixture-ticket",
-                          "publisher_node_id": "f" * 64, "install_path": str(home_path / ".local/bin/elastos"), "installed_version": manifest[name]["version"], "head_cid": "", "gateways": [gateway]}
+                source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": public_ticket(),
+                          "publisher_node_id": HOLDER_NODE, "install_path": str(home_path / ".local/bin/elastos"), "installed_version": manifest[name]["version"], "head_cid": "", "gateways": [gateway]}
                 observer.write(directory / "sources.json", {"default_source": "default", "sources": [source]})
             else:
                 sources = observer.read(directory / "sources.json")
@@ -407,6 +462,7 @@ class CliFixtureTests(unittest.TestCase):
                 observer.write(directory / "sources.json", sources)
         class Process:
             def __init__(self, argv, **kwargs):
+                nonlocal initial_holder_config
                 self.argv, self.home = argv, Path(kwargs["cwd"])
                 self.stderr = kwargs["stderr"]
                 self.pid, self.returncode = 20000 + len(processes), 0
@@ -415,13 +471,23 @@ class CliFixtureTests(unittest.TestCase):
                 stdout, stderr = "", ""
                 args = argv[1:]
                 if args[0] == "gateway":
+                    config = (holder_data / "config.toml").read_text()
+                    # Model the actual public-bootstrap gate; mocks cannot supply it for free.
+                    if 'gateway_public_publisher_bootstrap = true\n' not in config:
+                        raise ValueError("public publisher bootstrap is disabled")
+                    if initial_holder_config is None:
+                        initial_holder_config = config
+                    elif config != initial_holder_config:
+                        raise ValueError("holder transport configuration changed")
                     self.returncode = None
                     stderr = holder_stderr
+                    if config_drift:
+                        (holder_data / "config.toml").write_text(config + "# changed\n")
                 elif args[:2] == ["node", "info"]:
                     key = self.home / observer.CLI_DATA / "identity/device.key"
                     key.parent.mkdir(parents=True, exist_ok=True)
                     key.write_bytes(b"observer fake identity bytes only")
-                    stdout = json.dumps({"did": "did:key:holder" if self.home.name == "holder" else "did:key:consumer"})
+                    stdout = json.dumps({"did": local_did if self.home.name == "holder" else "did:key:consumer"})
                 elif argv[0].endswith("/kubo"):
                     Path(kwargs["env"]["IPFS_PATH"]).mkdir(parents=True)
                 elif argv[0] == "/bin/bash" or args[0] == "update":
@@ -474,6 +540,14 @@ class CliFixtureTests(unittest.TestCase):
             if cleanup_error:
                 raise OSError("fixture process census unavailable")
             return [{"pid": proc.pid, "parent": 0, "group": proc.pid, "command": " ".join(proc.argv)} for proc in processes if proc.poll() is None]
+        def bootstrap_response(*args, **kwargs):
+            nonlocal bootstrap_calls
+            bootstrap_calls += 1
+            fields = restart_fields if bootstrap_calls > 1 and restart_fields is not None else bootstrap_fields
+            # gateway_room.rs deliberately omits DID on its public publisher response.
+            return io.BytesIO(json.dumps({"schema": "elastos.carrier.bootstrap/v1", "transport": "carrier",
+                                         "role": "publisher", "ticket": public_ticket(), "node_id": HOLDER_NODE,
+                                         "generated_at": 1, **(fields or {})}).encode())
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(observer, "cli_admit", return_value=manifest))
             stack.enter_context(patch.object(observer.subprocess, "Popen", Process))
@@ -484,7 +558,7 @@ class CliFixtureTests(unittest.TestCase):
             stack.enter_context(patch.object(observer, "health", side_effect=lambda _: any(proc.poll() is None for proc in processes)))
             stack.enter_context(patch.object(observer, "lock_state", side_effect=lambda _: "held" if any(proc.poll() is None for proc in processes) else "released"))
             opener = stack.enter_context(patch.object(observer.urllib.request, "build_opener"))
-            opener.return_value.open.side_effect = lambda *args, **kwargs: io.BytesIO(json.dumps({"schema": "elastos.carrier.bootstrap/v1", "role": "publisher", "did": bootstrap_did, "ticket": "fixture-ticket", "node_id": "f" * 64}).encode())
+            opener.return_value.open.side_effect = bootstrap_response
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = observer.cli_run(self.config, self.root / "results")
         return code, calls, observer.read(self.root / "results/result.json")
@@ -499,8 +573,11 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(all(entry["clean"] for entry in result["holder_output"]))
         self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
         holder_config = self.root / "results/homes/holder" / observer.CLI_DATA / "config.toml"
-        self.assertRegex(holder_config.read_text(), r'^carrier_bind_addr = "127\.0\.0\.1:[1-9][0-9]*"\n$')
+        self.assertRegex(holder_config.read_text(), r'^carrier_bind_addr = "127\.0\.0\.1:[1-9][0-9]*"\ngateway_public_publisher_bootstrap = true\n$')
         self.assertEqual(holder_config.stat().st_mode & 0o777, 0o600)
+        holder_identity = next(index for index, (argv, _) in enumerate(calls) if argv[1:] == ["node", "info", "--json"])
+        first_gateway = next(index for index, (argv, _) in enumerate(calls) if argv[1] == "gateway")
+        self.assertLess(holder_identity, first_gateway)
         updates = [argv[1:] for argv, _ in calls if argv[1] == "update"]
         self.assertEqual(updates[:3], [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
         self.assertEqual(updates[3:], [["update", "--yes"]] * 3)
@@ -510,11 +587,48 @@ class CliFixtureTests(unittest.TestCase):
             self.assertTrue(set(observer.CLI_REFUSALS) <= set(result["paths"][selector]["checks"]))
 
     def test_holder_identity_mismatch_stops_before_install_and_cleans_up(self):
-        code, calls, result = self.fake_run(bootstrap_did="did:key:unowned")
+        code, calls, result = self.fake_run(bootstrap_fields={"node_id": "f" * 64})
         self.assertEqual(code, 1)
         self.assertFalse(any(argv[0] == "/bin/bash" for argv, _ in calls))
         self.assertIn("transport identity", result["failure"])
         self.assertTrue(result["cleanup"]["passed"])
+
+    def test_malformed_local_did_stops_before_gateway_and_cleans_up(self):
+        code, calls, result = self.fake_run(local_did="did:key:holder")
+        self.assertEqual(code, 1)
+        self.assertFalse(any(argv[0] == "/bin/bash" or argv[1] == "gateway" for argv, _ in calls))
+        self.assertIn("canonical Ed25519", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_release_signer_cannot_be_the_owned_holder_identity(self):
+        self.manifest["signer_did"] = HOLDER_DID
+        self.freeze()
+        code, calls, result = self.fake_run()
+        self.assertEqual(code, 1)
+        self.assertFalse(any(argv[0] == "/bin/bash" or argv[1] == "gateway" for argv, _ in calls))
+        self.assertIn("holder and signer identities coincide", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_holder_node_drift_stops_after_install_before_update_and_cleans_up(self):
+        code, calls, result = self.fake_run(restart_fields={"node_id": "f" * 64, "ticket": public_ticket("f" * 64)})
+        self.assertEqual(code, 1)
+        self.assertTrue(any(argv[0] == "/bin/bash" for argv, _ in calls))
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertIn("transport identity", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_malformed_holder_ticket_after_restart_stops_before_update_and_cleans_up(self):
+        code, calls, result = self.fake_run(restart_fields={"ticket": ""})
+        self.assertEqual(code, 1)
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertIn("ticket encoding", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_holder_config_drift_cannot_pass_cleanup(self):
+        code, _, result = self.fake_run(config_drift=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(result["cleanup"]["passed"])
+        self.assertIn("holder transport configuration changed", result["cleanup"]["errors"])
 
     def test_fixture_cannot_override_observer_owned_holder_transport(self):
         relative = self.add("holder-config.toml", b'carrier_bind_addr = "0.0.0.0:4433"\n')
