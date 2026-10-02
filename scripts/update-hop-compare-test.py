@@ -493,9 +493,14 @@ class CliFixtureTests(unittest.TestCase):
         code, calls, result = self.fake_run()
         self.assertEqual(code, 0, result)
         self.assertEqual(result["proof_kind"], "harness-self-test")
+        self.assertEqual(result["signer_did"], self.manifest["signer_did"])
+        self.assertEqual(result["channel"], self.manifest["channel"])
         self.assertTrue(result["cleanup"]["passed"])
         self.assertTrue(all(entry["clean"] for entry in result["holder_output"]))
         self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+        holder_config = self.root / "results/homes/holder" / observer.CLI_DATA / "config.toml"
+        self.assertRegex(holder_config.read_text(), r'^carrier_bind_addr = "127\.0\.0\.1:[1-9][0-9]*"\n$')
+        self.assertEqual(holder_config.stat().st_mode & 0o777, 0o600)
         updates = [argv[1:] for argv, _ in calls if argv[1] == "update"]
         self.assertEqual(updates[:3], [["update", "--check"], ["update", "--yes"], ["update", "--yes"]])
         self.assertEqual(updates[3:], [["update", "--yes"]] * 3)
@@ -509,6 +514,16 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(any(argv[0] == "/bin/bash" for argv, _ in calls))
         self.assertIn("transport identity", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_fixture_cannot_override_observer_owned_holder_transport(self):
+        relative = self.add("holder-config.toml", b'carrier_bind_addr = "0.0.0.0:4433"\n')
+        self.manifest["holder"]["files"][observer.CLI_DATA + "/config.toml"] = relative
+        self.freeze()
+        code, calls, result = self.fake_run()
+        self.assertEqual(code, 1)
+        self.assertIn("transport configuration", result["failure"])
+        self.assertFalse(any(argv[0] == "/bin/bash" or argv[1] == "gateway" for argv, _ in calls))
         self.assertTrue(result["cleanup"]["passed"])
 
     def test_zero_exit_with_endpoint_drop_and_cleanup_failure_cannot_pass(self):

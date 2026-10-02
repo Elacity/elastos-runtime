@@ -986,6 +986,7 @@ def cli_run(config, output):
     processes = CliProcesses(output)
     result = {"schema": "elastos.update-hop.result/v1", "mode": CLI_MODE,
               "proof_kind": manifest["proof_kind"], "approval": manifest["approval"],
+              "signer_did": manifest["signer_did"], "channel": manifest["channel"],
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
@@ -995,7 +996,8 @@ def cli_run(config, output):
     holder_data = holder / CLI_DATA
     holder_bin = holder / ".local/bin/elastos"
     installer = cli_path(root, manifest["installer"])
-    host, bootstrap, port, installer_bootstrap = None, None, None, None
+    host, bootstrap, port, installer_bootstrap, carrier_port = None, None, None, None, None
+    holder_config = holder_data / "config.toml"
     holder_labels = []
 
     def command(home_path, args, label):
@@ -1087,6 +1089,12 @@ def cli_run(config, output):
         holder_mapping = manifest["holder"]["files"]
         binaries = {target: relative for target, relative in holder_mapping.items() if "/ipfs-repo/" not in target}
         cli_copy(root, manifest, binaries, holder)
+        need(not holder_config.exists(), "holder fixture must leave transport configuration to the observer")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            carrier_port = probe.getsockname()[1]
+        holder_config.write_text('carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n')
+        holder_config.chmod(0o600)
         track(holder, manifest["holder"]["files"])
         kubo_env = cli_environment(holder)
         kubo_env["IPFS_PATH"] = str(holder_data / "ipfs-repo")
@@ -1174,6 +1182,9 @@ def cli_run(config, output):
             cli_inventory(root, manifest)
             need(digest(root / "manifest.json") == config["immutable"]["sha256"], "manifest changed during run")
             need(lock_state(holder_data / "host-process.lock") != "held" and (port is None or not health(port)), "holder remains active after cleanup")
+            if carrier_port is not None:
+                need(holder_config.read_text() == 'carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n',
+                     "holder transport configuration changed")
         except (OSError, ValueError, KeyError) as error:
             result["cleanup"]["errors"].append(cli_safe_error(error))
         result["cleanup"]["passed"] = not result["cleanup"]["errors"]
