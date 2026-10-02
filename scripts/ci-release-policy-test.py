@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Check CI release/cache decisions without builds, Docker, or publication."""
 import os
+import hashlib
+import json
 from pathlib import Path
 import re
+import runpy
+import signal
 import subprocess
+import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
@@ -38,7 +44,7 @@ def evaluate(expression, context):
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    expression = re.sub(r"(?:github|inputs|env|steps)\.[\w.-]+",
+    expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
     return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
 
@@ -61,7 +67,8 @@ CASES = [
 ]
 # Only pushes of merged code to these branches may write shared caches.
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
-NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false"}
+NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
+                "steps.engine-cache.outputs.cache-hit": "false"}
 
 
 def validate_cache_guards(source):
@@ -97,12 +104,61 @@ def validate_cache_guards(source):
                     raise AssertionError(f"cache guard permits uncached build in {job}")
 
 
+def validate_arm_package_dependency(source):
+    linux_steps = steps("source-home-linux", jobs(source))
+    package, = [step for step in linux_steps
+                if step.startswith("name: build and package release binaries\n")]
+    verify, = [step for step in linux_steps
+               if step.startswith("name: verify Jetson release compatibility\n")]
+    for event, ref, ref_type, override, _, _ in CASES:
+        for platform in ("ubuntu-24.04", "ubuntu-22.04-arm"):
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override,
+                       "matrix.os": platform}
+            if evaluate(field(verify, "if"), context) and not evaluate(field(package, "if"), context):
+                raise AssertionError("ARM compatibility check requires its packaged archive")
+
+
+def validate_installed_greeting_limit(source):
+    # Read the actual runs_create request's flat input literal; reject shape changes.
+    request, = re.findall(
+        r'(?ms)^  const created = await request\(assistant, "/api/provider/model/runs_create", \{\n'
+        r'(.*?)^  \}\);', source)
+    input_literal, = re.findall(r'input: \{([^{}]*)\}', request)
+    limits = re.findall(r'(?:^|,)\s*max_output_tokens:\s*([0-9]+)\s*(?=,|$)', input_literal)
+    if len(limits) != 1 or not 0 < int(limits[0]) <= 8:
+        raise AssertionError("installed greeting requires 1 through 8 output tokens")
+
+
 class ReleasePolicyTests(unittest.TestCase):
+    def test_package_guards_preserve_arm_proof_and_skip_other_pr_archives(self):
+        for job, platform in (("source-home-linux", "ubuntu-24.04"),
+                              ("source-home-linux", "ubuntu-22.04-arm"),
+                              ("source-home-macos", "macos-14")):
+            package, = [step for step in steps(job)
+                        if step.startswith("name: build and package release binaries\n")]
+            for event, ref, ref_type, override, _, _ in CASES:
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override,
+                           "matrix.os": platform}
+                with self.subTest(job=job, platform=platform, event=event, ref=ref):
+                    expected = event != "pull_request" or platform == "ubuntu-22.04-arm"
+                    self.assertEqual(evaluate(field(package, "if"), context), expected)
+
+    def test_arm_compatibility_always_has_its_archive(self):
+        validate_arm_package_dependency(SOURCE)
+
+    def test_skipping_the_arm_pr_archive_is_refused(self):
+        broken = SOURCE.replace("github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'",
+                                "github.event_name != 'pull_request'", 1)
+        with self.assertRaisesRegex(AssertionError, "requires its packaged archive"):
+            validate_arm_package_dependency(broken)
+
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 9)
+        self.assertEqual(len(caches), 11)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -120,7 +176,8 @@ class ReleasePolicyTests(unittest.TestCase):
                     for job, step in caches:
                         expected = cached and (job != "custody-harness-smoke" or should_run)
                         if "actions/cache/save@" in step:
-                            expected = expected and save
+                            expected = expected and (event == "push" and ref == "refs/heads/develop"
+                                                     if job == "engine-llama-arm64" else save)
                         self.assertEqual(evaluate(field(step, "if"), context), expected,
                                          f"cache guard in {job}")
 
@@ -173,11 +230,12 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_github_runners_check_names_and_release_dependencies_stay_fixed(self):
         expected = {
             "source-gate": ("source-gate", "ubuntu-24.04"),
+            "engine-llama-arm64": ("engine-llama-arm64", "ubuntu-24.04-arm"),
             "lint": ("lint", "ubuntu-24.04"),
             "test-elastos": ("test-elastos", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
-            "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
+            "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
@@ -186,11 +244,280 @@ class ReleasePolicyTests(unittest.TestCase):
             self.assertEqual(field(JOBS[job], "name"), name)
             self.assertEqual(field(JOBS[job], "runs-on"), runner)
         self.assertEqual(field(JOBS["source-home-linux"], "os"),
-                         "[ubuntu-24.04, ubuntu-24.04-arm]")
+                         "[ubuntu-24.04, ubuntu-22.04-arm]")
+        self.assertIn("          - os: ubuntu-22.04-arm\n"
+                      "            check_name: ubuntu-24.04-arm\n",
+                      JOBS["source-home-linux"])
         needs = JOBS["release"].split("    needs:\n", 1)[1].split("    permissions:\n", 1)[0]
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-capsules", "source-home-linux", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+    def test_engine_cache_has_exact_recipe_key_and_develop_only_writers(self):
+        restore, = [step for step in steps("engine-llama-arm64") if "actions/cache/restore@" in step]
+        save, = [step for step in steps("engine-llama-arm64") if "actions/cache/save@" in step]
+        self.assertEqual(field(restore, "key"), "${{ steps.engine-recipe.outputs.cache-key }}")
+        self.assertEqual(field(save, "key"), "${{ steps.engine-cache.outputs.cache-primary-key }}")
+        self.assertNotIn("restore-keys:", restore)
+        for event, ref, ref_type, override, cached, _ in CASES:
+            for hit in ("true", "false"):
+                context = {"github.event_name": event, "github.ref": ref,
+                           "env.CI_USE_CACHE": str(cached).lower(),
+                           "steps.engine-cache.outputs.cache-hit": hit}
+                self.assertEqual(evaluate(field(save, "if"), context),
+                                 cached and event == "push" and ref == "refs/heads/develop" and hit == "false")
+        self.assertEqual(field(JOBS["engine-llama-arm64"], "image"),
+                         field(JOBS["engine-llama-arm64"], "BUILD_CONTAINER_IMAGE"))
+        self.assertIn('apt-get install -y -qq --no-install-recommends "${tools[@]}"',
+                      JOBS["engine-llama-arm64"])
+        self.assertIn('read -r -a tools <<< "$ENGINE_BUILD_TOOLS"', JOBS["engine-llama-arm64"])
+
+    def test_engine_recipe_key_changes_with_source_container_or_tools(self):
+        recipe, = [step for step in steps("engine-llama-arm64") if "id: engine-recipe" in step]
+        script = textwrap.dedent(recipe.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scripts/build/build-llama-server-bundle.sh"
+            source.parent.mkdir(parents=True)
+            source.write_text("original flags")
+            output = root / "output"
+            env = {**os.environ, "GITHUB_OUTPUT": str(output),
+                   "BUILD_CONTAINER_IMAGE": "pinned-image", "ENGINE_BUILD_TOOLS": "pinned-tools"}
+            def key():
+                output.write_text("")
+                subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                               cwd=root, env=env, check=True)
+                return output.read_text()
+            original = key()
+            self.assertRegex(original, r"^cache-key=develop-llama-arm64-[0-9a-f]{64}\n$")
+            source.write_text("changed flags")
+            self.assertNotEqual(original, key())
+            source.write_text("original flags")
+            for name in ("BUILD_CONTAINER_IMAGE", "ENGINE_BUILD_TOOLS"):
+                previous = env[name]
+                env[name] += " changed"
+                self.assertNotEqual(original, key())
+                env[name] = previous
+            env["RECIPE_COMMIT"] = "changed checkout"
+            self.assertEqual(original, key())
+
+    def test_engine_build_receipt_uses_the_checked_out_recipe_commit(self):
+        build, = [step for step in steps("engine-llama-arm64") if "id: engine-build" in step]
+        self.assertIn('RECIPE_COMMIT="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)"', build)
+        self.assertIn('export RECIPE_COMMIT\n', build)
+        self.assertNotIn("RECIPE_COMMIT: ${{ github.sha }}", JOBS["engine-llama-arm64"])
+
+    def test_engine_consumers_gate_the_current_run_input_with_shared_pin(self):
+        self.assertEqual(field(JOBS["source-home-linux"], "needs"),
+                         "[source-gate, engine-llama-arm64]")
+        download, = [step for step in steps("source-home-linux") if "actions/download-artifact@" in step]
+        self.assertIn("name: llama-arm64-bundle", download)
+        self.assertNotIn("run-id:", download)
+        self.assertNotIn("36501810782", SOURCE)
+        verify = 'bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"'
+        for job in ("engine-llama-arm64", "source-home-linux"):
+            self.assertIn(verify, JOBS[job])
+        producer = steps("engine-llama-arm64")
+        gate = next(i for i, step in enumerate(producer) if verify in step)
+        saving = next(i for i, step in enumerate(producer) if "actions/cache/save@" in step)
+        self.assertLess(gate, saving)
+        self.assertNotIn("always()", producer[saving])
+        pin = field(SOURCE, "CI_LLAMA_ARM64_SHA256")
+        self.assertRegex(pin, r"^[0-9a-f]{64}$")
+        manifest = json.loads((WORKFLOW.parents[2] / "components.json").read_text())
+        component = manifest["external"]["llama-server"]["platforms"]["linux-arm64"]
+        if "checksum" in component:
+            self.assertEqual(component["checksum"], "sha256:" + pin)
+
+    def test_engine_archive_rejects_missing_malformed_and_wrong_ci_pins(self):
+        builder = WORKFLOW.parents[2] / "scripts/build/build-llama-server-bundle.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz").write_bytes(b"fixture engine")
+            correct = hashlib.sha256(b"fixture engine").hexdigest()
+            for checksum in (correct, "0" * 64, "", "untrusted", "md5:" + "0" * 64):
+                result = subprocess.run(["bash", str(builder), "--verify-archive", directory],
+                                        env={**os.environ, "CI_LLAMA_ARM64_SHA256": checksum},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, checksum == correct, result.stderr)
+
+    def test_engine_elf_validator_refuses_wrong_architecture_libraries_and_symbols(self):
+        source = (WORKFLOW.parents[2] / "scripts/build/build-llama-server-bundle.sh").read_text()
+        validator = source.split('> "$out/elf-verification.txt" <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("llama-server", "libllama.so"):
+                (root / name).write_bytes(b"\x7fELFfixture")
+            cases = [("AArch64", "$ORIGIN", "libc.so.6", "GLIBC_2.35", True),
+                     ("Advanced Micro Devices X86-64", "$ORIGIN", "libc.so.6", "GLIBC_2.35", False),
+                     ("AArch64", "/host", "libc.so.6", "GLIBC_2.35", False),
+                     ("AArch64", "$ORIGIN", "libmissing.so", "GLIBC_2.35", False),
+                     ("AArch64", "$ORIGIN", "libc.so.6", "GLIBC_2.36", False)]
+            for machine, runpath, library, version, accepted in cases:
+                def inspect(args, **kwargs):
+                    if args[0] == "ldd":
+                        return "resolved dependencies"
+                    if args[1] == "-h":
+                        return f"Class: ELF64\nMachine: {machine}\n"
+                    if args[1] == "-d":
+                        return f"(RUNPATH) [{runpath}]\n(NEEDED) [{library}]\n"
+                    return version
+                with mock.patch("sys.argv", ["validator", directory]), \
+                     mock.patch("subprocess.check_output", side_effect=inspect), \
+                     mock.patch("builtins.print"):
+                    if accepted:
+                        exec(compile(validator, "engine ELF validator", "exec"), {})
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(validator, "engine ELF validator", "exec"), {})
+
+
+class InstalledJourneyTests(unittest.TestCase):
+    def test_installed_greeting_has_a_small_explicit_output_allowance(self):
+        source = (WORKFLOW.parents[2] / "scripts/ci-installed-home-journey.mjs").read_text()
+        validate_installed_greeting_limit(source)
+
+    def test_missing_zero_and_oversized_greeting_allowances_are_refused(self):
+        source = (WORKFLOW.parents[2] / "scripts/ci-installed-home-journey.mjs").read_text()
+        allowance = "max_output_tokens: 8"
+        self.assertEqual(source.count(allowance), 1)
+        for replacement in ("", "max_output_tokens: 0", "max_output_tokens: 9",
+                            "max_output_tokens: 1024"):
+            with self.subTest(allowance=replacement), self.assertRaises(AssertionError):
+                validate_installed_greeting_limit(source.replace(allowance, replacement))
+
+    def fixture(self, root, platform):
+        home = root / "home"
+        data = home / ("Library/Application Support/elastos" if platform == "macos"
+                       else ".local/share/elastos")
+        evidence = root / "evidence"
+        (data / "bin").mkdir(parents=True)
+        (data / "receipts").mkdir()
+        evidence.mkdir()
+        runtime = data / "bin/elastos"
+        runtime.write_bytes(b"installed fixture Runtime")
+        (data / "bin/model-provider").write_bytes(b"installed fixture model provider")
+        receipt = {"source": {"commit": "c" * 40}, "runtime": {
+            "installed_sha256": "sha256:" + hashlib.sha256(runtime.read_bytes()).hexdigest()}}
+        (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+        (data / "components.json").write_text("{}")
+        return home, data, evidence, receipt
+
+    def execute(self, home, data, evidence, available=20):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        child = mock.Mock(pid=12345)
+        child.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+
+        def node_journey(*args, **kwargs):
+            (evidence / "home-journey.json").write_text(json.dumps({"results": {
+                "home_screenshots": "passed", "model_package_admission": "passed",
+                "installed_runtime_reply": "passed"}}))
+
+        with mock.patch.dict(os.environ, {"PATH": "/fixture-tools"}, clear=True), \
+                mock.patch.object(subprocess, "check_output", return_value="c" * 40 + "\n"), \
+                mock.patch.object(subprocess, "Popen", return_value=child) as gateway, \
+                mock.patch.object(subprocess, "run", side_effect=node_journey) as node, \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(os, "killpg") as stop, \
+                mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
+                    "capacity_bytes": 100, "available_bytes": available}}):
+            try:
+                journey["run"](home, data, evidence)
+            finally:
+                self.gateway, self.node, self.stop = gateway, node, stop
+        return child
+
+    def test_gateway_and_node_share_the_installed_fixture_root(self):
+        for platform in ("macos", "linux"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), platform)
+                child = self.execute(home, data, evidence)
+                self.assertEqual(self.gateway.call_args.args[0][:2],
+                                 [str(data / "bin/elastos"), "gateway"])
+                self.assertEqual(self.node.call_args.args[0][:2],
+                                 ["node", "scripts/ci-installed-home-journey.mjs"])
+                for process in (self.gateway, self.node):
+                    env = process.call_args.kwargs["env"]
+                    self.assertEqual(env["HOME"], str(home))
+                    self.assertEqual(Path(env["XDG_DATA_HOME"]) / "elastos", data)
+                    self.assertEqual(env["PATH"], "/fixture-tools")
+                self.stop.assert_called_once_with(child.pid, signal.SIGTERM)
+                child.wait.assert_called_once_with(timeout=15)
+                record = json.loads((evidence / "installed-journeys.json").read_text())
+                self.assertEqual(record["installed_model_provider_sha256"],
+                                 hashlib.sha256((data / "bin/model-provider").read_bytes()).hexdigest())
+
+    def test_receipt_hash_and_disk_refuse_launch(self):
+        for failure in ("receipt", "hash", "provider", "disk"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, receipt = self.fixture(Path(temp), "macos")
+                if failure == "receipt":
+                    receipt["source"]["commit"] = "d" * 40
+                    (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+                elif failure == "hash":
+                    (data / "bin/elastos").write_bytes(b"changed fixture Runtime")
+                elif failure == "provider":
+                    (data / "bin/model-provider").unlink()
+                expected = (RuntimeError if failure == "disk" else
+                            FileNotFoundError if failure == "provider" else AssertionError)
+                with self.assertRaises(expected):
+                    self.execute(home, data, evidence, available=11 if failure == "disk" else 20)
+                self.gateway.assert_not_called()
+                self.node.assert_not_called()
+                self.stop.assert_not_called()
+
+
+class InstalledModelTimingTests(unittest.TestCase):
+    def setUp(self):
+        self.timing = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-model-timing.py"))
+
+    def test_public_receipt_refuses_private_text_unknown_stages_and_invalid_times(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "private.log"
+            log.write_text("\n".join([
+                "[model-provider] local timing stage=engine_ready elapsed_ms=123",
+                "[model-provider] local timing stage=run_timeout elapsed_ms=120000",
+                "[model-provider] local timing stage=operator_secret elapsed_ms=1",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=1 private=/operator/key",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=3600001",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=-1",
+                "private model text and credentials",
+            ]))
+            self.assertEqual(self.timing["stage_timings"](log), [
+                {"stage": "engine_ready", "elapsed_ms": 123},
+                {"stage": "run_timeout", "elapsed_ms": 120000},
+            ])
+
+    def test_probe_refuses_wrong_alias_malformed_and_oversize_responses(self):
+        alias = "a" * 32
+        cases = [(json.dumps({"data": [{"id": alias}]}).encode(), "matching_alias"),
+                 (json.dumps({"data": [{"id": "b" * 32}]}).encode(), "wrong_alias"),
+                 (b"private malformed response", "unavailable"),
+                 (b"x" * 16385, "oversize")]
+        for body, expected in cases:
+            with self.subTest(expected=expected), mock.patch("socket.socket") as connect:
+                wire = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                connect.return_value.__enter__.return_value.recv.side_effect = [wire, b""]
+                self.assertEqual(self.timing["matching_alias"]("/owned.engine.sock", alias), expected)
+
+    def test_observer_refuses_unrelated_processes_and_foreign_engine_paths(self):
+        data = Path("/isolated/data/elastos")
+        engine = (f"{data}/libexec/llama-server -m /model --host /owned.engine.sock "
+                  f"--ctx-size 4096 --alias {'a' * 32}")
+        rows = {2: (1, str(data / "bin/model-provider")),
+                3: (2, str(data / "bin/model-provider") + " --internal-local-llama-guard"),
+                4: (3, engine)}
+        observe = self.timing["owned_engine"]
+        self.assertEqual(list(observe(rows, 1, data)), [(4, "/owned.engine.sock", "a" * 32)])
+        self.assertEqual(list(observe(rows, 9, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (3, engine.replace(str(data), "/foreign"))}, 1, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (2, engine)}, 1, data)), [])
+        for guard in ("/foreign/guard --internal-local-llama-guard",
+                      str(data / "bin/model-provider") + " --internal-local-llama-guard extra"):
+            with self.subTest(guard=guard):
+                self.assertEqual(list(observe({**rows, 3: (2, guard)}, 1, data)), [])
 
 
 if __name__ == "__main__":

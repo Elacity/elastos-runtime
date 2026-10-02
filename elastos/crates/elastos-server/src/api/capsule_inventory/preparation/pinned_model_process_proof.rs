@@ -83,6 +83,7 @@ fn pinned_engine_sha(platform: &str) -> &'static str {
     match platform {
         "darwin-arm64" => "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
         "linux-amd64" => "fa24fc90877d1edc68990af5f4f8e476256959357d7f58cf59910e5657f7403f",
+        "linux-arm64" => "da88cc0a679c80cdf699fe368c4d2f772e5bce4280ad9316c30ed4c09e9d2cde",
         other => panic!("no pinned b10516 engine identity for {other}"),
     }
 }

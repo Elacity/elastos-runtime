@@ -16,6 +16,8 @@ whose temporary sibling is ignored by Git. CARGO_TARGET_DIR selects the native
 build cache; otherwise Cargo resolves it. CARGO_BUILD_JOBS defaults to 4 (max 4).
 The output contains artifacts/, draft components.json and platform-input.json.
 Generic provider microVM rootfs and Browser substrate acceptance are separate.
+Linux ARM64 requires ELASTOS_LLAMA_ARM64_BUNDLE to name the reviewed b10516
+archive. The archive is verified against components.json before any build.
 EOF
 }
 
@@ -53,6 +55,19 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64; TARGET=aarch64-apple-darwin ;;
     *) die "Native preparation supports Linux x86_64/ARM64 and macOS ARM64" ;;
 esac
+if [[ "$SETUP_PLATFORM" == linux-arm64 ]]; then
+    [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || die "ELASTOS_LLAMA_ARM64_BUNDLE is required for Linux ARM64"
+    python3 - "$ELASTOS_LLAMA_ARM64_BUNDLE" <<'PY'
+import hashlib, json, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+info = json.loads(pathlib.Path("components.json").read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
+if not source.is_file() or source.is_symlink() or source.stat().st_size != info["size"]:
+    raise SystemExit("ARM64 llama-server bundle is missing or has the wrong size")
+digest = hashlib.sha256(source.read_bytes()).hexdigest()
+if "sha256:" + digest != info["checksum"]:
+    raise SystemExit("ARM64 llama-server bundle checksum differs from components.json")
+PY
+fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 case "$CARGO_BUILD_JOBS" in 1|2|3|4) ;; *) die "CARGO_BUILD_JOBS must be between 1 and 4" ;; esac
 
@@ -187,6 +202,9 @@ for asset in "$TMPDIR/supported-assets-$PLATFORM"/* \
     [[ -f "$asset" ]] || continue
     cp "$asset" "$STAGING/artifacts/"
 done
+if [[ "$SETUP_PLATFORM" == linux-arm64 ]]; then
+    cp "$ELASTOS_LLAMA_ARM64_BUNDLE" "$STAGING/artifacts/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+fi
 if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
     cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
 fi
