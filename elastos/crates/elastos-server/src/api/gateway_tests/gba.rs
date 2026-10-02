@@ -55,13 +55,14 @@ async fn gba_viewer_storage_requires_exact_preconditions_and_preserves_the_winne
         .await
         .unwrap();
     assert_eq!(saved.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        saved
-            .headers()
-            .get("access-control-expose-headers")
-            .unwrap(),
-        "ETag"
-    );
+    assert!(saved
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(|header| header.trim().eq_ignore_ascii_case("etag")));
     let revision = saved
         .headers()
         .get("etag")
@@ -97,13 +98,14 @@ async fn gba_viewer_storage_requires_exact_preconditions_and_preserves_the_winne
         .await
         .unwrap();
     assert_eq!(restored.headers().get("etag").unwrap(), revision.as_str());
-    assert_eq!(
-        restored
-            .headers()
-            .get("access-control-expose-headers")
-            .unwrap(),
-        "ETag"
-    );
+    assert!(restored
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(|header| header.trim().eq_ignore_ascii_case("etag")));
     assert_eq!(
         axum::body::to_bytes(restored.into_body(), usize::MAX)
             .await

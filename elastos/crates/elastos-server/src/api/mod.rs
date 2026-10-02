@@ -25,6 +25,8 @@ mod model_provider_config;
 pub mod model_provider_egress;
 #[cfg(unix)]
 mod model_provider_egress_decision;
+#[cfg(target_os = "macos")]
+pub use model_provider_config::model_provider_engine_bundle;
 #[cfg(test)]
 pub(crate) use model_provider_config::seed_model_provider_operator_offers_for_test;
 pub(crate) use model_provider_config::{

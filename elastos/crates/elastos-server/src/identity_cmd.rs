@@ -30,6 +30,19 @@ pub async fn run_identity(cmd: crate::IdentityCommand) -> anyhow::Result<()> {
             println!("Enter this one-use token in Home's owner setup field. It expires in {expires_in} seconds:");
             println!("{}", secret.as_str());
         }
+        crate::IdentityCommand::PasskeyHint {
+            account,
+            principal,
+            rp_id,
+        } => {
+            let hint = crate::identity_passkey_hint::read_passkey_hint(
+                &default_data_dir(),
+                account.as_deref(),
+                principal.as_deref(),
+                rp_id.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string(&hint)?);
+        }
         crate::IdentityCommand::Show => {
             let profile = load_identity_profile(&default_data_dir()).await?;
             print_identity_profile(&profile)?;

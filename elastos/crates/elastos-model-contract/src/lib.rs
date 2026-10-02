@@ -163,7 +163,13 @@ pub fn model_input_hash(input: &Value) -> ContractResult<String> {
 pub fn validate_text_input_v2(input: &Value) -> ContractResult<&[Value]> {
     let invalid = || ContractError::new("invalid text/v2 conversation");
     let object = input.as_object().ok_or_else(invalid)?;
-    if object.len() != 2 || input["schema"] != TEXT_INPUT_V2_SCHEMA {
+    if (object.len() != 2 && object.len() != 3)
+        || input["schema"] != TEXT_INPUT_V2_SCHEMA
+        || (object.len() == 3
+            && input["max_output_tokens"]
+                .as_u64()
+                .is_none_or(|count| count == 0 || count > u32::MAX as u64))
+    {
         return Err(invalid());
     }
     let messages = input["messages"].as_array().ok_or_else(invalid)?;
@@ -287,6 +293,19 @@ mod tests {
             json!(vec![user.clone(); MAX_TEXT_MESSAGES + 1]),
         ];
         assert!(validate_text_input_v2(&extra_top).is_err());
+        let bounded =
+            json!({"schema":TEXT_INPUT_V2_SCHEMA,"messages":[user.clone()],"max_output_tokens":32});
+        assert!(validate_text_input_v2(&bounded).is_ok());
+        for invalid_limit in [
+            json!(0),
+            json!(-1),
+            json!("32"),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            let mut invalid = bounded.clone();
+            invalid["max_output_tokens"] = invalid_limit;
+            assert!(validate_text_input_v2(&invalid).is_err());
+        }
         assert!(
             validate_text_input_v2(&json!({"schema":TEXT_INPUT_V1_SCHEMA,"messages":[user]}))
                 .is_err()

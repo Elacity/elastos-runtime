@@ -4,6 +4,19 @@ mod direct;
 
 struct MockPeerProvider;
 
+fn signed_home_cookie_for_room_test(authority: &TestPasskeyAuthority) -> String {
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("localhost:61180"));
+    gateway_home_token::home_session_cookie_header_for_token(&headers, &authority.home_token, false)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 fn room_store_snapshot(data_dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     fn collect(
         root: &std::path::Path,
@@ -84,7 +97,7 @@ async fn test_room_service_assets_serve() {
         .oneshot(
             Request::builder()
                 .uri("/apps/chat-room/")
-                .header(HOST, "chat-room.localhost:61180")
+                .header(HOST, "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -107,7 +120,7 @@ async fn test_room_service_assets_serve() {
         .oneshot(
             Request::builder()
                 .uri("/apps/chat-room/chat_room_ui_bg.wasm")
-                .header(HOST, "chat-room.localhost:61180")
+                .header(HOST, "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -125,6 +138,7 @@ async fn test_room_service_assets_serve() {
 #[tokio::test]
 async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
     let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
     let registry = Arc::new(ProviderRegistry::new());
     registry
         .register_sub_provider("peer", Arc::new(MockPeerProvider))
@@ -141,10 +155,23 @@ async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
         data_dir: dir.path().to_path_buf(),
     });
 
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/elastos/carrier-bootstrap.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/.well-known/elastos/carrier-bootstrap.json")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -170,6 +197,7 @@ async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
 #[tokio::test]
 async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
     let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "managed-room-peer").await;
     let registry = Arc::new(ProviderRegistry::new());
@@ -188,10 +216,23 @@ async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
         data_dir: dir.path().to_path_buf(),
     });
 
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/elastos/carrier-bootstrap.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/.well-known/elastos/carrier-bootstrap.json")
+                .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -210,6 +251,11 @@ async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
 #[tokio::test]
 async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "gateway_public_publisher_bootstrap = true\n",
+    )
+    .unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "managed-room-peer").await;
     let registry = Arc::new(ProviderRegistry::new());
@@ -246,18 +292,34 @@ async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
     assert_eq!(payload["ticket"], "gateway-live-ticket");
     assert_eq!(payload["node_id"], "gateway-live-node");
     assert_eq!(payload["role"], "publisher");
+    assert!(payload.get("did").is_none());
 }
 
 #[tokio::test]
-async fn test_chat_room_summary_is_available_without_shell_launch_token() {
+async fn test_chat_room_summary_requires_signed_launch_authority() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/chat-room/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
 
     let summary = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/apps/chat-room/summary")
+                .header("x-elastos-home-token", token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -652,7 +714,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
     ] {
         assert_eq!(
             app.clone().oneshot(request).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::FORBIDDEN
         );
     }
     let summary = app
@@ -715,7 +777,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
     ] {
         assert_eq!(
             app.clone().oneshot(request).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -862,7 +924,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         )
         .await
         .unwrap();
-    assert_eq!(cookie_only_summary.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(cookie_only_summary.status(), StatusCode::FORBIDDEN);
     let cookie_only_poll = app
         .clone()
         .oneshot(
@@ -876,7 +938,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         )
         .await
         .unwrap();
-    assert_eq!(cookie_only_poll.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(cookie_only_poll.status(), StatusCode::FORBIDDEN);
     let cookie_only_leave = app
         .clone()
         .oneshot(
@@ -889,7 +951,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         )
         .await
         .unwrap();
-    assert_eq!(cookie_only_leave.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(cookie_only_leave.status(), StatusCode::FORBIDDEN);
     let direct = app
         .clone()
         .oneshot(
@@ -905,7 +967,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         )
         .await
         .unwrap();
-    assert_eq!(direct.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(direct.status(), StatusCode::FORBIDDEN);
     let forged = app
         .clone()
         .oneshot(
@@ -921,7 +983,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         )
         .await
         .unwrap();
-    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
 
     let uploads_path = elastos_common::localhost::rooted_localhost_fs_path(
         dir.path(),
@@ -1070,6 +1132,8 @@ async fn configured_chat_rejects_every_legacy_control_and_guest_route_before_mut
     let mut state = test_state(dir.path());
     state.collaboration_chat_product_port = Some(port);
     let app = gateway_router(state);
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
     let before = room_store_snapshot(dir.path());
     let acceptance = serde_json::json!({
         "acceptance": {
@@ -1090,23 +1154,23 @@ async fn configured_chat_rejects_every_legacy_control_and_guest_route_before_mut
         }
     });
     let requests = vec![
-        Request::builder().method("POST").uri("/api/apps/chat-room/requests/request/approve").body(Body::empty()).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/requests/request/deny").body(Body::empty()).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/guests/session/kick").body(Body::empty()).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/access-policy").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"allow_guest_invites":true,"allow_member_invites":true,"allow_members_to_host_guests":true}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/members/invite").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member","role":"member"}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/members/remove").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member"}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/invites/revoke").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite_id":"invite"}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/invites/create-link").header(CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/invites/claim").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"token":"invite","member_did":"did:key:z6member"}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/invites/acceptance").header(CONTENT_TYPE, "application/json").body(Body::from(acceptance.to_string())).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/invites/join").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite":"invite"}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/upload/start").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"file_name":"blocked.txt","mime_type":"text/plain","size_bytes":1}"#)).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/upload/upload/chunk").header("x-elastos-upload-offset", "0").body(Body::from("x")).unwrap(),
-        Request::builder().method("POST").uri("/api/apps/chat-room/upload/upload/finish").body(Body::empty()).unwrap(),
-        Request::builder().uri("/api/apps/chat-room/attachments/attachment").body(Body::empty()).unwrap(),
-        Request::builder().method("POST").uri("/api/browser/session/request").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"display_name":"Guest","device_label":"Browser","capabilities":["room.access"]}"#)).unwrap(),
-        Request::builder().uri("/api/browser/session/request/request").header(COOKIE, "browser-session-request=request").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/requests/request/approve").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/requests/request/deny").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/guests/session/kick").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/access-policy").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"allow_guest_invites":true,"allow_member_invites":true,"allow_members_to_host_guests":true}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/members/invite").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member","role":"member"}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/members/remove").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member"}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/revoke").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite_id":"invite"}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/create-link").header(CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/claim").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"token":"invite","member_did":"did:key:z6member"}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/acceptance").header(CONTENT_TYPE, "application/json").body(Body::from(acceptance.to_string())).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/join").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite":"invite"}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/start").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"file_name":"blocked.txt","mime_type":"text/plain","size_bytes":1}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/upload/chunk").header("x-elastos-upload-offset", "0").body(Body::from("x")).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/upload/finish").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).uri("/api/apps/chat-room/attachments/attachment").body(Body::empty()).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/browser/session/request").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"display_name":"Guest","device_label":"Browser","capabilities":["room.access"]}"#)).unwrap(),
+        Request::builder().header("x-elastos-home-token", token.as_str()).uri("/api/browser/session/request/request").header(COOKIE, "browser-session-request=request").body(Body::empty()).unwrap(),
     ];
     for request in requests {
         let method = request.method().clone();
@@ -1229,12 +1293,15 @@ fn gateway_room_source_has_no_route_owned_resource_bridge() {
 async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
     let chat_token = issue_home_launch_token(dir.path(), CHAT_ROOM_CAPSULE_ID).unwrap();
 
     let request = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header(CONTENT_TYPE, "application/json")
@@ -1269,7 +1336,8 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .method("GET")
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
@@ -1302,7 +1370,8 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .method("GET")
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
@@ -1322,6 +1391,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let gateway_home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let launch = app
         .clone()
@@ -1374,12 +1444,13 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
             .unwrap()
             .token
             .unwrap();
-    let both_cookies = format!("browser-session={browser_token}; {room_cookie}");
+    let both_cookies =
+        format!("{gateway_home_cookie}; browser-session={browser_token}; {room_cookie}");
 
     let send = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/objects/send")
                 .header(COOKIE, both_cookies)
@@ -1395,10 +1466,10 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
 
     let poll = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/poll")
-                .header(COOKIE, room_cookie)
+                .header(COOKIE, format!("{gateway_home_cookie}; {room_cookie}"))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"since":0}"#))
                 .unwrap(),
@@ -1421,6 +1492,8 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
 async fn test_chat_room_shell_can_approve_browser_access_request() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let launch = app
         .clone()
@@ -1445,7 +1518,8 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
     let request = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header(CONTENT_TYPE, "application/json")
@@ -1457,7 +1531,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
             .await
             .unwrap();
     assert_eq!(request.status(), StatusCode::OK);
-    let request_cookie = browser_request_cookie_header(&request);
+    let request_cookie = format!("{home_cookie}; {}", browser_request_cookie_header(&request));
     let request_body = axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1470,7 +1544,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
             test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/requests/{request_id}/approve"))
-                .header("x-elastos-home-token", home_token)
+                .header("x-elastos-home-token", &home_token)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1490,7 +1564,8 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1506,7 +1581,8 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
     let unbound_status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .uri(format!("/api/browser/session/request/{request_id}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1517,7 +1593,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
 
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri(format!("/api/browser/session/request/{request_id}"))
                 .header(COOKIE, request_cookie)
                 .body(Body::empty())
@@ -1536,10 +1612,13 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
 async fn test_room_service_summary_omits_display_name_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1569,7 +1648,7 @@ async fn test_room_service_summary_does_not_create_identity_on_read() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(!dir.path().join("identity").join("device.key").exists());
     assert!(load_home_runtime_coords(dir.path()).is_none());
 }
@@ -1605,10 +1684,13 @@ async fn test_room_service_summary_includes_hosted_guest_urls() {
     )
     .unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1645,10 +1727,13 @@ async fn test_room_service_summary_blocks_browser_access_when_seeded_room_has_no
     )
     .unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                 .uri("/api/apps/chat-room/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1674,14 +1759,81 @@ async fn test_room_service_summary_blocks_browser_access_when_seeded_room_has_no
 }
 
 #[tokio::test]
+async fn browser_room_cookie_capabilities_require_signed_home_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
+    let pair = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/browser/session/request")
+                .header(COOKIE, home_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Guest","device_label":"Browser","capabilities":["room.access"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pair.status(), StatusCode::OK);
+    let request_cookie = browser_request_cookie_header(&pair);
+    let request: Value = serde_json::from_slice(
+        &axum::body::to_bytes(pair.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let request_id = request["request_id"].as_str().unwrap();
+    crate::room_service::approve_next_request(dir.path())
+        .unwrap()
+        .unwrap();
+    let guest_token = crate::room_service::browser_access_status(dir.path(), request_id)
+        .unwrap()
+        .token
+        .unwrap();
+    let before = room_store_snapshot(dir.path());
+    for request in [
+        test_browser_request("localhost:61180", "http://localhost:61180")
+            .method("POST")
+            .uri("/api/browser/session/request")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"display_name":"Unsigned","device_label":"Browser","capabilities":["room.access"]}"#))
+            .unwrap(),
+        test_browser_request("localhost:61180", "http://localhost:61180")
+            .uri(format!("/api/browser/session/request/{request_id}"))
+            .header(COOKIE, request_cookie)
+            .body(Body::empty())
+            .unwrap(),
+        test_browser_request("localhost:61180", "http://localhost:61180")
+            .method("POST")
+            .uri("/api/apps/chat-room/poll")
+            .header(COOKIE, format!("browser-session={guest_token}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"since":0}"#))
+            .unwrap(),
+    ] {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+        );
+    }
+    assert_eq!(room_store_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
 async fn test_browser_session_request_and_status_routes_chat_room() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -1693,7 +1845,10 @@ async fn test_browser_session_request_and_status_routes_chat_room() {
             .await
             .unwrap();
     assert_eq!(pair_resp.status(), StatusCode::OK);
-    let request_cookie = browser_request_cookie_header(&pair_resp);
+    let request_cookie = format!(
+        "{home_cookie}; {}",
+        browser_request_cookie_header(&pair_resp)
+    );
     let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1703,7 +1858,7 @@ async fn test_browser_session_request_and_status_routes_chat_room() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie)
@@ -1734,10 +1889,13 @@ async fn test_browser_session_pair_is_forbidden_when_seeded_room_has_no_runtime_
     )
     .unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -1755,11 +1913,14 @@ async fn test_browser_session_pair_is_forbidden_when_seeded_room_has_no_runtime_
 async fn test_room_service_browser_access_and_object_flow() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -1771,7 +1932,10 @@ async fn test_room_service_browser_access_and_object_flow() {
             .await
             .unwrap();
     assert_eq!(pair_resp.status(), StatusCode::OK);
-    let request_cookie = browser_request_cookie_header(&pair_resp);
+    let request_cookie = format!(
+        "{home_cookie}; {}",
+        browser_request_cookie_header(&pair_resp)
+    );
     let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1781,7 +1945,7 @@ async fn test_room_service_browser_access_and_object_flow() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie.clone())
@@ -1804,7 +1968,7 @@ async fn test_room_service_browser_access_and_object_flow() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie)
@@ -1814,7 +1978,7 @@ async fn test_room_service_browser_access_and_object_flow() {
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
-    let room_cookie = browser_cookie_header(&status_resp);
+    let room_cookie = format!("{home_cookie}; {}", browser_cookie_header(&status_resp));
     let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1825,7 +1989,7 @@ async fn test_room_service_browser_access_and_object_flow() {
     let send_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/objects/send")
                 .header("cookie", &room_cookie)
@@ -1841,7 +2005,7 @@ async fn test_room_service_browser_access_and_object_flow() {
 
     let feed_resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/poll")
                 .header("cookie", &room_cookie)
@@ -1872,11 +2036,14 @@ async fn test_room_service_browser_access_and_object_flow() {
 async fn test_room_service_attachment_upload_and_fetch() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -1887,7 +2054,10 @@ async fn test_room_service_attachment_upload_and_fetch() {
             )
             .await
             .unwrap();
-    let request_cookie = browser_request_cookie_header(&pair_resp);
+    let request_cookie = format!(
+        "{home_cookie}; {}",
+        browser_request_cookie_header(&pair_resp)
+    );
     let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1901,7 +2071,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie)
@@ -1910,7 +2080,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
         )
         .await
         .unwrap();
-    let room_cookie = browser_cookie_header(&status_resp);
+    let room_cookie = format!("{home_cookie}; {}", browser_cookie_header(&status_resp));
     let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1920,7 +2090,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
     let upload_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/upload/start")
                 .header("cookie", &room_cookie)
@@ -1943,7 +2113,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
     let chunk_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/upload/{}/chunk", upload_id))
                 .header("cookie", &room_cookie)
@@ -1959,7 +2129,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
     let finish_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/upload/{}/finish", upload_id))
                 .header("cookie", &room_cookie)
@@ -1978,7 +2148,7 @@ async fn test_room_service_attachment_upload_and_fetch() {
 
     let fetch_resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri(format!("/api/apps/chat-room/attachments/{}", attachment_id))
                 .header("cookie", &room_cookie)
                 .body(Body::empty())
@@ -2004,11 +2174,14 @@ async fn test_room_service_attachment_upload_and_fetch() {
 async fn test_room_service_audio_attachment_upload_is_inline_media() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -2019,7 +2192,10 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
             )
             .await
             .unwrap();
-    let request_cookie = browser_request_cookie_header(&pair_resp);
+    let request_cookie = format!(
+        "{home_cookie}; {}",
+        browser_request_cookie_header(&pair_resp)
+    );
     let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2033,7 +2209,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie)
@@ -2042,7 +2218,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
         )
         .await
         .unwrap();
-    let room_cookie = browser_cookie_header(&status_resp);
+    let room_cookie = format!("{home_cookie}; {}", browser_cookie_header(&status_resp));
     let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2052,7 +2228,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
     let upload_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/upload/start")
                 .header("cookie", &room_cookie)
@@ -2075,7 +2251,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
     let chunk_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/upload/{}/chunk", upload_id))
                 .header("cookie", &room_cookie)
@@ -2091,7 +2267,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
     let finish_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/upload/{}/finish", upload_id))
                 .header("cookie", &room_cookie)
@@ -2110,7 +2286,7 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
 
     let fetch_resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri(format!("/api/apps/chat-room/attachments/{}", attachment_id))
                 .header("cookie", &room_cookie)
                 .body(Body::empty())
@@ -2132,11 +2308,14 @@ async fn test_room_service_audio_attachment_upload_is_inline_media() {
 async fn test_room_service_session_leave_appends_system_object() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let home_cookie = signed_home_cookie_for_room_test(&authority);
 
     let pair_resp = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                .header(COOKIE, &home_cookie)
                     .method("POST")
                     .uri("/api/browser/session/request")
                     .header("content-type", "application/json")
@@ -2147,7 +2326,10 @@ async fn test_room_service_session_leave_appends_system_object() {
             )
             .await
             .unwrap();
-    let request_cookie = browser_request_cookie_header(&pair_resp);
+    let request_cookie = format!(
+        "{home_cookie}; {}",
+        browser_request_cookie_header(&pair_resp)
+    );
     let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2161,7 +2343,7 @@ async fn test_room_service_session_leave_appends_system_object() {
     let status_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("GET")
                 .uri(format!("/api/browser/session/request/{}", request_id))
                 .header(COOKIE, request_cookie)
@@ -2170,7 +2352,7 @@ async fn test_room_service_session_leave_appends_system_object() {
         )
         .await
         .unwrap();
-    let room_cookie = browser_cookie_header(&status_resp);
+    let room_cookie = format!("{home_cookie}; {}", browser_cookie_header(&status_resp));
     let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2180,7 +2362,7 @@ async fn test_room_service_session_leave_appends_system_object() {
     let leave_resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/leave")
                 .header("cookie", &room_cookie)

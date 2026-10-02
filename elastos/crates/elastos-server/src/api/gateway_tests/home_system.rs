@@ -405,18 +405,26 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(unsigned_summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(unsigned_summary.into_body(), usize::MAX)
+    assert_eq!(unsigned_summary.status(), StatusCode::FORBIDDEN);
+
+    let sign_in = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/auth/passkey/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["authority"]["signed_in"], false);
+    assert_eq!(sign_in.status(), StatusCode::OK);
 
     let cookie_name = home_session_cookie_name(
         test_browser_request("localhost:61180", "http://localhost:61180")
@@ -452,6 +460,7 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
@@ -513,6 +522,11 @@ async fn test_home_entry_redirects_preserve_bookmarks_and_capsule_roots() {
 #[tokio::test]
 async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"gateway_allowed_hosts = ["localhost:8090", "elastos.elacitylabs.com"]"#,
+    )
+    .unwrap();
     let app = gateway_router(test_state(dir.path()));
     std::fs::write(
         dir.path()
@@ -568,8 +582,13 @@ async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
             assert_eq!(home.headers()["x-content-type-options"], "nosniff");
             if home_path.ends_with('/') || home_path.ends_with(".html") {
                 let csp = home.headers()["content-security-policy"].to_str().unwrap();
+                assert!(csp.contains("default-src 'self'"));
+                assert!(csp.contains("script-src 'self'"));
+                assert!(csp.contains("style-src 'self'"));
                 assert!(csp.contains("connect-src 'self'"));
                 assert!(csp.contains("frame-ancestors 'none'"));
+                assert!(!csp.contains("sandbox"));
+                assert!(!csp.contains("'unsafe-inline'"));
             }
             let home_body = axum::body::to_bytes(home.into_body(), usize::MAX)
                 .await
@@ -638,6 +657,7 @@ async fn test_home_entry_rejects_path_traversal() {
 #[tokio::test]
 #[cfg(unix)]
 async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
     let _args = EnvRestore::set(
@@ -656,8 +676,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let contract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/home-cli/terminal/contract")
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -785,10 +806,11 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let bad_events = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/apps/home-cli/terminal/sessions/{session_id}/events?ticket=wrong"
                 ))
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -799,8 +821,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let non_websocket_input = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(input_socket_url)
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1142,15 +1165,22 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let public = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(public.status(), StatusCode::OK);
-    let public_body = axum::body::to_bytes(public.into_body(), usize::MAX)
+    assert_eq!(public.status(), StatusCode::FORBIDDEN);
+    // The signed-out read model stays private and keeps empty account facts.
+    let signed_out_model = gateway_home_system::home_summary(
+        State(library_test_state(dir.path()).await),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let public_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let public_payload: serde_json::Value = serde_json::from_slice(&public_body).unwrap();
@@ -5260,17 +5290,33 @@ fn system_runtime_activity_filters_attach_noise() {
 async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let before = file_snapshot(dir.path());
 
     for uri in [
         "/api/apps/system/identity/handle",
         "/api/apps/system/identity/profile-card",
     ] {
+        let unsigned = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"owner"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::FORBIDDEN, "{uri}");
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri(uri)
+                    .header("x-elastos-home-token", &authority.system_token)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"display_name":"owner"}"#))
                     .unwrap(),
@@ -5287,11 +5333,12 @@ async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state()
             response.status()
         );
     }
+    assert_eq!(file_snapshot(dir.path()), before);
     assert!(
         crate::collaboration_profile_authority::load_profile_authority(
             dir.path(),
-            "person:local:missing",
-            &crate::auth::principal_localhost_root("person:local:missing"),
+            &authority.principal_id,
+            &crate::auth::principal_localhost_root(&authority.principal_id),
         )
         .unwrap()
         .is_none()
@@ -6681,15 +6728,18 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         authority.principal_id
     );
 
-    let (status, wrong_origin_shell_summary) = home_test_get_json(
-        &app,
-        "/api/apps/home/summary",
-        &home_cli_token,
-        "http://localhost:61180",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(wrong_origin_shell_summary["authority"]["signed_in"], false);
+    let wrong_origin_shell_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", &home_cli_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin_shell_summary.status(), StatusCode::FORBIDDEN);
 
     let catalog = app
         .clone()
@@ -6720,9 +6770,10 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let esp_initialize = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", &home_cli_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"esp_version":"0","accepts":["elastos.capsules.catalog/v1"]}"#,
@@ -6761,10 +6812,20 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
-    let (status, native_regular_summary) =
-        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &regular_token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(native_regular_summary["authority"]["signed_in"], false);
+    let native_regular_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", &regular_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_regular_summary.status(), StatusCode::FORBIDDEN);
+
     let catalog_rejected = app
         .clone()
         .oneshot(
@@ -8438,8 +8499,12 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
         )
         .await
         .unwrap();
-    assert_eq!(unsigned.status(), StatusCode::OK);
-    let unsigned_body = axum::body::to_bytes(unsigned.into_body(), usize::MAX)
+    assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+    // Unit-test the fixed signed-out projection independently of API admission.
+    let signed_out_model =
+        gateway_home_system::home_summary(State(test_state(dir.path())), HeaderMap::new()).await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let unsigned_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let unsigned_payload: serde_json::Value = serde_json::from_slice(&unsigned_body).unwrap();
@@ -8680,6 +8745,160 @@ fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
         "offer:{}:browser-engine",
         home_people_contact_id(&fixture.profile.document().profile_did)
     )
+}
+
+#[tokio::test]
+async fn test_private_engine_request_requires_share_before_inbox_approval() {
+    for model_shared in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        std::fs::create_dir_all(right.path().join("config")).unwrap();
+        std::fs::write(
+            right.path().join("config/browser-engine-adapter.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(right.path().join("bin")).unwrap();
+        std::fs::write(right.path().join("bin/model-provider"), b"").unwrap();
+        let services_token =
+            app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+        if model_shared {
+            let (status, _) = services_contact_post(
+                &bob.app,
+                &services_token,
+                "/api/apps/services/offers",
+                json!({"offer_id":MODEL_LOCAL_OFFER,"section":"mine","selected":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let alice_token =
+            app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, _) = services_contact_post(
+            &alice.app,
+            &alice_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":services_engine_offer(&bob),"section":"others","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = home_test_post_json(
+            &bob.app,
+            "/api/apps/home/launch",
+            &bob.authority.home_token,
+            "http://localhost:61180",
+            json!({"target":INBOX_CAPSULE_ID}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (_, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        let request = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_request")
+            .unwrap();
+        assert!(request["body"].as_str().unwrap().contains(
+            "Your Browser Engine is private. Share it in Services before approving this request."
+        ));
+        let action = request["action_ref"]["action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert!(!status.is_success());
+        assert!(
+            message.contains("Your Browser Engine is private. Share it in Services"),
+            "{message}"
+        );
+        let (_, still_pending) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(still_pending["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action_ref"]["action_id"] == action));
+
+        let (status, _) = services_contact_post(
+            &bob.app,
+            &services_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":"local:provider:browser-engine","section":"mine","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert!(services["local_offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["offer_id"] == "local:provider:browser-engine"));
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+        let (_, ready_inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(!ready_inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action_ref"]["action_id"] == action)
+            .unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("is private"));
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{message}");
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+    }
 }
 
 #[tokio::test]
@@ -10122,13 +10341,15 @@ async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_sign
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
     let service = bob.discovery_service.clone();
     service.sync_services_mailboxes_once(right.path(), 0).await;
-    assert!(bob
-        .peer_provider
-        .state
-        .provider_requests
-        .lock()
-        .await
-        .is_empty());
+    let initial_peer_calls = bob.peer_provider.state.provider_requests.lock().await;
+    assert!(
+        initial_peer_calls.iter().all(|call| matches!(
+            call["op"].as_str(),
+            Some("get_ticket" | "gossip_join" | "gossip_join_peers" | "gossip_recv")
+        )),
+        "an empty mailbox may poll but must not send: {initial_peer_calls:?}"
+    );
+    drop(initial_peer_calls);
     assert!(
         services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
             ["requests"]

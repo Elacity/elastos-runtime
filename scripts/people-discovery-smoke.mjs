@@ -785,7 +785,7 @@ if (!scenario) {
     );
     assert.equal(child.status, 0, child.stderr || child.stdout);
   }
-  const inboxUi = readFileSync("capsules/inbox/browser/index.html", "utf8");
+  const inboxUi = readFileSync("capsules/inbox/browser/inbox.js", "utf8");
   assert.match(inboxUi, /contact-accept-request:/);
   assert.match(inboxUi, /createActionButton\("Accept", actionId, "primary"\)/);
   assert.match(inboxUi, /createActionButton\("Decline", "contact-decline-request:/);
