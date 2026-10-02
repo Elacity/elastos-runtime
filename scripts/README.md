@@ -14,9 +14,12 @@ automatically a stable end-user command.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
-- `publish-release.sh` is the low-level release publisher. Use
-  `elastos publish-release --version <version> --dry-run` for read-only planning;
-  the low-level script rejects that flag before side effects.
+- `publish-release.sh` prepares unsigned native release inputs. Use
+  `elastos publish-release --version <version> --dry-run` for read-only planning.
+  Runtime imports frozen signed output through `--signed-publication`.
+- `release-signer.py` is the separately installed custodian tool. The operator
+  pins its interpreter, OpenSSL and source, and owns all release-key access.
+  The existing release-input CI suite runs its refused-case tests.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
   manifest exports, native/guest target selection and the staged artifact gate
   without signing or uploading. CI and `just verify` run these checks.
@@ -220,3 +223,61 @@ for the explicit simulation boundary and the operator flow it supports.
 - Keep installed mode explicit where a command supports both source and
   installed paths.
 - Keep host-specific secrets and private maintenance commands outside the repo.
+
+## Signing and publication ownership
+
+Builders prepare inert inputs. The custodian signs their approved hashes. The
+publication host imports that frozen output and announces it through Carrier.
+Each host has a separate account and role; the publication host receives the
+public DID and signed files.
+
+For a canary on Apple silicon, the builder can prepare one qualified native
+input. Run this from the reviewed source checkout, with an absent output
+directory outside it:
+
+```sh
+elastos publish-release --version VERSION --channel canary \
+  --platform-input aarch64-darwin=/path/to/native-input \
+  --preview-platform aarch64-darwin --prepare-only /path/to/unsigned-input \
+  --publisher-did DID
+```
+
+The resulting `signing-input.json` binds the source commit/tree, artifact
+hashes, sizes and CIDs, release data and public installer stamps. The operator
+records its SHA-256 in a protected policy outside the input directory. That
+policy also pins the repository, remote version tag, tag object, main-line
+commit/tree, version, channel, public DID, file/total quotas and the trusted
+Python, OpenSSL and signer tool paths and SHA-256 hashes. The operator alone
+sets the protected Ed25519 PEM key path. Use the signer from its installed,
+reviewed path, with a clean environment and its pinned Python:
+
+```sh
+env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+  --policy /path/to/operator-policy.json --input-root /path/to/unsigned-input \
+  --output-root /path/to/new-signed-set
+```
+
+The tool verifies the approved remote tag belongs to main, reads candidate
+files as data, and asks the operator to confirm the source before signing. It
+fetches the installer template from that approved tree. Its frozen installer
+keeps `HEAD_CID` empty to avoid a hash cycle; the signed head binds the final
+release CID and installer hash. Carrier holder identity and ticket remain
+public transport inputs, separate from the signer identity.
+
+On the publication host, inspect the frozen set before committing it:
+
+```sh
+elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID --dry-run
+elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID \
+  --ipfs-provider-bin /path/to/qualified-ipfs-provider
+```
+
+A saved pin change requires `--allow-signer-rotation` and confirmation of the
+complete public DID. Runtime verifies signatures, exact artifact hashes and
+imported CIDs, promotes the public pin and files before the head, and restores
+the prior set if promotion fails. A committed set can be retried to finish its
+ledger and Carrier announcement. The gateway serves each release file only
+when the saved public pin and complete signed set agree; `install.sh` stays
+byte-identical across gateway hosts.

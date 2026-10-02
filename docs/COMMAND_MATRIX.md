@@ -87,7 +87,7 @@ bootstrap omits the Runtime DID. The default bootstrap requires caller authority
 | `elastos verify` | Self-contained | Verifies a local capsule signature. With `--cid`, it fetches and verifies provenance through the content provider. |
 | `elastos sign-payload` | Self-contained | Reads bytes from stdin and writes a domain-separated Ed25519 signature and signer DID as JSON. |
 | `elastos publish <path>` | Self-contained | Validates the manifest, checks that the resolved entrypoint path exists, then publishes through the content provider. A microVM uses the explicitly installed local `ipfs-provider`. [Capsule authoring](CAPSULE_AUTHORING.md#publish-with-the-right-gate) owns the exact validation limits. |
-| `elastos publish-release` | Self-contained | Runs the signed release pipeline. Dry-run and preflight modes do not publish. Public URL options may start their own gateway and tunnel step. |
+| `elastos publish-release` | Self-contained | Prepares unsigned native inputs or imports a frozen signed set against an operator-approved public DID. The separate custodian tool owns signing. Dry-run and preflight modes keep publication unchanged. |
 | `elastos share <path>` | Self-contained | Publishes a file or directory, provenance, and a signed channel head unless disabled by flags. |
 | `elastos share <path> --public` | Self-contained | Adds an immediate tunnel and remains active until interrupted. It is not a Runtime host. |
 | `elastos content publish-object`, `elastos content repair-worker`, `elastos content status` | Self-contained | Each command starts the installed content and IPFS provider path directly. |

@@ -211,15 +211,24 @@ enum Commands {
 
         /// Prepare unsigned native inputs for the separately installed custodian signer
         #[arg(long, value_name = "DIR", requires_all = &["platform_inputs", "publisher_did"],
-              conflicts_with_all = &["key", "public_url", "public_with_sudo"])]
+              conflicts_with_all = &["key", "public_url", "public_with_sudo", "signed_publication", "allow_signer_rotation"])]
         prepare_only: Option<PathBuf>,
 
-        /// Public signer DID for unsigned preparation
-        #[arg(long, value_name = "DID", requires = "prepare_only")]
+        /// Frozen output from the separately installed custodian signer
+        #[arg(long, value_name = "DIR", requires = "publisher_did",
+              conflicts_with_all = &["prepare_only", "key", "platform_inputs", "preview_platform", "skip_build", "skip_rootfs", "cross", "capsules", "public_url", "public_with_sudo"])]
+        signed_publication: Option<PathBuf>,
+
+        /// Independently approved public signer DID
+        #[arg(long, value_name = "DID")]
         publisher_did: Option<String>,
 
-        /// Override release signing key path
-        #[arg(long)]
+        /// Confirm an operator-approved change to the saved public signer pin
+        #[arg(long, requires = "signed_publication")]
+        allow_signer_rotation: bool,
+
+        /// Retired: signing belongs to the separate custodian tool
+        #[arg(long, hide = true)]
         key: Option<PathBuf>,
 
         /// Show the publish plan without building or uploading
@@ -250,8 +259,8 @@ enum Commands {
         #[arg(long)]
         ipfs_provider_bin: Option<PathBuf>,
 
-        /// Allow publishing without a stamped trusted-source bootstrap
-        #[arg(long)]
+        /// Retired: the approved signing input owns its public bootstrap
+        #[arg(long, hide = true)]
         allow_no_bootstrap: bool,
     },
 
@@ -1449,7 +1458,9 @@ async fn main() -> anyhow::Result<()> {
             platform_inputs,
             preview_platform,
             prepare_only,
+            signed_publication,
             publisher_did,
+            allow_signer_rotation,
             key,
             dry_run,
             preflight_only,
@@ -1471,7 +1482,9 @@ async fn main() -> anyhow::Result<()> {
                 platform_inputs,
                 preview_platform,
                 prepare_only,
+                signed_publication,
                 publisher_did,
+                allow_signer_rotation,
                 key,
                 dry_run,
                 preflight_only,
@@ -2413,6 +2426,49 @@ mod tests {
             assert!(super::Cli::try_parse_from(invalid).is_err());
         }
         assert!(super::Cli::try_parse_from(&args[..12]).is_err());
+    }
+
+    #[test]
+    fn publish_release_cli_accepts_only_frozen_publication_options() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "1.2.3",
+            "--channel",
+            "canary",
+            "--signed-publication",
+            "/approved/frozen",
+            "--publisher-did",
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::PublishRelease {
+                signed_publication: Some(_),
+                key: None,
+                ..
+            })
+        ));
+        assert!(super::Cli::try_parse_from(&args[..8]).is_err());
+        for conflict in [
+            vec!["--key", "/custodian/unopened.pem"],
+            vec!["--prepare-only", "/unsigned"],
+            vec!["--platform-input", "aarch64-darwin=/prepared/mac"],
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+            vec!["--public-url"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        let mut approved_rotation = args.to_vec();
+        approved_rotation.push("--allow-signer-rotation");
+        assert!(super::Cli::try_parse_from(approved_rotation).is_ok());
     }
 
     #[test]

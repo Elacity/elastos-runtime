@@ -219,9 +219,6 @@ class PlatformInputTest(unittest.TestCase):
 
     def test_actual_publisher_import_success_and_effect_boundaries(self):
         source = self.actual_source_fixture()
-        publisher = (source / "scripts/publish-release.sh").read_text()
-        payload = "RELEASE_PAYLOAD=" + publisher.split("\nRELEASE_PAYLOAD=", 1)[1].split(
-            '\ninfo "Signing release payload', 1)[0]
         for failure in ("", "tamper", "upload"):
             with self.subTest(failure=failure):
                 work = self.root / ("publisher-" + (failure or "success"))
@@ -245,10 +242,6 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
 printf '%s\n' "$RELEASE_SOURCE_JSON" > "$TMPDIR/source.json"
 printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
 '''
-                body = body.replace("printf 'later signing boundary reached",
-                    'CHANNEL=stable\nPREV_RELEASE_CID=null\n' + payload +
-                    "\nprintf '%s\\n' \"$RELEASE_PAYLOAD\" > \"$TMPDIR/release-payload.json\"\n" +
-                    "printf 'later signing boundary reached")
                 result = subprocess.run(["/bin/bash", "-euc", body, "publisher-fixture",
                                          str(source / "scripts/publish-release.sh"), str(work), failure,
                                          *self.values()], capture_output=True, text=True)
@@ -271,11 +264,6 @@ printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
                             self.bundles[platform] / "artifacts" / f"elastos-{platform}"))
                     public_source = json.loads((prepared / "source.json").read_text())
                     self.assertEqual(set(public_source), {"commit", "tree"})
-                    release = json.loads((prepared / "release-payload.json").read_text())
-                    self.assertEqual(release["source"], public_source)
-                    self.assertEqual(set(release["platforms"]), set(inputs.PLATFORMS))
-                    self.assertNotIn("shell_cid", release)
-                    self.assertNotIn("shell_sha256", release)
                     self.assertTrue((prepared / "later-effect").exists())
 
     def pin_catalogue(self):
@@ -376,9 +364,6 @@ printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
     def test_actual_publisher_preview_publishes_only_the_selected_platform(self):
         pin = self.pin_catalogue()
         source = self.actual_source_fixture()
-        publisher = (source / "scripts/publish-release.sh").read_text()
-        payload = "RELEASE_PAYLOAD=" + publisher.split("\nRELEASE_PAYLOAD=", 1)[1].split(
-            '\ninfo "Signing release payload', 1)[0]
         work = self.root / "publisher-preview"
         work.mkdir()
         body = r'''source "$1"
@@ -397,9 +382,6 @@ ipfs_add() {
 }
 publish_prepared_platform_inputs "$TMPDIR/staged"
 printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
-PREV_RELEASE_CID=null
-''' + payload + r'''
-printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
 '''
         result = subprocess.run(["/bin/bash", "-euc", body, "publisher-fixture",
                                  str(source / "scripts/publish-release.sh"), str(work),
@@ -412,8 +394,6 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
         self.assertEqual(sorted((prepared / "uploads").read_text().splitlines()),
                          ["components-aarch64-darwin.json", "elastos-aarch64-darwin", "home.tar.gz",
                           "model-catalog.json", "shell-darwin-arm64", "shell-metadata.tar.gz"])
-        release = json.loads((prepared / "release-payload.json").read_text())
-        self.assertEqual((release["channel"], set(release["platforms"])), ("canary", {"aarch64-darwin"}))
         self.assertEqual(json.loads((prepared / "components.json").read_text())["model_catalog"], pin)
         self.assertEqual(platforms["aarch64-darwin"]["binary"]["sha256"],
                          inputs.digest(self.bundles["aarch64-darwin"] / "artifacts/elastos-aarch64-darwin"))
@@ -423,11 +403,13 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
         darwin = f"aarch64-darwin={os.path.relpath(self.bundles['aarch64-darwin'], self.root)}"
         linux = f"x86_64-linux={os.path.relpath(self.bundles['x86_64-linux'], self.root)}"
         base = ["/bin/bash", str(source / "scripts/publish-release.sh"), "--version", "0.7.1",
-                "--key", str(self.root / "missing-key"), "--preview-platform", "aarch64-darwin"]
+                "--prepare-only", str(self.root / "unsigned-preview"),
+                "--publisher-did", signer.public_did(bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")),
+                "--preview-platform", "aarch64-darwin"]
         state = self.root / "publisher-state"
         cases = [
             ("stable channel", ["--channel", "stable", "--platform-input", darwin], "requires --channel canary"),
-            ("no input", ["--channel", "canary"], "exactly one --platform-input aarch64-darwin=DIR"),
+            ("no input", ["--channel", "canary"], "unsigned preparation requires --platform-input"),
             ("two inputs", ["--channel", "canary", "--platform-input", darwin, "--platform-input", linux],
              "exactly one --platform-input aarch64-darwin=DIR"),
             ("other platform input", ["--channel", "canary", "--platform-input", linux],
@@ -445,7 +427,7 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
                 self.assertIn(message, result.stderr)
                 self.assertFalse(state.exists())
 
-    def test_actual_publisher_rejects_input_before_state_or_key_inspection(self):
+    def test_legacy_key_cli_rejects_before_state_or_input_inspection(self):
         source = self.actual_source_fixture()
         state = self.root / "publisher-state"
         command = ["/bin/bash", str(source / "scripts/publish-release.sh"),
@@ -460,8 +442,7 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
                                         cwd=self.root, env={**os.environ, "ELASTOS_PUBLISH_STATE_DIR": str(state)},
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
-                expected = {"key": "Key file not found", "conflict": "conflicts with", "corrupt": "differs from receipt"}[failure]
-                self.assertIn(expected, result.stderr)
+                self.assertIn("Shell release signing is retired", result.stderr)
                 self.assertFalse(state.exists())
 
     def test_input_snapshot_and_copy_races_preserve_absent_output(self):
@@ -1079,6 +1060,42 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
         self.assertFalse((self.root / "key-must-stay-absent").exists())
         self.assertFalse(fixture.output.exists())
         self.assertEqual({path.name: path.read_bytes() for path in fixture.state.iterdir()}, before)
+
+    def test_shell_unsigned_helper_uses_json_receipt_before_legacy_cids(self):
+        fixture = self.shell_signing_fixture()
+        receipt = {"last_release_cid": signer.unixfs_metadata_cid(b"committed public release"),
+                   "last_head_cid": signer.unixfs_metadata_cid(b"committed public head")}
+        self.write_json(fixture.state / "publish-state.json", receipt)
+        before = {path.name: path.read_bytes() for path in fixture.state.iterdir()}
+        _, result = self.run_shell_signing_fixture(fixture)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = fixture.capture.read_text().splitlines()
+        self.assertEqual(arguments[arguments.index("--prev-release-cid") + 1], receipt["last_release_cid"])
+        self.assertEqual(arguments[arguments.index("--prev-head-cid") + 1], receipt["last_head_cid"])
+        self.assertNotIn(fixture.previous["last-release-cid"], arguments)
+        self.assertNotIn(fixture.previous["last-release-head-cid"], arguments)
+        self.assertEqual({path.name: path.read_bytes() for path in fixture.state.iterdir()}, before)
+        self.assertFalse(fixture.output.exists())
+
+    def test_shell_unsigned_helper_keeps_json_receipt_authoritative_when_empty_or_invalid(self):
+        fixture = self.shell_signing_fixture()
+        receipt_path = fixture.state / "publish-state.json"
+        for raw, accepted in [(b"{}", True), (b"{", False), (b"[]", False),
+                              (b'{"last_release_cid":42}', False)]:
+            with self.subTest(receipt=raw):
+                receipt_path.write_bytes(raw)
+                fixture.capture.unlink(missing_ok=True)
+                before = {path.name: path.read_bytes() for path in fixture.state.iterdir()}
+                _, result = self.run_shell_signing_fixture(fixture)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                if accepted:
+                    arguments = fixture.capture.read_text().splitlines()
+                    self.assertNotIn("--prev-release-cid", arguments)
+                    self.assertNotIn("--prev-head-cid", arguments)
+                else:
+                    self.assertFalse(fixture.capture.exists())
+                self.assertEqual({path.name: path.read_bytes() for path in fixture.state.iterdir()}, before)
+                self.assertFalse(fixture.output.exists())
 
     def test_shell_unsigned_helper_refuses_unpaired_bootstrap_before_python(self):
         fixture = self.shell_signing_fixture()

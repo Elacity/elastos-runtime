@@ -604,25 +604,29 @@ validate_release_identity "$1" "$2"
         self.assertIn("No release available for platform: aarch64-darwin", result.stderr)
         self.assertEqual(len(requests), 2)
 
-    def test_publisher_hashes_the_final_envelope_bytes_into_head_payload(self):
-        source = INSTALLER.with_name("publish-release.sh").read_text()
-        sha_helper = source[source.index("sha256() {"):source.index("\nfile_size() {")]
-        envelope_write = source[source.index('echo "$RELEASE_JSON" > "${TMPDIR}/release.json"'):source.index('info "Publishing release.json to IPFS..."')]
-        head_payload = source[source.index("HEAD_PAYLOAD=$(jq"):source.index('info "Signing release head..."')]
-        with tempfile.TemporaryDirectory(prefix="publisher-binding-") as directory:
-            result = shell(sha_helper + '''
-TMPDIR="$1"
-RELEASE_JSON='{"payload":{"note":"café"},"signature":"test"}'
-CHANNEL=stable VERSION=0.7.1 RELEASE_CID=release-a RELEASE_OBJECT_CID=object-a
-SIGNER_DID=test PREV_HEAD_CID=null
-now_unix() { echo 1; }
-''' + envelope_write + head_payload + '\nprintf "%s\\n" "$HEAD_PAYLOAD"\n', directory)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            written = Path(directory, "release.json").read_bytes()
-            payload = json.loads(result.stdout)
-            self.assertTrue(written.endswith(b"\n"))
-            self.assertEqual(payload["release_sha256"], hashlib.sha256(written).hexdigest())
-            self.assertEqual(payload["latest_release_cid"], "release-a")
+    def test_custodian_hashes_final_envelope_bytes_into_head_payload(self):
+        import importlib.util
+        import sys
+        from types import SimpleNamespace
+        path = INSTALLER.with_name("release-signer.py")
+        spec = importlib.util.spec_from_file_location("installer_custodian", path)
+        signer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = signer
+        spec.loader.exec_module(signer)
+        payload = {"schema": "elastos.release/v1", "channel": "stable", "version": "0.7.1", "note": "café"}
+        backend = mock.Mock()
+        backend.public_key.return_value = CRYPTO["decode_did_key"](PUBLISHER_DID)
+        backend.sign.return_value = bytes(64)
+        backend.verify.return_value = True
+        prepared = SimpleNamespace(publisher_did=PUBLISHER_DID, files=(), release=signer.json_bytes(payload),
+                                   updated_at=1, prev_head_cid=None)
+        publication = dict(signer.sign_publication(prepared, backend))
+        release = publication["release.json"]
+        head = json.loads(publication["release-head.json"])["payload"]
+        self.assertEqual(release, signer.json_bytes(json.loads(release)))
+        self.assertEqual(head["release_sha256"], hashlib.sha256(release).hexdigest())
+        self.assertEqual(head["latest_release_cid"], signer.unixfs_metadata_cid(release))
+        self.assertNotEqual(head["release_sha256"], hashlib.sha256(release + b"\n").hexdigest())
 
 
 class InstallationTests(unittest.TestCase):
