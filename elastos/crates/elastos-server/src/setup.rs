@@ -344,6 +344,9 @@ async fn run_with_data_dir(
     for name in &components {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
+        if name == "llama-server" {
+            verify_arm64_model_host(&platform)?;
+        }
         let status = match effective_component_install_state_for_name(
             &manifest,
             &data_dir,
@@ -496,6 +499,7 @@ async fn run_with_data_dir(
                 platform_info,
                 &dest,
                 &ipfs_gateways,
+                FirstPartyCarrierContext::Setup,
             )
             .await?;
             write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
@@ -512,6 +516,7 @@ async fn run_with_data_dir(
                 comp,
                 &platform,
                 &ipfs_gateways,
+                FirstPartyCarrierContext::Setup,
             )
             .await?;
             changed = true;
@@ -855,6 +860,7 @@ pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow
         &info,
         &dest,
         &build_gateway_list(data_dir),
+        FirstPartyCarrierContext::Runtime,
     )
     .await
 }
@@ -932,6 +938,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
         platform_info,
         &dest,
         &gateways,
+        FirstPartyCarrierContext::Runtime,
     )
     .await?;
     write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
@@ -972,6 +979,7 @@ async fn ensure_provider_capsule_metadata_component(
     component: &Component,
     platform: &str,
     ipfs_gateways: &[ElastosFetchPath],
+    carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     let Some(metadata) = component.capsule_metadata.as_ref() else {
         return Ok(());
@@ -1008,6 +1016,7 @@ async fn ensure_provider_capsule_metadata_component(
         platform_info,
         &dest,
         ipfs_gateways,
+        carrier_context,
     )
     .await?;
     write_platform_cache_metadata(platform_info, &dest)?;
@@ -1407,6 +1416,9 @@ fn write_cache_metadata(
         })?;
         let (version, checksum, binary) =
             local_model_engine_receipt_args(component, platform_info.unwrap())?;
+        if platform == "linux-arm64" && platform_info.unwrap().release_path.is_some() {
+            probe_arm64_model_engine(&dest.join(binary))?;
+        }
         local_model_engine_receipt::write(dest, version, platform, checksum, binary)?;
         let install_path = resolve_install_path(component, platform_info)
             .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
@@ -1438,6 +1450,102 @@ fn write_cache_metadata(
     write_platform_cache_metadata(platform_info, dest)
 }
 
+// Linux AArch64 HWCAP: FP16 scalar, FP16 SIMD and dot product.
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+const ARM64_MODEL_HWCAP: u64 = (1 << 9) | (1 << 10) | (1 << 20);
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+fn arm64_model_cpu_features_available(hwcap: u64) -> bool {
+    hwcap & ARM64_MODEL_HWCAP == ARM64_MODEL_HWCAP
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+fn arm64_model_elf_compatible(header: &[u8]) -> bool {
+    header.len() >= 20
+        && header.starts_with(b"\x7fELF\x02\x01\x01")
+        && matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+        && u16::from_le_bytes([header[18], header[19]]) == 183
+}
+
+pub(crate) fn verify_arm64_model_host(platform: &str) -> anyhow::Result<()> {
+    if platform != "linux-arm64" {
+        return Ok(());
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        let available = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
+        anyhow::ensure!(
+            arm64_model_cpu_features_available(available),
+            "ARM64 llama-server requires dot product and FP16 CPU features"
+        );
+    }
+    Ok(())
+}
+
+fn probe_arm64_model_engine(path: &Path) -> anyhow::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        verify_arm64_model_host("linux-arm64")?;
+        let check_elf = |file: &Path| -> anyhow::Result<()> {
+            let mut header = [0_u8; 20];
+            fs::File::open(file)?.read_exact(&mut header)?;
+            anyhow::ensure!(
+                arm64_model_elf_compatible(&header),
+                "ARM64 model engine bundle contains an incompatible ELF: {}",
+                file.display()
+            );
+            Ok(())
+        };
+        check_elf(path)?;
+        let mut libraries = 0;
+        for entry in fs::read_dir(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("engine path has no parent"))?,
+        )? {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().contains(".so") || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            check_elf(&entry.path())?;
+            libraries += 1;
+        }
+        anyhow::ensure!(libraries > 0, "ARM64 model engine libraries are missing");
+        let mut child = Command::new(path)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("ARM64 model engine cannot start: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::ensure!(
+                    status.success(),
+                    "ARM64 model engine or host libraries are incompatible"
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("ARM64 model engine compatibility probe timed out");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn local_model_engine_receipt_args<'a>(
     component: &'a Component,
     platform_info: &'a PlatformInfo,
@@ -1457,6 +1565,39 @@ fn local_model_engine_receipt_args<'a>(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("llama-server bundle binary path is missing"))?,
     ))
+}
+
+/// A read-only confinement boundary, separate from engine verification and
+/// offer admission. It can precede installation of the exact pinned bundle.
+#[cfg(target_os = "macos")]
+pub(crate) fn local_model_engine_confinement_bundle(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(component) = manifest.external.get("llama-server") else {
+        return Ok(None);
+    };
+    let platform = detect_platform();
+    let Some(info) = component.platforms.get(&platform) else {
+        return Ok(None);
+    };
+    let (version, checksum, _) = local_model_engine_receipt_args(component, info)?;
+    anyhow::ensure!(
+        Path::new(version).components().count() == 1
+            && Path::new(version)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && checksum.strip_prefix("sha256:").is_some_and(
+                |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+        "local model engine pin is invalid"
+    );
+    let expected = format!("libexec/llama.cpp/{version}/{platform}");
+    anyhow::ensure!(
+        resolve_install_path(component, Some(info)) == Some(expected.as_str()),
+        "local model engine confinement path is invalid"
+    );
+    Ok(Some(data_dir.canonicalize()?.join(expected)))
 }
 
 #[cfg(unix)]
@@ -1627,6 +1768,7 @@ pub(crate) fn verified_local_model_engine(
         "local model engine install path is unavailable"
     );
     local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    verify_arm64_model_host(&platform)?;
     anyhow::ensure!(
         local_model_engine_receipt_identity(data_dir, manifest)? == identity
             && compute_sha256_checksum(&identity.path)? == identity.sha256,
@@ -2079,15 +2221,6 @@ pub(crate) fn install_signed_model_catalog(
     Ok(())
 }
 
-pub fn write_installed_manifest_bytes(
-    data_dir: &Path,
-    manifest_bytes: &[u8],
-    platform: &str,
-) -> anyhow::Result<Vec<String>> {
-    let manifest: ComponentsManifest = serde_json::from_slice(manifest_bytes)?;
-    write_installed_manifest(data_dir, &manifest, platform)
-}
-
 // ── List mode ───────────────────────────────────────────────────────
 
 fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &str) {
@@ -2291,7 +2424,16 @@ async fn prepare_selected_component_prerequisites(
             ) {
                 let url = resolve_component_download_url(info)
                     .ok_or_else(|| anyhow::anyhow!("Home media-tools release path is missing"))?;
-                download_component(data_dir, name, &url, info, &dest, ipfs_gateways).await?;
+                download_component(
+                    data_dir,
+                    name,
+                    &url,
+                    info,
+                    &dest,
+                    ipfs_gateways,
+                    FirstPartyCarrierContext::Setup,
+                )
+                .await?;
                 write_cache_metadata(manifest, Some(info), platform, name, &dest)?;
             }
             managed_tools = dest.join("bin");
@@ -2408,11 +2550,30 @@ fn required_release_artifact_checksum<'a>(
     }
 }
 
+/// Refresh support assets after the updater installs the verified manifest bytes.
+/// The publisher owns that manifest; setup's local stamping stays separate.
 pub async fn refresh_installed_components_for_update(
     data_dir: &Path,
     old_components: Option<&[u8]>,
     new_components: &[u8],
     platform: &str,
+) -> anyhow::Result<Vec<String>> {
+    refresh_installed_components_for_update_in_context(
+        data_dir,
+        old_components,
+        new_components,
+        platform,
+        FirstPartyCarrierContext::Setup,
+    )
+    .await
+}
+
+pub(crate) async fn refresh_installed_components_for_update_in_context(
+    data_dir: &Path,
+    old_components: Option<&[u8]>,
+    new_components: &[u8],
+    platform: &str,
+    carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<Vec<String>> {
     let new_manifest: ComponentsManifest = serde_json::from_slice(new_components)?;
     let Some(old_bytes) = old_components else {
@@ -2485,6 +2646,7 @@ pub async fn refresh_installed_components_for_update(
             new_platform_info,
             &dest,
             &gateways,
+            carrier_context,
         )
         .await?;
         write_cache_metadata(
@@ -2520,6 +2682,7 @@ pub async fn refresh_installed_components_for_update(
             new_component,
             platform,
             &gateways,
+            carrier_context,
         )
         .await?;
         refreshed.push(name.clone());
@@ -2527,7 +2690,6 @@ pub async fn refresh_installed_components_for_update(
 
     refreshed.sort();
     refreshed.dedup();
-    write_installed_manifest_bytes(data_dir, new_components, platform)?;
     Ok(refreshed)
 }
 
@@ -2592,18 +2754,53 @@ pub async fn run_download(
 ) -> anyhow::Result<()> {
     let data_dir = data_dir().unwrap_or_else(|_| PathBuf::from("/tmp/elastos"));
     let gateways = build_gateway_list(&data_dir);
-    download_component(&data_dir, name, url, platform_info, dest, &gateways).await
+    download_component(
+        &data_dir,
+        name,
+        url,
+        platform_info,
+        dest,
+        &gateways,
+        FirstPartyCarrierContext::Runtime,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FirstPartyCarrierContext {
+    /// Standalone setup owns the operator's configured transport address.
+    Setup,
+    /// In-process downloads choose a temporary port on the configured IP;
+    /// the running Runtime retains its listener and closes it at shutdown.
+    Runtime,
+}
+
+fn first_party_carrier_bind_addr(
+    data_dir: &Path,
+    context: FirstPartyCarrierContext,
+) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    Ok(
+        crate::carrier::configured_carrier_bind_addr(data_dir)?.map(|mut address| {
+            if matches!(context, FirstPartyCarrierContext::Runtime) {
+                address.set_port(0);
+            }
+            address
+        }),
+    )
 }
 
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
     release_path: &str,
+    context: FirstPartyCarrierContext,
 ) -> anyhow::Result<Vec<u8>> {
     let source = crate::sources::load_trusted_sources(data_dir)?
         .default_source()
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
-    crate::carrier::fetch_file_from_trusted_source(&source, release_path, 15, 30).await
+    let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
+    crate::carrier::fetch_file_from_trusted_source_bound(&source, release_path, 15, 30, bind_addr)
+        .await
 }
 
 pub(crate) async fn install_first_party_component_via_carrier(
@@ -2611,6 +2808,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
     name: &str,
     platform_info: &PlatformInfo,
     dest: &Path,
+    context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     if name == browser_vm_image::NAME {
         return browser_vm_image::install_via_carrier(
@@ -2618,13 +2816,14 @@ pub(crate) async fn install_first_party_component_via_carrier(
             platform_info,
             dest,
             &detect_platform(),
+            context,
         )
         .await;
     }
     let release_path = platform_info.release_path.as_deref().ok_or_else(|| {
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
-    let bytes = fetch_first_party_component_via_carrier(data_dir, release_path).await?;
+    let bytes = fetch_first_party_component_via_carrier(data_dir, release_path, context).await?;
 
     verify_checksum(name, &bytes, platform_info)?;
 
@@ -2655,6 +2854,7 @@ async fn download_component(
     platform_info: &PlatformInfo,
     dest: &Path,
     ipfs_gateways: &[ElastosFetchPath],
+    carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     if name == browser_vm_image::NAME {
         browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
@@ -2688,7 +2888,15 @@ async fn download_component(
             "  Trying {} via trusted source over Carrier...",
             elastos_url
         );
-        match install_first_party_component_via_carrier(data_dir, name, platform_info, dest).await {
+        match install_first_party_component_via_carrier(
+            data_dir,
+            name,
+            platform_info,
+            dest,
+            carrier_context,
+        )
+        .await
+        {
             Ok(()) => {
                 ensure_bundle_executable_link(data_dir, name, platform_info)?;
                 println!("  Installed: {}", dest.display());
@@ -3161,6 +3369,33 @@ mod tests {
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn arm64_model_profile_requires_dot_product_and_both_fp16_features() {
+        assert!(arm64_model_cpu_features_available(ARM64_MODEL_HWCAP));
+        assert!(arm64_model_cpu_features_available(
+            ARM64_MODEL_HWCAP | (1 << 0)
+        ));
+        for bit in [1 << 9, 1 << 10, 1 << 20] {
+            assert!(!arm64_model_cpu_features_available(
+                ARM64_MODEL_HWCAP & !bit
+            ));
+        }
+    }
+
+    #[test]
+    fn arm64_model_bundle_rejects_wrong_elf_machine_and_format() {
+        let mut header = [0_u8; 20];
+        header[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        header[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        assert!(arm64_model_elf_compatible(&header));
+        header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        assert!(!arm64_model_elf_compatible(&header));
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        header[4] = 1;
+        assert!(!arm64_model_elf_compatible(&header));
+    }
+
     #[cfg(unix)]
     #[test]
     fn home_cli_renderer_archive_extraction_preserves_native_bytes_and_mode() {
@@ -3579,6 +3814,43 @@ mod tests {
         assert_eq!(
             fs::read(data.join("bin/effect")).unwrap(),
             b"other component"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn model_confinement_predeclares_only_current_pinned_engine_bundle() {
+        let manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let mut manifest = load_manifest_from_path(&manifest_path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bundle = local_model_engine_confinement_bundle(root.path(), &manifest)
+            .unwrap()
+            .unwrap();
+        assert!(!bundle.exists(), "predeclaration must precede installation");
+        let platform = detect_platform();
+        let version = manifest.external["llama-server"].version.as_ref().unwrap();
+        assert_eq!(
+            bundle,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join(format!("libexec/llama.cpp/{version}/{platform}"))
+        );
+        let info = manifest
+            .external
+            .get_mut("llama-server")
+            .unwrap()
+            .platforms
+            .get_mut(&platform)
+            .unwrap();
+        info.install_path = Some("providers/model-provider".into());
+        assert!(local_model_engine_confinement_bundle(root.path(), &manifest).is_err());
+        manifest.external.remove("llama-server");
+        assert!(
+            local_model_engine_confinement_bundle(root.path(), &manifest)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -4659,6 +4931,23 @@ mod tests {
             InstallState::Stale(_)
         ));
         fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(bundle.join("unexpected.dylib")).unwrap();
+        let library = bundle.join("libfixture.dylib");
+        fs::set_permissions(&library, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&library, b"changed library\n").unwrap();
+        fs::set_permissions(&library, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(matches!(
+            component_install_state_for_name(
+                &manifest,
+                &data,
+                "llama-server",
+                component,
+                resolve_platform_info(component, "darwin-arm64"),
+            ),
+            InstallState::Stale(_)
+        ));
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -5682,10 +5971,31 @@ mod tests {
             &info,
             &tmp.path().join("bin/shell"),
             &[],
+            FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("missing checksum"));
+    }
+
+    #[tokio::test]
+    async fn update_refresh_preserves_manifest_bytes_without_asset_changes() {
+        let new_bytes = b"{ \n \"profiles\": {}, \"external\":{}, \"capsules\": {}, \"publisher_extension\":true }\n";
+        let old_bytes = br#"{"external":{},"capsules":{},"profiles":{}}"#;
+        for old in [None, Some(old_bytes.as_slice()), Some(new_bytes.as_slice())] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("components.json");
+            fs::write(&path, new_bytes).unwrap();
+            let expected_hash = sha2::Sha256::digest(new_bytes);
+            let refreshed =
+                refresh_installed_components_for_update(tmp.path(), old, new_bytes, "x86_64-linux")
+                    .await
+                    .unwrap();
+            assert!(refreshed.is_empty());
+            let installed = fs::read(&path).unwrap();
+            assert_eq!(sha2::Sha256::digest(&installed), expected_hash);
+            assert_eq!(installed, new_bytes);
+        }
     }
 
     #[tokio::test]
@@ -5736,10 +6046,17 @@ mod tests {
             "profiles": {}
         });
 
+        // The updater installs the publisher's bytes before refreshing assets.
+        let mut new_bytes = b" \n".to_vec();
+        new_bytes.extend(serde_json::to_vec(&new_manifest).unwrap());
+        new_bytes.extend(b"\n ");
+        let manifest_path = data_dir.join("components.json");
+        fs::write(&manifest_path, &new_bytes).unwrap();
+        let expected_hash = sha2::Sha256::digest(&new_bytes);
         let refreshed = refresh_installed_components_for_update(
             data_dir,
             Some(&serde_json::to_vec(&old_manifest).unwrap()),
-            &serde_json::to_vec(&new_manifest).unwrap(),
+            &new_bytes,
             "x86_64-linux",
         )
         .await
@@ -5747,6 +6064,9 @@ mod tests {
 
         assert_eq!(refreshed, vec!["localhost-provider".to_string()]);
         assert_eq!(fs::read(&install_path).unwrap(), b"new-binary");
+        let installed = fs::read(&manifest_path).unwrap();
+        assert_eq!(sha2::Sha256::digest(&installed), expected_hash);
+        assert_eq!(installed, new_bytes);
     }
 
     #[tokio::test]

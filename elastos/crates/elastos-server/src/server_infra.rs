@@ -17,6 +17,7 @@ use elastos_server::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
 use elastos_server::binaries;
+use elastos_server::carrier::configured_carrier_bind_addr;
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
@@ -621,27 +622,6 @@ async fn serve_capability_store(
         .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
 }
 
-/// A configured listener is an operator-owned address; it must survive restarts
-/// and fail closed rather than silently selecting an ephemeral replacement.
-fn configured_carrier_bind_addr(data_dir: &Path) -> anyhow::Result<Option<std::net::SocketAddr>> {
-    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
-    };
-    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
-    table
-        .get("carrier_bind_addr")
-        .map(|value| {
-            value
-                .as_str()
-                .context("carrier_bind_addr must be a socket address string")?
-                .parse()
-                .context("Invalid carrier_bind_addr")
-        })
-        .transpose()
-}
-
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
@@ -1030,12 +1010,26 @@ async fn setup_server_infrastructure_impl(
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((mut model_config, worker)) => {
                     #[cfg(target_os = "macos")]
-                    let bridge_result =
-                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
-                            .await
-                            .map(|(bridge, sockets, vacant, config, listener)| {
+                    let bridge_result = async {
+                        let root = Path::new(&model_config.base_path);
+                        let bundle = api::model_provider_engine_bundle(root).map_err(|_| {
+                            provider::bridge::BridgeError::InitFailed(
+                                "model engine confinement unavailable".into(),
+                            )
+                        })?;
+                        provider::ProviderBridge::spawn_confined_model_with_engine_bundle(
+                            &path,
+                            model_config.clone(),
+                            bundle.as_deref(),
+                        )
+                        .await
+                        .map(
+                            |(bridge, sockets, vacant, config, listener)| {
                                 (bridge, Some((sockets, vacant)), config, Some(listener))
-                            });
+                            },
+                        )
+                    }
+                    .await;
                     #[cfg(target_os = "linux")]
                     let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
                         &path,

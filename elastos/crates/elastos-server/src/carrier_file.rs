@@ -149,12 +149,13 @@ async fn receive_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Retry the existing ticket, relay and direct routes into the same temporary
 /// file. Each attempt starts at byte zero and stays bound to one trusted peer.
-pub(crate) async fn fetch_file_from_trusted_source_to(
+pub(crate) async fn fetch_file_from_trusted_source_to_bound(
     source: &TrustedSource,
     path: &str,
     file: &mut tokio::fs::File,
     expected_size: u64,
     progress: &mut (impl FnMut(u64, u64) -> Result<()> + Send),
+    bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<()> {
     let peer = super::source_transport_endpoint_id(source)?
         .context("trusted source has no usable Carrier node id")?;
@@ -176,8 +177,18 @@ pub(crate) async fn fetch_file_from_trusted_source_to(
         file.rewind().await?;
         progress(0, expected_size)?;
         let connected = match candidate {
-            Some(address) => CarrierClient::connect_endpoint_addr(address, 15).await,
-            None => CarrierClient::connect(&peer, &super::source_carrier_addrs(source), 15).await,
+            Some(address) => {
+                CarrierClient::connect_endpoint_addr_bound(address, 15, bind_addr).await
+            }
+            None => {
+                CarrierClient::connect_bound(
+                    &peer,
+                    &super::source_carrier_addrs(source),
+                    15,
+                    bind_addr,
+                )
+                .await
+            }
         };
         let client = match connected {
             Ok(client) => client,
@@ -186,10 +197,11 @@ pub(crate) async fn fetch_file_from_trusted_source_to(
                 continue;
             }
         };
-        match client
+        let result = client
             .fetch_file_to(path, file, expected_size, progress)
-            .await
-        {
+            .await;
+        client.close().await;
+        match result {
             Ok(()) => return Ok(()),
             Err(error) => errors.push(format!("fetch: {error:#}")),
         }
@@ -469,12 +481,13 @@ mod tests {
             "name":"test", "publisher_node_id":iroh::SecretKey::from_bytes(&[140; 32]).public().to_string(),
             "connect_ticket":super::super::carrier_connect_ticket(&node.endpoint)
         })).unwrap();
-        let error = fetch_file_from_trusted_source_to(
+        let error = fetch_file_from_trusted_source_to_bound(
             &source,
             "test.bin",
             &mut file,
             bytes.len() as u64,
             &mut |_, _| Ok(()),
+            None,
         )
         .await
         .unwrap_err();

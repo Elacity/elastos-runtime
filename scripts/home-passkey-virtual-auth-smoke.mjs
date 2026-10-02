@@ -654,12 +654,17 @@ function isLocalhostWebAuthnUrl(value) {
   return new URL(value).hostname === "localhost";
 }
 
-async function waitForHomeReady(page, timeoutMs = 30_000) {
-  await page.waitForFunction(
-    () => document.body?.dataset?.homeStatus === "ready",
-    null,
-    { timeout: timeoutMs },
-  );
+async function waitForHomeEntry(page, timeoutMs = 30_000) {
+  await page.waitForFunction(() => {
+    if (document.body?.dataset?.homeStatus === "ready") return true;
+    if (document.body?.dataset?.homeStatus !== "locked") return false;
+    const unlock = document.querySelector("#home-unlock");
+    if (!unlock || unlock.hidden) return false;
+    return ["#home-unlock-primary", "#home-unlock-person"].some(selector => {
+      const control = document.querySelector(selector);
+      return control && !control.disabled && control.getClientRects().length > 0;
+    });
+  }, null, { timeout: timeoutMs });
 }
 
 function launchTokenFromRoute(route) {
@@ -3965,7 +3970,7 @@ async function createPasskeyFromCurrentUnlock(page, mode, onCreated) {
 }
 
 async function ensureSignedWithVirtualPasskey(page, onCreated) {
-  await waitForHomeReady(page);
+  await waitForHomeEntry(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
     if (REUSE_SIGNED_HOME) {
@@ -4003,7 +4008,7 @@ async function ensureSignedWithVirtualPasskey(page, onCreated) {
       return { created: false, mode: "existing-passkey", homeToken };
     } catch {
       await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-      await waitForHomeReady(page);
+      await waitForHomeEntry(page);
     }
   }
 
@@ -4108,7 +4113,7 @@ async function signOut(page, homeToken = "") {
 async function signBackIn(page) {
   const tokenPromise = captureNextPasskeyToken(page, 20_000).catch(() => null);
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-  await waitForHomeReady(page);
+  await waitForHomeEntry(page);
   let signed = false;
   try {
     await waitForSignedHome(page, 8_000);
