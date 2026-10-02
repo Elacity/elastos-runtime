@@ -1376,6 +1376,14 @@ const servicesCapsule = read("capsules/services/capsule.json");
 const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
 const peopleScript = read("capsules/people/browser/people.js");
+assert(
+  peopleScript.includes('message.type !== "elastos:runtime-events"') &&
+    peopleScript.includes('item?.kind === "people.changed"') &&
+    peopleScript.includes('status === "connecting"') &&
+    !peopleScript.includes("setTimeout(") &&
+    !peopleScript.includes("setInterval("),
+  "People must follow Discovery through Home runtime events and show Connecting, without its own polling",
+);
 const peopleStyle = read("capsules/people/browser/style.css");
 const peopleDiscoverySmoke = read("scripts/people-discovery-smoke.mjs");
 const debugGuide = read("DEBUG.md");
@@ -3058,11 +3066,6 @@ assert(
       "pub(super) async fn room_service_poll",
       "Chat poll handler",
     ).includes("apply_profile_attribution_to_room_poll") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn room_service_poll",
-      "Chat poll handler",
-    ).includes("presence_port") &&
     sourceBlock(
       gatewayApi,
       "pub(super) async fn chat_room_session_start",
@@ -3070,10 +3073,28 @@ assert(
     ).includes("apply_profile_attribution_to_room_poll") &&
     !sourceBlock(
       gatewayApi,
-      "pub(super) async fn chat_room_session_start",
-      "Chat session start handler",
-    ).includes("presence_port"),
+      "fn room_profile_attribution_names",
+      "Chat attribution names",
+    ).includes("presence") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_room_poll",
+      "Chat attribution apply",
+    ).includes("presence"),
   "Shared-room attribution binds names to signed Profile heads: presence proves liveness, never identity",
+);
+assert(
+  (() => {
+    const directory = sourceBlock(
+      gatewayApi,
+      "fn participant_card_directory",
+      "Chat participant card directory",
+    );
+    return directory.includes("directory.present = snapshot") &&
+      !directory.includes("display_name") &&
+      !directory.includes("names");
+  })(),
+  "Chat presence only marks a verified participant active now; it never names anyone",
 );
 assert(
   sourceBlock(
@@ -5702,6 +5723,9 @@ const inboxWalletApprovalBoundary = {
     inbox.includes('inboxAction("wallet-approve-request:" + requestId'),
   inboxKeepsWalletDeepLink: inbox.includes("Review in Wallet") &&
     inbox.includes('openSource("wallet", { wallet_request: requestId })'),
+  inboxOpensDirectConversation: inbox.includes(
+    '? { conversation_id: actionId.slice("chat-open-direct:".length) } : {};',
+  ),
   gatewayRequiresFreshPasskeyForInboxSigning: gatewayInboxApi.includes(
     "fresh passkey verification is required to sign with a built-in wallet",
   ) &&
@@ -7909,6 +7933,12 @@ assert(
   shellAuth.includes("Create guest account") &&
     shellAuth.includes("create your own guest account"),
   "Home must present guest enrollment as self-registration",
+);
+assert(
+  shellIndex.includes('id="home-unlock-create"') &&
+    shellAuth.includes("unlockCreate.hidden = !(showFace && guestRegistrationEnabled);") &&
+    shellAuth.includes('unlockMode = "create_guest";'),
+  "Home lock face must offer Create account to first-time visitors when guest registration is on",
 );
 assert(
   shellAuth.includes("unlockPerson?.addEventListener(\"click\", startUnlock);") &&

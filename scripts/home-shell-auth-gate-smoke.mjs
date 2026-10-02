@@ -9,6 +9,9 @@ let signedSummary = false;
 let resolvePresenceHeartbeat = null;
 let presenceResponseMode = "pending";
 let credentialGetCount = 0;
+// The guest-enabled variant runs in a child process (see the end of this file)
+// because the shell modules bind to this fake DOM once per process.
+const guestRegistrationEnabled = process.env.HOME_AUTH_GATE_GUEST_ENABLED === "1";
 
 class FakeClassList {
   constructor() {
@@ -282,7 +285,7 @@ globalThis.fetch = async (url, init = {}) => {
     });
   }
   if (url === "/api/auth/passkey/status") {
-    return jsonResponse({ registered: true, guest_registration_enabled: false });
+    return jsonResponse({ registered: true, guest_registration_enabled: guestRegistrationEnabled });
   }
   if (url === "/api/auth/passkey/authenticate/begin") {
     return jsonResponse({
@@ -374,6 +377,31 @@ assert(!activeShellFrame.dataset.route, "auth gate kept a stale active shell rou
 assert(activeShellFrame.src === "about:blank", "auth gate did not unload the stale shell iframe", activeShellFrame.src);
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "auth gate tried to switch shells without a token", requests);
 assert(!requests.some((request) => request.url === "/api/apps/home/launch"), "auth gate tried to launch a shell while locked", requests);
+
+const createAccount = elementForSelector("#home-unlock-create");
+if (guestRegistrationEnabled) {
+  assert(createAccount.hidden === false, "lock face hid Create account while guest registration is on");
+  createAccount.click();
+  for (let attempt = 0; attempt < 20 && elementForSelector(".home-unlock-card").hidden; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert(
+    elementForSelector("#home-unlock-title").textContent === "Create guest account",
+    "Create account did not open guest enrollment",
+    elementForSelector("#home-unlock-title").textContent,
+  );
+  assert(elementForSelector(".home-unlock-card").hidden === false, "Create account did not show the enrollment card");
+  assert(elementForSelector(".home-unlock-face").hidden === true, "Create account left the lock face over the enrollment card");
+  assert(createAccount.hidden === true, "Create account stayed visible during guest enrollment");
+  assert(
+    requests.filter((request) => request.url === "/api/auth/passkey/authenticate/begin").length === 0,
+    "Create account started passkey sign-in instead of enrollment",
+    requests,
+  );
+  console.log("[home-shell-auth-gate] PASS (guest registration on)");
+  process.exit(0);
+}
+assert(createAccount.hidden === true, "lock face offered Create account while guest registration is off");
 
 elementForSelector("#home-unlock-person").click();
 for (
@@ -568,3 +596,10 @@ assert(profileReadinessActionTarget({
 }) === "system", "Home silently accepted an unknown Profile readiness status");
 
 console.log("[home-shell-auth-gate] PASS");
+
+const { spawnSync } = await import("node:child_process");
+const guestVariant = spawnSync(process.execPath, [new URL(import.meta.url).pathname], {
+  env: { ...process.env, HOME_AUTH_GATE_GUEST_ENABLED: "1" },
+  stdio: "inherit",
+});
+if (guestVariant.status !== 0) process.exit(guestVariant.status ?? 1);

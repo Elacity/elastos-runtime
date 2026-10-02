@@ -310,8 +310,8 @@ staging enters admission by exclusive same-filesystem rename. Exact-CID reuse
 retains one artifact charge with separate actor/request bindings.
 
 Private native/Registry capacity observation uses the ready backend's actual
-repository and same-volume datastores. It returns bounded facts and enforces the 10%
-free-space floor. Current-owner backend directories may use `0755` with no
+repository and same-volume datastores. It returns bounded facts and enforces the
+15 GiB free-space floor. Current-owner backend directories may use `0755` with no
 special or group/world write bits; staging remains owner-only `0700`.
 This filesystem observation is separate from the inventory reservation.
 Isolated process tests exercise fresh Use through real Content, Registry,
@@ -395,8 +395,10 @@ payload digests before admission; a range receipt alone cannot establish them.
 Runtime owns one private staging operation for the exact package identity and
 admission record. Bound catalog/manifest bytes, file count, each file, total
 bytes and time from validated policy and exact package facts. Account for
-backend pin storage, staging and final placement, preserving at least 10% free
-space on every affected volume before and during preparation. Verify ownership,
+backend pin storage, staging and final placement, preserving at least 15 GiB
+free space (`MIN_FREE_DISK_BYTES`) on every affected volume before and during
+preparation. The floor is a fixed amount, so it protects small and large
+volumes alike. Verify ownership,
 mode, symlink/hard-link refusal and containment. Atomically admit only the full
 verified closure; restart reconciles the same record and removes only its owned
 partial staging. Retry neither duplicates admission nor repeats a completed
@@ -470,7 +472,7 @@ Implemented source boundaries and remaining acceptance:
    JSON array. Large-model bootstrap must use bounded operator/provider import
    or a separately verified publisher repair. Capacity admission covers the
    complete proof layout, including an additional publisher backend copy when
-   used, while preserving the 10% free-space floor.
+   used, while preserving the 15 GiB free-space floor.
    Verify actual
    artifact/receipt parity and human behavior, then publish code/tests/docs/
    manifests only after explicit authorization. Passkey ceremonies require the

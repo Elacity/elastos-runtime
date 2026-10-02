@@ -1086,11 +1086,14 @@
     }
 
     function fillEntryActions(actions, entry) {
+      const actionId = entry.action_ref && entry.action_ref.action_id;
       if (typeof entry.source_app === "string" && entry.source_app.trim()) {
-        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
+        // A direct-message notice opens its own conversation in Chat.
+        const query = typeof actionId === "string" && actionId.startsWith("chat-open-direct:")
+          ? { conversation_id: actionId.slice("chat-open-direct:".length) } : {};
+        actions.appendChild(createButton("Open", () => openSource(entry.source_app, query)));
       }
 
-      const actionId = entry.action_ref && entry.action_ref.action_id;
       if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));

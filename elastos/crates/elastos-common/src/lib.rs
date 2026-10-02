@@ -44,6 +44,11 @@ pub fn is_safe_browser_profile_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+/// Free disk space every storage-consuming operation keeps after its own
+/// bytes. A fixed amount protects the host the same way on any volume size;
+/// a share of capacity would demand terabytes on large volumes.
+pub const MIN_FREE_DISK_BYTES: u64 = 15 * 1024 * 1024 * 1024;
+
 #[cfg(test)]
 mod browser_profile_tests {
     use super::*;

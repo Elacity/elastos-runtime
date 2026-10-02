@@ -28,7 +28,8 @@ run() {
 }
 
 disk_safe() {
-    df -Pk . | awk 'NR == 2 { exit !($4 * 10 >= $2) }'
+    # Keep 15 GiB free (df -Pk reports KiB), whatever the volume size.
+    df -Pk . | awk 'NR == 2 { exit !($4 >= 15 * 1024 * 1024) }'
 }
 
 run node-26 bash -c '[[ "$(node -p "process.versions.node.split(\".\")[0]")" == 26 ]]'

@@ -10379,19 +10379,24 @@ server.serve_forever()
 
     #[test]
     fn model_preparation_disk_floor_uses_checked_outstanding_bytes() {
-        assert!(storage::require_space_floor(1000, 200, 100).is_ok());
-        assert!(storage::require_space_floor(1000, 200, 101).is_err());
-        assert!(storage::require_space_floor(1000, 200, 201).is_err());
+        // The floor is a fixed amount, whatever the volume size.
+        let floor = u128::from(elastos_common::MIN_FREE_DISK_BYTES);
+        let capacity = 1_u128 << 40;
+        assert!(storage::require_space_floor(capacity, floor + 100, 100).is_ok());
+        assert!(storage::require_space_floor(capacity, floor + 100, 101).is_err());
+        assert!(storage::require_space_floor(capacity, floor + 100, floor + 101).is_err());
+        assert!(storage::require_space_floor(1_u128 << 50, floor + 100, 100).is_ok());
         assert!(storage::require_space_floor(0, 0, 0).is_err());
         assert!(storage::require_space_floor(1000, 1001, 0).is_err());
-        assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_err());
+        // A fixed floor has no capacity multiplication to overflow.
+        assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_ok());
     }
 
     #[test]
     fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
+        let floor = u128::from(elastos_common::MIN_FREE_DISK_BYTES);
         let margin = 1024 * 1024;
         let charge = preparation_charge(payload).unwrap();
         let initial_free = floor + u128::from(charge) + margin;
@@ -10423,8 +10428,8 @@ server.serve_forever()
     #[test]
     fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
+        let floor = u128::from(elastos_common::MIN_FREE_DISK_BYTES);
         let margin = 1024 * 1024;
         let stage_budget = staging_charge(payload).unwrap();
         let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
@@ -10648,8 +10653,8 @@ server.serve_forever()
     #[tokio::test]
     async fn model_preparation_capacity_windows_runtime_floor_counts_shared_backend_growth() {
         let (_root, mut record, _, _) = capacity_window_fixture(true, None).await;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
+        let floor = u128::from(elastos_common::MIN_FREE_DISK_BYTES);
         for completed in [0, 65536, 1024 * 1024, record.total_bytes] {
             record.completed_bytes = completed;
             record.index_bytes = 717;

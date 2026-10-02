@@ -586,7 +586,11 @@ pub(super) async fn people_discovery_update(
                     now,
                 )
                 .await?;
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -607,7 +611,11 @@ pub(super) async fn people_discovery_refresh(
         &headers,
         false,
         |service, authority, now| async move {
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -1055,6 +1063,12 @@ fn configured_people_discovery_summary(
         )
     } else if !status.enabled() {
         ("off", "Discovery is off.".to_string())
+    } else if status.connecting() {
+        (
+            "connecting",
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+                .to_string(),
+        )
     } else if status.available() {
         (
             "visible",
@@ -1235,6 +1249,29 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "off");
         assert!(json.get("remote_visibility_may_remain_until").is_none());
         assert!(json.get("remote_visibility_remaining_seconds").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_reports_connecting_before_first_relay_pass() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                true,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_connecting_for_test(),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "connecting");
+        assert_eq!(
+            json["status_message"],
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+        );
     }
 
     #[test]
@@ -5176,7 +5213,20 @@ async fn home_realtime_snapshot(
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
         home_state.services = HomeServicesSummary::default();
     }
-    let room_signature = home_room_realtime_signature(&home_state.room);
+    // A new direct message refreshes its conversation's notification time,
+    // so the newest such time signals direct messages alongside the room.
+    let direct_message_marker = home_state
+        .notifications
+        .entries
+        .iter()
+        .filter(|entry| crate::notifications::is_direct_message_notification_id(&entry.id))
+        .map(|entry| entry.created_at)
+        .max()
+        .unwrap_or_default();
+    let room_signature = format!(
+        "{}:dm{direct_message_marker}",
+        home_room_realtime_signature(&home_state.room)
+    );
     let mut notifications = home_state.notifications;
     let wallet_approvals = system_wallet_approvals_summary(state, authority, false).await;
     let mut wallet_request_signature = wallet_approvals
@@ -5220,7 +5270,17 @@ async fn home_realtime_snapshot(
     .await;
     let recovery_readiness = recovery_readiness_for_context(&state.data_dir, context);
     let desktop_signature = home_desktop_events_signature(state, context).await;
-    let people_signature = home_people_realtime_signature(&home_state.people);
+    let mut people_signature = home_people_realtime_signature(&home_state.people);
+    if let (Some(service), Ok(Some(authority))) = (
+        state.collaboration_discovery_service.as_ref(),
+        contact_authority.as_ref(),
+    ) {
+        if let Ok(status) =
+            service.read_only_status(authority.store.as_ref(), &authority.profile, now_ts())
+        {
+            people_signature.push(home_discovery_realtime_signature(&status));
+        }
+    }
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
@@ -5316,8 +5376,9 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         .collect::<Vec<_>>();
     sessions.sort();
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         room.room_slug,
+        room.latest_seq,
         room.pending_count,
         room.active_session_count,
         room.member_count,
@@ -5325,6 +5386,27 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         room.local_runtime_role.as_deref().unwrap_or_default(),
         pending.join(","),
         sessions.join(",")
+    )
+}
+
+/// Discovery state that People shows. Countdown seconds stay out so the
+/// signature changes only when what a person can act on changes.
+fn home_discovery_realtime_signature(
+    status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+) -> String {
+    let mut visible = status
+        .visible_people()
+        .iter()
+        .map(|person| person.advertisement_id())
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    format!(
+        "discovery:{}:{}:{}:{}:{}",
+        status.enabled(),
+        status.connecting(),
+        status.available(),
+        status.incoming_requests().len(),
+        visible.join(",")
     )
 }
 
@@ -5652,15 +5734,18 @@ pub(super) fn recovery_readiness_for_context(
         &home_browser_localhost_root(context),
     ) {
         Ok(recovery) => {
+            let kit_outdated = recovery
+                .required_actions
+                .iter()
+                .any(|action| action == "download_recovery_kit_with_profile");
             if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
-                && !recovery
-                    .required_actions
-                    .iter()
-                    .any(|action| action == "download_recovery_kit_with_profile")
+                && !kit_outdated
             {
                 RecoveryReadinessSummary::ready()
+            } else if recovery.recovery_configured {
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
             } else {
-                RecoveryReadinessSummary::setup_required()
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
             }
         }
         Err(_) => RecoveryReadinessSummary::unavailable(),
@@ -7726,6 +7811,14 @@ mod home_realtime_tests {
     use super::*;
 
     #[test]
+    fn room_realtime_signature_changes_when_a_message_arrives() {
+        let mut room = HomeRoomSummary::default();
+        let before = home_room_realtime_signature(&room);
+        room.latest_seq = 7;
+        assert_ne!(home_room_realtime_signature(&room), before);
+    }
+
+    #[test]
     fn room_realtime_signature_ignores_session_last_seen_heartbeat() {
         let mut room = HomeRoomSummary {
             active_session_count: 1,
@@ -7939,7 +8032,9 @@ mod home_realtime_tests {
     fn recovery_readiness_change_emits_home_summary_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
-            recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            recovery_readiness: RecoveryReadinessSummary::setup_required(
+                RECOVERY_READINESS_REASON_KIT_MISSING,
+            ),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),

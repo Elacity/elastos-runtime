@@ -725,6 +725,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(gateway_carrier_bootstrap),
         )
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
+        .route(
+            "/.well-known/elastos/collaboration-network.json",
+            get(gateway_collaboration_network),
+        )
+        .route(
+            "/api/apps/chat-room/contacts/request",
+            post(chat_room_contact_request),
+        )
         .route("/artifacts/*path", get(serve_artifact_file))
         .route(
             "/api/apps/assistant/workspace",

@@ -109,6 +109,20 @@ function bindActions() {
     profileDraftDirty = true;
     profileDraftValue = profileInput.value;
   });
+  // Home pushes people.changed when contacts or Discovery state change, so
+  // "Connecting…" and newly visible people update without a manual Refresh.
+  window.addEventListener("message", (event) => {
+    if (event.origin !== homeParentOrigin || event.source !== window.top) {
+      return;
+    }
+    const message = event.data || {};
+    if (message.type !== "elastos:runtime-events" || !Array.isArray(message.events)) {
+      return;
+    }
+    if (message.events.some((item) => item?.scope === "people" || item?.kind === "people.changed")) {
+      refreshPeople({ quiet: true }).catch(() => {});
+    }
+  });
   window.addEventListener("message", (event) => {
     if (event.origin !== "null" || event.source !== window.parent) {
       return;
@@ -375,6 +389,9 @@ function normalizeDiscoveryStatusMessage(status, runtimeMessage, remainingSecond
   if (status === "off") {
     return "Discovery is off.";
   }
+  if (status === "connecting") {
+    return "Discovery is connecting. People who are visible appear here in a few seconds.";
+  }
   return runtimeMessage || "Discovery is unavailable.";
 }
 
@@ -395,6 +412,12 @@ function discoveryEmptyState(status, configured, enabled) {
     return {
       emptyTitle: "Visibility is expiring",
       emptyCopy: "Your last visibility window is closing.",
+    };
+  }
+  if (status === "connecting") {
+    return {
+      emptyTitle: "Connecting…",
+      emptyCopy: "Looking for people who are visible right now.",
     };
   }
   if (status === "off") {

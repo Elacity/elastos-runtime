@@ -40,6 +40,12 @@ pub struct ComponentsManifest {
     /// unchanged; catalog entries cannot supply their own trust configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_catalog: Option<ModelCatalogConfig>,
+
+    /// Release-pinned default collaboration network. Absence leaves the
+    /// Home's collaboration configuration unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_network:
+        Option<crate::collaboration_release_network::CollaborationNetworkPin>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -526,6 +532,7 @@ async fn run_with_data_dir(
 
     let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
     install_signed_model_catalog(&data_dir, &manifest, &manifest_path)?;
+    install_release_collaboration_network(&data_dir, &manifest, &manifest_path)?;
 
     println!();
     if !stamped.is_empty() {
@@ -2044,6 +2051,34 @@ fn resolve_model_catalog_source(manifest_path: &Path, dest: &Path) -> anyhow::Re
         "model catalog pin is present but {MODEL_CATALOG_FILE} is missing beside {} and in the data directory",
         manifest_path.display()
     );
+}
+
+/// Records the person's choice to keep this Home out of the shared
+/// Community room. Setup then leaves the release network uninstalled.
+pub fn choose_isolated_collaboration() -> anyhow::Result<()> {
+    crate::collaboration_release_network::choose_isolated(&data_dir()?)
+}
+
+/// Joins the release-pinned Community network unless this Home is isolated.
+fn install_release_collaboration_network(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    manifest_path: &Path,
+) -> anyhow::Result<()> {
+    use crate::collaboration_release_network as release_network;
+    let release_copy = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("components manifest has no parent directory"))?
+        .join(release_network::RELEASE_COLLABORATION_NETWORK_FILE);
+    let outcome = release_network::install_release_network(
+        data_dir,
+        manifest.collaboration_network.as_ref(),
+        &release_copy,
+    )?;
+    if let Some(line) = outcome.summary_line() {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 pub(crate) fn install_signed_model_catalog(
@@ -4849,6 +4884,7 @@ mod tests {
         fs::write(&binary_path, b"object-provider").unwrap();
         let manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4938,12 +4974,14 @@ mod tests {
 
         let old_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4970,12 +5008,14 @@ mod tests {
         old_component.capsule_metadata = None;
         let old_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -5209,6 +5249,7 @@ mod tests {
         };
         let manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),

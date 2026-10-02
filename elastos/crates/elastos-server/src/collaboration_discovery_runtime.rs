@@ -77,6 +77,9 @@ const DECLARED_CONTACT_REVOCATION_END_OF_LIFE: crate::collaboration_delivery::De
     crate::collaboration_delivery::DeliveryEndOfLife::RemintExact;
 const DISCOVERY_SYNC_BASE_BACKOFF_SECS: u64 = 5;
 const DISCOVERY_SYNC_MAX_BACKOFF_SECS: u64 = 60;
+/// While a person has Discovery on and is waiting to see people, a failed
+/// relay pass retries within this bound instead of the idle backoff ceiling.
+const DISCOVERY_SYNC_ENABLED_MAX_BACKOFF_SECS: u64 = 15;
 const MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC: usize = 4;
 
 #[derive(Clone)]
@@ -95,6 +98,7 @@ pub struct CollaborationDiscoveryService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CollaborationDiscoveryStatus {
     available: bool,
+    connecting: bool,
     enabled: bool,
     expires_at: Option<u64>,
     remote_visibility_may_remain_until: Option<u64>,
@@ -105,6 +109,8 @@ pub(crate) struct CollaborationDiscoveryStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
     advertisement_id: String,
+    /// Kept inside Runtime to match a visible person to a Chat participant.
+    profile_did: String,
     display_name: String,
     handle: Option<String>,
     last_seen_at: u64,
@@ -199,6 +205,8 @@ struct DiscoveryClientState {
     observed_profile_heads: BTreeMap<String, ObservedProfileHead>,
     remote_visibility_may_remain_until: Option<u64>,
     transport_available: bool,
+    /// Discovery was just turned on and no relay pass has finished since.
+    connecting: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,6 +241,7 @@ impl Default for DiscoveryClientState {
             observed_profile_heads: BTreeMap::new(),
             remote_visibility_may_remain_until: None,
             transport_available: true,
+            connecting: false,
         }
     }
 }
@@ -578,11 +587,36 @@ impl CollaborationDiscoveryService {
         anyhow::bail!("discovery sync context is not registered");
     }
 
+    /// A person turned Discovery on or asked for a refresh. The next worker
+    /// pass retries Discovery at once, even after earlier failures; the worker
+    /// cadence still bounds how often the relay is reached.
+    pub(crate) fn wake_registered_discovery_now(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        if self.wake_registered_sync_inner(store, profile, now, true)? {
+            return Ok(());
+        }
+        anyhow::bail!("discovery sync context is not registered");
+    }
+
     pub(crate) fn wake_registered_sync_if_present(
         &self,
         store: &CollaborationContactStore,
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
+    ) -> anyhow::Result<bool> {
+        self.wake_registered_sync_inner(store, profile, now, false)
+    }
+
+    fn wake_registered_sync_inner(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+        person_requested_discovery: bool,
     ) -> anyhow::Result<bool> {
         self.require_profile_store_match(store, profile)?;
         let key = DiscoverySyncContextKey {
@@ -597,6 +631,9 @@ impl CollaborationDiscoveryService {
         let Some(context) = contexts.get_mut(&key) else {
             return Ok(false);
         };
+        if person_requested_discovery {
+            context.discovery_failures = 0;
+        }
         if context.discovery_failures == 0 {
             context.discovery_next_wake_at = now;
         }
@@ -710,11 +747,20 @@ impl CollaborationDiscoveryService {
                 }
             };
             let discovery_result = if context.discovery_next_wake_at <= now {
-                Some(
-                    self.refresh(context.store.as_ref(), &context.profile, now)
-                        .await
-                        .is_ok(),
-                )
+                match self
+                    .refresh(context.store.as_ref(), &context.profile, now)
+                    .await
+                {
+                    Ok(_) => Some(true),
+                    Err(err) => {
+                        tracing::debug!(
+                            failures = context.discovery_failures,
+                            error = %format!("{err:#}"),
+                            "discovery relay pass failed"
+                        );
+                        Some(false)
+                    }
+                }
             } else {
                 None
             };
@@ -761,7 +807,8 @@ impl CollaborationDiscoveryService {
                 continue;
             }
             if let Some(success) = discovery_result {
-                let cadence = match current.store.discovery_enabled() {
+                let enabled = current.store.discovery_enabled();
+                let cadence = match enabled {
                     Ok(true) => DISCOVERY_SYNC_ENABLED_CADENCE_SECS,
                     Ok(false) => DISCOVERY_SYNC_IDLE_CADENCE_SECS,
                     Err(_) => DISCOVERY_SYNC_MAX_BACKOFF_SECS,
@@ -773,6 +820,11 @@ impl CollaborationDiscoveryService {
                     cadence,
                     now,
                 );
+                if !success && matches!(enabled, Ok(true)) {
+                    current.discovery_next_wake_at = current
+                        .discovery_next_wake_at
+                        .min(now.saturating_add(DISCOVERY_SYNC_ENABLED_MAX_BACKOFF_SECS));
+                }
             }
             if let Some(success) = direct_result {
                 update_sync_schedule(
@@ -881,6 +933,7 @@ impl CollaborationDiscoveryService {
             state.current_advertisement = None;
             state.remote_visibility_may_remain_until = None;
             state.transport_available = false;
+            state.connecting = true;
         } else {
             store.set_discovery_enabled(false, now)?;
             let current = {
@@ -904,6 +957,7 @@ impl CollaborationDiscoveryService {
             let state = client_state_mut(&mut states, profile_did)?;
             state.remote_visibility_may_remain_until = remote_visibility_may_remain_until;
             state.transport_available = false;
+            state.connecting = false;
         }
         self.status_from_state(store, now)
     }
@@ -938,9 +992,13 @@ impl CollaborationDiscoveryService {
         } else {
             Ok(())
         };
+        // The outbox retries on every pass; a refused item is not a relay
+        // outage, so it neither blocks the query nor reads as unavailable.
         if let Err(err) = outbox_result {
-            self.set_transport_available(profile_did, false)?;
-            return Err(err.context("discovery relay outbox delivery failed"));
+            tracing::debug!(
+                error = %format!("{err:#}"),
+                "discovery relay outbox delivery failed; retrying on the next pass"
+            );
         }
         if let Err(err) = mailbox_result {
             self.set_transport_available(profile_did, false)?;
@@ -996,6 +1054,7 @@ impl CollaborationDiscoveryService {
                     let state = client_state_mut(&mut states, profile_did)?;
                     state.current_advertisement = Some(cached);
                     state.transport_available = false;
+                    state.connecting = false;
                     anyhow::bail!("discovery relay query failed");
                 }
             }
@@ -1030,6 +1089,7 @@ impl CollaborationDiscoveryService {
                     let state = client_state_mut(&mut states, profile_did)?;
                     state.remote_visibility_may_remain_until = None;
                     state.transport_available = true;
+                    state.connecting = false;
                 }
                 Err(_) => {
                     self.mark_withdrawal_unavailable(profile_did, &current)?;
@@ -1326,6 +1386,8 @@ impl CollaborationDiscoveryService {
         let mut decisions =
             VecDeque::from(store.resendable_contact_decisions(now, MAX_DISCOVERY_QUERY_RESULTS)?);
         let mut prefer_requests = true;
+        // One refused item must not starve the rest of the outbox.
+        let mut first_failure: Option<anyhow::Error> = None;
         for _ in 0..MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC {
             let next_is_request = match (requests.is_empty(), decisions.is_empty()) {
                 (true, true) => break,
@@ -1337,7 +1399,7 @@ impl CollaborationDiscoveryService {
                 let request = requests
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("pending contact request queue underflow"))?;
-                let response = self
+                let sent = match self
                     .invoke_bootstrap(
                         "send_contact_request",
                         serde_json::to_value(DiscoveryProviderContactRequest {
@@ -1345,13 +1407,21 @@ impl CollaborationDiscoveryService {
                             request: encode_bytes(&request),
                         })?,
                     )
-                    .await?;
-                require_discovery_provider_success(response, "contact request submission")?;
+                    .await
+                {
+                    Ok(response) => {
+                        require_discovery_provider_success(response, "contact request submission")
+                    }
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = sent {
+                    first_failure.get_or_insert(err);
+                }
             } else {
                 let receipt = decisions
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("pending contact decision queue underflow"))?;
-                let response = self
+                let sent = match self
                     .invoke_bootstrap(
                         "submit_contact_decision_receipt",
                         serde_json::to_value(DiscoveryProviderDecisionReceiptRequest {
@@ -1359,8 +1429,16 @@ impl CollaborationDiscoveryService {
                             receipt: encode_bytes(&receipt),
                         })?,
                     )
-                    .await?;
-                require_discovery_provider_success(response, "contact decision submission")?;
+                    .await
+                {
+                    Ok(response) => {
+                        require_discovery_provider_success(response, "contact decision submission")
+                    }
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = sent {
+                    first_failure.get_or_insert(err);
+                }
             }
             if !requests.is_empty() && !decisions.is_empty() {
                 prefer_requests = !prefer_requests;
@@ -1368,7 +1446,10 @@ impl CollaborationDiscoveryService {
                 prefer_requests = !requests.is_empty();
             }
         }
-        Ok(())
+        match first_failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn set_transport_available(&self, profile_did: &str, available: bool) -> anyhow::Result<()> {
@@ -1376,7 +1457,9 @@ impl CollaborationDiscoveryService {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
-        client_state_mut(&mut states, profile_did)?.transport_available = available;
+        let state = client_state_mut(&mut states, profile_did)?;
+        state.transport_available = available;
+        state.connecting = false;
         Ok(())
     }
 
@@ -1392,6 +1475,7 @@ impl CollaborationDiscoveryService {
         let state = client_state_mut(&mut states, profile_did)?;
         state.current_advertisement = Some(current_advertisement);
         state.transport_available = false;
+        state.connecting = false;
         Ok(())
     }
 
@@ -1414,6 +1498,7 @@ impl CollaborationDiscoveryService {
                 .expires_at,
         );
         state.transport_available = false;
+        state.connecting = false;
         Ok(())
     }
 
@@ -1611,6 +1696,7 @@ fn project_discovery_status(
             .values()
             .map(|cached| DiscoveryVisiblePerson {
                 advertisement_id: cached.verified.message().envelope_sha256().to_string(),
+                profile_did: cached.verified.profile_did().to_string(),
                 display_name: cached.verified.display_name().to_string(),
                 handle: cached.verified.handle().map(str::to_string),
                 last_seen_at: cached.verified.message().envelope().payload.created_at,
@@ -1622,6 +1708,7 @@ fn project_discovery_status(
     };
     Ok(CollaborationDiscoveryStatus {
         available: state.transport_available,
+        connecting: enabled && state.connecting,
         enabled,
         expires_at: state
             .current_advertisement
@@ -1761,6 +1848,11 @@ impl CollaborationDiscoveryStatus {
         self.available
     }
 
+    /// Discovery is on and its first relay pass has not finished yet.
+    pub(crate) fn connecting(&self) -> bool {
+        self.connecting
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
@@ -1787,6 +1879,12 @@ impl CollaborationDiscoveryStatus {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_connecting_for_test(mut self) -> Self {
+        self.connecting = true;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_new(
         available: bool,
         enabled: bool,
@@ -1797,6 +1895,7 @@ impl CollaborationDiscoveryStatus {
     ) -> Self {
         Self {
             available,
+            connecting: false,
             enabled,
             expires_at,
             remote_visibility_may_remain_until,
@@ -1809,6 +1908,10 @@ impl CollaborationDiscoveryStatus {
 impl DiscoveryVisiblePerson {
     pub(crate) fn advertisement_id(&self) -> &str {
         &self.advertisement_id
+    }
+
+    pub(crate) fn profile_did(&self) -> &str {
+        &self.profile_did
     }
 
     pub(crate) fn display_name(&self) -> &str {
@@ -1831,8 +1934,10 @@ impl DiscoveryVisiblePerson {
         last_seen_at: u64,
         expires_at: u64,
     ) -> Self {
+        let advertisement_id = advertisement_id.into();
         Self {
-            advertisement_id: advertisement_id.into(),
+            profile_did: format!("did:key:test-{advertisement_id}"),
+            advertisement_id,
             display_name: display_name.into(),
             handle,
             last_seen_at,
@@ -2830,7 +2935,8 @@ fn client_state_mut<'a>(
                 && state.visible_advertisements.is_empty()
                 && state.observed_profile_heads.is_empty()
                 && state.remote_visibility_may_remain_until.is_none()
-                && state.transport_available)
+                && state.transport_available
+                && !state.connecting)
                 .then(|| candidate.clone())
         }) {
             states.remove(&disposable_profile_did);
@@ -2862,6 +2968,7 @@ fn apply_decoded_advertisements(
     state.observed_profile_heads = candidate_heads;
     state.visible_advertisements = candidate_visible;
     state.transport_available = transport_available;
+    state.connecting = false;
     Ok(())
 }
 
@@ -4487,6 +4594,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(enabled.enabled());
+        assert!(
+            enabled.connecting(),
+            "turning Discovery on reads as connecting until the first relay pass finishes"
+        );
         let refreshed = wait_for_visible_peer(
             &local_service,
             local_store.as_ref(),
@@ -4494,6 +4605,11 @@ pub(crate) mod tests {
             "Remote",
         )
         .await;
+        assert!(
+            !refreshed.connecting(),
+            "a finished relay pass ends connecting"
+        );
+        assert!(refreshed.available());
         assert_eq!(refreshed.visible_people().len(), 1);
         assert_eq!(refreshed.visible_people()[0].display_name(), "Remote");
         assert_eq!(refreshed.incoming_requests().len(), 0);
@@ -4773,6 +4889,66 @@ pub(crate) mod tests {
         assert_eq!(
             remote_contacts.contacts()[0].conversation_id(),
             conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn person_requested_discovery_wake_clears_backoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let pair = durable_profile_peer_pair(temp.path()).await;
+        let root_a = temp.path().join("a");
+        let now = crate::auth::now_ts();
+        let grant_a =
+            store_home_session_grant_for_test(&root_a, &pair.identity_a, "alice-home", now);
+        pair.service_a
+            .register_sync_context(
+                pair.store_a.clone(),
+                pair.identity_a.profile.clone(),
+                &grant_a.session_id,
+                Some(&pair.identity_a.proof_binding_id),
+                &grant_a.grant_id,
+                now,
+            )
+            .unwrap();
+        let backed_off_until = now + DISCOVERY_SYNC_MAX_BACKOFF_SECS;
+        let set_backoff = || {
+            for context in pair.service_a.sync_contexts.lock().unwrap().values_mut() {
+                context.discovery_failures = 4;
+                context.discovery_next_wake_at = backed_off_until;
+            }
+        };
+        let discovery_schedule = || {
+            pair.service_a
+                .sync_contexts
+                .lock()
+                .unwrap()
+                .values()
+                .map(|context| (context.discovery_failures, context.discovery_next_wake_at))
+                .collect::<Vec<_>>()
+        };
+
+        set_backoff();
+        assert!(pair
+            .service_a
+            .wake_registered_sync_if_present(
+                pair.store_a.as_ref(),
+                &pair.identity_a.profile,
+                now + 1
+            )
+            .unwrap());
+        assert_eq!(
+            discovery_schedule(),
+            vec![(4, backed_off_until)],
+            "a background wake keeps the failure backoff"
+        );
+
+        pair.service_a
+            .wake_registered_discovery_now(pair.store_a.as_ref(), &pair.identity_a.profile, now + 1)
+            .unwrap();
+        assert_eq!(
+            discovery_schedule(),
+            vec![(0, now + 1)],
+            "a person's Refresh or Turn On retries Discovery at once"
         );
     }
 
@@ -5743,19 +5919,23 @@ pub(crate) mod tests {
             )
             .unwrap()
             .expect("request must remain stored for retry");
-        assert!(local_service
+        // A refused outbox item stays queued, but the pass still reaches the
+        // relay's mailbox and query, so Discovery keeps working meanwhile.
+        let during_outage = local_service
             .refresh(local_store.as_ref(), &local_profile, current_timestamp())
             .await
-            .is_err());
+            .unwrap();
+        assert!(during_outage.available());
         assert!(remote_store.pending_incoming_requests().unwrap().is_empty());
 
         seed_provider.allow_requests();
         seed_provider
             .set_request_submission_response(serde_json::json!({"status":"error","data":{}}));
-        assert!(local_service
+        local_service
             .refresh(local_store.as_ref(), &local_profile, current_timestamp())
             .await
-            .is_err());
+            .unwrap();
+        assert!(remote_store.pending_incoming_requests().unwrap().is_empty());
         assert_eq!(
             local_store
                 .stored_outgoing_contact_request(
@@ -8543,6 +8723,7 @@ pub(crate) mod tests {
             observed_profile_heads: BTreeMap::new(),
             remote_visibility_may_remain_until: None,
             transport_available: false,
+            connecting: false,
         };
 
         apply_decoded_advertisements(&mut state, vec![revision_two.clone()], true).unwrap();
@@ -8625,6 +8806,7 @@ pub(crate) mod tests {
             observed_profile_heads: BTreeMap::new(),
             remote_visibility_may_remain_until: None,
             transport_available: false,
+            connecting: false,
         };
 
         let error =

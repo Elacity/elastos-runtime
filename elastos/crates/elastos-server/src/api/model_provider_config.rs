@@ -1213,8 +1213,11 @@ pub(super) fn archive_hosted_egress_decision(
             "failed to inspect hosted egress history volume"
         );
         let volume = unsafe { volume.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        let available_bytes =
+            u128::from(volume.f_bavail as u64) * u128::from(volume.f_frsize as u64);
         anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
+            available_bytes >= u128::from(elastos_common::MIN_FREE_DISK_BYTES),
             "hosted egress history disk reserve reached"
         );
     }

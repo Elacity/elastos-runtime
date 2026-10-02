@@ -6,7 +6,7 @@
   <title>Chat</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css" />
-  <link rel="stylesheet" href="./style.css?v=chat-room-20260812a" />
+  <link rel="stylesheet" href="./style.css?v=chat-room-20260930c" />
 </head>
 <body data-room-session-active="false">
   <script>
@@ -110,6 +110,13 @@
         </div>
       </div>
       <ol id="participant-list" class="participants"></ol>
+      <section id="participant-card" class="participant-card" role="dialog" aria-labelledby="participant-card-name" hidden>
+        <button id="participant-card-close" type="button" class="participant-card-close" aria-label="Close">×</button>
+        <div id="participant-card-avatar" class="participant-avatar participant-card-avatar" aria-hidden="true"></div>
+        <h3 id="participant-card-name" class="participant-card-name"></h3>
+        <p id="participant-card-state" class="participant-card-state" role="status"></p>
+        <button id="participant-card-action" type="button" class="participant-card-action" hidden></button>
+      </section>
       <section id="browser-access-section" class="browser-access" hidden>
         <div class="browser-access-head">
           <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>
@@ -141,7 +148,7 @@
     import {
       createHomeClipboardClient,
     } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
-    import init from "./chat_room_ui.js?v=chat-room-ui-20260804a";
+    import init from "./chat_room_ui.js?v=chat-room-ui-20260930c";
 
     const chatLaunchParams = new URLSearchParams(window.location.search);
     const chatHomeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -158,7 +165,7 @@
       purpose: "conversation.invite",
     });
     init({
-      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260804a", import.meta.url),
+      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260930c", import.meta.url),
     });
   </script>
   <script>
