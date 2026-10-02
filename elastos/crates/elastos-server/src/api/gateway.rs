@@ -587,8 +587,21 @@ fn apply_capsule_cors_headers(headers: &mut HeaderMap, origin: &HeaderValue) {
 }
 
 fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> Router {
-    Router::new()
+    let user_content = Router::new()
         .route("/", get(serve_public_root))
+        .route("/s/:cid", get(redirect_cid_root))
+        .route("/s/:cid/", get(serve_cid_root))
+        .route("/s/:cid/*path", get(serve_cid_file))
+        .route("/content/:cid", get(serve_ipfs_cid_root))
+        // IPFS-compatible paths so install.sh can use this gateway like ipfs.io.
+        .route("/ipfs/:cid", get(serve_ipfs_cid_root))
+        .route("/ipfs/:cid/", get(serve_cid_root))
+        .route("/ipfs/:cid/*path", get(serve_cid_file))
+        .route("/*path", get(serve_public_site_path))
+        .layer(axum::middleware::map_response(sandbox_content_response));
+
+    Router::new()
+        .merge(user_content)
         .route("/healthz", get(healthz))
         .route(
             "/api/auth/evm/challenge",
@@ -1231,17 +1244,9 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/apps/:app/*path",
             get(super::browser_capsules::serve_browser_app_asset),
         )
-        .route("/s/:cid", get(redirect_cid_root))
-        .route("/s/:cid/", get(serve_cid_root))
-        .route("/s/:cid/*path", get(serve_cid_file))
-        .route("/content/:cid", get(serve_ipfs_cid_root))
-        // IPFS-compatible paths so install.sh can use this gateway like ipfs.io
-        .route("/ipfs/:cid", get(serve_ipfs_cid_root))
-        .route("/ipfs/:cid/", get(serve_cid_root))
-        .route("/ipfs/:cid/*path", get(serve_cid_file))
-        .route("/*path", get(serve_public_site_path))
         .with_state(state)
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
+        .layer(axum::middleware::from_fn(refuse_content_api_resources))
         .layer(axum::middleware::from_fn(capsule_origin_cors))
 }
 

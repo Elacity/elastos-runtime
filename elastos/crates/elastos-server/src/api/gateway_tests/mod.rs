@@ -860,6 +860,7 @@ mod assistant_workspace_v2;
 mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
+mod content_sandbox;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
