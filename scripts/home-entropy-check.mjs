@@ -4074,7 +4074,7 @@ assert(
 );
 assert(
   homeCliManifest.role === "shell" &&
-    homeCliManifest.type === "wasm" &&
+    homeCliManifest.type === "web-projection" &&
     homeCliManifest.runtime_abi === "elastos.runtime-projection/v1" &&
     homeCliManifest.bus_contract === "elastos.runtime-projection/v1" &&
     homeCliManifest.execution === "web-projection" &&
@@ -4104,7 +4104,7 @@ assert(
 );
 assert(
   browserCapsuleManifest.role === "app" &&
-    browserCapsuleManifest.type === "wasm" &&
+    browserCapsuleManifest.type === "web-projection" &&
     browserCapsuleManifest.runtime_abi === "elastos.runtime-projection/v1" &&
     browserCapsuleManifest.bus_contract === "elastos.runtime-projection/v1" &&
     browserCapsuleManifest.execution === "web-projection" &&

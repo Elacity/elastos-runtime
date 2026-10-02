@@ -1318,7 +1318,9 @@ fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Opt
     }
     if matches!(
         manifest.capsule_type,
-        elastos_common::CapsuleType::Wasm | elastos_common::CapsuleType::Data
+        elastos_common::CapsuleType::Wasm
+            | elastos_common::CapsuleType::WebProjection
+            | elastos_common::CapsuleType::Data
     ) && !install_root.join(&manifest.entrypoint).is_file()
     {
         return Some(format!(
@@ -1352,6 +1354,9 @@ fn installed_provider_capsule_metadata_stale_reason(
     }
     if manifest.role != elastos_common::CapsuleRole::Provider {
         return Some("capsule metadata role must be provider".to_string());
+    }
+    if manifest.capsule_type != elastos_common::CapsuleType::NativeProvider {
+        return Some("provider capsule metadata type must be native-provider".to_string());
     }
     let Some(icon_dir) = manifest
         .icon

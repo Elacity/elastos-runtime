@@ -445,6 +445,18 @@ pub(super) async fn launch_runtime_backed_home_target(
     if manifest.is_runtime_projection() {
         return None;
     }
+    if matches!(
+        manifest.capsule_type,
+        CapsuleType::NativeProvider | CapsuleType::NativeHost
+    ) {
+        return Some(GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some(
+                "Native helpers are launched through trusted Runtime components".to_string(),
+            ),
+        });
+    }
 
     let runtime_capsule_dir =
         match materialize_source_wasm_capsule_for_runtime(data_dir, &capsule_dir, &manifest) {
@@ -1856,6 +1868,45 @@ async fn home_list_runtime_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_shell_metadata_refuses_generic_home_launch_before_runtime_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path();
+        let capsule_dir = data_dir.join("capsules/shell");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            include_str!("../../../../capsules/shell/capsule.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("components.json"),
+            serde_json::json!({
+                "external": { "shell": { "install_path": "capsules/shell", "platforms": {} } },
+                "capsules": {}, "profiles": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: "fixture".to_string(),
+            session_id: "fixture".to_string(),
+            proof_binding_id: None,
+            grant_id: "fixture".to_string(),
+        };
+        let outcome = launch_runtime_backed_home_target(data_dir, "shell", &context)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome.capsule_id.is_none());
+        assert!(outcome
+            .detail
+            .unwrap()
+            .contains("trusted Runtime components"));
+        assert!(!crate::runtime_control::home_runtime_coord_path(data_dir).exists());
+        assert!(!data_dir.join("managed-runtimes").exists());
+    }
 
     #[test]
     fn declared_capsule_icon_resolves_to_that_capsule_own_asset_routes() {

@@ -972,7 +972,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        if capsule_type == "wasm" {
+        if matches!(capsule_type, "wasm" | "web-projection") {
             fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
             fs::create_dir_all(dir.join("browser")).unwrap();
             fs::write(dir.join("browser/index.html"), "<!doctype html>").unwrap();
@@ -993,7 +993,7 @@ mod tests {
         if manifest
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|capsule_type| capsule_type == "wasm")
+            .is_some_and(|capsule_type| matches!(capsule_type, "wasm" | "web-projection"))
         {
             fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
             fs::create_dir_all(dir.join("browser")).unwrap();
@@ -1674,7 +1674,7 @@ mod tests {
                 "description": "Marketplace test capsule",
                 "author": "elastos",
                 "role": "app",
-                "type": "wasm",
+                "type": "web-projection",
                 "runtime_abi": "elastos.runtime-projection/v1",
                 "bus_contract": "elastos.runtime-projection/v1",
                 "execution": "web-projection",

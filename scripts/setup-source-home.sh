@@ -544,6 +544,13 @@ for name, component in manifest.get("external", {}).items():
         raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
     if runtime.get("execution") != "native-provider":
         raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "capsules" / name / "capsule.json"
+    if not capsule_path.is_file():
+        capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "elastos" / "capsules" / name / "capsule.json"
+    if capsule_path.is_file():
+        capsule = json.loads(capsule_path.read_text())
+        if (capsule.get("role"), capsule.get("type"), capsule.get("execution"), capsule.get("runtime_abi"), capsule.get("entrypoint")) != ("provider", "native-provider", "native-provider", "elastos.provider-stdio/v1", name):
+            raise SystemExit(f"{name} capsule metadata must describe its native provider execution")
     provides = runtime.get("provides")
     if not isinstance(provides, str) or not provides:
         raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
@@ -762,7 +769,12 @@ import pathlib
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(manifest.get("runtime_abi", ""))
+abi = manifest.get("runtime_abi", "")
+if abi == "elastos.runtime-projection/v1" and (manifest.get("type"), manifest.get("execution")) != ("web-projection", "web-projection"):
+    raise SystemExit(f"{sys.argv[1]} projection execution requires type=web-projection")
+if abi == "elastos.component/v1" and (manifest.get("type"), manifest.get("execution")) != ("wasm", "component"):
+    raise SystemExit(f"{sys.argv[1]} component execution requires type=wasm")
+print(abi)
 PY
 }
 
