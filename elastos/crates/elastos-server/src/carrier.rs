@@ -10297,7 +10297,11 @@ pub(crate) mod tests {
         crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
-            crate::setup::fetch_first_party_component_via_carrier(dir.path(), "artifact"),
+            crate::setup::fetch_first_party_component_via_carrier(
+                dir.path(),
+                "artifact",
+                crate::setup::FirstPartyCarrierContext::Setup,
+            ),
         )
         .await
         .unwrap()
@@ -10325,10 +10329,13 @@ pub(crate) mod tests {
             }
         });
         for _ in 0..2 {
-            let bytes =
-                crate::setup::fetch_first_party_component_via_carrier(dir.path(), "artifact")
-                    .await
-                    .unwrap();
+            let bytes = crate::setup::fetch_first_party_component_via_carrier(
+                dir.path(),
+                "artifact",
+                crate::setup::FirstPartyCarrierContext::Setup,
+            )
+            .await
+            .unwrap();
             assert_eq!(bytes, b"fixture");
         }
         // The second fetch exercises same-address reuse while transport disposal completes.
@@ -10350,6 +10357,153 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn carrier_runtime_download_preserves_configured_listener_and_hash_gate() {
+        let server = bind_carrier_endpoint(
+            SecretKey::from_bytes(&[142; 32]),
+            CarrierNodeNetwork::Isolated,
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let runtime = bind_carrier_endpoint(
+            SecretKey::from_bytes(&[143; 32]),
+            CarrierNodeNetwork::Isolated,
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        // The fixture accepts Carrier file requests without a full Runtime router.
+        server.set_alpns(vec![CARRIER_ALPN.to_vec()]);
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let bind_addr = runtime.bound_sockets()[0];
+        let runtime_id = runtime.id();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("carrier_bind_addr = \"{bind_addr}\"\n"),
+        )
+        .unwrap();
+        let source = TrustedSource {
+            name: "fixture".into(),
+            publisher_dids: vec![],
+            channel: "stable".into(),
+            discovery_uri: String::new(),
+            connect_ticket: encode_ticket_for(address.clone()),
+            gateways: vec![],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: server.id().to_string(),
+            ipns_name: String::new(),
+        };
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.default_source = source.name.clone();
+        sources.sources.push(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let good_checksum = format!("sha256:{:x}", Sha256::digest(b"fixture"));
+        let manifest = serde_json::from_value(serde_json::json!({
+            "external": {
+                "good-fixture": {"install_path": "good-fixture", "platforms": {
+                    "*": {"release_path": "artifact", "checksum": good_checksum}
+                }},
+                "bad-fixture": {"install_path": "bad-fixture", "platforms": {
+                    "*": {"release_path": "artifact", "checksum": format!("sha256:{}", "0".repeat(64))}
+                }}
+            },
+            "profiles": {}
+        }))
+        .unwrap();
+        let mut supervisor = crate::supervisor::Supervisor::new(dir.path().to_path_buf(), manifest);
+        supervisor.set_carrier_endpoint(runtime.clone());
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            for index in 0..3 {
+                let incoming = server_endpoint.accept().await.unwrap();
+                let iroh::endpoint::IncomingAddr::Ip(client_addr) = incoming.remote_addr() else {
+                    panic!("fixture fetch must use the configured loopback IP");
+                };
+                assert_eq!(client_addr.ip(), bind_addr.ip());
+                assert_eq!(client_addr == bind_addr, index == 2);
+                let conn = incoming.await.unwrap();
+                assert_eq!(conn.remote_id() == runtime_id, index == 2);
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                    "artifact"
+                );
+                send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                send.write_all(b"fixture").await.unwrap();
+                send.finish().unwrap();
+                if index < 2 {
+                    assert!(matches!(
+                        conn.closed().await,
+                        iroh::endpoint::ConnectionError::ApplicationClosed(_)
+                    ));
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            match std::net::UdpSocket::bind(client_addr) {
+                                Ok(socket) => break drop(socket),
+                                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                                Err(error) => {
+                                    panic!("temporary Carrier port release failed: {error}")
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .expect("download must release its temporary port on success and hash refusal");
+                }
+            }
+        });
+        for (name, accepted) in [("good-fixture", true), ("bad-fixture", false)] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                supervisor.handle_request(crate::supervisor::SupervisorRequest::DownloadExternal {
+                    name: name.into(),
+                    platform: "*".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status == "ok", accepted, "{:?}", response.error);
+            if accepted {
+                assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"fixture");
+            } else {
+                assert!(response.error.unwrap().contains("Checksum mismatch"));
+                assert!(!dir.path().join(name).exists());
+            }
+            assert!(!runtime.is_closed());
+            assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
+            assert!(std::net::UdpSocket::bind(bind_addr).is_err());
+        }
+        // A real request on the owner's endpoint proves its transport stays usable.
+        let client = CarrierClient::connect_known_endpoint(&runtime, address, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_file_with_timeout(client, "artifact", 5)
+                .await
+                .unwrap(),
+            b"fixture"
+        );
+        assert!(!runtime.is_closed());
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.close().await;
         server.close().await;
     }
 

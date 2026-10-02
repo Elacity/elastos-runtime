@@ -499,6 +499,7 @@ async fn run_with_data_dir(
                 platform_info,
                 &dest,
                 &ipfs_gateways,
+                FirstPartyCarrierContext::Setup,
             )
             .await?;
             write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
@@ -858,6 +859,7 @@ pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow
         &info,
         &dest,
         &build_gateway_list(data_dir),
+        FirstPartyCarrierContext::Runtime,
     )
     .await
 }
@@ -935,6 +937,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
         platform_info,
         &dest,
         &gateways,
+        FirstPartyCarrierContext::Runtime,
     )
     .await?;
     write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
@@ -1011,6 +1014,7 @@ async fn ensure_provider_capsule_metadata_component(
         platform_info,
         &dest,
         ipfs_gateways,
+        FirstPartyCarrierContext::Setup,
     )
     .await?;
     write_platform_cache_metadata(platform_info, &dest)?;
@@ -2394,7 +2398,16 @@ async fn prepare_selected_component_prerequisites(
             ) {
                 let url = resolve_component_download_url(info)
                     .ok_or_else(|| anyhow::anyhow!("Home media-tools release path is missing"))?;
-                download_component(data_dir, name, &url, info, &dest, ipfs_gateways).await?;
+                download_component(
+                    data_dir,
+                    name,
+                    &url,
+                    info,
+                    &dest,
+                    ipfs_gateways,
+                    FirstPartyCarrierContext::Setup,
+                )
+                .await?;
                 write_cache_metadata(manifest, Some(info), platform, name, &dest)?;
             }
             managed_tools = dest.join("bin");
@@ -2588,6 +2601,7 @@ pub async fn refresh_installed_components_for_update(
             new_platform_info,
             &dest,
             &gateways,
+            FirstPartyCarrierContext::Setup,
         )
         .await?;
         write_cache_metadata(
@@ -2695,18 +2709,42 @@ pub async fn run_download(
 ) -> anyhow::Result<()> {
     let data_dir = data_dir().unwrap_or_else(|_| PathBuf::from("/tmp/elastos"));
     let gateways = build_gateway_list(&data_dir);
-    download_component(&data_dir, name, url, platform_info, dest, &gateways).await
+    download_component(
+        &data_dir,
+        name,
+        url,
+        platform_info,
+        dest,
+        &gateways,
+        FirstPartyCarrierContext::Runtime,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FirstPartyCarrierContext {
+    /// Standalone setup owns the operator's configured transport address.
+    Setup,
+    /// In-process downloads choose a temporary port on the configured IP;
+    /// the running Runtime retains its listener and closes it at shutdown.
+    Runtime,
 }
 
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
     release_path: &str,
+    context: FirstPartyCarrierContext,
 ) -> anyhow::Result<Vec<u8>> {
     let source = crate::sources::load_trusted_sources(data_dir)?
         .default_source()
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
-    let bind_addr = crate::carrier::configured_carrier_bind_addr(data_dir)?;
+    let bind_addr = crate::carrier::configured_carrier_bind_addr(data_dir)?.map(|mut address| {
+        if matches!(context, FirstPartyCarrierContext::Runtime) {
+            address.set_port(0);
+        }
+        address
+    });
     crate::carrier::fetch_file_from_trusted_source_bound(&source, release_path, 15, 30, bind_addr)
         .await
 }
@@ -2716,6 +2754,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
     name: &str,
     platform_info: &PlatformInfo,
     dest: &Path,
+    context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     if name == browser_vm_image::NAME {
         return browser_vm_image::install_via_carrier(
@@ -2729,7 +2768,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
     let release_path = platform_info.release_path.as_deref().ok_or_else(|| {
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
-    let bytes = fetch_first_party_component_via_carrier(data_dir, release_path).await?;
+    let bytes = fetch_first_party_component_via_carrier(data_dir, release_path, context).await?;
 
     verify_checksum(name, &bytes, platform_info)?;
 
@@ -2760,6 +2799,7 @@ async fn download_component(
     platform_info: &PlatformInfo,
     dest: &Path,
     ipfs_gateways: &[ElastosFetchPath],
+    carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     if name == browser_vm_image::NAME {
         browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
@@ -2793,7 +2833,15 @@ async fn download_component(
             "  Trying {} via trusted source over Carrier...",
             elastos_url
         );
-        match install_first_party_component_via_carrier(data_dir, name, platform_info, dest).await {
+        match install_first_party_component_via_carrier(
+            data_dir,
+            name,
+            platform_info,
+            dest,
+            carrier_context,
+        )
+        .await
+        {
             Ok(()) => {
                 ensure_bundle_executable_link(data_dir, name, platform_info)?;
                 println!("  Installed: {}", dest.display());
@@ -5831,6 +5879,7 @@ mod tests {
             &info,
             &tmp.path().join("bin/shell"),
             &[],
+            FirstPartyCarrierContext::Setup,
         )
         .await
         .unwrap_err();
