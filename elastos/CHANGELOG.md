@@ -4,6 +4,12 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime stages and verifies offline updates with unchanged support assets
+  under one installation lock and journal. Failed or interrupted activation
+  restores the previous release files. Automatic Home restart remains a follow-up.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for
