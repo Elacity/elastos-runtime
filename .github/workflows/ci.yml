@@ -66,6 +66,7 @@ jobs:
           node scripts/home-shell-regression-smoke.mjs
           node scripts/home-agent-shell-smoke.mjs
           node --test scripts/home-agent-cancellation.test.mjs
+          node --test scripts/home-assistant-mark.test.mjs
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |
