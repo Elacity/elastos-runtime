@@ -50,6 +50,9 @@ async fn run_update_command_for_data_dir(
     rollback_to: Option<String>,
     current_version: &'static str,
 ) -> anyhow::Result<()> {
+    if !check {
+        update::recover_pending_installation(data_dir)?;
+    }
     let sources = elastos_server::sources::load_trusted_sources(data_dir)?;
     let source_config = sources
         .default_source()
@@ -347,6 +350,124 @@ mod tests {
             }
         };
         assert_eq!(*requests.lock().unwrap(), expected_requests);
+    }
+
+    #[tokio::test]
+    async fn apply_recovers_interrupted_release_before_default_carrier_refusal() {
+        use elastos_common::localhost::{
+            publisher_release_head_path, publisher_release_manifest_path,
+        };
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let data = root.join("data");
+        let binary = root.join("bin/elastos");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(publisher_release_head_path(&data).parent().unwrap()).unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "offline fixture", "publisher_dids": ["fixture"], "channel": "stable",
+            "installed_version": "0.7.0", "install_path": binary,
+            "publisher_node_id": "invalid offline endpoint"
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        let original_sources = serde_json::to_vec_pretty(&sources).unwrap();
+        let old_binary = b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n".as_slice();
+        let destinations = [
+            ("runtime_binary", binary.clone(), old_binary),
+            (
+                "components",
+                data.join("components.json"),
+                b"old components".as_slice(),
+            ),
+            (
+                "sources",
+                data.join("sources.json"),
+                original_sources.as_slice(),
+            ),
+            (
+                "release_head",
+                publisher_release_head_path(&data),
+                b"old release head".as_slice(),
+            ),
+            (
+                "release_manifest",
+                publisher_release_manifest_path(&data),
+                b"old release manifest".as_slice(),
+            ),
+        ];
+        let mut entries = Vec::new();
+        for (index, (id, destination, old)) in destinations.iter().enumerate() {
+            let mode = if index == 0 { 0o755 } else { 0o600 };
+            let parent = destination.parent().unwrap();
+            for directory in [".elastos.update-stage", ".elastos.update-rollback"] {
+                let directory = parent.join(directory);
+                if !directory.exists() {
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&directory)
+                        .unwrap();
+                }
+            }
+            let next = if *id == "sources" {
+                original_sources.as_slice()
+            } else {
+                b"candidate release bytes".as_slice()
+            };
+            std::fs::write(destination, if index < 2 { next } else { old }).unwrap();
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode)).unwrap();
+            let rollback = parent.join(".elastos.update-rollback").join(id);
+            std::fs::write(&rollback, old).unwrap();
+            std::fs::set_permissions(&rollback, std::fs::Permissions::from_mode(mode)).unwrap();
+            if index >= 2 {
+                let stage = parent.join(".elastos.update-stage").join(id);
+                std::fs::write(&stage, next).unwrap();
+                std::fs::set_permissions(stage, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            entries.push(serde_json::json!({
+                "id": id, "original_sha256": hex::encode(Sha256::digest(old)), "original_mode": mode,
+                "staged_sha256": hex::encode(Sha256::digest(next)), "staged_mode": mode
+            }));
+        }
+        std::fs::write(data.join("owner-data"), b"owner private data").unwrap();
+        let journal = binary
+            .parent()
+            .unwrap()
+            .join(".elastos.update-journal.json");
+        std::fs::write(&journal, serde_json::to_vec(&serde_json::json!({
+            "schema": "elastos.install-transaction/v1", "transaction_id": "0123456789abcdef0123456789abcdef",
+            "data_dir": data, "binary_basename": "elastos", "phase": "committing", "entries": entries
+        })).unwrap()).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = run_update_command_for_data_dir(
+            &data,
+            false,
+            None,
+            false,
+            Vec::new(),
+            true,
+            None,
+            "0.7.0",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Carrier connection failed"));
+        for (_, destination, old) in destinations {
+            assert_eq!(std::fs::read(destination).unwrap(), old);
+        }
+        assert!(!journal.exists());
+        assert_eq!(
+            std::fs::read(data.join("owner-data")).unwrap(),
+            b"owner private data"
+        );
+        let output = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"elastos 0.7.0\n");
     }
 
     #[tokio::test]
