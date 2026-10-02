@@ -10,12 +10,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use rand::RngCore;
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex, Notify};
 
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 
 const HOME_CLI_CAPSULE_ID: &str = "home-cli";
 const HOME_TERMINAL_CONTRACT_SCHEMA: &str = "elastos.home-cli.terminal-contract/v1";
@@ -175,6 +177,7 @@ struct HomeTerminalSession {
     child_pid: Option<u32>,
     created_at_ms: u64,
     input: Mutex<Option<HomeTerminalInput>>,
+    input_closed: watch::Sender<bool>,
     child: Mutex<Child>,
     events: broadcast::Sender<HomeTerminalBroadcastEvent>,
     replay: StdMutex<HomeTerminalReplayLog>,
@@ -186,7 +189,7 @@ struct HomeTerminalSession {
 
 enum HomeTerminalInput {
     #[cfg(unix)]
-    Pty(File),
+    Pty(AsyncFd<File>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -584,7 +587,7 @@ async fn home_terminal_input_socket(
         let Some(input) = input.as_mut() else {
             break;
         };
-        if input.write_all(&data).await.is_err() {
+        if input.write_all(&data, &session.input_closed).await.is_err() {
             break;
         }
     }
@@ -780,6 +783,7 @@ async fn start_home_terminal_session(
         child_pid,
         created_at_ms: now_unix_ms(),
         input: Mutex::new(Some(pty.input)),
+        input_closed: watch::channel(false).0,
         child: Mutex::new(child),
         events,
         replay: StdMutex::new(HomeTerminalReplayLog::default()),
@@ -809,7 +813,7 @@ async fn start_home_terminal_session(
 #[cfg(unix)]
 struct HomeTerminalPty {
     input: HomeTerminalInput,
-    reader: File,
+    reader: AsyncFd<File>,
     slave_stdin: File,
     slave_stdout: File,
     slave_stderr: File,
@@ -862,9 +866,17 @@ fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminal
             return Err(io::Error::other("PTY close-on-exec flag was not retained").into());
         }
     }
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error()).context("set PTY master nonblocking");
+    }
     Ok(HomeTerminalPty {
-        input: HomeTerminalInput::Pty(master.try_clone().context("clone PTY master for input")?),
-        reader: master,
+        input: HomeTerminalInput::Pty(AsyncFd::new(
+            master.try_clone().context("clone PTY master for input")?,
+        )?),
+        reader: AsyncFd::new(master)?,
         slave_stdin: slave.try_clone().context("clone PTY slave for stdin")?,
         slave_stdout: slave.try_clone().context("clone PTY slave for stdout")?,
         slave_stderr: slave,
@@ -872,15 +884,28 @@ fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminal
 }
 
 impl HomeTerminalInput {
-    async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+    async fn write_all(&mut self, mut data: &[u8], closed: &watch::Sender<bool>) -> io::Result<()> {
         match self {
             #[cfg(unix)]
             HomeTerminalInput::Pty(file) => {
-                let mut writer = file.try_clone()?;
-                let data = data.to_vec();
-                tokio::task::spawn_blocking(move || writer.write_all(&data))
-                    .await
-                    .map_err(io::Error::other)?
+                let mut closed = closed.subscribe();
+                while !data.is_empty() {
+                    let mut ready = tokio::select! {
+                        biased;
+                        _ = closed.wait_for(|closed| *closed) => {
+                            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal input closed"));
+                        }
+                        ready = file.writable() => ready?,
+                    };
+                    match ready.try_io(|file| file.get_ref().write(data)) {
+                        Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(Ok(written)) => data = &data[written..],
+                        Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Ok(Err(err)) => return Err(err),
+                        Err(_) => continue,
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -966,12 +991,19 @@ fn home_terminal_command() -> anyhow::Result<HomeTerminalCommand> {
 }
 
 #[cfg(unix)]
-fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader: File) {
-    tokio::task::spawn_blocking(move || {
+fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, reader: AsyncFd<File>) {
+    tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
         let mut decoder = HomeTerminalUtf8Decoder::default();
         loop {
-            match reader.read(&mut buffer) {
+            let read = match reader.readable().await {
+                Ok(mut ready) => match ready.try_io(|reader| reader.get_ref().read(&mut buffer)) {
+                    Ok(read) => read,
+                    Err(_) => continue,
+                },
+                Err(err) => Err(err),
+            };
+            match read {
                 Ok(0) => {
                     if let Some(data) = decoder.flush_lossy() {
                         send_home_terminal_stdout(&session, data);
@@ -983,6 +1015,7 @@ fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader:
                         send_home_terminal_stdout(&session, data);
                     }
                 }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     emit_home_terminal_event(
                         &session,
@@ -1075,6 +1108,7 @@ fn send_home_terminal_stdout(session: &HomeTerminalSession, data: String) {
 fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
     tokio::spawn(async move {
         let status = session.child.lock().await.wait().await;
+        session.input_closed.send_replace(true);
         {
             let mut input_handle = session.input.lock().await;
             input_handle.take();
@@ -1414,8 +1448,9 @@ async fn close_home_terminal_session(session_id: &str, message: &str) -> Option<
 
 async fn close_home_terminal_session_handle(session: Arc<HomeTerminalSession>, message: &str) {
     let session_id = session.session_id.clone();
-    // A full PTY can block a writer while it holds the input lock. Terminating
-    // the process first releases that write and lets input cleanup complete.
+    // Runtime cancels pending input before waiting for its owner. Slave closure
+    // alone can leave a master write blocked on Linux.
+    session.input_closed.send_replace(true);
     kill_home_terminal_process(session.child_pid);
     {
         let mut input_handle = session.input.lock().await;
@@ -1858,9 +1893,9 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn test_home_cli_terminal_pty_descriptors_are_close_on_exec() {
+    async fn test_home_cli_terminal_pty_descriptors_are_close_on_exec() {
         let pty = open_home_terminal_pty(HomeTerminalSize {
             cols: 100,
             rows: 32,
@@ -1883,6 +1918,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_home_cli_terminal_fixture_cleanup_kills_child_on_panic() {
+        let pty = test_raw_terminal_pty();
         let mut child = Command::new("/bin/sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -1891,15 +1927,33 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let cleanup = TestBlockedPtyCleanup {
+        let mut cleanup = TestBlockedPtyCleanup {
             child_pid: child.id(),
             writer: None,
         };
+        let closed = watch::channel(false).0;
+        let mut writer = tokio::spawn(async move {
+            let mut input = pty.input;
+            input
+                .write_all(&vec![b'x'; HOME_TERMINAL_INPUT_MAX_BYTES * 32], &closed)
+                .await
+        });
+        cleanup.writer = Some(writer.abort_handle());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut writer)
+                .await
+                .is_err()
+        );
         let panic = std::panic::catch_unwind(|| {
             let _cleanup = cleanup;
             panic!("exercise terminal fixture assertion cleanup");
         });
         assert!(panic.is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("panic cleanup must release the blocked fixture writer")
+            .unwrap_err()
+            .is_cancelled());
         let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
             .expect("panic cleanup must terminate and reap the fixture child")
@@ -1908,11 +1962,8 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
-    #[tokio::test]
     #[cfg(unix)]
-    async fn test_home_cli_terminal_policy_revocation_releases_blocked_pty_input() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+    fn test_raw_terminal_pty() -> HomeTerminalPty {
         let pty = open_home_terminal_pty(HomeTerminalSize {
             cols: 100,
             rows: 32,
@@ -1930,6 +1981,15 @@ mod tests {
                 0
             );
         }
+        pty
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_policy_revocation_releases_blocked_pty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+        let pty = test_raw_terminal_pty();
         let mut command = Command::new("/bin/sleep");
         command
             .arg("30")
@@ -1965,7 +2025,10 @@ mod tests {
             // error to stop generating new writes after the slave closes.
             for _ in 0..32 {
                 if input
-                    .write_all(&[b'x'; HOME_TERMINAL_INPUT_MAX_BYTES])
+                    .write_all(
+                        &[b'x'; HOME_TERMINAL_INPUT_MAX_BYTES],
+                        &writing_session.input_closed,
+                    )
                     .await
                     .is_err()
                 {
@@ -2008,7 +2071,7 @@ mod tests {
         cleanup.child_pid = None;
         tokio::time::timeout(Duration::from_secs(2), writer)
             .await
-            .expect("child termination must release the blocked PTY writer")
+            .expect("policy revocation must cancel the blocked PTY writer")
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2024,6 +2087,47 @@ mod tests {
         drop(pty.reader);
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_nonblocking_reader_waits_for_output_and_drains() {
+        let mut pty = test_raw_terminal_pty();
+        let child = Command::new("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let session = test_terminal_session(child, Some(pty.input));
+        session.pty_reader_drained.store(false, Ordering::SeqCst);
+        let mut events = session.events.subscribe();
+        spawn_home_terminal_pty_reader(session.clone(), pty.reader);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(!session.pty_reader_drained.load(Ordering::SeqCst));
+        pty.slave_stdout.write_all(b"terminal output").unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("reader must resume when output arrives")
+            .unwrap();
+        assert_eq!(event.payload.stream, "stdout");
+        assert_eq!(event.payload.data.as_deref(), Some("terminal output"));
+        drop(pty.slave_stdin);
+        drop(pty.slave_stdout);
+        drop(pty.slave_stderr);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.pty_reader_drained.load(Ordering::SeqCst) {
+                session.pty_reader_drained_notify.notified().await;
+            }
+        })
+        .await
+        .expect("reader must drain when the slave closes");
+        session.child.lock().await.wait().await.unwrap();
+    }
+
     #[cfg(unix)]
     struct TestBlockedPtyCleanup {
         child_pid: Option<u32>,
@@ -2034,7 +2138,8 @@ mod tests {
     impl Drop for TestBlockedPtyCleanup {
         fn drop(&mut self) {
             // This runs during assertion unwinding, before Tokio shuts down.
-            // Killing the only slave owner releases any pending blocking write.
+            // Input uses cancellable async I/O, so abort releases its descriptor.
+            // The guard also terminates the fixture's owned child on failure.
             kill_home_terminal_process(self.child_pid);
             if let Some(writer) = &self.writer {
                 writer.abort();
@@ -2700,6 +2805,7 @@ mod tests {
             child_pid,
             created_at_ms: now_unix_ms(),
             input: Mutex::new(input),
+            input_closed: watch::channel(false).0,
             child: Mutex::new(child),
             events,
             replay: StdMutex::new(HomeTerminalReplayLog::default()),
