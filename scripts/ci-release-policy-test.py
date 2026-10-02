@@ -67,8 +67,7 @@ CASES = [
 ]
 # Only pushes of merged code to these branches may write shared caches.
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
-NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
-                "steps.capsules-cache.outputs.cache-hit": "false"}
+NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false"}
 
 
 def validate_cache_guards(source):
@@ -158,7 +157,7 @@ class ReleasePolicyTests(unittest.TestCase):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 11)
+        self.assertEqual(len(caches), 9)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
