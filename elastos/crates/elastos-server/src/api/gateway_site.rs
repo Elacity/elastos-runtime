@@ -13,9 +13,62 @@ struct PublicationReceipt {
     last_version: String,
 }
 
-/// One router admits one complete publication scan at a time.
+// A receipt commit admits one verified snapshot. Later reads check identities
+// and hash only the requested artifact. Concurrent requests wait their turn.
 #[derive(Clone)]
-pub(super) struct ReleaseReadGate(pub(super) Arc<tokio::sync::Semaphore>);
+pub(super) struct ReleaseReadGate {
+    pub(super) permit: Arc<tokio::sync::Semaphore>,
+    cache: Arc<std::sync::Mutex<Option<CachedPublication>>>,
+    #[cfg(test)]
+    pub(super) admissions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReleaseReadGate {
+    pub(super) fn new() -> Self {
+        Self {
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            cache: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            admissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+type ReceiptStamp = (u64, u64, u64, i64, i64, i64, i64, u32, u64);
+
+fn receipt_stamp(metadata: &std::fs::Metadata) -> ReceiptStamp {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.mode(),
+        metadata.nlink(),
+    )
+}
+
+#[derive(PartialEq, Eq)]
+struct PublicationKey {
+    root_path: std::path::PathBuf,
+    receipt_stamp: ReceiptStamp,
+}
+
+struct PublicationContext {
+    key: PublicationKey,
+    receipt: PublicationReceipt,
+    receipt_file: File,
+}
+
+struct CachedPublication {
+    key: PublicationKey,
+    // Retaining the receipt descriptor prevents inode reuse for this cache key.
+    _receipt_file: File,
+    // A changed snapshot stays refused until the publisher commits its receipt.
+    publication: Option<Publication>,
+}
 
 fn publication_open_at(parent: &File, name: &str, directory: bool) -> std::io::Result<File> {
     let name = CString::new(name)?;
@@ -50,7 +103,9 @@ fn publication_directory(path: &std::path::Path) -> std::io::Result<File> {
     Ok(directory)
 }
 
-fn read_publication_receipt(root: &File) -> anyhow::Result<PublicationReceipt> {
+fn read_publication_receipt(
+    root: &File,
+) -> anyhow::Result<(PublicationReceipt, File, ReceiptStamp)> {
     let file = publication_open_at(root, "publish-state.json", false)?;
     let before = file.metadata()?;
     anyhow::ensure!(
@@ -64,35 +119,15 @@ fn read_publication_receipt(root: &File) -> anyhow::Result<PublicationReceipt> {
     );
     let mut bytes = vec![0; before.len() as usize];
     file.read_exact_at(&mut bytes, 0)?;
-    let after = file.metadata()?;
+    let stamp = receipt_stamp(&before);
     anyhow::ensure!(
-        (
-            before.dev(),
-            before.ino(),
-            before.len(),
-            before.mtime(),
-            before.mtime_nsec(),
-            before.ctime(),
-            before.ctime_nsec(),
-            before.mode(),
-            before.nlink()
-        ) == (
-            after.dev(),
-            after.ino(),
-            after.len(),
-            after.mtime(),
-            after.mtime_nsec(),
-            after.ctime(),
-            after.ctime_nsec(),
-            after.mode(),
-            after.nlink()
-        ),
+        stamp == receipt_stamp(&file.metadata()?),
         "publisher receipt changed"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((serde_json::from_slice(&bytes)?, file, stamp))
 }
 
-fn load_release_publication(data_dir: &std::path::Path) -> Result<Publication, StatusCode> {
+fn publication_context(data_dir: &std::path::Path) -> Result<PublicationContext, StatusCode> {
     // Runtime owns data_dir. Normalize its OS alias (e.g. macOS /var) before
     // the no-follow walk of the publication and its saved policy receipt.
     let base = data_dir.canonicalize().map_err(|error| {
@@ -110,28 +145,36 @@ fn load_release_publication(data_dir: &std::path::Path) -> Result<Publication, S
             StatusCode::SERVICE_UNAVAILABLE
         }
     })?;
-    let validated = (|| -> anyhow::Result<Publication> {
+    let validated = (|| -> anyhow::Result<PublicationContext> {
         let metadata = root.metadata()?;
         anyhow::ensure!(
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
             "unsafe publisher root"
         );
-        // This pin is saved by the operator's publication transaction, rather
-        // than taken from the envelope that the gateway is about to verify.
-        let receipt = read_publication_receipt(&root)?;
-        let publication = Publication::open_published(&root_path, &receipt.publisher_did)?;
-        anyhow::ensure!(
-            receipt.last_release_cid == publication.release_cid()
-                && receipt.last_version == publication.version(),
-            "publisher receipt differs from signed set"
-        );
-        crate::update::verify_release_metadata_cid(
-            &receipt.last_head_cid,
-            publication.head_bytes(),
-        )?;
-        Ok(publication)
+        let (receipt, receipt_file, stamp) = read_publication_receipt(&root)?;
+        Ok(PublicationContext {
+            key: PublicationKey {
+                root_path,
+                receipt_stamp: stamp,
+            },
+            receipt,
+            receipt_file,
+        })
     })();
     validated.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn load_release_publication(context: &PublicationContext) -> anyhow::Result<Publication> {
+    // The operator's committed receipt owns the pin, rather than the envelope.
+    let receipt = &context.receipt;
+    let publication = Publication::open_published(&context.key.root_path, &receipt.publisher_did)?;
+    anyhow::ensure!(
+        receipt.last_release_cid == publication.release_cid()
+            && receipt.last_version == publication.version(),
+        "publisher receipt differs from signed set"
+    );
+    crate::update::verify_release_metadata_cid(&receipt.last_head_cid, publication.head_bytes())?;
+    Ok(publication)
 }
 
 enum ReleaseFile {
@@ -147,35 +190,74 @@ async fn signed_release_response(
     file: ReleaseFile,
     media_type: &'static str,
 ) -> Response {
-    let Ok(permit) = gate.0.try_acquire_owned() else {
+    let Ok(permit) = gate.permit.clone().acquire_owned().await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Release publication busy; retry later",
+            "Release publication unavailable",
         )
             .into_response();
     };
     let data_dir = state.data_dir;
     let result = tokio::task::spawn_blocking(move || {
-        // The worker owns this permit even if the awaiting HTTP task is cancelled.
+        // Cancellation keeps the worker's permit until it finishes its checks.
         let _permit = permit;
-        let publication = load_release_publication(&data_dir)?;
-        match file {
-            ReleaseFile::Head => Ok(publication.head_bytes().to_vec()),
-            ReleaseFile::Release => Ok(publication.release_bytes().to_vec()),
-            ReleaseFile::Installer => Ok(publication.installer_bytes().to_vec()),
-            ReleaseFile::Artifact(name) => {
-                if !publication
-                    .artifacts()
-                    .iter()
-                    .any(|record| record.name == name)
-                {
-                    return Err(StatusCode::NOT_FOUND);
-                }
-                publication
-                    .read_verified_artifact(&name)
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
-            }
+        let context = publication_context(&data_dir)?;
+        let mut cache = gate
+            .cache
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if cache.as_ref().is_none_or(|saved| saved.key != context.key) {
+            #[cfg(test)]
+            gate.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let publication = load_release_publication(&context).ok();
+            *cache = Some(CachedPublication {
+                key: context.key,
+                _receipt_file: context.receipt_file,
+                publication,
+            });
         }
+        let saved = cache.as_mut().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let checked = (|| {
+            let publication = saved
+                .publication
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            publication
+                .unchanged_published()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let response = match file {
+                ReleaseFile::Head => Ok(publication.head_bytes().to_vec()),
+                ReleaseFile::Release => Ok(publication.release_bytes().to_vec()),
+                ReleaseFile::Installer => Ok(publication.installer_bytes().to_vec()),
+                ReleaseFile::Artifact(name) => {
+                    if publication
+                        .artifacts()
+                        .iter()
+                        .any(|record| record.name == name)
+                    {
+                        publication
+                            .read_verified_artifact(&name)
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+                    } else {
+                        Err(StatusCode::NOT_FOUND)
+                    }
+                }
+            };
+            publication
+                .unchanged_published()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let after =
+                publication_context(&data_dir).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if after.key != saved.key {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            response
+        })();
+        if matches!(checked, Err(StatusCode::SERVICE_UNAVAILABLE)) {
+            saved.publication = None;
+        }
+        checked
     })
     .await
     .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE));

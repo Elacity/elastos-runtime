@@ -18,6 +18,11 @@ const MAX_COMPONENTS: u64 = 2 * 1024 * 1024;
 const MAX_FILES: usize = 512;
 const METADATA: [&str; 3] = ["release-head.json", "release.json", "install.sh"];
 
+#[cfg(test)]
+thread_local! {
+    static STREAM_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactDescriptor {
     pub name: String,
@@ -29,14 +34,24 @@ pub struct ArtifactDescriptor {
 struct Artifact {
     descriptor: ArtifactDescriptor,
     file: File,
+    admitted: StatStamp,
 }
 
-/// Open files retain the admitted directory and inode identities. Each use also
-/// hashes the signed size, so an in-place change fails before publication/use.
+struct AdmittedMetadata {
+    file: File,
+    admitted: StatStamp,
+}
+
+/// Open files retain the admitted directory and inode identities. Artifact
+/// reads and snapshots also verify the signed bytes before publication/use.
 pub struct Publication {
     root_path: PathBuf,
     _root: File,
     _artifact_directory: File,
+    root_stamp: StatStamp,
+    artifact_directory_stamp: StatStamp,
+    metadata_files: [AdmittedMetadata; 3],
+    published: bool,
     version: String,
     channel: String,
     release_cid: String,
@@ -63,17 +78,16 @@ impl Publication {
             "noncanonical publisher pin"
         );
         let root = directory(path)?;
+        let root_stamp = directory_stamp(&root)?;
         let artifact_directory = if published {
             open_at(&root, "artifacts", libc::O_RDONLY | libc::O_DIRECTORY)?
         } else {
             root.try_clone()?
         };
-        let head = bounded_bytes(&regular(&root, METADATA[0], MAX_METADATA)?, MAX_METADATA)?;
-        let release = bounded_bytes(&regular(&root, METADATA[1], MAX_METADATA)?, MAX_METADATA)?;
-        let installer = bounded_bytes(
-            &regular(&root, METADATA[2], MAX_COMPONENTS)?,
-            MAX_COMPONENTS,
-        )?;
+        let artifact_directory_stamp = directory_stamp(&artifact_directory)?;
+        let (head_file, head) = admitted_metadata(&root, METADATA[0], MAX_METADATA)?;
+        let (release_file, release) = admitted_metadata(&root, METADATA[1], MAX_METADATA)?;
+        let (installer_file, installer) = admitted_metadata(&root, METADATA[2], MAX_COMPONENTS)?;
         let head_envelope =
             crate::crypto::verify_release_envelope(&head, "elastos.release.head.v1", pinned_did)?;
         let release_envelope =
@@ -223,10 +237,14 @@ impl Publication {
             ensure!(names == expected, "unadvertised flat publication file");
         }
         let descriptors = artifacts.values().map(|a| a.descriptor.clone()).collect();
-        Ok(Self {
+        let publication = Self {
             root_path: path.to_owned(),
             _root: root,
             _artifact_directory: artifact_directory,
+            root_stamp,
+            artifact_directory_stamp,
+            metadata_files: [head_file, release_file, installer_file],
+            published,
             version,
             channel,
             release_cid,
@@ -235,7 +253,9 @@ impl Publication {
             installer,
             descriptors,
             artifacts,
-        })
+        };
+        publication.unchanged()?;
+        Ok(publication)
     }
 
     pub fn version(&self) -> &str {
@@ -258,6 +278,70 @@ impl Publication {
     }
     pub fn artifacts(&self) -> &[ArtifactDescriptor] {
         &self.descriptors
+    }
+
+    /// Cached publication bytes belong to this admitted immutable generation.
+    /// This check observes file identities and metadata without reading content.
+    pub fn unchanged_published(&self) -> Result<()> {
+        ensure!(self.published, "published layout required");
+        self.unchanged()
+    }
+
+    fn held_unchanged(&self) -> Result<()> {
+        ensure!(
+            directory_stamp(&self._root)? == self.root_stamp
+                && directory_stamp(&self._artifact_directory)? == self.artifact_directory_stamp,
+            "publication directory changed"
+        );
+        for metadata in &self.metadata_files {
+            ensure!(
+                stamp(&metadata.file)? == metadata.admitted,
+                "publication metadata changed"
+            );
+        }
+        for artifact in self.artifacts.values() {
+            ensure!(
+                stamp(&artifact.file)? == artifact.admitted,
+                "publication artifact changed"
+            );
+        }
+        Ok(())
+    }
+
+    fn unchanged(&self) -> Result<()> {
+        self.held_unchanged()?;
+        let root = directory(&self.root_path)?;
+        ensure!(
+            directory_stamp(&root)? == self.root_stamp,
+            "publication root changed"
+        );
+        let artifacts = if self.published {
+            open_at(&root, "artifacts", libc::O_RDONLY | libc::O_DIRECTORY)?
+        } else {
+            root.try_clone()?
+        };
+        ensure!(
+            directory_stamp(&artifacts)? == self.artifact_directory_stamp,
+            "publication artifact directory changed"
+        );
+        for (name, metadata) in METADATA.iter().zip(&self.metadata_files) {
+            ensure!(
+                stamp(&regular(&root, name, metadata.admitted.size)?)? == metadata.admitted,
+                "publication metadata path changed: {name}"
+            );
+        }
+        for (name, artifact) in &self.artifacts {
+            ensure!(
+                stamp(&regular(&artifacts, name, artifact.descriptor.size)?)? == artifact.admitted,
+                "publication artifact path changed: {name}"
+            );
+        }
+        self.held_unchanged()?;
+        ensure!(
+            directory_stamp(&directory(&self.root_path)?)? == self.root_stamp,
+            "publication root changed during check"
+        );
+        Ok(())
     }
 
     pub fn read_verified_artifact(&self, name: &str) -> Result<Vec<u8>> {
@@ -496,8 +580,14 @@ fn admit_descriptor(
                 sha256: digest.to_owned(),
                 size,
             };
-            let artifact = Artifact { descriptor, file };
-            if stream_verified(&artifact, |_| Ok(())).is_ok() {
+            let admitted = stamp(&file)?;
+            let artifact = Artifact {
+                descriptor,
+                file,
+                admitted,
+            };
+            if stream_verified(&artifact, |_| Ok(())).is_ok() && stamp(&artifact.file)? == admitted
+            {
                 matches.push(name.clone());
             }
         }
@@ -526,11 +616,18 @@ fn admit_descriptor(
             continue;
         }
         ensure!(artifacts.len() < MAX_FILES, "artifact count refused");
+        let file = regular(dir, &name, size)?;
+        let admitted = stamp(&file)?;
         let artifact = Artifact {
             descriptor,
-            file: regular(dir, &name, size)?,
+            file,
+            admitted,
         };
         stream_verified(&artifact, |_| Ok(()))?;
+        ensure!(
+            stamp(&artifact.file)? == admitted,
+            "artifact changed during admission"
+        );
         artifacts.insert(name, artifact);
     }
     Ok(())
@@ -611,18 +708,56 @@ fn regular(dir: &File, name: &str, limit: u64) -> Result<File> {
     );
     Ok(file)
 }
-fn stamp(file: &File) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    nlink: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl StatStamp {
+    fn from_metadata(m: &std::fs::Metadata) -> Self {
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.len(),
+            mode: m.mode(),
+            nlink: m.nlink(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
+}
+
+fn stamp(file: &File) -> Result<StatStamp> {
     let m = file.metadata()?;
     ensure!(m.is_file() && m.nlink() == 1, "file link/type changed");
-    Ok((
-        m.dev(),
-        m.ino(),
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec(),
-        m.ctime(),
-        m.ctime_nsec(),
-    ))
+    Ok(StatStamp::from_metadata(&m))
+}
+
+fn directory_stamp(file: &File) -> Result<StatStamp> {
+    let m = file.metadata()?;
+    ensure!(m.is_dir(), "publication directory type changed");
+    Ok(StatStamp::from_metadata(&m))
+}
+
+fn admitted_metadata(dir: &File, name: &str, limit: u64) -> Result<(AdmittedMetadata, Vec<u8>)> {
+    let file = regular(dir, name, limit)?;
+    let admitted = stamp(&file)?;
+    let bytes = bounded_bytes(&file, limit)?;
+    ensure!(
+        stamp(&file)? == admitted,
+        "metadata changed during admission"
+    );
+    Ok((AdmittedMetadata { file, admitted }, bytes))
 }
 fn stream_file(
     file: &File,
@@ -630,13 +765,15 @@ fn stream_file(
     mut consume: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<String> {
     let before = stamp(file)?;
-    ensure!(before.2 == size, "artifact size differs");
+    ensure!(before.size == size, "artifact size differs");
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut offset = 0;
     while offset < size {
         let wanted = (size - offset).min(buffer.len() as u64) as usize;
         let count = file.read_at(&mut buffer[..wanted], offset)?;
+        #[cfg(test)]
+        STREAM_READS.with(|reads| reads.set(reads.get() + 1));
         ensure!(count > 0, "artifact truncated");
         hasher.update(&buffer[..count]);
         consume(&buffer[..count])?;
@@ -929,6 +1066,105 @@ mod tests {
             );
         }
         assert!(!fixture.input.join("candidate-executed").exists());
+    }
+
+    #[test]
+    fn published_cache_check_keeps_hash_reads_at_admission_and_requested_artifact() {
+        let fixture = PublicPublicationFixture::new();
+        let output = fixture.parent.join("published");
+        fixture.open().unwrap().snapshot_into(&output).unwrap();
+        let publication = Publication::open_published(&output, &fixture.did).unwrap();
+        let reads = STREAM_READS.with(|reads| reads.get());
+        for _ in 0..3 {
+            publication.unchanged_published().unwrap();
+        }
+        assert_eq!(STREAM_READS.with(|reads| reads.get()), reads);
+        publication.read_verified_artifact("home.tar.gz").unwrap();
+        assert!(STREAM_READS.with(|reads| reads.get()) > reads);
+    }
+
+    #[test]
+    fn published_cache_refuses_same_size_in_place_metadata_and_artifact_changes() {
+        for name in METADATA.into_iter().chain([
+            "artifacts/elastos-aarch64-darwin",
+            "artifacts/components-aarch64-darwin.json",
+            "artifacts/home.tar.gz",
+            "artifacts/model-catalog.json",
+        ]) {
+            let fixture = PublicPublicationFixture::new();
+            let output = fixture.parent.join("published");
+            fixture.open().unwrap().snapshot_into(&output).unwrap();
+            let path = output.join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let publication = Publication::open_published(&output, &fixture.did).unwrap();
+            let before = std::fs::metadata(&path).unwrap().len();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let first = std::fs::read(&path).unwrap()[0];
+            file.write_at(&[first ^ 1], 0).unwrap();
+            file.sync_all().unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+            assert!(publication.unchanged_published().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn published_cache_refuses_replacement_links_and_mode_changes() {
+        for name in ["install.sh", "artifacts/home.tar.gz"] {
+            for mutation in ["replacement", "symlink", "hardlink", "mode"] {
+                let fixture = PublicPublicationFixture::new();
+                let output = fixture.parent.join("published");
+                fixture.open().unwrap().snapshot_into(&output).unwrap();
+                let publication = Publication::open_published(&output, &fixture.did).unwrap();
+                let path = output.join(name);
+                let retained = fixture.parent.join("retained-public-file");
+                match mutation {
+                    "replacement" | "symlink" => {
+                        std::fs::rename(&path, &retained).unwrap();
+                        if mutation == "symlink" {
+                            symlink(&retained, &path).unwrap();
+                        } else {
+                            std::fs::copy(&retained, &path).unwrap();
+                        }
+                    }
+                    "hardlink" => std::fs::hard_link(&path, retained).unwrap(),
+                    _ => std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap(),
+                }
+                assert!(
+                    publication.unchanged_published().is_err(),
+                    "{name}: {mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn published_cache_refuses_root_and_artifact_directory_namespace_changes() {
+        for name in ["", "artifacts"] {
+            for replacement in ["directory", "symlink", "mode"] {
+                let fixture = PublicPublicationFixture::new();
+                let output = fixture.parent.join("published");
+                fixture.open().unwrap().snapshot_into(&output).unwrap();
+                let publication = Publication::open_published(&output, &fixture.did).unwrap();
+                let path = output.join(name);
+                if replacement == "mode" {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                } else {
+                    let retained = fixture.parent.join("retained-public-directory");
+                    std::fs::rename(&path, &retained).unwrap();
+                    if replacement == "symlink" {
+                        symlink(retained, &path).unwrap();
+                    } else {
+                        std::fs::create_dir(&path).unwrap();
+                    }
+                }
+                assert!(
+                    publication.unchanged_published().is_err(),
+                    "{name}: {replacement}"
+                );
+            }
+        }
     }
 
     #[test]

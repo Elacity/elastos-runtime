@@ -561,9 +561,7 @@ async fn test_install_script_frozen_across_host_and_forwarded_headers() {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         let response = super::super::gateway_site::serve_install_script(
             AxumState(test_state(&fixture.base)),
-            Extension(super::super::gateway_site::ReleaseReadGate(Arc::new(
-                tokio::sync::Semaphore::new(1),
-            ))),
+            Extension(super::super::gateway_site::ReleaseReadGate::new()),
             headers,
         )
         .await;
@@ -575,40 +573,52 @@ async fn test_install_script_frozen_across_host_and_forwarded_headers() {
     }
 }
 
-#[tokio::test]
-async fn test_busy_release_read_refused_health_works_and_permit_restored() {
+fn publication_test_router(
+    fixture: &SignedGatewayPublication,
+    gate: super::super::gateway_site::ReleaseReadGate,
+) -> Router {
     use super::super::gateway_site::{
         healthz, serve_artifact_file, serve_install_script, serve_release_head,
-        serve_release_manifest, ReleaseReadGate,
+        serve_release_manifest,
     };
-    let fixture = SignedGatewayPublication::new();
-    let gate = ReleaseReadGate(Arc::new(tokio::sync::Semaphore::new(1)));
-    let app = Router::new()
+    Router::new()
         .route("/release-head.json", get(serve_release_head))
         .route("/release.json", get(serve_release_manifest))
         .route("/install.sh", get(serve_install_script))
         .route("/artifacts/*path", get(serve_artifact_file))
         .route("/healthz", get(healthz))
-        .layer(Extension(gate.clone()))
-        .with_state(test_state(&fixture.base));
-    let permit = gate.0.clone().try_acquire_owned().unwrap();
+        .layer(Extension(gate))
+        .with_state(test_state(&fixture.base))
+}
+
+#[tokio::test]
+async fn test_concurrent_release_reads_wait_health_works_and_scan_once() {
+    use super::super::gateway_site::ReleaseReadGate;
+    let fixture = SignedGatewayPublication::new();
+    let gate = ReleaseReadGate::new();
+    let app = publication_test_router(&fixture, gate.clone());
+    let permit = gate.permit.clone().try_acquire_owned().unwrap();
+    let mut requests = Vec::new();
     for path in [
         "/release-head.json",
         "/release.json",
         "/install.sh",
-        "/artifacts/home.tar.gz",
+        "/artifacts/elastos-aarch64-darwin",
     ] {
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body.as_ref(), b"Release publication busy; retry later");
+        let router = app.clone();
+        requests.push(tokio::spawn(async move {
+            router
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }));
     }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut requests[0])
+            .await
+            .is_err()
+    );
+    assert!(requests.iter().all(|request| !request.is_finished()));
     let response = app
         .clone()
         .oneshot(
@@ -621,15 +631,137 @@ async fn test_busy_release_read_refused_health_works_and_permit_restored() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     drop(permit);
-    for path in ["/release-head.json", "/install.sh"] {
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+    for (request, expected) in requests.into_iter().zip([
+        &fixture.head,
+        &fixture.release,
+        &fixture.installer,
+        &fixture.binary,
+    ]) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(gate.0.available_permits(), 1);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_slice());
     }
+    for _ in 0..3 {
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/release-head.json")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(gate.permit.available_permits(), 1);
+    assert_eq!(
+        gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_cached_publication_tamper_refused_until_new_receipt_commit() {
+    use super::super::gateway_site::ReleaseReadGate;
+    for name in [
+        "release-head.json",
+        "release.json",
+        "install.sh",
+        "artifacts/elastos-aarch64-darwin",
+        "artifacts/home.tar.gz",
+    ] {
+        let fixture = SignedGatewayPublication::new();
+        let gate = ReleaseReadGate::new();
+        let app = publication_test_router(&fixture, gate.clone());
+        let request = || {
+            Request::builder()
+                .uri("/release-head.json")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let path = fixture.root.join(name);
+        let original = std::fs::read(&path).unwrap();
+        let mut tampered = original.clone();
+        tampered[0] ^= 1;
+        std::fs::write(&path, tampered).unwrap();
+        for route in [
+            "/release-head.json",
+            "/release.json",
+            "/install.sh",
+            "/artifacts/elastos-aarch64-darwin",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{name} {route}"
+            );
+        }
+        std::fs::write(path, original).unwrap();
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let receipt = fixture.root.join("publish-state.json");
+        let next = fixture.root.join("next-receipt.json");
+        std::fs::write(&next, std::fs::read(&receipt).unwrap()).unwrap();
+        std::fs::rename(next, receipt).unwrap();
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK,
+            "{name}"
+        );
+        assert_eq!(
+            gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_refused_publication_is_not_rescanned_for_same_receipt() {
+    use super::super::gateway_site::ReleaseReadGate;
+    let fixture = SignedGatewayPublication::new();
+    std::fs::write(fixture.root.join("artifacts/home.tar.gz"), b"tampered").unwrap();
+    let gate = ReleaseReadGate::new();
+    let app = publication_test_router(&fixture, gate.clone());
+    for _ in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/release-head.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(
+        gate.admissions.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]
