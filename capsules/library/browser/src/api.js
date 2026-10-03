@@ -265,6 +265,28 @@ export function createLibraryRuntime({ getHomeToken }) {
     });
   }
 
+  // Library only expresses the intent; Home holds the appearance authority
+  // and reads the object itself. Resolves once Home has answered.
+  function setDesktopBackground(uri) {
+    const requestId = crypto.randomUUID();
+    const token = getHomeToken();
+    return new Promise((resolve) => {
+      const finish = (accepted) => {
+        window.clearTimeout(timer);
+        window.removeEventListener("message", receive);
+        resolve(accepted);
+      };
+      const receive = (event) => {
+        if (event.source !== window.top || event.origin !== homeParentOrigin ||
+            event.data?.type !== "home:shell-response" || event.data.requestId !== requestId) return;
+        finish(getHomeToken() === token && event.data.result?.accepted === true && !event.data.error);
+      };
+      const timer = window.setTimeout(() => finish(false), 20_000);
+      window.addEventListener("message", receive);
+      if (!shellMessage({ type: "home:set-desktop-background", uri, requestId })) finish(false);
+    });
+  }
+
   function closeSelf() {
     return shellMessage({ type: "home:close-self" });
   }
@@ -276,6 +298,7 @@ export function createLibraryRuntime({ getHomeToken }) {
     openTarget,
     openPublishedUri,
     deliverToTarget,
+    setDesktopBackground,
     closeSelf,
   };
 }

@@ -64,6 +64,17 @@ export function hasCapability(object, capability) {
   return !Array.isArray(capabilities) || capabilities.includes(capability);
 }
 
+// Mirrors the Runtime's wallpaper rules so the menu only offers what will save.
+const DESKTOP_BACKGROUND_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const DESKTOP_BACKGROUND_MAX_BYTES = 5 * 1024 * 1024;
+
+export function isDesktopBackgroundCandidate(object) {
+  if (!object || isDirectory(object) || inTrash(object)) return false;
+  if (!String(object.uri || "").startsWith("localhost://Users/")) return false;
+  if (!DESKTOP_BACKGROUND_MIME_TYPES.has(String(object.mime || ""))) return false;
+  return Number(object.size || 0) <= DESKTOP_BACKGROUND_MAX_BYTES;
+}
+
 export function isWebSpaceUri(uri) {
   const value = String(uri || "").replace(/\/+$/, "");
   return value === "localhost://WebSpaces" || value.startsWith("localhost://WebSpaces/");
