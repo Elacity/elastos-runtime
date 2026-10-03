@@ -67,9 +67,9 @@ class SourceUpstreamTests(unittest.TestCase):
         (self.root / 'scripts/release-upstream-recipes.json').write_text(json.dumps({
             'schema': 'elastos.release-upstream-recipes/v1', 'recipes': self.recipes}))
 
-    def seed(self, verify=False, data=None):
+    def seed(self, verify=False, data=None, platform=PLATFORM):
         return subprocess.run(['bash', str(self.root / 'scripts/seed-kubo-cache.sh'),
-                               str(self.cache), str(data or self.data), PLATFORM,
+                               str(self.cache), str(data or self.data), platform,
                                *(['--verify-installed'] if verify else [])],
                               capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
 
@@ -191,6 +191,41 @@ class SourceUpstreamTests(unittest.TestCase):
         result = self.source_function('install_content_publish_backend')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Installed Kubo differs', result.stderr)
+
+    def test_source_home_mac_reuses_ci_preseed_cache_without_fetching(self):
+        runner = self.root / 'runner-temp'
+        self.cache = runner / 'kubo-cache'
+        self.recipes[0]['platform'] = 'darwin-arm64'
+        self.write_recipes()
+        self.assert_ok(self.seed(platform='darwin-arm64'))
+        cached = {path.name: (path.stat().st_ino, path.read_bytes())
+                  for path in self.cache.glob('sha*')}
+        receipt = (self.data / 'receipts/kubo-build.json').read_bytes()
+        # Match CI: seed-kubo used RUNNER_TEMP/kubo-cache, then a later shell
+        # runs source-home without either explicit cache override. Removing the
+        # original inputs proves that verification uses the same pinned cache.
+        for source in (self.recipes[0]['source'], self.recipes[0]['license']['files'][0]['source']):
+            Path(source['path']).unlink()
+        environment = {'PLATFORM': 'darwin-arm64', 'RUNNER_TEMP': str(runner),
+                       'SETUP_SOURCE_HOME_UPSTREAM_CACHE': '', 'KUBO_CACHE_DIR': ''}
+        self.assert_ok(self.source_function('install_content_publish_backend', environment))
+        self.assertFalse((self.root / 'target-build/upstream-cache').exists())
+        self.assertEqual((self.data / 'receipts/kubo-build.json').read_bytes(), receipt)
+        self.assertEqual({path.name: (path.stat().st_ino, path.read_bytes())
+                          for path in self.cache.glob('sha*')}, cached)
+        for overrides in ({'SETUP_SOURCE_HOME_UPSTREAM_CACHE': str(self.cache),
+                           'KUBO_CACHE_DIR': str(self.root / 'wrong-kubo-cache')},
+                          {'KUBO_CACHE_DIR': str(self.cache)}):
+            self.assert_ok(self.source_function('install_content_publish_backend', {
+                **environment, 'RUNNER_TEMP': str(self.root / 'wrong-runner-temp'), **overrides}))
+        self.assertFalse((self.root / 'wrong-runner-temp').exists())
+        self.assertFalse((self.root / 'wrong-kubo-cache').exists())
+        binary = self.data / 'bin/kubo'
+        binary.write_bytes(b'changed installed bytes')
+        result = self.source_function('install_content_publish_backend', environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Installed Kubo differs', result.stderr)
+        self.assertEqual(binary.read_bytes(), b'changed installed bytes')
 
     def test_source_home_stamps_native_pins_and_keeps_provider_runtime(self):
         self.assert_ok(self.seed())
