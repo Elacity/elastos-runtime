@@ -107,7 +107,7 @@ jobs:
         env:
           NODE_PATH: ${{ runner.temp }}/behaviour-browser/node_modules
           BROWSER_OPERATOR_PLAYWRIGHT_CORE: ${{ runner.temp }}/behaviour-core/node_modules/playwright-core
-        run: node --test --test-timeout=60000 scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+        run: node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
 
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.

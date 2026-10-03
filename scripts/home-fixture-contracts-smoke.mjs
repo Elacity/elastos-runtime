@@ -8,9 +8,33 @@ import test from "node:test";
 import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 const require = createRequire(import.meta.url);
+
+test("valid product data leaves Home isolation and Runtime projection evidence open", () => {
+  assert(checkProductData().capsules > 0);
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("./home-shell-objective-audit.mjs", import.meta.url)), "--require-complete"], { encoding: "utf8" });
+  assert.equal(result.status, 1, result.stderr);
+  const audit = JSON.parse(result.stdout);
+  for (const id of ["home_gui_boundary", "capsule_interface_projection", "operator_browser_ux_manual"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, false, id);
+  }
+  assert.match(audit.criteria.find((entry) => entry.id === "capsule_interface_projection").missing, /installed \/api\/capsules\/contracts\/audit/);
+});
+
+test("generated native media defaults do not accept missing product or manual evidence", () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("./browser-objective-audit.mjs", import.meta.url))], { encoding: "utf8" });
+  assert.equal(result.status, 1, result.stderr);
+  const audit = JSON.parse(result.stdout);
+  assert.equal(audit.criteria.find((entry) => entry.id === "native_media_not_faked").ok, true);
+  for (const id of ["native_product_media_accepted", "manual_ux_accepted"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, false, id);
+  }
+  assert.equal(audit.product_provider_accepted, false);
+});
 const hostedDriver = read("scripts/browser-hosted-product-display-smoke.sh")
   .split("node - <<'NODE'\n")[1].split("\nNODE")[0];
 async function hostedAdapterFixture(mode) {

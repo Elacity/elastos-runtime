@@ -5,7 +5,6 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkProductData } from "./check-product-data.mjs";
 
 import {
   sha256File,
@@ -322,7 +321,8 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
         "capsules/browser/browser/browser-input-surface.js",
         "capsules/browser/browser/browser-remote-display.js",
         "scripts/browser-display-mode-smoke.mjs",
-        "scripts/check-product-data.mjs",
+        "scripts/browser-native-operator-config.mjs",
+        "scripts/browser-native-target-preflight.sh",
         "docs/BROWSER_CAPSULE.md",
         "scripts/browser-kasm-control-service.mjs",
       ],
@@ -364,8 +364,6 @@ function main() {
   const decisionReport = readRepo("scripts/browser-provider-decision-report.mjs");
   const decisionReportSmoke = readRepo("scripts/browser-provider-decision-report-smoke.sh");
   const runbook = readRepo("scripts/browser-provider-runbook.mjs");
-  let productDataValid = false;
-  try { checkProductData(); productDataValid = true; } catch {}
   const configFixture = fs.mkdtempSync(join(tmpdir(), "browser-objective-config-"));
   let nativeMediaDefaultsOff = false;
   try {
@@ -374,7 +372,10 @@ function main() {
       "--out-dir", configFixture, "--browser-program", "/fixture/browser",
       "--supervisor-bin", "/fixture/supervisor", "--proxy-engine-bin", "/fixture/proxy",
     ], { encoding: "utf8" }));
-    nativeMediaDefaultsOff = config.native_audio_declared === false && config.native_video_declared === false;
+    const adapter = JSON.parse(fs.readFileSync(join(configFixture, "browser-engine-adapter.json"), "utf8"));
+    const supervisor = JSON.parse(adapter.adapters[0].supervisor.env.ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG);
+    nativeMediaDefaultsOff = config.native_audio_declared === false && config.native_video_declared === false &&
+      supervisor.display_capabilities.audio === false && supervisor.display_capabilities.video === false;
   } finally { fs.rmSync(configFixture, { recursive: true, force: true }); }
   const browserUi = [
     readRepo("capsules/browser/browser/browser.js"),
@@ -489,11 +490,10 @@ function main() {
         nativeConfig.includes("nativeVideo: false") &&
         nativeConfig.includes("--native-audio") &&
         nativeConfig.includes("--native-video") &&
-        nativeMediaDefaultsOff && productDataValid,
+        nativeMediaDefaultsOff,
       [
         "elastos/tools/browser-engine-supervisor/src/main.rs",
         "scripts/browser-native-operator-config.mjs",
-        "scripts/check-product-data.mjs",
       ],
       "Keep generated native media declarations off until the operator provides capabilities; product media needs accepted target evidence.",
     ),
