@@ -100,6 +100,6 @@ Required handoff gate:
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 (cd elastos && cargo fmt --all -- --check)
 ```

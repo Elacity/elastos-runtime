@@ -300,7 +300,8 @@ basic gate before handing work back:
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
+node --test scripts/check-product-data.test.mjs
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 ```
@@ -313,7 +314,7 @@ for touched crates or scripts, for example:
 cargo test --manifest-path capsules/chain-provider/Cargo.toml -- --nocapture
 ```
 
-For Browser-facing changes, include the relevant Browser entropy/smoke gates and
+For Browser-facing changes, include the relevant Browser behaviour/smoke gates and
 do not claim product readiness unless `scripts/browser-objective-audit.mjs`
 passes with accepted product media plus matching manual UX evidence.
 
@@ -461,10 +462,8 @@ Rust target; do not re-document dependency installation here.
   use. `wasm32-unknown-unknown` is the capsule Component target; the release
   scripts also add it on demand via `ensure_rust_target_installed`.
 - Core gate has no JS/Python package deps: the `.mjs` checks in `just verify`
-  (`home-entropy-check.mjs`, `browser-entropy-check.mjs`,
-  `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
-  only stdlib/`node --test`. `playwright` appears only as a scanned string in
-  entropy checks and as an import in Browser/GUI headless smokes that are NOT
+  (`check-product-data.mjs`, `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
+  only stdlib/`node --test`. `playwright` appears as an import in Browser/GUI headless smokes that are NOT
   part of the core gate, so no `npm install` is needed for build/lint/test.
 - Build/lint/test run from the repo root (the recipes `cd elastos`
   themselves): `just build`, `just lint`, `just test`. A cold `just build` is

@@ -168,9 +168,10 @@ Common branch gates include:
 
 `public-copy-entropy-check.mjs` checks selected public manifests, static HTML,
 accessibility labels, and Home CLI command copy for Home, People, Spaces,
-Services, and System. `check-wci-alignment.sh` owns canonical architecture terms
-and retired product terms. Both run directly; this checkout has no separate
-`terminology-lint` recipe.
+Services, and System. `node scripts/check-product-data.mjs` validates capsule
+authority and interface metadata, setup profiles, release asset metadata,
+model catalog bindings, and install icons. Behaviour tests prove Runtime
+authority and UI journeys.
 
 ## Browser capacity proof
 

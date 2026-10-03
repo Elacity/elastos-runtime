@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import process from "node:process";
+import { checkProductData } from "./check-product-data.mjs";
 
 import { validateHomeShellManualUxReport } from "./home-shell-manual-ux-report.mjs";
 
@@ -148,7 +149,8 @@ function audit(args) {
   const contractDoc = read("docs/HOME_SHELL_HOST_CONTRACT.md");
   const capsuleContractDoc = read("docs/CAPSULE_INTERFACE_CONTRACT.md");
   const espDoc = read("docs/ESP_V0.md");
-  const entropy = read("scripts/home-entropy-check.mjs");
+  let productDataValid = false;
+  try { checkProductData(); productDataValid = true; } catch {}
   const bridgeSmoke = read("scripts/home-shell-bridge-smoke.mjs");
   const authGateSmoke = read("scripts/home-shell-auth-gate-smoke.mjs");
   const staleHintSmoke = read("scripts/home-shell-stale-hint-boot-smoke.mjs");
@@ -223,7 +225,7 @@ function audit(args) {
         !shellCore.includes("export async function ensureHomeGuiDom()") &&
         !shellCore.includes("function desktopLayoutBounds()") &&
         !shellCore.includes("desktopIconsVisible: true") &&
-        entropy.includes("Home must keep a host-only DOM") &&
+        productDataValid &&
         homeGuiManifest.includes('"execution": "web-projection"') &&
         homeIndex.includes('id="active-shell-frame"') &&
         homeGuiIndex.includes('<div class="home-gui-shell"></div>') &&
@@ -238,7 +240,7 @@ function audit(args) {
         "capsules/home/browser/shell-core.js",
         "capsules/home/browser/home-shell-host.js",
         "docs/HOME_SHELL_HOST_CONTRACT.md",
-        "scripts/home-entropy-check.mjs",
+        "scripts/check-product-data.mjs",
       ],
       "Keep GUI projection inside the isolated home-gui capsule and keep the Home host free of GUI DOM or behavior.",
     ),
@@ -346,12 +348,12 @@ function audit(args) {
       "capsule_interface_projection",
       "Capsules expose web, CLI, facts, affordances, gate metadata, audit/mirror, and Carrier/service readiness through Runtime-derived projections.",
       includesNormalized(capsuleContractDoc, "web, CLI, facts, affordances, gates, audit/mirror, and Carrier/service") &&
-        entropy.includes("first_party_capsules_have_complete_projection_contract") &&
+        productDataValid &&
         gatewayCapsuleCatalog.includes("first_party_capsules_have_complete_projection_contract") &&
         state.includes("first_party_capsules_have_complete_projection_contract"),
       [
         "docs/HOME_SHELL_HOST_CONTRACT.md",
-        "scripts/home-entropy-check.mjs",
+        "scripts/check-product-data.mjs",
         "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
         "state.md",
       ],

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { checkProductData } from "./check-product-data.mjs";
 import vm from "node:vm";
 import test from "node:test";
 import { createRequire } from "node:module";
@@ -86,47 +88,23 @@ function fn(source, name) {
   assert(start >= 0, name);
   return source.slice(start, source.indexOf("\n}", start) + 2);
 }
-const entropy = read("scripts/home-entropy-check.mjs");
-function traversalFixture() {
-  const entry = (name, directory = false) => ({ name, isDirectory: () => directory, isFile: () => !directory });
-  const directories = new Map([
-    ["/fixture", [entry("target", true), entry("target-build", true), entry("docs", true), entry("README.md")]],
-    ["/fixture/docs", [entry("contract.md")]],
-  ]);
-  const files = new Map([["/fixture/README.md", "[contract](docs/contract.md)"], ["/fixture/docs/contract.md", "Current source contract."]]);
-  const context = vm.createContext({
-    repoRootPath: "/fixture", resolve, dirname,
-    assert: (condition, message, details) => assert(condition, `${message}: ${JSON.stringify(details)}`),
-    existsSync: (path) => directories.has(path) || files.has(path) || ["/fixture/target", "/fixture/target-build"].includes(path),
-    readdirSync: (path) => {
-      assert(directories.has(path), `must not traverse rebuildable output: ${path}`);
-      return directories.get(path);
-    },
-    readFileSync: (path) => {
-      if (!files.has(path)) throw new Error(`ENOENT: ${path}`);
-      return files.get(path);
-    },
-  });
-  for (const name of ["listMarkdownFiles", "listTextFiles", "listFilesRecursive", "isTestOrGeneratedPath", "assertMarkdownLocalLinksResolve"]) vm.runInContext(fn(entropy, name), context);
-  return { context, files };
-}
-test("all entropy walks exclude the configured build output and retain source docs", () => {
-  assert.match(read(".cargo/config.toml"), /^build-dir = "target-build"$/m);
-  for (const name of ["listMarkdownFiles", "listTextFiles", "listFilesRecursive"]) {
-    const { context } = traversalFixture();
-    assert.deepEqual(Array.from(context[name]("/fixture")).sort(), ["/fixture/README.md", "/fixture/docs/contract.md"]);
+test("product data refuses missing input and missing declared install assets", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "home-data-refusal-"));
+  try {
+    assert.throws(() => checkProductData(fixture), /ENOENT/);
+    const capsuleRoot = join(fixture, "capsules/assistant");
+    mkdirSync(join(capsuleRoot, "browser"), { recursive: true });
+    mkdirSync(join(fixture, "elastos/capsules"), { recursive: true });
+    const manifestPath = join(capsuleRoot, "capsule.json");
+    writeFileSync(manifestPath, read("capsules/assistant/capsule.json"));
+    assert.throws(() => checkProductData(fixture), /missing entrypoint/);
+    writeFileSync(join(capsuleRoot, "browser/index.html"), "");
+    assert.throws(() => checkProductData(fixture), /missing 32px icon/);
+    writeFileSync(manifestPath, "{");
+    assert.throws(() => checkProductData(fixture), SyntaxError);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
-  const { context } = traversalFixture();
-  assert(context.isTestOrGeneratedPath("/fixture/target-build/debug/generated.rs"));
-  assert(!context.isTestOrGeneratedPath("/fixture/docs/contract.md"));
-});
-test("broken source links and source read failures still fail entropy", () => {
-  const { context, files } = traversalFixture();
-  context.assertMarkdownLocalLinksResolve();
-  files.set("/fixture/docs/contract.md", "[missing](missing.md)");
-  assert.throws(() => context.assertMarkdownLocalLinksResolve(), /Markdown local links must resolve/);
-  files.delete("/fixture/docs/contract.md");
-  assert.throws(() => context.assertMarkdownLocalLinksResolve(), /ENOENT/);
 });
 
 const lifecycle = read("scripts/home-browser-restored-lifecycle-headless-smoke.mjs");

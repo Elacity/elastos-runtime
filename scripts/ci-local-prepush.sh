@@ -36,9 +36,7 @@ run rust-1.91 bash -c '[[ "$(rustc --version)" == "rustc 1.91.0 "* ]]'
 run diff-check git diff --check
 run rust-format bash -c 'cd elastos && cargo fmt --all -- --check'
 run chain-format cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
-run alignment bash scripts/check-wci-alignment.sh
-run home-entropy node scripts/home-entropy-check.mjs
-run browser-entropy node scripts/browser-entropy-check.mjs
+run product-data node scripts/check-product-data.mjs
 run home-shell node scripts/home-shell-regression-smoke.mjs
 run agent-shell node scripts/home-agent-shell-smoke.mjs
 run agent-cancellation node --test scripts/home-agent-cancellation.test.mjs
