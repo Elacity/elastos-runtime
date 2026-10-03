@@ -519,6 +519,7 @@ elementForSelector("#home-older-key-action").click();
 hintInput.value = JSON.stringify(hint);
 for (const listener of windowListeners.get("pagehide") || []) listener();
 assert(hintInput.value === "", "hint survived pagehide");
+for (const listener of windowListeners.get("pageshow") || []) listener();
 elementForSelector("#home-passkey-hint-cancel").click();
 
 for (const listener of windowListeners.get("message") || []) {
@@ -830,24 +831,30 @@ eventsResponseMode = "network-error";
 recoveredStream.onerror({});
 const warn = console.warn;
 console.warn = () => {};
+let reconnectDelayTotal = 0;
 try {
-  for (let attempt = 0; attempt < 20 && eventPollTimers.size; attempt += 1) await runEventPoll();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const delay = eventPollTimers.values().next().value?.delay;
+    assert(delay > 0 && delay <= 30_000, "Home lost its bounded reconnect backoff", delay);
+    reconnectDelayTotal += delay;
+    await runEventPoll();
+  }
 } finally {
   console.warn = warn;
 }
-assert(eventPollTimers.size === 0, "Home kept retrying a failed Runtime without a bound");
-assert(eventRequests().length === pollCount + 15, "Home changed its bounded reconnect attempt limit");
-assert(hasHomeAuthorityToken(), "bounded restart recovery cleared the session");
+assert(reconnectDelayTotal > 30_000, "Home outage did not exceed the former reconnect window");
+assert(eventPollTimers.size === 1, "active Home stopped automatic recovery after a long outage");
+assert(eventRequests().length === pollCount + 21, "Home lost an owned reconnect probe");
+assert(eventPollTimers.values().next().value.delay === 30_000, "Home did not retain its capped reconnect delay");
+assert(hasHomeAuthorityToken(), "restart recovery cleared the session");
 eventsResponseMode = "success";
-for (const listener of documentListeners.get("visibilitychange") || []) listener();
-await pause();
 await runEventPoll();
-assert(eventSources.length === 3, "returning to Home did not resume bounded recovery");
+assert(eventSources.length === 3, "Home did not reconnect automatically after a long outage");
 
 document.hidden = true;
 eventSources.at(-1).onerror({});
 const beforeHiddenPoll = eventRequests().length;
-await runEventPoll();
+await pause();
 assert(eventRequests().length === beforeHiddenPoll, "hidden Home polled during restart recovery");
 assert(eventPollTimers.size === 0, "hidden Home kept a permanent reconnect timer");
 document.hidden = false;

@@ -125,6 +125,7 @@ let runtimeUpdateBusy = false;
 let runtimeUpdateActive = true;
 let runtimeUpdateTimer = 0;
 let runtimeUpdateReconnects = 0;
+const runtimeUpdateRequests = new Set();
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -3721,6 +3722,7 @@ function configureRuntimeUpdate() {
   window.addEventListener("pagehide", () => {
     runtimeUpdateActive = false;
     window.clearTimeout(runtimeUpdateTimer);
+    for (const request of runtimeUpdateRequests) request.abort();
   }, { once: true });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) scheduleRuntimeUpdateRefresh(0);
@@ -3764,12 +3766,17 @@ function renderRuntimeUpdate(update) {
   const actionable = runtimeUpdateCanApply();
   runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
   runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
-  runtimeUpdateButton.textContent = runtimeUpdatePending ? "Update in progress" : "Update and restart Home";
+  const progress = runtimeUpdateProgressPhase();
+  runtimeUpdateButton.textContent = runtimeUpdatePending
+    ? runtimeUpdatePending.dispatched ? "Update in progress" : "Waiting for update status"
+    : "Update and restart Home";
   if (runtimeUpdatePending) {
     showRuntimeUpdateStatus(runtimeUpdateBusy && !runtimeUpdatePending.stepUpToken
       ? "Verify your passkey to start the update."
-      : phase === "restarting" ? "Home is restarting. Reconnecting…"
-        : phase === "staging" ? "Checking the signed update. Keep Home open." : "Starting the update. Keep Home open.");
+      : progress === "restarting" ? "Home is restarting. Reconnecting…"
+        : progress === "staging" ? "Checking the signed update. Keep Home open."
+          : progress === "queued" ? "The update is queued. Keep Home open."
+            : "Checking the update with Home. Keep Home open.");
   } else if (["staging", "restarting"].includes(phase)) {
     showRuntimeUpdateStatus(phase === "restarting"
       ? "Home is restarting. Reconnecting…" : "Checking the signed update. Keep Home open.");
@@ -3781,6 +3788,17 @@ function renderRuntimeUpdate(update) {
       : readText(runtimeUpdate?.message) || "Update checks are unavailable on this Home.");
   }
   scheduleRuntimeUpdateRefresh();
+}
+
+function runtimeUpdateProgressPhase() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  if (!runtimeUpdatePending) return phase;
+  if (runtimeUpdate?.controller?.id === runtimeUpdatePending.intent.request_id
+    && ["staging", "restarting"].includes(phase)) {
+    runtimeUpdatePending.dispatched = true;
+    runtimeUpdatePending.phase = phase;
+  }
+  return runtimeUpdatePending.phase || "checking";
 }
 
 function runtimeUpdateCanApply() {
@@ -3803,18 +3821,22 @@ function scheduleRuntimeUpdateRefresh(delay) {
 }
 
 async function pollRuntimeUpdate() {
+  if (!runtimeUpdateActive) return;
   if (systemSummaryInFlight) {
     scheduleRuntimeUpdateRefresh();
     return;
   }
   if (runtimeUpdatePending && ++runtimeUpdatePending.polls >= 90) {
-    showRuntimeUpdateStatus("Home has not completed the update. Open Home again to check its status.");
+    showRuntimeUpdateStatus(runtimeUpdatePending.dispatched
+      ? "Home has not completed the update. Open System from Home again to check its status."
+      : "Home has not confirmed the update. Open System from Home again to check its status.");
     return;
   }
   try {
     await refreshSystemSummary();
     runtimeUpdateReconnects = 0;
   } catch (error) {
+    if (!runtimeUpdateActive) return;
     if (error.status === 401 || error.status === 403) {
       runtimeUpdateButton.hidden = true;
       runtimeUpdateButton.disabled = true;
@@ -3826,17 +3848,25 @@ async function pollRuntimeUpdate() {
       showRuntimeUpdateStatus("Home has not reconnected. Open Home again to check the update.");
       return;
     }
-    showRuntimeUpdateStatus(runtimeUpdatePending || runtimeUpdate?.controller?.phase === "restarting"
-      ? "Home is restarting. Reconnecting…" : "Update status is unavailable. Reconnecting…");
+    showRuntimeUpdateStatus(runtimeUpdateProgressPhase() === "restarting"
+      ? "Home is restarting. Reconnecting…"
+      : runtimeUpdatePending?.dispatched ? "Waiting for Home to report update progress. Reconnecting…"
+        : runtimeUpdatePending ? "Waiting for Home to confirm the update. Reconnecting…"
+        : "Update status is unavailable. Reconnecting…");
   }
   scheduleRuntimeUpdateRefresh();
 }
 
 async function fetchRuntimeUpdateJson(init) {
   const abort = new AbortController();
-  const timeout = window.setTimeout(() => abort.abort(), 10_000);
+  runtimeUpdateRequests.add(abort);
+  // Carrier admission includes connection, signed metadata checks and transport drain.
+  const timeout = window.setTimeout(() => abort.abort(), init.method === "POST" ? 60_000 : 10_000);
   try { return await fetchJson("/api/apps/system/summary", { ...init, signal: abort.signal }); }
-  finally { window.clearTimeout(timeout); }
+  finally {
+    window.clearTimeout(timeout);
+    runtimeUpdateRequests.delete(abort);
+  }
 }
 
 async function onRuntimeUpdateApply() {
@@ -3845,30 +3875,40 @@ async function onRuntimeUpdateApply() {
   for (const field of ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]) {
     intent[field] = runtimeUpdate[field];
   }
-  runtimeUpdatePending = { intent, stepUpToken: null, polls: 0, publisher: runtimeUpdate.publisher, changes: runtimeUpdate.changes };
+  const pending = { intent, stepUpToken: null, polls: 0, dispatched: false, phase: "checking",
+    publisher: runtimeUpdate.publisher, changes: runtimeUpdate.changes };
+  runtimeUpdatePending = pending;
   runtimeUpdateBusy = true;
   renderRuntimeUpdate(runtimeUpdate);
   let feedback = "";
   try {
-    runtimeUpdatePending.stepUpToken = await requestPasskeyStepUp("system.update.apply", intent);
-    if (!runtimeUpdateActive) return;
-    const body = JSON.stringify({ ...intent, step_up_token: runtimeUpdatePending.stepUpToken });
+    pending.stepUpToken = await requestPasskeyStepUp("system.update.apply", intent);
+    if (!runtimeUpdateActive || runtimeUpdatePending !== pending) return;
+    const body = JSON.stringify({ ...intent, step_up_token: pending.stepUpToken });
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body });
+        const reply = await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body });
+        if (runtimeUpdatePending !== pending || !runtimeUpdateActive) return;
+        if (reply?.id !== intent.request_id || reply?.phase !== "queued") throw new Error("Update queue confirmation is unavailable.");
+        pending.dispatched = true;
+        if (pending.phase === "checking") pending.phase = "queued";
         break;
       } catch (error) {
-        if ((error.status >= 400 && error.status < 500) || attempt === 1) throw error;
+        if (!runtimeUpdateActive || (error.status >= 400 && error.status < 500) || attempt === 1) throw error;
       }
     }
   } catch (error) {
-    if (!runtimeUpdatePending?.stepUpToken || (error.status >= 400 && error.status < 500)) {
+    if (runtimeUpdatePending !== pending) return;
+    if (!pending.stepUpToken || (error.status >= 400 && error.status < 500)) {
       runtimeUpdatePending = null;
       feedback = error.status === 401 || error.status === 403
         ? "Sign in as the Home owner to start the update."
         : "The update could not start. Check the update and try again.";
     } else {
-      feedback = "Home is restarting. Reconnecting…";
+      feedback = runtimeUpdateProgressPhase() === "restarting"
+        ? "Home is restarting. Reconnecting…"
+        : pending.dispatched ? "Waiting for Home to report update progress. Keep Home open."
+          : "Waiting for Home to confirm the update. Keep Home open.";
     }
   } finally {
     runtimeUpdateBusy = false;

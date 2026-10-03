@@ -45,7 +45,7 @@ const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
 const HOME_EVENTS_WAIT_MS = 25_000;
 const HOME_EVENTS_RETRY_MS = 2_000;
-const HOME_EVENTS_MAX_RECONNECT_ATTEMPTS = 15;
+const HOME_EVENTS_MAX_RETRY_MS = 30_000;
 const HOME_EVENTS_RECONNECT_TIMEOUT_MS = 10_000;
 const HOME_EVENTS_POLL_TIMEOUT_MS = HOME_EVENTS_WAIT_MS + HOME_EVENTS_RECONNECT_TIMEOUT_MS;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
@@ -100,6 +100,8 @@ const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
 let homeEventsReconnectAttempts = 0;
 let homeEventsReconnectInFlight = null;
+let homeEventsReconnectController = null;
+let homeEventsChannelActive = true;
 let homeEventsChannelGeneration = 0;
 let homeEventsPollController = null;
 const pendingActiveShellReady = {
@@ -2321,11 +2323,21 @@ async function refreshShellSummary({
   return summary;
 }
 
+function bindHomeEventLifecycle() {
+  window.addEventListener("pagehide", () => {
+    homeEventsChannelActive = false;
+    stopHomeEventChannel();
+  });
+  window.addEventListener("pageshow", () => {
+    homeEventsChannelActive = true;
+    ensureHomeEventChannel();
+  });
+}
+
+bindHomeEventLifecycle();
+
 function ensureHomeEventChannel() {
-  if (
-    !homeSummarySignedIn(shellState.currentSummary) ||
-    homeEventsReconnectAttempts >= HOME_EVENTS_MAX_RECONNECT_ATTEMPTS
-  ) {
+  if (!homeEventsChannelActive || document.hidden || !homeSummarySignedIn(shellState.currentSummary)) {
     return;
   }
   if (window.EventSource && !shellState.homeEventsStreamFailed) {
@@ -2343,6 +2355,9 @@ function stopHomeEventChannel() {
   homeEventsChannelGeneration += 1;
   homeEventsPollController?.abort();
   homeEventsPollController = null;
+  homeEventsReconnectController?.abort();
+  homeEventsReconnectController = null;
+  homeEventsReconnectInFlight = null;
   homeEventsReconnectAttempts = 0;
   shellState.homeEventsCursor = "";
   shellState.homeEventsInFlight = false;
@@ -2356,17 +2371,21 @@ function stopHomeEventChannel() {
 }
 
 function refreshHomeAfterEventReconnect() {
+  if (!homeEventsChannelActive || document.hidden) return Promise.resolve(null);
   if (!homeEventsReconnectInFlight) {
     const generation = homeEventsChannelGeneration;
-    homeEventsReconnectInFlight = Promise.resolve()
-      .then(() => homeSummaryHasProofBoundSession(shellState.currentSummary)
-        ? refreshHomeSession({ signal: AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS) })
-        : null)
-      .then(() => generation === homeEventsChannelGeneration
-        ? refreshShellSummary({ signal: AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS) })
-        : null)
+    const controller = new AbortController();
+    homeEventsReconnectController = controller;
+    const signal = () => AbortSignal.any([
+      controller.signal, AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS),
+    ]);
+    const current = () => homeEventsChannelActive && generation === homeEventsChannelGeneration;
+    const pending = Promise.resolve()
+      .then(() => current() && homeSummaryHasProofBoundSession(shellState.currentSummary)
+        ? refreshHomeSession({ signal: signal() }) : null)
+      .then(() => current() ? refreshShellSummary({ signal: signal() }) : null)
       .then((summary) => {
-        if (generation === homeEventsChannelGeneration && homeSummarySignedIn(summary)) {
+        if (current() && homeSummarySignedIn(summary)) {
           broadcastHomeRuntimeEvents([{
             kind: "home.summary.changed",
             scope: "home",
@@ -2376,13 +2395,16 @@ function refreshHomeAfterEventReconnect() {
         return summary;
       })
       .finally(() => {
-        homeEventsReconnectInFlight = null;
+        if (homeEventsReconnectInFlight === pending) homeEventsReconnectInFlight = null;
+        if (homeEventsReconnectController === controller) homeEventsReconnectController = null;
       });
+    homeEventsReconnectInFlight = pending;
   }
   return homeEventsReconnectInFlight;
 }
 
 function retryHomeEventChannel(error) {
+  if (!homeEventsChannelActive) return;
   if (isHomeAuthError(error)) {
     clearHomeAuthorityToken();
     stopHomeEventChannel();
@@ -2391,18 +2413,12 @@ function retryHomeEventChannel(error) {
     });
     return;
   }
-  homeEventsReconnectAttempts += 1;
-  if (homeEventsReconnectAttempts < HOME_EVENTS_MAX_RECONNECT_ATTEMPTS) {
-    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
-  } else {
-    window.clearTimeout(shellState.homeEventsTimer);
-    shellState.homeEventsTimer = null;
-    console.warn("Home updates paused. Return to Home to reconnect.");
-  }
+  homeEventsReconnectAttempts = Math.min(homeEventsReconnectAttempts + 1, 5);
+  scheduleHomeEventPoll(Math.min(HOME_EVENTS_RETRY_MS * 2 ** (homeEventsReconnectAttempts - 1), HOME_EVENTS_MAX_RETRY_MS));
 }
 
 function ensureHomeEventStream({ refreshOnOpen = true } = {}) {
-  if (shellState.homeEventsSource) {
+  if (!homeEventsChannelActive || document.hidden || shellState.homeEventsSource) {
     return;
   }
   window.clearTimeout(shellState.homeEventsTimer);
@@ -2445,7 +2461,7 @@ function ensureHomeEventStream({ refreshOnOpen = true } = {}) {
 }
 
 async function pollHomeEvents() {
-  if (shellState.homeEventsInFlight || shellState.homeEventsSource) {
+  if (!homeEventsChannelActive || shellState.homeEventsInFlight || shellState.homeEventsSource) {
     return;
   }
   if (!homeSummarySignedIn(shellState.currentSummary)) {
@@ -2542,6 +2558,8 @@ function homeEventsRequireShellSummary(events) {
 
 function scheduleHomeEventPoll(delayMs) {
   window.clearTimeout(shellState.homeEventsTimer);
+  shellState.homeEventsTimer = null;
+  if (!homeEventsChannelActive || document.hidden || !homeSummarySignedIn(shellState.currentSummary)) return;
   shellState.homeEventsTimer = window.setTimeout(
     pollHomeEvents,
     Math.max(250, Number(delayMs) || HOME_EVENTS_RETRY_MS),

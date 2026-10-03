@@ -212,11 +212,12 @@ test("hosted handoff replaces the previous selection with the exact requested of
 });
 
 const updateFunctions = source.slice(source.indexOf("function configureRuntimeUpdate() {"), source.indexOf("function readQueryParam("));
+const settleUpdateTasks = () => new Promise(resolve => setImmediate(resolve));
 
 function updateFixture(overrides = {}) {
   const fields = new Map(), hiddenFields = new Map(), timers = new Map(), listeners = new Map();
   const posts = [], approvals = [];
-  let timerId = 0;
+  let timerId = 0, now = 0;
   const button = { hidden: true, disabled: true, addEventListener(type, handler) { this[type] = handler; } };
   const panel = { hidden: true }, status = { textContent: "" }, top = {};
   const context = vm.createContext({
@@ -224,12 +225,13 @@ function updateFixture(overrides = {}) {
     runtimeUpdateNode: panel, runtimeUpdateButton: button, runtimeUpdateStatusNode: status,
     runtimeUpdate: undefined, runtimeUpdatePending: null, runtimeUpdateBusy: false,
     runtimeUpdateActive: true, runtimeUpdateTimer: 0, runtimeUpdateReconnects: 0,
+    runtimeUpdateRequests: new Set(),
     systemSummaryInFlight: null, homeParentOrigin: "https://home.example",
     document: { hidden: false, addEventListener: (type, handler) => listeners.set(`document:${type}`, handler) },
     window: {
       top, crypto: { randomUUID },
       addEventListener: (type, handler) => listeners.set(type, handler),
-      setTimeout: (handler, delay) => { timers.set(++timerId, { handler, delay }); return timerId; },
+      setTimeout: (handler, delay) => { timers.set(++timerId, { handler, delay, due: now + delay }); return timerId; },
       clearTimeout: id => timers.delete(id),
     },
     readText: value => typeof value === "string" ? value.trim() : "",
@@ -237,7 +239,10 @@ function updateFixture(overrides = {}) {
     setHiddenFields: (field, value) => hiddenFields.set(field, value),
     shellHeaders: extra => ({ "x-elastos-home-token": "system-token", ...extra }),
     requestPasskeyStepUp: async (operation, intent) => { approvals.push({ operation, intent: JSON.parse(JSON.stringify(intent)) }); return "approved-exact-choice"; },
-    fetchJson: async (url, init) => { posts.push({ url, ...init }); return {}; },
+    fetchJson: async (url, init) => {
+      posts.push({ url, ...init });
+      return init.method === "POST" ? { id: JSON.parse(init.body).request_id, phase: "queued" } : {};
+    },
     refreshSystemSummary: async () => {},
     ...overrides,
   });
@@ -250,7 +255,19 @@ function updateFixture(overrides = {}) {
   };
   context.configureRuntimeUpdate();
   context.renderRuntimeUpdate(offer);
-  return { context, offer, button, panel, status, fields, hiddenFields, timers, listeners, posts, approvals, top };
+  const advance = async ms => {
+    const target = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, timer]) => timer.due <= target).sort((a, b) => a[1].due - b[1].due)[0];
+      if (!next) break;
+      timers.delete(next[0]);
+      now = next[1].due;
+      await next[1].handler();
+      await Promise.resolve();
+    }
+    now = target;
+  };
+  return { context, offer, button, panel, status, fields, hiddenFields, timers, listeners, posts, approvals, top, advance };
 }
 
 test("Home update requires a verified complete offer and a controller that can apply", () => {
@@ -295,7 +312,7 @@ test("Home update freezes one exact passkey intent and retries a lost response w
   f.context.fetchJson = async (url, init) => {
     f.posts.push({ url, ...init });
     if (++attempt === 1) throw new TypeError("response lost");
-    return {};
+    return { id: JSON.parse(init.body).request_id, phase: "queued" };
   };
   const apply = f.context.onRuntimeUpdateApply();
   await f.context.onRuntimeUpdateApply();
@@ -339,7 +356,8 @@ test("Home update keeps an ambiguous submission pending and stops bounded progre
     assert.equal(bodies.length, 2);
     assert.equal(bodies[0], bodies[1]);
     assert.equal(f.button.disabled, true);
-    assert.match(f.status.textContent, /Reconnecting/);
+    assert.match(f.status.textContent, /Waiting for Home to confirm/);
+    assert(!f.status.textContent.includes("restarting"));
     f.context.systemSummaryInFlight = Promise.resolve();
     const polls = f.context.runtimeUpdatePending.polls;
     await f.context.pollRuntimeUpdate();
@@ -349,7 +367,8 @@ test("Home update keeps an ambiguous submission pending and stops bounded progre
     const before = f.timers.size;
     await f.context.pollRuntimeUpdate();
     assert.equal(f.timers.size, before, "exhausted recovery adds no timer");
-    assert.match(f.status.textContent, /has not completed/);
+    assert.match(f.status.textContent, /has not confirmed/);
+    assert.match(f.status.textContent, /Open System from Home again/);
   }
 });
 
@@ -366,6 +385,125 @@ test("Home update cancellation and definitive refusal each allow a fresh approve
   assert(!f.status.textContent.includes("private"));
   await f.context.onRuntimeUpdateApply();
   assert.notEqual(f.approvals[1].intent.request_id, first);
+});
+
+test("slow Carrier admission stays neutral beyond thirty seconds and can still refuse the choice", async () => {
+  const f = updateFixture();
+  let refuse;
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise((_resolve, reject) => { refuse = reject; });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await Promise.resolve();
+  await f.advance(35_000);
+  assert.equal(f.posts.length, 1, "slow admission retains one submission");
+  assert.equal(f.posts[0].signal.aborted, false);
+  assert([...f.timers.values()].some(timer => timer.delay === 60_000));
+  assert.equal(f.context.runtimeUpdatePending.dispatched, false);
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id: "another-request", phase: "restarting" } });
+  assert.match(f.status.textContent, /Checking the update with Home/);
+  assert(!f.status.textContent.includes("restarting"), "another controller request cannot prove this restart");
+  const error = new Error("signed choice refused"); error.status = 409;
+  refuse(error);
+  await applying;
+  assert.equal(f.posts.length, 1, "a definite refusal does not replay");
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.context.runtimeUpdateRequests.size, 0);
+  assert.match(f.status.textContent, /could not start/);
+  assert.equal(f.button.disabled, true, "the other active request controls action availability");
+});
+
+test("matching queue confirmation and controller state prove progress after slow admission", async () => {
+  const f = updateFixture();
+  let confirm;
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise(resolve => { confirm = resolve; });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await Promise.resolve();
+  await f.advance(35_000);
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  confirm({ id, phase: "queued" });
+  await applying;
+  assert.equal(f.context.runtimeUpdatePending.dispatched, true);
+  assert.match(f.status.textContent, /update is queued/);
+  assert(!f.status.textContent.includes("restarting"));
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "staging" } });
+  assert.match(f.status.textContent, /Checking the signed update/);
+  f.context.refreshSystemSummary = async () => { throw new TypeError("response lost"); };
+  await f.context.pollRuntimeUpdate();
+  assert.match(f.status.textContent, /report update progress/);
+  assert(!f.status.textContent.includes("restarting"));
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "restarting" } });
+  assert.match(f.status.textContent, /Home is restarting/);
+  await f.context.pollRuntimeUpdate();
+  assert.match(f.status.textContent, /Home is restarting/);
+});
+
+test("only a matching queue reply confirms dispatch and an ambiguous deadline preserves the exact retry", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = async (_url, init) => {
+    f.posts.push(init);
+    return { id: "unrelated-request", phase: "queued" };
+  };
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[0].body, f.posts[1].body);
+  assert.equal(f.context.runtimeUpdatePending.dispatched, false);
+  assert.match(f.status.textContent, /Waiting for Home to confirm/);
+  const g = updateFixture();
+  g.context.fetchJson = (_url, init) => {
+    g.posts.push(init);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("admission deadline")));
+    });
+  };
+  const applying = g.context.onRuntimeUpdateApply();
+  await settleUpdateTasks();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const deadline = [...g.timers.values()].find(timer => timer.delay === 60_000);
+    assert(deadline, "each exact submission has a sixty-second deadline");
+    deadline.handler();
+    await settleUpdateTasks();
+  }
+  await applying;
+  assert.equal(g.posts.length, 2);
+  assert.equal(g.posts[0].body, g.posts[1].body);
+  assert.equal(g.approvals.length, 1);
+  assert.equal(g.context.runtimeUpdateRequests.size, 0);
+  assert.equal(g.context.runtimeUpdatePending.dispatched, false);
+  assert.match(g.status.textContent, /Waiting for Home to confirm/);
+});
+
+test("closing System aborts its owned submission and summary requests without a replay", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("document closed")));
+    });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await settleUpdateTasks();
+  const reading = f.context.fetchRuntimeUpdateJson({ headers: {} });
+  const readClosed = assert.rejects(reading, /document closed/);
+  assert.equal(f.context.runtimeUpdateRequests.size, 2);
+  f.listeners.get("pagehide")();
+  await Promise.all([applying, readClosed]);
+  assert.equal(f.posts.length, 2, "one POST and one GET stop with their document");
+  assert(f.posts.every(request => request.signal.aborted));
+  assert.equal(f.context.runtimeUpdateRequests.size, 0);
+  assert.equal(f.timers.size, 0, "request deadlines and polling timers are released");
+  await f.context.pollRuntimeUpdate();
+  assert.equal(f.posts.length, 2, "a stale poll cannot restart a closed document");
+  const g = updateFixture({ requestPasskeyStepUp: () => new Promise(resolve => { g.approve = resolve; }) });
+  const approving = g.context.onRuntimeUpdateApply();
+  g.listeners.get("pagehide")();
+  g.approve("approved");
+  await approving;
+  assert.equal(g.posts.length, 0, "late passkey approval cannot submit after page close");
 });
 
 test("Home update polling binds host messages, stops at auth refusal, and closes with its document", async () => {
