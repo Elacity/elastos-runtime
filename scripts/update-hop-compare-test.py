@@ -818,6 +818,267 @@ class CliFixtureTests(unittest.TestCase):
             for changed_stdout, changed_stderr, unchanged in ((stdout, "Carrier connection failed", True), (stdout, stderr, False)):
                 self.assertEqual(observer.cli_refusal(case, failure, changed_stdout, changed_stderr, unchanged)["status"], "failed")
 
+    def qualified_home_support(self):
+        support = self.root / "support"
+        (support / "bin").mkdir(parents=True, exist_ok=True)
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            path = support / "bin" / name
+            path.write_bytes(name.encode())
+            path.chmod(0o755)
+        capsule = support / "capsules/home"
+        (capsule / "browser").mkdir(parents=True, exist_ok=True)
+        observer.write(capsule / "capsule.json", {"schema": "elastos.capsule/v1", "name": "home", "role": "app",
+                       "type": "wasm", "entrypoint": "browser/index.html", "execution": "web-projection"})
+        (capsule / "browser/index.html").write_bytes(b"<html>installed Home fixture</html>")
+        (capsule / "browser/shell.js").write_bytes(b"export const home = true;")
+        document = capsule / "browser/index.html"
+        entry = {"cid": "", "sha256": "", "size": 0, "install_path": "capsules/home", "entrypoint": "browser/index.html",
+                 "entrypoint_sha256": "sha256:" + observer.digest(document), "entrypoint_size": document.stat().st_size,
+                 "platforms": ["darwin-arm64"], "browser_assets": [{"path": path.relative_to(capsule).as_posix(),
+                 "sha256": "sha256:" + observer.digest(path), "size": path.stat().st_size} for path in sorted((capsule / "browser").rglob("*")) if path.is_file()]}
+        observer.write(support / "components.json", {"capsules": {"home": entry}, "external": {name: {
+            "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
+            for name in ("ipfs-provider", "kubo", "localhost-provider")}})
+        return support
+
+    def initial_home_fixture(self):
+        support = self.qualified_home_support()
+        entry, paths, descriptor = observer.cli_qualified_home(support, "darwin-arm64")
+        mapping = {}
+        for path in [support / "bin/localhost-provider", *paths]:
+            target = path.relative_to(support).as_posix()
+            mapping[target] = self.add("initial/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
+        mapping["fixture-tools/open"] = self.add("initial/opener", b"fixture no-op utility", 0o700)
+        self.manifest["consumer"]["files"].update(mapping)
+        for relative in mapping.values():
+            self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+        self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
+        components_path = self.root / self.manifest["publications"]["old"]["components"]
+        components = observer.cli_json(components_path)
+        components["capsules"]["home"] = entry
+        native = self.manifest["files"][mapping["bin/localhost-provider"]]
+        selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/localhost-provider"}
+        components["external"]["localhost-provider"] = {**descriptor, "platforms": {"darwin-arm64": selected}}
+        observer.write(components_path, components)
+        home = self.root / "initial-home"
+        home.mkdir()
+        directory = home / observer.CLI_DATA
+        directory.mkdir(parents=True)
+        observer.cli_copy(self.root, self.manifest, self.manifest["consumer"]["files"], directory)
+        binary = home / ".local/bin/elastos"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes((self.root / self.manifest["publications"]["old"]["binary"]).read_bytes())
+        binary.chmod(0o755)
+        for name, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
+            (directory / name).write_bytes((self.root / self.manifest["publications"]["old"][key]).read_bytes())
+        sources = {"default_source": "default", "sources": [{"name": "default", "publisher_dids": [self.manifest["signer_did"]],
+                   "channel": "canary", "installed_version": self.manifest["old"]["version"], "install_path": str(binary)}]}
+        observer.write(directory / "sources.json", sources)
+        key = directory / "identity/device.key"
+        key.parent.mkdir()
+        key.write_bytes(b"isolated fixture identity")
+        controller_directory = directory / "update-controller"
+        controller_directory.mkdir()
+        controller = controller_directory / "runtime"
+        controller.write_bytes(binary.read_bytes())
+        controller.chmod(0o700)
+        encode = lambda value: base64.b64encode(os.fsencode(value)).decode()
+        launch = {"args": [encode("home"), encode("--browser")], "environment": [], "cwd": encode(home)}
+        receipt = {"schema": "elastos.update-controller/v1", "data_dir": str(directory), "binary": str(binary), "controller": str(controller),
+                   "controller_sha256": observer.digest(binary), "signed_controller_release": base64.b64encode(
+                       (self.root / self.manifest["publications"]["old"]["release"]).read_bytes()).decode(),
+                   "trusted_source": sources["sources"][0], "launch": launch,
+                   "launch_sha256": hashlib.sha256(json.dumps(launch, separators=(",", ":")).encode()).hexdigest()}
+        identities = {45001: {"pid": 45001, "parent": os.getpid(), "group": 45001, "start": "macos:100:12"},
+                      45002: {"pid": 45002, "parent": 45001, "group": 45002, "start": "macos:101:34"}}
+        status = {"id": None, "phase": "ready", "current_version": self.manifest["old"]["version"], "new_version": None,
+                  "message": "ready fixture", "controller_pid": 45001, "controller_start": identities[45001]["start"],
+                  "host_pid": 45002, "generation": "a" * 32}
+        coords = {"api_url": "http://127.0.0.1:60123", "attach_secret": "b" * 64, "pid": 45002, "runtime_kind": "gateway",
+                  "binary_sha256": observer.digest(binary), "generation": status["generation"], "home_url": "http://localhost:8090/home/"}
+        lock = {"pid": 45002, "role": "gateway", "addr": "localhost:8090", "generation": status["generation"]}
+        for path, value in ((controller_directory / "receipt.json", receipt), (controller_directory / "status.json", status),
+                            (directory / "gateway-runtime-coords.json", coords), (directory / "host-process.lock", lock)):
+            observer.write(path, value)
+            path.chmod(0o600)
+        (controller_directory / "controller.lock").write_bytes(b"")
+        (controller_directory / "controller.lock").chmod(0o600)
+        process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None)
+        executables = {45001: str(controller), 45002: str(binary)}
+        def response(url, limit, payload=None, token=None):
+            if url.endswith("/api/auth/attach"):
+                self.assertEqual(payload, {"secret": "b" * 64, "scope": "client"})
+                return b'{"token":"private fixture token","session_type":"capsule"}'
+            if url.endswith("/api/health"):
+                self.assertEqual(token, "private fixture token")
+                return json.dumps({"version": self.manifest["old"]["version"]}).encode()
+            self.assertEqual(url, "http://127.0.0.1:8090/home/")
+            return (directory / self.manifest["initial_home"]["entrypoint"]).read_bytes()
+        return home, directory, process, status, identities, executables, response
+
+    def test_initial_home_matches_signed_controller_live_generation_and_private_attach(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        observer.cli_admit_home_support(self.root, self.manifest)
+        manager = SimpleNamespace(roots={})
+        with patch.object(observer, "cli_process_identity", side_effect=identities.get), \
+             patch.object(observer, "cli_process_executable", side_effect=executables.get), \
+             patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "lock_state", return_value="held"):
+            proof = observer.cli_observe_initial_home(manager, self.manifest, home, process, status)
+        self.assertTrue(proof["authenticated_health"])
+        self.assertEqual(proof["host"], identities[45002])
+        self.assertEqual(proof["home_sha256"], observer.digest(directory / self.manifest["initial_home"]["entrypoint"]))
+        self.assertNotIn("attach_secret", json.dumps(proof))
+        self.assertNotIn("private fixture token", json.dumps(proof))
+
+    def test_initial_home_refuses_substituted_signed_receipt_or_child_generation(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        receipt_path = directory / "update-controller/receipt.json"
+        receipt = observer.read(receipt_path)
+        coords_path = directory / "gateway-runtime-coords.json"
+        coords = observer.read(coords_path)
+        for refusal in ("signed release", "launch intent", "executable", "parent", "birth", "generation", "served bytes"):
+            with self.subTest(refusal=refusal):
+                changed_receipt, changed_status, changed_coords = (json.loads(json.dumps(value)) for value in (receipt, status, coords))
+                changed_identities = {key: dict(value) for key, value in identities.items()}
+                changed_executables = dict(executables)
+                if refusal == "signed release":
+                    changed_receipt["signed_controller_release"] = base64.b64encode(b"foreign release").decode()
+                elif refusal == "launch intent":
+                    changed_receipt["launch"]["args"] = [base64.b64encode(b"serve").decode()]
+                elif refusal == "executable":
+                    changed_executables[45001] = str(home / ".local/bin/elastos")
+                elif refusal == "parent":
+                    changed_identities[45002]["parent"] = 999
+                elif refusal == "birth":
+                    changed_status["controller_start"] = "macos:2:3"
+                elif refusal == "generation":
+                    changed_coords["generation"] = "c" * 32
+                observer.write(receipt_path, changed_receipt)
+                observer.write(coords_path, changed_coords)
+                def reply(url, *args, **kwargs):
+                    return b"foreign Home" if refusal == "served bytes" and url.endswith("/home/") else response(url, *args, **kwargs)
+                with patch.object(observer, "cli_process_identity", side_effect=changed_identities.get), \
+                     patch.object(observer, "cli_process_executable", side_effect=changed_executables.get), \
+                     patch.object(observer, "cli_home_response", side_effect=reply), patch.object(observer, "lock_state", return_value="held"), \
+                     self.assertRaises(ValueError):
+                    observer.cli_observe_initial_home(SimpleNamespace(roots={}), self.manifest, home, process, changed_status)
+
+    def test_qualified_home_refuses_unpinned_or_escaping_support_before_signing(self):
+        support = self.qualified_home_support()
+        provider = support / "bin/localhost-provider"
+        provider.write_bytes(b"substituted provider")
+        with self.assertRaisesRegex(ValueError, "provider binding"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+        provider.write_bytes(b"localhost-provider")
+        extra = support / "capsules/home/browser/uninventoried.js"
+        extra.write_bytes(b"unqualified script")
+        with self.assertRaisesRegex(ValueError, "asset closure"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+        extra.unlink()
+        extra.symlink_to(self.root / "manifest.json")
+        with self.assertRaisesRegex(ValueError, "symlink|escapes"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+
+    def test_initial_home_owner_stop_preserves_data_and_proves_all_owned_absence(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        running = True
+        captured = []
+        process.poll = lambda: None if running else 0
+        def wait(timeout):
+            self.assertEqual(timeout, 35)
+            process.returncode = 0
+            return 0
+        process.wait = wait
+        def stop(pid, sig):
+            nonlocal running
+            self.assertEqual((pid, sig), (45001, observer.signal.SIGTERM))
+            running = False
+            (directory / "gateway-runtime-coords.json").unlink()
+        def spawn(argv, env, cwd, label):
+            captured.append((argv, env, cwd, label))
+            return process
+        manager = SimpleNamespace(roots={}, spawn=spawn)
+        real_observe = observer.cli_observe_initial_home
+        def observe(*args):
+            with patch.object(observer, "lock_state", return_value="held"):
+                return real_observe(*args)
+        with patch.object(observer, "cli_process_identity", side_effect=lambda pid: identities.get(pid) if running else None), \
+             patch.object(observer, "cli_process_executable", side_effect=executables.get), \
+             patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
+             patch.object(observer, "cli_port_released") as ports, patch.object(observer, "cli_census", return_value=[]), \
+             patch.object(observer, "lock_state", return_value="released"), patch.object(observer.os, "killpg", side_effect=stop):
+            proof = observer.cli_initial_home(manager, self.manifest, home)
+        self.assertTrue(proof["cleanup"]["reaped"] and proof["cleanup"]["data_preserved"])
+        self.assertTrue(proof["desktop_opener"]["suppressed"])
+        self.assertEqual(ports.call_count, 5)
+        argv, env, cwd, label = captured[0]
+        self.assertEqual(argv[1:], ["home", "--browser"])
+        self.assertEqual(env["PATH"].split(":")[0], str(directory / "fixture-tools"))
+        self.assertEqual(env["ELASTOS_CARRIER_MDNS"], "0")
+
+    def test_initial_home_failure_paths_stop_owner_and_retain_refusals(self):
+        home, directory, _, status, identities, _, _ = self.initial_home_fixture()
+        coords_path = directory / "gateway-runtime-coords.json"
+        coords = observer.read(coords_path)
+        sentinel = directory / "state/value"
+        original = sentinel.read_bytes()
+        for refusal in ("readiness", "owned group", "held lock", "listener", "user data"):
+            with self.subTest(refusal=refusal):
+                running = True
+                observer.write(coords_path, coords)
+                coords_path.chmod(0o600)
+                sentinel.write_bytes(original)
+                process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None if running else 0)
+                def wait(timeout):
+                    process.returncode = 0
+                    return 0
+                process.wait = wait
+                def stop(pid, sig):
+                    nonlocal running
+                    self.assertEqual((pid, sig), (45001, observer.signal.SIGTERM))
+                    running = False
+                    coords_path.unlink()
+                    if refusal == "user data":
+                        sentinel.write_bytes(b"changed user data")
+                def observe(*args):
+                    if refusal == "readiness":
+                        raise ValueError("injected initial readiness refusal")
+                    return {"status": "passed", "controller": identities[45001], "host": identities[45002],
+                            "home_url": coords["home_url"], "api_url": coords["api_url"]}
+                def port(value):
+                    if refusal == "listener" and not running:
+                        raise ValueError("initial Home listener survives shutdown")
+                with patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
+                     patch.object(observer, "cli_process_identity", return_value=None), patch.object(observer, "cli_port_released", side_effect=port), \
+                     patch.object(observer, "lock_state", return_value="held" if refusal == "held lock" else "released"), \
+                     patch.object(observer, "cli_census", return_value=[{"group": 45002}] if refusal == "owned group" else []), \
+                     patch.object(observer.os, "killpg", side_effect=stop) as killed, self.assertRaises(ValueError):
+                    observer.cli_initial_home(SimpleNamespace(roots={}, spawn=lambda *args: process), self.manifest, home)
+                self.assertFalse(running)
+                self.assertEqual(process.returncode, 0)
+                killed.assert_called_once()
+
+    def test_initial_home_response_and_private_records_keep_their_bounds(self):
+        with patch.object(observer.urllib.request, "build_opener") as opener:
+            reply = opener.return_value.open.return_value.__enter__.return_value
+            reply.status = 200
+            reply.read.return_value = b"too large"
+            with self.assertRaisesRegex(ValueError, "exceeds its bound"):
+                observer.cli_home_response("http://127.0.0.1:8090/home/", 2)
+            reply.read.assert_called_once_with(3)
+        path = self.root / "private-home-record"
+        path.write_bytes(b'{"pid":1,"pid":2}')
+        path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "repeats a field"):
+            observer.cli_private_json(path)
+        path.write_bytes(b'{"pid":1}')
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            observer.cli_private_json(path)
+        for value in ("https://localhost:8090/home/", "http://example.test:8090/home/", "http://localhost:8090/home/?secret=x"):
+            with self.assertRaises(ValueError):
+                observer.cli_home_base(value, public=True)
+
     def test_generator_uses_explicit_disposable_keys_and_real_signature_admission(self):
         # Fake command delivery exercises generation; existing RFC 8032 test
         # signing supplies valid signatures to the actual installer verifier.
@@ -832,12 +1093,7 @@ class CliFixtureTests(unittest.TestCase):
             "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
             "status": "passed", "cleanup": {"passed": True}, **{name: {"source": source, "version": version,
             "sha256": observer.digest(path), "version_environment": version} for name, path, version in (("old", native, "0.7.1"), ("new", next_runtime, "0.7.2"))}})
-        support = self.root / "support"
-        (support / "bin").mkdir(parents=True)
-        for name in ("ipfs-provider", "kubo"):
-            (support / "bin" / name).write_bytes(name.encode())
-        observer.write(support / "components.json", {"external": {name: {"platforms": {"darwin-arm64": {
-            "checksum": "sha256:" + observer.digest(support / "bin" / name)}}} for name in ("ipfs-provider", "kubo")}})
+        support = self.qualified_home_support()
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
         def command(argv, **kwargs):
@@ -870,6 +1126,12 @@ class CliFixtureTests(unittest.TestCase):
         self.assertFalse((generated / "generator").exists())
         generated_manifest = observer.cli_json(generated / "manifest.json")
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
+        components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
+        self.assertEqual(components["capsules"]["home"], observer.cli_json(support / "components.json")["capsules"]["home"])
+        self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
+                            for target in generated_manifest["initial_home"]["files"]))
+        native = generated_manifest["files"][generated_manifest["consumer"]["files"]["bin/localhost-provider"]]
+        self.assertEqual(components["external"]["localhost-provider"]["platforms"]["darwin-arm64"]["cid"], native["cid"])
         self.assertNotEqual(generated_manifest["signer_did"], observer.cli_json(generated / generated_manifest["publications"]["wrong-signer-head"]["head"])["signer_did"])
         generated_manifest["proof_kind"] = "harness-self-test"
         observer.write(generated / "manifest.json", generated_manifest)
@@ -938,10 +1200,7 @@ class CliFixtureTests(unittest.TestCase):
         self.assertFalse((destination / "elastos-new").exists())
 
     def test_generator_command_failure_removes_keys_and_repository(self):
-        support = self.root / "support"
-        (support / "bin").mkdir(parents=True)
-        for name in ("ipfs-provider", "kubo"):
-            (support / "bin" / name).write_bytes(name.encode())
+        support = self.qualified_home_support()
         runtime = self.root / "runtime"
         runtime.write_bytes(b"Runtime command substitute")
         generated = self.root / "generated"
