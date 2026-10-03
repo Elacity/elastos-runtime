@@ -278,7 +278,13 @@ where
             Some(_) => "Home is up to date.",
             None => "Could not check for updates. Check again when Carrier is connected.",
         },
-        "controller":controller,
+        "controller":{
+            "id":controller.id,
+            "phase":controller.phase,
+            "current_version":controller.current_version,
+            "new_version":controller.new_version,
+            "message":controller.message,
+        },
     }))
 }
 

@@ -295,6 +295,19 @@ async fn system_update_summary_stays_fast_while_check_is_pending_and_keeps_queue
     assert_eq!(summary["available"], false);
     assert_eq!(summary["can_apply"], false);
     assert!(summary["new_version"].is_null());
+    let public_status = summary["controller"].as_object().unwrap();
+    assert_eq!(public_status.len(), 5);
+    for field in ["id", "phase", "current_version", "new_version", "message"] {
+        assert!(public_status.contains_key(field), "{field}");
+    }
+    for field in [
+        "controller_pid",
+        "controller_start",
+        "host_pid",
+        "generation",
+    ] {
+        assert!(!public_status.contains_key(field), "{field}");
+    }
     release.send(Some(cached_offer())).unwrap();
     let completed = tokio::time::timeout(std::time::Duration::from_millis(500), async {
         loop {
