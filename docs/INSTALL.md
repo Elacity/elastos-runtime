@@ -169,6 +169,29 @@ elastos update --check
 `elastos update` discovers newer signed releases through the trusted source
 created during install.
 
+### Recover an interrupted update
+
+If Runtime reports an interrupted command-line update, run `elastos update`
+again before starting Home. Runtime owns the saved transaction and verifies its
+files before recovery. Keep the installation files and data in place.
+
+A Home with an installed update controller keeps its controller Runtime and
+private receipt in the data directory. If restart recovery requires that
+controller, set `ELASTOS_RECOVERY_DATA` to the data directory shown in the local
+message and run:
+
+```bash
+"${ELASTOS_RECOVERY_DATA}/update-controller/runtime" __update-controller \
+  --receipt "${ELASTOS_RECOVERY_DATA}/update-controller/receipt.json"
+```
+
+The controller verifies its signed Runtime, retained launch settings and saved
+release before it starts Home. Keep this terminal open. Initial startup has a
+120-second limit; update and rollback startup have a 30-second limit. A startup
+failure names the private `update-controller/runtime.log` file to inspect
+before trying again. The receipt can contain private launch environment values;
+retain its owner-only permissions and share only a safe error summary.
+
 These overrides are for operators:
 
 ```bash
