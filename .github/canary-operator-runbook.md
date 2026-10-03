@@ -11,7 +11,7 @@ isolated Mac HOME; the existing Mac account and Home data stay in place.
 - Source: `8a9dec16b4febfac5759883ec7462e1ea780dd59`.
 - Source tree: `e18d17a3431b4d2548796347528e28afee909e35`.
 - Source CI: <https://github.com/Elacity/elastos-runtime/actions/runs/37086607684>.
-- Native builder: use the replacement run linked in #89 for this exact source.
+- Native builder: <https://github.com/Elacity/elastos-runtime/actions/runs/37088374176>.
 - Draft versions: V1 `0.8.0-alpha.1`, V2 `0.8.0-alpha.2`; channel `canary`.
 - Origin: `https://elastos.elacitylabs.com`.
 - Public signer: `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`.
@@ -102,7 +102,9 @@ PINNED_PYTHON='/opt/homebrew/Cellar/python@3.12/3.12.13_2/Frameworks/Python.fram
 PINNED_OPENSSL='/opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl'
 INSTALLED_SIGNER="$CUSTODY/release-signer.py"
 PEM_KEY="$CUSTODY/maintainer-ed25519.pem"
-shasum -a 256 "$INSTALLED_SIGNER" "$PINNED_PYTHON" "$PINNED_OPENSSL"
+test "$(shasum -a 256 "$INSTALLED_SIGNER" | cut -d ' ' -f 1)" = 'e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2'
+test "$(shasum -a 256 "$PINNED_PYTHON" | cut -d ' ' -f 1)" = 'fe46716a94d8efa4514feb3c39ba3e270deee2187556986f6ddcff54aba7bb9a'
+test "$(shasum -a 256 "$PINNED_OPENSSL" | cut -d ' ' -f 1)" = '5d8f84484b7317ec5639ce68ccecc1d6f565ca6df483c8ae731e25265d83466d'
 "$PINNED_PYTHON" --version
 "$PINNED_OPENSSL" version
 ```

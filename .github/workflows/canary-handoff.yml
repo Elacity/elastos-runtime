@@ -9,7 +9,7 @@ on:
     inputs:
       original_run:
         description: Accepted canary-inputs run to package
-        default: '37084288629'
+        default: '37088374176'
         required: true
         type: string
       finalize_v2:
@@ -29,8 +29,8 @@ concurrency:
 env:
   SOURCE_COMMIT: 8a9dec16b4febfac5759883ec7462e1ea780dd59
   SOURCE_TREE: e18d17a3431b4d2548796347528e28afee909e35
-  ORIGINAL_RUN: ${{ inputs.original_run || '37084288629' }}
-  ORIGINAL_WORKFLOW_COMMIT: 9acfb04a31b6d5856cabe3cb3c485c3f0464a571
+  ORIGINAL_RUN: ${{ inputs.original_run || '37088374176' }}
+  ORIGINAL_WORKFLOW_COMMIT: 7eeb93f9f6e3ae70b8e5d67816c0c0a5f7b73dfe
   CANARY_DID: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
   PUBLISHER_ORIGIN: https://elastos.elacitylabs.com
   FINALIZE_V2: ${{ inputs.finalize_v2 == true && 'true' || 'false' }}
@@ -75,7 +75,7 @@ jobs:
           from pathlib import Path, PurePosixPath
           repository = 'Elacity/elastos-runtime'
           run_id = os.environ['ORIGINAL_RUN']
-          assert run_id == '37084288629', 'Original run requires a separately reviewed workflow change'
+          assert run_id == '37088374176', 'Original run requires a separately reviewed workflow change'
           commit, tree = os.environ['SOURCE_COMMIT'], os.environ['SOURCE_TREE']
           scratch = Path(os.environ['RUNNER_TEMP']) / 'canary-handoff'
           scratch.mkdir(mode=0o700)
