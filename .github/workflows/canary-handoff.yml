@@ -33,6 +33,8 @@ env:
   ORIGINAL_WORKFLOW_COMMIT: 7eeb93f9f6e3ae70b8e5d67816c0c0a5f7b73dfe
   CANARY_DID: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
   PUBLISHER_ORIGIN: https://elastos.elacitylabs.com
+  V1_RELEASE_CID: QmPwpaXwp4biZ3ZvSExLgBoTADCXkFrY8kggDYTXGJE9h8
+  V1_HEAD_CID: QmeAK6hudaKZPANVEE5FXVh9dP6agcWLK5LCschg3ZzBte
   FINALIZE_V2: ${{ inputs.finalize_v2 == true && 'true' || 'false' }}
   PYTHONDONTWRITEBYTECODE: '1'
 
@@ -71,7 +73,7 @@ jobs:
           [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           python3 - <<'PY'
-          import gzip, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          import base64, gzip, hashlib, importlib.util, ipaddress, json, os, re, shutil, stat, subprocess, sys, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
           from pathlib import Path, PurePosixPath
           repository = 'Elacity/elastos-runtime'
           run_id = os.environ['ORIGINAL_RUN']
@@ -436,6 +438,7 @@ jobs:
               head_bytes, head = verified_envelope('release-head.json', 'elastos.release.head.v1')
               assert release == v1['release'], 'Public signed V1 differs from the prepared V1 payload'
               release_cid, head_cid = signer.unixfs_metadata_cid(release_bytes), signer.unixfs_metadata_cid(head_bytes)
+              assert release_cid == os.environ['V1_RELEASE_CID'] and head_cid == os.environ['V1_HEAD_CID']
               expected_head = {'schema': 'elastos.release.head/v1', 'channel': 'canary', 'version': '0.8.0-alpha.1',
                                'latest_release_cid': release_cid, 'release_sha256': signer.sha256(release_bytes),
                                'updated_at': v1['head']['updated_at'], 'signer_did': did,
@@ -448,8 +451,101 @@ jobs:
               bootstrap_bytes = public_bytes('.well-known/elastos/carrier-bootstrap.json?role=publisher', 16 * 1024)
               bootstrap = signer.parse_json(bootstrap_bytes)
               assert bootstrap['schema'] == 'elastos.carrier.bootstrap/v1' and bootstrap['role'] == 'publisher'
-              assert bootstrap['node_id'] == stamps['PUBLISHER_NODE_ID'] and bootstrap['ticket'] == stamps['SOURCE_CONNECT_TICKET']
+              # The frozen installer keeps its ticket. A restarted holder may
+              # change only the optional IPv6 port in its current public ticket.
+              # Every other decoded field remains exactly the frozen value.
+              def ticket_content(encoded, node):
+                  assert type(encoded) is str and 0 < len(encoded) <= 16 * 1024
+                  assert re.fullmatch(r'[a-z2-7]+', encoded)
+                  raw = base64.b32decode(encoded.upper() + '=' * (-len(encoded) % 8))
+                  assert base64.b32encode(raw).decode().rstrip('=').lower() == encoded
+                  document = signer.parse_json(raw)
+                  assert type(document) is dict and set(document) == {'endpoints', 'topic'} and document['topic'] is None
+                  endpoints = document['endpoints']
+                  assert type(endpoints) is list and len(endpoints) == 1
+                  endpoint = endpoints[0]
+                  assert type(endpoint) is dict and set(endpoint) == {'id', 'addrs'} and endpoint['id'] == node
+                  addresses = endpoint['addrs']
+                  assert type(addresses) is list and len(addresses) == 4
+                  ports = []
+                  for record in addresses:
+                      assert type(record) is dict and set(record) == {'Ip'} and type(record['Ip']) is str
+                      address = record['Ip']
+                      if address.startswith('['):
+                          match = re.fullmatch(r'\[([^\]]+)\]:([1-9][0-9]{0,4})', address)
+                          assert match and str(ipaddress.IPv6Address(match[1])) == match[1]
+                          port = int(match[2])
+                          assert port <= 65535
+                          ports.append(port)
+                          record['Ip'] = '[' + match[1] + ']:optional-port'
+                      else:
+                          host, port = address.rsplit(':', 1)
+                          assert str(ipaddress.IPv4Address(host)) == host and port == '4433'
+                  assert len(ports) == 1
+                  return document, ports[0]
+              frozen_ticket = stamps['SOURCE_CONNECT_TICKET']
+              node = stamps['PUBLISHER_NODE_ID']
+              frozen_content, frozen_port = ticket_content(frozen_ticket, node)
+              def verify_bootstrap_ticket(document):
+                  assert type(document) is dict and document['node_id'] == node
+                  content, port = ticket_content(document['ticket'], node)
+                  assert content == frozen_content
+                  return port
+              routing_checks = []
+              original_document = signer.parse_json(base64.b32decode(frozen_ticket.upper() + '=' * (-len(frozen_ticket) % 8)))
+              def encoded_ticket(document):
+                  return base64.b32encode(signer.json_bytes(document)).decode().rstrip('=').lower()
+              assert verify_bootstrap_ticket({'node_id': node, 'ticket': frozen_ticket}) == frozen_port
+              routing_checks.append('exact frozen ticket accepted')
+              changed = signer.parse_json(signer.json_bytes(original_document))
+              ipv6_index = next(index for index, record in enumerate(changed['endpoints'][0]['addrs']) if record['Ip'].startswith('['))
+              changed['endpoints'][0]['addrs'][ipv6_index]['Ip'] = changed['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':1'
+              assert verify_bootstrap_ticket({'node_id': node, 'ticket': encoded_ticket(changed)}) == 1
+              routing_checks.append('optional IPv6 port change accepted with all other fields exact')
+              def refused(label, mutate):
+                  fixture = signer.parse_json(signer.json_bytes(original_document))
+                  mutate(fixture)
+                  try:
+                      verify_bootstrap_ticket({'node_id': node, 'ticket': encoded_ticket(fixture)})
+                  except (AssertionError, ValueError, KeyError, TypeError):
+                      routing_checks.append(label + ' refused')
+                  else:
+                      raise AssertionError(label + ' was accepted')
+              refused('wrong holder identity', lambda fixture: fixture['endpoints'][0].update(id='0' * 64))
+              refused('changed IPv6 address', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip='[::1]:4433'))
+              refused('changed IPv4 address', lambda fixture: fixture['endpoints'][0]['addrs'][0].update(Ip='192.0.2.1:4433'))
+              refused('changed IPv4 port', lambda fixture: fixture['endpoints'][0]['addrs'][0].update(Ip=fixture['endpoints'][0]['addrs'][0]['Ip'].rsplit(':', 1)[0] + ':4434'))
+              refused('missing route', lambda fixture: fixture['endpoints'][0]['addrs'].pop(0))
+              refused('added route', lambda fixture: fixture['endpoints'][0]['addrs'].append({'Ip': '192.0.2.1:4433'}))
+              refused('reordered routes', lambda fixture: fixture['endpoints'][0]['addrs'].reverse())
+              refused('extra endpoint', lambda fixture: fixture['endpoints'].append(fixture['endpoints'][0]))
+              refused('changed topic', lambda fixture: fixture.update(topic='changed'))
+              refused('extra ticket field', lambda fixture: fixture.update(extra=True))
+              refused('zero IPv6 port', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip=fixture['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':0'))
+              refused('out-of-range IPv6 port', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip=fixture['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':65536'))
+              for label, document in [
+                  ('wrong bootstrap node', {'node_id': '0' * 64, 'ticket': frozen_ticket}),
+                  ('malformed ticket encoding', {'node_id': node, 'ticket': '!'}),
+                  ('duplicate ticket field', {'node_id': node, 'ticket': base64.b32encode(b'{"endpoints":[],"endpoints":[],"topic":null}').decode().rstrip('=').lower()}),
+              ]:
+                  try:
+                      verify_bootstrap_ticket(document)
+                  except (AssertionError, ValueError, KeyError, TypeError):
+                      routing_checks.append(label + ' refused')
+                  else:
+                      raise AssertionError(label + ' was accepted')
+              public_port = verify_bootstrap_ticket(bootstrap)
               (public / 'carrier-bootstrap.json').write_bytes(bootstrap_bytes)
+              (public / 'frozen-ticket.json').write_bytes(signer.json_bytes(original_document))
+              (public / 'current-ticket.json').write_bytes(signer.json_bytes(signer.parse_json(base64.b32decode(bootstrap['ticket'].upper() + '=' * (-len(bootstrap['ticket']) % 8)))))
+              (root / 'receipts/bootstrap-routing-verification.json').write_text(json.dumps({
+                  'node_id': node, 'frozen_ticket_sha256': signer.sha256(frozen_ticket.encode()),
+                  'public_ticket_sha256': signer.sha256(bootstrap['ticket'].encode()),
+                  'public_bootstrap_sha256': signer.sha256(bootstrap_bytes),
+                  'frozen_ipv6_port': frozen_port, 'public_ipv6_port': public_port,
+                  'rule': 'Complete decoded ticket equality except the optional IPv6 port; frozen installer unchanged.',
+                  'checks': routing_checks, 'all_passed': True,
+                  'operator_gate': 'Final V2 policy signing/publication and Mac M2 require Anders approval.'}, indent=2) + '\n')
               source_policy = {'repository': repository, 'channel': 'canary', 'version': '0.8.0-alpha.2',
                                'commit': commit, 'tree': tree,
                                'develop_oid': api_json(f'/repos/{repository}/git/ref/heads/develop')['object']['sha']}
