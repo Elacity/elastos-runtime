@@ -3,7 +3,7 @@
 // Validate shipped data. Runtime and UI behaviour belongs in executable tests.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -192,6 +192,44 @@ const homeCore = [
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
 const obsolete = ["chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
+const archiveAssets = ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"];
+
+export function parsePublishData(shellSource, rustSource) {
+  const shell = (name) => {
+    const body = shellSource.match(new RegExp(`^${name}=\\(([\\s\\S]*?)^\\)`, "m"))?.[1];
+    assert(body !== undefined, `${name}: missing declared publish data`);
+    return body.replace(/#[^\n]*/g, "").trim().split(/\s+/).filter(Boolean).map((entry) => entry.replace(/^(['"])(.*)\1$/, "$2"));
+  };
+  const rust = (name) => {
+    const body = rustSource.match(new RegExp(`const\\s+${name}:\\s*&\\[&str\\]\\s*=\\s*&\\[([\\s\\S]*?)\\];`))?.[1];
+    assert(body !== undefined, `${name}: missing declared publish data`);
+    return body.replace(/\/\/[^\n]*/g, "").split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => JSON.parse(entry));
+  };
+  const lists = {
+    shellDefault: shell("DEFAULT_CAPSULES"), shellRequired: shell("REQUIRED_SUPPORTED_CAPSULES"),
+    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustRequired: rust("REQUIRED_SUPPORTED_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
+  };
+  for (const [name, values] of Object.entries(lists)) {
+    assert(values.length > 0 && values.every((value) => typeof value === "string" && /^[a-z0-9][a-z0-9-]*$/.test(value)), `${name}: invalid publish capsule data`);
+    unique(values, `${name}: publish capsules`);
+  }
+  return lists;
+}
+
+export function validatePublishData(components, manifests, lists) {
+  const installedHome = components.profiles.home.components.filter((name) => Object.hasOwn(manifests, name)).sort();
+  for (const name of ["shellDefault", "rustHome"]) same([...lists[name]].sort(), installedHome, `${name}: published capsules must match the Home profile`);
+  for (const name of ["shellRequired", "rustRequired"]) {
+    for (const capsule of installedHome) assert(lists[name].includes(capsule), `${name}: missing Home capsule ${capsule}`);
+  }
+  same([...lists.shellRequired].sort(), [...lists.rustRequired].sort(), "Shell and Rust supported publish capsules must match");
+  for (const [name, values] of Object.entries(lists)) {
+    unique(values, `${name}: publish capsules`);
+    for (const capsule of values) assert(Object.hasOwn(manifests, capsule) && !obsolete.includes(capsule), `${name}: unknown or retired publish capsule ${capsule}`);
+  }
+  for (const capsule of ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
+  for (const capsule of lists.rustDemo) assert(components.profiles.demo.components.includes(capsule) && !installedHome.includes(capsule), `rustDemo: ${capsule} belongs in the demo profile`);
+}
 
 export function validateComponents(components, manifests) {
   same(components.schema, "elastos.components/v1", "Components schema");
@@ -240,6 +278,12 @@ export function validateComponents(components, manifests) {
   }
   for (const name of [...homeCore.filter((name) => name !== "llama-server"), "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "availability-provider"]) {
     for (const platform of ["linux-amd64", "linux-arm64"]) assert(components.external[name]?.platforms[platform] ?? components.external[name]?.platforms["*"], `${name}: release metadata for ${platform}`);
+  }
+  for (const name of archiveAssets) {
+    for (const platform of ["linux-amd64", "linux-arm64"]) {
+      const metadata = components.external[name]?.platforms[platform] ?? components.external[name]?.platforms["*"];
+      present(metadata?.extract_path, `${name}: ${platform} archive extraction path`);
+    }
   }
   for (const name of protectedProviders) {
     const provider = components.external[name]?.provider_runtime;
@@ -308,12 +352,13 @@ export function checkProductData(repoRoot = root) {
       if (manifest.execution === "web-projection") assert(existsSync(resolve(repoRoot, dirname(path), manifest.entrypoint)), `${path}: missing entrypoint`);
       if (manifest.icon !== undefined) {
         present(manifest.icon, `${path}: icon path`);
-        const capsuleRoot = resolve(repoRoot, dirname(path));
+        const capsuleRoot = realpathSync(resolve(repoRoot, dirname(path)));
         const iconRoot = resolve(capsuleRoot, manifest.icon);
         assert(iconRoot.startsWith(capsuleRoot + sep), `${path}: icon stays in its capsule`);
         for (const size of [32, 64, 128, 256]) {
           const icon = resolve(iconRoot, `icon-${size}.png`);
           assert(existsSync(icon), `${path}: missing ${size}px icon`);
+          assert(realpathSync(icon).startsWith(capsuleRoot + sep), `${path}: icon stays in its capsule`);
           const bytes = readFileSync(icon);
           same(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a", `${path}: ${size}px PNG signature`);
           same([bytes.readUInt32BE(16), bytes.readUInt32BE(20)], [size, size], `${path}: ${size}px icon dimensions`);
@@ -324,6 +369,10 @@ export function checkProductData(repoRoot = root) {
   validateContracts(manifests);
   const components = json("components.json");
   validateComponents(components, manifests);
+  validatePublishData(components, manifests, parsePublishData(
+    readFileSync(resolve(repoRoot, "scripts/publish-release.sh"), "utf8"),
+    readFileSync(resolve(repoRoot, "elastos/crates/elastos-server/src/publish.rs"), "utf8"),
+  ));
   validateModelCatalog(components, json("model-catalog.json"));
   validateCatalogBinding(components, readFileSync(resolve(repoRoot, "model-catalog.json")));
   const pwa = json("capsules/home/browser/manifest.webmanifest");
@@ -333,6 +382,7 @@ export function checkProductData(repoRoot = root) {
     assert(icon, `Home PWA ${size}px icon`);
     const path = resolve(repoRoot, "capsules/home/browser", icon.src);
     assert(path.startsWith(resolve(repoRoot, "capsules/home/browser") + sep), "Home PWA icon stays in its capsule");
+    assert(realpathSync(path).startsWith(realpathSync(resolve(repoRoot, "capsules/home/browser")) + sep), "Home PWA icon stays in its capsule");
     const bytes = readFileSync(path);
     same(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a", `Home PWA ${size}px PNG signature`);
     same([bytes.readUInt32BE(16), bytes.readUInt32BE(20)], [size, size], `Home PWA ${size}px dimensions`);

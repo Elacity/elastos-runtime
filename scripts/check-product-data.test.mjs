@@ -5,7 +5,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkProductData, validateCapsule, validateCatalogBinding, validateComponents, validateContracts, validateModelCatalog } from "./check-product-data.mjs";
+import { checkProductData, parsePublishData, validatePublishData, validateCapsule, validateCatalogBinding, validateComponents, validateContracts, validateModelCatalog } from "./check-product-data.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const json = (path) => JSON.parse(readFileSync(resolve(root, path), "utf8"));
@@ -27,6 +27,49 @@ for (const base of ["capsules", "elastos/capsules"]) {
 const components = json("components.json");
 const catalog = json("model-catalog.json");
 const clone = (value) => structuredClone(value);
+const shellPublish = readFileSync(resolve(root, "scripts/publish-release.sh"), "utf8");
+const rustPublish = readFileSync(resolve(root, "elastos/crates/elastos-server/src/publish.rs"), "utf8");
+const publish = parsePublishData(shellPublish, rustPublish);
+
+for (const [name, mutate, message] of [
+  ["missing shell default capsule", (_components, lists) => lists.shellDefault = lists.shellDefault.filter((name) => name !== "home-gui"), /shellDefault: published capsules/],
+  ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "services"), /rustHome: published capsules/],
+  ["missing shell required capsule", (_components, lists) => lists.shellRequired = lists.shellRequired.filter((name) => name !== "wallet-provider"), /shellRequired: missing Home capsule wallet-provider/],
+  ["missing Rust required capsule", (_components, lists) => lists.rustRequired = lists.rustRequired.filter((name) => name !== "documents"), /rustRequired: missing Home capsule documents/],
+  ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("chat-room"), /shellDefault: published capsules/],
+  ["missing demo publication", (_components, lists) => lists.rustDemo = lists.rustDemo.filter((name) => name !== "gba-emulator"), /missing demo capsule/],
+  ["Home capsule in demo additions", (_components, lists) => lists.rustDemo.push("home"), /belongs in the demo profile/],
+  ["uninstalled demo publication", (value) => value.profiles.demo.components = value.profiles.demo.components.filter((name) => name !== "tunnel-provider"), /belongs in the demo profile/],
+  ["Home installation without publication parity", (value) => value.profiles.home.components = value.profiles.home.components.filter((name) => name !== "assistant"), /published capsules/],
+  ["different supported capsule sets", (_components, lists) => lists.shellRequired.push("key-provider"), /supported publish capsules must match/],
+  ["unknown supported capsule", (_components, lists) => { lists.shellRequired.push("unknown"); lists.rustRequired.push("unknown"); }, /unknown or retired publish capsule/],
+]) {
+  test(`publication data refuse ${name}`, () => {
+    const value = clone(components), lists = clone(publish);
+    mutate(value, lists);
+    assert.throws(() => validatePublishData(value, manifests, lists), message);
+  });
+}
+
+test("publish parser reads declared values and ignores comments", () => {
+  assert.deepEqual(parsePublishData(shellPublish.replace("DEFAULT_CAPSULES=(", "DEFAULT_CAPSULES=( # comment-capsule"), rustPublish.replace('    "shell",', '    "shell", // "comment-capsule"')), publish);
+  assert.deepEqual(parsePublishData(shellPublish.replace("\n    home-gui\n", '\n    "home-gui"\n'), rustPublish), publish);
+  assert.throws(() => parsePublishData(shellPublish.replace("DEFAULT_CAPSULES=(", "DEFAULT_CAPSULES=(\n    home"), rustPublish), /duplicate entries/);
+  assert.throws(() => parsePublishData(shellPublish.replace("DEFAULT_CAPSULES=(", "DEFAULT_CAPSULES=(\n    $(untrusted)"), rustPublish), /invalid publish capsule data/);
+  assert.throws(() => parsePublishData(shellPublish, rustPublish.replace('"services"', "true")), /invalid publish capsule data/);
+});
+
+for (const [name, shell, rust, message] of [
+  ["shell default", shellPublish.replace(/(DEFAULT_CAPSULES=\([\s\S]*?)\n    home-gui\n/, "$1\n"), rustPublish, /shellDefault: published capsules/],
+  ["shell required", shellPublish.replace(/(REQUIRED_SUPPORTED_CAPSULES=\([\s\S]*?)\n    wallet-provider\n/, "$1\n"), rustPublish, /shellRequired: missing Home capsule/],
+  ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "services",/, "$1"), /rustHome: published capsules/],
+  ["Rust required", shellPublish, rustPublish.replace(/(const REQUIRED_SUPPORTED_PUBLISH_CAPSULES:[\s\S]*?)\n    "documents",/, "$1"), /rustRequired: missing Home capsule/],
+  ["Rust demo", shellPublish, rustPublish.replace('"gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"', '"gba-ucity", "chat-room", "tunnel-provider"'), /missing demo capsule/],
+]) {
+  test(`changed ${name} declared publication data is refused`, () => {
+    assert.throws(() => validatePublishData(components, manifests, parsePublishData(shell, rust)), message);
+  });
+}
 
 test("shipped capsule, profile, catalog and icon data pass together", () => {
   const result = checkProductData();
@@ -67,6 +110,19 @@ for (const [name, mutate, message] of [
     mutate(value);
     assert.throws(() => validateCapsule(value), message);
   });
+}
+
+for (const name of ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"]) {
+  for (const platform of ["linux-amd64", "linux-arm64"]) {
+    test(`${name} refuses missing ${platform} extraction metadata for a changed archive format`, () => {
+      const value = clone(components);
+      const metadata = clone(value.external[name].platforms[platform] ?? value.external[name].platforms["*"]);
+      metadata.release_path = `${name}.zip`;
+      delete metadata.extract_path;
+      value.external[name].platforms[platform] = metadata;
+      assert.throws(() => validateComponents(value, manifests), /archive extraction path/);
+    });
+  }
 }
 
 for (const [name, mutate, message] of [
@@ -137,10 +193,10 @@ for (const [name, mutate, message] of [
   });
 }
 
-test("CLI exits unsuccessfully on a broken manifest and missing declared icon fixture", () => {
+function dataFixture() {
   const fixture = mkdtempSync(join(tmpdir(), "product-data-fixture-"));
   try {
-    // Copy manifests and point at small checked-in assets; fixture writes remain isolated.
+    // Copy only the declared small assets; fixture writes and icon paths stay isolated.
     for (const path of paths) {
       const value = json(path);
       const directory = resolve(fixture, dirname(path));
@@ -151,11 +207,24 @@ test("CLI exits unsuccessfully on a broken manifest and missing declared icon fi
         writeFileSync(resolve(directory, value.entrypoint), "");
       }
       if (value.icon) {
-        mkdirSync(dirname(resolve(directory, value.icon)), { recursive: true });
-        symlinkSync(resolve(root, dirname(path), value.icon), resolve(directory, value.icon), "dir");
+        mkdirSync(resolve(directory, value.icon), { recursive: true });
+        for (const size of [32, 64, 128, 256]) copyFileSync(resolve(root, dirname(path), value.icon, `icon-${size}.png`), resolve(directory, value.icon, `icon-${size}.png`));
       }
     }
-    for (const path of ["components.json", "model-catalog.json", "capsules/home/browser/manifest.webmanifest", "capsules/home/browser/elastos-home-icon-192.png", "capsules/home/browser/elastos-home-icon-512.png"]) copyFileSync(resolve(root, path), resolve(fixture, path));
+    for (const path of ["components.json", "model-catalog.json", "capsules/home/browser/manifest.webmanifest", "capsules/home/browser/elastos-home-icon-192.png", "capsules/home/browser/elastos-home-icon-512.png", "scripts/publish-release.sh", "elastos/crates/elastos-server/src/publish.rs"]) {
+      mkdirSync(dirname(resolve(fixture, path)), { recursive: true });
+      copyFileSync(resolve(root, path), resolve(fixture, path));
+    }
+    return fixture;
+  } catch (error) {
+    rmSync(fixture, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+test("CLI exits unsuccessfully on a broken manifest and missing declared icon fixture", () => {
+  const fixture = dataFixture();
+  try {
     const lint = resolve(root, "scripts/check-product-data.mjs");
     assert.equal(JSON.parse(execFileSync(process.execPath, [lint, fixture], { encoding: "utf8" })).ok, true);
     const path = resolve(fixture, "capsules/assistant/capsule.json");
@@ -175,3 +244,31 @@ test("CLI exits unsuccessfully on a broken manifest and missing declared icon fi
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+test("product data accepts a symlink alias for its repository root", () => {
+  const fixture = dataFixture(), alias = `${fixture}-alias`;
+  try {
+    symlinkSync(fixture, alias, "dir");
+    assert.equal(checkProductData(alias).capsules, paths.length);
+  } finally {
+    rmSync(alias, { force: true });
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+for (const [name, path, type, message] of [
+  ["capsule icon directory", "capsules/assistant/browser/icons", "dir", /icon stays in its capsule/],
+  ["capsule icon file", "capsules/assistant/browser/icons/icon-32.png", "file", /icon stays in its capsule/],
+  ["Home PWA icon file", "capsules/home/browser/elastos-home-icon-192.png", "file", /Home PWA icon stays in its capsule/],
+]) {
+  test(`product data refuses escaping ${name} symlink`, () => {
+    const fixture = dataFixture();
+    try {
+      rmSync(resolve(fixture, path), { recursive: true });
+      symlinkSync(resolve(root, path), resolve(fixture, path), type);
+      assert.throws(() => checkProductData(fixture), message);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+}
