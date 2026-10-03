@@ -285,6 +285,7 @@ async fn serve_browser_capsule_asset(
                     request_headers,
                     app,
                     relative_path == capsule.entrypoint,
+                    capsule.manifest.role == CapsuleRole::Shell,
                 ) {
                     headers.insert("content-security-policy", policy.parse().unwrap());
                 }
@@ -315,9 +316,12 @@ async fn serve_browser_capsule_asset(
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     if is_document {
-        if let Some(policy) =
-            shell_content_security_policy(request_headers, app, relative_path == capsule.entrypoint)
-        {
+        if let Some(policy) = shell_content_security_policy(
+            request_headers,
+            app,
+            relative_path == capsule.entrypoint,
+            capsule.manifest.role == CapsuleRole::Shell,
+        ) {
             headers.insert("content-security-policy", policy.parse().unwrap());
         }
     }
@@ -328,13 +332,18 @@ fn shell_content_security_policy(
     headers: &axum::http::HeaderMap,
     app: &str,
     entrypoint: bool,
+    shell: bool,
 ) -> Option<String> {
     let home_source = home_document_origin(headers)?;
     let is_home_host = app == super::gateway::HOME_CAPSULE_ID && entrypoint;
+    // App documents are framed by the sandboxed shell. frame-ancestors checks
+    // every ancestor and an opaque origin never matches, so apps cannot carry it.
     let frame_ancestors = if is_home_host {
-        "'none'".to_string()
+        "; frame-ancestors 'none'".to_string()
+    } else if shell {
+        format!("; frame-ancestors {home_source}")
     } else {
-        home_source.clone()
+        String::new()
     };
     let (default_source, style_source) = if is_home_host {
         ("'self'".to_string(), "'self'".to_string())
@@ -360,7 +369,7 @@ fn shell_content_security_policy(
         "'self' 'wasm-unsafe-eval'"
     };
     Some(format!(
-        "{sandbox}default-src {default_source}; script-src {script_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
+        "{sandbox}default-src {default_source}; script-src {script_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}{frame_ancestors}"
     ))
 }
 
@@ -1076,6 +1085,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(BROWSER_CAPSULE_DOCUMENT_CORP)
         );
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(csp.starts_with("sandbox "));
+        assert!(!csp.contains("allow-same-origin"));
+        assert!(!csp.contains("frame-ancestors"));
     }
 
     #[cfg(unix)]

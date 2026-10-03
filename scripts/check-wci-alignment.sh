@@ -316,7 +316,7 @@ check_forbidden_in_path 'esp-shell' components.json 'obsolete ESP Shell capsule 
 check_required 'Home is the user-facing front door' README.md 'README must teach Home front door'
 check_required 'No ambient authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
 check_required 'Carrier is not the capsule contract' PRINCIPLES.md 'principles file must codify the Carrier transport boundary'
-check_required 'audit-linux-runtime-portability\.sh' scripts/publish-release.sh 'publish release must audit Linux runtime portability before publishing'
+check_required '^[[:space:]]*scripts/audit-linux-runtime-portability\.sh --platform' scripts/prepare-release-platform.sh 'native Linux preparation must audit Runtime portability before recording inputs'
 check_forbidden_in_path 'using default: \$ELASTOS' scripts/publish-release.sh 'public Linux runtime publish must not silently fall back to the glibc host binary'
 check_required 'opens Home' docs/GETTING_STARTED.md 'Getting Started must teach Home front door'
 check_required 'info "Opening Home\.\.\."' scripts/install.sh 'installer must open Home when a terminal is present'
@@ -367,7 +367,15 @@ check_required 'edge_binding_path' elastos/crates/elastos-server/src/api/gateway
 check_required 'edge_site_head_path' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must resolve signed site-head state through Edge'
 check_required 'publisher_site_release_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist named releases under Publisher state'
 check_required 'edge_release_channel_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist release channels under Edge state'
-check_required 'publisher_release_manifest_path' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must read release manifests from Publisher state'
+check_required 'Publication::open_published\(&context\.key\.root_path, &receipt\.publisher_did\)' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must validate Publisher bytes against the saved public pin'
+check_required 'last_release_cid == publication\.release_cid\(\)' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must bind the saved release receipt to the signed set'
+check_required 'crate::update::verify_release_metadata_cid\(' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must verify the saved head CID against exact signed bytes'
+check_required 'verify_release_envelope\(&head, "elastos\.release\.head\.v1", pinned_did\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must verify the signed head against the independent pin'
+check_required 'verify_release_envelope\(&release, "elastos\.release\.v1", pinned_did\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must verify the signed release against the independent pin'
+check_required 'checked_hash\(text\(r, "installer_sha256"\)\?\)\? == digest\(&installer\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must bind frozen installer bytes to the signed hash'
+check_required 'component_refs\(&component, &artifact_directory, &names, &mut artifacts\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must verify transitive component artifact references'
+check_required 'stream_verified\(&artifact, \|_\| Ok\(\(\)\)\)' elastos/crates/elastos-server/src/release_publication.rs 'shared publication admission must hash artifact bytes against signed descriptors'
+check_forbidden_in_path '\.replace\("__PUBLISHER_GATEWAY__"' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must serve the frozen installer bytes'
 check_required 'publish_to_content_availability' elastos/crates/elastos-server/src/gateway_cmd.rs 'public gateway publish must route through content availability'
 check_forbidden_in_path 'publish_to_ipfs|no CID in ipfs-provider response' elastos/crates/elastos-server/src/gateway_cmd.rs 'public gateway publish must not bind directly to ipfs-provider'
 check_required 'ProviderInvocation' elastos/crates/elastos-server/src/content.rs 'content provider must use the provider invocation envelope'
@@ -675,7 +683,7 @@ check_forbidden_in_path 'get_ipfs_bridge|prepare_capsule_from_cid|send_raw\("ipf
 check_forbidden_in_path 'send_raw\("ipfs"|ipfs_cat_via_provider|try_download_capsule_via_ipfs_provider' elastos/crates/elastos-server/src/supervisor.rs 'supervisor capsule downloads must use elastos://content/fetch, not raw IPFS'
 
 python3 - <<'PY'
-import json, re, sys
+import ast, json, re, sys
 from pathlib import Path
 
 components = json.loads(Path("components.json").read_text())
@@ -1013,8 +1021,46 @@ def rust_const_items(text, name):
 
 publish_release = Path("scripts/publish-release.sh").read_text()
 publish_rs = Path("elastos/crates/elastos-server/src/publish.rs").read_text()
-if "components-release-integrity-check.py" not in publish_release or "validate_generated_components_json" not in publish_release:
-    print("[alignment] publish-release must validate generated components.json release checksums")
+platform_input = Path("scripts/release-platform-input.py").read_text()
+input_functions = {node.name: node for node in ast.parse(platform_input).body
+                   if isinstance(node, ast.FunctionDef)}
+
+def require_input_calls(function, required):
+    node = input_functions.get(function)
+    calls = {} if node is None else {
+        ast.unparse(call.func): call.lineno for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    }
+    if not set(required) <= calls.keys():
+        print(f"[alignment] native {function} must retain input/component checks: {', '.join(required)}")
+        sys.exit(1)
+    return calls
+
+prepare_platform = Path("scripts/prepare-release-platform.sh").read_text()
+audit = re.search(r'^\s*scripts/audit-linux-runtime-portability\.sh --platform[^\n]+$', prepare_platform, re.MULTILINE)
+receipt = re.search(r'^python3 scripts/release-platform-input\.py record\s', prepare_platform, re.MULTILINE)
+if audit is None or receipt is None or audit.start() >= receipt.start():
+    print("[alignment] native Linux portability audit must precede the unsigned input receipt")
+    sys.exit(1)
+require_input_calls("record", ["check_contents", "verify"])
+require_input_calls("check_contents", ["integrity.audit_manifest", "integrity.audit_release_artifacts", "check_binary"])
+require_input_calls("stage_inputs", ["validate_inputs", "verify_staged_inputs"])
+require_input_calls("prepared_components_bytes", ["integrity.audit_manifest", "integrity.audit_release_artifacts"])
+signing_calls = require_input_calls("signing_input", ["verify_staged_inputs", "prepared_components_bytes"])
+comparisons = [node.lineno for node in ast.walk(input_functions["signing_input"])
+               if isinstance(node, ast.Compare)
+               and any(isinstance(value, ast.Name) and value.id == "expected_components"
+                       for value in node.comparators)]
+writes = [node.lineno for node in ast.walk(input_functions["signing_input"])
+          if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+          and node.func.attr == "write_bytes"
+          and any(isinstance(value, ast.Name) and value.id == "manifest_bytes" for value in node.args)]
+if (not comparisons or not writes
+        or not signing_calls["prepared_components_bytes"] < min(comparisons) < min(writes)):
+    print("[alignment] generated components must match admitted checksummed inputs before unsigned signing input is written")
+    sys.exit(1)
+if not re.search(r'^\s*python3 scripts/release-platform-input\.py signing-input ', publish_release, re.MULTILINE):
+    print("[alignment] unsigned publication must use native input admission")
     sys.exit(1)
 publish_release_default = shell_array_items(publish_release, "DEFAULT_CAPSULES")
 publish_release_required = shell_array_items(publish_release, "REQUIRED_SUPPORTED_CAPSULES")
