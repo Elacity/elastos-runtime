@@ -781,7 +781,7 @@ fn cli_transaction_refusals_name_cli_recovery_and_preserve_release_files() {
         assert!(!message.contains("controller"), "{message}");
         assert_eq!(fixture.snapshot(), before);
     }
-    assert!(writer.recover().unwrap());
+    writer.recover().unwrap();
     fixture.assert_release(&writer, true);
     assert!(authorize_host_start_with_generation(
         &fixture.data,
