@@ -39,6 +39,7 @@ import {
   homeClipboardTargetSupported,
 } from "./home-clipboard-host.js?v=home-20260726a";
 import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260805a";
+import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -1472,6 +1473,11 @@ function registerHomeServiceWorker() {
 }
 
 applyActiveShellBootHint();
+const homeLink = createHomeLinkStatus({
+  post: postToActiveShell,
+  retry: () => requestShellSummaryRefresh({ reason: "reconnect", delay: 0 }),
+});
+activeShellFrame?.addEventListener("load", () => homeLink.replay());
 
 boot().catch((error) => {
   document.body.dataset.homeStatus = "error";
@@ -2189,11 +2195,16 @@ function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRES
       return;
     }
     shellState.summaryRefreshInFlight = true;
-    refreshShellSummary().catch((error) => {
+    refreshShellSummary().then(() => {
+      homeLink.reportSuccess();
+    }).catch((error) => {
       if (isHomeAuthError(error)) {
         showHostAuthGate().catch((unlockError) => {
           console.error("home unlock failed", unlockError);
         });
+        return;
+      }
+      if (homeLink.reportFailure(error)) {
         return;
       }
       console.error(`home summary refresh failed (${reason})`, error);
@@ -2388,6 +2399,7 @@ async function pollHomeEvents() {
   const hadCursor = Boolean(shellState.homeEventsCursor);
   try {
     const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`);
+    homeLink.reportSuccess();
     handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
     scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
   } catch (error) {
@@ -2398,7 +2410,9 @@ async function pollHomeEvents() {
       });
       return;
     }
-    console.warn("home event channel failed", error);
+    if (!homeLink.reportFailure(error)) {
+      console.warn("home event channel failed", error);
+    }
     scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
   } finally {
     shellState.homeEventsInFlight = false;
