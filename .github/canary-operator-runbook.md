@@ -241,11 +241,17 @@ The copied Runtime needs `scripts/publish-release.sh` and its reviewed Python
 helper at the embedded root even when it imports an already signed set.
 `--dry-run` returns before that helper check; use `--preflight-only` as well.
 If the existing seed Runtime differs from the reviewed candidate, the operator
-updates the intentional Runtime/helper files under Anders's approval and
-restarts the existing instance with its retained data root, identity, holder,
-provider configuration and service arguments. Verify binary parity after
-restart. Use the existing publication instance; its one current signed set is
-replaced at the first approved new-key canary import.
+first completes the baseline and receipt steps below during the approved
+window, then updates the intentional Runtime/helper files. Before the approved
+restart, keep the existing gateway config and set
+`gateway_allowed_hosts = ["elastos.elacitylabs.com"]` and
+`gateway_public_publisher_bootstrap = true` for the approved public origin and
+holder. Retain the previous config with the approved rollback. Restart the
+existing instance with its retained data root, identity, holder, provider
+configuration and service arguments. Verify binary parity after restart and
+the public host/bootstrap after import. Use the existing publication instance;
+its one current signed set is replaced at the first approved new-key canary
+import.
 
 The legacy instance reported in #89 has no Publisher receipt. Its old served
 release also lacks the installer hash required by the new gateway admission.
@@ -410,10 +416,12 @@ the existing service environment for migration and all publication commands.
 
 On the seed, set `SEED_RUNTIME`, `SIGNED_SET`, and `IPFS_PROVIDER` to their
 verified absolute paths. Run in the existing instance's approved HOME/data-root
-environment. For V1 and V2 alike:
+environment. For V1 and V2 alike, use a protected umask for the publication
+snapshot:
 
 ```bash
 set -euo pipefail
+umask 077
 V1='0.8.0-alpha.1'
 DID='did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe'
 "$SEED_RUNTIME" publish-release --version "$V1" --channel canary \
