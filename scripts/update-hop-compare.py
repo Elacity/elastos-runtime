@@ -100,6 +100,7 @@ import ctypes
 import fcntl
 import hashlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -540,6 +542,7 @@ CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", 
 CLI_PHASES = ("old", "new", *CLI_REFUSALS)
 CLI_DATA = "Library/Application Support/elastos"
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
+CLI_INSTALLED_METADATA = ("installation/release-head.json", "installation/release.json")
 CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("15.0.1", "15.1", "15.2", "15.3", "15.4", "16.1", "16.2"))
 
 
@@ -640,6 +643,64 @@ def cli_inventory(root, manifest):
              "fixture payload hash differs")
         need(binding["mode"] in (0o600, 0o644, 0o700, 0o755), "fixture installation mode invalid")
     need(not any(path.is_symlink() for path in (root / "payload").rglob("*")), "fixture payload contains a symlink")
+
+
+def cli_model_fixture_capsule():
+    return {"schema": "elastos.capsule/v1", "version": "0.1.0", "name": "model-update-hop-fixture",
+            "role": "content", "type": "data", "entrypoint": "weights.gguf", "projections": ["content"],
+            "model_content": {"format": "gguf", "quantization": "Q4_K_M", "engine": "llama.cpp",
+                "consumer_interface": "elastos.provider.model", "consumer_interface_version": "0.1.0",
+                "minimum_memory_mb": 8192, "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                "provenance": {"base_repository": "fixture/base", "base_revision": "a" * 40,
+                    "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE.base"},
+                    "quantized_repository": "fixture/quantized", "quantized_revision": "b" * 40,
+                    "path": "PROVENANCE.md"}}}
+
+
+def cli_model_fixture_object(manifest, mapping):
+    entries = [{"path": path, "size": manifest["files"][relative]["bytes"],
+                "sha256": manifest["files"][relative]["sha256"]} for path, relative in sorted(mapping.items())]
+    closure = hashlib.sha256()
+    for entry in entries:
+        for value in (entry["path"], entry["sha256"], str(entry["size"])):
+            closure.update(value.encode() + b"\0")
+    return {"schema": "elastos.content.object.manifest/v1", "kind": "capsule",
+            "content_digest": "sha256:" + closure.hexdigest(), "files": entries}
+
+
+def cli_admit_model_fixture(root, manifest):
+    fixture = manifest["model_fixture"]
+    need(set(fixture) == {"package", "files"}
+         and set(fixture["files"]) == {"capsule.json", "weights.gguf", "LICENSE", "LICENSE.base", "PROVENANCE.md"},
+         "model fixture closure inventory differs")
+    package = fixture["package"]
+    mapping = fixture["files"]
+    need(all(relative in manifest["files"] for relative in (package, *mapping.values())), "model fixture bytes absent")
+    cid = manifest["files"][package]["cid"]
+    encoded = cid[1:].upper()
+    need(cid.startswith("b") and base64.b32decode(encoded + "=" * (-len(encoded) % 8))[:4] == b"\x01\x70\x12\x20",
+         "model fixture package requires DAG-PB SHA-256 CIDv1")
+    for relative in (package, *mapping.values()):
+        binding = manifest["files"][relative]
+        need(0 < binding["bytes"] <= 256 * 1024 and manifest["holder"]["content"].get(binding["cid"]) == relative,
+             "model fixture holder CID mapping differs")
+        cli_metadata_cid(binding["cid"], cli_path(root, relative).read_bytes())
+    with tarfile.open(cli_path(root, package), mode="r:") as archive:
+        members = archive.getmembers()
+        need([member.name for member in members] == sorted(mapping)
+             and all(member.isfile() and member.size == manifest["files"][mapping[member.name]]["bytes"] for member in members),
+             "model fixture package inventory differs")
+        for member in members:
+            with archive.extractfile(member) as stream:
+                need(stream.read() == cli_path(root, mapping[member.name]).read_bytes(), "model fixture package bytes differ")
+    capsule = cli_model_fixture_capsule()
+    need(cli_path(root, mapping["capsule.json"]).read_bytes() == json.dumps(capsule, sort_keys=True, separators=(",", ":")).encode(),
+         "model fixture capsule bytes differ")
+    entry = {"cid": cid, "capsule_manifest": capsule, "object_manifest": cli_model_fixture_object(manifest, mapping)}
+    for publication in manifest["publications"].values():
+        payload = cli_json(cli_path(root, publication["catalogue"]))["payload"]
+        need(payload == {"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None, "entries": [entry]},
+             "model fixture catalogue closure differs")
 
 
 def cli_admit(config):
@@ -770,6 +831,8 @@ def cli_admit(config):
             need(mapped in manifest["files"] and manifest["files"][mapped]["sha256"] == manifest["files"][relative]["sha256"], "holder CID content mapping incomplete")
     need(manifest["files"][holder["files"][".local/bin/elastos"]]["sha256"] in
          {manifest["files"][publication["binary"]]["sha256"] for publication in (old, new)}, "holder Runtime differs from qualified binaries")
+    if "model_fixture" in manifest:
+        cli_admit_model_fixture(root, manifest)
     need({"config", "data", "support"} <= set(manifest["preserve"]), "config/data/support preservation paths required")
     for group, paths in manifest["preserve"].items():
         need(isinstance(paths, list) and paths, "empty preservation group")
@@ -780,6 +843,8 @@ def cli_admit(config):
         cli_admit_home_support(root, manifest)
     need(scope != "ci-rehearsal" or manifest["proof_kind"] != "real-runtime" or "initial_home" in manifest,
          "native CI rehearsal requires the installed Home startup fixture")
+    need(scope != "ci-rehearsal" or manifest["proof_kind"] != "real-runtime" or "model_fixture" in manifest,
+         "native CI rehearsal requires the signed model catalogue fixture")
     disk = shutil.disk_usage(root)
     growth = 8 * sum(value["bytes"] for value in manifest["files"].values())
     need((disk.free - growth) / disk.total >= 0.15, "fixture copies would breach the 15% disk reserve")
@@ -1153,7 +1218,27 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
             key.write_text(os.urandom(32).hex())
             key.chmod(0o600)
         execute([str(root / kubo_relative), "init", "--profile=test"])
-        catalogue_envelope = sign({"schema": "elastos.model.catalog/v1", "entries": []}, "elastos.model.catalog.v1", keys[0])
+        capsule = cli_model_fixture_capsule()
+        model_bytes = {"capsule.json": json.dumps(capsule, sort_keys=True, separators=(",", ":")).encode(),
+                       "weights.gguf": b"GGUF synthetic fixture metadata only; no inference model.\n",
+                       "LICENSE": b"Synthetic fixture bytes licensed under Apache-2.0.\n",
+                       "LICENSE.base": b"Synthetic base fixture bytes licensed under Apache-2.0.\n",
+                       "PROVENANCE.md": b"Owned CI fixture bytes only. No downloaded weights or inference claim.\n"}
+        model_mapping = {name: add("model-fixture/" + name, raw) for name, raw in sorted(model_bytes.items())}
+        for relative in model_mapping.values():
+            content(relative, raw=True)
+        package_bytes = io.BytesIO()
+        with tarfile.open(fileobj=package_bytes, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, raw in sorted(model_bytes.items()):
+                member = tarfile.TarInfo(name)
+                member.size, member.mode, member.mtime = len(raw), 0o600, 1
+                archive.addfile(member, io.BytesIO(raw))
+        package = add("model-fixture.tar", package_bytes.getvalue())
+        package_cid = content(package)
+        manifest["model_fixture"] = {"package": package, "files": model_mapping}
+        catalogue_envelope = sign({"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None,
+            "entries": [{"cid": package_cid, "capsule_manifest": capsule,
+                         "object_manifest": cli_model_fixture_object(manifest, model_mapping)}]}, "elastos.model.catalog.v1", keys[0])
         manifest["signer_did"] = catalogue_envelope["signer_did"]
         catalogue = add("catalogue.json", catalogue_envelope)
         content(catalogue, raw=True)
@@ -1496,6 +1581,49 @@ def cli_coordination(home_path, required=True):
     return {"status": "released", **metadata}
 
 
+def cli_installed_metadata(home_path):
+    directory = cli_path(home_path, CLI_DATA + "/installation")
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return None
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+         and stat.S_IMODE(info.st_mode) == 0o700, "installed metadata directory ownership/mode differs")
+    need({path.name for path in directory.iterdir()} == {"release-head.json", "release.json"},
+         "installed metadata inventory differs")
+    snapshot = {}
+    for relative in CLI_INSTALLED_METADATA:
+        path = home_path / CLI_DATA / relative
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 256 * 1024,
+                 "installed metadata file ownership/mode/bound differs")
+            raw = stream.read(256 * 1024 + 1)
+            need(len(raw) <= 256 * 1024, "installed metadata file grew beyond its bound")
+            snapshot[relative] = hashlib.sha256(raw).hexdigest()
+    return snapshot
+
+
+def cli_expected_installed_metadata(manifest, publication_name):
+    publication = manifest["publications"][publication_name]
+    return {relative: manifest["files"][publication[key]]["sha256"]
+            for relative, key in zip(CLI_INSTALLED_METADATA, ("head", "release"))}
+
+
+def cli_legacy_installed_metadata(home_path):
+    snapshot = {}
+    for relative in CLI_INSTALLED_METADATA:
+        path, original = cli_copy_target(home_path, CLI_DATA + "/" + CLI_PUBLISHER + "/" + Path(relative).name)
+        need(original is not None, "legacy installed metadata absent")
+        info = path.lstat()
+        need(info.st_nlink == 1 and info.st_mode & 0o7022 == 0 and info.st_size <= 256 * 1024,
+             "legacy installed metadata ownership/mode/bound differs")
+        snapshot[relative] = digest(path)
+    return snapshot
+
+
 def cli_state(manifest, home_path):
     directory = home_path / CLI_DATA
     coordination = cli_coordination(home_path)
@@ -1504,8 +1632,9 @@ def cli_state(manifest, home_path):
     return {"binary": digest(home_path / ".local/bin/elastos"),
             "components": digest(directory / "components.json"),
             "catalogue": digest(directory / "model-catalog.json"), "sources": sources, "coordination": coordination,
+            "installed_metadata": cli_installed_metadata(home_path),
             "data": {relative: binding for relative, binding in (files(directory) or {}).items()
-                     if relative not in ("sources.json", "components.json", "model-catalog.json", "host-process.lock", CLI_PUBLISHER + "/release-head.json", CLI_PUBLISHER + "/release.json")
+                     if relative not in ("sources.json", "components.json", "model-catalog.json", "host-process.lock", *CLI_INSTALLED_METADATA)
                      and not relative.startswith("backups/principal-root-upgrade-")},
             "preserved": {key: {relative: files(cli_path(directory, relative)) for relative in paths}
                           for key, paths in manifest["preserve"].items()}}
@@ -1647,6 +1776,8 @@ def cli_home_snapshot(manifest, home_path):
     return {"binary": digest(home_path / ".local/bin/elastos"), "components": digest(directory / "components.json"),
             "catalogue": digest(directory / "model-catalog.json"), "sources": cli_json(directory / "sources.json"),
             "identity": digest(directory / "identity/device.key"),
+            "installed_metadata": cli_installed_metadata(home_path),
+            "publisher": files(directory / CLI_PUBLISHER),
             "preserved": {key: {relative: files(cli_path(directory, relative)) for relative in paths}
                           for key, paths in manifest["preserve"].items()}}
 
@@ -1732,6 +1863,12 @@ def cli_port_released(value):
 def cli_initial_home(processes, manifest, home_path, evidence=None):
     """Run the installed entrypoint; Runtime alone admits and owns its child."""
     before = cli_home_snapshot(manifest, home_path)
+    expected_metadata = cli_expected_installed_metadata(manifest, "old")
+    need(before["installed_metadata"] in (None, expected_metadata), "initial Home installed metadata differs from signed old release")
+    if before["installed_metadata"] is None:
+        need(cli_legacy_installed_metadata(home_path) == expected_metadata, "initial Home legacy metadata differs from signed old release")
+    # Initial Home may migrate the frozen installer's legacy signed pair once.
+    before["installed_metadata"] = expected_metadata
     directory = home_path / CLI_DATA
     for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/"):
         cli_port_released(value)
@@ -1925,6 +2062,16 @@ def cli_run(config, output):
              and stored["installed_version"] == version, "installed trust/config binding differs")
         if publication_name == "old":
             need(not stored["head_cid"], "frozen installer cached a head CID")
+            need(observation["installed_metadata"] in (None, cli_expected_installed_metadata(manifest, "old")),
+                 "old installed metadata differs")
+            if observation["installed_metadata"] is None:
+                need(cli_legacy_installed_metadata(home_path) == cli_expected_installed_metadata(manifest, "old"),
+                     "old legacy installed metadata hash differs")
+        else:
+            need(observation["installed_metadata"] == cli_expected_installed_metadata(manifest, publication_name),
+                 "installed consumed metadata hash differs")
+            need(stored["head_cid"] == manifest["files"][publication["head"]]["cid"],
+                 "installed consumed head CID differs")
         return observation
 
     try:

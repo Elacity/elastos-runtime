@@ -578,6 +578,96 @@ class CliFixtureTests(unittest.TestCase):
         lock.chmod(0o600)
         return home, lock
 
+    def installed_metadata_fixture(self, home, name="old", consumed=True):
+        directory = home / observer.CLI_DATA / ("installation" if consumed else observer.CLI_PUBLISHER)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        for key, filename in (("head", "release-head.json"), ("release", "release.json")):
+            path = directory / filename
+            path.write_bytes((self.root / self.manifest["publications"][name][key]).read_bytes())
+            path.chmod(0o600)
+        return directory
+
+    def test_consumed_metadata_is_authoritative_snapshot_and_publisher_is_preserved_data(self):
+        home, _ = self.coordination_fixture()
+        publisher = self.installed_metadata_fixture(home, consumed=False)
+        legacy = observer.cli_state(self.manifest, home)
+        self.assertIsNone(legacy["installed_metadata"])
+        self.assertEqual(observer.cli_legacy_installed_metadata(home), observer.cli_expected_installed_metadata(self.manifest, "old"))
+        for path in publisher.iterdir():
+            path.chmod(0o644)  # Frozen installer metadata uses its historical accepted mode.
+        self.assertEqual(observer.cli_legacy_installed_metadata(home), observer.cli_expected_installed_metadata(self.manifest, "old"))
+        legacy_release = publisher / "release.json"
+        legacy_release.chmod(0o666)
+        with self.assertRaisesRegex(ValueError, "legacy installed metadata ownership/mode/bound"):
+            observer.cli_legacy_installed_metadata(home)
+        legacy_release.chmod(0o644)
+        installed = self.installed_metadata_fixture(home, "new")
+        current = observer.cli_state(self.manifest, home)
+        self.assertEqual(current["installed_metadata"], observer.cli_expected_installed_metadata(self.manifest, "new"))
+        self.assertEqual(legacy["data"], current["data"])
+        self.assertTrue(all(relative not in current["data"] for relative in observer.CLI_INSTALLED_METADATA))
+        self.assertIn(observer.CLI_PUBLISHER + "/release.json", current["data"])
+        (installed / "release.json").write_bytes(b"substituted consumed release")
+        changed = observer.cli_state(self.manifest, home)
+        self.assertNotEqual(current, changed)
+        self.assertEqual(current["data"], changed["data"])
+        (publisher / "release.json").write_bytes(b"changed publication")
+        self.assertNotEqual(changed["data"], observer.cli_state(self.manifest, home)["data"])
+
+    def test_consumed_metadata_refuses_partial_unsafe_or_unknown_inventory(self):
+        for case in ("partial", "symlink file", "symlink directory", "file mode", "directory mode", "hard link", "unknown", "fifo"):
+            with self.subTest(case=case):
+                home = self.root / ("metadata-" + case.replace(" ", "-"))
+                installed = self.installed_metadata_fixture(home)
+                target = installed / "release.json"
+                if case == "partial":
+                    target.unlink()
+                elif case == "symlink file":
+                    target.unlink()
+                    target.symlink_to(self.root / self.manifest["publications"]["old"]["release"])
+                elif case == "symlink directory":
+                    other = installed.with_name("foreign-installation")
+                    installed.rename(other)
+                    installed.symlink_to(other, target_is_directory=True)
+                elif case == "file mode":
+                    target.chmod(0o644)
+                elif case == "directory mode":
+                    installed.chmod(0o755)
+                elif case == "hard link":
+                    os.link(target, home / "foreign-link")
+                elif case == "unknown":
+                    (installed / "migration-scratch").write_bytes(b"unclassified authority")
+                else:
+                    target.unlink()
+                    os.mkfifo(target, 0o600)
+                with self.assertRaises((ValueError, OSError)):
+                    observer.cli_installed_metadata(home)
+
+    def test_migration_scratch_remains_in_ordinary_preservation_snapshot(self):
+        home, _ = self.coordination_fixture()
+        before = observer.cli_state(self.manifest, home)
+        stage = home / observer.CLI_DATA / ".elastos.installation-migrate"
+        stage.mkdir(mode=0o700)
+        (stage / "release.json").write_bytes(b"incomplete migration")
+        after = observer.cli_state(self.manifest, home)
+        self.assertNotEqual(before["data"], after["data"])
+        self.assertIn(".elastos.installation-migrate/release.json", after["data"])
+
+    def test_consumed_metadata_refuses_foreign_file_owner_and_oversize(self):
+        home = self.root / "metadata-owner"
+        installed = self.installed_metadata_fixture(home)
+        fstat = observer.os.fstat
+        def foreign_file(descriptor):
+            info = fstat(descriptor)
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1,
+                                   st_nlink=info.st_nlink, st_size=info.st_size)
+        with patch.object(observer.os, "fstat", side_effect=foreign_file), self.assertRaisesRegex(ValueError, "file ownership"):
+            observer.cli_installed_metadata(home)
+        (installed / "release.json").write_bytes(b"x" * (256 * 1024 + 1))
+        with self.assertRaisesRegex(ValueError, "file ownership/mode/bound"):
+            observer.cli_installed_metadata(home)
+
     def test_coordination_pid_change_is_separate_from_user_data_and_other_locks(self):
         home, lock = self.coordination_fixture()
         other = lock.with_name("user.lock")
@@ -874,6 +964,8 @@ class CliFixtureTests(unittest.TestCase):
         sources = {"default_source": "default", "sources": [{"name": "default", "publisher_dids": [self.manifest["signer_did"]],
                    "channel": "canary", "installed_version": self.manifest["old"]["version"], "install_path": str(binary)}]}
         observer.write(directory / "sources.json", sources)
+        self.installed_metadata_fixture(home, consumed=False)
+        self.installed_metadata_fixture(home)
         key = directory / "identity/device.key"
         key.parent.mkdir()
         key.write_bytes(b"isolated fixture identity")
@@ -982,6 +1074,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def test_initial_home_owner_stop_preserves_data_and_proves_all_owned_absence(self):
         home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        shutil.rmtree(directory / "installation")
         running = True
         captured = []
         process.poll = lambda: None if running else 0
@@ -997,6 +1090,7 @@ class CliFixtureTests(unittest.TestCase):
             (directory / "gateway-runtime-coords.json").unlink()
         def spawn(argv, env, cwd, label):
             captured.append((argv, env, cwd, label))
+            self.installed_metadata_fixture(home)
             return process
         manager = SimpleNamespace(roots={}, spawn=spawn)
         real_observe = observer.cli_observe_initial_home
@@ -1018,6 +1112,19 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(env["PATH"].split(":")[0], str(directory / "fixture-tools"))
         self.assertEqual(env["ELASTOS_CARRIER_MDNS"], "0")
 
+    def test_initial_home_refuses_foreign_consumed_authority_before_spawn(self):
+        home, directory, _, _, _, _, _ = self.initial_home_fixture()
+        self.installed_metadata_fixture(home, "new")
+        manager = SimpleNamespace(roots={}, spawn=unittest.mock.Mock())
+        with self.assertRaisesRegex(ValueError, "installed metadata differs from signed old release"):
+            observer.cli_initial_home(manager, self.manifest, home)
+        manager.spawn.assert_not_called()
+        shutil.rmtree(directory / "installation")
+        (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"substituted legacy release")
+        with self.assertRaisesRegex(ValueError, "legacy metadata differs from signed old release"):
+            observer.cli_initial_home(manager, self.manifest, home)
+        manager.spawn.assert_not_called()
+
     def test_initial_home_failure_paths_stop_owner_and_retain_refusals(self):
         home, directory, _, status, identities, _, _ = self.initial_home_fixture()
         coords_path = directory / "gateway-runtime-coords.json"
@@ -1025,12 +1132,14 @@ class CliFixtureTests(unittest.TestCase):
         sentinel = directory / "state/value"
         original = sentinel.read_bytes()
         for refusal in ("readiness", "readiness nonzero CI", "readiness nonzero operator", "readiness missing CI log",
-                        "owned group", "held lock", "listener", "user data"):
+                        "owned group", "held lock", "listener", "user data", "live metadata", "shutdown metadata", "publisher"):
             with self.subTest(refusal=refusal):
                 running = True
                 observer.write(coords_path, coords)
                 coords_path.chmod(0o600)
                 sentinel.write_bytes(original)
+                self.installed_metadata_fixture(home)
+                self.installed_metadata_fixture(home, consumed=False)
                 process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None if running else 0)
                 def wait(timeout):
                     process.returncode = 1 if "nonzero" in refusal else 0
@@ -1043,9 +1152,15 @@ class CliFixtureTests(unittest.TestCase):
                     coords_path.unlink()
                     if refusal == "user data":
                         sentinel.write_bytes(b"changed user data")
+                    if refusal == "shutdown metadata":
+                        (directory / "installation/release.json").write_bytes(b"changed consumed release")
+                    if refusal == "publisher":
+                        (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"changed publication")
                 def observe(*args):
                     if refusal.startswith("readiness"):
                         raise ValueError("injected initial readiness refusal")
+                    if refusal == "live metadata":
+                        (directory / "installation/release.json").write_bytes(b"changed consumed release")
                     return {"status": "passed", "controller": identities[45001], "host": identities[45002],
                             "home_url": coords["home_url"], "api_url": coords["api_url"]}
                 def port(value):
@@ -1143,8 +1258,18 @@ class CliFixtureTests(unittest.TestCase):
                     (repo / "blocks").mkdir(parents=True)
                     return subprocess.CompletedProcess(argv, 0, b"", b"")
                 raw = Path(argv[-1]).read_bytes()
-                cid = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("=")
-                (repo / "blocks" / cid).write_bytes(raw)
+                codec, block = 0x55, raw
+                if "--raw-leaves=false" in argv:
+                    def varint(value):
+                        result = bytearray()
+                        while value >= 128:
+                            result.append((value & 127) | 128)
+                            value >>= 7
+                        return bytes(result + bytes([value]))
+                    unixfs = b"\x08\x02\x12" + varint(len(raw)) + raw + b"\x18" + varint(len(raw))
+                    codec, block = 0x70, b"\x0a" + varint(len(unixfs)) + unixfs
+                cid = "b" + base64.b32encode(bytes([1, codec, 0x12, 0x20]) + hashlib.sha256(block).digest()).decode().lower().rstrip("=")
+                (repo / "blocks" / cid).write_bytes(block)
                 return subprocess.CompletedProcess(argv, 0, (cid + "\n").encode(), b"")
             return real_run(argv, **kwargs)
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
@@ -1156,6 +1281,29 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in key_paths))
         self.assertFalse((generated / "generator").exists())
         generated_manifest = observer.cli_json(generated / "manifest.json")
+        observer.cli_admit_model_fixture(generated, generated_manifest)
+        model_fixture = generated_manifest["model_fixture"]
+        catalogue_path = generated / generated_manifest["publications"]["old"]["catalogue"]
+        original_catalogue = catalogue_path.read_bytes()
+        for refusal in ("empty entries", "missing publication time", "closure digest", "missing package file", "holder CID"):
+            with self.subTest(model_refusal=refusal):
+                changed = json.loads(json.dumps(generated_manifest))
+                catalogue = json.loads(original_catalogue)
+                if refusal == "empty entries":
+                    catalogue["payload"]["entries"] = []
+                elif refusal == "missing publication time":
+                    del catalogue["payload"]["published_at"]
+                elif refusal == "closure digest":
+                    catalogue["payload"]["entries"][0]["object_manifest"]["content_digest"] = "sha256:" + "0" * 64
+                elif refusal == "missing package file":
+                    del changed["model_fixture"]["files"]["LICENSE"]
+                else:
+                    cid = changed["files"][model_fixture["package"]]["cid"]
+                    del changed["holder"]["content"][cid]
+                observer.write(catalogue_path, catalogue)
+                with self.assertRaises(ValueError):
+                    observer.cli_admit_model_fixture(generated, changed)
+        catalogue_path.write_bytes(original_catalogue)
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
         components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
         self.assertEqual(components["capsules"]["home"], observer.cli_json(support / "components.json")["capsules"]["home"])
@@ -1248,7 +1396,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
-                 config_drift=False, user_data_drift=False, coordination_pid_drift=False):
+                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
@@ -1264,12 +1412,22 @@ class CliFixtureTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((root / pub[key]).read_bytes())
             if first:
+                self.installed_metadata_fixture(home_path, name, consumed=False)
+                if metadata_drift == "legacy":
+                    (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"substituted legacy release")
                 source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": public_ticket(),
                           "publisher_node_id": HOLDER_NODE, "install_path": str(home_path / ".local/bin/elastos"), "installed_version": manifest[name]["version"], "head_cid": "", "gateways": [gateway]}
                 observer.write(directory / "sources.json", {"default_source": "default", "sources": [source]})
             else:
+                self.installed_metadata_fixture(home_path, name)
+                if metadata_drift == "consumed":
+                    (directory / "installation/release.json").write_bytes(b"substituted consumed release")
+                if metadata_drift == "publisher":
+                    (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"changed publication")
                 sources = observer.read(directory / "sources.json")
                 sources["sources"][0].update(installed_version=manifest[name]["version"], head_cid=manifest["files"][pub["head"]]["cid"])
+                if metadata_drift == "head CID":
+                    sources["sources"][0]["head_cid"] = manifest["files"][manifest["publications"]["old"]["head"]]["cid"]
                 observer.write(directory / "sources.json", sources)
         class Process:
             def __init__(self, argv, **kwargs):
@@ -1414,6 +1572,31 @@ class CliFixtureTests(unittest.TestCase):
 
     def test_runner_rejects_changed_user_data_despite_valid_coordination(self):
         code, _, result = self.fake_run(user_data_drift=True)
+        self.assertEqual(code, 1)
+        self.assertIn("config/data/support preservation differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_substituted_legacy_metadata_before_update(self):
+        code, calls, result = self.fake_run(metadata_drift="legacy")
+        self.assertEqual(code, 1)
+        self.assertIn("old legacy installed metadata hash differs", result["failure"])
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_substituted_consumed_metadata_after_apply(self):
+        code, _, result = self.fake_run(metadata_drift="consumed")
+        self.assertEqual(code, 1)
+        self.assertIn("installed consumed metadata hash differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_consumed_head_cid_mismatch(self):
+        code, _, result = self.fake_run(metadata_drift="head CID")
+        self.assertEqual(code, 1)
+        self.assertIn("installed consumed head CID differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_publisher_changes_after_apply(self):
+        code, _, result = self.fake_run(metadata_drift="publisher")
         self.assertEqual(code, 1)
         self.assertIn("config/data/support preservation differs", result["failure"])
         self.assertTrue(result["cleanup"]["passed"])
