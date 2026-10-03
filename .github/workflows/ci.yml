@@ -238,6 +238,13 @@ jobs:
         run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - name: list workspace tests
+        working-directory: elastos
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- --list | tee "${RUNNER_TEMP}/elastos-test-list.txt"
+          total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/elastos-test-list.txt")
+          echo "Workspace listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
@@ -290,6 +297,18 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+
+      - name: list own-workspace capsule tests
+        run: |
+          set -euo pipefail
+          : > "${RUNNER_TEMP}/capsules-test-list.txt"
+          for lock in capsules/*/Cargo.lock; do
+              capsule="$(dirname "$lock")"
+              echo "== listing $capsule =="
+              (cd "$capsule" && cargo test -- --list) | tee -a "${RUNNER_TEMP}/capsules-test-list.txt"
+          done
+          total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/capsules-test-list.txt")
+          echo "Capsules listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
