@@ -45,6 +45,17 @@ impl PrivateFixture {
         self.directory.join("runtime")
     }
 
+    fn publish_installed_release(&self) -> TrustedSource {
+        let manifest = publisher_release_manifest_path(&self.data);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        self.file(
+            &manifest,
+            &signed_release(&digest(b"signed fixture Runtime")),
+            0o600,
+        );
+        source_config(&self.binary).sources.remove(0)
+    }
+
     fn snapshot(&self) -> Snapshot {
         fn collect(root: &Path, path: &Path, result: &mut Snapshot) {
             let metadata = fs::symlink_metadata(path).unwrap();
@@ -433,7 +444,7 @@ fn receipt_round_trip_keeps_non_utf8_launch_args_environment_and_working_directo
     fs::create_dir(&cwd).unwrap();
     let encode = |value: &OsStr| BASE64.encode(value.as_bytes());
     let argument = OsString::from_vec(b"argument-\xfe".to_vec());
-    let key = OsString::from_vec(b"FIXTURE_\xff".to_vec());
+    let key = OsString::from("PATH");
     let value = OsString::from_vec(b"value-\xfe".to_vec());
     let launch = LaunchPlan {
         args: [
@@ -507,6 +518,430 @@ fn receipt_round_trip_keeps_non_utf8_launch_args_environment_and_working_directo
     bad.args[0] = "invalid base64!".into();
     assert!(bad.command(&fixture.binary, &generation, true).is_err());
     assert_ne!(bad.sha256().unwrap(), receipt.launch_sha256);
+}
+
+#[test]
+fn launch_capture_and_retained_commands_exclude_unrelated_credentials() {
+    let cwd = PathBuf::from("/private/Home fixture");
+    let allowed = [
+        ("HOME", "/private/Home fixture"),
+        ("XDG_DATA_HOME", "/private/Home fixture/data"),
+        ("PATH", "/usr/bin:/private/native-support/bin"),
+        ("CARGO_HOME", "/private/tools/cargo"),
+        ("RUSTUP_HOME", "/private/tools/rustup"),
+        (
+            "ELASTOS_CAPSULE_BIN_DIR",
+            "/private/Home fixture/data/elastos/bin",
+        ),
+        ("ELASTOS_IPFS_KUBO_PATH", "/private/native-support/kubo"),
+        (
+            "ELASTOS_POLICY_FILE",
+            "/private/Home fixture/data/elastos/policy.json",
+        ),
+        (
+            "ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR",
+            "/private/Home fixture/data/elastos",
+        ),
+        (
+            "ELASTOS_HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID",
+            "private-Home-proof",
+        ),
+    ];
+    let excluded = [
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITHUB_TOKEN",
+        "COINGECKO_DEMO_API_KEY",
+        "ELASTOS_AVAILABILITY_AUTHORIZATION",
+        "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_AUTHORIZATION",
+        "ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG",
+        "ELASTOS_UNKNOWN_API_KEY",
+        "ELASTOS_UPDATE_GENERATION",
+    ];
+    let mut environment = allowed
+        .iter()
+        .map(|(key, value)| (OsString::from(*key), OsString::from(*value)))
+        .collect::<Vec<_>>();
+    environment.extend(excluded.iter().map(|key| {
+        (
+            OsString::from(*key),
+            OsString::from("excluded-secret-fixture"),
+        )
+    }));
+    let launch = LaunchPlan::capture_environment(environment, cwd.clone());
+    let receipt_bytes = serde_json::to_vec(&launch).unwrap();
+    let secret = BASE64.encode(b"excluded-secret-fixture");
+    assert!(!receipt_bytes
+        .windows(secret.len())
+        .any(|window| window == secret.as_bytes()));
+    assert_eq!(launch.environment.len(), allowed.len());
+    let launch_hash = launch.sha256().unwrap();
+    let mut retained: LaunchPlan = serde_json::from_slice(&receipt_bytes).unwrap();
+    assert_eq!(retained.sha256().unwrap(), launch_hash);
+    // A pre-fix private receipt may still contain these fields. Validate its
+    // recorded bytes before the command filters its launch environment.
+    retained.environment.extend(excluded.iter().map(|key| {
+        (
+            BASE64.encode(key.as_bytes()),
+            BASE64.encode(b"excluded-secret-fixture"),
+        )
+    }));
+    let retained_hash = retained.sha256().unwrap();
+    let command = retained
+        .command(Path::new("/private/runtime"), &"a".repeat(32), false)
+        .unwrap();
+    assert_eq!(retained.sha256().unwrap(), retained_hash);
+    let values = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.unwrap().to_os_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (key, value) in allowed {
+        assert_eq!(values[&OsString::from(key)], value);
+    }
+    for key in excluded
+        .into_iter()
+        .filter(|key| *key != "ELASTOS_UPDATE_GENERATION")
+    {
+        assert!(!values.contains_key(&OsString::from(key)), "{key}");
+    }
+    assert_eq!(
+        values[&OsString::from("ELASTOS_UPDATE_GENERATION")],
+        "a".repeat(32).as_str()
+    );
+}
+
+#[test]
+fn first_start_enospc_at_each_bootstrap_step_preserves_ordinary_host_admission() {
+    for step in ["directory", "lease", "writer"] {
+        let fixture = PrivateFixture::new();
+        let source = fixture.publish_installed_release();
+        fs::remove_dir(&fixture.directory).unwrap();
+        let result = bootstrap_controller(
+            &fixture.data,
+            &fixture.binary,
+            &source,
+            |data| {
+                if step == "directory" {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+                } else {
+                    controller_directory(data)
+                }
+            },
+            |directory| {
+                if step == "lease" {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+                } else {
+                    acquire_lease(directory)
+                }
+            },
+            |parent| {
+                if step == "writer" {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+                } else {
+                    crate::install_transaction::InstallationGuard::acquire(parent)
+                }
+            },
+        )
+        .unwrap();
+        assert!(result.is_none(), "{step}");
+        assert_eq!(
+            fs::read(&fixture.binary).unwrap(),
+            b"signed fixture Runtime"
+        );
+        assert!(!fixture.controller().exists());
+        assert!(!fixture.directory.join(RECEIPT).exists());
+        crate::install_transaction::authorize_host_start_with_generation(
+            &fixture.data,
+            &fixture.binary,
+            None,
+            std::process::id(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn first_start_enospc_refuses_existing_authority_busy_or_unsafe_bootstrap_state() {
+    for state in [
+        "runtime",
+        RECEIPT,
+        REQUEST,
+        ACTIVE_REQUEST,
+        STATUS,
+        "runtime.partial",
+        "busy lease",
+        "unsafe directory",
+        "unsafe lease",
+        "nonempty lease",
+        "pending journal",
+        "invalid signature",
+    ] {
+        let fixture = PrivateFixture::new();
+        let source = fixture.publish_installed_release();
+        let mut held = None;
+        match state {
+            "busy lease" => held = Some(acquire_lease(&fixture.directory).unwrap()),
+            "unsafe directory" => {
+                fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o755)).unwrap()
+            }
+            "unsafe lease" => {
+                symlink(&fixture.binary, fixture.directory.join("controller.lock")).unwrap()
+            }
+            "nonempty lease" => fixture.file(
+                &fixture.directory.join("controller.lock"),
+                b"unexpected lease contents",
+                0o600,
+            ),
+            "pending journal" => fixture.file(
+                &fixture
+                    .binary
+                    .parent()
+                    .unwrap()
+                    .join(".elastos.update-journal.json"),
+                b"{}",
+                0o600,
+            ),
+            "invalid signature" => fs::write(
+                publisher_release_manifest_path(&fixture.data),
+                b"invalid signed installed release",
+            )
+            .unwrap(),
+            _ => fixture.file(
+                &fixture.directory.join(state),
+                b"retained controller authority",
+                0o600,
+            ),
+        }
+        let before = fixture.snapshot();
+        let result = bootstrap_controller(
+            &fixture.data,
+            &fixture.binary,
+            &source,
+            |_| Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into()),
+            acquire_lease,
+            crate::install_transaction::InstallationGuard::acquire,
+        );
+        assert!(result.is_err(), "{state}");
+        assert_eq!(fixture.snapshot(), before, "{state}");
+        drop(held);
+    }
+}
+
+#[test]
+fn first_start_enospc_rechecks_a_journal_created_during_bootstrap() {
+    let fixture = PrivateFixture::new();
+    let source = fixture.publish_installed_release();
+    let journal = fixture
+        .binary
+        .parent()
+        .unwrap()
+        .join(".elastos.update-journal.json");
+    let result = bootstrap_controller(
+        &fixture.data,
+        &fixture.binary,
+        &source,
+        controller_directory,
+        acquire_lease,
+        |_| {
+            fixture.file(&journal, b"{}", 0o600);
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read(journal).unwrap(), b"{}");
+    assert!(!fixture.controller().exists());
+    assert!(!fixture.directory.join(RECEIPT).exists());
+}
+
+#[test]
+fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    let _lease = acquire_lease(&fixture.directory).unwrap();
+    let _writer =
+        crate::install_transaction::InstallationGuard::acquire(fixture.binary.parent().unwrap())
+            .unwrap();
+    let before = fixture.snapshot();
+    let identity = fs::metadata(fixture.controller()).unwrap();
+    let expected = digest(b"signed fixture Runtime");
+    assert!(prepare_controller(
+        &fixture.directory,
+        &fixture.binary,
+        &expected,
+        |_, _| panic!("same-hash reuse requested disk reserve")
+    )
+    .unwrap());
+    let after = fs::metadata(fixture.controller()).unwrap();
+    assert_eq!((identity.dev(), identity.ino()), (after.dev(), after.ino()));
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn first_controller_low_space_keeps_ordinary_home_available_without_creating_a_controller() {
+    for error in [
+        anyhow::Error::from(crate::install_transaction::DiskReserveError),
+        anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+    ] {
+        let fixture = PrivateFixture::new();
+        let _lease = acquire_lease(&fixture.directory).unwrap();
+        let _writer = crate::install_transaction::InstallationGuard::acquire(
+            fixture.binary.parent().unwrap(),
+        )
+        .unwrap();
+        let before = fixture.snapshot();
+        assert!(!prepare_controller(
+            &fixture.directory,
+            &fixture.binary,
+            &digest(b"signed fixture Runtime"),
+            |_, _| Err(error)
+        )
+        .unwrap());
+        assert_eq!(fixture.snapshot(), before);
+        assert!(!fixture.controller().exists());
+        assert!(!fixture.directory.join(RECEIPT).exists());
+        crate::install_transaction::authorize_host_start_with_generation(
+            &fixture.data,
+            &fixture.binary,
+            None,
+            std::process::id(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn low_space_cannot_hide_unsafe_controller_state_or_foreign_errors() {
+    for state in [
+        "symlink",
+        "mode",
+        "unknown bytes",
+        "malformed receipt",
+        "unsafe scratch",
+        "pending journal",
+        "controller FIFO",
+        "scratch FIFO",
+        "receipt FIFO",
+    ] {
+        let fixture = PrivateFixture::new();
+        let _lease = acquire_lease(&fixture.directory).unwrap();
+        let _writer = crate::install_transaction::InstallationGuard::acquire(
+            fixture.binary.parent().unwrap(),
+        )
+        .unwrap();
+        match state {
+            "symlink" => symlink(&fixture.binary, fixture.controller()).unwrap(),
+            "mode" => fixture.file(&fixture.controller(), b"signed fixture Runtime", 0o755),
+            "unknown bytes" => {
+                fixture.file(&fixture.controller(), b"foreign private controller", 0o700)
+            }
+            "malformed receipt" => fixture.file(&fixture.directory.join(RECEIPT), b"{}", 0o600),
+            "unsafe scratch" => symlink(
+                &fixture.binary,
+                fixture.controller().with_extension("partial"),
+            )
+            .unwrap(),
+            "pending journal" => fixture.file(
+                &fixture
+                    .binary
+                    .parent()
+                    .unwrap()
+                    .join(".elastos.update-journal.json"),
+                b"{}",
+                0o600,
+            ),
+            "controller FIFO" | "scratch FIFO" | "receipt FIFO" => {
+                let (path, mode) = match state {
+                    "scratch FIFO" => (fixture.controller().with_extension("partial"), 0o700),
+                    "receipt FIFO" => (fixture.directory.join(RECEIPT), 0o600),
+                    _ => (fixture.controller(), 0o700),
+                };
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), mode) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let before = fixture.snapshot();
+        assert!(
+            prepare_controller(
+                &fixture.directory,
+                &fixture.binary,
+                &digest(b"signed fixture Runtime"),
+                |_, _| Err(crate::install_transaction::DiskReserveError.into())
+            )
+            .is_err(),
+            "{state}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{state}");
+    }
+    let fixture = PrivateFixture::new();
+    let before = fixture.snapshot();
+    assert!(prepare_controller(
+        &fixture.directory,
+        &fixture.binary,
+        &digest(b"signed fixture Runtime"),
+        |_, _| Err(std::io::Error::from_raw_os_error(libc::EACCES).into())
+    )
+    .is_err());
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn signed_current_controller_repairs_only_an_admitted_prior_receipt() {
+    for tamper in ["none", "signature", "launch", "binary path"] {
+        let fixture = PrivateFixture::new();
+        publish_retained_receipt(&fixture);
+        let _lease = acquire_lease(&fixture.directory).unwrap();
+        let _writer = crate::install_transaction::InstallationGuard::acquire(
+            fixture.binary.parent().unwrap(),
+        )
+        .unwrap();
+        let path = fixture.directory.join(RECEIPT);
+        let mut receipt: Receipt = read_private_json(&path).unwrap();
+        let mut source = receipt.trusted_source.clone();
+        source.installed_version = "0.7.1".into();
+        let current_bytes = b"next signed Runtime";
+        let expected = digest(current_bytes);
+        let mut payload = json!({"schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable", "platforms":{}});
+        payload["platforms"][crate::update::detect_release_platform()] =
+            json!({"binary":{"sha256":expected}});
+        let signed = signed(payload, "elastos.release.v1");
+        fs::write(&fixture.binary, current_bytes).unwrap();
+        // Simulate a crash after the new controller rename and before the receipt rename.
+        fs::write(fixture.controller(), current_bytes).unwrap();
+        assert_eq!(
+            admit_installed_release(&signed, &source, &fixture.binary).unwrap(),
+            expected
+        );
+        match tamper {
+            "signature" => {
+                receipt.signed_controller_release = BASE64.encode(b"invalid signed prior release")
+            }
+            "launch" => receipt.launch.cwd = BASE64.encode(b"changed prior launch"),
+            "binary path" => receipt.binary = fixture.data.join("foreign-runtime"),
+            _ => {}
+        }
+        write_private(&path, &receipt).unwrap();
+        let before = fixture.snapshot();
+        let result = prepare_controller(&fixture.directory, &fixture.binary, &expected, |_, _| {
+            panic!("current signed bytes need no copy")
+        });
+        if tamper == "none" {
+            assert!(result.unwrap());
+            assert_eq!(fixture.snapshot(), before);
+            receipt.controller_sha256 = expected;
+            receipt.signed_controller_release = BASE64.encode(signed);
+            receipt.trusted_source = source;
+            write_private(&path, &receipt).unwrap();
+            validate_retained_receipt(&read_private_json::<Receipt>(&path).unwrap()).unwrap();
+        } else {
+            assert!(result.is_err(), "{tamper}");
+            assert_eq!(fixture.snapshot(), before, "{tamper}");
+        }
+    }
 }
 
 #[test]

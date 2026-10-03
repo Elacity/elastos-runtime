@@ -39,6 +39,49 @@ const MAX_PRIVATE_JSON: u64 = 256 * 1024;
 const INITIAL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Home reads provider and Browser settings from its installed private config files.
+// Persist only the paths, locale, and Runtime bindings needed to restart this Home.
+const LAUNCH_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "PATH",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "ELASTOS_CAPSULE_BIN_DIR",
+    "ELASTOS_IPFS_KUBO_PATH",
+    "ELASTOS_IPFS_PROVIDER_BIN",
+    "ELASTOS_POLICY_FILE",
+    "ELASTOS_CARRIER_NETWORK",
+    "ELASTOS_CARRIER_MDNS",
+    "ELASTOS_RELAY_URL",
+    "ELASTOS_HOME_LAUNCH_TRUSTED_SIGNER_DID",
+    "ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR",
+    "ELASTOS_HOSTED_HTTPS_OWNER_DATA_DIR",
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID",
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_SESSION_ID",
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID",
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_GRANT_ID",
+    "ELASTOS_HOME_CLI_GATEWAY_API_URL",
+    "ELASTOS_HOME_CLI_TERMINAL_PROGRAM",
+    "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+    "ELASTOS_BROWSER_MAX_ACTIVE_SESSIONS",
+    "ELASTOS_BROWSER_MAX_SESSIONS_PER_PRINCIPAL",
+    "ELASTOS_QUIET_RUNTIME_NOTICES",
+];
+
+fn allowed_launch_key(key: &std::ffi::OsStr) -> bool {
+    LAUNCH_ENVIRONMENT
+        .iter()
+        .any(|allowed| key == std::ffi::OsStr::new(allowed))
+}
+
 fn readiness_budget(restarting: bool) -> Duration {
     if restarting {
         READY_TIMEOUT
@@ -57,18 +100,29 @@ struct LaunchPlan {
 
 impl LaunchPlan {
     fn capture() -> Result<Self> {
+        Ok(Self::capture_environment(
+            std::env::vars_os(),
+            std::env::current_dir()?,
+        ))
+    }
+
+    fn capture_environment(
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+        cwd: PathBuf,
+    ) -> Self {
         let encode = |value: &std::ffi::OsStr| BASE64.encode(value.as_bytes());
-        Ok(Self {
+        Self {
             args: vec![
                 encode(std::ffi::OsStr::new("home")),
                 encode(std::ffi::OsStr::new("--browser")),
             ],
-            environment: std::env::vars_os()
-                .filter(|(key, _)| !key.as_bytes().starts_with(b"ELASTOS_UPDATE_"))
+            environment: environment
+                .into_iter()
+                .filter(|(key, _)| allowed_launch_key(key))
                 .map(|(key, value)| (encode(&key), encode(&value)))
                 .collect(),
-            cwd: encode(std::env::current_dir()?.as_os_str()),
-        })
+            cwd: encode(cwd.as_os_str()),
+        }
     }
 
     fn command(
@@ -89,7 +143,10 @@ impl LaunchPlan {
             command.arg(decode(arg)?);
         }
         for (key, value) in &self.environment {
-            command.env(decode(key)?, decode(value)?);
+            let key = decode(key)?;
+            if allowed_launch_key(&key) {
+                command.env(key, decode(value)?);
+            }
         }
         command
             .env(HOST_ENV, "1")
@@ -144,6 +201,76 @@ pub struct UpdateStatus {
     pub generation: String,
 }
 
+struct ControllerBootstrap {
+    directory: PathBuf,
+    lease: File,
+    writer: crate::install_transaction::InstallationGuard,
+    signed: Vec<u8>,
+    expected: String,
+}
+
+fn bootstrap_controller(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    directory: impl FnOnce(&Path) -> Result<PathBuf>,
+    lease: impl FnOnce(&Path) -> Result<File>,
+    writer: impl FnOnce(&Path) -> Result<crate::install_transaction::InstallationGuard>,
+) -> Result<Option<ControllerBootstrap>> {
+    crate::install_transaction::refuse_pending_home_start(data, binary)?;
+    let signed = read_regular_bounded(&publisher_release_manifest_path(data), MAX_PRIVATE_JSON)?;
+    let expected = admit_installed_release(&signed, source, binary)?;
+    let result = (|| {
+        let directory = directory(data)?;
+        let lease = lease(&directory)?;
+        let writer = writer(
+            binary
+                .parent()
+                .context("installed Runtime parent missing")?,
+        )?;
+        crate::install_transaction::refuse_pending_home_start(data, binary)?;
+        Ok(ControllerBootstrap {
+            directory,
+            lease,
+            writer,
+            signed,
+            expected,
+        })
+    })();
+    match result {
+        Ok(bootstrap) => Ok(Some(bootstrap)),
+        Err(error) if controller_space_error(&error) => {
+            crate::install_transaction::refuse_pending_home_start(data, binary)?;
+            if first_start_without_controller_authority(data)? {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn first_start_without_controller_authority(data: &Path) -> Result<bool> {
+    let directory = data.join(DIRECTORY);
+    if !path_present(&directory)? {
+        return Ok(true);
+    }
+    check_controller_directory(&directory)?;
+    let mut lease = None;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if entry.file_name() != "controller.lock" {
+            return Ok(false);
+        }
+        // An empty safe lock carries no receipt authority, but an active lease
+        // still owns startup even before its first controller copy.
+        lease = Some(acquire_lease(&directory)?);
+    }
+    drop(lease);
+    Ok(true)
+}
+
 /// Used by the existing Home browser entry. Source Homes keep their current launcher.
 pub fn enter_browser_home() -> Result<()> {
     if std::env::var(HOST_ENV).as_deref() == Ok("1") {
@@ -159,17 +286,31 @@ pub fn enter_browser_home() -> Result<()> {
     }
     let data = fs::canonicalize(data)?;
     let binary = fs::canonicalize(current)?;
-    crate::install_transaction::refuse_pending_home_start(&data, &binary)?;
-    let directory = controller_directory(&data)?;
-    let lease = acquire_lease(&directory)?;
-    let signed = read_regular_bounded(&publisher_release_manifest_path(&data), MAX_PRIVATE_JSON)?;
-    let expected = admit_installed_release(&signed, &source, &binary)?;
+    let Some(ControllerBootstrap {
+        directory,
+        lease,
+        writer,
+        signed,
+        expected,
+    }) = bootstrap_controller(
+        &data,
+        &binary,
+        &source,
+        controller_directory,
+        acquire_lease,
+        crate::install_transaction::InstallationGuard::acquire,
+    )?
+    else {
+        eprintln!("Home will open. Free disk space before updating.");
+        return Ok(());
+    };
     let controller = directory.join("runtime");
-    crate::install_transaction::require_controller_disk_reserve(
-        &directory,
-        fs::metadata(&binary)?.len() + MAX_PRIVATE_JSON,
-    )?;
-    copy_controller(&binary, &controller, &expected)?;
+    if !prepare_controller(&directory, &binary, &expected, |path, needed| {
+        crate::install_transaction::require_controller_disk_reserve(path, needed)
+    })? {
+        eprintln!("Home will open. Free disk space before updating.");
+        return Ok(());
+    }
     let launch = LaunchPlan::capture()?;
     let receipt = Receipt {
         schema: "elastos.update-controller/v1".into(),
@@ -183,7 +324,14 @@ pub fn enter_browser_home() -> Result<()> {
         launch,
     };
     let path = directory.join(RECEIPT);
-    write_private(&path, &receipt)?;
+    if let Err(error) = write_private(&path, &receipt) {
+        if controller_space_error(&error) {
+            eprintln!("Home will open. Free disk space before updating.");
+            return Ok(());
+        }
+        return Err(error);
+    }
+    drop(writer);
     // Exec keeps the terminal's foreground process and the same lease description.
     let inherited = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_DUPFD, 3) };
     if inherited < 0 {
@@ -849,6 +997,15 @@ fn normalized_channel(source: &TrustedSource) -> &str {
 }
 
 fn admit_installed_release(signed: &[u8], source: &TrustedSource, binary: &Path) -> Result<String> {
+    let expected = admit_release_digest(signed, source)?;
+    anyhow::ensure!(
+        crate::runtime_control::sha256_file(binary)? == expected,
+        "Installed Runtime differs from its signed release."
+    );
+    Ok(expected)
+}
+
+fn admit_release_digest(signed: &[u8], source: &TrustedSource) -> Result<String> {
     let (release, _) = crate::crypto::verify_release_envelope_against_dids(
         signed,
         "elastos.release.v1",
@@ -867,10 +1024,6 @@ fn admit_installed_release(signed: &[u8], source: &TrustedSource, binary: &Path)
         .filter(|hash| valid_hash(hash))
         .context("Signed controller Runtime checksum missing")?
         .to_owned();
-    anyhow::ensure!(
-        crate::runtime_control::sha256_file(binary)? == expected,
-        "Installed Runtime differs from its signed release."
-    );
     Ok(expected)
 }
 
@@ -885,6 +1038,16 @@ fn validate_receipt(receipt: &Receipt) -> Result<()> {
 }
 
 fn validate_retained_receipt(receipt: &Receipt) -> Result<()> {
+    validate_retained_receipt_record(receipt)?;
+    anyhow::ensure!(
+        controller_file_digest(&receipt.controller)?.as_deref()
+            == Some(receipt.controller_sha256.as_str()),
+        "Controller binary differs from its signed receipt."
+    );
+    Ok(())
+}
+
+fn validate_retained_receipt_record(receipt: &Receipt) -> Result<()> {
     anyhow::ensure!(
         receipt.schema == "elastos.update-controller/v1"
             && receipt.data_dir.is_absolute()
@@ -893,7 +1056,24 @@ fn validate_retained_receipt(receipt: &Receipt) -> Result<()> {
             && receipt.launch.sha256()? == receipt.launch_sha256,
         "Installed controller receipt is incompatible."
     );
-    let metadata = fs::symlink_metadata(&receipt.controller)?;
+    let signed = BASE64.decode(&receipt.signed_controller_release)?;
+    let digest = admit_release_digest(&signed, &receipt.trusted_source)?;
+    anyhow::ensure!(
+        digest == receipt.controller_sha256,
+        "Controller binary differs from its signed receipt."
+    );
+    Ok(())
+}
+
+fn controller_file_digest(path: &Path) -> Result<Option<String>> {
+    if !path_present(path)? {
+        return Ok(None);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
     anyhow::ensure!(
         metadata.is_file()
             && metadata.uid() == unsafe { libc::geteuid() }
@@ -901,13 +1081,67 @@ fn validate_retained_receipt(receipt: &Receipt) -> Result<()> {
             && metadata.mode() & 0o7777 == 0o700,
         "Retained controller file is unsafe."
     );
-    let signed = BASE64.decode(&receipt.signed_controller_release)?;
-    let digest = admit_installed_release(&signed, &receipt.trusted_source, &receipt.controller)?;
-    anyhow::ensure!(
-        digest == receipt.controller_sha256,
-        "Controller binary differs from its signed receipt."
-    );
-    Ok(())
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(Some(hex::encode(digest.finalize())))
+}
+
+fn controller_space_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::install_transaction::DiskReserveError>()
+        .is_some()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
+}
+
+// Caller holds the controller lease and installation lock through receipt publication.
+fn prepare_controller(
+    directory: &Path,
+    binary: &Path,
+    expected: &str,
+    reserve: impl FnOnce(&Path, u64) -> Result<()>,
+) -> Result<bool> {
+    crate::install_transaction::refuse_pending_home_start(directory.parent().unwrap(), binary)?;
+    let controller = directory.join("runtime");
+    controller_file_digest(&controller.with_extension("partial"))?;
+    let existing = controller_file_digest(&controller)?;
+    let path = directory.join(RECEIPT);
+    if path_present(&path)? {
+        let receipt: Receipt = read_private_json(&path)?;
+        validate_retained_receipt_record(&receipt)?;
+        anyhow::ensure!(
+            receipt.data_dir == directory.parent().unwrap()
+                && receipt.binary == binary
+                && existing
+                    .as_deref()
+                    .is_some_and(|hash| hash == receipt.controller_sha256 || hash == expected),
+            "Retained controller identity changed. Preserve its files for repair."
+        );
+    } else if let Some(hash) = existing.as_deref() {
+        anyhow::ensure!(
+            hash == expected,
+            "Existing controller has no signed receipt. Preserve it for repair."
+        );
+    }
+    if existing.as_deref() == Some(expected) {
+        // Also repairs a crash after current signed bytes replaced an older receipt's bytes.
+        return Ok(true);
+    }
+    let result = reserve(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
+        .and_then(|()| copy_controller(binary, &controller, expected));
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if controller_space_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// The retained receipt locates the writer lock even during an interrupted sources rename.
@@ -939,7 +1173,12 @@ fn controller_directory(data_dir: &Path) -> Result<PathBuf> {
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    let metadata = fs::symlink_metadata(&path)?;
+    check_controller_directory(&path)?;
+    Ok(path)
+}
+
+fn check_controller_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
     anyhow::ensure!(
         metadata.is_dir()
             && !metadata.file_type().is_symlink()
@@ -947,7 +1186,7 @@ fn controller_directory(data_dir: &Path) -> Result<PathBuf> {
             && metadata.mode() & 0o7777 == 0o700,
         "controller directory must be an owner-only real directory"
     );
-    Ok(path)
+    Ok(())
 }
 
 fn acquire_lease(directory: &Path) -> Result<File> {
@@ -961,6 +1200,10 @@ fn acquire_lease(directory: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)?;
     check_private_file(&file)?;
+    anyhow::ensure!(
+        file.metadata()?.len() == 0,
+        "controller lease file must be empty"
+    );
     anyhow::ensure!(
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "Home already has an update controller. Keep its terminal open."
@@ -1082,7 +1325,7 @@ fn check_private_file(file: &File) -> Result<()> {
 fn read_regular_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     anyhow::ensure!(
@@ -1101,7 +1344,7 @@ fn read_regular_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
 fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     check_private_file(&file)?;
     anyhow::ensure!(
