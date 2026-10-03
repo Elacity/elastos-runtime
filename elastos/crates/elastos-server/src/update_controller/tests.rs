@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 struct PrivateFixture {
     _root: tempfile::TempDir,
@@ -502,7 +502,7 @@ fn receipt_round_trip_keeps_non_utf8_launch_args_environment_and_working_directo
         assert_eq!(environment[&OsString::from(HOST_ENV)], "1");
         assert_eq!(
             environment[&OsString::from("ELASTOS_UPDATE_GENERATION")],
-            generation
+            generation.as_str()
         );
         assert_eq!(
             environment[&OsString::from("ELASTOS_UPDATE_RESTART")],
