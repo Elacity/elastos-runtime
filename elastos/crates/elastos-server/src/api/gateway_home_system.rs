@@ -6763,7 +6763,40 @@ fn sanitize_home_layout_targets(
     if let Some(taskbar) = layout_object.get_mut("taskbar") {
         *taskbar = sanitize_home_target_array(taskbar.take(), known_targets);
     }
+    // The phone Home's own arrangement: its Dock row and its pages of apps.
+    if let Some(dock) = layout_object.get_mut("homeDock") {
+        *dock = sanitize_home_target_array(dock.take(), known_targets);
+    }
+    if let Some(pages) = layout_object.get_mut("homePages") {
+        *pages = sanitize_home_target_pages(pages.take(), known_targets);
+    }
     Some(layout)
+}
+
+/// Pages of targets: each id once across all pages, empty pages dropped.
+fn sanitize_home_target_pages(
+    value: serde_json::Value,
+    known_targets: &BTreeSet<String>,
+) -> serde_json::Value {
+    let mut seen = BTreeSet::new();
+    let pages = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|page| page.as_array())
+        .map(|page| {
+            page.iter()
+                .filter_map(|target| target.as_str())
+                .filter(|target| {
+                    known_targets.contains(*target) && seen.insert((*target).to_string())
+                })
+                .map(|target| serde_json::Value::String(target.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|page| !page.is_empty())
+        .map(serde_json::Value::Array)
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(pages)
 }
 
 fn is_home_desktop_object_layout_entry(localhost_root: &str, entry: &str) -> bool {

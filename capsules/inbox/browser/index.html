@@ -555,12 +555,15 @@
         gap: 8px;
       }
 
+      /* The list is as tall as its requests (capped, then it scrolls) so the
+         selected request reads directly beneath it, not mid-screen. */
       .entry-split {
         grid-template-columns: 1fr;
-        grid-template-rows: minmax(160px, 42%) minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr);
       }
 
       .entry-rows {
+        max-height: 40dvh;
         border-right: 0;
         border-bottom: 1px solid var(--line);
       }
@@ -568,6 +571,47 @@
       .summary-stack {
         grid-template-columns: 1fr;
       }
+    }
+
+    /* Phone stage: the app menu (All Pending / Needs Review) is not on the
+       phone bar, so the filters return as a two-segment row above the list.
+       The rail stays a bare list. */
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .shell {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .sidebar {
+      display: block;
+      padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .sidebar-title {
+      display: none;
+    }
+
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .summary-stack {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .summary-card {
+      justify-content: center;
+      min-height: var(--el-touch-target);
+      border-radius: 10px;
+    }
+
+    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .summary-card strong {
+      min-width: 0;
+      text-align: left;
+    }
+
+    html[data-el-form-factor="phone"] .action-secondary,
+    html[data-el-form-factor="phone"] .entry-action {
+      min-height: var(--el-touch-target);
+      padding-inline: 14px;
     }
   </style>
 </head>

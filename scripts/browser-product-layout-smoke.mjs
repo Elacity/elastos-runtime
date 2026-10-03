@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/browser/browser");
@@ -18,6 +19,9 @@ function assert(condition, message, details = undefined) {
     throw new Error(`${message}${details ? `\n${JSON.stringify(details, null, 2)}` : ""}`);
   }
 }
+
+const homeBrowserRoot = join(repoRoot, "capsules/home/browser");
+const HOME_APP_PREFIX = "/apps/home/";
 
 async function buildFixtureRoot() {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "browser-product-layout-"));
@@ -36,8 +40,10 @@ async function serveFile(response, fixtureRoot, pathname) {
     response.end();
     return;
   }
-  const relative = pathname === "/" ? "index.html" : pathname.slice(1);
-  const root = relative === "index.html" ? fixtureRoot : browserRoot;
+  // The Browser imports Home's clipboard client by its gateway path.
+  const fromHome = pathname.startsWith(HOME_APP_PREFIX);
+  const relative = pathname === "/" ? "index.html" : pathname.slice(fromHome ? HOME_APP_PREFIX.length : 1);
+  const root = fromHome ? homeBrowserRoot : relative === "index.html" ? fixtureRoot : browserRoot;
   const path = join(root, relative);
   assert(path.startsWith(`${root}/`) || path === join(root, "index.html"), "invalid Browser asset path", {
     pathname,
@@ -129,9 +135,12 @@ async function setScenario(page) {
   await page.evaluate(() => new Promise((resolvePromise) => requestAnimationFrame(() => requestAnimationFrame(resolvePromise))));
 }
 
-async function assertScenario(page, width, height, screenshotPath) {
+async function assertScenario(page, width, height, screenshotPath, { phone = false } = {}) {
   await page.setViewportSize({ width, height });
   await page.goto(page.url(), { waitUntil: "networkidle" });
+  if (phone) {
+    await setPhoneFormFactor(page);
+  }
   await setScenario(page);
   const result = await page.evaluate(() => {
     const measure = (selector) => {
@@ -154,7 +163,9 @@ async function assertScenario(page, width, height, screenshotPath) {
       innerHeight: window.innerHeight,
       scrollWidth: document.scrollingElement?.scrollWidth ?? 0,
       toolbar: measure(".browser-chrome"),
+      firstControl: measure(".browser-chrome button"),
       address: measure("#browser-url"),
+      addressFont: getComputedStyle(document.querySelector("#browser-url")).fontSize,
       settings: measure("#browser-settings"),
       stage: measure("#browser-render-panel"),
       panel: measure("#browser-settings-panel"),
@@ -166,6 +177,32 @@ async function assertScenario(page, width, height, screenshotPath) {
   assert(result.stage.width > 0 && result.stage.height > 0, "Browser stage is not visible", result);
   assert(result.panel.left >= 0 && result.panel.right <= result.innerWidth + 0.5, "Browser settings panel escapes viewport width", result);
   assert(result.panel.top >= 0 && result.panel.bottom <= result.innerHeight + 0.5, "Browser settings panel escapes viewport height", result);
+  if (phone) {
+    assert(result.firstControl.left <= 12, "Browser phone toolbar must start at the leading edge", result);
+    assert(result.address.height >= 44 && result.addressFont === "16px", "Browser phone address must be a 44 px, 16 px field", result);
+    const targets = await page.evaluate(() => {
+      const status = document.querySelector("#browser-status");
+      const message = document.createElement("span");
+      message.className = "browser-status-message";
+      message.textContent = "Browser Engine is not running";
+      const copy = document.createElement("button");
+      copy.className = "browser-status-copy";
+      copy.type = "button";
+      copy.textContent = "Copy";
+      status.replaceChildren(message, copy);
+      status.dataset.copyable = "true";
+      const size = (node) => {
+        const rect = node.getBoundingClientRect();
+        return { label: node.getAttribute("aria-label") || node.textContent.trim(), width: Math.round(rect.width), height: Math.round(rect.height) };
+      };
+      return [...document.querySelectorAll(".browser-chrome button"), copy].map(size);
+    });
+    assert(
+      targets.every((target) => target.width >= 44 && target.height >= 44),
+      "Browser phone controls and the status Copy action must be 44 px targets",
+      targets,
+    );
+  }
   await page.screenshot({ path: screenshotPath, fullPage: false });
 }
 
@@ -196,14 +233,16 @@ async function main() {
     await page.goto(server.baseUrl, { waitUntil: "networkidle" });
     const desktopScreenshot = "/tmp/browser-uiux-desktop-1280x900.png";
     const narrowScreenshot = "/tmp/browser-uiux-narrow-640x900.png";
+    const phoneScreenshot = "/tmp/browser-uiux-phone-390x844.png";
     await assertScenario(page, 1280, 900, desktopScreenshot);
     await assertScenario(page, 640, 900, narrowScreenshot);
+    await assertScenario(page, PHONE_VIEWPORT.width, PHONE_VIEWPORT.height, phoneScreenshot, { phone: true });
     assert(server.requestFailures.length === 0, "Browser layout fixture returned 500", server.requestFailures);
     assert(pageErrors.length === 0, "Browser layout page emitted page errors", pageErrors);
     assert(consoleErrors.length === 0, "Browser layout page emitted console errors", consoleErrors);
     assert(failedRequests.length === 0, "Browser layout page had failed requests", failedRequests);
     console.log(JSON.stringify({
-      screenshots: [desktopScreenshot, narrowScreenshot],
+      screenshots: [desktopScreenshot, narrowScreenshot, phoneScreenshot],
     }, null, 2));
   } finally {
     await browser?.close();

@@ -65,6 +65,14 @@ jobs:
           node --test scripts/home-agent-cancellation.test.mjs
           node --test scripts/home-link-status.test.mjs
           node --test scripts/chat-room-enter.test.mjs
+          node --test scripts/home-form-factor.test.mjs
+          node --test scripts/home-keyboard-inset.test.mjs
+          node --test scripts/home-capsule-layout.test.mjs
+          node --test scripts/home-phone-dock.test.mjs
+          node --test scripts/home-phone-stage.test.mjs
+          node --test scripts/home-sheet-handle.test.mjs
+          node --test scripts/home-touch-long-press.test.mjs
+          node --test scripts/home-phone-home.test.mjs
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |

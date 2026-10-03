@@ -7,8 +7,9 @@
  * then run `just vendor-ui`; `just alignment-check` fails on drift.
  *
  * Contents: Inter (OFL, latin variable subset), palette, type scale, radii,
- * hairlines, blur/elevation steps, motion tokens, and minimal control
- * primitives. Layout is each app's business — tokens only.
+ * hairlines, blur/elevation steps, motion tokens, minimal control
+ * primitives, and the phone push drawer (with elastos-drawer.js). Layout is
+ * otherwise each app's business — tokens only.
  */
 
 @font-face {
@@ -384,6 +385,108 @@
 .el-copy-btn .el-copy-check[hidden],
 .el-copy-btn .el-copy-icon[hidden] {
   display: none;
+}
+
+/* Phone stage (html[data-el-form-factor="phone"], set from the shell's
+   `elastos:shell-layout` message by elastos-theme.js). The shell's own 44 px
+   title bar sits above the frame and no traffic lights overlay it, so the
+   desktop chrome safe areas are zero. The drawer tokens are the Assistant's
+   push-sidebar values, so every capsule's sidebar moves the same way. */
+:root {
+  --el-drawer-w: min(300px, 82vw);
+  --el-drawer-ms: 420ms;
+  --el-drawer-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --el-drawer-room-radius: 28px;
+  --el-touch-target: 44px;
+}
+
+:root[data-el-form-factor="phone"] {
+  --window-chrome-safe-top: 0px;
+  --window-chrome-safe-leading: 0px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --el-drawer-ms: 1ms;
+  }
+}
+
+/* Phone push drawer (elastos-drawer.js): the sidebar leaves the layout and
+   sits under the leading edge; opening slides it in and pushes the room
+   aside by the same width with a rounded edge. Transform only — no reflow of
+   the room while it moves. */
+.el-drawer-toggle {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .el-drawer-toggle {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  padding: 0;
+  border: 0;
+  border-radius: var(--el-radius-md);
+  background: transparent;
+  color: var(--el-text);
+  cursor: pointer;
+}
+
+:root[data-el-form-factor="phone"] .el-drawer-toggle::before {
+  content: "";
+  width: 22px;
+  height: 22px;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='16' rx='3'/%3E%3Cpath d='M9 4v16'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='16' rx='3'/%3E%3Cpath d='M9 4v16'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+:root[data-el-form-factor="phone"] .el-drawer-toggle:active {
+  background: var(--el-lift);
+}
+
+:root[data-el-form-factor="phone"] .el-drawer-toggle:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: -2px;
+}
+
+:root[data-el-form-factor="phone"] [data-el-drawer] {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 40;
+  width: var(--el-drawer-w);
+  max-width: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  outline: none;
+  transform: translateX(-105%);
+  visibility: hidden;
+  transition:
+    transform var(--el-drawer-ms) var(--el-drawer-ease),
+    visibility 0s linear var(--el-drawer-ms);
+}
+
+:root[data-el-form-factor="phone"] [data-el-drawer][data-el-drawer-state="open"] {
+  transform: none;
+  visibility: visible;
+  transition: transform var(--el-drawer-ms) var(--el-drawer-ease);
+}
+
+:root[data-el-form-factor="phone"] [data-el-drawer-room] {
+  transition:
+    transform var(--el-drawer-ms) var(--el-drawer-ease),
+    border-radius var(--el-drawer-ms) var(--el-drawer-ease);
+}
+
+:root[data-el-form-factor="phone"] [data-el-drawer-room][data-el-drawer-state="open"] {
+  transform: translateX(var(--el-drawer-w));
+  border-radius: var(--el-drawer-room-radius) 0 0 var(--el-drawer-room-radius);
+  overflow: hidden;
+  box-shadow: -1px 0 0 var(--el-hairline);
+  cursor: pointer;
 }
 
 @media (prefers-reduced-motion: reduce) {

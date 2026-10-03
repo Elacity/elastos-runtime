@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>People · ElastOS</title>
   <script src="./elastos-theme.js"></script>
+  <script src="./elastos-drawer.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
   <link rel="stylesheet" href="./style.css?v=people-20260812a">
 </head>
@@ -18,21 +19,24 @@
   </section>
 
   <main id="people-shell" class="people-shell hidden" aria-label="People">
-    <aside class="people-sidebar" aria-label="People sections">
-      <button class="people-sidebar-item active" type="button" data-section-target="people">
+    <aside id="people-sidebar" class="people-sidebar" aria-label="People sections" data-el-drawer>
+      <button class="people-sidebar-item active" type="button" data-el-drawer-close data-section-target="people">
         <span class="people-sidebar-icon people-sidebar-icon-people" aria-hidden="true"></span>
         <span>People</span>
       </button>
-      <button class="people-sidebar-item" type="button" data-section-target="discovery">
+      <button class="people-sidebar-item" type="button" data-el-drawer-close data-section-target="discovery">
         <span class="people-sidebar-icon people-sidebar-icon-discovery" aria-hidden="true"></span>
         <span>Discovery</span>
       </button>
     </aside>
 
-    <section class="people-main">
+    <section class="people-main" data-el-drawer-room="people-sidebar">
       <div class="people-content">
         <div class="people-content-inner">
-          <h1 class="people-page-title">People</h1>
+          <div class="people-page-head">
+            <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="people-sidebar" aria-label="Show sections"></button>
+            <h1 class="people-page-title">People</h1>
+          </div>
           <div id="people-status" class="people-status" role="status" hidden></div>
 
           <section id="people" class="people-section" aria-label="People">

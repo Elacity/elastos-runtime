@@ -1984,13 +1984,10 @@ assert(
     homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
     homeGuiStyle.includes(".launcher {\n  position: static;") &&
     !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
-    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,") &&
-    homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
-    homeGuiStyle.includes(".launcher-popover {\n    height: min(48vh, 380px);") &&
-    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: min(48vh, 380px);") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,\n  .launcher-header,\n  .launcher-scroll,\n  .taskbar.is-launcher-face .launcher,\n  .taskbar.is-launcher-face .launcher-header,\n  .taskbar.is-launcher-face .launcher-scroll,\n  .taskbar {\n    transition: none;") &&
     !homeGuiStyle.includes("launcher-fly-icon") &&
     !homeGuiStyle.includes("data-launcher-morphing"),
-  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched narrow launcher heights",
+  "Home launcher styles must keep one material Shelf face, narrow bounds and reduced motion (the phone has the Home grid instead)",
 );
 assert(
   /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
@@ -2778,7 +2775,7 @@ assert(
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
     servicesIndex.includes("services-20260921b") &&
-    servicesIndex.includes("./style.css?v=services-20260921b") &&
+    servicesIndex.includes("./style.css?v=services-20260929a") &&
     servicesIndex.includes("./services.js?v=services-20260921b") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -5526,7 +5523,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-models-20260929b";
+const systemAssetVersion = "system-models-20260929d";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
