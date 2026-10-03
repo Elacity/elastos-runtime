@@ -375,9 +375,9 @@ impl InstallTransaction {
                     bail!("Consumed release inputs require owner-only files.")
                 }
                 Err(error)
-                    if !error
+                    if error
                         .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                        .is_none_or(|error| error.kind() != std::io::ErrorKind::NotFound) =>
                 {
                     return Err(error)
                 }
@@ -412,6 +412,7 @@ impl InstallTransaction {
         self.layout == ReleaseLayout::Consumed
     }
 
+    #[cfg(test)]
     pub(crate) fn staged_binary(&self) -> PathBuf {
         self.scratch(ReleaseFile::RuntimeBinary, STAGE)
     }
@@ -974,7 +975,7 @@ impl InstallTransaction {
             );
             let candidate =
                 state_matches(&state, Some(&entry.staged_sha256), Some(entry.staged_mode));
-            if !original && !(journal.phase == Phase::Committing && candidate && !original_suffix) {
+            if !(original || journal.phase == Phase::Committing && candidate && !original_suffix) {
                 bail!("release activation prefix changed; retain journal for recovery");
             }
             if original && !candidate {
