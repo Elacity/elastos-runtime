@@ -101,6 +101,20 @@
         messageInput.addEventListener("input", syncComposerPresentation);
       }
 
+      // Until the shell names the form factor, the device screen stands in for
+      // it: this window's own width is the app window, not the device. Same
+      // 640 px phone class as the Home shell.
+      function isPhone() {
+        const named = document.documentElement.dataset.elFormFactor;
+        if (named) {
+          return named === "phone";
+        }
+        const screen = window.screen || {};
+        const coarse = Boolean(window.matchMedia?.("(pointer: coarse)")?.matches
+          || window.matchMedia?.("(hover: none)")?.matches);
+        return screen.width <= 640 || (coarse && screen.height <= 640);
+      }
+
       if (messageInput && composerForm) {
         messageInput.addEventListener("keydown", (event) => {
           // 229: Safari reports an IME's confirming Enter without isComposing.
@@ -109,7 +123,7 @@
             return;
           }
           // A phone keyboard's Return adds a line; Send sends.
-          if (document.documentElement.dataset.elFormFactor === "phone") {
+          if (isPhone()) {
             return;
           }
           event.preventDefault();
