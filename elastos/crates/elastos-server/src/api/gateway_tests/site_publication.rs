@@ -592,6 +592,65 @@ fn publication_test_router(
 }
 
 #[tokio::test]
+async fn test_oversized_http_artifact_retains_admitted_publication() {
+    use super::super::gateway_site::ReleaseReadGate;
+    let fixture = SignedGatewayPublication::new();
+    let default_gate = ReleaseReadGate::new();
+    let mut small_gate = default_gate.clone();
+    // Exercise the real size-policy boundary with inert fixture bytes.
+    small_gate.max_http_artifact_bytes = 32;
+    assert!(fixture.binary.len() > 32);
+    let app = publication_test_router(&fixture, small_gate);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/artifacts/elastos-aarch64-darwin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    for path in [
+        "/release-head.json",
+        "/release.json",
+        "/install.sh",
+        "/artifacts/home.tar.gz",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let response = publication_test_router(&fixture, default_gate.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/artifacts/elastos-aarch64-darwin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        fixture.binary.as_slice()
+    );
+    assert_eq!(
+        default_gate
+            .admissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_concurrent_release_reads_wait_health_works_and_scan_once() {
     use super::super::gateway_site::ReleaseReadGate;
     let fixture = SignedGatewayPublication::new();

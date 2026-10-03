@@ -4827,14 +4827,14 @@ const homeProfile = new Set(components.profiles.home.components);
 const demoProfile = new Set(components.profiles.demo.components);
 assert(
   homeProfile.has("model-provider") &&
-    homeProfile.has("llama-server") &&
+    !homeProfile.has("llama-server") &&
     demoProfile.has("model-provider") &&
     demoProfile.has("llama-server"),
-  "Home and demo profiles must install model-provider and llama-server",
+  "Home keeps model-provider; llama-server installs on demand. Demo retains its explicit engine.",
 );
 assert(
-  ![...homeProfile].some((component) => component.startsWith("model-qwen")),
-  "Home profile must not install huggingface GGUF components",
+  ![...homeProfile].some((component) => component.startsWith("model-qwen") || component.startsWith("model-bonsai")),
+  "Home leaves GGUF model installation to Assistant",
 );
 assert(
   typeof components.model_catalog?.head_cid === "string" &&
