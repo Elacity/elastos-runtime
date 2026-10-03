@@ -153,7 +153,7 @@ static UPDATE_CHECK: std::sync::OnceLock<tokio::sync::Mutex<UpdateCheckCache>> =
     std::sync::OnceLock::new();
 
 fn source_policy_sha256(config: &crate::sources::TrustedSourcesConfig) -> Option<String> {
-    Some(lowercase_hex(&Sha256::digest(
+    Some(hex::encode(Sha256::digest(
         serde_json::to_vec(config).ok()?,
     )))
 }
