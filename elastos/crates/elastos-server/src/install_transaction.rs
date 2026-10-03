@@ -95,7 +95,11 @@ impl InstallationGuard {
         }
         let binary_parent =
             fs::canonicalize(binary_parent).context("resolve installation binary parent")?;
-        check_directory(&binary_parent)?;
+        Self::acquire_resolved(&binary_parent)
+    }
+
+    fn acquire_resolved(binary_parent: &Path) -> anyhow::Result<Self> {
+        check_directory(binary_parent)?;
         let lock_path = binary_parent.join(INSTALL_LOCK);
         let lock = OpenOptions::new()
             .read(true)
@@ -150,7 +154,7 @@ impl InstallTransaction {
         }
         let binary = bin_parent.join(basename);
         file_state(&binary)?;
-        let guard = InstallationGuard::acquire(&bin_parent)?;
+        let guard = InstallationGuard::acquire_resolved(&bin_parent)?;
         let destinations = BTreeMap::from([
             (ReleaseFile::RuntimeBinary, binary.clone()),
             (ReleaseFile::Components, data_dir.join("components.json")),
@@ -1030,6 +1034,93 @@ mod tests {
         let _other_guard = InstallationGuard::acquire(&other).unwrap();
         drop(guard);
         let _writer = fixture.writer();
+    }
+
+    #[test]
+    fn installation_guard_refuses_a_replaced_resolved_parent() {
+        fn snapshot(parent: &Path) -> BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
+            fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .chain(std::iter::once(parent.to_path_buf()))
+                .map(|path| {
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let bytes = metadata.is_file().then(|| fs::read(&path).unwrap());
+                    (path, (metadata.mode(), bytes))
+                })
+                .collect()
+        }
+
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let moved = parent.with_file_name("moved-bin");
+        let other = parent.with_file_name("other-bin");
+        fs::create_dir(&other).unwrap();
+        write_new(&parent.join("elastos"), b"original binary", 0o755).unwrap();
+        write_new(&parent.join("owner-data"), b"original owner data", 0o600).unwrap();
+        write_new(&other.join("elastos"), b"other binary", 0o750).unwrap();
+        write_new(&other.join("owner-data"), b"other owner data", 0o640).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&other, &parent).unwrap();
+        let moved_before = snapshot(&moved);
+        let other_before = snapshot(&other);
+
+        assert!(InstallationGuard::acquire_resolved(&parent).is_err());
+
+        assert_eq!(snapshot(&moved), moved_before);
+        assert_eq!(snapshot(&other), other_before);
+        assert!(!moved.join(INSTALL_LOCK).exists());
+        assert!(!other.join(INSTALL_LOCK).exists());
+    }
+
+    #[test]
+    fn transaction_keeps_resolved_binary_parent_after_alias_retarget() {
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let alias = fixture._root.path().join("bin-alias");
+        let other = parent.with_file_name("other-bin");
+        fs::create_dir(&other).unwrap();
+        symlink(&parent, &alias).unwrap();
+        let writer = InstallTransaction::acquire(&fixture.data, &alias.join("elastos")).unwrap();
+        fixture.old_files(&writer, false);
+        write_new(&other.join("elastos"), b"other binary", 0o755).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+
+        assert_eq!(writer.binary_path(), parent.join("elastos"));
+        assert_eq!(
+            writer.destinations[&ReleaseFile::RuntimeBinary],
+            parent.join("elastos")
+        );
+        assert_eq!(writer.journal_path(), parent.join(JOURNAL));
+        assert_eq!(
+            writer.staged_binary(),
+            parent.join(STAGE).join("runtime_binary")
+        );
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        let _other_guard = InstallationGuard::acquire(&alias).unwrap();
+        writer.prepare(&candidate()).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(
+            fs::read(parent.join("elastos")).unwrap(),
+            b"candidate bytes"
+        );
+        assert_eq!(fs::read(other.join("elastos")).unwrap(), b"other binary");
+    }
+
+    #[test]
+    fn transaction_checks_binary_before_acquiring_installation_lock() {
+        let fixture = Fixture::new();
+        let parent = fixture.binary.parent().unwrap();
+        assert!(InstallTransaction::acquire(&fixture.data, &parent.join(INSTALL_LOCK)).is_err());
+        assert!(!parent.join(INSTALL_LOCK).exists());
+        write_new(&fixture.binary, b"unsafe binary", 0o777).unwrap();
+        assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
+        assert!(!parent.join(INSTALL_LOCK).exists());
+        assert_eq!(fs::read(&fixture.binary).unwrap(), b"unsafe binary");
+        assert_eq!(fs::metadata(&fixture.binary).unwrap().mode() & 0o777, 0o777);
     }
 
     #[test]
