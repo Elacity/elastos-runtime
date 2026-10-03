@@ -219,7 +219,7 @@ pub async fn run(receipt_path: PathBuf) -> Result<()> {
     let result = tokio::select! {
         result = async {
             controller.reconcile_pending().await?;
-            if controller.child.is_none() { controller.start_initial().await?; }
+            controller.complete_reconciliation().await?;
             controller.serve().await
         } => result,
         _ = interrupt.recv() => Ok(()),
@@ -346,6 +346,26 @@ impl Controller {
         }
         Ok(())
     }
+    async fn complete_reconciliation(&mut self) -> Result<()> {
+        if self.child.is_none() {
+            self.start_initial().await
+        } else {
+            self.publish_ready_result()
+        }
+    }
+
+    fn publish_ready_result(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.child.is_some() && self.host_ready,
+            "Recovered Home is not ready."
+        );
+        let source = installed_source(&self.receipt.data_dir)?;
+        let (phase, message) =
+            initial_ready_result(self.request.as_ref(), &source.installed_version)?;
+        self.previous_version = source.installed_version;
+        self.publish(phase, message)
+    }
+
     async fn start_initial(&mut self) -> Result<()> {
         let source = installed_source(&self.receipt.data_dir)?;
         let release = read_regular_bounded(
@@ -357,9 +377,7 @@ impl Controller {
         self.spawn(&generation, false)?;
         self.wait_ready(&generation, &source.installed_version, &expected)
             .await?;
-        self.previous_version = source.installed_version;
-        let (phase, message) = initial_ready_result(self.request.as_ref(), &self.previous_version)?;
-        self.publish(phase, message)?;
+        self.publish_ready_result()?;
         println!("Home: http://localhost:8090/home/");
         println!("Keep this terminal open. Press Ctrl+C to stop Home.");
         Ok(())

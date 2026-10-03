@@ -1021,3 +1021,36 @@ fn recovered_consumed_request_reports_terminal_result_after_readiness() {
     }
     assert!(initial_ready_result(Some(&request), "unapproved version").is_err());
 }
+
+#[tokio::test]
+async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
+    let (_, request, _) = choice_fixture();
+    let mut command = tokio::process::Command::new("/bin/true");
+    let child = child::OwnedChild::spawn(&mut command).unwrap();
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(child),
+        request: Some(request.clone()),
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: "a".repeat(32),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+    };
+    // A failed readiness proof retains recovery rather than publishing success.
+    assert!(controller.complete_reconciliation().await.is_err());
+    assert!(!fixture.directory.join(STATUS).exists());
+    controller.host_ready = true;
+    controller.complete_reconciliation().await.unwrap();
+    let status = status(&fixture.data).unwrap().unwrap();
+    assert_eq!(status.phase, "restored");
+    assert_eq!(status.id.as_deref(), Some(request.id.as_str()));
+    assert_eq!(status.current_version, request.current_version);
+    assert!(controller.child.is_some(), "recovered child was replaced");
+    controller.stop_child().await.unwrap();
+}
