@@ -1000,3 +1000,24 @@ async fn readiness_http_response_refuses_status_and_size_before_use() {
         }
     }
 }
+
+#[test]
+fn recovered_consumed_request_reports_terminal_result_after_readiness() {
+    let (_, request, _) = choice_fixture();
+    assert_eq!(
+        initial_ready_result(None, &request.current_version)
+            .unwrap()
+            .0,
+        "ready"
+    );
+    for (version, phase) in [
+        (&request.new_version, "updated"),
+        (&request.current_version, "restored"),
+    ] {
+        assert_eq!(
+            initial_ready_result(Some(&request), version).unwrap().0,
+            phase
+        );
+    }
+    assert!(initial_ready_result(Some(&request), "unapproved version").is_err());
+}

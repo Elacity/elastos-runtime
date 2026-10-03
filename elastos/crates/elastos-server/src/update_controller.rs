@@ -283,6 +283,25 @@ pub fn queue_update(data_dir: &Path, request: UpdateRequest) -> Result<()> {
     Ok(())
 }
 
+fn initial_ready_result(
+    request: Option<&UpdateRequest>,
+    installed_version: &str,
+) -> Result<(&'static str, &'static str)> {
+    let Some(request) = request else {
+        return Ok(("ready", "Home is ready."));
+    };
+    if installed_version == request.new_version {
+        Ok(("updated", "The update is complete. Home is ready."))
+    } else if installed_version == request.current_version {
+        Ok((
+            "restored",
+            "The previous Runtime is ready. Check the update and approve it again.",
+        ))
+    } else {
+        bail!("Recovered Runtime version differs from the approved update.")
+    }
+}
+
 struct Controller {
     receipt: Receipt,
     directory: PathBuf,
@@ -339,7 +358,8 @@ impl Controller {
         self.wait_ready(&generation, &source.installed_version, &expected)
             .await?;
         self.previous_version = source.installed_version;
-        self.publish("ready", "Home is ready.")?;
+        let (phase, message) = initial_ready_result(self.request.as_ref(), &self.previous_version)?;
+        self.publish(phase, message)?;
         println!("Home: http://localhost:8090/home/");
         println!("Keep this terminal open. Press Ctrl+C to stop Home.");
         Ok(())
