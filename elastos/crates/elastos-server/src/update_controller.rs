@@ -36,7 +36,16 @@ const ACTIVE_REQUEST: &str = "active-request.json";
 const LEASE_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_LEASE";
 const HOST_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_HOST";
 const MAX_PRIVATE_JSON: u64 = 256 * 1024;
+const INITIAL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn readiness_budget(restarting: bool) -> Duration {
+    if restarting {
+        READY_TIMEOUT
+    } else {
+        INITIAL_READY_TIMEOUT
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,12 +319,10 @@ pub fn enter_browser_home() -> Result<()> {
         return Ok(());
     }
     let data = fs::canonicalize(data)?;
+    let binary = fs::canonicalize(current)?;
+    crate::install_transaction::refuse_pending_home_start(&data, &binary)?;
     let directory = controller_directory(&data)?;
     let lease = acquire_lease(&directory)?;
-    let binary = fs::canonicalize(current)?;
-    if InstallTransaction::has_pending_recovery(&binary) {
-        bail!("Home recovery is pending. Run the retained installed update controller.");
-    }
     let signed = read_regular_bounded(&publisher_release_manifest_path(&data), MAX_PRIVATE_JSON)?;
     let expected = admit_installed_release(&signed, &source, &binary)?;
     let controller = directory.join("runtime");
@@ -566,9 +573,18 @@ impl Controller {
         )?;
         let expected = admit_installed_release(&release, &source, &self.receipt.binary)?;
         let generation = hex::encode(rand::random::<[u8; 16]>());
-        self.spawn(&generation, false)?;
-        self.wait_ready(&generation, &source.installed_version, &expected)
-            .await?;
+        async {
+            self.spawn(&generation, false)?;
+            self.wait_ready(&generation, &source.installed_version, &expected, false)
+                .await
+        }
+        .await
+        .with_context(|| {
+            format!(
+                "Home could not start. Check the startup log at {} before starting Home again.",
+                self.directory.join("runtime.log").display()
+            )
+        })?;
         self.publish_ready_result()?;
         println!("Home: http://localhost:8090/home/");
         println!("Keep this terminal open. Press Ctrl+C to stop Home.");
@@ -597,6 +613,7 @@ impl Controller {
         generation: &str,
         version: &str,
         binary_sha256: &str,
+        restarting: bool,
     ) -> Result<()> {
         let home_sha256 = home_digest(&self.receipt.data_dir)?;
         let child = self.child.as_ref().context("controller host missing")?;
@@ -607,7 +624,8 @@ impl Controller {
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let budget = readiness_budget(restarting);
+        let deadline = tokio::time::Instant::now() + budget;
         loop {
             if child.observed_exit()?.is_some() {
                 bail!("Home exited before it became ready.");
@@ -637,7 +655,10 @@ impl Controller {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("Home did not become ready within 30 seconds.");
+                bail!(
+                    "Home did not become ready within {} seconds.",
+                    budget.as_secs()
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -963,7 +984,7 @@ impl crate::update::RestartOwner for Controller {
                 pid,
                 process_start(pid).context("Home exited during start")?,
             )?;
-            self.wait_ready(&record.generation, version, &expected)
+            self.wait_ready(&record.generation, version, &expected, true)
                 .await?;
             Ok(())
         })

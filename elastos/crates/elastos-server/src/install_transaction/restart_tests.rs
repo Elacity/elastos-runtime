@@ -767,6 +767,51 @@ fn foreign_live_or_scratch_changes_preserve_the_whole_set_on_restore_and_cleanup
 }
 
 #[test]
+fn cli_transaction_refusals_name_cli_recovery_and_preserve_release_files() {
+    let fixture = RestartFixture::new();
+    let writer = fixture.writer();
+    prepare_release(&writer);
+    let before = fixture.snapshot();
+    for result in [
+        authorize_host_start_with_generation(&fixture.data, &fixture.binary, None, CANDIDATE_PID),
+        refuse_pending_home_start(&fixture.data, &fixture.binary),
+    ] {
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("Run `elastos update` again"), "{message}");
+        assert!(!message.contains("controller"), "{message}");
+        assert_eq!(fixture.snapshot(), before);
+    }
+    assert!(writer.recover().unwrap());
+    fixture.assert_release(&writer, true);
+    assert!(authorize_host_start_with_generation(
+        &fixture.data,
+        &fixture.binary,
+        None,
+        CANDIDATE_PID
+    )
+    .is_ok());
+    assert!(refuse_pending_home_start(&fixture.data, &fixture.binary).is_ok());
+}
+
+#[test]
+fn controller_transaction_refusals_keep_the_controller_recovery_owner() {
+    let fixture = RestartFixture::new();
+    let writer = fixture.activated();
+    let before = fixture.snapshot();
+    for result in [
+        authorize_host_start_with_generation(&fixture.data, &fixture.binary, None, CANDIDATE_PID),
+        refuse_pending_home_start(&fixture.data, &fixture.binary),
+    ] {
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("retained update controller"), "{message}");
+        assert!(!message.contains("`elastos update`"), "{message}");
+        assert_eq!(fixture.snapshot(), before);
+    }
+    assert!(writer.recover().is_err());
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
 fn host_start_fence_admits_only_the_claimed_generation_and_binary() {
     let fixture = RestartFixture::new();
     let writer = fixture.writer();
