@@ -1,0 +1,628 @@
+{
+  "schema": "elastos.release-upstream-recipes/v1",
+  "recipes": [
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "linux-amd64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:86f9c07bca62d09839e53553df0f81bc306364b1467a459d52f3e4505cc948d196ed0c219c03c667cd681e057bb24bbfc0e0eebf4b83bc64a36a0e9923a60e05",
+        "max_bytes": 536870912,
+        "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz"
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "linux-arm64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
+        "max_bytes": 536870912,
+        "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz"
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "darwin-arm64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:13b6d5dc04e661bfde6b8ba469bcf5b19d9d0062fe8ed50c7aadd8a078f500d0bceee4be7c9bfa476b48c4eb84c246ba083605ed1ed24d16b98e6cd0f09140bb",
+        "max_bytes": 536870912,
+        "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz"
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "linux-amd64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/linux-amd64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "linux-arm64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8",
+        "max_bytes": 536870912,
+        "path": "@llama-arm64-bundle"
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/linux-arm64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "darwin-arm64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/darwin-arm64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "cloudflared",
+      "platform": "linux-amd64",
+      "version": "2026.2.0",
+      "source": {
+        "checksum": "sha256:176746db3be7dc7bd48f3dd287c8930a4645ebb6e6700f883fddda5a4c307c16",
+        "max_bytes": 536870912,
+        "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "raw",
+      "root": "cloudflared",
+      "entrypoint": "cloudflared",
+      "extract_path": "cloudflared/cloudflared",
+      "install_path": "bin/cloudflared",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/cloudflare/cloudflared/2026.2.0/LICENSE",
+              "checksum": "sha256:58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "cloudflared",
+      "platform": "linux-arm64",
+      "version": "2026.2.0",
+      "source": {
+        "checksum": "sha256:03c5d58e283f521d752dc4436014eb341092edf076eb1095953ab82debe54a8e",
+        "max_bytes": 536870912,
+        "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-arm64",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "raw",
+      "root": "cloudflared",
+      "entrypoint": "cloudflared",
+      "extract_path": "cloudflared/cloudflared",
+      "install_path": "bin/cloudflared",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/cloudflare/cloudflared/2026.2.0/LICENSE",
+              "checksum": "sha256:58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "model-qwen3.5-0.8b",
+      "platform": "*",
+      "version": "1.0.0",
+      "source": {
+        "checksum": "sha256:bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+        "max_bytes": 12884901888,
+        "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "redirect_hosts": [
+          "cdn-lfs.hf.co",
+          "cdn-lfs-us-1.hf.co",
+          "cdn-lfs-eu-1.hf.co",
+          "cas-bridge.xethub.hf.co"
+        ]
+      },
+      "format": "raw",
+      "root": "model-qwen3.5-0.8b",
+      "entrypoint": "Qwen3.5-0.8B-Q4_K_M.gguf",
+      "extract_path": "model-qwen3.5-0.8b/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "install_path": "models/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "max_unpacked_bytes": 17179869184,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/2fc06364715b967f1860aea9cf38778875588b17/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE.base",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/2fc06364715b967f1860aea9cf38778875588b17/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "model_content": {
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "engine": "llama.cpp",
+        "consumer_interface": "elastos.provider.model",
+        "consumer_interface_version": "0.1.0",
+        "minimum_memory_mb": 2048,
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "path": "LICENSE"
+        },
+        "provenance": {
+          "base_repository": "Qwen/Qwen3.5-0.8B",
+          "base_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+          "base_license": {
+            "spdx_id": "Apache-2.0",
+            "path": "LICENSE.base"
+          },
+          "quantized_repository": "unsloth/Qwen3.5-0.8B-GGUF",
+          "quantized_revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+          "path": "PROVENANCE.md"
+        }
+      },
+      "notices": [
+        {
+          "name": "PROVENANCE.md",
+          "source": {
+            "path": "scripts/release-upstream-provenance/model-qwen3.5-0.8b.md",
+            "checksum": "sha256:855991d9f67a606b770f8dafce23fb538597929b77d9f20939101612166e2c1b",
+            "max_bytes": 1048576
+          }
+        }
+      ]
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "model-qwen3.5-4b",
+      "platform": "*",
+      "version": "1.0.0",
+      "source": {
+        "checksum": "sha256:00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+        "max_bytes": 12884901888,
+        "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+        "redirect_hosts": [
+          "cdn-lfs.hf.co",
+          "cdn-lfs-us-1.hf.co",
+          "cdn-lfs-eu-1.hf.co",
+          "cas-bridge.xethub.hf.co"
+        ]
+      },
+      "format": "raw",
+      "root": "model-qwen3.5-4b",
+      "entrypoint": "Qwen3.5-4B-Q4_K_M.gguf",
+      "extract_path": "model-qwen3.5-4b/Qwen3.5-4B-Q4_K_M.gguf",
+      "install_path": "models/Qwen3.5-4B-Q4_K_M.gguf",
+      "max_unpacked_bytes": 17179869184,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-4B/resolve/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE.base",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-4B/resolve/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "model_content": {
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "engine": "llama.cpp",
+        "consumer_interface": "elastos.provider.model",
+        "consumer_interface_version": "0.1.0",
+        "minimum_memory_mb": 4096,
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "path": "LICENSE"
+        },
+        "provenance": {
+          "base_repository": "Qwen/Qwen3.5-4B",
+          "base_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+          "base_license": {
+            "spdx_id": "Apache-2.0",
+            "path": "LICENSE.base"
+          },
+          "quantized_repository": "unsloth/Qwen3.5-4B-GGUF",
+          "quantized_revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+          "path": "PROVENANCE.md"
+        }
+      },
+      "notices": [
+        {
+          "name": "PROVENANCE.md",
+          "source": {
+            "path": "scripts/release-upstream-provenance/model-qwen3.5-4b.md",
+            "checksum": "sha256:47c8f6806d6f61ccdeb6674f207feb8d4849710402b7ef0e3851f01fcd85b296",
+            "max_bytes": 1048576
+          }
+        }
+      ]
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "model-qwen3.5-9b",
+      "platform": "*",
+      "version": "1.0.0",
+      "source": {
+        "checksum": "sha256:d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43",
+        "max_bytes": 12884901888,
+        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/bc658f7a1ae222ee901a565aafd2f5b8c839e176/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+        "redirect_hosts": [
+          "cdn-lfs.hf.co",
+          "cdn-lfs-us-1.hf.co",
+          "cdn-lfs-eu-1.hf.co",
+          "cas-bridge.xethub.hf.co"
+        ]
+      },
+      "format": "raw",
+      "root": "model-qwen3.5-9b",
+      "entrypoint": "Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+      "extract_path": "model-qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+      "install_path": "models/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+      "max_unpacked_bytes": 17179869184,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-9B/resolve/c202236235762e1c871ad0ccb60c8ee5ba337b9a/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE.base",
+            "source": {
+              "url": "https://huggingface.co/Qwen/Qwen3.5-9B/resolve/c202236235762e1c871ad0ccb60c8ee5ba337b9a/LICENSE",
+              "checksum": "sha256:bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "model_content": {
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "engine": "llama.cpp",
+        "consumer_interface": "elastos.provider.model",
+        "consumer_interface_version": "0.1.0",
+        "minimum_memory_mb": 8192,
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "path": "LICENSE"
+        },
+        "provenance": {
+          "base_repository": "Qwen/Qwen3.5-9B",
+          "base_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "base_license": {
+            "spdx_id": "Apache-2.0",
+            "path": "LICENSE.base"
+          },
+          "quantized_repository": "bartowski/Qwen_Qwen3.5-9B-GGUF",
+          "quantized_revision": "bc658f7a1ae222ee901a565aafd2f5b8c839e176",
+          "path": "PROVENANCE.md"
+        }
+      },
+      "notices": [
+        {
+          "name": "PROVENANCE.md",
+          "source": {
+            "path": "scripts/release-upstream-provenance/model-qwen3.5-9b.md",
+            "checksum": "sha256:a22b4f36b3811996f5fbd703fcf215e3769e92f97a9c6da551cdfe6c9b0361a0",
+            "max_bytes": 1048576
+          }
+        }
+      ]
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "model-bonsai-8b-q1",
+      "platform": "*",
+      "version": "1.0.0",
+      "source": {
+        "checksum": "sha256:284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+        "max_bytes": 12884901888,
+        "url": "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/48516770dd04643643e9f9019a2a349cf26c5dbd/Bonsai-8B-Q1_0.gguf",
+        "redirect_hosts": [
+          "cdn-lfs.hf.co",
+          "cdn-lfs-us-1.hf.co",
+          "cdn-lfs-eu-1.hf.co",
+          "cas-bridge.xethub.hf.co"
+        ]
+      },
+      "format": "raw",
+      "root": "model-bonsai-8b-q1",
+      "entrypoint": "Bonsai-8B-Q1_0.gguf",
+      "extract_path": "model-bonsai-8b-q1/Bonsai-8B-Q1_0.gguf",
+      "install_path": "models/Bonsai-8B-Q1_0.gguf",
+      "max_unpacked_bytes": 17179869184,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://huggingface.co/prism-ml/Bonsai-8B-unpacked/resolve/376f381570d6115bc03f82adcfa4af0c7672ae54/LICENSE",
+              "checksum": "sha256:69849221bfb90053de2134ef5e6d540287b4b98062326492f1f96f5da685524b",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE.base",
+            "source": {
+              "url": "https://huggingface.co/prism-ml/Bonsai-8B-unpacked/resolve/376f381570d6115bc03f82adcfa4af0c7672ae54/LICENSE",
+              "checksum": "sha256:69849221bfb90053de2134ef5e6d540287b4b98062326492f1f96f5da685524b",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "model_content": {
+        "format": "gguf",
+        "quantization": "Q1_0",
+        "engine": "llama.cpp",
+        "consumer_interface": "elastos.provider.model",
+        "consumer_interface_version": "0.1.0",
+        "minimum_memory_mb": 4096,
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "path": "LICENSE"
+        },
+        "provenance": {
+          "base_repository": "prism-ml/Bonsai-8B-unpacked",
+          "base_revision": "376f381570d6115bc03f82adcfa4af0c7672ae54",
+          "base_license": {
+            "spdx_id": "Apache-2.0",
+            "path": "LICENSE.base"
+          },
+          "quantized_repository": "prism-ml/Bonsai-8B-gguf",
+          "quantized_revision": "48516770dd04643643e9f9019a2a349cf26c5dbd",
+          "path": "PROVENANCE.md"
+        }
+      },
+      "notices": [
+        {
+          "name": "PROVENANCE.md",
+          "source": {
+            "path": "scripts/release-upstream-provenance/model-bonsai-8b-q1.md",
+            "checksum": "sha256:9bb3ff4d6cf6f60c8425a70629c453e40223af1a84994fe29974fab459750790",
+            "max_bytes": 1048576
+          }
+        },
+        {
+          "name": "NOTICE.txt",
+          "source": {
+            "url": "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/48516770dd04643643e9f9019a2a349cf26c5dbd/NOTICE.txt",
+            "checksum": "sha256:7334e66ce48a4ee267ee936c7d2a4f16bd865c766c60ba56b9e04526fae33e0b",
+            "max_bytes": 1048576
+          }
+        }
+      ]
+    }
+  ]
+}

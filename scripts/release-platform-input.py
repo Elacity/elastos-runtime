@@ -25,6 +25,7 @@ import tempfile
 SCRIPT_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = SCRIPT_ROOT.parent
 SCHEMA = "elastos.release-platform-input/v1"
+MODEL_COMPONENTS = {"model-qwen3.5-0.8b", "model-qwen3.5-4b", "model-qwen3.5-9b", "model-bonsai-8b-q1"}
 PLATFORMS = {
     "x86_64-linux": ("linux-amd64", "x86_64-unknown-linux-musl", 62),
     "aarch64-linux": ("linux-arm64", "aarch64-unknown-linux-musl", 183),
@@ -72,11 +73,347 @@ def admit_model_catalog_artifact(manifest, artifact_root, referenced):
         return
     if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
         raise ValueError("model_catalog.head_cid is required")
-    data = regular_file(artifact_root, "model-catalog.json").read_bytes()
+    with regular_file(artifact_root, "model-catalog.json").open("rb") as catalog:
+        data = catalog.read(128 * 1024 + 1)
+    if len(data) > 128 * 1024:
+        raise ValueError("model catalogue artifact exceeds its metadata bound")
     actual = catalog_head_cid(data)
     if actual != pin["head_cid"]:
         raise ValueError(f"model-catalog.json head {actual} does not match pin {pin['head_cid']}")
     referenced.add("model-catalog.json")
+    retention = manifest.get("model_retention")
+    if retention is not None:
+        signer, handoff = model_tools()
+        envelope = signer.parse_json(data)
+        if envelope.get("signer_did") not in pin.get("publisher_dids", []):
+            raise ValueError("catalogue publisher differs from trust pin")
+        roots = admit_catalog_payload(envelope.get("payload"), signer)
+        admit_model_budget(pin.get("local_use"), envelope["payload"])
+        admit_retention(retention, roots, artifact_root, referenced, handoff)
+
+
+def model_tools():
+    """Load reviewed source helpers, independent of candidate artifact paths."""
+    modules = []
+    for name in ("release-signer", "model-package-handoff"):
+        module_name = "release_input_" + name.replace("-", "_")
+        if module_name not in sys.modules:
+            definition = importlib.util.spec_from_file_location(module_name, SCRIPT_ROOT / (name + ".py"))
+            module = importlib.util.module_from_spec(definition)
+            sys.modules[module_name] = module
+            definition.loader.exec_module(module)
+        modules.append(sys.modules[module_name])
+    return modules
+
+
+def admit_catalog_payload(payload, signer):
+    signer.require(type(payload) is dict and set(payload) == {"schema", "published_at", "expires_at", "entries"}
+                   and payload["schema"] == "elastos.model.catalog/v1", "catalogue payload fields refused")
+    now = int(datetime.now(timezone.utc).timestamp())
+    published, expiry = payload["published_at"], payload["expires_at"]
+    signer.require(type(published) is int and 0 <= published <= now
+                   and (expiry is None or type(expiry) is int and expiry > now and expiry > published),
+                   "catalogue publication or expiry refused")
+    signer.require(type(payload["entries"]) is list and len(payload["entries"]) == 4,
+                   "four catalogue entries required")
+    roots = {}
+    for entry in payload["entries"]:
+        signer.require(type(entry) is dict and set(entry) == {"cid", "capsule_manifest", "object_manifest"},
+                       "catalogue entry fields refused")
+        cid, capsule, index = entry["cid"], entry["capsule_manifest"], entry["object_manifest"]
+        codec, _ = signer.cid_info(cid)
+        signer.require(cid.startswith("b") and codec == 0x70 and cid not in roots.values(),
+                       "distinct canonical directory CIDs required")
+        signer.require(type(capsule) is dict and type(index) is dict
+                       and capsule.get("name") in MODEL_COMPONENTS and capsule["name"] not in roots,
+                       "catalogue component inventory differs")
+        signer.catalogue_closure(capsule, index)
+        roots[capsule["name"]] = cid
+    signer.require(set(roots) == MODEL_COMPONENTS, "four canonical models required")
+    return roots
+
+
+def retention_descriptor(value):
+    if (type(value) is not dict or set(value) != {"release_path", "checksum", "size"}
+            or type(value["release_path"]) is not str
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,239}", value["release_path"])
+            or value["release_path"].endswith(".")
+            or type(value["checksum"]) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["checksum"])
+            or type(value["size"]) is not int or not 0 < value["size"] <= 16 * 1024**3):
+        raise ValueError("model retention descriptor refused")
+    return value
+
+
+def admit_model_budget(budget, payload):
+    if budget is None:
+        return
+    if (type(budget) is not dict or set(budget) != {"max_cache_bytes", "max_model_memory_bytes"}
+            or any(type(value) is not int or not 0 < value < 2**63 for value in budget.values())):
+        raise ValueError("approved model local-use budget refused")
+    for entry in payload["entries"]:
+        total = sum(item["size"] for item in entry["object_manifest"]["files"])
+        # Runtime also stages the bounded object index, which is outside its own
+        # closure list. Charge its actual canonical bytes with serializer slack.
+        total += len(json.dumps(entry["object_manifest"], sort_keys=True, separators=(",", ":")).encode()) + 1
+        charge = 3 * total + 8 * 1024**2 + 3 * 65536
+        memory = entry["capsule_manifest"]["model_content"]["minimum_memory_mb"] * 1024**2
+        if charge > budget["max_cache_bytes"] or memory > budget["max_model_memory_bytes"]:
+            raise ValueError("model closure exceeds approved local-use budget")
+
+
+def admit_retention(retention, roots, root, referenced, handoff):
+    if type(retention) is not dict or set(retention) != MODEL_COMPONENTS:
+        raise ValueError("four model retention records required")
+    names = set(referenced)
+    for name, record in retention.items():
+        if (type(record) is not dict or set(record) != {"package_cid", "car", "receipt"}
+                or record["package_cid"] != roots[name]):
+            raise ValueError("model retention catalogue root differs")
+        paths = {}
+        for kind in ("car", "receipt"):
+            info = retention_descriptor(record[kind])
+            relative = info["release_path"]
+            if relative in names:
+                raise ValueError("model retention artifact alias refused")
+            names.add(relative)
+            path = regular_file(root, relative)
+            if path.stat().st_size != info["size"] or "sha256:" + digest(path) != info["checksum"]:
+                raise ValueError("model retention artifact bytes differ")
+            paths[kind] = path
+            referenced.add(relative)
+        try:
+            receipt = handoff.check_car(str(paths["car"]), str(paths["receipt"]), record["package_cid"])
+        except handoff.Refusal as exc:
+            raise ValueError(str(exc)) from exc
+        if receipt.kubo_version != handoff.KUBO_VERSION:
+            raise ValueError("model retention Kubo version differs")
+
+
+def public_catalog_verification(data, publisher_did, openssl, parent):
+    """Verify public bytes with an explicit OpenSSL 3 executable; key access is absent."""
+    signer, _ = model_tools()
+    envelope = signer.parse_json(data)
+    signer.check_did(publisher_did)
+    signer.require(set(envelope) == {"payload", "signature", "signer_did"}
+                   and envelope["signer_did"] == publisher_did, "catalogue public publisher differs")
+    roots = admit_catalog_payload(envelope["payload"], signer)
+    signature = envelope["signature"]
+    signer.require(type(signature) is str and re.fullmatch(r"[0-9a-f]{128}", signature),
+                   "Ed25519 catalogue signature required")
+    executable = Path(openssl)
+    signer.require(executable.is_absolute() and executable == executable.resolve(strict=True)
+                   and os.access(executable, os.X_OK), "explicit qualified OpenSSL path required")
+    for path in (*executable.parents, executable):
+        metadata = path.lstat()
+        signer.require(metadata.st_uid in (0, os.geteuid()) and not metadata.st_mode & 0o022,
+                       "OpenSSL path protection refused")
+    tool_sha = digest(executable)
+    def execute(arguments, cwd):
+        result = subprocess.run([str(executable), *arguments], cwd=cwd,
+                                env={"OPENSSL_CONF": "/dev/null", "LANG": "C"},
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+        signer.require(result.returncode == 0 and len(result.stdout) <= 65536 and len(result.stderr) <= 65536,
+                       "OpenSSL public verification failed")
+        return result.stdout
+    signer.require(execute(["version"], parent).startswith(b"OpenSSL 3."), "OpenSSL 3 required")
+    number = 0
+    for char in publisher_did[len("did:key:z"):]:
+        number = number * 58 + signer.BASE58.index(char)
+    raw = number.to_bytes(34, "big")[2:]
+    with tempfile.TemporaryDirectory(prefix=".model-public-verify-", dir=parent) as temporary:
+        scratch = Path(temporary)
+        (scratch / "public.der").write_bytes(bytes.fromhex("302a300506032b6570032100") + raw)
+        (scratch / "digest").write_bytes(hashlib.sha256(b"elastos.model.catalog.v1\0" + signer.json_bytes(envelope["payload"])).digest())
+        (scratch / "signature").write_bytes(bytes.fromhex(signature))
+        execute(["pkeyutl", "-provider", "default", "-verify", "-rawin", "-pubin", "-keyform", "DER",
+                 "-inkey", "public.der", "-in", "digest", "-sigfile", "signature"], scratch)
+    signer.require(digest(executable) == tool_sha, "OpenSSL executable changed")
+    return envelope, roots, {"path": str(executable), "sha256": tool_sha}
+
+
+def protected_model_directory(path, private=True):
+    held = directory_descriptor(path)
+    try:
+        metadata = os.fstat(held)
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & (0o077 if private else 0o022):
+            raise ValueError("model handoff requires a protected owned directory")
+    finally:
+        os.close(held)
+
+
+def finalize_models(args):
+    signer, handoff = model_tools()
+    source = Path(os.path.abspath(args.input))
+    protected_model_directory(source, private=False)
+    original = verify(source)
+    if "support_origin" in original or "model_finalization" in original:
+        raise ValueError("model finalization requires an original native build input")
+    record_bytes = signer.regular_bytes(regular_file(source, "model-handoff.json"), 128 * 1024)
+    record = signer.parse_json(record_bytes)
+    fields = {"schema", "scope", "source", "platform", "version", "handoff_directory", "upstream_input_sha256",
+              "model_catalog_unsigned", "model_retention", "files"}
+    if (set(record) != fields or record["schema"] != "elastos.release-model-handoff/v1"
+            or record["scope"] != "key-free model preparation; signed catalogue finalization follows"
+            or type(record["source"]) is not dict or record["source"].get("clean") is not True
+            or record["source"] != {key: original["source"][key] for key in ("commit", "tree", "clean")}
+            or record["platform"] != original["platform"] or record["version"] != original["version"]):
+        raise ValueError("model handoff native source binding differs")
+    model_root = Path(os.path.abspath(args.handoff))
+    if model_root.parent != source.parent or record["handoff_directory"] != "../" + model_root.name:
+        raise ValueError("model handoff must be the recorded sibling directory")
+    protected_model_directory(model_root)
+    upstream_bytes = signer.regular_bytes(regular_file(source, "upstream-input.json"), signer.MAX_JSON)
+    upstream = signer.parse_json(upstream_bytes)
+    if (hashlib.sha256(upstream_bytes).hexdigest() != record["upstream_input_sha256"]
+            or any(upstream.get(key) != record[key] for key in ("model_catalog_unsigned", "model_retention"))):
+        raise ValueError("model handoff upstream binding differs")
+    unsigned = record["model_catalog_unsigned"]
+    if type(unsigned) is not dict or set(unsigned) != {"release_path", "checksum", "size", "publisher_did"}:
+        raise ValueError("unsigned catalogue descriptor refused")
+    signer.check_did(args.publisher_did)
+    if unsigned["publisher_did"] != args.publisher_did or unsigned["release_path"] != "model-catalog.unsigned.json":
+        raise ValueError("model handoff public publisher differs")
+    expected = {unsigned["release_path"]: retention_descriptor({key: unsigned[key] for key in ("release_path", "checksum", "size")})}
+    if type(record["model_retention"]) is not dict or set(record["model_retention"]) != MODEL_COMPONENTS:
+        raise ValueError("four model handoff retention records required")
+    for item in record["model_retention"].values():
+        if type(item) is not dict or set(item) != {"package_cid", "car", "receipt"}:
+            raise ValueError("model retention record fields refused")
+        for kind in ("car", "receipt"):
+            descriptor = retention_descriptor(item[kind])
+            if descriptor["release_path"] in expected:
+                raise ValueError("model handoff artifact alias refused")
+            expected[descriptor["release_path"]] = descriptor
+    file_pins = {name: {key: info[key] for key in ("checksum", "size")} for name, info in expected.items()}
+    if record["files"] != file_pins or {path.name for path in model_root.iterdir()} != set(expected):
+        raise ValueError("model handoff file inventory differs")
+    for name, pin in file_pins.items():
+        path = regular_file(model_root, name)
+        metadata = path.stat()
+        if (metadata.st_nlink != 1 or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077
+                or metadata.st_size != pin["size"] or "sha256:" + digest(path) != pin["checksum"]):
+            raise ValueError("model handoff file protection or bytes differ")
+    payload = signer.parse_json(signer.regular_bytes(model_root / unsigned["release_path"], 128 * 1024))
+    signed_bytes = signer.regular_bytes(args.catalogue, 128 * 1024)
+    destination = Path(os.path.abspath(args.output))
+    parent = destination.parent
+    protected_model_directory(parent, private=False)
+    if (destination.exists() or destination.is_symlink() or destination.is_relative_to(source)
+            or destination.is_relative_to(model_root)):
+        raise ValueError("model finalization requires a new output outside its inputs")
+    tool_path = Path(args.openssl)
+    if any(tool_path.is_relative_to(path) for path in (source, model_root, destination)):
+        raise ValueError("qualified OpenSSL must be outside candidate inputs")
+    # Reserve the complete copy plus bounded new control documents before even
+    # creating public-verification scratch. CARs stay streamed throughout.
+    total = sum(info["size"] for info in original["files"].values()) + sum(info["size"] for info in expected.values())
+    total += 8 * 1024**2 + len(signed_bytes)
+    usage = shutil.disk_usage(parent)
+    if (usage.free - total) * 100 < usage.total * 15:
+        raise ValueError("model finalization requires 15 percent free after its complete copy")
+    envelope, roots, tool = public_catalog_verification(signed_bytes, args.publisher_did, args.openssl, parent)
+    if signer.json_bytes(payload) != signer.json_bytes(envelope["payload"]):
+        raise ValueError("signed catalogue payload differs from unsigned preparation")
+    capsules = {item.get("component"): item for item in upstream.get("capsules", [])
+                if item.get("component") in MODEL_COMPONENTS}
+    if set(capsules) != MODEL_COMPONENTS:
+        raise ValueError("four native model capsule receipts required")
+    for entry in payload["entries"]:
+        capsule = capsules[entry["capsule_manifest"]["name"]]
+        if any(signer.json_bytes(capsule.get(key)) != signer.json_bytes(entry[key])
+               for key in ("capsule_manifest", "object_manifest")):
+            raise ValueError("catalogue closure differs from native capsule receipt")
+    admitted = {unsigned["release_path"]}
+    admit_retention(record["model_retention"], roots, model_root, admitted, handoff)
+    manifest = signer.parse_json(regular_file(source, "components.json").read_bytes())
+    if "model_retention" in manifest:
+        raise ValueError("native input already has model retention")
+    template = signer.parse_json(regular_file(source, "components-template.json").read_bytes())
+    budget = template.get("model_catalog", {}).get("local_use")
+    admit_model_budget(budget, payload)
+    manifest["model_catalog"] = {"head_cid": catalog_head_cid(signed_bytes), "publisher_dids": [args.publisher_did]}
+    if budget is not None:
+        manifest["model_catalog"]["local_use"] = budget
+    manifest["model_retention"] = record["model_retention"]
+    receipt_bytes = signer.regular_bytes(regular_file(source, "platform-input.json"), signer.MAX_JSON)
+    components_bytes = signer.regular_bytes(regular_file(source, "components.json"), signer.MAX_JSON)
+    with tempfile.TemporaryDirectory(prefix=".finalize-models-", dir=parent) as temporary:
+        output = Path(temporary) / "input"
+        output.mkdir(mode=0o700)
+        for name, pin in original["files"].items():
+            target = output / name
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copyfile(regular_file(source, name), target)
+            target.chmod(0o700 if pin["executable"] else 0o600)
+            if file_record(target) != pin:
+                raise ValueError("native input changed during model finalization")
+        for name in admitted - {unsigned["release_path"]}:
+            target = output / "artifacts" / name
+            if target.exists():
+                raise ValueError("model retention collides with a native artifact")
+            shutil.copyfile(regular_file(model_root, name), target)
+            target.chmod(0o600)
+            if file_record(target)["sha256"] != file_pins[name]["checksum"][7:] or target.stat().st_size != file_pins[name]["size"]:
+                raise ValueError("model handoff changed during finalization")
+        (output / "artifacts/model-catalog.json").write_bytes(signed_bytes)
+        (output / "components.json").write_bytes(signer.json_bytes(manifest))
+        (output / "model-native-input.json").write_bytes(receipt_bytes)
+        (output / "model-native-components.json").write_bytes(components_bytes)
+        if "artifacts/model-catalog.json" in original["files"]:
+            shutil.copyfile(regular_file(source, "artifacts/model-catalog.json"), output / "model-native-catalog.json")
+        receipt = copy.deepcopy(original)
+        receipt["model_finalization"] = {"native_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            "publisher_did": args.publisher_did, "catalogue_sha256": hashlib.sha256(signed_bytes).hexdigest(),
+            "signature_domain": "elastos.model.catalog.v1", "openssl": tool,
+            "scope": "public signature and CAR receipt bytes verified; retention import and consumer activation require acceptance"}
+        receipt["files"] = {str(path.relative_to(output)): file_record(path)
+                            for path in output.rglob("*") if path.is_file()}
+        (output / "platform-input.json").write_bytes(signer.json_bytes(receipt))
+        verify(output)
+        if verify(source) != original or regular_file(source, "platform-input.json").read_bytes() != receipt_bytes:
+            raise ValueError("native input changed during model finalization")
+        if destination.exists() or destination.is_symlink():
+            raise ValueError("model finalization output already exists")
+        output.rename(destination)
+    return receipt
+
+
+def verify_model_finalization(root, receipt):
+    signer, _ = model_tools()
+    proof = receipt["model_finalization"]
+    if (type(proof) is not dict or set(proof) != {"native_receipt_sha256", "publisher_did", "catalogue_sha256",
+            "signature_domain", "openssl", "scope"} or proof["signature_domain"] != "elastos.model.catalog.v1"):
+        raise ValueError("model finalization proof fields refused")
+    original_bytes = signer.regular_bytes(regular_file(root, "model-native-input.json"), signer.MAX_JSON)
+    if hashlib.sha256(original_bytes).hexdigest() != proof["native_receipt_sha256"]:
+        raise ValueError("model native provenance receipt differs")
+    original = verify_receipt_header(signer.parse_json(original_bytes))
+    if "support_origin" in original or "model_finalization" in original:
+        raise ValueError("nested model finalization provenance refused")
+    for key, value in original.items():
+        if key != "files" and receipt.get(key) != value:
+            raise ValueError("model finalization rewrote native build provenance")
+    for name, pin in original["files"].items():
+        retained = {"components.json": "model-native-components.json",
+                    "artifacts/model-catalog.json": "model-native-catalog.json"}.get(name, name)
+        if file_record(regular_file(root, retained)) != pin:
+            raise ValueError("model finalization original artifact differs")
+    data = signer.regular_bytes(regular_file(root, "artifacts/model-catalog.json"), 128 * 1024)
+    envelope = signer.parse_json(data)
+    signer.check_did(proof["publisher_did"])
+    if (set(envelope) != {"payload", "signature", "signer_did"}
+            or envelope["signer_did"] != proof["publisher_did"]
+            or hashlib.sha256(data).hexdigest() != proof["catalogue_sha256"]):
+        raise ValueError("model finalization catalogue differs")
+    original_components = signer.parse_json(regular_file(root, "model-native-components.json").read_bytes())
+    handoff_record = signer.parse_json(regular_file(root, "model-handoff.json").read_bytes())
+    budget = signer.parse_json(regular_file(root, "components-template.json").read_bytes()).get("model_catalog", {}).get("local_use")
+    original_components["model_catalog"] = {"head_cid": catalog_head_cid(data), "publisher_dids": [proof["publisher_did"]]}
+    if budget is not None:
+        original_components["model_catalog"]["local_use"] = budget
+    original_components["model_retention"] = handoff_record["model_retention"]
+    if signer.parse_json(regular_file(root, "components.json").read_bytes()) != original_components:
+        raise ValueError("model finalization changed unrelated native components")
 
 
 def file_record(path):
@@ -252,6 +589,161 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
                 raise ValueError(f"{path.name}: missing provider icon {size}")
 
 
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+
+
+def public_upstream_recipe(recipe):
+    value = copy.deepcopy(recipe)
+    for source in [value["source"], *[item["source"] for item in value["license"]["files"]],
+                   *[item["source"] for item in value.get("notices", [])]]:
+        source.pop("path", None)
+    return value
+
+
+def check_upstream_archive(path, recipe, receipt, platform):
+    root = recipe["root"]
+    records, metadata, headers, seen = {}, {}, {}, set()
+    metadata_names = {"capsule.json", "PROVENANCE.json", "_elastos_object.json"}
+    notices = {item["name"]: item for item in [*recipe["license"]["files"], *recipe.get("notices", [])]}
+    total = 0
+    with tarfile.open(path, "r|gz") as archive:
+        for member in archive:
+            name = member.name
+            if (not member.isfile() or member.pax_headers or "\\" in name or name in seen
+                    or not name.startswith(root + "/") or any(part in {"", ".", ".."} for part in name.split("/"))):
+                raise ValueError("upstream capsule contains unsafe, duplicate or nonregular members")
+            seen.add(name)
+            short = name[len(root) + 1:]
+            total += member.size
+            if member.size < 0 or total > recipe["max_unpacked_bytes"] + 64 * 1024**2 or len(seen) > 4131:
+                raise ValueError("upstream capsule exceeds its reviewed unpacked bound")
+            stream = archive.extractfile(member)
+            header = stream.read(64)
+            value, license_hash = hashlib.sha256(header), None
+            payload_hash = None
+            if recipe["format"] == "raw" and short == recipe["entrypoint"]:
+                payload_algorithm, payload_expected = recipe["source"]["checksum"].split(":", 1)
+                payload_hash = hashlib.new(payload_algorithm, header)
+            if short in notices:
+                algorithm, expected = notices[short]["source"]["checksum"].split(":", 1)
+                license_hash = hashlib.new(algorithm, header)
+            captured = bytearray(header) if short in metadata_names else None
+            if captured is not None and member.size > 1024**2:
+                raise ValueError("upstream capsule metadata exceeds its bound")
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                value.update(chunk)
+                if payload_hash is not None:
+                    payload_hash.update(chunk)
+                if license_hash is not None:
+                    license_hash.update(chunk)
+                if captured is not None:
+                    captured.extend(chunk)
+            if payload_hash is not None:
+                if payload_hash.hexdigest() != payload_expected:
+                    raise ValueError("upstream raw payload differs from its original source checksum")
+            if license_hash is not None and license_hash.hexdigest() != expected:
+                raise ValueError("upstream capsule licence or provenance notice differs from its source pin")
+            if captured is not None:
+                metadata[short] = json.loads(captured)
+            headers[short] = (header, member.mode)
+            if short != "_elastos_object.json":
+                records[short] = {"path": short, "sha256": value.hexdigest(), "size": member.size}
+    if not metadata_names <= set(metadata) or not set(notices) <= set(records):
+        raise ValueError("upstream capsule metadata, licence or notice is missing")
+    expected_capsule = {"schema": "elastos.capsule/v1", "name": recipe["component"],
+        "version": recipe["version"], "role": "content", "type": "data", "projections": ["content"],
+        "entrypoint": recipe["entrypoint"]}
+    if "model_content" in recipe:
+        expected_capsule["model_content"] = recipe["model_content"]
+    if metadata["capsule.json"] != expected_capsule or receipt.get("capsule_manifest") != expected_capsule:
+        raise ValueError("upstream content capsule contract differs from its recipe")
+    source_record = lambda source: {key: value for key, value in source.items() if key != "path"}
+    expected_provenance = {"schema": "elastos.release-upstream-input/v1", "component": recipe["component"],
+        "platform": recipe["platform"], "license": recipe["license"]["spdx_id"],
+        "recipe_sha256": hashlib.sha256(canonical(public_upstream_recipe(recipe))).hexdigest(),
+        "upstream": source_record(recipe["source"]),
+        "notices": [{"name": item["name"], "source": source_record(item["source"])}
+                    for item in [*recipe["license"]["files"], *recipe.get("notices", [])]]}
+    if metadata["PROVENANCE.json"] != expected_provenance:
+        raise ValueError("upstream capsule provenance differs from its reviewed recipe")
+    ordered = [records[name] for name in sorted(records)]
+    closure = hashlib.sha256()
+    for record in ordered:
+        for field in (record["path"], record["sha256"], str(record["size"])):
+            closure.update(field.encode() + b"\0")
+    expected_index = {"schema": "elastos.content.object.manifest/v1", "kind": "capsule", "files": ordered,
+                      "content_digest": "sha256:" + closure.hexdigest()}
+    if metadata["_elastos_object.json"] != expected_index or receipt.get("object_manifest") != expected_index:
+        raise ValueError("upstream capsule object closure differs from its actual files")
+    entrypoint = recipe["entrypoint"]
+    if entrypoint not in headers:
+        raise ValueError("upstream capsule entrypoint is missing")
+    header, mode = headers[entrypoint]
+    if recipe.get("model_content"):
+        if header[:4] != b"GGUF":
+            raise ValueError("upstream model payload has no GGUF header")
+    else:
+        check_native_header(header, mode, platform, entrypoint)
+        if recipe["component"] == "llama-server" and platform == "aarch64-linux":
+            libraries = [name for name in headers if ".so" in PurePosixPath(name).name]
+            if not libraries:
+                raise ValueError("upstream ARM64 llama-server libraries are missing")
+            for name in libraries:
+                check_native_header(*headers[name], platform, name)
+
+
+def admit_upstream_inputs(root, platform, manifest, template):
+    setup = PLATFORMS[platform][0]
+    inventory_path = root / "upstream-recipes.json"
+    receipt_path = root / "upstream-input.json"
+    source_inventory = SOURCE_ROOT / "scripts/release-upstream-recipes.json"
+    if not inventory_path.exists():
+        if source_inventory.exists():
+            source = json.loads(source_inventory.read_bytes())
+            selected = {r["component"] for r in source["recipes"] if r["platform"] in (setup, "*")}
+            if selected & set(template["external"]):
+                raise ValueError("upstream dependencies require retained recipe and input receipts")
+        if receipt_path.exists():
+            raise ValueError("upstream input receipt lacks retained recipes")
+        return {}
+    inventory = json.loads(regular_file(root, "upstream-recipes.json").read_bytes())
+    document = json.loads(regular_file(root, "upstream-input.json").read_bytes())
+    if (inventory.get("schema") != "elastos.release-upstream-recipes/v1"
+            or document.get("schema") != "elastos.release-upstream-assets/v1" or document.get("platform") != setup
+            or document.get("recipes_sha256") != digest(inventory_path)):
+        raise ValueError("upstream recipe inventory or platform binding differs")
+    recipes = [r for r in inventory["recipes"] if r["platform"] in (setup, "*") and r["component"] in template["external"]]
+    by_name = {r["component"]: r for r in recipes}
+    receipts = document.get("capsules", [])
+    if (len(by_name) != len(recipes) or not isinstance(receipts, list)
+            or len(receipts) != len(by_name) or {r.get("component") for r in receipts} != set(by_name)):
+        raise ValueError("upstream component inventory differs from selected recipes")
+    for receipt in receipts:
+        recipe = by_name[receipt["component"]]
+        if (receipt.get("schema") != "elastos.release-upstream-input/v1"
+                or receipt.get("platform") != recipe["platform"]
+                or receipt.get("recipe_sha256") != hashlib.sha256(canonical(recipe)).hexdigest()):
+            raise ValueError("upstream input recipe/source binding differs")
+        component = manifest["external"][recipe["component"]]
+        _, info = integrity.resolve_platform_info(component, setup)
+        fields = ("release_path", "checksum", "size", "extract_path", "install_path", "binary_path")
+        if info != {key: receipt[key] for key in fields if key in receipt}:
+            raise ValueError("upstream dependency descriptor differs from its build receipt")
+        for key in ("extract_path", "install_path", "binary_path"):
+            if receipt.get(key) != recipe.get(key):
+                raise ValueError("upstream extraction/install contract differs from its recipe")
+        metadata = component.get("capsule_metadata", {})
+        _, metadata_info = integrity.resolve_platform_info(metadata, setup)
+        if (metadata.get("role") != "content" or metadata.get("type") != "data"
+                or not isinstance(metadata_info, dict) or metadata_info != receipt.get("capsule_metadata")
+                or metadata_info.get("extract_path") != recipe["root"]
+                or metadata_info.get("install_path") != "capsules/" + recipe["component"]):
+            raise ValueError("upstream content metadata differs from its recipe/receipt")
+        check_upstream_archive(regular_file(root / "artifacts", info["release_path"]), recipe, receipt, platform)
+    return by_name
+
+
 def check_contents(root, platform, omissions):
     setup_platform = PLATFORMS[platform][0]
     manifest = json.loads(regular_file(root, "components.json").read_text())
@@ -273,6 +765,7 @@ def check_contents(root, platform, omissions):
     errors += integrity.audit_release_artifacts(manifest, [setup_platform], root / "artifacts")
     if errors:
         raise ValueError("; ".join(errors))
+    upstream_recipes = admit_upstream_inputs(root, platform, manifest, template)
     referenced = {f"elastos-{platform}"}
     for name, component in manifest["external"].items():
         contract = lambda value: {k: v for k, v in value.items() if k not in ("platforms", "capsule_metadata")}
@@ -291,7 +784,7 @@ def check_contents(root, platform, omissions):
         if original_info is not None:
             if original_info.get("release_path") and not prepared_info.get("release_path"):
                 raise ValueError(f"{name}: source-local component needs a local artifact")
-            if not original_info.get("release_path") and original_info.get("url") and prepared_info != original_info:
+            if name not in upstream_recipes and not original_info.get("release_path") and original_info.get("url") and prepared_info != original_info:
                 raise ValueError(f"{name}: external dependency differs from pinned source template")
         provider_runtime = component.get("provider_runtime")
         if (original_info is not None and isinstance(provider_runtime, dict)
@@ -304,7 +797,8 @@ def check_contents(root, platform, omissions):
             entries.append(component["capsule_metadata"])
         for entry in entries:
             selected_key, info = integrity.resolve_platform_info(entry, setup_platform)
-            is_provider_metadata = entry is not component
+            is_metadata = entry is not component
+            is_provider_metadata = is_metadata and name not in upstream_recipes
             if is_provider_metadata:
                 if info is None or not info.get("release_path") or info.get("extract_path") != name:
                     raise ValueError(f"{name}: provider metadata needs a local archive rooted at its capsule name")
@@ -323,13 +817,15 @@ def check_contents(root, platform, omissions):
                 expected_install = (original or {}).get("install_path", component.get("install_path"))
             if info.get("install_path", entry.get("install_path")) != expected_install:
                 raise ValueError(f"{name}: prepared install path differs from source contract")
-            if info.get("install_path", entry.get("install_path", "")).startswith("bin/"):
-                check_binary(path, platform)
-            elif info.get("extract_path"):
+            if name in upstream_recipes:
+                continue  # Complete archive admission above includes the extracted native payload.
+            if info.get("extract_path"):
                 check_archive(path, info["extract_path"], provider=is_provider_metadata,
                               home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None,
                               media_platform=platform if name == "media-tools" else None,
                               engine_platform=platform if name == "llama-server" and platform == "aarch64-linux" else None)
+            elif info.get("install_path", entry.get("install_path", "")).startswith("bin/"):
+                check_binary(path, platform)
             elif expected_install and expected_install.startswith("capsules/"):
                 raise ValueError(f"{name}: capsule artifact needs an extraction path")
     check_binary(regular_file(root / "artifacts", f"elastos-{platform}"), platform)
@@ -380,6 +876,12 @@ def record(args):
     omissions = json.loads(args.omissions_json.read_text())
     check_contents(root, args.platform, omissions)
     paths = [root / "components.json", template, *sorted((root / "artifacts").rglob("*"))]
+    for name in ("upstream-input.json", "upstream-recipes.json", "model-handoff.json"):
+        if (root / name).exists():
+            paths.append(regular_file(root, name))
+    if not reuse and (root / "upstream-recipes.json").exists():
+        if (root / "upstream-recipes.json").read_bytes() != (SOURCE_ROOT / "scripts/release-upstream-recipes.json").read_bytes():
+            raise ValueError("retained upstream recipes differ from reviewed source")
     if reuse:
         paths.append(origin)
     files = {str(p.relative_to(root)): file_record(regular_file(root, str(p.relative_to(root))))
@@ -504,6 +1006,10 @@ def verify(root):
             raise ValueError("reused platform omissions differ from original receipt")
     elif "support-input.json" in files:
         raise ValueError("support input lacks provenance binding")
+    if "model_finalization" in receipt:
+        verify_model_finalization(root, receipt)
+    elif any(name in files for name in ("model-native-input.json", "model-native-components.json", "model-native-catalog.json")):
+        raise ValueError("model native provenance lacks finalization binding")
     return receipt
 
 
@@ -674,6 +1180,12 @@ def validate_inputs(values, version=None, preview_platform=None):
         if receipt["platform"] != name:
             raise ValueError("input label differs from receipt platform")
         manifest = json.loads((Path(path) / "components.json").read_text())
+        if "upstream-input.json" in receipt["files"]:
+            upstream = json.loads(regular_file(Path(path), "upstream-input.json").read_bytes())
+            prepared_models = {item["component"] for item in upstream.get("capsules", [])} & MODEL_COMPONENTS
+            if prepared_models and (prepared_models != MODEL_COMPONENTS
+                    or set(manifest.get("model_retention", {})) != MODEL_COMPONENTS):
+                raise ValueError("model publication requires the finalized four-model catalogue and retention set")
         for component_name in manifest["profiles"]["home"]["components"]:
             component = manifest["external"].get(component_name)
             if component is None:
@@ -686,6 +1198,13 @@ def validate_inputs(values, version=None, preview_platform=None):
                 raise ValueError(f"{name}: required Home component needs a distributable artifact: {component_name}")
             elif not any(info.get(key) for key in ("release_path", "url")):
                 raise ValueError(f"{name}: required Home component has no prepared delivery path: {component_name}")
+        if "upstream-recipes.json" in receipt["files"]:
+            origin = receipt
+            if "support_origin" in receipt:
+                origin = json.loads(regular_file(Path(path), "support-input.json").read_bytes())
+            reviewed = subprocess.check_output(["git", "show", origin["source"]["commit"] + ":scripts/release-upstream-recipes.json"], cwd=SOURCE_ROOT)
+            if hashlib.sha256(reviewed).hexdigest() != receipt["files"]["upstream-recipes.json"]["sha256"]:
+                raise ValueError("upstream recipe pins differ from their original reviewed source")
         inputs[name] = receipt
     selected = selected_platforms(preview_platform, inputs)
     if set(inputs) != selected:
@@ -723,6 +1242,7 @@ def merged_input_components(values, receipts):
     merged = json.loads((SOURCE_ROOT / "components.json").read_text())
     merged["schema"], merged["capsules"] = "elastos.components/v1", {}
     selected = {}
+    model_contract = None
     for value in values:
         platform, _, path = value.partition("=")
         manifest_path = regular_file(Path(path), "components.json")
@@ -733,6 +1253,15 @@ def merged_input_components(values, receipts):
         if actual != expected:
             raise ValueError(f"input manifest changed after admission: {platform}")
         manifest = json.loads(manifest_bytes)
+        contract = {name: manifest.get(name) for name in ("model_catalog", "model_retention")}
+        if model_contract is not None and contract != model_contract:
+            raise ValueError("platform model catalogue/retention contracts differ")
+        model_contract = contract
+        for name, value in contract.items():
+            if value is None:
+                merged.pop(name, None)
+            else:
+                merged[name] = copy.deepcopy(value)
         for name, component in manifest["external"].items():
             for metadata in (False, True):
                 entry = component.get("capsule_metadata") if metadata else component
@@ -845,8 +1374,12 @@ def prepared_components_bytes(stage, record, cids):
             for info in entry.get("platforms", {}).values():
                 if info.get("release_path"):
                     info["cid"] = cids[info["release_path"]]
+    for model in manifest.get("model_retention", {}).values():
+        for kind in ("car", "receipt"):
+            descriptor = model[kind]
+            descriptor["cid"] = cids[descriptor["release_path"]]
     # Each selected platform gets the same complete manifest. Descriptors were
-    # replaced as units during staging; pinned external URL records remain unchanged.
+    # replaced as units during staging; each release descriptor names admitted bytes.
     output_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
     for platform in record["platforms"]:
         setup = PLATFORMS[platform][0]
@@ -973,6 +1506,10 @@ def main():
         reuse.add_argument("--" + name, type=Path, required=True)
     reuse.add_argument("--platform", choices=PLATFORMS, required=True)
     reuse.add_argument("--version", required=True)
+    finalize = commands.add_parser("finalize-models", help="verify public catalogue and retained CAR bytes into a new native input")
+    for name in ("input", "handoff", "catalogue", "output", "openssl"):
+        finalize.add_argument("--" + name, type=Path, required=True)
+    finalize.add_argument("--publisher-did", required=True)
     combined = commands.add_parser("validate-inputs")
     combined.add_argument("--input", action="append", required=True)
     combined.add_argument("--version")
@@ -1002,6 +1539,9 @@ def main():
             record(args)
         elif args.command == "copy-support":
             copy_support(args)
+        elif args.command == "finalize-models":
+            finalize_models(args)
+            print("Verified public catalogue and CAR receipt bytes in a new native input; consumer acceptance remains separate.")
         elif args.command == "verify":
             print(json.dumps(verify(args.root), sort_keys=True))
         elif args.command == "stage-inputs":

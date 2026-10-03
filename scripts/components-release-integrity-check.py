@@ -150,7 +150,7 @@ def audit_manifest(data, platforms, selected_components=None, source_home_capsul
 
 
 def audit_release_artifacts(data, platforms, artifact_root):
-    """Verify locally advertised files; external URL-only downloads stay external."""
+    """Verify that release dependencies have locally admitted artifact bytes."""
     root = Path(artifact_root)
     errors = []
     if not platforms:
@@ -200,8 +200,11 @@ def audit_release_artifacts(data, platforms, artifact_root):
                 entries.append((f"{name} capsule_metadata", component["capsule_metadata"]))
             for label, entry in entries:
                 _, info = resolve_platform_info(entry, platform)
-                if info is not None and "release_path" in info:
-                    verify(f"{label} {platform}", info)
+                if info is not None:
+                    if non_empty(info.get("url")) and not non_empty(info.get("release_path")):
+                        errors.append(f"{label} {platform}: URL-only dependency requires a release artifact")
+                    elif "release_path" in info:
+                        verify(f"{label} {platform}", info)
         release_platform = RELEASE_PLATFORMS.get(platform, platform)
         for name, entry in sorted((data.get("capsules") or {}).items()):
             capsule_platforms = entry.get("platforms")
@@ -243,6 +246,22 @@ def audit_provider_capsule_metadata(data, platforms, selected_components=None, s
         if metadata.get("install_path") != expected_install_path:
             errors.append(f"{name}: capsule_metadata install_path mismatch")
 
+        if metadata.get("role") == "content" and metadata.get("type") == "data":
+            if isinstance(component.get("provider_runtime"), dict):
+                errors.append(f"{name}: native provider requires provider capsule metadata")
+                continue
+            for platform, info in sorted((metadata.get("platforms") or {}).items()):
+                if not isinstance(info, dict) or info.get("install_path") != expected_install_path:
+                    errors.append(f"{name}: content capsule_metadata {platform} install_path mismatch")
+                    continue
+                root = info.get("extract_path")
+                if (not non_empty(root) or "\\" in root
+                        or any(part in {"", ".", ".."} for part in root.split("/"))):
+                    errors.append(f"{name}: content capsule_metadata {platform} extract_path is unsafe")
+            continue
+        if "role" in metadata or "type" in metadata:
+            errors.append(f"{name}: capsule_metadata content role/type mismatch")
+            continue
         capsule_root = source_capsule_root(source_root, name) if source_root else None
         if capsule_root is None:
             if source_root is not None:
