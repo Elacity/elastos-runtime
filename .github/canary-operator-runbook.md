@@ -8,8 +8,8 @@ isolated Mac HOME; the existing Mac account and Home data stay in place.
 ## Approved input identities
 
 - Repository: `Elacity/elastos-runtime`.
-- Source: `8a9dec16b4febfac5759883ec7462e1ea780dd59`.
-- Source tree: `e18d17a3431b4d2548796347528e28afee909e35`.
+- Exact source commit and tree: read `receipts/build.json` and match them to
+  the accepted source and CI receipt linked in #89.
 - Source CI: <https://github.com/Elacity/elastos-runtime/actions/runs/37086607684>.
 - Native builder: <https://github.com/Elacity/elastos-runtime/actions/runs/37088374176>.
 - Draft versions: V1 `0.8.0-alpha.1`, V2 `0.8.0-alpha.2`; channel `canary`.
