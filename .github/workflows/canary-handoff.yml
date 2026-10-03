@@ -263,6 +263,7 @@ jobs:
               assert len(matches) == 1
               return matches[0]
           public_program = operator_python('"$PINNED_PYTHON" -I -S - "$INPUTS" "$CUSTODY/verified-baseline-receipt.json"')
+          permission_program = operator_python('python3 -I -S - "$SEED_DATA_DIR"')
           seed_program = operator_python('python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT"')
           migration = scratch / 'migration-qualification'
           migration.mkdir(mode=0o700)
@@ -310,6 +311,70 @@ jobs:
           provision(writable, False)
           assert not (writable / 'ElastOS').exists()
           checks.append('writable data parent refused before receipt creation')
+          def legacy_tree(label, mode=0o775):
+              data = migration / label
+              data.mkdir(mode=0o700)
+              directories = []
+              current = data
+              for name in ['ElastOS', 'SystemServices', 'Publisher']:
+                  current = current / name
+                  current.mkdir(mode=0o700)
+                  current.chmod(mode)
+                  directories.append(current)
+              return data, directories
+          def normalize(data, succeeds):
+              result = subprocess.run([sys.executable, '-I', '-S', '-', str(data)],
+                                      input=permission_program.encode(), env={'PATH': '/usr/bin:/bin'}, capture_output=True, timeout=30)
+              assert (result.returncode == 0) == succeeds
+          for mode in [0o775, 0o2775, 0o1775]:
+              legacy, directories = legacy_tree('legacy-mode-' + oct(mode), mode)
+              preserved = directories[-1] / 'preserved-public-input.json'
+              preserved.write_bytes(baseline.read_bytes())
+              preserved.chmod(0o600)
+              normalize(legacy, True)
+              assert all(stat.S_IMODE(path.stat().st_mode) == mode & ~stat.S_IWGRP for path in directories)
+              assert stat.S_IMODE(legacy.stat().st_mode) == 0o700
+              assert preserved.read_bytes() == baseline.read_bytes() and stat.S_IMODE(preserved.stat().st_mode) == 0o600
+              provision(legacy, True)
+              assert (directories[-1] / 'publish-state.json').read_bytes() == baseline.read_bytes()
+              checks.append('legacy ' + oct(mode) + ' removes only group write and admits the strict migration')
+          def unchanged(paths):
+              return [(path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_uid,
+                       stat.S_IMODE(path.lstat().st_mode)) for path in paths]
+          for level in range(4):
+              legacy, directories = legacy_tree('legacy-link-' + str(level))
+              target = [legacy, *directories][level]
+              moved = target.with_name(target.name + '-preserved')
+              target.rename(moved)
+              target.symlink_to(moved, target_is_directory=True)
+              paths = [legacy, *directories, moved]
+              before = unchanged(paths)
+              normalize(legacy, False)
+              assert unchanged(paths) == before
+              checks.append('legacy directory link at level ' + str(level) + ' refused before permission changes')
+          legacy, directories = legacy_tree('legacy-ancestor-target')
+          alias = migration / 'legacy-ancestor-link'
+          alias.symlink_to(migration, target_is_directory=True)
+          paths = [legacy, *directories, alias]
+          before = unchanged(paths)
+          normalize(alias / legacy.name, False)
+          assert unchanged(paths) == before
+          checks.append('legacy data ancestor link refused before permission changes')
+          for failure in ['foreign-owner', 'world-write', 'writable-data']:
+              legacy, directories = legacy_tree('legacy-' + failure)
+              if failure == 'foreign-owner':
+                  # Fixture ownership is changed only inside this disposable
+                  # hosted runner. The operator procedure uses its own UID.
+                  subprocess.run(['sudo', 'chown', '0:0', str(directories[-1])], check=True, timeout=15)
+              elif failure == 'world-write':
+                  directories[-1].chmod(0o777)
+              else:
+                  legacy.chmod(0o770)
+              paths = [legacy, *directories]
+              before = unchanged(paths)
+              normalize(legacy, False)
+              assert unchanged(paths) == before
+              checks.append('legacy ' + failure + ' refused before permission changes')
           shutil.rmtree(migration)
           (root / 'receipts/migration-qualification.json').write_text(json.dumps({
               'checks': checks, 'all_passed': True, 'isolated_data_removed': True,

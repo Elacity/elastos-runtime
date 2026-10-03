@@ -318,6 +318,50 @@ instance's selected data directory and `BASELINE_RECEIPT` to that verified
 staging file. The canonical destination belongs to Publisher; consumer trust
 configuration stays with the installed client.
 
+During the approved window, stop the existing Runtime before changing its
+Publisher parents. If the three existing directories `ElastOS`,
+`SystemServices` and `Publisher` have legacy group write, run this step as
+the service owner. It checks all three before changing permissions, removes
+only group write and preserves their other mode bits. The absolute data root
+keeps its permissions. Links, foreign owners and world write require a new
+operator decision; this step leaves their permissions intact.
+
+```bash
+set -euo pipefail
+python3 -I -S - "$SEED_DATA_DIR" <<'PY'
+import os, stat, sys
+from pathlib import Path
+data = Path(sys.argv[1])
+assert data.is_absolute() and '..' not in data.parts
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+descriptors = [os.open('/', flags)]
+try:
+    for part in data.parts[1:]:
+        descriptors.append(os.open(part, flags, dir_fd=descriptors[-1]))
+    metadata = os.fstat(descriptors[-1])
+    assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid() and metadata.st_mode & 0o022 == 0
+    approved = []
+    for name in ['ElastOS', 'SystemServices', 'Publisher']:
+        descriptor = os.open(name, flags, dir_fd=descriptors[-1])
+        descriptors.append(descriptor)
+        metadata = os.fstat(descriptor)
+        assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid() and metadata.st_mode & 0o002 == 0
+        approved.append((descriptor, metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode)))
+    for descriptor, device, inode, mode in approved:
+        os.fchmod(descriptor, mode & ~stat.S_IWGRP)
+        metadata = os.fstat(descriptor)
+        assert (metadata.st_dev, metadata.st_ino, metadata.st_uid) == (device, inode, os.geteuid())
+        assert stat.S_IMODE(metadata.st_mode) == mode & ~stat.S_IWGRP
+    print('Publisher parent group write removed; other permissions and files preserved.')
+finally:
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+PY
+```
+
+Run the strict receipt migration below after this permission check. A writable
+data root remains a refused case and requires an operator decision.
+
 ```bash
 set -euo pipefail
 python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT" <<'PY'
