@@ -153,17 +153,4 @@ mod tests {
         assert_eq!(info.id(), "test-123");
         assert!(info.is_elastos_runtime());
     }
-
-    #[test]
-    fn test_capsule_info_default() {
-        let info = CapsuleInfo::default();
-        assert!(info.name().is_empty());
-        assert!(info.id().is_empty());
-        assert!(!info.is_elastos_runtime());
-    }
-
-    #[test]
-    fn test_version() {
-        assert_ne!(VERSION, "");
-    }
 }

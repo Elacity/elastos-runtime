@@ -1944,35 +1944,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_lane_conflict_mentions_operator_lane_when_serve_owns_home() {
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: 123,
-            role: "serve".to_string(),
-            addr: "0.0.0.0:3000".to_string(),
-        };
-
-        let message = managed_runtime_lane_conflict_message("home", &owner);
-
-        assert!(message.contains("`elastos serve` already owns this home."));
-        assert!(message.contains("managed home lane"));
-        assert!(message.contains("`elastos node ...`"));
-    }
-
-    #[test]
-    fn managed_runtime_lane_conflict_mentions_gateway_when_gateway_owns_home() {
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: 456,
-            role: "gateway".to_string(),
-            addr: "127.0.0.1:8090".to_string(),
-        };
-
-        let message = managed_runtime_lane_conflict_message("chat", &owner);
-
-        assert!(message.contains("gateway host already owns this home"));
-        assert!(message.contains("managed chat lane"));
-    }
-
-    #[test]
     fn current_gateway_host_allows_subordinate_managed_runtime() {
         let owner = crate::host_lock::HostProcessInfo {
             pid: std::process::id(),

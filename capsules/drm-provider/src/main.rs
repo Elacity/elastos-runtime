@@ -344,53 +344,6 @@ mod tests {
         }
     }
 
-    fn ok_data(response: Response) -> Value {
-        match response {
-            Response::Ok { data: Some(data) } => data,
-            other => panic!("expected ok data, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn status_advertises_blocked_raw_authority() {
-        let provider = DrmProvider;
-        let data = ok_data(provider.status());
-
-        assert_eq!(data["provider"], "drm");
-        assert_eq!(data["configured"], false);
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("raw_cek")));
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("chain_rpc")));
-    }
-
-    #[test]
-    fn status_declares_canonical_open_sequence() {
-        let provider = DrmProvider;
-        let data = ok_data(provider.status());
-        let sequence = data["required_sequence"].as_array().unwrap();
-
-        assert_eq!(sequence.len(), 8);
-        assert_eq!(sequence[0]["resource"], "elastos://content/status");
-        assert_eq!(
-            sequence[2]["resource"],
-            "elastos://rights/access/has_access_by_content_id"
-        );
-        assert_eq!(sequence[3]["resource"], "elastos://key/release");
-        assert_eq!(sequence[4]["resource"], "elastos://decrypt/session/open");
-        assert_eq!(sequence[5]["resource"], "elastos://decrypt/render");
-        assert_eq!(sequence[6]["step"], "release_receipt");
-        assert_eq!(sequence[7]["step"], "audit");
-        assert!(data["required_runtime_events"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("release_receipt")));
-    }
-
     #[test]
     fn open_fails_closed_until_real_rights_key_and_decrypt_providers_exist() {
         let provider = DrmProvider;

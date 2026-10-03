@@ -782,6 +782,12 @@ mod private_request_tests {
     #[test]
     #[cfg(unix)]
     fn private_request_write_failure_kills_and_reaps_child() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                kill_and_reap(&mut self.0);
+            }
+        }
         let marker = std::env::temp_dir().join(format!(
             "elastos-browser-private-request-{}-{}",
             std::process::id(),
@@ -790,17 +796,17 @@ mod private_request_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut child = Command::new("python3")
+        let mut child = OwnedChild(Command::new("python3")
             .args([
                 "-c",
-                "import os,sys,time; os.close(0); open(sys.argv[1], 'x').close(); time.sleep(30)",
+                "import os,sys,threading; os.close(0); open(sys.argv[1], 'x').close(); threading.Event().wait()",
             ])
             .arg(&marker)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
         for _ in 0..1000 {
             if marker.exists() {
                 break;
@@ -808,23 +814,22 @@ mod private_request_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         if !marker.exists() {
-            let status = child.try_wait().unwrap();
-            kill_and_reap(&mut child);
+            let status = child.0.try_wait().unwrap();
             panic!(
                 "Python pipe fixture did not create marker within 10 s; child status: {status:?}"
             );
         }
 
         // A pipe read end forces a write error independently of inherited readers.
-        let read_end: std::os::fd::OwnedFd = child.stdout.take().unwrap().into();
-        child.stdin = Some(read_end.into());
-        let result = write_private_supervisor_request(&mut child, b"private request");
+        let read_end: std::os::fd::OwnedFd = child.0.stdout.take().unwrap().into();
+        child.0.stdin = Some(read_end.into());
+        let result = write_private_supervisor_request(&mut child.0, b"private request");
 
         assert!(result
             .unwrap_err()
             .message
             .contains("private request write failed"));
-        assert!(child.try_wait().unwrap().is_some());
+        assert!(child.0.try_wait().unwrap().is_some());
         let _ = fs::remove_file(marker);
     }
 }

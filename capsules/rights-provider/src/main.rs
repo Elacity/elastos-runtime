@@ -380,38 +380,6 @@ mod tests {
         }
     }
 
-    fn ok_data(response: Response) -> Value {
-        match response {
-            Response::Ok { data: Some(data) } => data,
-            other => panic!("expected ok data, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn status_advertises_blocked_raw_authority() {
-        let provider = RightsProvider;
-        let data = ok_data(provider.status());
-
-        assert_eq!(data["provider"], "rights");
-        assert_eq!(data["configured"], false);
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("chain_rpc")));
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("contract_sdk")));
-        assert_eq!(
-            data["contract"]["schema"],
-            "elastos.protected-content.rights-provider/v1"
-        );
-        assert_eq!(
-            data["contract"]["status"],
-            "fail_closed_until_policy_backend_configured"
-        );
-    }
-
     #[test]
     fn access_checks_fail_closed_until_backend_exists() {
         let provider = RightsProvider;

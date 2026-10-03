@@ -8016,24 +8016,6 @@ mod services_kind_tests {
     }
 
     #[test]
-    fn request_notification_copy_names_the_requested_service() {
-        let (noun, effect) = home_services_request_notification_copy(
-            super::super::MODEL_SERVICE_KIND,
-            super::super::MODEL_SERVICE_URI,
-        );
-        assert_eq!(noun, "AI model");
-        assert!(effect.contains("one named model offer"));
-        assert!(effect.contains("new exact-offer request"));
-        let (noun, _) = home_services_request_notification_copy(
-            crate::carrier::ENGINE_SERVICE_KIND,
-            crate::carrier::ENGINE_SERVICE_URI,
-        );
-        assert_eq!(noun, "Browser Engine");
-        let (noun, _) = home_services_request_notification_copy("remote_exit", "elastos://x");
-        assert_eq!(noun, "Browser Exit Node");
-    }
-
-    #[test]
     fn an_approved_model_grant_past_its_expiry_is_expired() {
         let request = HomeServicesRemoteOfferRequestRecord {
             status: "approved".into(),

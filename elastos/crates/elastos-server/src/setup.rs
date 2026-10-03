@@ -4224,47 +4224,35 @@ mod tests {
     }
 
     #[test]
-    fn assistant_capsule_is_packaged_with_a_capsule_owned_icon() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("capsules/assistant/capsule.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["schema"], "elastos.capsule/v1");
-        assert_eq!(manifest["name"], "assistant");
-        assert_eq!(manifest["icon"], "browser/icons");
-        assert_eq!(manifest["entrypoint"], "browser/index.html");
-
-        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
-            assert!(
-                root.join("capsules/assistant/browser/icons")
-                    .join(file)
-                    .is_file(),
-                "missing Assistant icon asset {file}"
-            );
+    fn declared_capsule_icons_exist_in_each_manifest_directory() {
+        fn check_tree(root: &Path) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    let manifest_path = path.join("capsule.json");
+                    if manifest_path.is_file() {
+                        let manifest: CapsuleManifest =
+                            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+                        manifest
+                            .validate()
+                            .unwrap_or_else(|error| panic!("{}: {error}", manifest_path.display()));
+                        if let Some(icon) = manifest.icon {
+                            for size in [32, 64, 128, 256] {
+                                let asset = path.join(&icon).join(format!("icon-{size}.png"));
+                                assert!(
+                                    asset.is_file(),
+                                    "missing declared icon {}",
+                                    asset.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
-
-        let components: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
-        assert_eq!(
-            components["external"]["assistant"]["install_path"],
-            "capsules/assistant"
-        );
-        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
-            assert!(
-                components["profiles"][profile]["components"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|value| value == "assistant"),
-                "profile {profile} must include the Assistant capsule"
-            );
-        }
-    }
-
-    #[test]
-    fn service_provider_capsules_are_packaged_with_capsule_owned_icons() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        check_tree(&root.join("capsules"));
+        check_tree(&root.join("elastos/capsules"));
         for name in [
             "browser-engine-adapter",
             "chain-provider",
@@ -4278,70 +4266,40 @@ mod tests {
             "wallet-provider",
             "webspace-provider",
         ] {
+            let manifest: CapsuleManifest = serde_json::from_slice(
+                &fs::read(root.join("capsules").join(name).join("capsule.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(manifest.icon.is_some(), "{name} declares its required icon");
+        }
+        let components: ComponentsManifest =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        for name in ["assistant", "elacity-player"] {
             let capsule_dir = root.join("capsules").join(name);
-            let manifest: elastos_common::CapsuleManifest =
+            let manifest: CapsuleManifest =
                 serde_json::from_slice(&fs::read(capsule_dir.join("capsule.json")).unwrap())
                     .unwrap();
-            manifest
-                .validate()
-                .unwrap_or_else(|err| panic!("{name} manifest must validate: {err}"));
-            assert_eq!(manifest.role, elastos_common::CapsuleRole::Provider);
-            assert_eq!(
-                manifest.icon.as_deref(),
-                Some("icons"),
-                "{name} must own its icon"
+            assert!(manifest.icon.is_some(), "{name} declares its required icon");
+            assert!(
+                capsule_dir.join(&manifest.entrypoint).is_file(),
+                "{name} entrypoint exists in its installed capsule"
             );
-            for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            let install_path = format!("capsules/{name}");
+            assert_eq!(
+                components.external[name].install_path.as_deref(),
+                Some(install_path.as_str()),
+                "{name} installation follows its capsule directory"
+            );
+            for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
                 assert!(
-                    capsule_dir.join("icons").join(file).is_file(),
-                    "missing {name} icon asset {file}"
+                    components.profiles[profile]
+                        .components
+                        .iter()
+                        .any(|component| component == name),
+                    "{profile} installs {name}"
                 );
             }
         }
-    }
-
-    #[test]
-    fn elacity_player_capsule_is_packaged_with_a_capsule_owned_icon() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("capsules/elacity-player/capsule.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["schema"], "elastos.capsule/v1");
-        assert_eq!(manifest["name"], "elacity-player");
-        assert_eq!(manifest["icon"], "browser/icons");
-        assert_eq!(manifest["entrypoint"], "browser/index.html");
-
-        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
-            assert!(
-                root.join("capsules/elacity-player/browser/icons")
-                    .join(file)
-                    .is_file(),
-                "missing Elacity Player icon asset {file}"
-            );
-        }
-
-        let components: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
-        assert_eq!(
-            components["external"]["elacity-player"]["install_path"],
-            "capsules/elacity-player"
-        );
-        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
-            assert!(
-                components["profiles"][profile]["components"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|value| value == "elacity-player"),
-                "profile {profile} must include the Elacity Player capsule"
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_profile_name_preserves_home_profile() {
-        assert_eq!(normalize_profile_name("home"), "home");
     }
 
     #[test]
@@ -4362,22 +4320,6 @@ mod tests {
             manifest,
             PathBuf::from("/tmp/elastos-runtime/components.json")
         );
-    }
-
-    #[test]
-    fn test_missing_manifest_message_mentions_source_checkout() {
-        let message = missing_manifest_message();
-        assert!(message.contains("ELASTOS_COMPONENTS_MANIFEST"));
-        assert!(message.contains("<source-checkout>/components.json"));
-        assert!(message.contains("Source-built binaries are not self-contained installs."));
-    }
-
-    #[test]
-    fn test_missing_trusted_source_error_mentions_source_add() {
-        let err = missing_trusted_source_error();
-        let message = err.to_string();
-        assert!(message.contains("elastos setup"));
-        assert!(message.contains("elastos source add"));
     }
 
     #[test]

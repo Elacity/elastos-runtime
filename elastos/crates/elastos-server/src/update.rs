@@ -1543,11 +1543,32 @@ fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::extract::Path as AxumPath;
-    use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
+
+    #[tokio::test]
+    async fn test_fetch_cid_via_gateways_uses_ipfs_path() {
+        use axum::{body::Body, extract::Path as AxumPath, http::StatusCode};
+
+        async fn handler(AxumPath(cid): AxumPath<String>) -> (StatusCode, Body) {
+            assert_eq!(cid, "bafy-test-cid");
+            (StatusCode::OK, Body::from("gateway-bytes"))
+        }
+
+        let app = Router::new().route("/ipfs/:cid", get(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let bytes = fetch_cid_via_gateways("bafy-test-cid", &[format!("http://{}", addr)])
+            .await
+            .unwrap();
+        server.shutdown().await;
+        assert_eq!(bytes, b"gateway-bytes");
+    }
 
     fn raw_cid(bytes: &[u8]) -> String {
         use sha2::Digest;
@@ -3064,44 +3085,5 @@ mod tests {
         assert!(msg.contains(&bin.display().to_string()));
         assert!(msg.contains("Installed binary version check failed"));
         assert!(msg.contains("permission denied"));
-    }
-
-    #[tokio::test]
-    async fn test_fetch_cid_via_gateways_uses_ipfs_path() {
-        async fn handler(AxumPath(cid): AxumPath<String>) -> (StatusCode, Body) {
-            assert_eq!(cid, "bafy-test-cid");
-            (StatusCode::OK, Body::from("gateway-bytes"))
-        }
-
-        let app = Router::new().route("/ipfs/:cid", get(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let bytes = fetch_cid_via_gateways("bafy-test-cid", &[format!("http://{}", addr)])
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"gateway-bytes");
-    }
-
-    #[tokio::test]
-    async fn test_fetch_release_manifest_via_gateway_uses_release_json_path() {
-        async fn handler() -> (StatusCode, Body) {
-            (StatusCode::OK, Body::from("release-manifest"))
-        }
-
-        let app = Router::new().route("/release.json", get(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let bytes = fetch_release_manifest_via_gateway(&format!("http://{}", addr))
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"release-manifest");
     }
 }

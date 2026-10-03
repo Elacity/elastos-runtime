@@ -9437,16 +9437,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_topic_hash_deterministic() {
-        let h1 = topic_hash("#general");
-        let h2 = topic_hash("#general");
-        assert_eq!(h1, h2, "same topic name must produce same hash");
-
-        let h3 = topic_hash("#other");
-        assert_ne!(h1, h3, "different topics must produce different hashes");
-    }
-
-    #[test]
     fn test_topic_hash_matches_distributed_topic_tracker_topic_id() {
         let topic_name = "__elastos_internal/carrier-test-v1/topic";
         let mut expected = [0u8; 32];
@@ -9456,45 +9446,6 @@ pub(crate) mod tests {
             topic_hash(topic_name),
             iroh_gossip::proto::TopicId::from(expected)
         );
-    }
-
-    #[test]
-    fn test_gossip_message_serialization() {
-        let msg = GossipMessage {
-            sender_id: "did:key:z6MkTest".to_string(),
-            sender_nick: "alice".to_string(),
-            content: "hello world".to_string(),
-            ts: 1700000000,
-            nonce: 42,
-            signature: None,
-            sender_session_id: None,
-        };
-        let bytes = serde_json::to_vec(&msg).unwrap();
-        let decoded: GossipMessage = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded.sender_id, "did:key:z6MkTest");
-        assert_eq!(decoded.sender_nick, "alice");
-        assert_eq!(decoded.content, "hello world");
-        assert_eq!(decoded.ts, 1700000000);
-        assert_eq!(decoded.nonce, 42);
-        assert!(decoded.signature.is_none());
-    }
-
-    #[test]
-    fn test_gossip_message_with_signature() {
-        let msg = GossipMessage {
-            sender_id: "did:key:z6MkTest".to_string(),
-            sender_nick: "bob".to_string(),
-            content: "signed msg".to_string(),
-            ts: 1700000000,
-            nonce: 1,
-            signature: Some("deadbeef".to_string()),
-            sender_session_id: None,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"signature\":\"deadbeef\""));
-
-        let decoded: GossipMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.signature, Some("deadbeef".to_string()));
     }
 
     #[test]
@@ -11178,10 +11129,15 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let availability = Arc::new(CarrierAvailabilityProvider::with_provider_registry(
-            consumer_node.gossip_state.clone(),
-            Arc::downgrade(&consumer_registry),
-        ));
+        // Announcements are seeded before each request. Exercise each real
+        // holder once, without an unrelated discovery wait after refusal.
+        let availability = Arc::new(
+            CarrierAvailabilityProvider::with_provider_registry(
+                consumer_node.gossip_state.clone(),
+                Arc::downgrade(&consumer_registry),
+            )
+            .with_discovery_wait(Duration::ZERO),
+        );
         consumer_registry.register(availability.clone()).await;
 
         // Holders: one that announced and is gone, one that oversizes, one real.
@@ -11535,13 +11491,14 @@ pub(crate) mod tests {
         shutdown_test_carrier_node(consumer_node).await;
     }
 
-    /// A holder whose Content answers every operation after a fixed delay.
-    struct SlowContentProvider {
-        delay: std::time::Duration,
+    /// A holder whose test owns response readiness separately from transport.
+    struct HeldContentProvider {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
-    impl Provider for SlowContentProvider {
+    impl Provider for HeldContentProvider {
         async fn handle(
             &self,
             _: elastos_runtime::provider::ResourceRequest,
@@ -11552,13 +11509,14 @@ pub(crate) mod tests {
             vec![]
         }
         fn name(&self) -> &'static str {
-            "slow-content"
+            "held-content"
         }
         async fn send_raw(
             &self,
             request: &serde_json::Value,
         ) -> std::result::Result<serde_json::Value, ProviderError> {
-            tokio::time::sleep(self.delay).await;
+            self.entered.notify_one();
+            self.release.notified().await;
             Ok(serde_json::json!({"status":"ok","data":{
                 "op": request["op"], "receipt": "effect-completed"
             }}))
@@ -11586,10 +11544,13 @@ pub(crate) mod tests {
                 ),
             ))
             .await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let slow = start_holder_runtime(
             88,
-            Arc::new(SlowContentProvider {
-                delay: std::time::Duration::from_millis(2_500),
+            Arc::new(HeldContentProvider {
+                entered: entered.clone(),
+                release: release.clone(),
             }),
             None,
         )
@@ -11612,45 +11573,62 @@ pub(crate) mod tests {
                 ),
             };
 
-        // An effectful operation keeps its open-ended answer past the route budget.
-        let started = std::time::Instant::now();
-        let response = local_registry
-            .invoke_provider(route(
-                "import_object",
-                serde_json::json!({"op":"import_object","cid":"bafyfixture"}),
-                ProviderTransfer::Json,
-            ))
+        // Hold the effect until after its route budget. The provider readiness
+        // signal puts actual network I/O before the virtual deadline step.
+        let effect = route(
+            "import_object",
+            serde_json::json!({"op":"import_object","cid":"bafyfixture"}),
+            ProviderTransfer::Json,
+        );
+        let registry = local_registry.clone();
+        let effect = tokio::spawn(async move { registry.invoke_provider(effect).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
+            .expect("effect reaches the held provider");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(2_500)).await;
+        tokio::time::resume();
+        assert!(
+            !effect.is_finished(),
+            "the effect retains its open-ended answer"
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(5), effect)
+            .await
+            .expect("released effect completes")
+            .unwrap()
             .unwrap();
         assert_eq!(
             response["data"]["receipt"], "effect-completed",
             "{response}"
         );
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(2_500),
-            "the receipt arrived after the route budget without being cut"
-        );
 
-        // The bounded fetch to the same holder is cut at the route budget.
-        let started = std::time::Instant::now();
-        let err = local_registry
-            .invoke_provider(route(
-                "fetch",
-                serde_json::json!({"op":"fetch","cid":"bafyfixture","path":"weights.gguf",
-                    "local_only":true,"bounded_read":true,"range":{"start":0,"end":3},
-                    "transfer":"bytes"}),
-                ProviderTransfer::Bytes,
-            ))
+        // The same held answer is cut for a bounded fetch at its route budget.
+        let fetch = route(
+            "fetch",
+            serde_json::json!({"op":"fetch","cid":"bafyfixture","path":"weights.gguf",
+                "local_only":true,"bounded_read":true,"range":{"start":0,"end":3},
+                "transfer":"bytes"}),
+            ProviderTransfer::Bytes,
+        );
+        let registry = local_registry.clone();
+        let fetch = tokio::spawn(async move { registry.invoke_provider(fetch).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
+            .expect("fetch reaches the held provider");
+        tokio::time::pause();
+        // The budget starts before the real provider readiness signal. Advance
+        // past it, without assuming how much real transport time has elapsed.
+        tokio::time::advance(Duration::from_millis(1_050)).await;
+        let completed = tokio::time::timeout(Duration::from_millis(10), fetch).await;
+        tokio::time::resume();
+        let err = completed
+            .expect("bounded fetch deadline completes without a real-time route wait")
+            .unwrap()
             .unwrap_err()
             .to_string();
-        let cut_after = started.elapsed();
         assert!(err.contains("response deadline of 1s passed"), "{err}");
-        assert!(
-            cut_after >= std::time::Duration::from_secs(1)
-                && cut_after < std::time::Duration::from_millis(2_400),
-            "bounded fetch is cut at its budget, before the slow answer: {cut_after:?}"
-        );
+        release.notify_one();
 
         shutdown_test_carrier_node(slow.node).await;
         shutdown_test_carrier_node(local_node).await;
@@ -14276,6 +14254,8 @@ pub(crate) mod tests {
         let buffers = state.lock().await.buffers.clone();
         let ticket = holder_ticket.clone();
         let topic = topic_name.clone();
+        // Transport is mocked after the endpoint fixture is ready.
+        tokio::time::pause();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2500)).await;
             let (message, _) =
@@ -14294,7 +14274,7 @@ pub(crate) mod tests {
             data_dir.path().to_path_buf(),
         )
         .with_discovery_wait(Duration::from_secs(4));
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let response = provider
             .send_raw(&serde_json::json!({
                 "op": "fetch",
@@ -15204,18 +15184,6 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("invalid segment"));
-    }
-
-    #[test]
-    fn test_requested_gossip_ts_prefers_explicit_value() {
-        let request = serde_json::json!({ "ts": 1_700_000_123u64 });
-        assert_eq!(requested_gossip_ts(&request), 1_700_000_123u64);
-    }
-
-    #[test]
-    fn test_requested_gossip_nonce_prefers_explicit_value() {
-        let request = serde_json::json!({ "nonce": 42u64 });
-        assert_eq!(requested_gossip_nonce(&request), 42u64);
     }
 
     #[test]

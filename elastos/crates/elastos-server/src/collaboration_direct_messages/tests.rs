@@ -760,7 +760,7 @@ async fn incoming_direct_message_notifies_until_the_conversation_is_read() {
 async fn bilateral_removal_delivers_the_signed_revocation_and_both_sides_stay_visible() {
     let temp = tempfile::tempdir().unwrap();
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     let now = now_ts();
     let a_did = pair.profile_a.document().profile_did.clone();
     let b_did = pair.profile_b.document().profile_did.clone();
@@ -842,7 +842,7 @@ async fn bilateral_removal_delivers_the_signed_revocation_and_both_sides_stay_vi
 async fn abandoned_message_reads_expired_never_pending_and_a_receipt_still_wins() {
     let temp = tempfile::tempdir().unwrap();
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     // The recipient never comes back: the envelope stays durable and unsettled.
     pair._node_b.endpoint.close().await;
 
@@ -928,7 +928,7 @@ async fn abandoned_message_reads_expired_never_pending_and_a_receipt_still_wins(
 async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
     let temp = tempfile::tempdir().unwrap();
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     pair._node_b.endpoint.close().await;
 
     let direct_a = pair.service_a.direct_message_service();
@@ -986,7 +986,9 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
     restarted_b
         .memory_lookup
         .add_endpoint_info(pair._node_a.endpoint.watch_addr().get());
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    crate::collaboration_discovery_runtime::tests::connect_peer_pair(&pair._node_a, &restarted_b)
+        .await;
 
     restarted
         .retry_pending(&pair.profile_a.document().profile_did, now_ts())
@@ -1030,7 +1032,7 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
 async fn retry_filters_invalid_and_removed_records_before_its_bounded_budget() {
     let temp = tempfile::tempdir().unwrap();
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     let direct_a = pair.service_a.direct_message_service();
     let context = direct_a
         .context(&pair.profile_a.document().profile_did, now_ts())
@@ -1158,7 +1160,7 @@ async fn unavailable_first_contact_does_not_starve_later_reachable_pending_messa
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
     let (offline_did, offline_conversation) =
         crate::collaboration_discovery_runtime::tests::add_offline_accepted_contact(&pair);
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     let direct = pair.service_a.direct_message_service();
     let context = direct
         .context(&pair.profile_a.document().profile_did, now_ts())
@@ -1471,7 +1473,7 @@ async fn accepted_contacts_exchange_direct_messages_without_bootstrap_peers_or_s
         .is_empty());
     assert!(!pair.store_a.discovery_enabled().unwrap());
     assert!(!pair.store_b.discovery_enabled().unwrap());
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     let direct_a = pair.service_a.direct_message_service();
     let direct_b = pair.service_b.direct_message_service();
     let outcome_a = direct_a

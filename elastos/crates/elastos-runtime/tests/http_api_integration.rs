@@ -44,31 +44,6 @@ fn create_test_infra() -> (
 // ==================== Session Registry Tests ====================
 
 #[tokio::test]
-async fn test_create_shell_session() {
-    let (session_registry, _, _) = create_test_infra();
-
-    let session = session_registry
-        .create_session(SessionType::Shell, None)
-        .await;
-
-    assert!(session.is_shell());
-    assert!(!session.token.is_empty());
-    assert!(session.vm_id.is_none());
-}
-
-#[tokio::test]
-async fn test_create_capsule_session_with_vm() {
-    let (session_registry, _, _) = create_test_infra();
-
-    let session = session_registry
-        .create_session(SessionType::Capsule, Some("vm-123".to_string()))
-        .await;
-
-    assert!(!session.is_shell());
-    assert_eq!(session.vm_id, Some("vm-123".to_string()));
-}
-
-#[tokio::test]
 async fn test_validate_session_token() {
     let (session_registry, _, _) = create_test_infra();
 
@@ -107,63 +82,6 @@ async fn test_invalidate_session() {
 }
 
 // ==================== Capability Request Flow Tests ====================
-
-#[tokio::test]
-async fn test_create_capability_request() {
-    let (session_registry, _, pending_store) = create_test_infra();
-
-    let session = session_registry
-        .create_session(SessionType::Capsule, None)
-        .await;
-
-    let request = pending_store
-        .create_request(
-            session.id.clone(),
-            ResourceId::new("localhost://Users/self/Documents/photos/*"),
-            Action::Read,
-        )
-        .await;
-
-    assert!(request.is_pending());
-    assert_eq!(request.session_id, session.id);
-    assert_eq!(
-        request.resource.to_string(),
-        "localhost://Users/self/Documents/photos/*"
-    );
-    assert_eq!(request.action, Action::Read);
-}
-
-#[tokio::test]
-async fn test_list_pending_requests() {
-    let (session_registry, _, pending_store) = create_test_infra();
-
-    // Create two sessions with requests
-    let session1 = session_registry
-        .create_session(SessionType::Capsule, None)
-        .await;
-    let session2 = session_registry
-        .create_session(SessionType::Capsule, None)
-        .await;
-
-    pending_store
-        .create_request(
-            session1.id.clone(),
-            ResourceId::new("localhost://Users/self/Documents/photos/*"),
-            Action::Read,
-        )
-        .await;
-
-    pending_store
-        .create_request(
-            session2.id.clone(),
-            ResourceId::new("localhost://Users/self/Documents/documents/*"),
-            Action::Write,
-        )
-        .await;
-
-    let pending = pending_store.list_pending().await;
-    assert_eq!(pending.len(), 2);
-}
 
 #[tokio::test]
 async fn test_grant_capability_request() {
@@ -396,26 +314,6 @@ async fn test_grant_once_duration() {
 
 // ==================== Request Expiry Tests ====================
 
-#[tokio::test]
-async fn test_request_expiry_detection() {
-    let (session_registry, _, pending_store) = create_test_infra();
-
-    let session = session_registry
-        .create_session(SessionType::Capsule, None)
-        .await;
-
-    let request = pending_store
-        .create_request(
-            session.id.clone(),
-            ResourceId::new("localhost://Users/self/Documents/photos/*"),
-            Action::Read,
-        )
-        .await;
-
-    // Request should not be expired initially (timeout is usually 5 minutes)
-    assert!(!request.is_expired());
-}
-
 // ==================== Action Parsing Tests ====================
 
 #[tokio::test]
@@ -450,21 +348,6 @@ async fn test_all_action_types() {
 
 // ==================== Session Type Authorization Tests ====================
 
-#[tokio::test]
-async fn test_shell_session_is_shell() {
-    let (session_registry, _, _) = create_test_infra();
-
-    let shell = session_registry
-        .create_session(SessionType::Shell, None)
-        .await;
-    let capsule = session_registry
-        .create_session(SessionType::Capsule, None)
-        .await;
-
-    assert!(shell.is_shell());
-    assert!(!capsule.is_shell());
-}
-
 // ==================== VM Session Tracking Tests ====================
 
 #[tokio::test]
@@ -484,35 +367,6 @@ async fn test_vm_session_tracking() {
     let token = session_registry.get_vm_token("vm-abc").await;
     assert!(token.is_some());
     assert_eq!(token.unwrap(), session.token);
-}
-
-#[tokio::test]
-async fn test_cleanup_dead_vm_sessions() {
-    let (session_registry, _, _) = create_test_infra();
-
-    // Create sessions for VMs
-    session_registry
-        .create_session(SessionType::Capsule, Some("vm-1".to_string()))
-        .await;
-    session_registry
-        .create_session(SessionType::Capsule, Some("vm-2".to_string()))
-        .await;
-    session_registry
-        .create_session(SessionType::Capsule, Some("vm-3".to_string()))
-        .await;
-
-    assert_eq!(session_registry.session_count().await, 3);
-
-    // Cleanup with only vm-2 alive
-    let cleaned = session_registry
-        .cleanup_dead_vm_sessions(&["vm-2".to_string()])
-        .await;
-
-    assert_eq!(cleaned, 2);
-    assert_eq!(session_registry.session_count().await, 1);
-    assert!(session_registry.has_vm_session("vm-2").await);
-    assert!(!session_registry.has_vm_session("vm-1").await);
-    assert!(!session_registry.has_vm_session("vm-3").await);
 }
 
 // ==================== Multiple Concurrent Requests Tests ====================

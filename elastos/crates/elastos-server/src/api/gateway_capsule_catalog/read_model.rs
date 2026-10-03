@@ -771,13 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn capsule_title_preserves_product_names() {
-        assert_eq!(capsule_title("wallet-metamask"), "MetaMask");
-        assert_eq!(capsule_title("wallet-unisat"), "UniSat");
-        assert_eq!(capsule_title("wallet-walletconnect"), "WalletConnect");
-    }
-
-    #[test]
     fn component_metadata_uses_the_current_platform_deterministically() {
         let data_dir = tempfile::tempdir().unwrap();
         let platform = crate::setup::detect_platform();

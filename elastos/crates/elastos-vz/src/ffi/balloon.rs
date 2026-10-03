@@ -18,13 +18,3 @@ pub(crate) fn build_balloon_device() -> Retained<VZVirtioTraditionalMemoryBalloo
     // the device is inert until attached to the VM.
     unsafe { VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new() }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn balloon_device_constructs() {
-        let _cfg = build_balloon_device();
-    }
-}

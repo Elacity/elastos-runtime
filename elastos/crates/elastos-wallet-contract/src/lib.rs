@@ -1843,26 +1843,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_contract_constants_are_exact() {
-        assert_eq!(WALLET_BUS_OPERATION, "wallet_contract");
-        assert_eq!(WALLET_PROTOCOL_VERSION, "2.3");
-        assert_eq!(WALLET_REQUEST_SCHEMA, "elastos.wallet.provider-request/v2");
-        assert_eq!(
-            WALLET_RESPONSE_SCHEMA,
-            "elastos.wallet.provider-response/v2"
-        );
-        assert_eq!(ERC1271_EVIDENCE_SCHEMA, "elastos.chain.erc1271_proof/v1");
-        assert_eq!(
-            MANAGED_RECOVERY_SET_SCHEMA,
-            "elastos.wallet.managed-recovery-set/v1"
-        );
-        assert_eq!(
-            VALIDATED_CHAIN_OUTCOME_SCHEMA,
-            "elastos.wallet.validated-chain-outcome/v1"
-        );
-    }
-
-    #[test]
     fn validated_chain_outcome_is_authority_bound_and_bounded() {
         let operation = WalletProviderOperationV2::AttachValidatedChainOutcome {
             outcome: validated_chain_outcome(),

@@ -803,11 +803,6 @@ fn system_diagnostics_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     ]
 }
 
-#[cfg(test)]
-fn compact_system_lines(snapshot: &HomeSnapshot) -> Vec<String> {
-    system_settings_lines(snapshot)
-}
-
 fn active_shell_label(snapshot: &HomeSnapshot) -> String {
     snapshot
         .active_shell

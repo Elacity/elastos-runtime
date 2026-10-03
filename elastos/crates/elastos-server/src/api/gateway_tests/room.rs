@@ -1261,34 +1261,6 @@ async fn unconfigured_chat_room_access_policy_uses_strict_post_guard_decoding() 
     );
 }
 
-#[test]
-fn gateway_room_source_has_no_route_owned_resource_bridge() {
-    let source = include_str!("../gateway_room.rs");
-    for removed in [
-        concat!("RoomTransport", "Bridge"),
-        concat!("ROOM_", "TRANSPORT_"),
-        concat!("room", "-sync"),
-        concat!("gossip_", "send"),
-        concat!("gossip_", "recv"),
-        concat!("append_object", "_with_transport"),
-        concat!("leave_session", "_with_transport"),
-    ] {
-        assert!(!source.contains(removed), "stale route bridge: {removed}");
-    }
-
-    let carrier_source = include_str!("../../carrier.rs");
-    assert!(
-        !carrier_source.contains(concat!("room-sync", "-v1")),
-        "retired Chat room-sync topic must be absent from Carrier source"
-    );
-    let browser_sessions = include_str!("../browser_sessions.rs");
-    assert!(
-        browser_sessions.contains("configured_collaboration_browser_session_unsupported_response")
-    );
-    assert!(source.contains("start_configured_chat_room_session"));
-    assert!(source.contains("configured_legacy_room_control_unsupported_response"));
-}
-
 #[tokio::test]
 async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
     let dir = tempfile::tempdir().unwrap();

@@ -133,12 +133,11 @@ if mode == 'healthy_with_subtree':
     subtree = subprocess.Popen([
         sys.executable,
         '-c',
-        'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(3600)',
+        'import signal,threading; signal.signal(signal.SIGTERM, signal.SIG_IGN); threading.Event().wait()',
     ])
     record('subtree:' + str(subtree.pid))
 if mode in ('timeout', 'timeout_ignore_term'):
-    while True:
-        time.sleep(1)
+    threading.Event().wait()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):

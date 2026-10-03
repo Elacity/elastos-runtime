@@ -7767,6 +7767,20 @@ server.serve_forever()
             }
         }
 
+        struct SampledWorker {
+            owner: Arc<PreparationOwner>,
+            task: Option<tokio::task::JoinHandle<()>>,
+        }
+
+        impl Drop for SampledWorker {
+            fn drop(&mut self) {
+                // The outer proof drains owned work after timeout or panic.
+                if let Some(task) = self.task.take() {
+                    *self.owner.worker.lock().unwrap() = Some(task);
+                }
+            }
+        }
+
         fn command(binary: &Path, root: &Path, repo: &Path, cwd: &Path, args: &[&str]) -> Command {
             let mut command = Command::new(binary);
             command
@@ -8355,14 +8369,27 @@ server.serve_forever()
                 let mut last_sample = Instant::now();
                 let mut max_sample_gap_ms = 0;
                 let mut rss_peak_kib = 0;
-                while !test_owner
-                    .worker
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .is_finished()
-                {
+                let mut worker = SampledWorker {
+                    task: Some(test_owner.worker.lock().unwrap().take().unwrap()),
+                    owner: test_owner.clone(),
+                };
+                let mut sample_tick = tokio::time::interval(Duration::from_millis(if real_model {
+                    1000
+                } else {
+                    10
+                }));
+                sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    // Completion wakes the proof immediately; sampling retains
+                    // its cadence while the native worker owns real I/O.
+                    tokio::select! {
+                        result = worker.task.as_mut().unwrap() => {
+                            worker.task.take();
+                            result.unwrap();
+                            break;
+                        }
+                        _ = sample_tick.tick() => {}
+                    }
                     // A real model backend has thousands of blocks. Sample
                     // volume space and owned-process RSS, not recursive trees.
                     let stage = if real_model {
@@ -8401,10 +8428,7 @@ server.serve_forever()
                     if real_model {
                         rss_peak_kib = rss_peak_kib.max(proof_rss_kib());
                     }
-                    tokio::time::sleep(Duration::from_millis(if real_model { 1000 } else { 10 }))
-                        .await;
                 }
-                join_worker(&test_owner).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let record = load_operation(&test_data, &id).unwrap();
                 assert_eq!(record.state, PreparationState::Admitted);

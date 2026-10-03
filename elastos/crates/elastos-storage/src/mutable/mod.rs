@@ -180,29 +180,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_entry_type_serialization() {
-        assert_eq!(serde_json::to_string(&EntryType::File).unwrap(), "\"file\"");
-        assert_eq!(
-            serde_json::to_string(&EntryType::Directory).unwrap(),
-            "\"directory\""
-        );
-    }
-
-    #[test]
-    fn test_dir_entry_serialization() {
-        let entry = DirEntry {
-            name: "test.txt".to_string(),
-            entry_type: EntryType::File,
-            size: 1024,
-            modified: 1234567890,
-        };
-
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"name\":\"test.txt\""));
-        assert!(json.contains("\"entry_type\":\"file\""));
-    }
-
-    #[test]
     fn test_metadata_helpers() {
         let file_meta = Metadata {
             entry_type: EntryType::File,

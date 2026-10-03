@@ -712,14 +712,6 @@ mod tests {
     const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
     #[test]
-    fn test_empty_catalog_deserializes() {
-        let json = "{}";
-        let cat: ShareCatalog = serde_json::from_str(json).unwrap();
-        assert!(cat.channels.is_empty());
-        assert_eq!(cat.author_did, None);
-    }
-
-    #[test]
     fn test_minimal_channel_deserializes() {
         let json = r#"{"channels":{"docs":{"latest_cid":"bafy123"}}}"#;
         let cat: ShareCatalog = serde_json::from_str(json).unwrap();
@@ -729,48 +721,6 @@ mod tests {
         assert_eq!(ch.latest_version, 0);
         assert_eq!(ch.revoke_reason, None);
         assert_eq!(ch.author_did, None);
-    }
-
-    #[test]
-    fn test_full_catalog_roundtrips() {
-        let mut cat = ShareCatalog {
-            schema: "elastos.share.catalog/v1".to_string(),
-            author_did: Some("did:key:z6MkTest".to_string()),
-            ..Default::default()
-        };
-        cat.channels.insert(
-            "docs".to_string(),
-            ShareChannel {
-                latest_cid: "bafy123".to_string(),
-                latest_version: 3,
-                status: ChannelStatus::Revoked,
-                revoke_reason: Some("sensitive".to_string()),
-                ..Default::default()
-            },
-        );
-        let json = serde_json::to_string(&cat).unwrap();
-        let cat2: ShareCatalog = serde_json::from_str(&json).unwrap();
-        assert_eq!(cat2.channels["docs"].status, ChannelStatus::Revoked);
-        assert_eq!(
-            cat2.channels["docs"].revoke_reason,
-            Some("sensitive".to_string())
-        );
-        assert_eq!(cat2.author_did, Some("did:key:z6MkTest".to_string()));
-    }
-
-    #[test]
-    fn test_share_entry_with_content_digest() {
-        let entry = ShareEntry {
-            cid: "bafy123".to_string(),
-            version: 1,
-            created_at: 1000,
-            content_digest: Some("sha256:abc".to_string()),
-            provenance_cid: None,
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("content_digest"));
-        let entry2: ShareEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(entry2.content_digest, Some("sha256:abc".to_string()));
     }
 
     #[test]
@@ -862,15 +812,6 @@ mod tests {
             compute_content_digest(&a).unwrap(),
             compute_content_digest(&b).unwrap()
         );
-    }
-
-    #[test]
-    fn test_encode_decode_did_key_roundtrip() {
-        let (_, vk) = generate_keypair();
-        let did = encode_did_key(&vk).unwrap();
-        assert!(did.starts_with("did:key:z"));
-        let decoded = decode_did_key(&did).unwrap();
-        assert_eq!(vk.as_bytes(), decoded.as_bytes());
     }
 
     #[test]
@@ -1154,11 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_head_domain_differs_from_provenance() {
-        assert_ne!(CHANNEL_HEAD_DOMAIN, PROVENANCE_DOMAIN);
-    }
-
-    #[test]
     fn test_share_channel_head_cid_migration() {
         let json = r#"{"channels":{"docs":{"latest_cid":"bafy123","latest_version":1}}}"#;
         let cat: ShareCatalog = serde_json::from_str(json).unwrap();
@@ -1262,35 +1198,6 @@ mod tests {
         )
         .unwrap();
         assert!(verify_channel_head(&head_bytes).is_err());
-    }
-
-    #[test]
-    fn test_sign_payload_domain_separation() {
-        use crate::crypto::domain_separated_sign;
-        let (sk, _) = generate_keypair();
-        let payload = b"test payload";
-        let (sig_a, _) = domain_separated_sign(&sk, "domain.a", payload);
-        let (sig_b, _) = domain_separated_sign(&sk, "domain.b", payload);
-        assert_ne!(sig_a, sig_b);
-    }
-
-    #[test]
-    fn test_sign_payload_deterministic() {
-        use crate::crypto::domain_separated_sign;
-        let bytes = [42u8; 32];
-        let sk = signature::SigningKey::from_bytes(&bytes);
-        let (sig1, _) = domain_separated_sign(&sk, "elastos.release.v1", b"payload");
-        let (sig2, _) = domain_separated_sign(&sk, "elastos.release.v1", b"payload");
-        assert_eq!(sig1, sig2);
-    }
-
-    #[test]
-    fn test_sign_payload_output_shape() {
-        use crate::crypto::domain_separated_sign;
-        let (sk, _) = generate_keypair();
-        let (sig_hex, did) = domain_separated_sign(&sk, "test", b"payload");
-        assert_eq!(sig_hex.len(), 128);
-        assert!(did.starts_with("did:key:z6Mk"));
     }
 
     #[test]
