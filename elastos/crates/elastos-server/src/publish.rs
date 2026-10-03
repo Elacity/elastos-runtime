@@ -1074,7 +1074,7 @@ fn model_import_space_guard(
         capacity > 0 && free <= capacity && free >= floor + required,
         "Model directory import would cross the 15 percent free-space floor"
     );
-    Ok(u64::try_from(floor).context("Model repository floor exceeds its integer bound")?)
+    u64::try_from(floor).context("Model repository floor exceeds its integer bound")
 }
 
 async fn bounded_model_import(
@@ -2377,7 +2377,7 @@ mod tests {
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
     };
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn platform_input_options() -> PublishReleaseOptions {
         PublishReleaseOptions {
