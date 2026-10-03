@@ -24,6 +24,14 @@ SHA-256. Outputs are a new read-only publication snapshot, outside input root.
 
 This code neither builds candidates nor runs candidate tools. Production custody,
 real signing and installer integration require separate operator acceptance.
+
+The trusted signing_role defaults to release. publisher-keys accepts only
+{source: {commit, tree}, statement: unsigned publisher-keys payload} and emits
+one root signature in publisher-keys.json. Its source/tool authority uses the
+approved develop_oid independently of the statement publication channel.
+Explicit max_statement_lifetime, max_future_skew and minimum_statement_version
+policy bounds apply at one fixed admission time. A rotation output is partial;
+client admission, dual-signature assembly and publication are separate work.
 """
 
 import argparse
@@ -41,6 +49,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPOSITORY = "Elacity/elastos-runtime"
@@ -52,6 +61,7 @@ MAX_JSON = 2 * 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 CHANNELS = {"stable", "canary", "jetson-test"}
 STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID", "IPNS_NAME"}
+MAX_RELEASE_DIDS = 16
 
 
 def require(condition, message):
@@ -418,12 +428,92 @@ class Prepared:
     prev_head_cid: object
 
 
-def prepare(policy, root, manifest_name, fetch, snapshot_root):
+@dataclass(frozen=True)
+class PreparedStatement:
+    publisher_did: str
+    statement: bytes
+
+
+def signing_source_policy(policy):
+    role = policy.get("signing_role", "release")
+    require(role in ("release", "publisher-keys"), "trusted signing role refused")
+    # Statement custody uses reviewed develop authority, independently of the
+    # publication channel. Release tag/main admission remains unchanged.
+    return {**policy, "channel": "canary"} if role == "publisher-keys" else policy
+
+
+def prepare(policy, root, manifest_name, fetch, snapshot_root, now=None):
+    source_policy = signing_source_policy(policy)
+    admission_time = int(time.time()) if now is None else now
     held_root = directory_fd(root)
     try:
+        if policy.get("signing_role", "release") == "publisher-keys":
+            return prepare_statement(policy, source_policy, root, manifest_name, fetch,
+                                     snapshot_root, held_root, admission_time)
         return prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_root)
     finally:
         os.close(held_root)
+
+
+def prepare_statement(policy, source_policy, root, manifest_name, fetch, snapshot_root, held_root, now):
+    require(type(policy.get("channel")) is str and policy["channel"] in CHANNELS,
+            "trusted statement channel refused")
+    verify_source(source_policy, fetch)
+    check_did(policy.get("publisher_did"))
+    root, snapshot_root = Path(root), Path(snapshot_root)
+    require(root.is_absolute() and root == root.resolve() and snapshot_root.is_absolute()
+            and snapshot_root == snapshot_root.resolve() and not snapshot_root.is_relative_to(root),
+            "custodian snapshot must be outside canonical input root")
+    data = regular_bytes(relative_path(manifest_name), MAX_JSON, root_fd=held_root)
+    require(sha256(data) == checked_hash(policy.get("manifest_sha256")), "manifest differs from operator approval")
+    manifest = parse_json(data)
+    require(set(manifest) == {"source", "statement"}, "publisher-keys input fields refused")
+    require(manifest["source"] == {field: policy[field] for field in ("commit", "tree")},
+            "statement source differs")
+    statement = manifest["statement"]
+    require(type(statement) is dict and set(statement) == {"schema", "version", "channel", "root_did",
+            "previous_root_did", "issued_at", "expires_at", "release_dids"}, "publisher-keys fields refused")
+    require(statement["schema"] == "elastos.publisher-keys/v1"
+            and type(statement["channel"]) is str and statement["channel"] in CHANNELS
+            and statement["channel"] == policy["channel"],
+            "publisher-keys schema/channel differs")
+    for field, minimum in (("max_statement_lifetime", 1), ("max_future_skew", 0), ("minimum_statement_version", 1)):
+        require(type(policy.get(field)) is int and minimum <= policy[field] < 2**63,
+                "explicit statement policy bound required")
+    require(type(statement["version"]) is int
+            and policy["minimum_statement_version"] <= statement["version"] < 2**63,
+            "statement version rollback or type refused")
+    require(type(now) is int and 0 <= now < 2**63, "fixed admission time required")
+    issued, expires = statement["issued_at"], statement["expires_at"]
+    require(type(issued) is int and type(expires) is int and 0 <= issued < expires < 2**63,
+            "statement timestamps refused")
+    require(expires > now, "expired publisher-keys statement refused")
+    require(issued <= now + policy["max_future_skew"], "future publisher-keys statement refused")
+    require(expires - issued <= policy["max_statement_lifetime"], "statement lifetime refused")
+    roots = [statement["root_did"]]
+    check_did(roots[0])
+    previous = statement["previous_root_did"]
+    if previous is not None:
+        check_did(previous)
+        require(previous != roots[0], "distinct rotation roots required")
+        roots.append(previous)
+    require(policy["publisher_did"] in roots, "approved signer is outside statement roots")
+    delegates = statement["release_dids"]
+    require(type(delegates) is list and len(delegates) <= MAX_RELEASE_DIDS,
+            "bounded release DIDs required")
+    for did in delegates:
+        check_did(did)
+        require(did not in roots, "root cannot be a release delegate")
+    require(len(set(delegates)) == len(delegates), "distinct release DIDs required")
+    for quota in ("max_file_bytes", "max_snapshot_bytes"):
+        require(type(policy.get(quota)) is int and 0 < policy[quota] < 2**63, "trusted snapshot quota required")
+    payload = json_bytes(statement)
+    require(len(data) <= policy["max_file_bytes"] and len(payload) + 300 <= policy["max_snapshot_bytes"]
+            and len(payload) + 300 <= 256 * 1024, "statement snapshot quota refused")
+    usage = shutil.disk_usage(snapshot_root)
+    require((usage.free - 3 * MAX_JSON) * 100 >= usage.total * 15,
+            "snapshot would cross the 15 percent free-space floor")
+    return PreparedStatement(policy["publisher_did"], payload)
 
 
 def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_root):
@@ -560,11 +650,22 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
 
 
 def signature_digest(domain, payload):
-    require(domain in ("elastos.release.v1", "elastos.release.head.v1"), "signing domain refused")
+    require(domain in ("elastos.release.v1", "elastos.release.head.v1", "elastos.publisher.keys.v1"), "signing domain refused")
     return hashlib.sha256(domain.encode() + b"\0" + payload).digest()
 
 
 def sign_publication(prepared, backend):
+    if isinstance(prepared, PreparedStatement):
+        require(public_did(backend.public_key()) == prepared.publisher_did, "custodian public DID differs")
+        digest = signature_digest("elastos.publisher.keys.v1", prepared.statement)
+        signature = backend.sign(digest)
+        require(type(signature) is bytes and len(signature) == 64, "Ed25519 signature length differs")
+        require(backend.verify(digest, signature) is True, "signature public verification failed")
+        # A rotation output contains this custodian's one signature. It is a
+        # partial handover until an independently verified second root signs.
+        statement = json_bytes({"payload": parse_json(prepared.statement), "signatures": [
+            {"signer_did": prepared.publisher_did, "signature": signature.hex()}]})
+        return (("publisher-keys.json", statement),)
     require(len(prepared.release) + 300 <= 256 * 1024, "single-chunk release metadata required")
     require(public_did(backend.public_key()) == prepared.publisher_did, "custodian public DID differs")
     def envelope(domain, payload):
@@ -642,7 +743,8 @@ class OpenSSLBackend:
 
 
 def confirmed(prepared, input_stream, output_stream):
-    output_stream.write(f"Sign approved release as {prepared.publisher_did}.\nType this complete DID to confirm, or press Enter to cancel: ")
+    subject = "publisher-keys statement (one root signature)" if isinstance(prepared, PreparedStatement) else "release"
+    output_stream.write(f"Sign approved {subject} as {prepared.publisher_did}.\nType this complete DID to confirm, or press Enter to cancel: ")
     output_stream.flush()
     return input_stream.readline().strip() == prepared.publisher_did
 
@@ -670,7 +772,7 @@ def main():
         prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
         require(confirmed(prepared, sys.stdin, sys.stderr), "signing cancelled")
         # Recheck canonical source authority after confirmation, before backend use.
-        verify_source(policy, github_json)
+        verify_source(signing_source_policy(policy), github_json)
         backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
         try:
             publication = sign_publication(prepared, backend)
@@ -690,7 +792,8 @@ def main():
         except Exception:
             shutil.rmtree(args.output_root)
             raise
-    print("Signed approved publication snapshot.")
+    print("Signed approved publisher-keys statement with one root signature." if isinstance(prepared, PreparedStatement)
+          else "Signed approved publication snapshot.")
 
 
 if __name__ == "__main__":
