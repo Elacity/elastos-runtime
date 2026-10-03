@@ -698,18 +698,53 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(list(self.snapshot.iterdir()), [])
         self.assertFalse(self.marker.exists())
 
-    def test_statement_publication_channel_uses_approved_develop_authority(self):
+    def test_statement_publication_channel_preserves_source_authority(self):
         self.statement_policy()
-        for channel in ("canary", "stable", "jetson-test"):
+        self.prepare_statement()
+        self.assertTrue(any("/git/ref/heads/develop" in path for path in self.requests))
+        self.assertFalse(any("/git/ref/heads/main" in path or "/git/ref/tags/" in path for path in self.requests))
+        self.policy.update(tag="v1.2.3", tag_oid=COMMIT)
+        self.api[f"/repos/{S.REPOSITORY}/git/ref/tags/v1.2.3"] = {
+            "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}}
+        for channel in ("stable", "jetson-test"):
+            self.requests.clear()
             self.policy["channel"] = self.manifest["statement"]["channel"] = channel
             self.approve_manifest()
             self.prepare_statement()
             self.assertEqual(self.policy["channel"], channel)
-        self.assertTrue(any("/git/ref/heads/develop" in path for path in self.requests))
-        self.assertFalse(any("/git/ref/heads/main" in path or "/git/ref/tags/" in path or "/git/blobs/" in path for path in self.requests))
+            self.assertTrue(any("/git/ref/heads/main" in path for path in self.requests))
+            self.assertTrue(any("/git/ref/tags/v1.2.3" in path for path in self.requests))
+            self.assertFalse(any("/git/ref/heads/develop" in path or "/git/blobs/" in path for path in self.requests))
+        self.policy["channel"] = self.manifest["statement"]["channel"] = "canary"
         self.policy["develop_oid"] = COMMIT
+        self.approve_manifest()
         with self.assertRaisesRegex(ValueError, "develop ref moved"):
             self.prepare_statement()
+
+    def test_stable_statement_develop_source_without_main_tag_refused_before_backend(self):
+        self.statement_policy()
+        self.policy["channel"] = self.manifest["statement"]["channel"] = "stable"
+        self.approve_manifest()
+        path = self.base / "operator-policy.json"
+        output = self.base / "publication"
+        prefix = f"/repos/{S.REPOSITORY}"
+        cases = [{}, {"tag": "v1.2.3", "tag_oid": COMMIT},
+                 {"tag": "v1.2.3", "tag_oid": COMMIT, "outside_main": True}]
+        for case in cases:
+            self.policy.update({field: value for field, value in case.items() if field != "outside_main"})
+            if case.get("outside_main"):
+                self.api[f"{prefix}/git/ref/tags/v1.2.3"] = {
+                    "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}}
+                self.api[f"{prefix}/compare/{COMMIT}...{MAIN}?per_page=1"]["status"] = "diverged"
+            path.write_bytes(S.json_bytes(self.policy))
+            with self.subTest(case=case), \
+                 mock.patch.object(sys, "argv", [str(SOURCE), "--policy", str(path), "--input-root", str(self.root), "--output-root", str(output)]), \
+                 mock.patch.object(S, "pinned_tools"), mock.patch.object(S, "github_json", side_effect=self.fetch), \
+                 mock.patch.object(S, "OpenSSLBackend") as backend:
+                with self.assertRaises(ValueError):
+                    S.main()
+                backend.assert_not_called()
+            self.assertFalse(output.exists())
 
     def test_statement_revoke_all_delegates_emits_approved_empty_list(self):
         self.statement_policy()
@@ -872,8 +907,6 @@ class SignerTests(unittest.TestCase):
 
     def test_statement_cli_uses_one_admission_time_rechecks_develop_and_writes_only_statement(self):
         self.statement_policy()
-        self.policy["channel"] = self.manifest["statement"]["channel"] = "stable"
-        self.approve_manifest()
         path = self.base / "operator-policy.json"
         path.write_bytes(S.json_bytes(self.policy))
         output = self.base / "publication"

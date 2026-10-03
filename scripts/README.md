@@ -350,19 +350,19 @@ roles and domains are refused. Its exact SHA-256 is the protected policy's
 
 The statement policy retains the existing repository, source commit/tree,
 source authority SemVer `version`, public `publisher_did`, tool/interpreter/
-OpenSSL pins, key path and file/snapshot quotas. It also requires the approved
-remote `develop_oid` and three explicit integer bounds:
+OpenSSL pins, key path and file/snapshot quotas. It also requires three explicit
+integer bounds:
 `max_statement_lifetime` (positive seconds), `max_future_skew` (nonnegative
 seconds), and `minimum_statement_version` (positive integer). Each bound is
 below `2**63`. These are operator approvals; the signer supplies no defaults.
 The statement's integer version is separate from the policy's source authority
 SemVer. Its channel matches the protected policy's publication channel.
 
-Publisher-keys custody qualifies the reviewed source through `develop`, even
-when the statement channel is `stable` or `jetson-test`. The tool checks a copy
-of the trusted source policy with the authority channel set to `canary`; it
-preserves the approved statement channel. A moved remote `develop` head needs
-a new approval. Release mode keeps its existing canary or tag/main checks.
+Both custody roles use the same channel-specific source gate. For `canary`, the
+policy pins the approved remote `develop_oid`; a moved head needs a new approval.
+For `stable` and `jetson-test`, the policy pins the matching version `tag` and
+`tag_oid`, and the approved tagged commit belongs to `main`. Statement custody
+preserves this gate, including the policy's source authority SemVer.
 
 The signer fixes admission time once, checks the version floor and lifetime,
 and bounds future issue time. `issued_at` precedes `expires_at`; expiry must be

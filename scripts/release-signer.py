@@ -27,8 +27,8 @@ real signing and installer integration require separate operator acceptance.
 
 The trusted signing_role defaults to release. publisher-keys accepts only
 {source: {commit, tree}, statement: unsigned publisher-keys payload} and emits
-one root signature in publisher-keys.json. Its source/tool authority uses the
-approved develop_oid independently of the statement publication channel.
+one root signature in publisher-keys.json. Source authority follows the policy
+channel: approved develop_oid for canary, version tag/main for other channels.
 Explicit max_statement_lifetime, max_future_skew and minimum_statement_version
 policy bounds apply at one fixed admission time. A rotation output is partial;
 client admission, dual-signature assembly and publication are separate work.
@@ -437,9 +437,8 @@ class PreparedStatement:
 def signing_source_policy(policy):
     role = policy.get("signing_role", "release")
     require(role in ("release", "publisher-keys"), "trusted signing role refused")
-    # Statement custody uses reviewed develop authority, independently of the
-    # publication channel. Release tag/main admission remains unchanged.
-    return {**policy, "channel": "canary"} if role == "publisher-keys" else policy
+    # Both custody roles retain the channel-specific source admission gate.
+    return policy
 
 
 def prepare(policy, root, manifest_name, fetch, snapshot_root, now=None):
