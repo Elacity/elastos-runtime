@@ -137,7 +137,7 @@ pub(crate) struct RestartRecord {
 
 /// Serializes installation writers at an absolute, resolved binary parent.
 /// Writers resolve the parent once and use the same path for their destinations.
-/// The lock path stays in place after the guard closes its file and releases the flock.
+/// The lock path stays in place after the guard releases the flock and closes its file.
 pub(crate) struct InstallationGuard {
     _lock: File,
     binary_parent: PathBuf,
@@ -191,6 +191,14 @@ impl InstallationGuard {
             bail!("installed release writer lock identity changed");
         }
         Ok(())
+    }
+}
+
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        // A forked command can retain this description until its CLOEXEC fd closes.
+        // The guard's scope owns the lock, so release it before closing our fd.
+        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._lock), libc::LOCK_UN) };
     }
 }
 
@@ -1735,6 +1743,47 @@ mod tests {
             inode
         );
         let _writer = fixture.writer();
+    }
+
+    #[test]
+    fn installation_guard_releases_ownership_with_a_retained_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let guard = InstallationGuard::acquire(&parent).unwrap();
+        let retained = guard._lock.try_clone().unwrap();
+        let inode = retained.metadata().unwrap().ino();
+        let flags = unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(parent.join(INSTALL_LOCK))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+        );
+        assert!(matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ));
+
+        drop(guard);
+        let next_guard = InstallationGuard::acquire(&parent).unwrap();
+        assert_eq!(retained.metadata().unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(parent.join(INSTALL_LOCK)).unwrap().ino(),
+            inode
+        );
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        drop(retained);
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        drop(next_guard);
+        let _guard = InstallationGuard::acquire(&parent).unwrap();
     }
 
     #[test]
