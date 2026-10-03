@@ -264,7 +264,12 @@ impl InstallTransaction {
             // Commit already verified the installed set. Cleanup owns only the
             // journal and scratch; later safe owner changes belong to the live set.
             for entry in &journal.entries {
-                file_state(&self.destinations[&entry.id])?;
+                if file_state(&self.destinations[&entry.id])?.is_none() {
+                    bail!(
+                        "release file {} is missing; retain journal for recovery",
+                        entry.id.name()
+                    );
+                }
             }
         } else {
             // Validate the complete restore plan before changing a release file.
@@ -1243,12 +1248,16 @@ mod tests {
 
     #[test]
     fn committed_cleanup_refuses_unsafe_live_changes_after_lock_acquisition() {
-        for mutation in ["symlink", "hardlink", "writable"] {
+        for (id, mutation) in ReleaseFile::ALL.into_iter().flat_map(|id| {
+            ["symlink", "hardlink", "writable", "missing"]
+                .into_iter()
+                .map(move |mutation| (id, mutation))
+        }) {
             let fixture = Fixture::new();
             let writer = fixture.writer();
             fixture.old_files(&writer, false);
             fixture.commit_before_cleanup(&writer);
-            let destination = &writer.destinations[&ReleaseFile::Sources];
+            let destination = &writer.destinations[&id];
             let owner_data = fixture.data.join("owner-data");
             match mutation {
                 "symlink" => {
@@ -1259,9 +1268,10 @@ mod tests {
                     fs::remove_file(destination).unwrap();
                     fs::hard_link(&owner_data, destination).unwrap();
                 }
+                "missing" => fs::remove_file(destination).unwrap(),
                 _ => fs::set_permissions(destination, fs::Permissions::from_mode(0o666)).unwrap(),
             }
-            assert!(writer.recover().is_err(), "{mutation}");
+            assert!(writer.recover().is_err(), "{}: {mutation}", id.name());
             assert!(writer.journal_path().exists());
             for id in ReleaseFile::ALL {
                 assert!(writer.scratch(id, ROLLBACK).exists());
