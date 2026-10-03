@@ -19,6 +19,7 @@ mod directory_hash;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const KUBO_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -689,6 +690,7 @@ impl IpfsProvider {
     }
 
     fn start_kubo(&mut self) -> Result<(), String> {
+        self.reap_previous_kubo()?;
         let binary = self.kubo_binary.as_ref().ok_or("Kubo binary not found")?;
         self.state = KuboState::Starting;
 
@@ -820,6 +822,35 @@ impl IpfsProvider {
         write_coord_file(&self.data_dir, &coord);
 
         Ok(())
+    }
+
+    fn reap_previous_kubo(&mut self) -> Result<(), String> {
+        let Some(child) = self.kubo_child.as_mut() else {
+            return Ok(());
+        };
+        let mut deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+        let mut forced = false;
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| format!("Previous Kubo exit check failed: {error}"))?
+                .is_some()
+            {
+                self.kubo_child = None;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                if forced {
+                    return Err("Previous Kubo did not exit; replacement refused".into());
+                }
+                // Keep ownership until the stopped daemon releases its repo lock.
+                // A concurrent exit can make kill fail; the next poll still reaps it.
+                let _ = child.kill();
+                forced = true;
+                deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+            }
+            std::thread::sleep(LOCKFILE_POLL_INTERVAL);
+        }
     }
 
     // ── Write ops ───────────────────────────────────────────────────
@@ -2306,6 +2337,110 @@ mod tests {
             .starts_with("POST /api/v0/cat?arg=release-cid"));
         assert_eq!(provider.state, KuboState::Ready);
         assert!(provider.kubo_child.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn immediate_recovery_read_reaps_delayed_previous_daemon_before_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut previous = Command::new("sh")
+            .args(["-c", "trap 'sleep 1; exit 0' TERM; printf ready; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        previous
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let previous_pid = previous.id();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        provider.kubo_child = Some(previous);
+        remove_coord_file(root.path());
+
+        // The replacement fixture exposes only the startup health and cat calls.
+        let kubo = root.path().join("kubo-fixture");
+        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 0;;\nesac\n").unwrap();
+        fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.kubo_binary = Some(kubo);
+        let started_path = provider.repo_dir.with_extension("started");
+        let backend = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let port = loop {
+                if let Ok(address) = fs::read_to_string(&started_path) {
+                    if let Some(port) = address
+                        .rsplit('/')
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                    {
+                        break port;
+                    }
+                }
+                assert!(Instant::now() < deadline, "replacement was not started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut health = accept_bounded_fixture(&listener);
+            let health_headers = read_bounded_fixture_headers(&mut health);
+            health
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            drop(health);
+            let mut cat = accept_bounded_fixture(&listener);
+            let cat_headers = read_bounded_fixture_headers(&mut cat);
+            cat.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89ab")
+                .unwrap();
+            (health_headers, cat_headers)
+        });
+
+        assert_eq!(unsafe { libc::kill(previous_pid as i32, libc::SIGTERM) }, 0);
+        let started = Instant::now();
+        let result = provider.fetch_bytes("release-cid");
+        let elapsed = started.elapsed();
+        let previous_reaped = !is_pid_alive(previous_pid);
+        if let Some(mut replacement) = provider.kubo_child.take() {
+            let _ = replacement.kill();
+            replacement.wait().unwrap();
+        }
+        // Settle the previous fixture even when a regression loses its Child handle.
+        unsafe { libc::waitpid(previous_pid as i32, std::ptr::null_mut(), 0) };
+        let (health_headers, cat_headers) = backend.join().unwrap();
+        assert_eq!(result.unwrap(), b"89ab");
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(
+            previous_reaped,
+            "previous Child was replaced before it was reaped"
+        );
+        assert!(health_headers.starts_with("POST /api/v0/id"));
+        assert!(cat_headers.starts_with("POST /api/v0/cat?arg=release-cid"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn previous_daemon_is_force_stopped_and_reaped_within_stop_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = Command::new("sleep").arg("60").spawn().unwrap();
+        let previous_pid = previous.id();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        provider.kubo_child = Some(previous);
+        let started = Instant::now();
+        let result = provider.reap_previous_kubo();
+        let elapsed = started.elapsed();
+        if let Some(mut remaining) = provider.kubo_child.take() {
+            let _ = remaining.kill();
+            remaining.wait().unwrap();
+        }
+        result.unwrap();
+        assert!(elapsed >= KUBO_STOP_TIMEOUT);
+        assert!(elapsed < KUBO_STOP_TIMEOUT * 2 + LOCKFILE_POLL_INTERVAL);
+        assert!(!is_pid_alive(previous_pid));
     }
 
     fn complete_metadata_request(max: u64) -> serde_json::Value {

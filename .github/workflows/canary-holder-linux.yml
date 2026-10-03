@@ -351,22 +351,11 @@ jobs:
                   raise AssertionError('production idle watcher did not stop Kubo within 75s')
               stop_count = len(re.findall(r'Kubo idle for [0-9]+s \(threshold 600s\), stopping', processes.text(log_label, 'stderr')))
               assert stop_count == initial_stops + 1
-              exit_deadline = time.monotonic() + 15
-              while time.monotonic() < exit_deadline:
-                  try:
-                      state = (Path('/proc') / str(coord['kubo_pid']) / 'stat').read_text().rsplit(')', 1)[1].split()[0]
-                  except FileNotFoundError:
-                      state = 'absent'
-                  with socket.socket() as probe:
-                      probe.settimeout(.2)
-                      closed = probe.connect_ex(('127.0.0.1', coord['api_port'])) != 0
-                  if closed and state in ('absent', 'Z'):
-                      break
-                  time.sleep(.2)
-              assert closed and state in ('absent', 'Z'), 'Kubo must stop before the recovery read'
+              # Start the next read as soon as the watcher removes coordinates.
+              # Provider recovery owns waiting for shutdown and reaping the child.
               result['idle_stops'].append({'label': label, 'elapsed_seconds': time.monotonic() - started,
                   'original_last_used': coord['last_used'], 'fixture_last_used': aged['last_used'],
-                  'coord_removed': True, 'old_api_closed': True, 'old_process_state': state,
+                  'coord_removed': True, 'recovery_waited_for_old_process': False,
                   'provider': identity, 'kubo': before, 'watcher_log_observed': True})
               return coord
           def restarted(data, before, label):
@@ -377,6 +366,7 @@ jobs:
                   'after_pid': after['kubo_pid'], 'api_port': after['api_port']})
               # ensure_kubo reaps the stopped owned child before a successful read.
               assert not (Path('/proc') / str(before['kubo_pid'])).exists(), 'stopped owned Kubo child was not reaped'
+              result['idle_stops'][-1]['old_process_reaped_after_recovery'] = True
           try:
               frozen = json.loads(Path('components.json').read_bytes())
               installed = {}
@@ -390,7 +380,9 @@ jobs:
                   shutil.copyfile(accepted / 'elastos', runtime)
                   runtime.chmod(0o700)
                   manifest = {'external': {}, 'profiles': {}, 'capsules': {}}
-                  for name in ('ipfs-provider', 'kubo'):
+                  # The consumer exercises Carrier immediately. An empty local
+                  # Kubo backend would first search its absent DAG for 300s.
+                  for name in (() if role == 'consumer' else ('ipfs-provider', 'kubo')):
                       source = accepted / name if name != 'kubo' else accepted / 'kubo-input/bin/kubo'
                       target = data / 'bin' / name
                       shutil.copyfile(source, target)
@@ -409,17 +401,18 @@ jobs:
                       'gateway_public_publisher_bootstrap = true\ngateway_allowed_hosts = ["127.0.0.1"]\n')
                   (data / 'config.toml').chmod(0o600)
                   command(home, [str(runtime), 'node', 'info', '--json'], role + '-identity')
-                  kubo_env = {**env(home), 'IPFS_PATH': str(data / 'ipfs-repo')}
-                  reply = processes.command([str(data / 'bin/kubo'), 'init', '--profile=test'], kubo_env, home, role + '-kubo-init')
-                  assert reply['exit'] == 0
-                  config_path = data / 'ipfs-repo/config'
-                  config = json.loads(config_path.read_bytes())
-                  config['Bootstrap'] = []
-                  config['Addresses']['Swarm'] = []
-                  config['Routing']['Type'] = 'none'
-                  config['Discovery']['MDNS']['Enabled'] = False
-                  config['AutoConf']['Enabled'] = False
-                  config_path.write_text(json.dumps(config))
+                  if role != 'consumer':
+                      kubo_env = {**env(home), 'IPFS_PATH': str(data / 'ipfs-repo')}
+                      reply = processes.command([str(data / 'bin/kubo'), 'init', '--profile=test'], kubo_env, home, role + '-kubo-init')
+                      assert reply['exit'] == 0
+                      config_path = data / 'ipfs-repo/config'
+                      config = json.loads(config_path.read_bytes())
+                      config['Bootstrap'] = []
+                      config['Addresses']['Swarm'] = []
+                      config['Routing']['Type'] = 'none'
+                      config['Discovery']['MDNS']['Enabled'] = False
+                      config['AutoConf']['Enabled'] = False
+                      config_path.write_text(json.dumps(config))
                   installed[role] = (home, data, runtime, http_port)
               home, data, runtime, holder_port = installed['holder']
               warmup = root / 'warmup.bin'
@@ -447,6 +440,14 @@ jobs:
               consumer = processes.spawn([str(consumer_runtime), 'gateway', '--addr', '127.0.0.1:' + str(consumer_port),
                   '--cache-dir', str(consumer_home / 'gateway-cache')], env(consumer_home), consumer_home, 'consumer')
               ready(consumer_home, consumer, consumer_port)
+              assert not (consumer_data / 'bin/ipfs-provider').exists()
+              assert not (consumer_data / 'bin/kubo').exists() and not (consumer_data / 'ipfs-repo').exists()
+              consumer_bootstrap = json.loads(get(f'http://127.0.0.1:{consumer_port}/.well-known/elastos/carrier-bootstrap.json?role=publisher', 65536))
+              consumer_did = json.loads(processes.text('consumer-identity'))['did']
+              observer.cli_holder_bootstrap(consumer_bootstrap, observer.cli_holder_node_id(consumer_did))
+              result['consumer'] = {'backend': 'Carrier-only; no local IPFS provider or repository',
+                  'runtime_sha256': sha(consumer_runtime), 'carrier_bootstrap_ready': True,
+                  'holder_peer_registered': True}
               assert read(home, holder_port, cids[0], warmup, 'gateway-before-idle')
               assert read(consumer_home, consumer_port, cids[0], warmup, 'carrier-before-idle')
               provider_before = provider_identity(holder, data / 'bin/ipfs-provider')
