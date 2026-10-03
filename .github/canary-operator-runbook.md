@@ -110,13 +110,30 @@ test "$(shasum -a 256 "$PINNED_OPENSSL" | cut -d ' ' -f 1)" = '5d8f84484b7317ec5
 "$PINNED_OPENSSL" version
 ```
 
-The operator edits and approves `V1-policy.json`: `tool.path` becomes
-`INSTALLED_SIGNER` and `key_path` becomes `PEM_KEY`. If develop has moved,
-renew approval for `develop_oid` after confirming the frozen source remains
-an ancestor of that head. Keep the source commit/tree, manifest hash, native
-bytes, tool pins and quotas from the reviewed draft. Compare the approved
-`develop_oid` with `gh api repos/Elacity/elastos-runtime/git/ref/heads/develop
---jq .object.sha` immediately before signing; the signer checks it again.
+The operator edits `V1-policy.json`: `tool.path` becomes `INSTALLED_SIGNER`
+and `key_path` becomes `PEM_KEY`. Use the following public checks for either
+V1 or V2, with `POLICY` set to that version's custody policy:
+
+```bash
+set -euo pipefail
+POLICY="$CUSTODY/V1-policy.json"
+SOURCE_COMMIT=$("$PINNED_PYTHON" -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$POLICY")
+CURRENT_DEVELOP=$(gh api repos/Elacity/elastos-runtime/git/ref/heads/develop --jq .object.sha)
+gh api "repos/Elacity/elastos-runtime/compare/$SOURCE_COMMIT...$CURRENT_DEVELOP?per_page=1" \
+  --jq '{status, behind_by, base: .base_commit.sha, merge_base: .merge_base_commit.sha}'
+```
+
+The comparison must report `ahead` or `identical`, `behind_by = 0`, and the
+frozen source commit for both `base` and `merge_base`. If develop has moved,
+Anders approves `CURRENT_DEVELOP` as the replacement `develop_oid` before
+the operator edits that field. Keep the source commit/tree, manifest hash,
+native bytes, tool pins and quotas from the reviewed draft. Anders then
+approves the exact policy file hash, manifest hash, custody paths and version.
+Compute the edited policy hash with `shasum -a 256 "$POLICY"`.
+Record the public approval and hashes in #89; custody paths stay private.
+Immediately before signing, compare the policy's `develop_oid` with a fresh
+`gh api repos/Elacity/elastos-runtime/git/ref/heads/develop --jq .object.sha`.
+A difference returns to this approval step; the signer also checks the pin.
 
 ## 3. Operator-only hex-to-PEM conversion
 
@@ -260,6 +277,9 @@ their recovery path while the new Runtime imports the first valid canary set.
 Successful source or baseline checks alone do not prove old-set serving after
 the Runtime replacement. Verify the approved new served bytes after import.
 
+For V2, retain the actual committed V1 receipt and skip the old-baseline
+receipt reconstruction and exclusive migration below. These steps apply
+only to the approved first V1 import with a verified absent legacy receipt.
 Before that first import, reconstruct the absent receipt from the verified
 old public baseline under Anders's approval. An empty receipt would refuse
 V1's predecessor CIDs even with `--allow-signer-rotation`. Keep the old DID
@@ -430,16 +450,100 @@ DID='did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe'
 "$SEED_RUNTIME" publish-release --version "$V1" --channel canary \
   --signed-publication "$SIGNED_SET" --publisher-did "$DID" \
   --ipfs-provider-bin "$IPFS_PROVIDER" --preflight-only --allow-signer-rotation
-"$SEED_RUNTIME" publish-release --version "$V1" --channel canary \
+if "$SEED_RUNTIME" publish-release --version "$V1" --channel canary \
   --signed-publication "$SIGNED_SET" --publisher-did "$DID" \
-  --ipfs-provider-bin "$IPFS_PROVIDER" --allow-signer-rotation
+  --ipfs-provider-bin "$IPFS_PROVIDER" --allow-signer-rotation; then
+  IMPORT_STATUS=0
+else
+  IMPORT_STATUS=$?
+fi
+printf 'Import exit status: %s\n' "$IMPORT_STATUS"
 ```
 
 The first import asks for the complete DID to change the saved public pin.
-Retain the committed public Publisher receipt and exact signed head/release
-CIDs. Verify public `release-head.json`, `release.json`, `install.sh` and
-bootstrap bytes against the approved set and holder. Preserve the chain;
-publication failure restores the prior served set rather than resetting state.
+Retain the terminal output and read it before proceeding. The frozen Runtime
+can exit with this exact postcommit gossip error on the gateway publication
+instance:
+
+```text
+Error: The signed set is committed; retry publication to announce its head: No running runtime found. Start `elastos serve` first for gossip announcements.
+```
+
+This error occurs after Publisher commits the signed set, receipt and head.
+The gateway owns a separate peer control endpoint; the frozen announcement
+code selects serve coordinates and its gossip calls require the serve API.
+Keep the gateway's existing control configuration. Direct Carrier pulls read
+the committed Publisher files and receipt. Gossip repair remains an #186 gate.
+
+Under the approved M1/M2 procedure, the operator can record this exact error
+as an outstanding gossip result and continue only after the checks below.
+Any other unexpected output or failed check stops the procedure for review.
+Keep the full output and exit status; receipt parity and Carrier proof establish
+this hop's result. Record gossip delivery only when it has separate evidence.
+
+As the service owner, retain the actual
+`$SEED_DATA_DIR/ElastOS/SystemServices/Publisher/publish-state.json`. Compare
+the committed `release-head.json`, `release.json` and `install.sh` in that
+directory byte for byte with `SIGNED_SET`, and record their SHA-256 hashes.
+Verify the receipt's signer and version, recompute both signed-envelope CIDs
+with the reviewed public-data signer, and match them to `last_head_cid` and
+`last_release_cid`. Keep the actual `last_published_at` from the committed
+receipt. Verify public envelope/installer hashes against the same set and
+the public bootstrap against the approved holder. The plain Carrier check
+in step 6 must pass before V2 signing; step 8's check must pass before M2
+applies V2. A failed import uses the helper's recovery result; preserve that
+evidence and the prior chain while the operator resolves it.
+
+Run the committed-file checks on the seed for each version, then copy only
+its public receipt back to the Mac custody directory:
+
+```bash
+set -euo pipefail
+PUBLISHER="$SEED_DATA_DIR/ElastOS/SystemServices/Publisher"
+for name in release-head.json release.json install.sh; do
+  cmp "$PUBLISHER/$name" "$SIGNED_SET/$name"
+  sha256sum "$PUBLISHER/$name" "$SIGNED_SET/$name"
+done
+sha256sum "$PUBLISHER/publish-state.json"
+```
+
+Set `SEED_RECEIPT` on the Mac to this seed receipt's absolute path. Set
+`PUBLIC_RECEIPT` to a new custody path, `PUBLIC_SET` to the corresponding
+`SIGNED_V1` or `SIGNED_V2`, and `PUBLIC_VERSION` to its approved version.
+After the public-only copy, match its SHA-256 to the seed result and verify
+the CIDs with the reviewed signer already installed on the Mac:
+
+```bash
+set -euo pipefail
+scp "$SEED_ALIAS:$SEED_RECEIPT" "$PUBLIC_RECEIPT"
+shasum -a 256 "$PUBLIC_RECEIPT"
+"$PINNED_PYTHON" -I -S - "$INSTALLED_SIGNER" "$PUBLIC_SET" "$PUBLIC_RECEIPT" "$PUBLIC_VERSION" <<'PY'
+import hashlib, importlib.util, sys
+from pathlib import Path
+tool, public, receipt_path = map(Path, sys.argv[1:4])
+version = sys.argv[4]
+assert hashlib.sha256(tool.read_bytes()).hexdigest() == 'e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2'
+spec = importlib.util.spec_from_file_location('public_signer', tool)
+signer = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = signer
+spec.loader.exec_module(signer)
+head_bytes = (public / 'release-head.json').read_bytes()
+release_bytes = (public / 'release.json').read_bytes()
+head_envelope, release_envelope = map(signer.parse_json, (head_bytes, release_bytes))
+head, release = head_envelope['payload'], release_envelope['payload']
+receipt = signer.parse_json(receipt_path.read_bytes())
+did = 'did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe'
+assert head_envelope['signer_did'] == release_envelope['signer_did'] == receipt['publisher_did'] == did
+assert head['version'] == release['version'] == receipt['last_version'] == version
+assert head['channel'] == release['channel'] == 'canary'
+assert head['release_sha256'] == signer.sha256(release_bytes)
+assert head['latest_release_cid'] == receipt['last_release_cid'] == signer.unixfs_metadata_cid(release_bytes)
+assert receipt['last_head_cid'] == signer.unixfs_metadata_cid(head_bytes)
+assert release['installer_sha256'] == signer.sha256((public / 'install.sh').read_bytes())
+assert type(receipt['last_published_at']) is int and receipt['last_published_at'] >= 0
+print('Committed public receipt matches signed bytes:', receipt['last_head_cid'], receipt['last_release_cid'])
+PY
+```
 
 ## 6. M1 on the isolated Mac HOME
 
@@ -469,10 +573,14 @@ expected = release['platforms']['aarch64-darwin']['binary']['sha256']
 assert hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest() == expected
 print('M1 installed binary matches the signed release hash.')
 PY
+env -i HOME="$TEST_HOME" PATH="$TEST_PATH" "$MAC_RUNTIME" update --check
 ```
 
 Record the selected source, config/data/support fingerprints and exact signed
-receipt before M2. Run the agreed disposable-key tampered-binary and wrong-signer
+receipt before M2. The plain Carrier check must reach committed V1 and report
+the current installation as up to date. Retain its transport evidence and
+confirm zero HTTP fallback before V2 signing. Run the agreed disposable-key
+tampered-binary and wrong-signer
 refusal fixture in its separate test HOME, with the frozen trust pin, preserving
 the positive real-key HOME. Production signing admits valid sets only. The
 complete positive/refusal CI rehearsal is linked in #89; operator receipts are
@@ -481,15 +589,30 @@ separate acceptance evidence.
 ## 7. Finalize, sign and publish V2
 
 After V1 is public, the key-free builder verifies its signed public envelopes
-and committed predecessor CIDs, then produces a **metadata-only V2 finalization
-artifact** from retained N2. This makes no native rebuild and uses no real key.
-The artifact carries the new `signing-input.json` SHA-256 and refreshed policy.
-Anders approves that exact hash and source/develop/tool pins. V2's final policy
-replaces the deliberately unusable provisional policy.
+and committed predecessor CIDs, then
+produces a metadata-only V2 finalization artifact from retained N2. It keeps
+the native bytes, original support input/origin, installer stamps and frozen
+installer. The builder uses public data; the operator keeps the real key.
+The artifact carries `receipts/V2-finalization.json`, the final
+`unsigned-V2/signing-input.json` and `policy-drafts/unsigned-V2.json`.
+Compare `public-V1/suggested-publish-state.json` with the actual committed
+seed V1 receipt before signing. The signer, version and head/release CIDs
+must agree; retain the actual receipt's import timestamp.
 
-Download and verify that completed artifact as in step 1. Set `V2_INPUTS` to
-its final read-only unsigned root. Install its approved policy at
-`$CUSTODY/V2-policy.json`, with the same custody tool/key paths. Then:
+Verify `public-V1/carrier-bootstrap.json` and
+`receipts/bootstrap-routing-verification.json`. The routing receipt permits
+only an optional IPv6 port change in the current public ticket and records
+the two ticket hashes/ports. All other decoded ticket fields and the holder
+identity stay fixed. Use its recorded refusal qualification when reviewing
+this allowance. Anders approves the final manifest hash and the exact
+source/develop/tool pins. V2's final policy replaces the provisional policy.
+
+Download and verify that completed artifact as in step 1, using its own
+completed run, artifact name and approved tar hash from #89. Set `V2_INPUTS`
+to its final `unsigned-V2` root. Copy `policy-drafts/unsigned-V2.json` to
+`$CUSTODY/V2-policy.json` with mode 0600 and set the same custody tool/key paths.
+Run step 2's develop-pin comparison and exact policy approval for V2 before
+signing. Then:
 
 ```bash
 set -euo pipefail
@@ -503,7 +626,10 @@ scp -r "$SIGNED_V2" "$CUSTODY/signed-V2-SHA256SUMS" "$SEED_ALIAS:$SEED_STAGE/"
 ```
 
 Repeat seed dry-run, preflight and import from step 5 with V2 version
-`0.8.0-alpha.2` and its verified signed-set path. Retain the committed V2 receipt.
+`0.8.0-alpha.2` and its verified signed-set path. Retain the V2 output and the
+actual committed V1 receipt as the predecessor. Skip the first-receipt
+migration. Retain the committed V2 receipt and repeat step 5's parity checks
+and exact gossip-error rule before step 8.
 
 ## 8. Plain Carrier M2, preservation and repeat
 
