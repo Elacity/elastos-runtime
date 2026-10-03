@@ -675,25 +675,18 @@ after real production watcher stops. The fixture records its accelerated
 `last_used` input. The separate bounded proof uses a real native provider;
 Runtime tests own the bounded Carrier prepare/retry proof.
 
-The qualified package is run `37152086972`, artifact `11284442655`, named
-`qualified-holder-linux-c968b440a6410adc7af14704e109b217acf6f159-1`.
-Its ZIP digest is `5ee9d80185617fbe610e1b154a12082b1f9439344cd8aacaf08826b45075b370`.
-Its `qualified-holder.tar.gz` SHA-256 is
-`591f4f98ee9b16485818b987428e63f3832b3454da95238c1239be91a1109ee4`.
-The provider SHA-256 is
-`211a1486303529558200036bacbe94488f4b94d5c49a44819a60a3c47a74042a`
-and its size is 3,945,720 bytes. `installed-component.json` SHA-256 is
-`8fd309c1deef17c82907f4bad8ef85c267043244635a886385149bed627d1e07`.
-The artifact expires on 10 October. Check the event and branch independently
-before accepting its receipts:
+Take the exact run, artifact name, provider source, archive digest and component
+pin from the current #89 operator approval. Set `HOLDER_RUN`,
+`HOLDER_ARTIFACT_NAME`, `HOLDER_PROVIDER_COMMIT`, and
+`HOLDER_ARCHIVE_SHA256` to those approved public inputs. Check the event and
+branch independently before accepting its receipts:
 
 ```bash
-gh api repos/Elacity/elastos-runtime/actions/runs/37152086972 \
+gh api "repos/Elacity/elastos-runtime/actions/runs/$HOLDER_RUN" \
   --jq '{event,head_branch,head_sha,path,status,conclusion}'
 ```
 
-Require `workflow_dispatch`, `develop`,
-`c968b440a6410adc7af14704e109b217acf6f159`,
+Require `workflow_dispatch`, `develop`, the approved `HOLDER_PROVIDER_COMMIT`,
 `.github/workflows/canary-holder-linux.yml`, `completed`, and `success`.
 Download into a new private directory. On the Mac use `shasum -a 256` in place
 of `sha256sum`:
@@ -701,13 +694,13 @@ of `sha256sum`:
 ```bash
 umask 077
 mkdir "$HOLDER_DOWNLOAD"
-gh run download 37152086972 --repo Elacity/elastos-runtime \
-  --name qualified-holder-linux-c968b440a6410adc7af14704e109b217acf6f159-1 \
+gh run download "$HOLDER_RUN" --repo Elacity/elastos-runtime \
+  --name "$HOLDER_ARTIFACT_NAME" \
   --dir "$HOLDER_DOWNLOAD"
 (cd "$HOLDER_DOWNLOAD" && sha256sum -c qualified-holder.tar.gz.sha256)
 ```
 
-Match that tar hash to the approved hash above before extracting it. Its
+Match that tar hash to `HOLDER_ARCHIVE_SHA256` before extracting it. Its
 members are regular files under `qualified-holder/`; refuse absolute paths,
 parent traversal, symlinks and hardlinks. Copy only verified public package
 files to the seed through the operator's established transfer path.
