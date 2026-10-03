@@ -241,6 +241,30 @@ jobs:
               'command': 'cargo build --locked --release --manifest-path capsules/ipfs-provider/Cargo.toml',
               'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}, indent=2) + '\n')
           PY
+      - name: build the frozen localhost provider for the full API fixtures
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # Full serve requires this host storage provider. It is a fixture-only
+          # prerequisite from the accepted Runtime source, outside the seed package.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+            --manifest-path "$GITHUB_WORKSPACE/source/elastos/Cargo.toml" -p localhost-provider
+          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/localhost-provider" "$ACCEPTED_INPUT/localhost-provider"
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          binary = Path(os.environ['ACCEPTED_INPUT']) / 'localhost-provider'
+          linkage = subprocess.check_output(['ldd', str(binary)], text=True)
+          assert 'not found' not in linkage
+          with binary.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          (Path(os.environ['HOLDER_OUTPUT']) / 'localhost-fixture-build.json').write_text(json.dumps({
+              'purpose': 'isolated CI full serve prerequisite', 'seed_package': False,
+              'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
+              'sha256': digest, 'size': binary.stat().st_size, 'ldd': linkage,
+              'command': 'cargo build --locked --release --manifest-path elastos/Cargo.toml -p localhost-provider',
+              'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}, indent=2) + '\n')
+          PY
       - name: test the exact reviewed provider source
         timeout-minutes: 15
         run: |
@@ -296,15 +320,15 @@ jobs:
                   payload = response.read(bound + 1)
                   assert len(payload) <= bound
                   return payload
-          def ready(home, host, http_port):
+          def ready(home, host, http_port, full_api=False):
               deadline = time.monotonic() + 60
               while time.monotonic() < deadline and host.poll() is None:
                   try:
-                      get(f'http://127.0.0.1:{http_port}/healthz', 65536, 2)
+                      get(f'http://127.0.0.1:{http_port}' + ('/api/health' if full_api else '/healthz'), 65536, 2)
                       return
                   except (OSError, urllib.error.URLError):
                       time.sleep(.2)
-              raise AssertionError('gateway readiness failed; see fixture logs')
+              raise AssertionError('Runtime readiness failed; see fixture logs')
           def child_identity(pid):
               path = Path('/proc') / str(pid)
               return {'pid': pid, 'start_time': (path / 'stat').read_text().rsplit(')', 1)[1].split()[19],
@@ -333,16 +357,16 @@ jobs:
                   headers['Authorization'] = 'Bearer ' + token
               wire = urllib.request.Request(url, data=json.dumps(request).encode(), headers=headers, method='POST')
               return json.loads(get(wire, bound))
-          def attach(data, owner, public_port):
+          def attach(data, owner, api_port):
               # Match Runtime's attach_to_runtime contract. Secrets and session
               # tokens remain in this process, outside logs and proof receipts.
-              path = data / 'gateway-runtime-coords.json'
+              path = data / 'runtime-coords.json'
               assert not path.is_symlink() and path.stat().st_mode & 0o077 == 0
               coords = json.loads(path.read_bytes())
-              assert coords['pid'] == owner.pid and coords['runtime_kind'] == 'gateway'
+              assert coords['pid'] == owner.pid and coords['runtime_kind'] == 'operator'
               parsed = urllib.parse.urlsplit(coords['api_url'])
               assert parsed.scheme == 'http' and parsed.hostname == '127.0.0.1'
-              assert parsed.port != public_port and parsed.path in ('', '/')
+              assert parsed.port == api_port and parsed.path in ('', '/')
               assert parsed.username is None and parsed.password is None and not parsed.query and not parsed.fragment
               api = coords['api_url'].rstrip('/')
               response = post(api + '/api/auth/attach', {'secret': coords['attach_secret'], 'scope': 'shell'}, 65536)
@@ -424,7 +448,7 @@ jobs:
           try:
               frozen = json.loads(Path('components.json').read_bytes())
               installed = {}
-              for role in ('holder', 'consumer', 'bounded'):
+              for role in ('holder', 'consumer', 'gateway', 'bounded'):
                   home = root / role
                   home.mkdir(mode=0o700)
                   data = home / '.local/share/elastos'
@@ -436,7 +460,10 @@ jobs:
                   manifest = {'external': {}, 'profiles': {}, 'capsules': {}}
                   # The consumer exercises Carrier immediately. An empty local
                   # Kubo backend would first search its absent DAG for 300s.
-                  for name in (() if role == 'consumer' else ('ipfs-provider', 'kubo')):
+                  names = ('localhost-provider',) if role == 'consumer' else ('ipfs-provider', 'kubo')
+                  if role == 'holder':
+                      names += ('localhost-provider',)
+                  for name in names:
                       source = accepted / name if name != 'kubo' else accepted / 'kubo-input/bin/kubo'
                       target = data / 'bin' / name
                       shutil.copyfile(source, target)
@@ -482,32 +509,42 @@ jobs:
                   cid = processes.text(label + '-add').strip()
                   assert re.fullmatch(r'b[a-z2-7]+', cid)
                   cids.append(cid)
-              holder = processes.spawn([str(runtime), 'gateway', '--addr', '127.0.0.1:' + str(holder_port),
-                  '--cache-dir', str(home / 'gateway-cache')], env(home), home, 'holder')
-              ready(home, holder, holder_port)
-              bootstrap = json.loads(get(f'http://127.0.0.1:{holder_port}/.well-known/elastos/carrier-bootstrap.json?role=publisher', 65536))
+              holder = processes.spawn([str(runtime), 'serve', '--addr', '127.0.0.1:' + str(holder_port),
+                  '--storage-path', str(data / 'storage')], env(home), home, 'holder')
+              ready(home, holder, holder_port, full_api=True)
+              holder_auth = attach(data, holder, holder_port)
+              # The full API exposes the existing peer provider contract. Obtain
+              # the real listening Carrier ticket before any idle-stop cycle.
+              ticket_response = post(holder_auth[0] + '/api/provider/peer/get_ticket', {}, 65536, holder_auth[1])
+              assert ticket_response['status'] == 'ok'
+              ticket = ticket_response['data']['ticket']
               did = json.loads(processes.text('holder-identity'))['did']
-              observer.cli_holder_bootstrap(bootstrap, observer.cli_holder_node_id(did))
+              assert isinstance(ticket, str) and 0 < len(ticket) <= 65536 and re.fullmatch(r'[a-zA-Z2-7]+', ticket)
+              ticket_data = json.loads(base64.b32decode(ticket.upper() + '=' * (-len(ticket) % 8)))
+              assert len(ticket_data['endpoints']) == 1
+              assert ticket_data['endpoints'][0]['id'] == ticket_response['data']['node_id']
               consumer_home, consumer_data, consumer_runtime, consumer_port = installed['consumer']
               command(consumer_home, [str(consumer_runtime), 'node', 'peer', 'add', '--did', did,
-                  '--ticket', bootstrap['ticket'], '--json'], 'consumer-local-holder-peer')
-              consumer = processes.spawn([str(consumer_runtime), 'gateway', '--addr', '127.0.0.1:' + str(consumer_port),
-                  '--cache-dir', str(consumer_home / 'gateway-cache')], env(consumer_home), consumer_home, 'consumer')
-              ready(consumer_home, consumer, consumer_port)
+                  '--ticket', ticket, '--json'], 'consumer-local-holder-peer')
+              consumer = processes.spawn([str(consumer_runtime), 'serve', '--addr', '127.0.0.1:' + str(consumer_port),
+                  '--storage-path', str(consumer_data / 'storage')], env(consumer_home), consumer_home, 'consumer')
+              ready(consumer_home, consumer, consumer_port, full_api=True)
               assert not (consumer_data / 'bin/ipfs-provider').exists()
               assert not (consumer_data / 'bin/kubo').exists() and not (consumer_data / 'ipfs-repo').exists()
-              consumer_bootstrap = json.loads(get(f'http://127.0.0.1:{consumer_port}/.well-known/elastos/carrier-bootstrap.json?role=publisher', 65536))
-              consumer_did = json.loads(processes.text('consumer-identity'))['did']
-              observer.cli_holder_bootstrap(consumer_bootstrap, observer.cli_holder_node_id(consumer_did))
-              result['consumer'] = {'backend': 'Carrier-only; no local IPFS provider or repository',
-                  'runtime_sha256': sha(consumer_runtime), 'carrier_bootstrap_ready': True,
-                  'holder_peer_registered': True}
-              holder_auth = attach(data, holder, holder_port)
               consumer_auth = attach(consumer_data, consumer, consumer_port)
+              result['consumer'] = {'backend': 'Carrier-only content; no local IPFS provider or repository',
+                  'runtime_sha256': sha(consumer_runtime), 'carrier_ticket_identity_verified': True,
+                  'holder_peer_registered': True, 'host_command': 'serve'}
+              localhost_build = json.loads((output / 'localhost-fixture-build.json').read_bytes())
+              assert localhost_build['source_commit'] == os.environ['SOURCE_COMMIT']
+              assert localhost_build['source_tree'] == os.environ['SOURCE_TREE'] and not localhost_build['seed_package']
+              result['localhost_fixture'] = {**localhost_build, 'installed_sha256': {
+                  role: sha(installed[role][1] / 'bin/localhost-provider') for role in ('holder', 'consumer')}}
+              assert all(digest == localhost_build['sha256'] for digest in result['localhost_fixture']['installed_sha256'].values())
               accepted_version = command(home, [str(runtime), '--version'], 'accepted-runtime-version')
               assert accepted_version == 'elastos ' + os.environ['ELASTOS_RELEASE_VERSION']
-              assert read(home, holder_port, cids[0], warmup, 'gateway-before-idle')
-              assert read(consumer_home, consumer_port, cids[0], warmup, 'carrier-before-idle')
+              assert content_read(holder_auth, cids[0], warmup, 'local-content-before-idle')
+              assert content_read(consumer_auth, cids[0], warmup, 'carrier-content-before-idle', carrier=True)
               provider_before = provider_identity(holder, data / 'bin/ipfs-provider')
               # Private Content fetch returns the entire accepted release binary.
               # Carrier's typed provider route reaches the holder's IPFS backend;
@@ -528,19 +565,35 @@ jobs:
               before = idle_stop(data, holder, provider_before, 'local-content-release-binary', 'holder')
               assert content_read(holder_auth, cids[1], runtime, 'local-content-release-binary-after-idle')
               restarted(data, before, 'local-content-release-binary')
-              before = idle_stop(data, holder, provider_before, 'gateway-generic-file', 'holder')
-              assert read(home, holder_port, cids[2], generic, 'gateway-generic-file-after-idle')
-              restarted(data, before, 'gateway-generic-file')
-              before = idle_stop(data, holder, provider_before, 'carrier-gateway-generic-file', 'holder')
-              assert read(consumer_home, consumer_port, cids[2], generic, 'carrier-gateway-generic-file-after-idle')
-              restarted(data, before, 'carrier-gateway-generic-file')
+              before = idle_stop(data, holder, provider_before, 'carrier-content-generic-file', 'holder')
+              assert content_read(consumer_auth, cids[2], generic, 'carrier-content-generic-file-after-idle', carrier=True)
+              restarted(data, before, 'carrier-content-generic-file')
               assert holder.poll() is None and consumer.poll() is None
               assert provider_identity(holder, data / 'bin/ipfs-provider') == provider_before
               result['same_provider_generation'] = True
               result['same_holder_generation'] = child_identity(holder.pid)
+              # Frozen full serve owns Content API access; gateway owns public
+              # /content rendering. Give that public journey its own Home/backend.
+              gateway_home, gateway_data, gateway_runtime, gateway_port = installed['gateway']
+              for label, content, cid in [('warmup', warmup, cids[0]), ('generic', generic, cids[2])]:
+                  kubo_env = {**env(gateway_home), 'IPFS_PATH': str(gateway_data / 'ipfs-repo')}
+                  reply = processes.command([str(gateway_data / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
+                      '--pin=true', str(content)], kubo_env, gateway_home, 'gateway-' + label + '-add')
+                  assert reply['exit'] == 0 and processes.text('gateway-' + label + '-add').strip() == cid
+              gateway = processes.spawn([str(gateway_runtime), 'gateway', '--addr', '127.0.0.1:' + str(gateway_port),
+                  '--cache-dir', str(gateway_home / 'gateway-cache')], env(gateway_home), gateway_home, 'gateway')
+              ready(gateway_home, gateway, gateway_port)
+              assert read(gateway_home, gateway_port, cids[0], warmup, 'gateway-before-idle')
+              gateway_provider = provider_identity(gateway, gateway_data / 'bin/ipfs-provider')
+              before = idle_stop(gateway_data, gateway, gateway_provider, 'gateway-generic-file', 'gateway')
+              assert read(gateway_home, gateway_port, cids[2], generic, 'gateway-generic-file-after-idle')
+              restarted(gateway_data, before, 'gateway-generic-file')
+              assert gateway.poll() is None and provider_identity(gateway, gateway_data / 'bin/ipfs-provider') == gateway_provider
+              result['same_gateway_generation'] = child_identity(gateway.pid)
+              result['same_gateway_provider_generation'] = gateway_provider
               # This separate fixture proves the native bounded backend contract.
               # Carrier bounded routing remains covered by Runtime's existing
-              # tests; the gateway HTTP endpoint above uses unbounded Content.
+              # tests; the full Content and public gateway reads above are unbounded.
               bounded_home, bounded_data, _, _ = installed['bounded']
               kubo_env = {**env(bounded_home), 'IPFS_PATH': str(bounded_data / 'ipfs-repo')}
               reply = processes.command([str(bounded_data / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
