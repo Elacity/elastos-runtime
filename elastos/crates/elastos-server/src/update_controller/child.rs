@@ -494,7 +494,11 @@ fn pipe_identity(fd: libc::c_int) -> io::Result<(u64, u64)> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
         return Err(io::Error::other("update parent descriptor is not a pipe"));
     }
-    Ok((stat.st_dev as u64, stat.st_ino as u64))
+    #[cfg(target_os = "macos")]
+    let device = stat.st_dev as u64;
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    Ok((device, stat.st_ino))
 }
 
 /// Call after installing SIGTERM handling and before launching subordinate groups.

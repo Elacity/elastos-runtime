@@ -24,7 +24,7 @@ struct HostProcessMeta {
     pid: u32,
     role: String,
     addr: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     generation: String,
 }
 

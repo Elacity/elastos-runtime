@@ -3,6 +3,9 @@ use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+type SnapshotEntry = (u32, Option<Vec<u8>>, Option<PathBuf>);
+type Snapshot = std::collections::BTreeMap<PathBuf, SnapshotEntry>;
+
 struct PrivateFixture {
     _root: tempfile::TempDir,
     data: PathBuf,
@@ -42,17 +45,8 @@ impl PrivateFixture {
         self.directory.join("runtime")
     }
 
-    fn snapshot(
-        &self,
-    ) -> std::collections::BTreeMap<PathBuf, (u32, Option<Vec<u8>>, Option<PathBuf>)> {
-        fn collect(
-            root: &Path,
-            path: &Path,
-            result: &mut std::collections::BTreeMap<
-                PathBuf,
-                (u32, Option<Vec<u8>>, Option<PathBuf>),
-            >,
-        ) {
+    fn snapshot(&self) -> Snapshot {
+        fn collect(root: &Path, path: &Path, result: &mut Snapshot) {
             let metadata = fs::symlink_metadata(path).unwrap();
             let bytes = metadata.is_file().then(|| fs::read(path).unwrap());
             let target = metadata
@@ -1007,11 +1001,38 @@ async fn readiness_http_response_refuses_status_and_size_before_use() {
     }
 }
 
+<<<<<<< HEAD
 fn owner_queue_fixture() -> (PrivateFixture, UpdateRequest) {
+=======
+#[test]
+fn recovered_consumed_request_reports_terminal_result_after_readiness() {
+    let (_, request, _) = choice_fixture();
+    assert_eq!(
+        initial_ready_result(None, &request.current_version)
+            .unwrap()
+            .0,
+        "ready"
+    );
+    for (version, phase) in [
+        (&request.new_version, "updated"),
+        (&request.current_version, "restored"),
+    ] {
+        assert_eq!(
+            initial_ready_result(Some(&request), version).unwrap().0,
+            phase
+        );
+    }
+    assert!(initial_ready_result(Some(&request), "unapproved version").is_err());
+}
+
+#[tokio::test]
+async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
+>>>>>>> fix/109-update-restart
     let fixture = PrivateFixture::new();
     publish_retained_receipt(&fixture);
     crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
     let (_, request, _) = choice_fixture();
+<<<<<<< HEAD
     publish_owner_queue_status(&fixture, &request, "ready", None);
     assert!(!has_queued_update(&fixture.data).unwrap());
     reserve_owner_update(
@@ -1387,4 +1408,31 @@ fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
     )
     .unwrap();
     assert!(has_queued_update(&fixture.data).unwrap());
+=======
+    let mut command = tokio::process::Command::new("/bin/true");
+    let child = child::OwnedChild::spawn(&mut command).unwrap();
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(child),
+        request: Some(request.clone()),
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: "a".repeat(32),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+    };
+    // A failed readiness proof retains recovery rather than publishing success.
+    assert!(controller.complete_reconciliation().await.is_err());
+    assert!(!fixture.directory.join(STATUS).exists());
+    controller.host_ready = true;
+    controller.complete_reconciliation().await.unwrap();
+    let status = status(&fixture.data).unwrap().unwrap();
+    assert_eq!(status.phase, "restored");
+    assert_eq!(status.id.as_deref(), Some(request.id.as_str()));
+    assert_eq!(status.current_version, request.current_version);
+    assert!(controller.child.is_some(), "recovered child was replaced");
+    controller.stop_child().await.unwrap();
+>>>>>>> fix/109-update-restart
 }
