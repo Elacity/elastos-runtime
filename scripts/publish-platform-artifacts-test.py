@@ -39,7 +39,8 @@ def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
     """Write a tiny three-platform publication set and return the served files it advertises."""
     artifacts = prepared / "artifacts"
     artifacts.mkdir(parents=True)
-    files = {"home.tar.gz": b"universal app" + salt, "shell-capsule-metadata.tar.gz": b"provider metadata" + salt}
+    files = {"home.tar.gz": b"universal app" + salt, "shell-capsule-metadata.tar.gz": b"provider metadata" + salt,
+             "kubo.capsule.tar.gz": b"inert upstream capsule bytes" + salt}
     for platform, setup in RELEASE_PLATFORMS.items():
         files[f"elastos-{platform}"] = b"runtime " + platform.encode() + salt
         files[f"shell-{setup}"] = b"native shell " + platform.encode() + salt
@@ -65,8 +66,7 @@ def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
                           "platforms": {setup: descriptor(f"shell-{setup}", "bin/shell")},
                           "capsule_metadata": {"install_path": "capsules/shell", "platforms": {
                               "*": descriptor("shell-capsule-metadata.tar.gz", "capsules/shell", "shell")}}},
-                "kubo": {"platforms": {"*": {"url": "https://example.invalid/kubo.tar.gz", "install_path": "bin/ipfs",
-                                             "checksum": "sha256:" + "d" * 64, "size": 100}}},
+                "kubo": {"platforms": {"*": descriptor("kubo.capsule.tar.gz", "bin/ipfs")}},
             },
             "profiles": {"home": {"components": ["home", "shell", "kubo"]}},
         }
@@ -574,6 +574,45 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                     order = [os.path.relpath(line, publisher) for line in moves.read_text().splitlines()]
                     artifacts = sorted(name for name in expected if name.startswith("artifacts/"))
                     self.assertEqual(order, artifacts + ["install.sh", "release.json", "publish-state.json", "release-head.json"])
+
+    def test_publication_export_retains_model_car_files_and_refuses_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepared, publisher = root / 'prepared', root / 'publisher'
+            publication_fixture(prepared)
+            retention = {}
+            for model in ('model-qwen3.5-0.8b', 'model-qwen3.5-4b', 'model-qwen3.5-9b', 'model-bonsai-8b-q1'):
+                entry = {'package_cid': 'fixture-model-root'}
+                for kind, suffix in (('car', '.car'), ('receipt', '.car.receipt.json')):
+                    name = model + suffix
+                    data = ('inert retention fixture ' + name).encode()
+                    (prepared / 'artifacts' / name).write_bytes(data)
+                    entry[kind] = {'release_path': name, 'cid': 'fixture-file-cid',
+                                   'checksum': 'sha256:' + sha256(data), 'size': len(data)}
+                retention[model] = entry
+            for platform in RELEASE_PLATFORMS:
+                path = prepared / 'artifacts' / f'components-{platform}.json'
+                manifest = json.loads(path.read_bytes())
+                manifest['model_retention'] = retention
+                data = json.dumps(manifest).encode()
+                path.write_bytes(data)
+                rewrite_release(prepared, lambda release, p=platform, b=data:
+                    release['payload']['platforms'][p]['components'].update(sha256=sha256(b), size=len(b)))
+            result = self.run_publication_export(prepared, publisher)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            before = snapshot(publisher)
+            for model in retention.values():
+                for kind in ('car', 'receipt'):
+                    name = model[kind]['release_path']
+                    self.assertEqual((publisher / 'artifacts' / name).read_bytes(),
+                                     (prepared / 'artifacts' / name).read_bytes())
+            first = prepared / 'artifacts' / retention['model-qwen3.5-0.8b']['car']['release_path']
+            original = first.read_bytes()
+            first.write_bytes(b'!' * len(original))
+            result = self.run_publication_export(prepared, publisher)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('prepared model retention bytes differ', result.stderr)
+            self.assertEqual(snapshot(publisher), before)
 
     def test_publication_export_rejects_incomplete_or_mismatched_sets_before_mutation(self):
         def replace(name, data):

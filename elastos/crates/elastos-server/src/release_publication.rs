@@ -31,6 +31,14 @@ pub struct ArtifactDescriptor {
     pub size: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRetention {
+    pub component: String,
+    pub package_cid: String,
+    pub car: ArtifactDescriptor,
+    pub receipt: ArtifactDescriptor,
+}
+
 struct Artifact {
     descriptor: ArtifactDescriptor,
     file: File,
@@ -60,6 +68,7 @@ pub struct Publication {
     installer: Vec<u8>,
     descriptors: Vec<ArtifactDescriptor>,
     artifacts: BTreeMap<String, Artifact>,
+    model_retention: Vec<ModelRetention>,
 }
 
 impl Publication {
@@ -183,6 +192,8 @@ impl Publication {
             }
         }
         let mut visited = BTreeSet::new();
+        let mut model_retention = None;
+        let mut retention_present = None;
         loop {
             let next = artifacts
                 .keys()
@@ -204,6 +215,13 @@ impl Publication {
                 continue;
             }
             component_refs(&component, &artifact_directory, &names, &mut artifacts)?;
+            let present = component.get("model_retention").is_some();
+            if let Some(prior) = retention_present.replace(present) {
+                ensure!(
+                    prior == present,
+                    "platform model retention contracts differ"
+                );
+            }
             if let Some(catalog) = component.get("model_catalog") {
                 let cid = text(catalog, "head_cid")?;
                 ensure!(
@@ -222,6 +240,14 @@ impl Publication {
                     &descriptor,
                     Some("model-catalog.json"),
                 )?;
+            }
+            if present {
+                let records = admit_model_retention(&component, &artifacts)?;
+                if let Some(prior) = &model_retention {
+                    ensure!(prior == &records, "platform model retention records differ");
+                } else {
+                    model_retention = Some(records);
+                }
             }
         }
         ensure!(
@@ -253,6 +279,7 @@ impl Publication {
             installer,
             descriptors,
             artifacts,
+            model_retention: model_retention.unwrap_or_default(),
         };
         publication.unchanged()?;
         if !published {
@@ -284,6 +311,9 @@ impl Publication {
     }
     pub fn artifacts(&self) -> &[ArtifactDescriptor] {
         &self.descriptors
+    }
+    pub fn model_retention(&self) -> &[ModelRetention] {
+        &self.model_retention
     }
 
     /// Cached publication bytes belong to this admitted immutable generation.
@@ -371,6 +401,18 @@ impl Publication {
         )
     }
 
+    /// Apply the caller's memory budget before reserving or reading bytes.
+    /// The held descriptor and signed hash still govern an admitted read.
+    pub fn read_verified_artifact_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        safe_name(name)?;
+        read_artifact(
+            self.artifacts
+                .get(name)
+                .context("artifact outside current signed set")?,
+            Some(max_bytes),
+        )
+    }
+
     /// Create a new private snapshot outside the admitted root. Callers promote
     /// only this successful result; failure removes this method's partial set.
     pub fn snapshot_into(&self, output: &Path) -> Result<()> {
@@ -453,6 +495,145 @@ impl Publication {
         }
         result
     }
+}
+
+fn admit_model_retention(
+    component: &Value,
+    artifacts: &BTreeMap<String, Artifact>,
+) -> Result<Vec<ModelRetention>> {
+    let trust: crate::setup::ModelCatalogConfig = serde_json::from_value(
+        component
+            .get("model_catalog")
+            .context("model retention requires catalogue trust")?
+            .clone(),
+    )?;
+    let catalog = artifacts
+        .get("model-catalog.json")
+        .context("model retention requires the admitted catalogue")?;
+    let bytes = read_artifact(catalog, Some(128 * 1024))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let entries = crate::api::capsule_inventory::verify_model_catalog(&trust, &bytes, now)?;
+    let records = component["model_retention"]
+        .as_object()
+        .context("model retention map required")?;
+    ensure!(
+        records.len() == 4 && entries.len() == 4,
+        "model retention requires four catalogue roots"
+    );
+    let external = component["external"]
+        .as_object()
+        .context("model retention requires external components")?;
+    let mut result = Vec::new();
+    let mut owned_files = BTreeSet::new();
+    for entry in entries {
+        let name = &entry.manifest.name;
+        ensure!(
+            external.contains_key(name),
+            "retained model is absent from components"
+        );
+        let value = records
+            .get(name)
+            .context("catalogue model lacks its retention record")?;
+        let fields = value
+            .as_object()
+            .context("model retention record required")?;
+        ensure!(
+            fields.len() == 3
+                && fields
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "package_cid" | "car" | "receipt")),
+            "model retention fields refused"
+        );
+        let package_cid = text(value, "package_cid")?;
+        let cid = checked_cid(package_cid)?;
+        ensure!(
+            cid.version() == cid::Version::V1 && cid.codec() == 0x70 && package_cid == entry.cid,
+            "model retention root differs from the signed catalogue"
+        );
+        let mut descriptors = Vec::new();
+        for kind in ["car", "receipt"] {
+            let descriptor = &value[kind];
+            let fields = descriptor
+                .as_object()
+                .context("model retention file descriptor required")?;
+            ensure!(
+                fields.len() == 4
+                    && fields.keys().all(|key| matches!(
+                        key.as_str(),
+                        "release_path" | "cid" | "checksum" | "size"
+                    )),
+                "model retention descriptor fields refused"
+            );
+            let path = text(descriptor, "release_path")?;
+            safe_name(path)?;
+            ensure!(
+                owned_files.insert(path.to_owned()),
+                "model retention file is shared by multiple records"
+            );
+            let artifact = artifacts
+                .get(path)
+                .context("model retention file outside admitted artifacts")?;
+            ensure!(
+                text(descriptor, "cid")? == artifact.descriptor.cid
+                    && text(descriptor, "checksum")?
+                        == format!("sha256:{}", artifact.descriptor.sha256)
+                    && descriptor["size"].as_u64() == Some(artifact.descriptor.size),
+                "model retention descriptor differs from admitted bytes"
+            );
+            descriptors.push(artifact.descriptor.clone());
+        }
+        let car = descriptors.remove(0);
+        let receipt = descriptors.remove(0);
+        ensure!(
+            car.name.ends_with(".car") && receipt.name == format!("{}.receipt.json", car.name),
+            "model retention file names refused"
+        );
+        ensure!(
+            car.size
+                <= entry
+                    .size_bytes
+                    .saturating_mul(2)
+                    .saturating_add(1024 * 1024),
+            "model CAR exceeds the closure storage bound"
+        );
+        let bytes = read_artifact(&artifacts[&receipt.name], Some(64 * 1024))?;
+        let receipt_json: Value = serde_json::from_slice(&bytes)?;
+        let fields = receipt_json
+            .as_object()
+            .context("model CAR receipt required")?;
+        ensure!(
+            fields.len() == 6
+                && fields.keys().all(|key| matches!(
+                    key.as_str(),
+                    "schema"
+                        | "package_cid"
+                        | "car_sha256"
+                        | "car_bytes"
+                        | "kubo_version"
+                        | "exported_at"
+                )),
+            "model CAR receipt fields refused"
+        );
+        ensure!(
+            text(&receipt_json, "schema")? == "elastos.model.package-car/v1"
+                && text(&receipt_json, "package_cid")? == package_cid
+                && text(&receipt_json, "car_sha256")? == car.sha256
+                && receipt_json["car_bytes"].as_u64() == Some(car.size)
+                && text(&receipt_json, "kubo_version")? == "0.40.1"
+                && receipt_json["exported_at"].as_u64().is_some(),
+            "model CAR receipt differs from its signed retention descriptor"
+        );
+        result.push(ModelRetention {
+            component: name.clone(),
+            package_cid: package_cid.to_owned(),
+            car,
+            receipt,
+        });
+    }
+    result.sort_by(|left, right| left.component.cmp(&right.component));
+    Ok(result)
 }
 
 fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -838,7 +1019,10 @@ fn bounded_bytes(file: &File, limit: u64) -> Result<Vec<u8>> {
 }
 fn read_artifact(artifact: &Artifact, limit: Option<u64>) -> Result<Vec<u8>> {
     if let Some(limit) = limit {
-        ensure!(artifact.descriptor.size <= limit, "artifact JSON too large");
+        ensure!(
+            artifact.descriptor.size <= limit,
+            "artifact exceeds read limit"
+        );
     }
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(usize::try_from(artifact.descriptor.size)?)?;
@@ -1078,6 +1262,163 @@ mod tests {
         fn open(&self) -> Result<Publication> {
             Publication::open_flat(&self.input, &self.did)
         }
+
+        fn write_components(&mut self, components: &Value) {
+            let bytes = serde_json::to_vec(components).unwrap();
+            std::fs::write(self.input.join("components-aarch64-darwin.json"), &bytes).unwrap();
+            self.release["platforms"]["aarch64-darwin"]["components"] = descriptor(&bytes);
+            self.write_signed();
+        }
+
+        fn with_model_retention() -> Self {
+            let mut fixture = Self::new();
+            let mut components: Value = serde_json::from_slice(
+                &std::fs::read(fixture.input.join("components-aarch64-darwin.json")).unwrap(),
+            )
+            .unwrap();
+            let original =
+                crate::api::capsule_inventory::tests::model_catalog_fixture()["entries"][0].clone();
+            let mut entries = Vec::new();
+            let mut retention = serde_json::Map::new();
+            for index in 0..4 {
+                let name = format!("model-fixture-{index}");
+                let mut entry = original.clone();
+                entry["capsule_manifest"]["name"] = json!(name);
+                let capsule = serde_json::to_vec(&entry["capsule_manifest"]).unwrap();
+                let files = entry["object_manifest"]["files"].as_array_mut().unwrap();
+                let mut hash = Sha256::new();
+                for file in files {
+                    if file["path"] == "capsule.json" {
+                        file["size"] = json!(capsule.len());
+                        file["sha256"] = json!(digest(&capsule));
+                    }
+                    for value in [
+                        file["path"].as_str().unwrap().to_owned(),
+                        file["sha256"].as_str().unwrap().to_owned(),
+                        file["size"].to_string(),
+                    ] {
+                        hash.update(value.as_bytes());
+                        hash.update(b"\0");
+                    }
+                }
+                entry["object_manifest"]["content_digest"] =
+                    json!(format!("sha256:{}", hex::encode(hash.finalize())));
+                // Synthetic metadata root shape, not a Kubo/Carrier proof.
+                let hash =
+                    cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest(&capsule)).unwrap();
+                let package = cid::Cid::new_v1(0x70, hash).to_string();
+                entry["cid"] = json!(package);
+                let car_name = format!("{name}.car");
+                let receipt_name = format!("{car_name}.receipt.json");
+                let car = format!("public model CAR fixture {index}").into_bytes();
+                let receipt = serde_json::to_vec(&json!({"schema":"elastos.model.package-car/v1",
+                    "package_cid":package,"car_sha256":digest(&car),"car_bytes":car.len(),
+                    "kubo_version":"0.40.1","exported_at":1}))
+                .unwrap();
+                let file_ref = |name: &str, bytes: &[u8]| json!({"release_path":name,"cid":raw_cid(bytes),"checksum":format!("sha256:{}",digest(bytes)),"size":bytes.len()});
+                std::fs::write(fixture.input.join(&car_name), &car).unwrap();
+                std::fs::write(fixture.input.join(&receipt_name), &receipt).unwrap();
+                retention.insert(name.clone(), json!({"package_cid":package,"car":file_ref(&car_name,&car),"receipt":file_ref(&receipt_name,&receipt)}));
+                components["external"][&name] = components["external"]["home"].clone();
+                entries.push(entry);
+            }
+            let catalog = envelope(
+                &fixture.key,
+                "elastos.model.catalog.v1",
+                &json!({
+                "schema":"elastos.model.catalog/v1","published_at":1,"expires_at":null,"entries":entries}),
+            );
+            std::fs::write(fixture.input.join("model-catalog.json"), &catalog).unwrap();
+            components["model_catalog"] =
+                json!({"head_cid":raw_cid(&catalog),"publisher_dids":[fixture.did]});
+            components["model_retention"] = Value::Object(retention);
+            fixture.write_components(&components);
+            fixture
+        }
+    }
+
+    #[test]
+    fn signed_model_retention_binds_four_roots_and_receipts_across_snapshot() {
+        let fixture = PublicPublicationFixture::with_model_retention();
+        let publication = fixture.open().unwrap();
+        assert_eq!(publication.model_retention().len(), 4);
+        let output = fixture.parent.join("retained-snapshot");
+        publication.snapshot_into(&output).unwrap();
+        let copied = Publication::open_published(&output, &fixture.did).unwrap();
+        assert_eq!(copied.model_retention(), publication.model_retention());
+    }
+
+    #[test]
+    fn model_retention_refuses_wrong_root_descriptor_fields_and_missing_models() {
+        for mutation in ["root", "descriptor", "missing", "catalog-signature"] {
+            let mut fixture = PublicPublicationFixture::with_model_retention();
+            let path = fixture.input.join("components-aarch64-darwin.json");
+            let mut components: Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            match mutation {
+                "root" => {
+                    components["model_retention"]["model-fixture-0"]["package_cid"] =
+                        components["model_retention"]["model-fixture-1"]["package_cid"].clone()
+                }
+                "descriptor" => {
+                    components["model_retention"]["model-fixture-0"]["car"]["unexpected"] =
+                        json!(true)
+                }
+                "missing" => {
+                    components["model_retention"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model-fixture-0");
+                }
+                _ => {
+                    let path = fixture.input.join("model-catalog.json");
+                    let mut catalog: Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    catalog["signature"] = json!("0".repeat(128));
+                    let bytes = serde_json::to_vec(&catalog).unwrap();
+                    std::fs::write(path, &bytes).unwrap();
+                    components["model_catalog"]["head_cid"] = json!(raw_cid(&bytes));
+                }
+            }
+            fixture.write_components(&components);
+            assert!(fixture.open().is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn model_car_receipt_requires_the_admitted_hash_size_and_profile() {
+        for field in [
+            "car_sha256",
+            "car_bytes",
+            "package_cid",
+            "kubo_version",
+            "extra",
+        ] {
+            let mut fixture = PublicPublicationFixture::with_model_retention();
+            let component_path = fixture.input.join("components-aarch64-darwin.json");
+            let mut components: Value =
+                serde_json::from_slice(&std::fs::read(&component_path).unwrap()).unwrap();
+            let receipt_path = fixture.input.join("model-fixture-0.car.receipt.json");
+            let mut receipt: Value =
+                serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+            receipt[field] = match field {
+                "car_bytes" => json!(1),
+                "extra" => json!(true),
+                "car_sha256" => json!("0".repeat(64)),
+                "package_cid" => {
+                    components["model_retention"]["model-fixture-1"]["package_cid"].clone()
+                }
+                _ => json!("0.39.0"),
+            };
+            let bytes = serde_json::to_vec(&receipt).unwrap();
+            std::fs::write(&receipt_path, &bytes).unwrap();
+            let descriptor = &mut components["model_retention"]["model-fixture-0"]["receipt"];
+            descriptor["cid"] = json!(raw_cid(&bytes));
+            descriptor["checksum"] = json!(format!("sha256:{}", digest(&bytes)));
+            descriptor["size"] = json!(bytes.len());
+            fixture.write_components(&components);
+            assert!(fixture.open().is_err(), "{field}");
+        }
     }
 
     #[test]
@@ -1169,6 +1510,43 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
             assert!(publication.unchanged_published().is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn bounded_artifact_read_refuses_before_reading_and_keeps_signed_tamper_checks() {
+        let fixture = PublicPublicationFixture::new();
+        let publication = fixture.open().unwrap();
+        let name = "home.tar.gz";
+        let size = publication
+            .artifacts()
+            .iter()
+            .find(|record| record.name == name)
+            .unwrap()
+            .size;
+        let reads = STREAM_READS.with(|reads| reads.get());
+        let error = publication
+            .read_verified_artifact_bounded(name, size - 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("read limit"));
+        assert_eq!(STREAM_READS.with(|reads| reads.get()), reads);
+        assert_eq!(
+            publication
+                .read_verified_artifact_bounded(name, size)
+                .unwrap(),
+            std::fs::read(fixture.input.join(name)).unwrap()
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.input.join(name))
+            .unwrap();
+        file.write_at(b"X", 0).unwrap();
+        file.sync_all().unwrap();
+        assert!(publication
+            .read_verified_artifact_bounded(name, size)
+            .is_err());
+        assert!(publication
+            .read_verified_artifact_bounded("../install.sh", size)
+            .is_err());
     }
 
     #[test]

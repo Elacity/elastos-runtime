@@ -966,6 +966,68 @@ build_platform_independent_provider_capsule_metadata_assets() {
 }
 # Attach transport identities only after local asset preparation succeeds.
 # Builders above return unsigned descriptors with no placeholder CIDs.
+# Upstream software is fetched only by this build worker. Installed clients use
+# the same signed release-path/CID contract as every first-party component.
+release_model_preparation_enabled() {
+    local name count=0
+    for name in ELASTOS_RELEASE_MODEL_KUBO_BIN ELASTOS_RELEASE_MODEL_KUBO_REPO \
+        ELASTOS_RELEASE_MODEL_PUBLISHED_AT ELASTOS_RELEASE_MODEL_PUBLISHER_DID \
+        ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT ELASTOS_RELEASE_MODEL_HANDOFF_INPUT; do
+        [[ -z "${!name:-}" ]] || count=$((count + 1))
+    done
+    if [[ "$count" == 0 ]]; then echo false; return; fi
+    if [[ -z "${ELASTOS_RELEASE_MODEL_PUBLISHED_AT:-}" || \
+          -z "${ELASTOS_RELEASE_MODEL_PUBLISHER_DID:-}" || \
+          -z "${ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT:-}" ]]; then
+        die "Model preparation requires PUBLISHED_AT, PUBLISHER_DID and HANDOFF_OUTPUT in ELASTOS_RELEASE_MODEL_*"
+    fi
+    if [[ -n "${ELASTOS_RELEASE_MODEL_HANDOFF_INPUT:-}" ]]; then
+        [[ "$count" == 4 ]] || die "Model preparation requires shared HANDOFF_INPUT without KUBO_BIN or KUBO_REPO"
+    else
+        [[ "$count" == 5 ]] || die "Model preparation requires KUBO_BIN and KUBO_REPO for the first authoritative handoff"
+    fi
+    echo true
+}
+
+build_upstream_direct_assets() {
+    local platform="$1" setup_platform="$2"
+    local output="$TMPDIR/supported-upstream-assets-$platform"
+    local cache="${ELASTOS_RELEASE_UPSTREAM_CACHE:-$TMPDIR/upstream-cache}"
+    local models
+    local args=()
+    models=$(release_model_preparation_enabled) || return
+    if [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]]; then
+        args+=(--llama-arm64-bundle "$ELASTOS_LLAMA_ARM64_BUNDLE")
+    fi
+    if [[ "$models" == true ]]; then
+        # The explicit operator handoff survives temporary build cleanup. This
+        # phase signs nothing; public catalogue finalization follows separately.
+        python3 - "$ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT" "$TMPDIR" <<'PY' || return
+from pathlib import Path
+import os, sys
+path, temporary = Path(sys.argv[1]), Path(sys.argv[2]).resolve()
+if not path.is_absolute() or any(parent.is_symlink() for parent in (path, *path.parents)):
+    raise SystemExit('Model handoff requires an absolute path without symlinks')
+if path.exists() or not path.parent.is_dir() or temporary == path or temporary in path.parents:
+    raise SystemExit('Model handoff requires a new directory outside temporary build output')
+metadata = path.parent.stat()
+if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+    raise SystemExit('Model handoff parent must be owned and protected')
+PY
+        args+=(--published-at "$ELASTOS_RELEASE_MODEL_PUBLISHED_AT"
+            --model-publisher-did "$ELASTOS_RELEASE_MODEL_PUBLISHER_DID"
+            --model-handoff-output "$ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT")
+        if [[ -n "${ELASTOS_RELEASE_MODEL_HANDOFF_INPUT:-}" ]]; then
+            args+=(--model-handoff-input "$ELASTOS_RELEASE_MODEL_HANDOFF_INPUT")
+        else
+            args+=(--model-kubo-bin "$ELASTOS_RELEASE_MODEL_KUBO_BIN"
+                --model-kubo-repo "$ELASTOS_RELEASE_MODEL_KUBO_REPO")
+        fi
+    fi
+    python3 scripts/release-upstream-assets.py --platform "$setup_platform" \
+        --cache "$cache" --output "$output" ${args[@]+"${args[@]}"}
+}
+
 publish_direct_assets() {
     local updates_json="$1"
     local platform="$2"
@@ -982,7 +1044,8 @@ publish_direct_assets() {
         for candidate in \
             "${TMPDIR}/supported-assets-${platform}/${release_path}" \
             "${TMPDIR}/supported-assets-universal/${release_path}" \
-            "${TMPDIR}/supported-provider-contracts-universal/${release_path}"; do
+            "${TMPDIR}/supported-provider-contracts-universal/${release_path}" \
+            "${TMPDIR}/supported-upstream-assets-${platform}/${release_path}"; do
             if [[ -f "$candidate" && ! -L "$candidate" ]]; then
                 staged="$candidate"
                 count=$((count + 1))
@@ -1251,6 +1314,29 @@ try:
         for name, entry in (manifest.get("capsules") or {}).items():
             if isinstance(entry, dict) and platform in (entry.get("platforms") or []):
                 referenced.add(f"{name}-{platform}.capsule.tar.gz")
+        retention = manifest.get("model_retention")
+        if retention is not None:
+            if not isinstance(retention, dict) or len(retention) != 4:
+                raise ValueError("prepared model_retention requires four models")
+            for model in retention.values():
+                if not isinstance(model, dict):
+                    raise ValueError("prepared model retention must be an object")
+                for kind in ("car", "receipt"):
+                    info = model.get(kind)
+                    if not isinstance(info, dict):
+                        raise ValueError(f"prepared model retention {kind} descriptor is required")
+                    name = info.get("release_path")
+                    if name not in present or not isinstance(info.get("cid"), str) or not info["cid"]:
+                        raise ValueError(f"prepared model retention {kind} artifact/CID is required")
+                    path = present[name]
+                    sha = hashlib.sha256()
+                    with path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            sha.update(chunk)
+                    if (type(info.get("size")) is not int or info["size"] != path.stat().st_size
+                            or info.get("checksum") != "sha256:" + sha.hexdigest()):
+                        raise ValueError(f"prepared model retention bytes differ: {name}")
+                    referenced.add(name)
     if errors:
         raise ValueError("; ".join(errors))
     extra = sorted(set(present) - referenced)

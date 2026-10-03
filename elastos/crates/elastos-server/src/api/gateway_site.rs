@@ -19,6 +19,7 @@ struct PublicationReceipt {
 pub(super) struct ReleaseReadGate {
     pub(super) permit: Arc<tokio::sync::Semaphore>,
     cache: Arc<std::sync::Mutex<Option<CachedPublication>>>,
+    pub(super) max_http_artifact_bytes: u64,
     #[cfg(test)]
     pub(super) admissions: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -28,6 +29,7 @@ impl ReleaseReadGate {
         Self {
             permit: Arc::new(tokio::sync::Semaphore::new(1)),
             cache: Arc::new(std::sync::Mutex::new(None)),
+            max_http_artifact_bytes: 200 * 1024 * 1024,
             #[cfg(test)]
             admissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -245,16 +247,20 @@ async fn signed_release_response(
                 ReleaseFile::Release => Ok(publication.release_bytes().to_vec()),
                 ReleaseFile::Installer => Ok(publication.installer_bytes().to_vec()),
                 ReleaseFile::Artifact(name) => {
-                    if publication
+                    match publication
                         .artifacts()
                         .iter()
-                        .any(|record| record.name == name)
+                        .find(|record| record.name == name)
                     {
-                        publication
-                            .read_verified_artifact(&name)
-                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
-                    } else {
-                        Err(StatusCode::NOT_FOUND)
+                        Some(record) if record.size > gate.max_http_artifact_bytes => {
+                            Err(StatusCode::PAYLOAD_TOO_LARGE)
+                        }
+                        Some(_) => publication
+                            // Keep HTTP bootstrap allocation bounded. Size-policy
+                            // refusal retains the admitted publication cache.
+                            .read_verified_artifact_bounded(&name, gate.max_http_artifact_bytes)
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE),
+                        None => Err(StatusCode::NOT_FOUND),
                     }
                 }
             };
@@ -280,6 +286,11 @@ async fn signed_release_response(
         Err(StatusCode::NOT_FOUND) => {
             (StatusCode::NOT_FOUND, "Release file not found").into_response()
         }
+        Err(StatusCode::PAYLOAD_TOO_LARGE) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Release artifact requires bounded Carrier delivery",
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Release publication unavailable",
