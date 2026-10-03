@@ -356,10 +356,8 @@ async fn system_update_summary_stays_fast_while_check_is_pending_and_keeps_queue
         system_runtime_update_summary_with_cache(dir.path(), &member_context, &cache, |_, _, _| {
             unexpected_check()
         })
-        .await
-        .unwrap();
-    assert_eq!(member_summary["available"], true);
-    assert_eq!(member_summary["can_apply"], false);
+        .await;
+    assert!(member_summary.is_none());
     std::fs::write(dir.path().join("update-controller/request.json"), b"{}").unwrap();
     let queued =
         system_runtime_update_summary_with_cache(dir.path(), &context, &cache, |_, _, _| {
@@ -369,6 +367,59 @@ async fn system_update_summary_stays_fast_while_check_is_pending_and_keeps_queue
         .unwrap();
     assert_eq!(queued["available"], true);
     assert_eq!(queued["can_apply"], false);
+}
+
+#[tokio::test]
+async fn system_update_guest_summary_skips_discovery_and_keeps_owner_check_unstarted() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let member = passkey_authority_with_name_role(
+        dir.path(),
+        Some("member"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let context = HomeLaunchTokenContext {
+        principal_id: member.principal_id.clone(),
+        session_id: member.session_id.clone(),
+        proof_binding_id: Some(member.proof_binding_id.clone()),
+        grant_id: member.grant_id.clone(),
+    };
+    configure_update_summary(dir.path());
+    let cache = tokio::sync::Mutex::new(UpdateCheckCache::default());
+    assert!(
+        system_runtime_update_summary_with_cache(dir.path(), &context, &cache, |_, _, _| {
+            unexpected_check()
+        })
+        .await
+        .is_none()
+    );
+    let (status, summary) =
+        home_test_get_json(&app, UPDATE_APPLY_ROUTE, &member.system_token, "null").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(summary["runtime_update"].is_null());
+    assert_update_stays_unqueued(dir.path());
+
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let owner_context = HomeLaunchTokenContext {
+        principal_id: owner.principal_id,
+        session_id: owner.session_id,
+        proof_binding_id: Some(owner.proof_binding_id),
+        grant_id: owner.grant_id,
+    };
+    let (started, observed) = tokio::sync::oneshot::channel();
+    let owner_summary = system_runtime_update_summary_with_cache(
+        dir.path(),
+        &owner_context,
+        &cache,
+        |_, _, _| async move {
+            started.send(()).unwrap();
+            Some(cached_offer())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(owner_summary["checking"], true);
+    observed.await.unwrap();
 }
 
 #[tokio::test]

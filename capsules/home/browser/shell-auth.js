@@ -229,9 +229,15 @@ export function bindHomeUnlock() {
 
 export function refreshHomeSession({ signal } = {}) {
   if (!sessionRefreshInFlight) {
+    const controller = signal ? null : new AbortController();
+    const deadline = controller ? window.setTimeout(() => {
+      const error = new Error("Home session refresh timed out.");
+      error.name = "TimeoutError";
+      controller.abort(error);
+    }, SESSION_REFRESH_TIMEOUT_MS) : null;
     sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", {
       method: "POST",
-      signal: signal || AbortSignal.timeout(SESSION_REFRESH_TIMEOUT_MS),
+      signal: signal || controller.signal,
     })
       .then((response) => {
         setHomeAuthorityToken(response?.home_token);
@@ -244,6 +250,7 @@ export function refreshHomeSession({ signal } = {}) {
         throw error;
       })
       .finally(() => {
+        window.clearTimeout(deadline);
         sessionRefreshInFlight = null;
       });
   }

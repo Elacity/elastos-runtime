@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { getEventListeners } from "node:events";
 
 const moduleVersion = "home-update-20261003a";
 const requests = [];
@@ -369,15 +370,15 @@ function eventFixture() {
     homeEventsSource: null, homeEventsStreamFailed: false, homeEventsTimer: null };
   const context = vm.createContext({
     AbortController, URLSearchParams, EventSource: EventSourceFixture,
-    AbortSignal: {
-      any: signals => AbortSignal.any(signals),
-      timeout: ms => { deadlines.push(ms); return new AbortController().signal; },
-    },
+    AbortSignal: {}, // Older Safari supplies AbortController without the static signal helpers.
     document: { hidden: false },
     window: {
       EventSource: EventSourceFixture,
       addEventListener: (type, handler) => listeners.set(type, handler),
-      setTimeout: (handler, delay) => { timers.set(++timerId, { handler, delay }); return timerId; },
+      setTimeout: (handler, delay) => {
+        if (delay === 10_000 || delay === 35_000) deadlines.push(delay);
+        timers.set(++timerId, { handler, delay }); return timerId;
+      },
       clearTimeout: id => timers.delete(id),
     },
     shellState: state, launchedAppContexts: new Map(), OPAQUE_FRAME_TARGET: "*",
@@ -428,6 +429,8 @@ function eventFixture() {
   assert(f.streams.length === 2 && !f.streams[1].closed, "recovery did not restore the event stream");
   assert(f.streams[1].options.withCredentials === true, "recovery lost signed stream credentials");
   assert(f.deadlines.every(ms => ms === 10_000), "outage probes or recovery refreshes lost their request deadline", f.deadlines);
+  assert(f.reads.every(read => getEventListeners(read.signal, "abort").length === 0),
+    "settled event requests retained their owned abort listeners");
   assert(f.broadcasts.some(message => message.events.some(event => event.kind === "home.summary.changed")), "recovery did not notify the active shell");
   f.listeners.get("pagehide")();
   assert(f.streams[1].closed && f.timers.size === 0, "recovered event channel outlived its document");
@@ -443,6 +446,8 @@ function eventFixture() {
   assert(f.deadlines[0] === 35_000, "normal long poll lost its bounded deadline");
   f.listeners.get("pagehide")();
   assert(f.reads[0].signal.aborted, "page close did not abort the owned long poll");
+  assert(f.timers.size === 0 && getEventListeners(f.reads[0].signal, "abort").length === 0,
+    "page close kept the request deadline or its abort listener");
   assert(f.context.homeEventsChannelGeneration > generation, "page close did not retire the event epoch");
   f.context.ensureHomeEventChannel();
   assert(f.timers.size === 0, "closed document armed another event timer");
@@ -453,6 +458,28 @@ function eventFixture() {
   assert(f.timers.size === 1, "restored Home document did not resume its channel");
   f.listeners.get("pagehide")();
   assert(f.timers.size === 0, "restored document kept an owned timer after close");
+}
+
+for (const reconnecting of [false, true]) {
+  const f = eventFixture();
+  f.context.window.EventSource = null;
+  f.state.homeEventsStreamFailed = reconnecting;
+  f.context.fetchJson = (url, init) => {
+    f.reads.push({ url, ...init });
+    return new Promise((resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+  };
+  const polling = f.context.pollHomeEvents();
+  const deadline = [...f.timers.values()][0];
+  assert(deadline.delay === (reconnecting ? 10_000 : 35_000), "event request lost its exact deadline");
+  deadline.handler();
+  await polling;
+  assert(f.reads[0].signal.aborted && f.reads[0].signal.reason.name === "TimeoutError",
+    "owned event deadline failed to abort the pending transport");
+  assert(getEventListeners(f.reads[0].signal, "abort").length === 0,
+    "timed-out event request retained an abort listener");
+  assert(f.timers.size === 1 && f.counts().clears === 0, "request timeout lost session authority or retry ownership");
+  f.listeners.get("pagehide")();
+  assert(f.timers.size === 0, "document close kept the timeout retry");
 }
 
 {
@@ -489,4 +516,4 @@ function eventFixture() {
   assert(f.timers.size === 0 && f.streams.every(stream => stream.closed), "auth refusal restarted the signed event channel");
 }
 
-console.log("[home-shell-recovery] PASS (4 event recovery cases)");
+console.log("[home-shell-recovery] PASS (6 event recovery cases)");

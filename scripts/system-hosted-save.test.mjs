@@ -302,6 +302,19 @@ test("Home update requires a verified complete offer and a controller that can a
   assert.equal(f.timers.size, 0, "source Home without an installed controller has no update polling");
 });
 
+test("guest System summary keeps update controls and discovery polling hidden", async () => {
+  const f = updateFixture();
+  f.context.renderRuntimeUpdate(null);
+  assert.equal(f.panel.hidden, true);
+  assert.equal(f.button.hidden, true);
+  assert.equal(f.button.disabled, true);
+  await f.context.onRuntimeUpdateApply();
+  await f.advance(60_000);
+  assert.equal(f.approvals.length, 0);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.timers.size, 0);
+});
+
 test("Home update freezes one exact passkey intent and retries a lost response with identical bytes", async () => {
   let approve;
   let attempt = 0;

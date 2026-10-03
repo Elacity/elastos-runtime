@@ -7945,11 +7945,13 @@ assert(
     shellAuth.includes("unlockPanel?.dataset.surface === \"lock-face\""),
   "Home lock sign-in must keep the explicit-click lock-face flow",
 );
+const shellPasskeySignIn = shellAuth.match(/^async function runPasskeySignIn\([\s\S]*?^\}/m)?.[0] || "";
 assert(
   !shellAuth.includes("startAutomaticPasskeySignIn") &&
     !shellAuth.includes("autoSignInAttempted") &&
-    !shellAuth.includes("AbortController") &&
-    !shellAuth.includes('name === "AbortError"'),
+    shellPasskeySignIn &&
+    !shellPasskeySignIn.includes("AbortController") &&
+    !shellPasskeySignIn.includes('name === "AbortError"'),
   "Home lock sign-in must not auto-start or add hidden cancellation state",
 );
 assert(

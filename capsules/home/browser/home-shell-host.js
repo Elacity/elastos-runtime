@@ -2336,6 +2336,29 @@ function bindHomeEventLifecycle() {
 
 bindHomeEventLifecycle();
 
+async function withHomeEventRequestDeadline(controller, timeout, request) {
+  const clearDeadline = () => {
+    window.clearTimeout(timer);
+    controller.signal.removeEventListener("abort", clearDeadline);
+  };
+  const timer = window.setTimeout(() => {
+    const error = new Error("Home event request timed out.");
+    error.name = "TimeoutError";
+    controller.abort(error);
+  }, timeout);
+  controller.signal.addEventListener("abort", clearDeadline, { once: true });
+  try {
+    if (controller.signal.aborted) {
+      const error = new Error("Home event request was cancelled.");
+      error.name = "AbortError";
+      throw error;
+    }
+    return await request(controller.signal);
+  } finally {
+    clearDeadline();
+  }
+}
+
 function ensureHomeEventChannel() {
   if (!homeEventsChannelActive || document.hidden || !homeSummarySignedIn(shellState.currentSummary)) {
     return;
@@ -2376,14 +2399,13 @@ function refreshHomeAfterEventReconnect() {
     const generation = homeEventsChannelGeneration;
     const controller = new AbortController();
     homeEventsReconnectController = controller;
-    const signal = () => AbortSignal.any([
-      controller.signal, AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS),
-    ]);
     const current = () => homeEventsChannelActive && generation === homeEventsChannelGeneration;
     const pending = Promise.resolve()
       .then(() => current() && homeSummaryHasProofBoundSession(shellState.currentSummary)
-        ? refreshHomeSession({ signal: signal() }) : null)
-      .then(() => current() ? refreshShellSummary({ signal: signal() }) : null)
+        ? withHomeEventRequestDeadline(controller, HOME_EVENTS_RECONNECT_TIMEOUT_MS,
+          signal => refreshHomeSession({ signal })) : null)
+      .then(() => current() ? withHomeEventRequestDeadline(controller, HOME_EVENTS_RECONNECT_TIMEOUT_MS,
+        signal => refreshShellSummary({ signal })) : null)
       .then((summary) => {
         if (current() && homeSummarySignedIn(summary)) {
           broadcastHomeRuntimeEvents([{
@@ -2485,11 +2507,9 @@ async function pollHomeEvents() {
   const hadCursor = Boolean(shellState.homeEventsCursor);
   let restartStream = false;
   try {
-    const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`, {
-      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(
-        reconnecting ? HOME_EVENTS_RECONNECT_TIMEOUT_MS : HOME_EVENTS_POLL_TIMEOUT_MS,
-      )]),
-    });
+    const payload = await withHomeEventRequestDeadline(controller,
+      reconnecting ? HOME_EVENTS_RECONNECT_TIMEOUT_MS : HOME_EVENTS_POLL_TIMEOUT_MS,
+      signal => fetchJson(`/api/apps/home/events?${params.toString()}`, { signal }));
     if (generation !== homeEventsChannelGeneration) {
       return;
     }

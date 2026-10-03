@@ -217,6 +217,9 @@ where
         + Send
         + 'static,
 {
+    if require_admin_principal(data_dir, context).is_err() {
+        return None;
+    }
     let controller = crate::update_controller::status(data_dir).ok()??;
     let config = crate::sources::load_trusted_sources(data_dir).ok()?;
     let source = config.default_source()?;

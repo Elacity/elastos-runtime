@@ -6,6 +6,12 @@ const windowListeners = new Map();
 const documentListeners = new Map();
 const intervals = new Map();
 const eventPollTimers = new Map();
+const requestDeadlineTimers = new Map();
+const requestDeadlines = [];
+const nativeAbortAny = AbortSignal.any;
+const nativeAbortTimeout = AbortSignal.timeout;
+AbortSignal.any = undefined;
+AbortSignal.timeout = undefined;
 const eventSources = [];
 let nextIntervalId = 1;
 let nextEventPollTimerId = 10_000;
@@ -270,6 +276,7 @@ globalThis.window = {
   },
   clearTimeout(id) {
     if (eventPollTimers.delete(id)) return;
+    if (requestDeadlineTimers.delete(id)) return;
     if (id) clearImmediate(id);
   },
   setInterval(callback, delay) {
@@ -278,6 +285,12 @@ globalThis.window = {
     return id;
   },
   setTimeout(callback, delay) {
+    if (delay === 10_000 || delay === 35_000) {
+      const id = nextEventPollTimerId++;
+      requestDeadlineTimers.set(id, { callback, delay });
+      requestDeadlines.push(delay);
+      return id;
+    }
     if (callback?.name === "pollHomeEvents") {
       const id = nextEventPollTimerId++;
       eventPollTimers.set(id, { callback, delay });
@@ -723,6 +736,8 @@ await refreshHomeSession();
 sessionResponseMode = "pending";
 const sessionAbort = new AbortController();
 const timedSession = refreshHomeSession({ signal: sessionAbort.signal });
+assert(requests.filter(request => request.url === "/api/auth/sessions/refresh").at(-1).signal === sessionAbort.signal,
+  "session refresh replaced its caller's owned abort signal");
 sessionAbort.abort(new DOMException("Request timed out", "TimeoutError"));
 let sessionAborted = false;
 try {
@@ -731,6 +746,20 @@ try {
   sessionAborted = error.name === "TimeoutError";
 }
 assert(sessionAborted && hasHomeAuthorityToken(), "session deadline lost the existing authority");
+assert(requestDeadlineTimers.size === 0, "settled session refresh retained its deadline");
+const ownedTimedSession = refreshHomeSession();
+assert(requestDeadlineTimers.size === 1, "default session refresh lacks one owned deadline");
+const [deadlineId, deadline] = requestDeadlineTimers.entries().next().value;
+requestDeadlineTimers.delete(deadlineId);
+deadline.callback();
+let ownedSessionTimedOut = false;
+try {
+  await ownedTimedSession;
+} catch (error) {
+  ownedSessionTimedOut = error.name === "TimeoutError";
+}
+assert(ownedSessionTimedOut && hasHomeAuthorityToken(), "owned session timeout lost its bounded refusal or authority");
+assert(requestDeadlineTimers.size === 0, "default session timeout retained its timer");
 resolveSessionRefresh = null;
 sessionResponseMode = "success";
 
@@ -782,12 +811,7 @@ for (const listener of windowListeners.get("message") || []) listener({
   data: { type: "home:app-ready", homeToken: "surviving-system-token" },
 });
 runtimeVersion = "after-restart";
-const reconnectDeadlines = [];
-const nativeAbortTimeout = AbortSignal.timeout;
-AbortSignal.timeout = (delay) => {
-  reconnectDeadlines.push(delay);
-  return nativeAbortTimeout(delay);
-};
+const reconnectDeadlineStart = requestDeadlines.length;
 sessionResponseMode = "pending";
 const refreshCount = sessionRequests().length;
 initialStream.emit("open");
@@ -888,7 +912,10 @@ assert(!hasHomeAuthorityToken(), "Home kept its authority after a definitive eve
 assert(eventPollTimers.size === 0, "Home retried events after a definitive authorization failure");
 assert(elementForSelector("#home-unlock").hidden === false, "event authorization failure lost the sign-in recovery");
 AbortSignal.timeout = nativeAbortTimeout;
+AbortSignal.any = nativeAbortAny;
+const reconnectDeadlines = requestDeadlines.slice(reconnectDeadlineStart);
 assert(reconnectDeadlines.length > 0 && reconnectDeadlines.every(delay => delay === 10_000),
   "Home reconnect requests lost their finite deadline", reconnectDeadlines);
+assert(requestDeadlineTimers.size === 0, "closed event channel retained request deadlines");
 
 console.log("[home-shell-auth-gate] PASS");
