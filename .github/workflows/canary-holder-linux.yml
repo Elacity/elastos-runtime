@@ -258,7 +258,7 @@ jobs:
           set -euo pipefail
           umask 077
           python3 - <<'PY'
-          import base64, hashlib, importlib.util, json, os, re, select, shutil, socket, subprocess, time, urllib.error, urllib.request
+          import base64, hashlib, importlib.util, json, os, re, select, shutil, socket, subprocess, time, urllib.error, urllib.parse, urllib.request
           from pathlib import Path
           observer_path = Path(os.environ['GITHUB_WORKSPACE']) / 'observer/scripts/update-hop-compare.py'
           assert hashlib.sha256(observer_path.read_bytes()).hexdigest() == os.environ['OBSERVER_SHA256']
@@ -317,12 +317,66 @@ jobs:
           def read(home, http_port, cid, expected, label):
               cache = home / 'gateway-cache' / (cid + '.raw')
               assert not cache.exists(), 'qualification read must be uncached'
-              record = {'label': label, 'cid': cid, 'expected_sha256': sha(expected), 'cache_absent': True}
+              record = {'label': label, 'cid': cid, 'ingress': 'public gateway /content/:cid',
+                        'expected_sha256': sha(expected), 'expected_size': expected.stat().st_size, 'cache_absent': True}
               try:
                   payload = get(f'http://127.0.0.1:{http_port}/content/{cid}')
                   record.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
                   record['passed'] = record['size'] == expected.stat().st_size and record['sha256'] == record['expected_sha256']
               except (OSError, urllib.error.URLError, AssertionError) as error:
+                  record.update(passed=False, error_type=type(error).__name__)
+              result['reads'].append(record)
+              return record['passed']
+          def post(url, request, bound, token=None):
+              headers = {'Content-Type': 'application/json'}
+              if token is not None:
+                  headers['Authorization'] = 'Bearer ' + token
+              wire = urllib.request.Request(url, data=json.dumps(request).encode(), headers=headers, method='POST')
+              return json.loads(get(wire, bound))
+          def attach(data, owner, public_port):
+              # Match Runtime's attach_to_runtime contract. Secrets and session
+              # tokens remain in this process, outside logs and proof receipts.
+              path = data / 'gateway-runtime-coords.json'
+              assert not path.is_symlink() and path.stat().st_mode & 0o077 == 0
+              coords = json.loads(path.read_bytes())
+              assert coords['pid'] == owner.pid and coords['runtime_kind'] == 'gateway'
+              parsed = urllib.parse.urlsplit(coords['api_url'])
+              assert parsed.scheme == 'http' and parsed.hostname == '127.0.0.1'
+              assert parsed.port != public_port and parsed.path in ('', '/')
+              assert parsed.username is None and parsed.password is None and not parsed.query and not parsed.fragment
+              api = coords['api_url'].rstrip('/')
+              response = post(api + '/api/auth/attach', {'secret': coords['attach_secret'], 'scope': 'shell'}, 65536)
+              assert response['session_type'] == 'shell' and isinstance(response['token'], str) and response['token']
+              return api, response['token']
+          def content_read(auth, cid, expected, label, carrier=False, destination=None):
+              record = {'label': label, 'cid': cid, 'ingress': 'private Runtime /api/provider/content/fetch',
+                        'transfer': 'complete unbounded bytes', 'expected_sha256': sha(expected),
+                        'expected_size': expected.stat().st_size, 'carrier_claim': carrier,
+                        'legacy_carrier_content_fetch_journey': False}
+              try:
+                  # No range, max_bytes, bounded_read or prepare operation is
+                  # sent. The first post-stop operation is this content read.
+                  bound = 4 * ((record['expected_size'] + 2) // 3) + 65536
+                  response = post(auth[0] + '/api/provider/content/fetch', {'cid': cid}, bound, auth[1])
+                  assert response['status'] == 'ok' and response['data']['cid'] == cid
+                  payload = base64.b64decode(response['data']['data'], validate=True)
+                  record.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+                  record['passed'] = record['size'] == record['expected_size'] and record['sha256'] == record['expected_sha256']
+                  if carrier:
+                      availability = response['data']['availability']
+                      assert availability['provider'] == 'carrier-availability'
+                      assert availability['policy'] == 'carrier_provider_invoke'
+                      assert availability['transport'] == 'carrier-provider-plane'
+                      assert availability['status'] == 'network_available'
+                      record['transport'] = 'typed availability / Carrier provider_invoke / holder Content / native IPFS cat'
+                  else:
+                      record['transport'] = 'local Content / native IPFS cat'
+                  if destination is not None:
+                      assert record['passed'] and not destination.exists()
+                      destination.write_bytes(payload)
+                      destination.chmod(0o700)
+                      assert sha(destination) == record['expected_sha256']
+              except (OSError, urllib.error.URLError, AssertionError, ValueError, KeyError) as error:
                   record.update(passed=False, error_type=type(error).__name__)
               result['reads'].append(record)
               return record['passed']
@@ -448,20 +502,38 @@ jobs:
               result['consumer'] = {'backend': 'Carrier-only; no local IPFS provider or repository',
                   'runtime_sha256': sha(consumer_runtime), 'carrier_bootstrap_ready': True,
                   'holder_peer_registered': True}
+              holder_auth = attach(data, holder, holder_port)
+              consumer_auth = attach(consumer_data, consumer, consumer_port)
+              accepted_version = command(home, [str(runtime), '--version'], 'accepted-runtime-version')
+              assert accepted_version == 'elastos ' + os.environ['ELASTOS_RELEASE_VERSION']
               assert read(home, holder_port, cids[0], warmup, 'gateway-before-idle')
               assert read(consumer_home, consumer_port, cids[0], warmup, 'carrier-before-idle')
               provider_before = provider_identity(holder, data / 'bin/ipfs-provider')
-              # Both caches have only the warmup CID. This is the actual accepted
-              # release Runtime, through the unbounded Content/Carrier file path.
+              # Private Content fetch returns the entire accepted release binary.
+              # Carrier's typed provider route reaches the holder's IPFS backend;
+              # public gateway rendering has its own file size limit. This proof
+              # does not claim a separate legacy Carrier content_fetch journey.
+              fetched_runtime = consumer_home / '.local/bin/carrier-fetched-elastos'
               before = idle_stop(data, holder, provider_before, 'carrier-release-binary', 'holder')
-              assert read(consumer_home, consumer_port, cids[1], runtime, 'carrier-release-binary-after-idle')
+              assert content_read(consumer_auth, cids[1], runtime, 'carrier-release-binary-after-idle',
+                  carrier=True, destination=fetched_runtime)
               restarted(data, before, 'carrier-release-binary')
-              before = idle_stop(data, holder, provider_before, 'gateway-release-binary', 'holder')
-              assert read(home, holder_port, cids[1], runtime, 'gateway-release-binary-after-idle')
-              restarted(data, before, 'gateway-release-binary')
-              before = idle_stop(data, holder, provider_before, 'carrier-generic-file', 'holder')
-              assert read(consumer_home, consumer_port, cids[2], generic, 'carrier-generic-file-after-idle')
-              restarted(data, before, 'carrier-generic-file')
+              processes.roots[str(fetched_runtime)] = {sha(fetched_runtime)}
+              fetched_version = command(consumer_home, [str(fetched_runtime), '--version'], 'carrier-fetched-runtime-version')
+              assert fetched_version == accepted_version
+              result['release_content'] = {'cid': cids[1], 'size': fetched_runtime.stat().st_size,
+                  'sha256': sha(fetched_runtime), 'version': fetched_version,
+                  'matches_accepted_runtime': True, 'carrier_route': 'typed Content availability/provider_invoke',
+                  'legacy_carrier_content_fetch_journey': False}
+              before = idle_stop(data, holder, provider_before, 'local-content-release-binary', 'holder')
+              assert content_read(holder_auth, cids[1], runtime, 'local-content-release-binary-after-idle')
+              restarted(data, before, 'local-content-release-binary')
+              before = idle_stop(data, holder, provider_before, 'gateway-generic-file', 'holder')
+              assert read(home, holder_port, cids[2], generic, 'gateway-generic-file-after-idle')
+              restarted(data, before, 'gateway-generic-file')
+              before = idle_stop(data, holder, provider_before, 'carrier-gateway-generic-file', 'holder')
+              assert read(consumer_home, consumer_port, cids[2], generic, 'carrier-gateway-generic-file-after-idle')
+              restarted(data, before, 'carrier-gateway-generic-file')
               assert holder.poll() is None and consumer.poll() is None
               assert provider_identity(holder, data / 'bin/ipfs-provider') == provider_before
               result['same_provider_generation'] = True
