@@ -890,6 +890,13 @@ const assistantGateway = read(
 const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
+  readBytes("capsules/marketplace/browser/model-contract.js").equals(
+    readBytes("capsules/assistant/browser/model-contract.js"),
+  ),
+  "Marketplace uses the canonical Assistant model contract; run just vendor-ui",
+);
+
+assert(
   assistantIndex.includes('<script type="module" src="./home-agent.js"></script>') &&
     assistantEntry.includes('from "./assistant-modes.js"') &&
     assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
