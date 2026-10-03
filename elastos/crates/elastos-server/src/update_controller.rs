@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use elastos_common::localhost::publisher_release_manifest_path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -227,23 +226,23 @@ fn bootstrap_controller(
     writer: impl FnOnce(&Path) -> Result<crate::install_transaction::InstallationGuard>,
 ) -> Result<Option<ControllerBootstrap>> {
     crate::install_transaction::refuse_pending_home_start(data, binary)?;
-    let signed = read_regular_bounded(&publisher_release_manifest_path(data), MAX_PRIVATE_JSON)?;
-    let expected = admit_installed_release(&signed, source, binary)?;
+    crate::installed_release::read_without_migration(data, binary, source)?;
     let result = (|| {
-        let directory = directory(data)?;
-        let lease = lease(&directory)?;
         let writer = writer(
             binary
                 .parent()
                 .context("installed Runtime parent missing")?,
         )?;
+        let directory = directory(data)?;
+        let lease = lease(&directory)?;
         crate::install_transaction::refuse_pending_home_start(data, binary)?;
+        let installed = admit_home_inputs(data, binary, source, &writer, &directory)?;
         Ok(ControllerBootstrap {
             directory,
             lease,
             writer,
-            signed,
-            expected,
+            signed: installed.release,
+            expected: installed.binary_sha256,
         })
     })();
     match result {
@@ -257,6 +256,46 @@ fn bootstrap_controller(
             }
         }
         Err(error) => Err(error),
+    }
+}
+
+// Ordinary Home may reuse its exact signed controller when only metadata migration
+// lacks space. Updates still require migration through load_or_migrate.
+fn admit_home_inputs(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    writer: &crate::install_transaction::InstallationGuard,
+    directory: &Path,
+) -> Result<crate::installed_release::InstalledRelease> {
+    reuse_home_inputs_after_space_refusal(
+        data,
+        binary,
+        source,
+        directory,
+        crate::installed_release::load_or_migrate(data, binary, source, writer),
+    )
+}
+
+fn reuse_home_inputs_after_space_refusal(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    directory: &Path,
+    result: Result<crate::installed_release::InstalledRelease>,
+) -> Result<crate::installed_release::InstalledRelease> {
+    match result {
+        Err(error) if controller_space_error(&error) => {
+            let installed = crate::installed_release::read_without_migration(data, binary, source)?;
+            if prepare_controller(directory, binary, &installed.binary_sha256, |_, _| {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+            })? {
+                Ok(installed)
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
     }
 }
 
@@ -532,11 +571,21 @@ impl Controller {
 
     async fn start_initial(&mut self) -> Result<()> {
         let source = installed_source(&self.receipt.data_dir)?;
-        let release = read_regular_bounded(
-            &publisher_release_manifest_path(&self.receipt.data_dir),
-            MAX_PRIVATE_JSON,
+        let writer = crate::install_transaction::InstallationGuard::acquire(
+            self.receipt
+                .binary
+                .parent()
+                .context("installed Runtime parent missing")?,
         )?;
-        let expected = admit_installed_release(&release, &source, &self.receipt.binary)?;
+        let installed = admit_home_inputs(
+            &self.receipt.data_dir,
+            &self.receipt.binary,
+            &source,
+            &writer,
+            &self.directory,
+        )?;
+        let expected = installed.binary_sha256;
+        drop(writer);
         let generation = hex::encode(rand::random::<[u8; 16]>());
         async {
             self.spawn(&generation, false)?;
@@ -741,12 +790,20 @@ impl Controller {
                 && request.current_version == source.installed_version,
             "Update choice changed. Check the update again."
         );
-        let signed = read_regular_bounded(
-            &publisher_release_manifest_path(&self.receipt.data_dir),
-            MAX_PRIVATE_JSON,
+        let writer = crate::install_transaction::InstallationGuard::acquire(
+            self.receipt
+                .binary
+                .parent()
+                .context("installed Runtime parent missing")?,
         )?;
-        self.previous_binary_sha256 =
-            admit_installed_release(&signed, &source, &self.receipt.binary)?;
+        self.previous_binary_sha256 = crate::installed_release::load_or_migrate(
+            &self.receipt.data_dir,
+            &self.receipt.binary,
+            &source,
+            &writer,
+        )?
+        .binary_sha256;
+        drop(writer);
         self.previous_version = source.installed_version.clone();
         let client =
             Arc::new(crate::carrier::CarrierClient::connect_trusted_source(&source, 15).await?);
@@ -931,11 +988,8 @@ impl crate::update::RestartOwner for Controller {
                 &source.installed_version == version,
                 "Installed version differs from the start claim"
             );
-            let signed = read_regular_bounded(
-                &publisher_release_manifest_path(&self.receipt.data_dir),
-                MAX_PRIVATE_JSON,
-            )?;
-            let expected = admit_installed_release(&signed, &source, &self.receipt.binary)?;
+            let expected =
+                crate::installed_release::read_for_transaction(transaction, &source)?.binary_sha256;
             if previous {
                 anyhow::ensure!(
                     expected == record.plan.previous_binary_sha256,
@@ -1005,6 +1059,7 @@ fn normalized_channel(source: &TrustedSource) -> &str {
     }
 }
 
+#[cfg(test)]
 fn admit_installed_release(signed: &[u8], source: &TrustedSource, binary: &Path) -> Result<String> {
     let expected = admit_release_digest(signed, source)?;
     anyhow::ensure!(

@@ -121,6 +121,8 @@ fn new_bytes(id: ReleaseFile) -> Vec<u8> {
 fn old_mode(id: ReleaseFile) -> u32 {
     if id == ReleaseFile::RuntimeBinary {
         0o750
+    } else if matches!(id, ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest) {
+        0o600
     } else {
         0o640
     }
@@ -170,13 +172,13 @@ fn assert_no_transaction_scratch(writer: &InstallTransaction) {
 }
 
 #[test]
-fn pre_restart_recovery_consumes_unchanged_v1_staging_and_prepared_state() {
+fn pre_restart_recovery_consumes_unchanged_v3_staging_and_prepared_state() {
     for phase in [Phase::Staging, Phase::Prepared] {
         let fixture = RestartFixture::new();
         let writer = fixture.writer();
         prepare_release(&writer);
         let mut journal = writer.read_journal().unwrap().unwrap();
-        assert_eq!(journal.schema, "elastos.install-transaction/v1");
+        assert_eq!(journal.schema, "elastos.install-transaction/v3");
         if phase == Phase::Staging {
             journal.phase = phase;
             writer.write_journal(&journal).unwrap();
@@ -200,7 +202,7 @@ fn pre_restart_recovery_consumes_unchanged_v1_staging_and_prepared_state() {
 }
 
 #[test]
-fn pre_restart_recovery_preserves_v2_and_v1_activation_for_their_own_recovery_owner() {
+fn pre_restart_recovery_preserves_v4_and_v3_activation_for_their_own_recovery_owner() {
     for activated in [false, true] {
         let fixture = RestartFixture::new();
         let writer = if activated {
@@ -565,7 +567,9 @@ fn restart_journal_refuses_malformed_identity_and_phase_before_any_file_change()
         ("v1 with restart", |v| {
             v["schema"] = json!("elastos.install-transaction/v1")
         }),
-        ("v2 without restart", |v| v["restart"] = Value::Null),
+        ("restart schema without restart", |v| {
+            v["restart"] = Value::Null
+        }),
         ("transaction length", |v| v["transaction_id"] = json!("a")),
         ("transaction alphabet", |v| {
             v["transaction_id"] = json!("g".repeat(32))
@@ -920,4 +924,229 @@ fn host_start_fence_admits_only_the_claimed_generation_and_binary() {
     )
     .is_err());
     assert_eq!(fixture.snapshot(), before);
+}
+
+fn publisher_sentinel(fixture: &RestartFixture) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut sentinels = Vec::new();
+    for path in [
+        publisher_release_head_path(&fixture.data),
+        publisher_release_manifest_path(&fixture.data),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = format!(
+            "Publisher owns {}",
+            path.file_name().unwrap().to_str().unwrap()
+        )
+        .into_bytes();
+        write_new(&path, &bytes, 0o600).unwrap();
+        sentinels.push((path, bytes));
+    }
+    sentinels
+}
+
+fn assert_sentinels(sentinels: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in sentinels {
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+    }
+}
+
+fn move_journal_to_legacy(
+    fixture: &RestartFixture,
+    writer: InstallTransaction,
+    schema: &str,
+) -> (InstallTransaction, Vec<(PathBuf, Vec<u8>)>) {
+    let mut journal = writer.read_journal().unwrap().unwrap();
+    journal.schema = schema.into();
+    writer.write_journal(&journal).unwrap();
+    drop(writer);
+    let publisher = publisher_release_head_path(&fixture.data)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::create_dir_all(publisher.parent().unwrap()).unwrap();
+    fs::rename(fixture.data.join("installation"), &publisher).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.data.join("installation"))
+        .unwrap();
+    let mut sentinels = Vec::new();
+    for path in [
+        installation_release_head_path(&fixture.data),
+        installation_release_manifest_path(&fixture.data),
+    ] {
+        let bytes = format!(
+            "Consumed owner {}",
+            path.file_name().unwrap().to_str().unwrap()
+        )
+        .into_bytes();
+        write_new(&path, &bytes, 0o600).unwrap();
+        sentinels.push((path, bytes));
+    }
+    let writer = fixture.writer();
+    assert!(!writer.uses_consumed_layout());
+    assert_eq!(
+        writer.release_head_path(),
+        publisher_release_head_path(&fixture.data)
+    );
+    assert_eq!(
+        writer.release_manifest_path(),
+        publisher_release_manifest_path(&fixture.data)
+    );
+    (writer, sentinels)
+}
+
+#[test]
+fn legacy_v1_recovery_keeps_its_publisher_map_and_object_recovery_only() {
+    for phase in [Phase::Staging, Phase::Prepared] {
+        let fixture = RestartFixture::new();
+        let writer = fixture.writer();
+        prepare_release(&writer);
+        let mut journal = writer.read_journal().unwrap().unwrap();
+        journal.phase = phase;
+        writer.write_journal(&journal).unwrap();
+        let (writer, sentinels) =
+            move_journal_to_legacy(&fixture, writer, "elastos.install-transaction/v1");
+        fixture.write_new_owner_data();
+        assert!(writer.prepare_restart(restart_plan()).is_err());
+        assert!(writer.recover_before_restart().unwrap());
+        fixture.assert_release(&writer, true);
+        assert_no_transaction_scratch(&writer);
+        let before = fixture.snapshot();
+        let files = ReleaseFile::ALL.map(|id| (id, new_bytes(id)));
+        let borrowed = files.each_ref().map(|(id, bytes)| (*id, bytes.as_slice()));
+        assert!(writer.prepare(&borrowed).is_err());
+        assert!(writer.prepare_restart(restart_plan()).is_err());
+        assert_eq!(fixture.snapshot(), before);
+        assert_sentinels(&sentinels);
+        fixture.assert_new_owner_data();
+        drop(writer);
+        assert!(fixture.writer().uses_consumed_layout());
+    }
+}
+
+#[test]
+fn legacy_v2_restore_previous_start_and_cleanup_touch_only_publisher_slots() {
+    let fixture = RestartFixture::new();
+    let activated = fixture.activated();
+    let (writer, sentinels) =
+        move_journal_to_legacy(&fixture, activated, "elastos.install-transaction/v2");
+    fixture.write_new_owner_data();
+    assert!(writer.prepare_restart(restart_plan()).is_err());
+    writer.restore_for_restart().unwrap();
+    fixture.assert_release(&writer, true);
+    let running = started(&writer, true);
+    writer
+        .record_ready(&running.generation, PREVIOUS_PID)
+        .unwrap();
+    writer.finish_restart().unwrap();
+    assert_no_transaction_scratch(&writer);
+    assert!(writer.prepare_restart(restart_plan()).is_err());
+    let files = ReleaseFile::ALL.map(|id| (id, new_bytes(id)));
+    let borrowed = files.each_ref().map(|(id, bytes)| (*id, bytes.as_slice()));
+    assert!(writer.prepare(&borrowed).is_err());
+    assert_sentinels(&sentinels);
+    fixture.assert_new_owner_data();
+}
+
+#[test]
+fn consumed_v3_and_v4_activation_recovery_preserve_publisher_publication() {
+    for restart in [false, true] {
+        let fixture = RestartFixture::new();
+        let sentinels = publisher_sentinel(&fixture);
+        let writer = if restart {
+            fixture.activated()
+        } else {
+            let writer = fixture.writer();
+            prepare_release(&writer);
+            writer.activate_artifacts_for_support().unwrap();
+            writer
+        };
+        assert!(writer.uses_consumed_layout());
+        assert_eq!(
+            writer.read_journal().unwrap().unwrap().schema,
+            if restart {
+                "elastos.install-transaction/v4"
+            } else {
+                "elastos.install-transaction/v3"
+            }
+        );
+        fixture.write_new_owner_data();
+        if restart {
+            writer.restore_for_restart().unwrap();
+            let running = started(&writer, true);
+            writer
+                .record_ready(&running.generation, PREVIOUS_PID)
+                .unwrap();
+            writer.finish_restart().unwrap();
+        } else {
+            writer.recover().unwrap();
+        }
+        fixture.assert_release(&writer, true);
+        assert_no_transaction_scratch(&writer);
+        assert_sentinels(&sentinels);
+        fixture.assert_new_owner_data();
+    }
+}
+
+#[test]
+fn normal_interrupted_binary_components_and_support_seams_keep_all_five_old_backups() {
+    for seam in ["binary", "components", "support"] {
+        let fixture = RestartFixture::new();
+        let sentinels = publisher_sentinel(&fixture);
+        let writer = fixture.writer();
+        prepare_release(&writer);
+        if seam == "binary" {
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            journal.phase = Phase::Committing;
+            writer.write_journal(&journal).unwrap();
+            fs::rename(
+                writer.scratch(ReleaseFile::RuntimeBinary, STAGE),
+                writer.binary_path(),
+            )
+            .unwrap();
+        } else {
+            writer.activate_artifacts_for_support().unwrap();
+            if seam == "support" {
+                write_new(
+                    &fixture.data.join("support-owner-file"),
+                    b"separately owned support remains",
+                    0o600,
+                )
+                .unwrap();
+            }
+        }
+        for entry in &writer.read_journal().unwrap().unwrap().entries {
+            assert_eq!(
+                fs::read(writer.scratch(entry.id, ROLLBACK)).unwrap(),
+                old_bytes(entry.id),
+                "{seam}"
+            );
+        }
+        assert!(InstallationGuard::acquire(writer.binary_path().parent().unwrap()).is_err());
+        drop(writer);
+        let writer = fixture.writer();
+        writer.recover().unwrap();
+        fixture.assert_release(&writer, true);
+        assert_no_transaction_scratch(&writer);
+        assert_sentinels(&sentinels);
+        if seam == "support" {
+            assert_eq!(
+                fs::read(fixture.data.join("support-owner-file")).unwrap(),
+                b"separately owned support remains"
+            );
+        }
+    }
+}
+
+#[test]
+fn normal_admitted_prefix_finishes_all_five_consumed_roles() {
+    let fixture = RestartFixture::new();
+    let sentinels = publisher_sentinel(&fixture);
+    let writer = fixture.writer();
+    prepare_release(&writer);
+    writer.activate_artifacts_for_support().unwrap();
+    writer.commit_checked(|| Ok(())).unwrap();
+    fixture.assert_release(&writer, false);
+    assert_no_transaction_scratch(&writer);
+    assert_sentinels(&sentinels);
 }

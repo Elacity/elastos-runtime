@@ -115,7 +115,7 @@ pub(crate) fn model_catalog_entries(
     verify_model_catalog(&trust, &bytes, now).map(Some)
 }
 
-fn verify_model_catalog(
+pub(crate) fn verify_model_catalog(
     trust: &crate::setup::ModelCatalogConfig,
     bytes: &[u8],
     now: u64,

@@ -169,6 +169,14 @@ elastos update --check
 `elastos update` discovers newer signed releases through the trusted source
 created during install.
 
+Runtime consumes the verified signed pair in `installation/release-head.json`
+and `installation/release.json` within its data directory. Publisher owns its
+separate publication files. For an older installation, Runtime migrates the
+signed pair after it verifies the trusted source, binary, components and installed
+support under the installation lock. An interrupted transaction completes its
+original recovery before that migration. If the saved pair requires repair,
+keep the files in place and follow Runtime's operator repair step.
+
 ### Recover an interrupted update
 
 If Runtime reports an interrupted command-line update, run `elastos update`

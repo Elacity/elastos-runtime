@@ -9,7 +9,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use elastos_common::localhost::{publisher_release_head_path, publisher_release_manifest_path};
+use elastos_common::localhost::{
+    installation_release_head_path, installation_release_manifest_path,
+    publisher_release_head_path, publisher_release_manifest_path,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -137,6 +140,7 @@ pub(crate) struct RestartRecord {
 /// The lock path stays in place after the guard closes its file and releases the flock.
 pub(crate) struct InstallationGuard {
     _lock: File,
+    binary_parent: PathBuf,
 }
 
 impl InstallationGuard {
@@ -144,7 +148,8 @@ impl InstallationGuard {
         if !binary_parent.is_absolute() {
             bail!("installation binary parent must be an absolute existing path");
         }
-        check_directory(binary_parent)?;
+        let binary_parent = fs::canonicalize(binary_parent)?;
+        check_directory(&binary_parent)?;
         let lock_path = binary_parent.join(INSTALL_LOCK);
         let lock = OpenOptions::new()
             .read(true)
@@ -165,8 +170,72 @@ impl InstallationGuard {
             return Err(std::io::Error::last_os_error())
                 .context("another writer owns the installation lock");
         }
-        Ok(Self { _lock: lock })
+        Ok(Self {
+            _lock: lock,
+            binary_parent,
+        })
     }
+
+    pub(crate) fn require_binary(&self, binary: &Path) -> anyhow::Result<()> {
+        if !binary.is_absolute()
+            || fs::canonicalize(binary.parent().context("installed binary parent missing")?)?
+                != self.binary_parent
+        {
+            bail!("installed release writer owns a different binary parent");
+        }
+        let path = self.binary_parent.join(INSTALL_LOCK);
+        check_file(&self._lock, &path, true)?;
+        let held = self._lock.metadata()?;
+        let current = fs::symlink_metadata(path)?;
+        if !current.is_file() || held.dev() != current.dev() || held.ino() != current.ino() {
+            bail!("installed release writer lock identity changed");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseLayout {
+    LegacyPublisher,
+    Consumed,
+}
+
+fn journal_layout(journal: &Journal) -> anyhow::Result<ReleaseLayout> {
+    match (journal.schema.as_str(), journal.restart.is_some()) {
+        ("elastos.install-transaction/v1", false) | ("elastos.install-transaction/v2", true) => {
+            Ok(ReleaseLayout::LegacyPublisher)
+        }
+        ("elastos.install-transaction/v3", false) | ("elastos.install-transaction/v4", true) => {
+            Ok(ReleaseLayout::Consumed)
+        }
+        _ => bail!("installation journal schema is incompatible with this writer"),
+    }
+}
+
+fn read_journal_file(path: &Path) -> anyhow::Result<Option<Journal>> {
+    let file = match open_read(path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file, path, true)?;
+    if file.metadata()?.len() > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let journal: Journal = serde_json::from_slice(&bytes)?;
+    journal_layout(&journal)?;
+    Ok(Some(journal))
 }
 
 /// Ordinary installed writers use the persisted binary location, so replacing source
@@ -214,6 +283,7 @@ pub(crate) struct InstallTransaction {
     data_dir: PathBuf,
     binary: PathBuf,
     destinations: BTreeMap<ReleaseFile, PathBuf>,
+    layout: ReleaseLayout,
 }
 
 impl InstallTransaction {
@@ -243,17 +313,28 @@ impl InstallTransaction {
         let binary = bin_parent.join(basename);
         file_state(&binary)?;
         let guard = InstallationGuard::acquire(&bin_parent)?;
+        let layout = read_journal_file(&bin_parent.join(JOURNAL))?
+            .as_ref()
+            .map(journal_layout)
+            .transpose()?
+            .unwrap_or(ReleaseLayout::Consumed);
         let destinations = BTreeMap::from([
             (ReleaseFile::RuntimeBinary, binary.clone()),
             (ReleaseFile::Components, data_dir.join("components.json")),
             (ReleaseFile::Sources, data_dir.join("sources.json")),
             (
                 ReleaseFile::ReleaseHead,
-                publisher_release_head_path(&data_dir),
+                match layout {
+                    ReleaseLayout::LegacyPublisher => publisher_release_head_path(&data_dir),
+                    ReleaseLayout::Consumed => installation_release_head_path(&data_dir),
+                },
             ),
             (
                 ReleaseFile::ReleaseManifest,
-                publisher_release_manifest_path(&data_dir),
+                match layout {
+                    ReleaseLayout::LegacyPublisher => publisher_release_manifest_path(&data_dir),
+                    ReleaseLayout::Consumed => installation_release_manifest_path(&data_dir),
+                },
             ),
         ]);
         if destinations.values().collect::<BTreeSet<_>>().len() != ReleaseFile::ALL.len() {
@@ -264,13 +345,46 @@ impl InstallTransaction {
             data_dir,
             binary,
             destinations,
+            layout,
         };
         // Check every destination and parent before the journal can authorize writes.
-        for destination in tx.destinations.values() {
+        for (&id, destination) in &tx.destinations {
             tx.check_parent(destination.parent().unwrap(), false)?;
+            tx.check_metadata_custody(id)?;
             file_state(destination)?;
         }
         Ok(tx)
+    }
+
+    fn check_metadata_custody(&self, id: ReleaseFile) -> anyhow::Result<()> {
+        if self.uses_consumed_layout()
+            && matches!(id, ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest)
+        {
+            let destination = &self.destinations[&id];
+            match fs::symlink_metadata(destination.parent().unwrap()) {
+                Ok(metadata) if metadata.mode() & 0o7777 != 0o700 => {
+                    bail!("Consumed release inputs require an owner-only directory.")
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
+            }
+            match open_read(destination) {
+                Ok(file) if file.metadata()?.mode() & 0o7777 != 0o600 => {
+                    bail!("Consumed release inputs require owner-only files.")
+                }
+                Err(error)
+                    if !error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Err(error)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn binary_path(&self) -> &Path {
@@ -279,6 +393,23 @@ impl InstallTransaction {
 
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Recovery reads the same metadata namespace selected by the journal schema.
+    pub(crate) fn release_manifest_path(&self) -> &Path {
+        &self.destinations[&ReleaseFile::ReleaseManifest]
+    }
+
+    pub(crate) fn release_head_path(&self) -> &Path {
+        &self.destinations[&ReleaseFile::ReleaseHead]
+    }
+
+    pub(crate) fn writer_guard(&self) -> &InstallationGuard {
+        &self._guard
+    }
+
+    pub(crate) fn uses_consumed_layout(&self) -> bool {
+        self.layout == ReleaseLayout::Consumed
     }
 
     pub(crate) fn staged_binary(&self) -> PathBuf {
@@ -465,7 +596,45 @@ impl InstallTransaction {
         self.cleanup(&journal)
     }
 
+    /// Check all refusal-only preparation gates before publishing migrated custody.
+    pub(crate) fn preflight_prepare(
+        &self,
+        files: &[(ReleaseFile, &[u8])],
+        previous_head: &[u8],
+        previous_release: &[u8],
+    ) -> anyhow::Result<()> {
+        if !self.uses_consumed_layout() {
+            bail!("Legacy recovery must finish before preparing a new installed release.");
+        }
+        self.require_empty_scratch()?;
+        if files.len() != ReleaseFile::ALL.len()
+            || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
+                != ReleaseFile::ALL.into_iter().collect()
+        {
+            bail!("release transaction requires exactly five release files");
+        }
+        let mut allocations = BTreeMap::new();
+        for &(id, bytes) in files {
+            self.check_parent(self.destinations[&id].parent().unwrap(), false)?;
+            self.check_metadata_custody(id)?;
+            let state = file_state(&self.destinations[&id])?;
+            let old_metadata = match id {
+                ReleaseFile::ReleaseHead => previous_head.len() as u64,
+                ReleaseFile::ReleaseManifest => previous_release.len() as u64,
+                _ => 0,
+            };
+            let original = state.as_ref().map(|state| state.2).unwrap_or(old_metadata);
+            // An absent pair first needs its migration copy as well as rollback.
+            let migration = if state.is_none() { old_metadata } else { 0 };
+            allocations.insert(id, bytes.len() as u64 + original + migration);
+        }
+        self.check_disk(&allocations)
+    }
+
     pub(crate) fn prepare(&self, files: &[(ReleaseFile, &[u8])]) -> anyhow::Result<()> {
+        if self.layout == ReleaseLayout::LegacyPublisher {
+            bail!("Legacy recovery must finish before preparing a new installed release.");
+        }
         self.require_empty_scratch()?;
         if files.len() != ReleaseFile::ALL.len()
             || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
@@ -476,6 +645,7 @@ impl InstallTransaction {
         let mut entries = Vec::new();
         let mut allocations = BTreeMap::new();
         for &(id, bytes) in files {
+            self.check_metadata_custody(id)?;
             let state = file_state(&self.destinations[&id])?;
             let original_mode = state.as_ref().map(|item| item.1);
             let staged_mode = if id == ReleaseFile::RuntimeBinary {
@@ -498,7 +668,7 @@ impl InstallTransaction {
             self.check_parent(&parent, true)?;
         }
         let mut journal = Journal {
-            schema: "elastos.install-transaction/v1".to_string(),
+            schema: "elastos.install-transaction/v3".to_string(),
             transaction_id: hex::encode(rand::random::<[u8; 16]>()),
             data_dir: self.data_dir.clone(),
             binary_basename: self
@@ -580,6 +750,9 @@ impl InstallTransaction {
     }
 
     pub(crate) fn prepare_restart(&self, plan: RestartPlan) -> anyhow::Result<()> {
+        if self.layout == ReleaseLayout::LegacyPublisher {
+            bail!("Legacy recovery must finish before preparing a new Home restart.");
+        }
         validate_restart_plan(&plan)?;
         let mut journal = self
             .read_journal()?
@@ -600,7 +773,7 @@ impl InstallTransaction {
         {
             bail!("automatic recovery requires a verified previous complete release");
         }
-        journal.schema = "elastos.install-transaction/v2".into();
+        journal.schema = "elastos.install-transaction/v4".into();
         journal.restart = Some(RestartRecord {
             plan,
             phase: RestartPhase::CandidatePending,
@@ -620,8 +793,8 @@ impl InstallTransaction {
         Ok(self.read_journal()?.and_then(|journal| journal.restart))
     }
 
-    /// Controller loss before restart planning leaves an unchanged v1 staging journal.
-    /// Recover only that pre-activation state; other v1 work keeps its original owner.
+    /// Controller loss before restart planning can leave an unchanged CLI staging journal.
+    /// Recover only pre-activation state in its schema-bound namespace.
     pub(crate) fn recover_before_restart(&self) -> anyhow::Result<bool> {
         let Some(journal) = self.read_journal()? else {
             return Ok(false);
@@ -742,6 +915,40 @@ impl InstallTransaction {
         self.cleanup(&journal)
     }
 
+    /// Normal setup needs the admitted candidate components while it refreshes support.
+    /// Keep original backups and the committing journal until the final metadata save.
+    pub(crate) fn activate_artifacts_for_support(&self) -> anyhow::Result<()> {
+        let mut journal = self
+            .read_journal()?
+            .context("prepared release journal missing")?;
+        if !self.uses_consumed_layout()
+            || journal.phase != Phase::Prepared
+            || journal.restart.is_some()
+        {
+            bail!("support activation requires a prepared consumed CLI release");
+        }
+        self.validate_scratch(&journal)?;
+        for entry in &journal.entries {
+            self.require_state(
+                entry.id,
+                entry.original_sha256.as_deref(),
+                entry.original_mode,
+            )?;
+        }
+        journal.phase = Phase::Committing;
+        self.write_journal(&journal)?;
+        let result = (|| {
+            for id in [ReleaseFile::RuntimeBinary, ReleaseFile::Components] {
+                let entry = journal.entries.iter().find(|entry| entry.id == id).unwrap();
+                fs::rename(self.scratch(id, STAGE), &self.destinations[&id])?;
+                sync_directory(self.destinations[&id].parent().unwrap())?;
+                self.require_state(id, Some(&entry.staged_sha256), Some(entry.staged_mode))?;
+            }
+            Ok(())
+        })();
+        self.restore_on_error(result)
+    }
+
     fn commit_with(
         &self,
         mut after_rename: impl FnMut(ReleaseFile) -> anyhow::Result<()>,
@@ -750,19 +957,32 @@ impl InstallTransaction {
         let mut journal = self
             .read_journal()?
             .context("prepared release journal missing")?;
-        if journal.phase != Phase::Prepared {
+        if !matches!(journal.phase, Phase::Prepared | Phase::Committing) {
             bail!("release transaction is not prepared");
         }
         self.validate_scratch(&journal)?;
+        // A resumed writer can finish only a contiguous, admitted activation prefix.
+        let mut original_suffix = false;
         for entry in &journal.entries {
             check_private_directory(self.scratch(entry.id, STAGE).parent().unwrap())?;
             check_private_directory(self.scratch(entry.id, ROLLBACK).parent().unwrap())?;
-            self.require_state(
-                entry.id,
+            let state = file_state(&self.destinations[&entry.id])?;
+            let original = state_matches(
+                &state,
                 entry.original_sha256.as_deref(),
                 entry.original_mode,
-            )?;
-            require_hash(&self.scratch(entry.id, STAGE), &entry.staged_sha256)?;
+            );
+            let candidate =
+                state_matches(&state, Some(&entry.staged_sha256), Some(entry.staged_mode));
+            if !original && !(journal.phase == Phase::Committing && candidate && !original_suffix) {
+                bail!("release activation prefix changed; retain journal for recovery");
+            }
+            if original && !candidate {
+                original_suffix = true;
+            }
+            if !candidate {
+                require_hash(&self.scratch(entry.id, STAGE), &entry.staged_sha256)?;
+            }
             if let Some(original) = &entry.original_sha256 {
                 require_hash(&self.scratch(entry.id, ROLLBACK), original)?;
             }
@@ -772,6 +992,13 @@ impl InstallTransaction {
             self.write_journal(&journal)?;
             for entry in &journal.entries {
                 self.check_parent(self.destinations[&entry.id].parent().unwrap(), false)?;
+                if state_matches(
+                    &file_state(&self.destinations[&entry.id])?,
+                    Some(&entry.staged_sha256),
+                    Some(entry.staged_mode),
+                ) {
+                    continue;
+                }
                 self.require_state(
                     entry.id,
                     entry.original_sha256.as_deref(),
@@ -840,28 +1067,11 @@ impl InstallTransaction {
     }
 
     fn read_journal(&self) -> anyhow::Result<Option<Journal>> {
-        let mut file = match open_read(&self.journal_path()) {
-            Ok(file) => file,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Ok(None)
-            }
-            Err(error) => return Err(error),
+        let Some(journal) = read_journal_file(&self.journal_path())? else {
+            return Ok(None);
         };
-        check_file(&file, &self.journal_path(), true)?;
-        if file.metadata()?.len() > MAX_JOURNAL {
-            bail!("installation journal exceeds size limit");
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let journal: Journal = serde_json::from_slice(&bytes)?;
-        if (journal.schema != "elastos.install-transaction/v1" || journal.restart.is_some())
-            && (journal.schema != "elastos.install-transaction/v2" || journal.restart.is_none())
-        {
-            bail!("installation journal schema is incompatible with this writer");
+        if journal_layout(&journal)? != self.layout {
+            bail!("installation journal layout changed during recovery");
         }
         if journal.data_dir != self.data_dir
             || journal.binary_basename != self.binary.file_name().unwrap().to_str().unwrap()
@@ -893,6 +1103,13 @@ impl InstallTransaction {
                     .is_some_and(|mode| mode & !0o777 != 0 || mode & 0o022 != 0)
                 || entry.staged_mode & !0o777 != 0
                 || entry.staged_mode & 0o022 != 0
+                || (self.uses_consumed_layout()
+                    && matches!(
+                        entry.id,
+                        ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest
+                    )
+                    && (entry.staged_mode != 0o600
+                        || entry.original_mode.is_some_and(|mode| mode != 0o600)))
             {
                 bail!("installation journal entry is invalid");
             }
@@ -1146,7 +1363,7 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_restart_plan(plan: &RestartPlan) -> anyhow::Result<()> {
+pub(crate) fn validate_restart_plan(plan: &RestartPlan) -> anyhow::Result<()> {
     if plan.request_id.len() != 32
         || !plan.request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || [
@@ -1169,8 +1386,10 @@ fn validate_restart_record(journal: &Journal) -> anyhow::Result<()> {
     let Some(restart) = &journal.restart else {
         return Ok(());
     };
-    if journal.schema != "elastos.install-transaction/v2"
-        || journal.transaction_id.len() != 32
+    if !matches!(
+        journal.schema.as_str(),
+        "elastos.install-transaction/v2" | "elastos.install-transaction/v4"
+    ) || journal.transaction_id.len() != 32
         || !journal
             .transaction_id
             .bytes()
@@ -1269,7 +1488,7 @@ pub(crate) fn authorize_host_start_with_generation(
     let Some(journal) = read_host_start_journal(data_dir, binary)? else {
         return Ok(());
     };
-    if journal.schema == "elastos.install-transaction/v1" {
+    if journal.restart.is_none() {
         bail!("{}", pending_home_recovery_hint(&journal));
     }
     let restart = journal.restart.context(
@@ -1320,7 +1539,7 @@ pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyho
 }
 
 fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
-    if journal.schema == "elastos.install-transaction/v1" {
+    if journal.restart.is_none() {
         "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
     } else {
         "Home restart recovery is pending. Start the retained update controller with its receipt."
@@ -1330,24 +1549,9 @@ fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
 fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
     let parent = binary.parent().context("host binary parent missing")?;
     let path = parent.join(JOURNAL);
-    let file = match open_read(&path) {
-        Ok(file) => file,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(None)
-        }
-        Err(error) => return Err(error),
+    let Some(journal) = read_journal_file(&path)? else {
+        return Ok(None);
     };
-    check_file(&file, &path, true)?;
-    if file.metadata()?.len() > MAX_JOURNAL {
-        bail!("installation journal exceeds size limit");
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
-    let journal: Journal = serde_json::from_slice(&bytes)?;
     validate_restart_record(&journal)?;
     if journal.data_dir != fs::canonicalize(data_dir)?
         || journal.binary_basename
@@ -1361,7 +1565,10 @@ fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Opt
     anyhow::ensure!(
         matches!(
             journal.schema.as_str(),
-            "elastos.install-transaction/v1" | "elastos.install-transaction/v2"
+            "elastos.install-transaction/v1"
+                | "elastos.install-transaction/v2"
+                | "elastos.install-transaction/v3"
+                | "elastos.install-transaction/v4"
         ),
         "Installation recovery format is unknown. Retain its files for operator repair."
     );
