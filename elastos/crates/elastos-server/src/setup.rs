@@ -75,8 +75,9 @@ where
 
 /// A setup-materialized component.
 ///
-/// First-party app bundles should resolve through trusted Elastos sources.
-/// Explicit vendor URLs remain allowed only for specific approved external tools.
+/// Published artifacts use signed release paths over Carrier. CID-only operator
+/// entries require configured trusted-source gateways. Local development uses
+/// the explicit source-build and local-copy strategies.
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Component {
     pub version: Option<String>,
@@ -154,6 +155,7 @@ pub struct CapsuleEntry {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PlatformInfo {
+    /// Legacy artifact hint; setup never fetches this URL.
     pub url: Option<String>,
     /// IPFS CID for content-addressed downloads (used instead of url).
     pub cid: Option<String>,
@@ -2456,8 +2458,8 @@ struct ElastosFetchPath {
     description: String,
 }
 
-/// Build explicit trusted-source fetch paths for component downloads that still
-/// require CID transport after Carrier bootstrap.
+/// Build the explicit gateway list for CID-only operator entries.
+/// Release-path downloads use Carrier and never fall back to these gateways.
 fn build_gateway_list(data_dir: &Path) -> Vec<ElastosFetchPath> {
     trusted_gateway_overrides(data_dir)
 }
@@ -2859,24 +2861,15 @@ async fn download_component(
     if name == browser_vm_image::NAME {
         browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
     }
-    // Ensure parent dir exists
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    required_release_artifact_checksum(name, platform_info)?;
 
-    let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);
-    let is_tarball =
-        url.ends_with(".tar.gz") || url.ends_with(".tgz") || platform_info.extract_path.is_some();
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
-
-    // First-party release artifacts come from the trusted source over Carrier.
-    // Do not silently fall back to an HTTP gateway here: setup must fail closed
-    // if the stamped Carrier bootstrap is missing or broken.
-    let response = if let Some(release_path) = platform_info.release_path.as_deref() {
+    // Release artifacts come from the trusted source over Carrier.
+    // A failed Carrier fetch stays a failure, even when a URL is present.
+    if let Some(release_path) = platform_info
+        .release_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        required_release_artifact_checksum(name, platform_info)?;
         let elastos_url = platform_info
             .cid
             .as_deref()
@@ -2911,54 +2904,64 @@ async fn download_component(
                 );
             }
         }
-    } else if let Some(cid) = &platform_info.cid {
-        let elastos_url = resolve_cid_display_url(cid);
-        println!("  Resolving {} from {}...", name, elastos_url);
-        {
-            if ipfs_gateways.is_empty() {
-                anyhow::bail!(
-                    "No configured fetch path for {} ({}). Configure a trusted source with a publisher gateway.",
-                    name,
-                    elastos_url
-                );
-            }
-            let mut last_err = String::new();
-            let mut resp = None;
-            for gw in ipfs_gateways {
-                let gw_url = format!("{}/ipfs/{}", gw.transport_base.trim_end_matches('/'), cid);
-                println!("  Trying {} via {}...", elastos_url, gw.description);
-                match client.get(&gw_url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        resp = Some(r);
-                        break;
-                    }
-                    Ok(r) => {
-                        last_err = format!("HTTP {}", r.status());
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                    }
-                }
-            }
-            resp.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "All configured Elastos fetch paths failed for {} ({}): {}",
-                    name,
-                    elastos_url,
-                    last_err
-                )
-            })?
-        }
-    } else {
-        println!("  Downloading {}...", url);
-        let r = client.get(url).send().await?;
-        if !r.status().is_success() {
-            anyhow::bail!("Download failed: HTTP {}", r.status());
-        }
-        r
-    };
+    }
 
+    let cid = platform_info
+        .cid
+        .as_deref()
+        .filter(|cid| !cid.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "component '{}' must come from the signed release: release_path or cid is required; URL-only downloads are refused",
+                name
+            )
+        })?;
+    required_release_artifact_checksum(name, platform_info)?;
+    let elastos_url = resolve_cid_display_url(cid);
+    if ipfs_gateways.is_empty() {
+        anyhow::bail!(
+            "No configured fetch path for {} ({}). Configure a trusted source with a publisher gateway.",
+            name,
+            elastos_url
+        );
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()?;
+    println!("  Resolving {} from {}...", name, elastos_url);
+    let mut last_err = String::new();
+    let mut response = None;
+    for gw in ipfs_gateways {
+        let gw_url = format!("{}/ipfs/{}", gw.transport_base.trim_end_matches('/'), cid);
+        println!("  Trying {} via {}...", elastos_url, gw.description);
+        match client.get(&gw_url).send().await {
+            Ok(r) if r.status().is_success() => {
+                response = Some(r);
+                break;
+            }
+            Ok(r) => {
+                last_err = format!("HTTP {}", r.status());
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+    }
+    let response = response.ok_or_else(|| {
+        anyhow::anyhow!(
+            "All configured Elastos fetch paths failed for {} ({}): {}",
+            name,
+            elastos_url,
+            last_err
+        )
+    })?;
     let content_length = response.content_length();
+    let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);
+    let is_tarball =
+        url.ends_with(".tar.gz") || url.ends_with(".tgz") || platform_info.extract_path.is_some();
 
     if is_model {
         // Stream large model files to disk with progress
@@ -5976,6 +5979,181 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("missing checksum"));
+    }
+
+    #[tokio::test]
+    async fn download_component_rejects_url_only_before_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for identity in [None, Some(""), Some(" ")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                "name": "fixture",
+                "publisher_dids": [elastos_identity::derive_did(&[217; 32]).1]
+            }))
+            .unwrap();
+            let mut sources = TrustedSourcesConfig::empty();
+            sources.upsert_source(source);
+            save_trusted_sources(tmp.path(), &sources).unwrap();
+
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = requests.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/artifact",
+                axum::routing::get(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { "upstream fixture" }
+                }),
+            );
+            let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+                "url": url,
+                "release_path": identity,
+                "cid": identity,
+                "checksum": format!("sha256:{:x}", sha2::Sha256::digest(b"upstream fixture"))
+            }))
+            .unwrap();
+            let dest = tmp.path().join("bin/kubo");
+            let result = download_component(
+                tmp.path(),
+                "kubo",
+                &url,
+                &info,
+                &dest,
+                &[],
+                FirstPartyCarrierContext::Setup,
+            )
+            .await;
+            serving.abort();
+            let _ = serving.await;
+
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("kubo"), "{error}");
+            assert!(error.contains("must come from the signed release"), "{error}");
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            assert!(!dest.parent().unwrap().exists());
+        }
+    }
+
+    async fn carrier_component_download_fixture(
+        data_dir: &Path,
+    ) -> (iroh::Endpoint, tokio::task::JoinHandle<()>, PlatformInfo) {
+        use tokio::io::AsyncBufReadExt;
+
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![b"elastos/carrier/1".to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = crate::carrier::tests::wait_for_direct_endpoint_addr(&server).await;
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture",
+            "publisher_dids": [elastos_identity::derive_did(&[217; 32]).1],
+            "connect_ticket": crate::carrier::tests::encode_ticket_for(address),
+            "publisher_node_id": server.id().to_string()
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(data_dir, &sources).unwrap();
+        fs::write(
+            data_dir.join("config.toml"),
+            "carrier_bind_addr = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+
+        let bytes = b"carrier fixture";
+        let digest = sha2::Sha256::digest(bytes);
+        let cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
+        );
+        let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/unused",
+            "release_path": "artifact",
+            "cid": cid.to_string(),
+            "checksum": format!("sha256:{digest:x}")
+        }))
+        .unwrap();
+        let endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = connection.accept_bi().await.unwrap();
+            let mut request = String::new();
+            tokio::io::BufReader::new(recv)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                "artifact"
+            );
+            send.write_all(&(bytes.len() as u64).to_be_bytes())
+                .await
+                .unwrap();
+            send.write_all(bytes).await.unwrap();
+            send.finish().unwrap();
+            connection.closed().await;
+        });
+        (server, serving, info)
+    }
+
+    #[tokio::test]
+    async fn download_component_accepts_release_path_and_cid_over_carrier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, serving, info) = carrier_component_download_fixture(tmp.path()).await;
+        let dest = tmp.path().join("bin/kubo");
+        let result = download_component(
+            tmp.path(),
+            "kubo",
+            info.url.as_deref().unwrap(),
+            &info,
+            &dest,
+            &[],
+            FirstPartyCarrierContext::Setup,
+        )
+        .await;
+        server.close().await;
+        serving.await.unwrap();
+
+        result.unwrap();
+        assert_eq!(fs::read(dest).unwrap(), b"carrier fixture");
+    }
+
+    #[tokio::test]
+    async fn download_component_rejects_cid_checksum_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, serving, mut info) = carrier_component_download_fixture(tmp.path()).await;
+        info.checksum = Some(format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(b"different component")
+        ));
+        let dest = tmp.path().join("bin/kubo");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"installed fixture").unwrap();
+        let result = download_component(
+            tmp.path(),
+            "kubo",
+            info.url.as_deref().unwrap(),
+            &info,
+            &dest,
+            &[],
+            FirstPartyCarrierContext::Setup,
+        )
+        .await;
+        server.close().await;
+        serving.await.unwrap();
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Checksum mismatch for kubo"), "{error}");
+        assert_eq!(fs::read(dest).unwrap(), b"installed fixture");
     }
 
     #[tokio::test]
