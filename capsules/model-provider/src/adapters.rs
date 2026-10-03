@@ -3351,6 +3351,8 @@ mod tests {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
         shutdown: Arc<AtomicBool>,
+        first_byte_release: Option<std_mpsc::Sender<()>>,
+        request_ready: Option<std_mpsc::Receiver<()>>,
         join: Option<thread::JoinHandle<()>>,
     }
 
@@ -3397,6 +3399,9 @@ mod tests {
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(release) = self.first_byte_release.take() {
+                let _ = release.send(());
+            }
             let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap_or(""));
             if let Some(join) = self.join.take() {
                 let result = join.join();
@@ -3415,6 +3420,29 @@ mod tests {
         responses: Vec<HttpResponseSpec>,
         first_byte_delay: Duration,
         allow_client_disconnect: bool,
+    ) -> TestServer {
+        start_server_with_response_gate(responses, first_byte_delay, allow_client_disconnect, None)
+    }
+
+    fn start_server_with_held_first_byte(responses: Vec<HttpResponseSpec>) -> TestServer {
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let mut server = start_server_with_response_gate(
+            responses,
+            Duration::ZERO,
+            true,
+            Some((release_rx, ready_tx)),
+        );
+        server.first_byte_release = Some(release_tx);
+        server.request_ready = Some(ready_rx);
+        server
+    }
+
+    fn start_server_with_response_gate(
+        responses: Vec<HttpResponseSpec>,
+        first_byte_delay: Duration,
+        allow_client_disconnect: bool,
+        first_byte_release: Option<(std_mpsc::Receiver<()>, std_mpsc::Sender<()>)>,
     ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3444,6 +3472,7 @@ mod tests {
                     return;
                 }
                 stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
                 let mut response = format!(
@@ -3458,7 +3487,15 @@ mod tests {
                     response.push_str("\r\n");
                 }
                 response.push_str("\r\n");
-                thread::sleep(first_byte_delay);
+                if let Some((release, ready)) = &first_byte_release {
+                    ready.send(()).unwrap();
+                    let _ = release.recv();
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                } else {
+                    thread::sleep(first_byte_delay);
+                }
                 let write_result = stream
                     .write_all(response.as_bytes())
                     .and_then(|_| stream.write_all(&spec.body))
@@ -3479,6 +3516,8 @@ mod tests {
             base_url,
             requests,
             shutdown,
+            first_byte_release: None,
+            request_ready: None,
             join: Some(join),
         }
     }
@@ -4149,15 +4188,11 @@ mod tests {
 
     #[test]
     fn hosted_openai_compatible_deadline_is_backend_timeout() {
-        let server = start_server_with_first_byte_delay(
-            vec![HttpResponseSpec {
-                status_line: "200 OK",
-                body: sse_body(&[], true),
-                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-            }],
-            Duration::from_millis(1_200),
-            true,
-        );
+        let server = start_server_with_held_first_byte(vec![HttpResponseSpec {
+            status_line: "200 OK",
+            body: sse_body(&[], true),
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        }]);
         let mut offer = openai_offer(&format!("{}/chat", server.base_url));
         offer.policy.runtime_ms_limit = 200;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4188,6 +4223,15 @@ mod tests {
         assert_eq!(fault.error.class, ErrorClass::BackendTimeout);
         assert_eq!(fault.error.code, "backend_timeout");
         assert!(update_rx.try_recv().is_err());
+        server
+            .request_ready
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("HTTP fixture did not receive the timed-out request");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /chat "));
     }
 
     #[test]

@@ -241,8 +241,8 @@ jobs:
       - name: time bounded regression cases
         working-directory: elastos
         run: |
-          /usr/bin/time -p cargo test -p elastos-server presence_capacity_prunes_expired_records_and_byte_overflow_fails_closed -- --nocapture
-          /usr/bin/time -p cargo test -p elastos-server test_bounded_content_transfer_between_runtimes_fails_over_holders_and_stays_bounded -- --nocapture
+          timeout --kill-after=5s 20s /usr/bin/time -p cargo test -p elastos-server presence_capacity_prunes_expired_records_and_byte_overflow_fails_closed -- --nocapture
+          timeout --kill-after=5s 20s /usr/bin/time -p cargo test -p elastos-server test_bounded_content_transfer_between_runtimes_fails_over_holders_and_stays_bounded -- --nocapture
       - name: list workspace tests
         working-directory: elastos
         run: |

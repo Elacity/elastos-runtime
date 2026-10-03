@@ -2593,12 +2593,13 @@ fn launch_reconciliation_is_bounded_when_control_service_is_unresponsive() {
     ))
     .unwrap();
     let elapsed = started.elapsed();
-    let received = control_socket
-        .received
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let received = std::sync::Arc::clone(&control_socket.received);
     drop(control_socket);
 
-    assert!(received, "reconciliation reaches the unresponsive service");
+    assert!(
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        "reconciliation reaches the unresponsive service"
+    );
     assert!(elapsed < Duration::from_secs(2));
     assert_eq!(response["status"], "ok");
     assert_eq!(response["data"]["state"], "cleanup_pending");
