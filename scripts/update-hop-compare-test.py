@@ -1008,7 +1008,8 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
              patch.object(observer, "cli_port_released") as ports, patch.object(observer, "cli_census", return_value=[]), \
              patch.object(observer, "lock_state", return_value="released"), patch.object(observer.os, "killpg", side_effect=stop):
-            proof = observer.cli_initial_home(manager, self.manifest, home)
+            proof = observer.cli_initial_home(manager, self.manifest, home, {"status": "failed"})
+        self.assertEqual(proof["status"], "passed")
         self.assertTrue(proof["cleanup"]["reaped"] and proof["cleanup"]["data_preserved"])
         self.assertTrue(proof["desktop_opener"]["suppressed"])
         self.assertEqual(ports.call_count, 5)
@@ -1023,7 +1024,8 @@ class CliFixtureTests(unittest.TestCase):
         coords = observer.read(coords_path)
         sentinel = directory / "state/value"
         original = sentinel.read_bytes()
-        for refusal in ("readiness", "owned group", "held lock", "listener", "user data"):
+        for refusal in ("readiness", "readiness nonzero CI", "readiness nonzero operator", "readiness missing CI log",
+                        "owned group", "held lock", "listener", "user data"):
             with self.subTest(refusal=refusal):
                 running = True
                 observer.write(coords_path, coords)
@@ -1031,8 +1033,8 @@ class CliFixtureTests(unittest.TestCase):
                 sentinel.write_bytes(original)
                 process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None if running else 0)
                 def wait(timeout):
-                    process.returncode = 0
-                    return 0
+                    process.returncode = 1 if "nonzero" in refusal else 0
+                    return process.returncode
                 process.wait = wait
                 def stop(pid, sig):
                     nonlocal running
@@ -1042,21 +1044,44 @@ class CliFixtureTests(unittest.TestCase):
                     if refusal == "user data":
                         sentinel.write_bytes(b"changed user data")
                 def observe(*args):
-                    if refusal == "readiness":
+                    if refusal.startswith("readiness"):
                         raise ValueError("injected initial readiness refusal")
                     return {"status": "passed", "controller": identities[45001], "host": identities[45002],
                             "home_url": coords["home_url"], "api_url": coords["api_url"]}
                 def port(value):
                     if refusal == "listener" and not running:
                         raise ValueError("initial Home listener survives shutdown")
+                manager = SimpleNamespace(roots={}, spawn=lambda *args: process)
+                manifest = dict(self.manifest)
+                evidence = {}
+                if "nonzero" in refusal:
+                    manager.output = self.root
+                    (self.root / "initial-home-start.stdout").write_bytes(b"fixture Home output")
+                    (self.root / "initial-home-start.stderr").write_text("x" * 5000 + "\nprivate controller cause")
+                    manifest["proof_scope"] = "ci-rehearsal" if refusal.endswith("CI") else "production-positive"
+                if "missing" in refusal:
+                    manager.output = self.root
+                    for stream in ("stdout", "stderr"):
+                        (self.root / ("initial-home-start." + stream)).unlink(missing_ok=True)
                 with patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
                      patch.object(observer, "cli_process_identity", return_value=None), patch.object(observer, "cli_port_released", side_effect=port), \
                      patch.object(observer, "lock_state", return_value="held" if refusal == "held lock" else "released"), \
                      patch.object(observer, "cli_census", return_value=[{"group": 45002}] if refusal == "owned group" else []), \
-                     patch.object(observer.os, "killpg", side_effect=stop) as killed, self.assertRaises(ValueError):
-                    observer.cli_initial_home(SimpleNamespace(roots={}, spawn=lambda *args: process), self.manifest, home)
+                     patch.object(observer.os, "killpg", side_effect=stop) as killed, self.assertRaises(ValueError) as raised:
+                    observer.cli_initial_home(manager, manifest, home, evidence)
                 self.assertFalse(running)
-                self.assertEqual(process.returncode, 0)
+                self.assertEqual(process.returncode, 1 if "nonzero" in refusal else 0)
+                if refusal.startswith("readiness"):
+                    self.assertTrue(str(raised.exception).startswith("injected initial readiness refusal"))
+                if "nonzero" in refusal:
+                    self.assertIn("controller exit 1", str(raised.exception))
+                    self.assertEqual("private controller cause" in str(raised.exception), refusal.endswith("CI"))
+                    self.assertLess(len(str(raised.exception)), 1200)
+                    for stream in ("stdout", "stderr"):
+                        self.assertEqual(evidence["controller_" + stream + "_sha256"],
+                                         observer.digest(self.root / ("initial-home-start." + stream)))
+                if "missing" in refusal:
+                    self.assertIn("CI controller diagnostic is unavailable", str(raised.exception))
                 killed.assert_called_once()
 
     def test_initial_home_response_and_private_records_keep_their_bounds(self):

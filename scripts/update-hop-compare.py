@@ -1729,7 +1729,7 @@ def cli_port_released(value):
             need(probe.connect_ex(address) != 0, "initial Home listener survives shutdown")
 
 
-def cli_initial_home(processes, manifest, home_path):
+def cli_initial_home(processes, manifest, home_path, evidence=None):
     """Run the installed entrypoint; Runtime alone admits and owns its child."""
     before = cli_home_snapshot(manifest, home_path)
     directory = home_path / CLI_DATA
@@ -1745,7 +1745,8 @@ def cli_initial_home(processes, manifest, home_path):
     env["PATH"] = str(opener.parent) + ":" + env["PATH"]
     processes.roots[str(opener)] = {binding["sha256"]}
     process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "initial-home-start")
-    proof = None
+    proof, failure, cleanup_failure, exit_code = None, None, None, None
+    evidence = {} if evidence is None else evidence
     try:
         deadline = time.monotonic() + 150
         while process.poll() is None and time.monotonic() < deadline:
@@ -1758,10 +1759,41 @@ def cli_initial_home(processes, manifest, home_path):
             time.sleep(.2)
         need(proof is not None and process.poll() is None, "installed Home did not reach controller readiness")
         need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
+    except Exception as error:
+        failure = error
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-        need(process.wait(timeout=35) == 0, "installed Home controller did not stop cleanly")
+        try:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            exit_code = process.wait(timeout=35)
+        except Exception as error:
+            cleanup_failure = error
+    evidence["controller_exit"] = exit_code
+    if hasattr(processes, "output"):
+        try:
+            for stream in ("stdout", "stderr"):
+                evidence["controller_" + stream + "_sha256"] = digest(processes.output / ("initial-home-start." + stream))
+        except OSError:
+            if cleanup_failure is None:
+                cleanup_failure = ValueError("initial Home log evidence is unavailable")
+    if failure is not None or cleanup_failure is not None or exit_code != 0:
+        detail = str(failure) if failure is not None else "installed Home controller did not stop cleanly"
+        detail += "; controller exit " + str(exit_code)
+        if cleanup_failure is not None:
+            detail += "; cleanup: " + str(cleanup_failure)
+        # The immutable CI fixture uses disposable keys. Operator Runtime logs stay private.
+        if manifest.get("proof_scope") == "ci-rehearsal" and hasattr(processes, "output"):
+            stderr = processes.output / "initial-home-start.stderr"
+            try:
+                with stderr.open("rb") as stream:
+                    stream.seek(max(0, stderr.stat().st_size - 4096))
+                    tail = stream.read(4096).decode(errors="replace")
+                tail = re.sub(r"\x1b\[[0-9;]*m", "", tail).strip()
+                if tail:
+                    detail += "; CI controller stderr: " + tail[-1024:]
+            except OSError:
+                detail += "; CI controller diagnostic is unavailable"
+        raise ValueError(detail) from failure
     need(proof is not None, "initial Home readiness proof is absent")
     for identity in (proof["controller"], proof["host"]):
         need(cli_process_identity(identity["pid"]) is None, "initial Home process survives shutdown")
@@ -1776,6 +1808,7 @@ def cli_initial_home(processes, manifest, home_path):
         cli_port_released(value)
     need(cli_home_snapshot(manifest, home_path) == before, "Home shutdown changed installed trust, identity or preserved data")
     proof["desktop_opener"] = {"suppressed": True, "sha256": binding["sha256"], "manual_ux": "requires operator acceptance"}
+    proof.update({key: value for key, value in evidence.items() if key.startswith("controller_")})
     proof["cleanup"] = {"controller_exit": process.returncode, "reaped": True, "groups_absent": True,
                         "ports_released": True, "locks_released": True, "coordinates_removed": True, "data_preserved": True}
     return proof
@@ -1942,7 +1975,8 @@ def cli_run(config, output):
             prepare(initial, "initial-home")
             result["paths"]["m1-install"]["checks"]["initial-home"] = {
                 "status": "failed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home"}
-            result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(processes, manifest, initial)
+            result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
+                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"])
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
         if result["proof_scope"] in ("production-positive", "ci-rehearsal"):
             phase("new")
