@@ -1,0 +1,357 @@
+# Key-free builder workflow for #89. This branch is never a product merge candidate.
+name: Canary inputs
+
+on:
+  push:
+    branches: [fix/89-canary-inputs]
+    paths: [.github/workflows/canary-inputs.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: canary-inputs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: 5814b06b0b5e1f42d05ab60002af9c548ec9d9b2
+  SOURCE_TREE: 72785a23bbed468f3460acbe998e99bb74c55906
+  ACCEPTED_CI_RUN: '37073055811'
+  PUBLISHER_ORIGIN: https://elastos.elacitylabs.com
+  PUBLISHER_NODE: 401264d32427bdfa7343cca7c895e441f1a363c93a6f975f0bb659b0f3919447
+  BASELINE_DID: did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj
+  CANARY_DID: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+  CARGO_BUILD_JOBS: '4'
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  macos-inputs:
+    name: unsigned Apple silicon V1 and provisional V2
+    runs-on: macos-14
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: define owned builder paths
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/macOS/ARM64 ]]
+          umask 077
+          echo "BUILDER_HOME=${HOME}/.elastos-ci/canary-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "BUILDER_CARGO_HOME=${CARGO_HOME:-${HOME}/.cargo}" >> "$GITHUB_ENV"
+          echo "BUILDER_RUSTUP_HOME=${RUSTUP_HOME:-${HOME}/.rustup}" >> "$GITHUB_ENV"
+          echo "INPUT_ARTIFACT=${RUNNER_TEMP}/canary-inputs" >> "$GITHUB_ENV"
+          install -d -m 700 "${RUNNER_TEMP}/canary-inputs/receipts" "${RUNNER_TEMP}/canary-inputs/public-baseline"
+      - name: check out exact reviewed source separately
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: bind clean source and archive it
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          git archive --format=tar.gz --output="$INPUT_ARTIFACT/source.tar.gz" "$SOURCE_COMMIT"
+          cp scripts/release-signer.py "$INPUT_ARTIFACT/release-signer.py"
+          [[ "$(shasum -a 256 "$INPUT_ARTIFACT/release-signer.py" | cut -d ' ' -f 1)" == e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2 ]]
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+          targets: wasm32-unknown-unknown,aarch64-apple-darwin
+      - name: restore Rust cache only
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: source/elastos
+          prefix-key: macOS-elastos-bd
+          cache-directories: source/target-build
+          save-if: 'false'
+      - name: restore Kubo archive cache only
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/kubo-cache
+          key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/components.json') }}
+      - name: prepare hosted capacity and native tools
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py prepare-ci-disk
+          brew install e2fsprogs coturn pkg-config openssl@3
+          echo "PUBLIC_VERIFY_OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+      - name: seed verified Kubo into owned builder data
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$BUILDER_HOME" "$BUILDER_HOME/Library/Application Support/elastos"
+          scripts/seed-kubo-cache.sh "$RUNNER_TEMP/kubo-cache" "$BUILDER_HOME/Library/Application Support/elastos" darwin-arm64
+      - name: prepare native N1 and frozen-support N2
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.1 --output "$INPUT_ARTIFACT/N1"
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.2 --output "$INPUT_ARTIFACT/N2" --reuse-support "$INPUT_ARTIFACT/N1"
+          python3 scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N1" > "$INPUT_ARTIFACT/receipts/N1-verify.json"
+          python3 scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N2" > "$INPUT_ARTIFACT/receipts/N2-verify.json"
+      - name: verify executable versions on the key-free builder
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, subprocess
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          install = Path(os.environ['BUILDER_HOME']) / 'bin'
+          install.mkdir(mode=0o700)
+          proof = []
+          for native, version in [('N1', '0.8.0-alpha.1'), ('N2', '0.8.0-alpha.2')]:
+              source = root / native / 'artifacts/elastos-aarch64-darwin'
+              target = install / native
+              shutil.copyfile(source, target)
+              target.chmod(0o700)
+              binary_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+              assert binary_sha == hashlib.sha256(source.read_bytes()).hexdigest()
+              env = dict(os.environ, HOME=os.environ['BUILDER_HOME'],
+                         CARGO_HOME=os.environ['BUILDER_CARGO_HOME'], RUSTUP_HOME=os.environ['BUILDER_RUSTUP_HOME'])
+              reply = subprocess.run([str(target), '--version'], env=env, capture_output=True, timeout=15, check=True)
+              assert reply.stdout == ('elastos ' + version + '\n').encode() and reply.stderr == b'', reply
+              proof.append({'native': native, 'version': version, 'binary_sha256': binary_sha,
+                            'stdout': reply.stdout.decode(), 'stderr': '', 'executed_by': 'key-free CI builder'})
+          (root / 'receipts/executable-versions.json').write_text(json.dumps(proof, indent=2) + '\n')
+          PY
+      - name: verify bounded public baseline and prepare unsigned manifests
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os, shutil, subprocess, sys, urllib.request
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          public = root / 'public-baseline'
+          spec = importlib.util.spec_from_file_location('release_signer', Path('scripts/release-signer.py').resolve())
+          signer = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = signer
+          spec.loader.exec_module(signer)
+          class FixedOrigin(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise ValueError('Public evidence redirects refused')
+          opener = urllib.request.build_opener(FixedOrigin())
+          def get(url, limit=256 * 1024):
+              request = urllib.request.Request(url, headers={'User-Agent': 'Elastos-key-free-builder', 'Accept': 'application/json'})
+              with opener.open(request, timeout=30) as response:
+                  assert response.status == 200
+                  data = response.read(limit + 1)
+                  assert len(data) <= limit, 'Public response exceeds bound'
+                  return data
+          commit = os.environ['SOURCE_COMMIT']
+          tree = os.environ['SOURCE_TREE']
+          ci_url = 'https://api.github.com/repos/Elacity/elastos-runtime/actions/runs/' + os.environ['ACCEPTED_CI_RUN']
+          ci = signer.parse_json(get(ci_url, 1024 * 1024))
+          assert ci['head_sha'] == commit and ci['status'] == 'completed' and ci['conclusion'] == 'success'
+          github_json = lambda path: signer.parse_json(get('https://api.github.com' + path, 1024 * 1024))
+          develop = github_json('/repos/Elacity/elastos-runtime/git/ref/heads/develop')['object']['sha']
+          assert develop == commit, 'Selected current develop moved; renew the builder source/CI approval'
+          source_policy = {'repository': 'Elacity/elastos-runtime', 'channel': 'canary',
+                           'version': '0.8.0-alpha.1', 'commit': commit, 'tree': tree, 'develop_oid': develop}
+          signer.verify_source(source_policy, github_json)
+          origin = os.environ['PUBLISHER_ORIGIN']
+          bootstrap_bytes = get(origin + '/.well-known/elastos/carrier-bootstrap.json?role=publisher', 16 * 1024)
+          bootstrap = signer.parse_json(bootstrap_bytes)
+          assert bootstrap['schema'] == 'elastos.carrier.bootstrap/v1' and bootstrap['role'] == 'publisher'
+          assert bootstrap['node_id'] == os.environ['PUBLISHER_NODE']
+          assert isinstance(bootstrap['ticket'], str) and bootstrap['ticket']
+          (public / 'carrier-bootstrap.json').write_bytes(bootstrap_bytes)
+          openssl = os.environ['PUBLIC_VERIFY_OPENSSL']
+          assert subprocess.check_output([openssl, 'version'], text=True).startswith('OpenSSL 3.')
+          did = os.environ['BASELINE_DID']
+          signer.check_did(did)
+          number = 0
+          for char in did[len('did:key:z'):]:
+              number = number * 58 + signer.BASE58.index(char)
+          key = number.to_bytes(34, 'big')[2:]
+          pubkey = public / 'public-key.der'
+          pubkey.write_bytes(bytes.fromhex('302a300506032b6570032100') + key)
+          def envelope(name, domain):
+              data = get(origin + '/' + name)
+              parsed = signer.parse_json(data)
+              assert set(parsed) == {'payload', 'signature', 'signer_did'} and parsed['signer_did'] == did
+              payload = parsed['payload']
+              if 'signer_did' in payload:
+                  assert payload['signer_did'] == did
+              signature = bytes.fromhex(parsed['signature'])
+              assert len(signature) == 64
+              digest = signer.signature_digest(domain, signer.json_bytes(payload))
+              digest_path, signature_path = public / (name + '.digest'), public / (name + '.signature')
+              digest_path.write_bytes(digest)
+              signature_path.write_bytes(signature)
+              subprocess.run([openssl, 'pkeyutl', '-verify', '-rawin', '-pubin', '-keyform', 'DER',
+                              '-inkey', str(pubkey), '-in', str(digest_path), '-sigfile', str(signature_path)],
+                             env=dict(os.environ, OPENSSL_CONF='/dev/null'), check=True, capture_output=True, timeout=15)
+              (public / name).write_bytes(data)
+              return data, payload
+          head_bytes, head = envelope('release-head.json', 'elastos.release.head.v1')
+          release_bytes, release = envelope('release.json', 'elastos.release.v1')
+          assert head['schema'] == 'elastos.release.head/v1' and release['schema'] == 'elastos.release/v1'
+          assert all(head[field] == release[field] for field in ['channel', 'version'])
+          assert head['release_sha256'] == signer.sha256(release_bytes)
+          assert head['latest_release_cid'] == signer.unixfs_metadata_cid(release_bytes)
+          assert type(head['updated_at']) is int and head['updated_at'] >= 0
+          receipt = {'publisher_did': did, 'last_head_cid': signer.unixfs_metadata_cid(head_bytes),
+                     'last_release_cid': head['latest_release_cid'], 'last_version': release['version'],
+                     'last_published_at': head['updated_at']}
+          (public / 'suggested-publish-state.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          data = Path(os.environ['BUILDER_HOME']) / 'Library/Application Support/elastos'
+          state = data / 'ElastOS/SystemServices/Publisher'
+          state.mkdir(mode=0o700, parents=True)
+          (state / 'publish-state.json').write_text(json.dumps(receipt) + '\n')
+          env = dict(os.environ, HOME=os.environ['BUILDER_HOME'], ELASTOS_DATA_DIR=str(data),
+                     CARGO_HOME=os.environ['BUILDER_CARGO_HOME'], RUSTUP_HOME=os.environ['BUILDER_RUSTUP_HOME'],
+                     ELASTOS_SOURCE_CONNECT_TICKET=bootstrap['ticket'], ELASTOS_PUBLISHER_NODE_ID=bootstrap['node_id'],
+                     ELASTOS_PUBLISHER_GATEWAY=origin, ELASTOS_IPNS_NAME='')
+          for native, version, output in [('N1', '0.8.0-alpha.1', 'unsigned-V1'),
+                                          ('N2', '0.8.0-alpha.2', 'unsigned-V2-PROVISIONAL')]:
+              command = [str(Path(os.environ['BUILDER_HOME']) / 'bin' / native), 'publish-release',
+                         '--version', version, '--channel', 'canary', '--platform-input', 'aarch64-darwin=' + str(root / native),
+                         '--preview-platform', 'aarch64-darwin', '--prepare-only', str(root / output),
+                         '--publisher-did', os.environ['CANARY_DID'], '--ipfs-provider-bin',
+                         str(root / native / 'artifacts/ipfs-provider-darwin-arm64')]
+              subprocess.run(command, env=env, check=True, timeout=1000)
+          (root / 'receipts/public-verification.json').write_text(json.dumps({
+              'origin': origin, 'publisher_node': bootstrap['node_id'], 'baseline_did': did,
+              'head_sha256': signer.sha256(head_bytes), 'release_sha256': signer.sha256(release_bytes),
+              'signatures': 'OpenSSL 3 Ed25519 verification passed', 'accepted_ci': ci['html_url'],
+              'source_commit': commit, 'source_tree': tree, 'develop_oid': develop, 'source_in_develop': True,
+              'operator_gate': 'Compare suggested-publish-state.json with the actual seed receipt before signing.'}, indent=2) + '\n')
+          PY
+      - name: retain policy drafts and artifact provenance
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os, subprocess, sys
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          spec = importlib.util.spec_from_file_location('release_signer', Path('scripts/release-signer.py').resolve())
+          signer = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = signer
+          spec.loader.exec_module(signer)
+          policies = root / 'policy-drafts'
+          policies.mkdir()
+          frozen = None
+          for output, version, final in [('unsigned-V1', '0.8.0-alpha.1', True),
+                                          ('unsigned-V2-PROVISIONAL', '0.8.0-alpha.2', False)]:
+              manifest_bytes = (root / output / 'signing-input.json').read_bytes()
+              manifest = signer.parse_json(manifest_bytes)
+              assert manifest['source'] == {'commit': os.environ['SOURCE_COMMIT'], 'tree': os.environ['SOURCE_TREE']}
+              assert manifest['version'] == version and manifest['channel'] == 'canary'
+              for name, record in manifest['files'].items():
+                  path = root / output / name
+                  assert signer.sha256(path.read_bytes()) == record['sha256'] and path.stat().st_size == record['size']
+              rendered = signer.render_installer(Path('scripts/install.sh').read_bytes(), manifest['installer']['stamps'], os.environ['CANARY_DID'])
+              assert signer.sha256(rendered) == manifest['release']['installer_sha256']
+              if frozen is None:
+                  frozen = rendered
+                  (root / 'frozen-install.sh').write_bytes(rendered)
+              else:
+                  assert rendered == frozen, 'V2 installer differs from frozen M1 installer'
+              (root / 'receipts' / (output + '-cids.json')).write_text(json.dumps(
+                  {name: record['cid'] for name, record in manifest['files'].items()}, indent=2) + '\n')
+              (root / 'receipts' / (output + '-stamps.json')).write_text(json.dumps(manifest['installer'], indent=2) + '\n')
+              policy = {'repository': 'Elacity/elastos-runtime', 'channel': 'canary', 'version': version,
+                        'commit': os.environ['SOURCE_COMMIT'], 'tree': os.environ['SOURCE_TREE'],
+                        'develop_oid': json.loads((root / 'receipts/public-verification.json').read_text())['develop_oid'],
+                        'publisher_did': os.environ['CANARY_DID'],
+                        'manifest_sha256': signer.sha256(manifest_bytes) if final else None,
+                        'max_file_bytes': max(record['size'] for record in manifest['files'].values()),
+                        'max_snapshot_bytes': sum(record['size'] for record in manifest['files'].values()),
+                        'tool': {'path': '/OPERATOR/installed-release-signer.py', 'sha256': 'e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2'},
+                        'python': {'path': '/opt/homebrew/Cellar/python@3.12/3.12.13_2/Frameworks/Python.framework/Versions/3.12/bin/python3.12',
+                                   'sha256': 'fe46716a94d8efa4514feb3c39ba3e270deee2187556986f6ddcff54aba7bb9a'},
+                        'openssl': {'path': '/opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl',
+                                    'sha256': '5d8f84484b7317ec5639ce68ccecc1d6f565ca6df483c8ae731e25265d83466d'},
+                        'key_path': '/OPERATOR/maintainer-ed25519.pem'}
+              (policies / (output + '.json')).write_text(json.dumps(policy, indent=2) + '\n')
+          assert not subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all'])
+          (root / 'receipts/build.json').write_text(json.dumps({
+              'schema': 'elastos.canary-builder-receipt/v1', 'source_commit': os.environ['SOURCE_COMMIT'],
+              'source_tree': os.environ['SOURCE_TREE'], 'source_clean_before_and_after': True,
+              'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'], 'workflow_commit': os.environ['GITHUB_SHA'],
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'native_platform': 'aarch64-darwin', 'signer_execution': 'public-data utilities only',
+              'V2': 'PROVISIONAL: real signed V1 predecessor CIDs required; draft manifest_sha256 is null',
+              'operator_gate': 'Review source/CI/signer provenance and replace operator path placeholders; sign outside CI.'}, indent=2) + '\n')
+          (root / 'OPERATOR-GATES.txt').write_text(
+              'Operator instructions: scripts/README.md in source.tar.gz, signing/publication section.\n'
+              'Compare the suggested public baseline receipt with the actual seed receipt before V1 signing.\n'
+              'V2 is PROVISIONAL and its null policy hash forces signer refusal. After real V1 signing/import,\n'
+              're-prepare V2 metadata from the retained N2 input against the actual V1 Publisher receipt.\n'
+              'Keep N2, original support_origin, installer stamps, and frozen-install.sh bytes fixed.\n'
+              'Review the replacement signing-input.json hash and current develop_oid before V2 signing.\n'
+              'Custodian owns private-key handling, signing and seed import; operator owns isolated Mac M1/M2.\n')
+          PY
+      - name: stop owned Kubo and remove ephemeral builder state
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, shutil, signal, subprocess, time
+          from pathlib import Path
+          home = Path(os.environ['BUILDER_HOME'])
+          data = home / 'Library/Application Support/elastos'
+          coords = data / 'ipfs-coords.json'
+          stopped = None
+          if coords.exists():
+              pid = json.loads(coords.read_text())['kubo_pid']
+              assert type(pid) is int and pid > 1
+              process = subprocess.run(['ps', '-p', str(pid), '-o', 'uid=', '-o', 'command='], capture_output=True, text=True)
+              if process.returncode == 0:
+                  uid, command = process.stdout.strip().split(None, 1)
+                  assert int(uid) == os.getuid() and command.startswith(str(data / 'bin/kubo') + ' daemon '), 'Owned Kubo process identity differs'
+                  os.kill(pid, signal.SIGTERM)
+                  for attempt in range(60):
+                      process = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True)
+                      if process.returncode != 0 or process.stdout.strip().startswith('Z'):
+                          break
+                      time.sleep(0.25)
+                  else:
+                      raise RuntimeError('Owned Kubo remains alive after cleanup')
+              else:
+                  assert process.returncode == 1 and not process.stdout.strip(), 'Owned Kubo status query failed'
+              stopped = pid
+          shutil.rmtree(home, ignore_errors=False) if home.exists() else None
+          receipt = Path(os.environ['INPUT_ARTIFACT']) / 'receipts/process-cleanup.json'
+          receipt.write_text(json.dumps({'owned_kubo_pid': stopped, 'owned_kubo_stopped': True,
+                                        'ephemeral_builder_home_removed': True}, indent=2) + '\n')
+          PY
+      - name: hash the complete retained artifact
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          lines = []
+          for path in sorted(root.rglob('*')):
+              assert not path.is_symlink()
+              if path.is_file() and path.name != 'SHA256SUMS':
+                  digest = hashlib.sha256()
+                  with path.open('rb') as source:
+                      for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                          digest.update(chunk)
+                  lines.append(digest.hexdigest() + '  ' + path.relative_to(root).as_posix())
+          (root / 'SHA256SUMS').write_text('\n'.join(lines) + '\n')
+          PY
+      - name: upload inert canary preparation inputs
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: canary-inputs-aarch64-darwin-${{ env.SOURCE_COMMIT }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary-inputs
+          if-no-files-found: error
+          retention-days: 7
