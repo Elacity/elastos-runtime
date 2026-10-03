@@ -679,6 +679,8 @@ impl Controller {
     }
 
     async fn stop_child(&mut self) -> Result<()> {
+        // Stopping retires readiness even when later custody cleanup must be retried.
+        self.host_ready = false;
         let owner_result = self
             .child
             .as_ref()
@@ -698,13 +700,12 @@ impl Controller {
         crate::runtime_control::gateway_children::refuse_unreconciled_groups(
             &self.receipt.data_dir,
         )?;
-        self.child = None;
-        self.host_ready = false;
-        self.generation.clear();
         anyhow::ensure!(
             crate::host_lock::active_host_process(&self.receipt.data_dir)?.is_none(),
             "A Runtime still owns Home; retain recovery files."
         );
+        self.child = None;
+        self.generation.clear();
         Ok(())
     }
 
@@ -730,6 +731,20 @@ impl Controller {
         )
     }
 
+    fn publish_apply_result(&self, result: &Result<()>) -> Result<()> {
+        if result.is_ok() {
+            self.publish("updated", "Home is up to date.")
+        } else if self.host_ready && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
+        {
+            self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")
+        } else {
+            self.publish(
+                "failed",
+                "Home could not restart. Run the retained update controller to recover.",
+            )
+        }
+    }
+
     async fn serve(&mut self) -> Result<()> {
         loop {
             if self
@@ -753,18 +768,7 @@ impl Controller {
                 self.request = Some(request);
                 self.publish("staging", "Checking the signed update.")?;
                 let result = self.apply().await;
-                if result.is_ok() {
-                    self.publish("updated", "Home is up to date.")?;
-                } else if self.host_ready
-                    && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
-                {
-                    self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")?;
-                } else {
-                    self.publish(
-                        "failed",
-                        "Home could not restart. Run the retained update controller to recover.",
-                    )?;
-                }
+                self.publish_apply_result(&result)?;
                 if InstallTransaction::has_pending_recovery(&self.receipt.binary)
                     || !self.host_ready
                 {
