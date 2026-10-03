@@ -21,6 +21,17 @@ const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
 const RESERVE_PERCENT: u128 = 15;
 
+#[derive(Debug)]
+pub(crate) struct DiskReserveError;
+
+impl std::fmt::Display for DiskReserveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("update would cross the 15% disk reserve; previous release preserved")
+    }
+}
+
+impl std::error::Error for DiskReserveError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReleaseFile {
@@ -1379,7 +1390,7 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
 fn require_disk_reserve(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
     let reserve = (total * RESERVE_PERCENT).div_ceil(100);
     if total == 0 || available < reserve || needed > available.saturating_sub(reserve) {
-        bail!("update would cross the 15% disk reserve; previous release preserved");
+        return Err(DiskReserveError.into());
     }
     Ok(())
 }
