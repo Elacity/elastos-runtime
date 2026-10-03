@@ -78,7 +78,8 @@ signer, version, head CID and release CID. If these fields differ, ask the
 key-free builder to re-prepare V1 against the actual receipt. Retain the seed's
 actual publication timestamp, which can record import time rather than the
 signed head time. The suggested CI receipt is comparison evidence; the seed
-keeps its actual receipt and holder identity.
+keeps its actual receipt and holder identity. For a verified absent legacy
+receipt, step 5 reconstructs the observed public chain under Anders's approval.
 Canonical Runtime derives its Publisher state path from its selected data root;
 `ELASTOS_PUBLISH_STATE_DIR` alone does not select that root.
 
@@ -110,9 +111,12 @@ test "$(shasum -a 256 "$PINNED_OPENSSL" | cut -d ' ' -f 1)" = '5d8f84484b7317ec5
 ```
 
 The operator edits and approves `V1-policy.json`: `tool.path` becomes
-`INSTALLED_SIGNER`, `key_path` becomes `PEM_KEY`; all other pins, manifest hash
-and quotas come from the reviewed draft. Compare its `develop_oid` with
-`gh api repos/Elacity/elastos-runtime/git/ref/heads/develop --jq .object.sha`.
+`INSTALLED_SIGNER` and `key_path` becomes `PEM_KEY`. If develop has moved,
+renew approval for `develop_oid` after confirming the frozen source remains
+an ancestor of that head. Keep the source commit/tree, manifest hash, native
+bytes, tool pins and quotas from the reviewed draft. Compare the approved
+`develop_oid` with `gh api repos/Elacity/elastos-runtime/git/ref/heads/develop
+--jq .object.sha` immediately before signing; the signer checks it again.
 
 ## 3. Operator-only hex-to-PEM conversion
 
@@ -206,6 +210,33 @@ build receipt, source tree, Runtime version/hash and recorded embedded helper
 root. Install the reviewed source helpers at that exact root. The existing
 seed provider's qualified path and hash remain explicit publication inputs.
 
+On the Mac, download the exact Linux run and artifact named in the handoff.
+Use a new transfer directory and the approved outer tar hash from #89:
+
+```bash
+set -euo pipefail
+LINUX_TRANSFER="$CUSTODY/linux-public-transfer"
+test ! -e "$LINUX_TRANSFER"
+mkdir -m 700 "$LINUX_TRANSFER"
+gh run download "$LINUX_RUN" --repo Elacity/elastos-runtime \
+  --name "$LINUX_ARTIFACT" --dir "$LINUX_TRANSFER"
+test "$(shasum -a 256 "$LINUX_TRANSFER/seed-publisher.tar.gz" | cut -d ' ' -f 1)" = "$APPROVED_LINUX_TAR_SHA256"
+mkdir -m 700 "$LINUX_TRANSFER/verified"
+tar -xzf "$LINUX_TRANSFER/seed-publisher.tar.gz" -C "$LINUX_TRANSFER/verified"
+cd "$LINUX_TRANSFER/verified"
+shasum -a 256 -c SHA256SUMS
+```
+
+The Linux receipt records its exact helper root, Runtime/provider hashes,
+Rust toolchain, source parity and Ubuntu/glibc ABI. The archive qualifies
+signed import/export; unsigned preparation also needs the frozen installer's
+Git objects. Transfer only these verified public files to the seed. Extract
+`source.tar.gz` at the receipt's helper root as the existing service owner,
+preserving `elastos/crates/elastos-server` and the complete reviewed source
+tree. Install the two binaries at operator-selected stable paths with mode
+0700, compare their hashes with the receipt, and pass the qualified provider
+explicitly. Its Kubo qualification and the real import remain seed checks.
+
 The copied Runtime needs `scripts/publish-release.sh` and its reviewed Python
 helper at the embedded root even when it imports an already signed set.
 `--dry-run` returns before that helper check; use `--preflight-only` as well.
@@ -215,6 +246,123 @@ restarts the existing instance with its retained data root, identity, holder,
 provider configuration and service arguments. Verify binary parity after
 restart. Use the existing publication instance; its one current signed set is
 replaced at the first approved new-key canary import.
+
+The legacy instance reported in #89 has no Publisher receipt. Its old served
+release also lacks the installer hash required by the new gateway admission.
+Anders approves an upgrade/import window that preserves the old files and
+their recovery path while the new Runtime imports the first valid canary set.
+Successful source or baseline checks alone do not prove old-set serving after
+the Runtime replacement. Verify the approved new served bytes after import.
+
+Before that first import, reconstruct the absent receipt from the verified
+old public baseline under Anders's approval. An empty receipt would refuse
+V1's predecessor CIDs even with `--allow-signer-rotation`. Keep the old DID
+and CIDs in this migration; the signed import owns the change to the new DID.
+
+On the Mac, use the pinned public-data tools to verify that the origin still
+serves the exact baseline bytes accepted in steps 1–2, recompute its CIDs, and
+bind them to V1. This writes a public receipt only:
+
+```bash
+set -euo pipefail
+"$PINNED_PYTHON" -I -S - "$INPUTS" "$CUSTODY/verified-baseline-receipt.json" <<'PY'
+import hashlib, importlib.util, json, sys, urllib.request
+from pathlib import Path
+inputs, destination = map(Path, sys.argv[1:])
+tool = inputs / 'release-signer.py'
+assert hashlib.sha256(tool.read_bytes()).hexdigest() == 'e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2'
+spec = importlib.util.spec_from_file_location('public_signer', tool)
+signer = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = signer
+spec.loader.exec_module(signer)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        raise ValueError('Baseline redirect refused')
+opener = urllib.request.build_opener(NoRedirect())
+envelopes, raw = {}, {}
+for name in ['release-head.json', 'release.json']:
+    with opener.open('https://elastos.elacitylabs.com/' + name, timeout=30) as reply:
+        data = reply.read(256 * 1024 + 1)
+    assert len(data) <= 256 * 1024
+    assert data == (inputs / 'public-baseline' / name).read_bytes(), 'Public baseline changed; renew builder approval'
+    envelope = signer.parse_json(data)
+    assert envelope['signer_did'] == 'did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj'
+    envelopes[name], raw[name] = envelope, data
+head, release = (envelopes[name]['payload'] for name in ['release-head.json', 'release.json'])
+assert head['version'] == release['version'] == '0.7.1'
+assert head['channel'] == release['channel'] == 'stable'
+assert head['release_sha256'] == signer.sha256(raw['release.json'])
+release_cid = signer.unixfs_metadata_cid(raw['release.json'])
+head_cid = signer.unixfs_metadata_cid(raw['release-head.json'])
+assert head['latest_release_cid'] == release_cid
+v1 = signer.parse_json((inputs / 'unsigned-V1/signing-input.json').read_bytes())
+assert v1['head']['prev_head_cid'] == head_cid
+assert v1['release']['prev_release_cid'] == release_cid
+receipt = signer.parse_json((inputs / 'public-baseline/suggested-publish-state.json').read_bytes())
+assert receipt == {'publisher_did': envelopes['release-head.json']['signer_did'],
+                   'last_release_cid': release_cid, 'last_head_cid': head_cid,
+                   'last_version': '0.7.1', 'last_published_at': head['updated_at']}
+with destination.open('x') as output:
+    output.write(json.dumps(receipt, indent=2) + '\n')
+destination.chmod(0o600)
+print('Verified public baseline receipt:', signer.sha256(destination.read_bytes()))
+PY
+```
+
+The retained baseline's signatures were independently verified in CI; exact
+byte equality preserves that verification. Record that `last_published_at`
+is reconstructed from the signed head because the old import time is unknown.
+Copy this public receipt to a verified staging path on the seed and compare
+its SHA-256. As the Runtime service owner, set `SEED_DATA_DIR` to the existing
+instance's selected data directory and `BASELINE_RECEIPT` to that verified
+staging file. The canonical destination belongs to Publisher; consumer trust
+configuration stays with the installed client.
+
+```bash
+set -euo pipefail
+python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT" <<'PY'
+import json, os, stat, sys
+from pathlib import Path
+data, source = map(Path, sys.argv[1:])
+data = data.resolve(strict=True)
+assert data.is_dir()
+raw = source.read_bytes()
+assert len(raw) <= 65536
+receipt = json.loads(raw)
+assert set(receipt) == {'publisher_did', 'last_release_cid', 'last_head_cid', 'last_version', 'last_published_at'}
+assert receipt['publisher_did'] == 'did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj'
+assert receipt['last_version'] == '0.7.1'
+root = data
+for part in ['ElastOS', 'SystemServices', 'Publisher']:
+    metadata = root.lstat()
+    assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid() and metadata.st_mode & 0o022 == 0
+    root = root / part
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+metadata = root.lstat()
+assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid() and metadata.st_mode & 0o022 == 0
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    descriptor = os.open('publish-state.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+        metadata = os.fstat(output.fileno())
+        assert metadata.st_uid == os.geteuid() and metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == 0o600
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print('Installed the approved old-baseline Publisher receipt; existing receipts are preserved.')
+PY
+```
+
+This exclusive migration refuses an existing receipt. Compare any receipt that
+appears with the approved baseline before proceeding. Runtime selects Linux
+data from `XDG_DATA_HOME/elastos`, otherwise `HOME/.local/share/elastos`; use
+the existing service environment for migration and all publication commands.
 
 On the seed, set `SEED_RUNTIME`, `SIGNED_SET`, and `IPFS_PROVIDER` to their
 verified absolute paths. Run in the existing instance's approved HOME/data-root

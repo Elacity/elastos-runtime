@@ -255,6 +255,67 @@ jobs:
                   if path.is_file():
                       path.chmod(0o400)
           assert read_json(root / 'policy-drafts/unsigned-V2-PROVISIONAL.json')['manifest_sha256'] is None
+          # Qualify the operator's public-receipt migration commands in an isolated
+          # hosted-runner data root. The real seed and custody paths stay outside CI.
+          runbook = Path('../builder/.github/canary-operator-runbook.md').read_text()
+          def operator_python(marker):
+              matches = re.findall(re.escape(marker) + r" <<'PY'\n(.*?)\nPY", runbook, re.S)
+              assert len(matches) == 1
+              return matches[0]
+          public_program = operator_python('"$PINNED_PYTHON" -I -S - "$INPUTS" "$CUSTODY/verified-baseline-receipt.json"')
+          seed_program = operator_python('python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT"')
+          migration = scratch / 'migration-qualification'
+          migration.mkdir(mode=0o700)
+          baseline = migration / 'verified-baseline-receipt.json'
+          if os.environ['FINALIZE_V2'] == 'true':
+              # V1 now owns the live origin. Use the previously verified old
+              # baseline only for isolated filesystem refusal tests; the V2
+              # branch below verifies the live signed V1 and its real CIDs.
+              baseline.write_bytes((root / 'public-baseline/suggested-publish-state.json').read_bytes())
+              baseline.chmod(0o600)
+          else:
+              subprocess.run([sys.executable, '-I', '-S', '-', str(root), str(baseline)],
+                             input=public_program.encode(), env={'PATH': '/usr/bin:/bin'}, check=True, capture_output=True, timeout=90)
+          checks = []
+          def provision(data, succeeds):
+              result = subprocess.run([sys.executable, '-I', '-S', '-', str(data), str(baseline)],
+                                      input=seed_program.encode(), env={'PATH': '/usr/bin:/bin'}, capture_output=True, timeout=30)
+              assert (result.returncode == 0) == succeeds
+          data = migration / 'data'
+          data.mkdir(mode=0o700)
+          provision(data, True)
+          receipt = data / 'ElastOS/SystemServices/Publisher/publish-state.json'
+          assert receipt.read_bytes() == baseline.read_bytes() and stat.S_IMODE(receipt.stat().st_mode) == 0o600
+          assert receipt.stat().st_nlink == 1 and receipt.stat().st_uid == os.getuid()
+          checks.append('verified baseline and exclusive protected receipt creation')
+          before = receipt.read_bytes(), receipt.stat().st_mode
+          provision(data, False)
+          assert (receipt.read_bytes(), receipt.stat().st_mode) == before
+          checks.append('existing receipt refused and preserved')
+          for kind in ['symlink', 'hardlink']:
+              alias_data = migration / kind
+              parent = alias_data / 'ElastOS/SystemServices/Publisher'
+              parent.mkdir(mode=0o700, parents=True)
+              destination = parent / 'publish-state.json'
+              if kind == 'symlink':
+                  destination.symlink_to(baseline)
+              else:
+                  os.link(baseline, destination)
+              provision(alias_data, False)
+              assert baseline.read_bytes() == receipt.read_bytes()
+              checks.append(kind + ' destination refused and public input preserved')
+          writable = migration / 'group-writable-data'
+          writable.mkdir(mode=0o770)
+          writable.chmod(0o770)
+          provision(writable, False)
+          assert not (writable / 'ElastOS').exists()
+          checks.append('writable data parent refused before receipt creation')
+          shutil.rmtree(migration)
+          (root / 'receipts/migration-qualification.json').write_text(json.dumps({
+              'checks': checks, 'all_passed': True, 'isolated_data_removed': True,
+              'old_baseline_online_verified': os.environ['FINALIZE_V2'] != 'true',
+              'runbook_sha256': hashlib.sha256(runbook.encode()).hexdigest(),
+              'operator_gate': 'Anders approves the real seed migration and upgrade/import window.'}, indent=2) + '\n')
           v2_state = 'PROVISIONAL; real signed V1 CIDs required'
           if os.environ['FINALIZE_V2'] == 'true':
               v1 = manifests['unsigned-V1']
