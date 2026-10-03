@@ -4078,6 +4078,151 @@ mod tests {
         assert!(manifest.external.contains_key("archive-manager"));
     }
 
+    fn first_party_provider_manifest_path(root: &Path, name: &str) -> Option<PathBuf> {
+        [
+            root.join("capsules").join(name).join("capsule.json"),
+            root.join("elastos")
+                .join("capsules")
+                .join(name)
+                .join("capsule.json"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    #[test]
+    fn provider_runtime_contract_covers_exact_active_provider_set() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let components: ComponentsManifest =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        let expected = BTreeMap::from([
+            (
+                "browser-engine-adapter".to_string(),
+                "elastos://browser-engine/*".to_string(),
+            ),
+            (
+                "chain-provider".to_string(),
+                "elastos://chain/*".to_string(),
+            ),
+            (
+                "content-block-graph-provider".to_string(),
+                "elastos://block-graph/*".to_string(),
+            ),
+            ("custody-provider".to_string(), "custody".to_string()),
+            ("did-provider".to_string(), "elastos://did/*".to_string()),
+            ("exit-provider".to_string(), "elastos://exit/*".to_string()),
+            ("ipfs-provider".to_string(), "elastos://ipfs/*".to_string()),
+            (
+                "localhost-provider".to_string(),
+                "localhost://*".to_string(),
+            ),
+            (
+                "model-provider".to_string(),
+                "elastos://model/*".to_string(),
+            ),
+            ("media-provider".to_string(), "media".to_string()),
+            ("net-provider".to_string(), "elastos://net/*".to_string()),
+            (
+                "object-provider".to_string(),
+                "elastos://object/*".to_string(),
+            ),
+            (
+                "protected-content-decrypt-provider".to_string(),
+                "protected-content-decrypt".to_string(),
+            ),
+            (
+                "protected-content-protect-provider".to_string(),
+                "protect".to_string(),
+            ),
+            (
+                "wallet-provider".to_string(),
+                "elastos://wallet/meta/status".to_string(),
+            ),
+            (
+                "webspace-provider".to_string(),
+                "localhost://WebSpaces/*".to_string(),
+            ),
+        ]);
+        let actual = components
+            .external
+            .iter()
+            .filter_map(|(name, component)| {
+                component
+                    .provider_runtime
+                    .as_ref()
+                    .map(|runtime| (name.clone(), runtime.provides.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(actual, expected);
+
+        for helper in [
+            "browser-engine-supervisor",
+            "browser-local-exit",
+            "browser-native-proxy-engine",
+            "browser-stream-bridge",
+        ] {
+            let component = components.external.get(helper).unwrap();
+            assert!(component.provider_runtime.is_none(), "{helper}");
+        }
+
+        for (name, provides) in expected {
+            let component = components.external.get(&name).unwrap();
+            let runtime = validate_provider_runtime(&name, component).unwrap();
+            let expected_install_path = format!("bin/{name}");
+            assert_eq!(
+                component.install_path.as_deref(),
+                Some(expected_install_path.as_str())
+            );
+            assert_eq!(runtime.provides, provides);
+            assert_eq!(
+                runtime.runtime_only,
+                matches!(
+                    name.as_str(),
+                    "custody-provider"
+                        | "media-provider"
+                        | "protected-content-decrypt-provider"
+                        | "protected-content-protect-provider"
+                )
+            );
+            if runtime.runtime_only {
+                assert!(first_party_provider_manifest_path(&root, &name).is_none());
+                continue;
+            }
+            let path = first_party_provider_manifest_path(&root, &name).unwrap();
+            let manifest: CapsuleManifest =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(manifest.role, CapsuleRole::Provider);
+            assert_eq!(
+                manifest.provides.as_deref(),
+                Some(runtime.provides.as_str())
+            );
+        }
+
+        for profile in ["agent-local-ai", "full"] {
+            assert!(
+                components
+                    .profiles
+                    .get(profile)
+                    .unwrap()
+                    .components
+                    .iter()
+                    .any(|value| value == "model-provider"),
+                "profile {profile} must install model-provider"
+            );
+        }
+        assert!(
+            !components
+                .profiles
+                .get("public-gateway")
+                .unwrap()
+                .components
+                .iter()
+                .any(|value| value == "model-provider"),
+            "public-gateway must not install model-provider"
+        );
+    }
+
     #[test]
     fn declared_capsule_icons_exist_in_each_manifest_directory() {
         fn check_tree(root: &Path) {
@@ -4108,6 +4253,25 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
         check_tree(&root.join("capsules"));
         check_tree(&root.join("elastos/capsules"));
+        let components: ComponentsManifest =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        for name in ["assistant", "elacity-player"] {
+            let install_path = format!("capsules/{name}");
+            assert_eq!(
+                components.external[name].install_path.as_deref(),
+                Some(install_path.as_str()),
+                "{name} installation follows its capsule directory"
+            );
+            for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+                assert!(
+                    components.profiles[profile]
+                        .components
+                        .iter()
+                        .any(|component| component == name),
+                    "{profile} installs {name}"
+                );
+            }
+        }
     }
 
     #[test]

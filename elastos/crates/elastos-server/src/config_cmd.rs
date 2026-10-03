@@ -173,8 +173,4 @@ mod tests {
             super::updated_config("broken = [", "carrier_bind_addr", "127.0.0.1:61967").is_err()
         );
     }
-
-    use std::path::Path;
-
-    use super::render_config_show;
 }

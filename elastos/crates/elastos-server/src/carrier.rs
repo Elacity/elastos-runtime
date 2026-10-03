@@ -11617,12 +11617,9 @@ pub(crate) mod tests {
             .await
             .expect("fetch reaches the held provider");
         tokio::time::pause();
-        tokio::time::advance(Duration::from_millis(950)).await;
-        assert!(
-            !fetch.is_finished(),
-            "bounded fetch keeps its answer until the route budget"
-        );
-        tokio::time::advance(Duration::from_millis(100)).await;
+        // The budget starts before the real provider readiness signal. Advance
+        // past it, without assuming how much real transport time has elapsed.
+        tokio::time::advance(Duration::from_millis(1_050)).await;
         let completed = tokio::time::timeout(Duration::from_millis(10), fetch).await;
         tokio::time::resume();
         let err = completed

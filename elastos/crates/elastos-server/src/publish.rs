@@ -851,13 +851,6 @@ fn load_capsule_manifests(
     Ok(manifests)
 }
 
-#[cfg(test)]
-fn discover_available_capsules(workspace_root: &Path) -> anyhow::Result<Vec<String>> {
-    Ok(load_capsule_manifests(workspace_root)?
-        .into_keys()
-        .collect::<Vec<_>>())
-}
-
 fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Result<Vec<String>> {
     let mut selected = match profile {
         "home" => DEFAULT_PUBLISH_CAPSULES
@@ -1785,12 +1778,11 @@ fn print_publish_plan(
 mod tests {
     use super::{
         append_publish_selection_args, build_release_ledger_entry, changed_capsules,
-        discover_available_capsules, load_publish_state, publish_profile_capsules,
-        release_discovery_topics, resolve_platform_input_paths, save_publish_state,
-        select_capsules, source_discovery_uri, validate_platform_input_options,
-        validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
-        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
-        DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        load_publish_state, publish_profile_capsules, release_discovery_topics,
+        resolve_platform_input_paths, save_publish_state, select_capsules, source_discovery_uri,
+        validate_platform_input_options, validate_prepare_options, validate_publish_inputs,
+        validate_publishable_manifest, PublishReleaseOptions, PublishState, ReleaseLedgerPlatform,
+        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,

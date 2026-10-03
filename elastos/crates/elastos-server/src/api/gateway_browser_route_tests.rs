@@ -7492,6 +7492,42 @@ async fn test_browser_net_provider_error_status_maps_to_fail_closed_http() {
 }
 
 #[tokio::test]
+async fn test_browser_net_http_hands_validated_request_to_internal_exit_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let app = gateway_router(net_exit_test_state(dir.path()).await);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/provider/net/http")
+                .header("x-elastos-home-token", browser_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.net-request/v1","url":"https://glidefinance.io/","method":"GET","reason":"open browser address"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        payload["data"]["schema"],
+        "elastos.exit.http-fetch.result/v1"
+    );
+    assert_eq!(payload["data"]["backend"], "mock-exit");
+    assert_eq!(payload["data"]["url"], "https://glidefinance.io/");
+    assert_eq!(payload["data"]["body_text"], "mock exit body");
+}
+
+#[tokio::test]
 async fn test_browser_net_stream_provider_route_is_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
@@ -8861,7 +8897,13 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
     // Each lifecycle boundary rejects before another Engine input. Keep the
     // original Runtime service alive to prove replacement, not merely drop.
     let mut replacement = None;
-    for boundary in ["expiry", "revoke", "session", "runtime"] {
+    for boundary in [
+        "expiry",
+        "capability-expiry",
+        "revoke",
+        "session",
+        "runtime",
+    ] {
         let candidate = sessions.create_session(SessionType::Capsule, None).await;
         let request = json!({"schema":"elastos.browser.operator-request/v1",
             "document_generation":"a".repeat(32),"actions":["click"],
@@ -8886,7 +8928,11 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
         )
         .await
         .1;
-        let capability = grant["capability"].as_str().unwrap();
+        let capability = if boundary == "capability-expiry" {
+            _service.expired_capability_fixture(id).await
+        } else {
+            grant["capability"].as_str().unwrap().to_owned()
+        };
         let expected = match boundary {
             "expiry" => {
                 tokio::time::pause();
@@ -8894,6 +8940,7 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
                 tokio::time::resume();
                 StatusCode::FORBIDDEN
             }
+            "capability-expiry" => StatusCode::FORBIDDEN,
             "revoke" => {
                 assert_eq!(
                     owner_operator_request(app.clone(), "DELETE", &decision, &owner).await,
@@ -8918,20 +8965,19 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
         let event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"f".repeat(32),
             "admission_id":id,"document_generation":"a".repeat(32),
             "ref":format!("{}:0","b".repeat(32)),"action":"click"});
-        assert_eq!(
-            operator_request(
-                app.clone(),
-                "POST",
-                &input_uri,
-                &candidate.token,
-                Some(capability),
-                json!({"event":event})
-            )
-            .await
-            .0,
-            expected,
-            "{boundary}"
-        );
+        let refused = operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &candidate.token,
+            Some(&capability),
+            json!({"event":event}),
+        )
+        .await;
+        assert_eq!(refused.0, expected, "{boundary}");
+        if boundary == "capability-expiry" {
+            assert_eq!(refused.1["code"], "operator_capability_rejected");
+        }
         assert_eq!(
             provider.inputs.lock().await.len(),
             before,

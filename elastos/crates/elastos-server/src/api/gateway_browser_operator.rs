@@ -29,6 +29,39 @@ pub(crate) struct BrowserOperatorService {
     snapshots: tokio::sync::Mutex<BTreeMap<String, OperatorSnapshot>>,
 }
 
+#[cfg(test)]
+impl BrowserOperatorService {
+    pub(in crate::api::gateway) async fn expired_capability_fixture(&self, id: &str) -> String {
+        let mut records = self.records.lock().await;
+        let record = records.get_mut(id).expect("approved fixture admission");
+        assert_eq!(record.phase, "active");
+        assert!(record.expires > Instant::now());
+        assert!(record.snapshot.as_ref().unwrap().expires > Instant::now());
+        let token = self.capabilities.grant(
+            record.session.id.as_str(),
+            resource(&record.page_id, id),
+            Action::Write,
+            record.token.as_ref().unwrap().constraints().clone(),
+            Some(SecureTimestamp::at(1)),
+        );
+        assert!(matches!(
+            self.capabilities
+                .validate(
+                    &token,
+                    record.session.id.as_str(),
+                    Action::Write,
+                    &resource(&record.page_id, id),
+                    None,
+                )
+                .await,
+            Err(elastos_runtime::capability::manager::ValidationError::TokenExpired)
+        ));
+        let capability = token.to_base64().unwrap();
+        record.token = Some(token);
+        capability
+    }
+}
+
 #[derive(Clone)]
 struct OperatorSnapshot {
     owner: BrowserInspectionOwner,
