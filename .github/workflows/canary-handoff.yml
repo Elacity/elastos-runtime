@@ -1,0 +1,298 @@
+# Repackage the accepted key-free builder artifact; this job does not rebuild it.
+name: Canary handoff
+
+on:
+  push:
+    branches: [fix/89-canary-inputs]
+    paths: [.github/workflows/canary-handoff.yml, .github/canary-operator-runbook.md]
+  workflow_dispatch:
+    inputs:
+      original_run:
+        description: Accepted canary-inputs run to package
+        default: '37084288629'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: canary-handoff-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: 5814b06b0b5e1f42d05ab60002af9c548ec9d9b2
+  SOURCE_TREE: 72785a23bbed468f3460acbe998e99bb74c55906
+  ORIGINAL_RUN: ${{ inputs.original_run || '37084288629' }}
+  ORIGINAL_WORKFLOW_COMMIT: 9acfb04a31b6d5856cabe3cb3c485c3f0464a571
+  CANARY_DID: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  package:
+    name: authenticate and preserve prepared input modes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: check out trusted source metadata tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: check out this workflow and its operator instructions
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          path: builder
+          persist-credentials: false
+      - name: authenticate, restore modes and package the original artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS" == true/github-hosted/Linux ]]
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          python3 - <<'PY'
+          import gzip, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          repository = 'Elacity/elastos-runtime'
+          run_id = os.environ['ORIGINAL_RUN']
+          assert run_id == '37084288629', 'Original run requires a separately reviewed workflow change'
+          commit, tree = os.environ['SOURCE_COMMIT'], os.environ['SOURCE_TREE']
+          scratch = Path(os.environ['RUNNER_TEMP']) / 'canary-handoff'
+          scratch.mkdir(mode=0o700)
+          root = scratch / 'inputs'
+          root.mkdir(mode=0o700)
+          output = scratch / 'output'
+          output.mkdir(mode=0o700)
+          bound = 8 * 1024**3
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect())
+          def api(path):
+              request = urllib.request.Request('https://api.github.com' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'Elastos-canary-handoff'})
+              return opener.open(request, timeout=60)
+          def api_json(path):
+              with api(path) as reply:
+                  data = reply.read(2 * 1024**2 + 1)
+                  assert len(data) <= 2 * 1024**2
+                  return json.loads(data)
+          run = api_json(f'/repos/{repository}/actions/runs/{run_id}')
+          assert run['id'] == int(run_id) and run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['head_sha'] == os.environ['ORIGINAL_WORKFLOW_COMMIT'] and run['head_branch'] == 'fix/89-canary-inputs'
+          assert run['path'] == '.github/workflows/canary-inputs.yml'
+          name = f"canary-inputs-aarch64-darwin-{commit}-{run['run_attempt']}"
+          listing = api_json(f'/repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+          assert listing['total_count'] <= 100
+          matches = [item for item in listing['artifacts'] if item['name'] == name]
+          assert len(matches) == 1
+          artifact = matches[0]
+          assert artifact['expired'] is False and 0 < artifact['size_in_bytes'] <= bound
+          assert artifact['workflow_run']['id'] == int(run_id)
+          assert artifact['workflow_run']['head_sha'] == run['head_sha']
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest'])
+          archive = scratch / 'original.zip'
+          usage = shutil.disk_usage(scratch)
+          assert (usage.free - artifact['size_in_bytes']) * 100 >= usage.total * 15
+          try:
+              api(f"/repos/{repository}/actions/artifacts/{artifact['id']}/zip")
+              raise ValueError('Expected authenticated artifact download redirect')
+          except urllib.error.HTTPError as reply:
+              assert reply.code == 302
+              location = reply.headers['Location']
+          target = urllib.parse.urlsplit(location)
+          assert target.scheme == 'https' and target.hostname and not target.username and not target.password
+          # The API supplies the signed download URL. Keep API credentials on api.github.com.
+          digest, size = hashlib.sha256(), 0
+          with opener.open(urllib.request.Request(location), timeout=60) as reply, archive.open('xb') as destination:
+              while chunk := reply.read(1024**2):
+                  size += len(chunk)
+                  assert size <= bound and size <= artifact['size_in_bytes']
+                  digest.update(chunk)
+                  destination.write(chunk)
+          assert size == artifact['size_in_bytes'] and 'sha256:' + digest.hexdigest() == artifact['digest']
+          def relative(name):
+              assert isinstance(name, str) and len(name) <= 240 and '\\' not in name
+              parts = name.split('/')
+              assert len(parts) <= 16 and all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', part)
+                                             and part not in ('.', '..') for part in parts)
+              assert not PurePosixPath(name).is_absolute()
+              return name
+          with zipfile.ZipFile(archive) as zipped:
+              members = zipped.infolist()
+              assert 0 < len(members) <= 4096
+              names, total = set(), 0
+              for member in members:
+                  relative(member.filename)
+                  assert member.filename not in names and not member.is_dir()
+                  names.add(member.filename)
+                  mode = member.external_attr >> 16
+                  assert stat.S_IFMT(mode) in (0, stat.S_IFREG), 'Special ZIP member refused'
+                  assert not member.flag_bits & 1 and 0 <= member.file_size <= bound
+                  total += member.file_size
+                  assert total <= bound
+              usage = shutil.disk_usage(scratch)
+              assert (usage.free - 2 * total - len(members) * 1024) * 100 >= usage.total * 15
+              for member in members:
+                  destination = root / member.filename
+                  destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                  count = 0
+                  with zipped.open(member) as source, destination.open('xb') as target:
+                      while chunk := source.read(1024**2):
+                          count += len(chunk)
+                          assert count <= member.file_size
+                          target.write(chunk)
+                  assert count == member.file_size
+          def sha(path):
+              digest = hashlib.sha256()
+              with path.open('rb') as source:
+                  for chunk in iter(lambda: source.read(1024**2), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          sums = root / 'SHA256SUMS'
+          assert sums.stat().st_size <= 1024**2
+          recorded = {}
+          for line in sums.read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+              assert match
+              expected, name = match.groups()
+              relative(name)
+              assert name not in recorded and name != 'SHA256SUMS'
+              recorded[name] = expected
+          assert names == set(recorded) | {'SHA256SUMS'}, 'Complete checksum inventory required'
+          for name, expected in recorded.items():
+              assert sha(root / name) == expected, name
+          def read_json(path):
+              assert path.stat().st_size <= 2 * 1024**2
+              return json.loads(path.read_bytes())
+          build = read_json(root / 'receipts/build.json')
+          assert build['source_commit'] == commit and build['source_tree'] == tree
+          assert build['workflow_commit'] == run['head_sha'] and build['source_clean_before_and_after'] is True
+          assert build['workflow_ref'] == repository + '/.github/workflows/canary-inputs.yml@refs/heads/fix/89-canary-inputs'
+          assert build['run'] == run_id and int(build['attempt']) == run['run_attempt']
+          cleanup = read_json(root / 'receipts/process-cleanup.json')
+          assert cleanup['owned_kubo_stopped'] is True and cleanup['ephemeral_builder_home_removed'] is True
+          # Byte-compare the uncompressed source archive with Git's exact pinned archive.
+          original_source_digest = hashlib.sha256()
+          uncompressed = 0
+          with gzip.open(root / 'source.tar.gz', 'rb') as source:
+              while chunk := source.read(1024**2):
+                  uncompressed += len(chunk)
+                  assert uncompressed <= bound
+                  original_source_digest.update(chunk)
+          reconstructed = hashlib.sha256()
+          with subprocess.Popen(['git', 'archive', '--format=tar', commit], stdout=subprocess.PIPE) as process:
+              for chunk in iter(lambda: process.stdout.read(1024**2), b''):
+                  reconstructed.update(chunk)
+              assert process.wait() == 0
+          assert reconstructed.digest() == original_source_digest.digest(), 'Pinned source archive differs'
+          for path in [root, *root.rglob('*')]:
+              assert not path.is_symlink()
+              path.chmod(0o700 if path.is_dir() else 0o600)
+          spec = importlib.util.spec_from_file_location('native_input', Path('scripts/release-platform-input.py').resolve())
+          native = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = native
+          spec.loader.exec_module(native)
+          for label, version in [('N1', '0.8.0-alpha.1'), ('N2', '0.8.0-alpha.2')]:
+              base = root / label
+              receipt = read_json(base / 'platform-input.json')
+              assert receipt['source']['commit'] == commit and receipt['source']['tree'] == tree
+              assert receipt['platform'] == 'aarch64-darwin' and receipt['version'] == version
+              assert 0 < len(receipt['files']) <= 512
+              assert {path.relative_to(base).as_posix() for path in base.rglob('*') if path.is_file()} == set(receipt['files']) | {'platform-input.json'}
+              for name, record in receipt['files'].items():
+                  relative(name)
+                  path = base / name
+                  assert type(record['executable']) is bool and type(record['size']) is int
+                  assert path.stat().st_size == record['size'] and sha(path) == record['sha256']
+                  path.chmod(0o700 if record['executable'] else 0o600)
+              native.verify(base)
+          assert (root / 'N2/support-input.json').read_bytes() == (root / 'N1/platform-input.json').read_bytes()
+          spec = importlib.util.spec_from_file_location('release_signer', Path('scripts/release-signer.py').resolve())
+          signer = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = signer
+          spec.loader.exec_module(signer)
+          assert sha(root / 'release-signer.py') == sha(Path('scripts/release-signer.py'))
+          for label, version in [('unsigned-V1', '0.8.0-alpha.1'), ('unsigned-V2-PROVISIONAL', '0.8.0-alpha.2')]:
+              base = root / label
+              manifest = signer.parse_json((base / 'signing-input.json').read_bytes())
+              assert manifest['source'] == {'commit': commit, 'tree': tree}
+              assert manifest['version'] == version and manifest['channel'] == 'canary'
+              assert {path.relative_to(base).as_posix() for path in base.rglob('*') if path.is_file()} == set(manifest['files']) | {'signing-input.json'}
+              for name, record in manifest['files'].items():
+                  relative(name)
+                  path = base / name
+                  assert sha(path) == record['sha256'] and path.stat().st_size == record['size']
+              rendered = signer.render_installer(Path('scripts/install.sh').read_bytes(), manifest['installer']['stamps'], os.environ['CANARY_DID'])
+              assert rendered == (root / 'frozen-install.sh').read_bytes()
+              assert signer.sha256(rendered) == manifest['release']['installer_sha256']
+              assert manifest['installer'] == read_json(root / ('receipts/' + label + '-stamps.json'))
+              assert {name: record['cid'] for name, record in manifest['files'].items()} == read_json(root / ('receipts/' + label + '-cids.json'))
+              for path in base.rglob('*'):
+                  if path.is_file():
+                      path.chmod(0o400)
+          assert read_json(root / 'policy-drafts/unsigned-V2-PROVISIONAL.json')['manifest_sha256'] is None
+          runbook = Path(os.environ['GITHUB_WORKSPACE']) / 'builder/.github/canary-operator-runbook.md'
+          assert runbook.is_file() and not runbook.is_symlink()
+          shutil.copyfile(runbook, root / 'operator-runbook.md')
+          (root / 'operator-runbook.md').chmod(0o600)
+          sums.rename(root / 'receipts/original-SHA256SUMS')
+          provenance = {'schema': 'elastos.canary-handoff-receipt/v1', 'original_run': int(run_id),
+                        'original_workflow_commit': run['head_sha'], 'original_artifact_id': artifact['id'],
+                        'original_artifact_name': artifact['name'], 'original_zip_digest': artifact['digest'],
+                        'source_commit': commit, 'source_tree': tree, 'source_archive_git_tar_sha256': reconstructed.hexdigest(),
+                        'native_modes': 'verified receipt executable=true:0700; false:0600; receipt:0600',
+                        'unsigned_modes': 'files:0400; directories:0700', 'native_verification': ['N1', 'N2'],
+                        'support_origin_matches_N1': True, 'frozen_installer_verified': True,
+                        'handoff_workflow_commit': os.environ['GITHUB_SHA'], 'handoff_run': os.environ['GITHUB_RUN_ID'],
+                        'operator_runbook_sha256': sha(runbook), 'V2': 'PROVISIONAL; real signed V1 CIDs required'}
+          (root / 'receipts/handoff.json').write_text(json.dumps(provenance, indent=2) + '\n')
+          files = sorted(path for path in root.rglob('*') if path.is_file())
+          sums.write_text(''.join(sha(path) + '  ' + path.relative_to(root).as_posix() + '\n' for path in files))
+          sums.chmod(0o600)
+          packaged = output / 'canary-handoff.tar.gz'
+          def portable(member):
+              assert member.isdir() or member.isfile()
+              member.uid = member.gid = 0
+              member.uname = member.gname = ''
+              return member
+          with tarfile.open(packaged, 'w:gz', dereference=True) as archive:
+              archive.add(root, arcname='canary-inputs', filter=portable)
+          with tarfile.open(packaged, 'r:gz') as archive:
+              members = archive.getmembers()
+              expected = {'canary-inputs': root, **{'canary-inputs/' + path.relative_to(root).as_posix(): path for path in root.rglob('*')}}
+              assert len(members) == len(expected) and {member.name for member in members} == set(expected)
+              for member in members:
+                  assert member.mode == stat.S_IMODE(expected[member.name].stat().st_mode)
+                  assert member.isdir() or member.isfile()
+                  if member.isfile():
+                      digest = hashlib.sha256()
+                      with archive.extractfile(member) as source:
+                          for chunk in iter(lambda: source.read(1024**2), b''):
+                              digest.update(chunk)
+                      assert digest.hexdigest() == sha(expected[member.name])
+          (output / 'SHA256SUMS').write_text(sha(packaged) + '  ' + packaged.name + '\n')
+          (output / 'handoff-receipt.json').write_text(json.dumps({**provenance, 'tar_sha256': sha(packaged)}, indent=2) + '\n')
+          assert not subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all'])
+          print('Verified original artifact, native modes, frozen installer and completed mode-preserving handoff archive.')
+          PY
+      - name: upload mode-preserving operator handoff
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: canary-handoff-aarch64-darwin-${{ env.SOURCE_COMMIT }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary-handoff/output
+          if-no-files-found: error
+          retention-days: 7
