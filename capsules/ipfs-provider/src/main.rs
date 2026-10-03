@@ -2189,6 +2189,8 @@ mod tests {
         );
         let root = tempfile::tempdir().unwrap();
         let mut provider = IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
