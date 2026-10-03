@@ -2355,3 +2355,79 @@ fn migration_space_refusal_reuses_only_the_exact_current_signed_controller() {
         }
     }
 }
+
+#[tokio::test]
+async fn stopped_home_with_unreconciled_child_record_reports_failure_and_retains_custody() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
+    let (_, request, _) = choice_fixture();
+    let active = fixture.directory.join(ACTIVE_REQUEST);
+    write_private(&active, &request).unwrap();
+    let active_bytes = fs::read(&active).unwrap();
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("60");
+    let owned = child::OwnedChild::spawn(&mut command).unwrap();
+    let pid = owned.pid();
+    let birth = process_start(pid).expect("live owned child has a kernel identity");
+    let generation = "e".repeat(32);
+    let records = fixture
+        .data
+        .join("gateway-owned-runtimes")
+        .join("a".repeat(64));
+    fs::create_dir_all(&records).unwrap();
+    let record = records.join(format!("{pid}.json"));
+    write_private(
+        &record,
+        &json!({"pid":pid, "process_start":birth,
+        "coords_path":fixture.data.join("retained-child-coords.json")}),
+    )
+    .unwrap();
+    let record_bytes = fs::read(&record).unwrap();
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(owned),
+        request: Some(request.clone()),
+        previous_binary_sha256: String::new(),
+        previous_version: request.current_version.clone(),
+        generation: generation.clone(),
+        host_ready: true,
+        carrier: None,
+        carrier_close: None,
+    };
+    let stopped = controller.stop_child().await;
+    assert!(stopped.is_err());
+    assert!(format!("{:#}", stopped.as_ref().unwrap_err()).contains("still need reconciliation"));
+    assert!(!controller.host_ready);
+    assert_eq!(controller.generation, generation);
+    let retained = controller
+        .child
+        .as_ref()
+        .expect("uncertain custody stays with its owner");
+    assert_eq!(retained.pid(), pid);
+    assert!(retained.observed_exit().unwrap().is_some());
+    assert!(child::generation_gone(pid, &birth).unwrap());
+    assert_eq!(fs::read(&record).unwrap(), record_bytes);
+    assert_eq!(fs::read(&active).unwrap(), active_bytes);
+    assert!(controller.publish_ready_result().is_err());
+    // Exercise the same status selector used by serve after a failed apply.
+    controller.publish_apply_result(&stopped).unwrap();
+    let projected = status(&fixture.data).unwrap().unwrap();
+    assert_eq!(projected.phase, "failed");
+    assert_eq!(projected.id.as_deref(), Some(request.id.as_str()));
+    assert!(projected.message.contains("recover"));
+    assert!(!projected.message.contains("ready"));
+    let mut next_request = request;
+    next_request.id = "f".repeat(32);
+    assert!(queue_update(&fixture.data, next_request).is_err());
+    assert!(!fixture.directory.join(REQUEST).exists());
+    assert_eq!(fs::read(&active).unwrap(), active_bytes);
+    // Once the test-owned record is reconciled, retry releases the already reaped host.
+    fs::remove_file(&record).unwrap();
+    controller.stop_child().await.unwrap();
+    assert!(controller.child.is_none());
+    assert!(!controller.host_ready);
+    assert!(controller.generation.is_empty());
+    assert!(child::generation_gone(pid, &birth).unwrap());
+}
