@@ -3121,6 +3121,87 @@ mod tests {
     }
 
     #[test]
+    fn runtime_role_init_preserves_native_environment_roots() {
+        // Child test processes isolate native environment selection from other
+        // tests. Init must preserve that selected root for both Runtime roles.
+        if let Some(expected) = std::env::var_os("ISSUE89_INIT_EXPECTED_ROOT") {
+            let expected = PathBuf::from(expected);
+            for role in ["user", "gateway"] {
+                let mut provider = IpfsProvider::new();
+                assert_eq!(provider.data_dir, expected);
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "op":"init", "config":{"base_path":"", "allowed_paths":[],
+                    "read_only":false, "encryption_key":"",
+                    "extra":{"runtime_host_role":role}}
+                }))
+                .unwrap();
+                assert!(matches!(provider.handle(request), Response::Ok { .. }));
+                assert_eq!(provider.data_dir, expected);
+                assert_eq!(provider.repo_dir, expected.join("ipfs-repo"));
+                assert_eq!(provider.kubo_binary, Some(expected.join("bin/kubo")));
+                assert_eq!(
+                    provider.host_role,
+                    if role == "user" {
+                        HostRole::User
+                    } else {
+                        HostRole::Gateway
+                    }
+                );
+                assert!(provider.initialized);
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let explicit = root.path().join("explicit");
+        let xdg = root.path().join("child-xdg");
+        let home = root.path().join("child-home");
+        for selected in [&parent, &explicit, &xdg.join("elastos")] {
+            fs::create_dir_all(selected.join("bin")).unwrap();
+            fs::create_dir_all(selected.join("ipfs-repo")).unwrap();
+            fs::write(
+                selected.join("bin/kubo"),
+                b"fixture; Init does not execute Kubo",
+            )
+            .unwrap();
+            fs::write(selected.join("ipfs-repo/config"), b"{}\n").unwrap();
+        }
+        for (case, expected, managed_parent) in [
+            ("managed-parent", parent.clone(), parent.clone()),
+            ("explicit", explicit.clone(), parent.clone()),
+            (
+                "xdg",
+                xdg.join("elastos"),
+                root.path().join("absent-parent"),
+            ),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::runtime_role_init_preserves_native_environment_roots",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", &xdg)
+                .env("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR", &managed_parent)
+                .env("ISSUE89_INIT_EXPECTED_ROOT", &expected);
+            if case == "explicit" {
+                child.env("ELASTOS_DATA_DIR", &explicit);
+            }
+            let result = child.output().unwrap();
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn runtime_host_role_defaults_to_user_and_only_gateway_keeps_kubo() {
         for config in [
             serde_json::json!({}),

@@ -10,6 +10,7 @@ use base64::Engine;
 use elastos_runtime::provider;
 
 /// Runtime selects the backend lifetime from its command, before provider Init.
+/// User-role backends retain idle stop; native IPFS root selection stays unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IpfsHostRole {
     #[default]
@@ -17,12 +18,8 @@ pub enum IpfsHostRole {
     Gateway,
 }
 
-pub fn ipfs_provider_config(
-    data_dir: &std::path::Path,
-    role: IpfsHostRole,
-) -> provider::BridgeProviderConfig {
+pub fn ipfs_provider_config(role: IpfsHostRole) -> provider::BridgeProviderConfig {
     provider::BridgeProviderConfig {
-        base_path: data_dir.to_string_lossy().into_owned(),
         extra: serde_json::json!({"runtime_host_role": match role {
             IpfsHostRole::User => "user",
             IpfsHostRole::Gateway => "gateway",
@@ -630,14 +627,19 @@ mod tests {
             (IpfsHostRole::User, "user"),
             (IpfsHostRole::Gateway, "gateway"),
         ] {
-            let config = ipfs_provider_config(std::path::Path::new("/managed-home/elastos"), role);
+            let config = ipfs_provider_config(role);
             let wire =
                 serde_json::to_value(provider::bridge::ProviderRequest::Init { config }).unwrap();
             assert_eq!(
                 wire["config"]["extra"],
                 serde_json::json!({"runtime_host_role":value})
             );
-            assert_eq!(wire["config"]["base_path"], "/managed-home/elastos");
+            let mut expected =
+                serde_json::to_value(provider::BridgeProviderConfig::default()).unwrap();
+            expected["extra"] = serde_json::json!({"runtime_host_role":value});
+            assert_eq!(wire["config"], expected);
+            assert_eq!(wire["config"]["base_path"], "");
+            assert!(wire["config"]["extra"].get("data_dir").is_none());
             assert!(wire["config"].get("runtime_host_role").is_none());
         }
     }

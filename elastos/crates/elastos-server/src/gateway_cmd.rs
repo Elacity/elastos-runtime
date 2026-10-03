@@ -379,7 +379,7 @@ async fn register_installed_ipfs_provider(
         .unregister_sub_provider("ipfs")
         .await
         .map_err(|error| anyhow::anyhow!("Failed to retire existing IPFS provider: {error}"))?;
-    let config = crate::ipfs::ipfs_provider_config(data_dir, crate::ipfs::IpfsHostRole::Gateway);
+    let config = crate::ipfs::ipfs_provider_config(crate::ipfs::IpfsHostRole::Gateway);
     let bridge = provider::ProviderBridge::spawn(&ipfs_binary, config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
@@ -676,7 +676,8 @@ for line in sys.stdin:
             assert_eq!(receipt.lines().count(), 1);
             let init: serde_json::Value = serde_json::from_str(&receipt).unwrap();
             assert_eq!(init["op"], "init");
-            assert_eq!(init["config"]["base_path"].as_str(), root.path().to_str());
+            assert_eq!(init["config"]["base_path"], "");
+            assert!(init["config"]["extra"].get("data_dir").is_none());
             assert_eq!(
                 init["config"]["extra"],
                 serde_json::json!({"runtime_host_role":"gateway"})

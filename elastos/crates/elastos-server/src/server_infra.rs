@@ -481,7 +481,6 @@ pub(crate) async fn register_ipfs_provider_plane(
     register_ipfs_provider_plane_with_role(
         provider_registry,
         binary_path,
-        &default_data_dir(),
         elastos_server::ipfs::IpfsHostRole::User,
     )
     .await
@@ -490,10 +489,9 @@ pub(crate) async fn register_ipfs_provider_plane(
 async fn register_ipfs_provider_plane_with_role(
     provider_registry: &Arc<provider::ProviderRegistry>,
     binary_path: &Path,
-    data_dir: &Path,
     role: elastos_server::ipfs::IpfsHostRole,
 ) -> anyhow::Result<()> {
-    let config = elastos_server::ipfs::ipfs_provider_config(data_dir, role);
+    let config = elastos_server::ipfs::ipfs_provider_config(role);
     let bridge = provider::ProviderBridge::spawn(binary_path, config)
         .await
         .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
@@ -1013,17 +1011,13 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match register_ipfs_provider_plane_with_role(
-            &provider_registry,
-            &path,
-            &data_dir,
-            ipfs_role,
-        )
-        .await
-        {
-            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
-            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
-        },
+        Ok(Some(path)) => {
+            match register_ipfs_provider_plane_with_role(&provider_registry, &path, ipfs_role).await
+            {
+                Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
+                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+            }
+        }
         Ok(None) => {
             tracing::warn!(
                 "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
