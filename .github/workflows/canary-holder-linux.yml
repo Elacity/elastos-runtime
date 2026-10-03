@@ -579,7 +579,7 @@ jobs:
           provider_build = json.loads((output / 'provider-build.json').read_bytes())
           frozen = json.loads(Path('components.json').read_bytes())
           entry = frozen['external']['ipfs-provider']
-          entry['platforms'] = {'linux-amd64': {**entry['platforms']['linux-amd64'],
+          entry['platforms'] = {'linux-amd64': {'install_path': 'bin/ipfs-provider',
               'checksum': 'sha256:' + provider_build['sha256'], 'size': provider_build['size']}}
           assert entry['provider_runtime']['role'] == 'provider'
           assert entry['provider_runtime']['substrate'] == 'native'
@@ -588,6 +588,8 @@ jobs:
           (package / 'installed-component.json').write_text(json.dumps({'name': 'ipfs-provider', 'entry': entry,
               'source_commit': provider_build['source_commit'], 'source_tree': provider_build['source_tree'],
               'runtime_source_commit': os.environ['SOURCE_COMMIT'], 'runtime_source_tree': os.environ['SOURCE_TREE'],
+              'management': 'operator-managed-local-overlay',
+              'provider_build_sha256': hashlib.sha256((output / 'provider-build.json').read_bytes()).hexdigest(),
               'operator_gate': 'Preserve existing manifest fields; replace only the linux-amd64 IPFS binary pin after approval.'}, indent=2) + '\n')
           shutil.copyfile(output / 'holder-idle.json', package / 'holder-idle.json')
           shutil.copyfile(output / 'accepted-build.json', package / 'accepted-build.json')
