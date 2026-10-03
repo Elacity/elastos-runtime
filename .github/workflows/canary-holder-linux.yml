@@ -331,6 +331,7 @@ jobs:
               coord = json.loads(coord_path.read_bytes())
               before = child_identity(coord['kubo_pid'])
               assert before['exe'] == str(data / 'bin/kubo')
+              initial_stops = len(re.findall(r'Kubo idle for [0-9]+s \(threshold 600s\), stopping', processes.text(log_label, 'stderr')))
               aged = {**coord, 'last_used': int(time.time()) - 601}
               # The fixture changes only its clock input. The production watcher
               # owns SIGTERM, coordination cleanup and the next cycle.
@@ -339,7 +340,6 @@ jobs:
               temporary.chmod(0o600)
               temporary.replace(coord_path)
               started, deadline = time.monotonic(), time.monotonic() + 75
-              initial_stops = len(re.findall(r'Kubo idle for [0-9]+s \(threshold 600s\), stopping', processes.text(log_label, 'stderr')))
               while time.monotonic() < deadline:
                   assert owner.poll() is None and child_identity(identity['pid']) == identity
                   if not coord_path.exists():
