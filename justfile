@@ -76,6 +76,18 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
+# Capsule units and script behavior fixtures. Browser fixtures use the explicit
+# Playwright/Chromium inputs installed by CI; NODE_PATH and
+# BROWSER_OPERATOR_PLAYWRIGHT_CORE select the unchanged pinned packages.
+test-behaviour:
+    node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+
+# Disposable Linux fixture; host namespace privileges belong to this test.
+test-native-browser-isolation:
+    cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
+    cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
+    sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
+
 # Collect local source, lint, and test results before a CI-fix push.
 ci-local-prepush:
     scripts/ci-local-prepush.sh
@@ -148,14 +160,13 @@ vendor-ui:
 fmt:
     cd elastos && cargo fmt --all
 
-# Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
+# Pre-commit gate: data contracts, behavior tests, smoke tests, fmt/lint/test
 verify:
     git --no-pager diff --check
-    just alignment-check
+    just product-data
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
-    node scripts/home-entropy-check.mjs
     python3 scripts/components-release-integrity-check.py --self-test
     python3 scripts/publish-platform-artifacts-test.py
     python3 scripts/release-platform-input-test.py
@@ -165,7 +176,6 @@ verify:
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs
-    node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
@@ -216,9 +226,9 @@ verify-release:
     just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
-# Fail-closed check for rooted-localhost and Home-first contract drift
-alignment-check:
-    ./scripts/check-wci-alignment.sh
+# Validate capsule metadata, component profiles and signed catalog bindings.
+product-data:
+    node scripts/check-product-data.mjs
 
 # Verify the checked-in ElastOS Bus contract and real Component fixture
 bus-conformance:

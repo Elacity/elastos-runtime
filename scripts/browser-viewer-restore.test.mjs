@@ -311,14 +311,15 @@ test('a restore callback cannot change a later owner failure policy', async () =
   await h.state.settleRemoteDisplayFailure('new acquisition failure'); assert.equal(h.failures.length, 1);
 });
 
-for (const owned of [true, false]) test(`actual startup selects ${owned ? 'restore' : 'fresh open'} from Runtime ownership`, async () => {
+for (const owned of [true, false]) for (const requestedUrl of ['', 'https://requested.invalid/']) test(
+  `actual startup selects ${owned ? 'restore' : requestedUrl ? 'fresh open' : 'address entry'} from Runtime ownership with ${requestedUrl ? 'a launch URL' : 'an empty route'}`, async () => {
   const h = harness(), value = summary(), opens = [];
   if (!owned) value.sessions.recoverable_page = null;
-  Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+  Object.assign(h.state, { params: new URLSearchParams(requestedUrl ? { url: requestedUrl } : {}), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
     fetchBrowserSummary: async () => value, requestRuntimeOpen: async url => opens.push(url),
     isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
-  assert.deepEqual(opens, owned ? [] : ['https://default.invalid/']);
+  assert.deepEqual(opens, owned || !requestedUrl ? [] : [requestedUrl]);
 });
 
 test('summary authority failure reaches startup renewal without a replacement open', async () => {
