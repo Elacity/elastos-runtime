@@ -224,8 +224,8 @@ def main():
         kubo_identity = identity(before["kubo_pid"])
         assert kubo_identity["exe"] == str(data / "bin/kubo")
         started = time.monotonic()
-        # Observe local process/coord state only. Send no provider, HTTP, Carrier
-        # or preparation requests until the first post-idle content fetch.
+        # During the full idle interval, observe local process/coord state only.
+        # Send no provider, HTTP, Carrier or preparation requests.
         while time.monotonic() - started < 665:
             assert holder.poll() is None and consumer.poll() is None
             assert identity(holder.pid) == holder_identity and identity(consumer.pid) == consumer_identity
@@ -238,6 +238,22 @@ def main():
         assert idle_coord == before
         assert idle_elapsed > 600 and int(time.time()) - before["last_used"] > 600
         assert "Kubo idle for" not in processes.text("always-on-holder", "stderr")
+        # Frozen serve reaps attach sessions idle >600s on a 60s timer. Refresh
+        # only the consumer's local authorization after the real idle interval;
+        # the holder's first operation remains the single Carrier content read.
+        fresh_auth = attach(consumer_data, consumer, "runtime-coords.json", "operator")
+        assert fresh_auth[0] == consumer_auth[0] and fresh_auth[1] != consumer_auth[1]
+        consumer_auth = fresh_auth
+        assert identity(consumer.pid) == consumer_identity
+        assert identity(holder.pid) == holder_identity
+        assert identity(provider_identity["pid"]) == provider_identity
+        assert identity(kubo_identity["pid"]) == kubo_identity
+        assert json.loads(coord_path.read_bytes()) == before, "consumer attach changed holder coordinates"
+        result["consumer_authorization"] = {
+            "refresh": "consumer-only local /api/auth/attach after the idle interval",
+            "reason": "frozen serve removes attach sessions idle >600s on a 60s cleanup timer",
+            "idle_limit_seconds": 600, "cleanup_interval_seconds": 60,
+            "holder_coordinates_unchanged": True, "consumer_generation_unchanged": True}
         request_started = time.monotonic()
         payload = carrier_fetch(consumer_auth, cids[1], accepted / "elastos")
         elapsed = time.monotonic() - request_started
