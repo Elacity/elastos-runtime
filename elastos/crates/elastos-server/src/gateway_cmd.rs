@@ -372,7 +372,8 @@ async fn register_installed_ipfs_provider(
         )
     })?;
 
-    let bridge = provider::ProviderBridge::spawn(&ipfs_binary, Default::default())
+    let config = crate::ipfs::ipfs_provider_config(data_dir, crate::ipfs::IpfsHostRole::Gateway);
+    let bridge = provider::ProviderBridge::spawn(&ipfs_binary, config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -535,6 +536,26 @@ mod tests {
     use tokio::sync::Mutex;
 
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn browser_home_public_mode_refuses_before_provider_setup() {
+        async fn forbidden_setup() -> anyhow::Result<GatewayControlPlane> {
+            panic!("Browser Home must refuse public mode before provider setup")
+        }
+        let error = run_gateway_direct_with_ready(
+            "127.0.0.1:8090".into(),
+            true,
+            None,
+            None,
+            forbidden_setup,
+            Some(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Home browser launch requires a local gateway"));
+    }
 
     struct MockContentProvider {
         requests: Mutex<Vec<serde_json::Value>>,
