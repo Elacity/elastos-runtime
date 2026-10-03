@@ -1107,10 +1107,13 @@ def cli_admit_home_support(root, manifest):
     need(set(fixture) == {"entrypoint", "files"}
          and fixture["entrypoint"] == "capsules/home/browser/index.html", "initial Home fixture differs")
     mapping = manifest["consumer"]["files"]
-    expected = {target for target in mapping if target.startswith("capsules/home/") or target in ("bin/localhost-provider", "fixture-tools/open")}
-    need(fixture["files"] == sorted(expected) and "bin/localhost-provider" in expected
+    native_paths = {"bin/ipfs-provider", "bin/kubo", "bin/localhost-provider"}
+    expected = {target for target in mapping if target.startswith("capsules/home/") or target in native_paths or target == "fixture-tools/open"}
+    need(fixture["files"] == sorted(expected) and native_paths <= expected
          and "fixture-tools/open" in expected and "capsules/home/capsule.json" in expected and fixture["entrypoint"] in expected,
          "initial Home support closure is incomplete")
+    need(all(any(target == path or target.startswith(path + "/") for path in manifest["preserve"]["support"])
+             for target in native_paths), "initial Home native support preservation is incomplete")
     components = cli_json(cli_path(root, manifest["publications"]["old"]["components"]))
     entry = components["capsules"]["home"]
     need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
@@ -1125,13 +1128,15 @@ def cli_admit_home_support(root, manifest):
                "size": manifest["files"][mapping[target]]["bytes"]}
               for target in sorted(expected) if target.startswith("capsules/home/browser/")]
     need(entry["browser_assets"] == assets, "signed Home browser closure differs from the inventory")
-    native = manifest["files"][mapping["bin/localhost-provider"]]
     platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
-    descriptor = components["external"]["localhost-provider"]
-    selected = descriptor["platforms"][platform_name]
-    need(selected["checksum"] == "sha256:" + native["sha256"] and selected["cid"] == native["cid"]
-         and selected.get("install_path", descriptor.get("install_path")) == "bin/localhost-provider"
-         and native["mode"] & 0o111, "signed localhost provider differs from the inventory")
+    for target in sorted(native_paths):
+        native = manifest["files"][mapping[target]]
+        descriptor = components["external"][Path(target).name]
+        selected = descriptor["platforms"][platform_name]
+        need(selected["checksum"] == "sha256:" + native["sha256"] and selected["cid"] == native["cid"]
+             and selected["size"] == native["bytes"]
+             and selected.get("install_path", descriptor.get("install_path")) == target
+             and native["mode"] & 0o111, "signed native Home support differs from the inventory")
     opener = manifest["files"][mapping["fixture-tools/open"]]
     need(opener["mode"] == 0o700, "initial Home opener ownership mode differs")
     for target in expected:
@@ -1244,7 +1249,10 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
         content(catalogue, raw=True)
         qualified = cli_json(support_home / "components.json")
         opener = add("home-opener", Path("/usr/bin/true"), 0o700)
-        home_mapping = {"bin/localhost-provider": localhost_relative, "fixture-tools/open": opener}
+        home_mapping = {"bin/ipfs-provider": provider_relative, "bin/kubo": kubo_relative,
+                        "bin/localhost-provider": localhost_relative, "fixture-tools/open": opener}
+        content(provider_relative)
+        content(kubo_relative)
         content(localhost_relative)
         content(opener)
         for path in home_paths:
@@ -1261,6 +1269,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
             # the installed executable bytes and exposes only local Carrier content.
             external[name] = {"install_path": "bin/" + name, "platforms": {component_platform: {
                 "checksum": "sha256:" + manifest["files"][relative]["sha256"],
+                "cid": manifest["files"][relative]["cid"],
                 "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name}}}
             if "provider_runtime" in descriptor:
                 external[name]["provider_runtime"] = descriptor["provider_runtime"]
@@ -1330,7 +1339,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
                                            "capsules/sentinel/data": add("consumer/support", b"preserve support")}}
         manifest["consumer"]["files"].update(home_mapping)
         manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(home_mapping)}
-        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", "bin/localhost-provider", "fixture-tools"]}
+        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]}
         write(root / "manifest.json", manifest)
         config = {"schema": manifest["schema"], "mode": CLI_MODE, "root": str(root),
                   "immutable": {"reference": manifest["reference"], "manifest": "manifest.json", "sha256": digest(root / "manifest.json")}}

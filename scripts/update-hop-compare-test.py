@@ -926,16 +926,20 @@ class CliFixtureTests(unittest.TestCase):
                  "entrypoint_sha256": "sha256:" + observer.digest(document), "entrypoint_size": document.stat().st_size,
                  "platforms": ["darwin-arm64"], "browser_assets": [{"path": path.relative_to(capsule).as_posix(),
                  "sha256": "sha256:" + observer.digest(path), "size": path.stat().st_size} for path in sorted((capsule / "browser").rglob("*")) if path.is_file()]}
-        observer.write(support / "components.json", {"capsules": {"home": entry}, "external": {name: {
+        registry = {"capsules": {"home": entry}, "external": {name: {
             "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
-            for name in ("ipfs-provider", "kubo", "localhost-provider")}})
+            for name in ("ipfs-provider", "kubo", "localhost-provider")}}
+        for name, provides in (("ipfs-provider", "elastos://ipfs/*"), ("localhost-provider", "localhost://*")):
+            registry["external"][name]["provider_runtime"] = {"role": "provider", "substrate": "native",
+                "runtime_abi": "elastos.provider-stdio/v1", "execution": "native-provider", "provides": provides}
+        observer.write(support / "components.json", registry)
         return support
 
     def initial_home_fixture(self, home_url="http://localhost:8090/home/"):
         support = self.qualified_home_support()
-        entry, paths, descriptor = observer.cli_qualified_home(support, "darwin-arm64")
+        entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
         mapping = {}
-        for path in [support / "bin/localhost-provider", *paths]:
+        for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
             target = path.relative_to(support).as_posix()
             mapping[target] = self.add("initial/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
         mapping["fixture-tools/open"] = self.add("initial/opener", b"fixture no-op utility", 0o700)
@@ -943,12 +947,15 @@ class CliFixtureTests(unittest.TestCase):
         for relative in mapping.values():
             self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
         self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
+        self.manifest["preserve"]["support"] = ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]
         components_path = self.root / self.manifest["publications"]["old"]["components"]
         components = observer.cli_json(components_path)
         components["capsules"]["home"] = entry
-        native = self.manifest["files"][mapping["bin/localhost-provider"]]
-        selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/localhost-provider"}
-        components["external"]["localhost-provider"] = {**descriptor, "platforms": {"darwin-arm64": selected}}
+        qualified = observer.cli_json(support / "components.json")
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            native = self.manifest["files"][mapping["bin/" + name]]
+            selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/" + name}
+            components["external"][name] = {**qualified["external"][name], "platforms": {"darwin-arm64": selected}}
         observer.write(components_path, components)
         home = self.root / "initial-home"
         home.mkdir()
@@ -1022,6 +1029,37 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(proof["home_sha256"], observer.digest(directory / self.manifest["initial_home"]["entrypoint"]))
         self.assertNotIn("attach_secret", json.dumps(proof))
         self.assertNotIn("private fixture token", json.dumps(proof))
+
+    def test_initial_home_admission_requires_signed_native_support_and_preservation(self):
+        self.initial_home_fixture()
+        observer.cli_admit_home_support(self.root, self.manifest)
+        for target in ("bin/ipfs-provider", "bin/kubo"):
+            for refusal in ("missing", "substituted", "nonexecutable", "unpreserved"):
+                with self.subTest(target=target, refusal=refusal):
+                    changed = json.loads(json.dumps(self.manifest))
+                    if refusal == "missing":
+                        del changed["consumer"]["files"][target]
+                        changed["initial_home"]["files"].remove(target)
+                    elif refusal == "substituted":
+                        changed["consumer"]["files"][target] = changed["consumer"]["files"]["bin/localhost-provider"]
+                    elif refusal == "nonexecutable":
+                        changed["files"][changed["consumer"]["files"][target]]["mode"] = 0o600
+                    else:
+                        changed["preserve"]["support"].remove(target)
+                    with self.assertRaisesRegex(ValueError, "support.*incomplete|signed native Home support"):
+                        observer.cli_admit_home_support(self.root, changed)
+
+    def test_initial_home_snapshot_preserves_ipfs_provider_and_kubo_bytes(self):
+        home, directory, _, _, _, _, _ = self.initial_home_fixture()
+        before = observer.cli_home_snapshot(self.manifest, home)
+        for target in ("bin/ipfs-provider", "bin/kubo"):
+            with self.subTest(target=target):
+                path = directory / target
+                original = path.read_bytes()
+                self.assertEqual(before["preserved"]["support"][target], {".": observer.digest(path)})
+                path.write_bytes(b"changed signed support")
+                self.assertNotEqual(observer.cli_home_snapshot(self.manifest, home), before)
+                path.write_bytes(original)
 
     def test_initial_home_refuses_substituted_signed_receipt_or_child_generation(self):
         home, directory, process, status, identities, executables, response = self.initial_home_fixture()
@@ -1306,6 +1344,24 @@ class CliFixtureTests(unittest.TestCase):
         catalogue_path.write_bytes(original_catalogue)
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
         components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
+        qualified = observer.cli_json(support / "components.json")
+        consumer_data = generated / "copied-consumer" / observer.CLI_DATA
+        observer.cli_copy(generated, generated_manifest, generated_manifest["consumer"]["files"], consumer_data)
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            target = "bin/" + name
+            relative = generated_manifest["consumer"]["files"][target]
+            binding = generated_manifest["files"][relative]
+            if name != "localhost-provider":
+                self.assertEqual(generated_manifest["holder"]["files"][observer.CLI_DATA + "/" + target], relative)
+            self.assertEqual(observer.digest(consumer_data / target), binding["sha256"])
+            self.assertTrue((consumer_data / target).stat().st_mode & 0o111)
+            self.assertIn(target, generated_manifest["preserve"]["support"])
+            selected = components["external"][name]["platforms"]["darwin-arm64"]
+            self.assertEqual(selected["checksum"], "sha256:" + binding["sha256"])
+            self.assertEqual(selected["size"], binding["bytes"])
+            self.assertEqual(selected["cid"], binding["cid"])
+            if "provider_runtime" in qualified["external"][name]:
+                self.assertEqual(components["external"][name]["provider_runtime"], qualified["external"][name]["provider_runtime"])
         self.assertEqual(components["capsules"]["home"], observer.cli_json(support / "components.json")["capsules"]["home"])
         self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
                             for target in generated_manifest["initial_home"]["files"]))
@@ -1542,6 +1598,44 @@ class CliFixtureTests(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = observer.cli_run(self.config, self.root / "results")
         return code, calls, observer.read(self.root / "results/result.json")
+
+    def test_runner_registers_copied_native_support_before_initial_home_and_cleans_orphans(self):
+        for name in ("ipfs-provider", "kubo"):
+            target = "bin/" + name
+            self.manifest["consumer"]["files"][target] = self.manifest["holder"]["files"][observer.CLI_DATA + "/" + target]
+            self.manifest["preserve"]["support"].append(target)
+        self.manifest["initial_home"] = {"files": []}
+        self.freeze()
+        owned_roots = {}
+        def initial_home(manager, manifest, home, evidence):
+            for name in ("ipfs-provider", "kubo"):
+                target = "bin/" + name
+                path = str(home / observer.CLI_DATA / target)
+                expected = manifest["files"][manifest["consumer"]["files"][target]]["sha256"]
+                self.assertEqual(manager.roots[path], {expected})
+                self.assertEqual(observer.digest(Path(path)), expected)
+                owned_roots[path] = manager.roots[path]
+            return {**evidence, "status": "passed"}
+        with patch.object(observer, "cli_initial_home", side_effect=initial_home) as initial:
+            code, _, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        initial.assert_called_once()
+        manager = observer.CliProcesses(self.root)
+        manager.roots.update(owned_roots)
+        rows = []
+        for index, path in enumerate(owned_roots):
+            pid = 32000 + index * 2
+            rows.extend(({"pid": pid, "parent": 1, "group": pid, "command": path},
+                         {"pid": pid + 1, "parent": pid, "group": pid, "command": "/usr/bin/owned-child"}))
+        expected_pids = {row["pid"] for row in rows}
+        def stop(pid, sig):
+            rows[:] = [row for row in rows if row["pid"] != pid]
+        with patch.object(observer, "cli_census", side_effect=lambda: list(rows)), \
+             patch.object(observer.os, "kill", side_effect=stop) as pids, patch.object(observer.time, "sleep"):
+            cleanup = manager.cleanup()
+        self.assertEqual({call.args[0] for call in pids.call_args_list}, expected_pids)
+        self.assertEqual(cleanup["remaining_pids"], [])
+        self.assertFalse(cleanup["errors"])
 
     def test_actual_runner_orders_fresh_install_plain_check_apply_repeat_and_all_refusals(self):
         code, calls, result = self.fake_run()
