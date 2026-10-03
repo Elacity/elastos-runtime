@@ -88,7 +88,7 @@ with conn:
     conn.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
-        b"Content-Length: 28\r\n"
+        b"Content-Length: 27\r\n"
         b"Connection: close\r\n\r\n"
         b"native-supervisor-proxy-ok\n"
     )
@@ -238,7 +238,6 @@ print(json.dumps({
         "stream_id": "stream:native-supervisor-proxy-smoke",
     },
     "display_mode": "native_surface",
-    "guarantee_level": "policy_webview",
     "wallet": {},
     "viewport": {"width": 1280, "height": 720},
 }))
