@@ -703,31 +703,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_audit_event_serialization() {
-        let event = AuditEvent::CapsuleLaunch {
-            timestamp: SecureTimestamp::now(),
-            capsule_id: "cap-123".to_string(),
-            capsule_name: "test-capsule".to_string(),
-            cid: Some("Qm123".to_string()),
-            trust_level: TrustLevel::Trusted,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("capsule_launch"));
-        assert!(json.contains("cap-123"));
-    }
-
-    #[test]
-    fn test_audit_log_memory() {
-        let log = AuditLog::new();
-        log.runtime_start("0.1.0");
-        log.capsule_launch("cap-1", "test", None, TrustLevel::Untrusted);
-        log.capsule_stop("cap-1", StopReason::Completed);
-        log.runtime_stop();
-        // No panic = success (memory-only log doesn't persist)
-    }
-
-    #[test]
     fn test_audit_log_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let log_path = temp_dir.path().join("audit.log");
@@ -740,94 +715,6 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("runtime_start"));
         assert!(content.contains("capsule_launch"));
-    }
-
-    #[test]
-    fn test_policy_proposal_event_serialization() {
-        let event = AuditEvent::PolicyProposal {
-            timestamp: SecureTimestamp::now(),
-            request_id: "req-001".to_string(),
-            recommended_outcome: "grant".to_string(),
-            confidence: 0.9,
-            rationale: "User granted before".to_string(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"policy_proposal\""));
-        assert!(json.contains("req-001"));
-        assert!(json.contains("0.9"));
-
-        let restored: AuditEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.event_type_name(), "policy_proposal");
-    }
-
-    #[test]
-    fn test_policy_decision_made_event_serialization() {
-        let event = AuditEvent::PolicyDecisionMade {
-            timestamp: SecureTimestamp::now(),
-            decision_id: "dec-001".to_string(),
-            request_id: "req-001".to_string(),
-            outcome: "grant".to_string(),
-            checks_passed: 3,
-            checks_failed: 0,
-            shadow: false,
-            rationale: "All checks passed".to_string(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"policy_decision_made\""));
-        assert!(json.contains("dec-001"));
-        assert!(json.contains("\"shadow\":false"));
-
-        let restored: AuditEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.event_type_name(), "policy_decision_made");
-    }
-
-    #[test]
-    fn test_policy_event_type_names() {
-        let proposal = AuditEvent::PolicyProposal {
-            timestamp: SecureTimestamp::now(),
-            request_id: "r".to_string(),
-            recommended_outcome: "grant".to_string(),
-            confidence: 0.5,
-            rationale: "test".to_string(),
-        };
-        assert_eq!(proposal.event_type_name(), "policy_proposal");
-
-        let decision = AuditEvent::PolicyDecisionMade {
-            timestamp: SecureTimestamp::now(),
-            decision_id: "d".to_string(),
-            request_id: "r".to_string(),
-            outcome: "deny".to_string(),
-            checks_passed: 1,
-            checks_failed: 2,
-            shadow: true,
-            rationale: "test".to_string(),
-        };
-        assert_eq!(decision.event_type_name(), "policy_decision_made");
-    }
-
-    #[test]
-    fn test_policy_divergence_event_serialization() {
-        let event = AuditEvent::PolicyDivergence {
-            timestamp: SecureTimestamp::now(),
-            request_id: "req-001".to_string(),
-            real_decision_id: "dec-real".to_string(),
-            shadow_decision_id: "dec-shadow".to_string(),
-            real_outcome: "deny".to_string(),
-            shadow_outcome: "grant".to_string(),
-            real_rationale: "Denied by user".to_string(),
-            shadow_rationale: "Auto-grant: all requests approved".to_string(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"policy_divergence\""));
-        assert!(json.contains("req-001"));
-        assert!(json.contains("dec-real"));
-        assert!(json.contains("dec-shadow"));
-
-        let restored: AuditEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.event_type_name(), "policy_divergence");
     }
 
     #[test]

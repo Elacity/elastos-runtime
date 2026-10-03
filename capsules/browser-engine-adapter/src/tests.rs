@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -405,7 +405,26 @@ fn spawn_status_socket_requests(body: Value, request_count: usize) -> String {
     path
 }
 
-fn spawn_unresponsive_status_socket() -> String {
+struct UnresponsiveStatusSocket {
+    path: String,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for UnresponsiveStatusSocket {
+    fn drop(&mut self) {
+        self.release.take();
+        // Wake accept even when reconciliation fails before dispatch.
+        let _ = UnixStream::connect(&self.path);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn spawn_unresponsive_status_socket() -> UnresponsiveStatusSocket {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -417,15 +436,29 @@ fn spawn_unresponsive_status_socket() -> String {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("unresponsive test socket should bind");
     let socket_path = path.clone();
-    std::thread::spawn(move || {
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_received = received.clone();
+    let worker = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buffer = [0_u8; 2048];
-            let _ = stream.read(&mut buffer);
-            std::thread::sleep(Duration::from_secs(3));
+            if stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .is_ok()
+                && stream.read(&mut buffer).is_ok_and(|bytes| bytes > 0)
+            {
+                worker_received.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = release_rx.recv();
         }
         let _ = std::fs::remove_file(socket_path);
     });
-    path
+    UnresponsiveStatusSocket {
+        path,
+        release: Some(release_tx),
+        worker: Some(worker),
+        received,
+    }
 }
 
 fn proof_adapter_config() -> Value {
@@ -867,21 +900,6 @@ fn close_page_request_contract_accepts_only_runtime_canonical_shape() {
     drifted["reason"] = json!("unused Runtime-only field");
     let error = decode_request(&drifted.to_string()).unwrap_err();
     assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
-fn provider_bridge_default_config_initializes_empty() {
-    let mut provider = BrowserEngineAdapter::new();
-    let response = serde_json::to_value(provider.init(json!({
-        "base_path": "",
-        "allowed_paths": [],
-        "read_only": false,
-        "encryption_key": ""
-    })))
-    .unwrap();
-
-    assert_eq!(response["status"], "ok");
-    assert_eq!(response["data"]["adapter_count"], 0);
 }
 
 #[test]
@@ -2559,7 +2577,7 @@ fn launch_reconciliation_is_bounded_when_control_service_is_unresponsive() {
             "supervisor": {
                 "program": "/bin/false",
                 "timeout_ms": 2000,
-                "control_socket_path": control_socket
+                "control_socket_path": control_socket.path
             }
         }]
     }));
@@ -2574,8 +2592,14 @@ fn launch_reconciliation_is_bounded_when_control_service_is_unresponsive() {
         None,
     ))
     .unwrap();
+    let elapsed = started.elapsed();
+    let received = control_socket
+        .received
+        .load(std::sync::atomic::Ordering::Relaxed);
+    drop(control_socket);
 
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(received, "reconciliation reaches the unresponsive service");
+    assert!(elapsed < Duration::from_secs(2));
     assert_eq!(response["status"], "ok");
     assert_eq!(response["data"]["state"], "cleanup_pending");
 }

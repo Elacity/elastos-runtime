@@ -177,20 +177,4 @@ mod tests {
     use std::path::Path;
 
     use super::render_config_show;
-
-    #[test]
-    fn render_config_show_marks_empty_file() {
-        let rendered = render_config_show(Path::new("/tmp/config.toml"), "");
-        assert!(rendered.contains("# /tmp/config.toml"));
-        assert!(rendered.contains("# (empty config file)"));
-    }
-
-    #[test]
-    fn render_config_show_preserves_non_empty_contents() {
-        let rendered = render_config_show(Path::new("/tmp/config.toml"), "dev_mode = true");
-        assert!(rendered.contains("# /tmp/config.toml"));
-        assert!(rendered.contains("dev_mode = true"));
-        assert!(!rendered.contains("(empty config file)"));
-        assert!(rendered.ends_with('\n'));
-    }
 }

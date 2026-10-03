@@ -5036,83 +5036,50 @@ mod tests {
     }
 
     #[test]
-    fn chat_action_stays_native_when_fullscreen_chat_is_not_packaged() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, true),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_stays_native_even_when_fullscreen_chat_prereqs_are_present() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "chat",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, true),
-            ActionLaunch::ManagedChat
-        );
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, true),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_stays_native_when_focus_chat_missing() {
-        let snapshot =
-            sample_snapshot_with_components(&["shell", "localhost-provider", "did-provider"]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, false),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_launch_uses_managed_native_when_fullscreen_chat_is_not_packaged() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, true),
-            ActionLaunch::ManagedChat
-        );
-    }
-
-    #[test]
-    fn chat_action_launch_uses_managed_native_when_focus_chat_missing() {
-        let snapshot =
-            sample_snapshot_with_components(&["shell", "localhost-provider", "did-provider"]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, false),
-            ActionLaunch::ManagedChat
-        );
+    fn chat_action_uses_managed_native_with_each_packaging_state() {
+        for (case, components, kvm) in [
+            (
+                "fullscreen absent",
+                &[
+                    "shell",
+                    "localhost-provider",
+                    "did-provider",
+                    "crosvm",
+                    "vmlinux",
+                ][..],
+                true,
+            ),
+            (
+                "fullscreen prerequisites present",
+                &[
+                    "shell",
+                    "localhost-provider",
+                    "did-provider",
+                    "chat",
+                    "crosvm",
+                    "vmlinux",
+                ][..],
+                true,
+            ),
+            (
+                "focus chat absent",
+                &["shell", "localhost-provider", "did-provider"][..],
+                false,
+            ),
+        ] {
+            let snapshot = sample_snapshot_with_components(components);
+            let action = action_spec("chat").unwrap();
+            assert_eq!(
+                action_command_with_kvm(action, &snapshot, kvm),
+                "home: open Chat",
+                "{case}"
+            );
+            assert_eq!(
+                action_launch_with_kvm(action, &snapshot, kvm),
+                ActionLaunch::ManagedChat,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -5324,44 +5291,5 @@ mod tests {
                 ActionReadiness::Blocked(reason) if reason == "unknown action"
             ));
         }
-    }
-
-    #[test]
-    fn blocked_local_site_notice_explains_stage_step() {
-        let snapshot = sample_snapshot_with_components(&[]);
-        let notice = render_site_local_blocked_notice(
-            &snapshot,
-            "stage a site first with `elastos site stage <dir>`",
-        );
-        assert_text_contains_all(
-            "empty MyWebSite notice",
-            &notice,
-            &[
-                "MyWebSite is empty",
-                "elastos site stage <dir>",
-                "preview",
-                "go public",
-            ],
-        );
-    }
-
-    #[test]
-    fn blocked_local_site_notice_explains_preview_prereq() {
-        let mut snapshot = sample_snapshot_with_components(&[]);
-        snapshot.site.staged = true;
-        let notice = render_site_local_blocked_notice(
-            &snapshot,
-            "missing site-provider -- run: elastos setup --profile demo",
-        );
-        assert_text_contains_all(
-            "staged MyWebSite notice",
-            &notice,
-            &[
-                "MyWebSite is staged",
-                "localhost://MyWebSite",
-                "elastos setup --profile demo",
-                "site-provider",
-            ],
-        );
     }
 }

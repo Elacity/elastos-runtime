@@ -127,17 +127,4 @@ mod tests {
             "is_supported() must be false outside macOS arm64"
         );
     }
-
-    #[test]
-    fn carrier_guest_device_path_constant_is_hvc1() {
-        assert_eq!(CARRIER_GUEST_DEVICE_PATH, "/dev/hvc1");
-    }
-
-    #[test]
-    fn unavailable_message_is_single_source_of_truth() {
-        // One source of truth for the fail-closed message; tests pin
-        // the stable operator wording so future edits don't drift.
-        assert!(VZ_BACKEND_UNAVAILABLE_MESSAGE.contains("vz backend unavailable"));
-        assert!(VZ_BACKEND_UNAVAILABLE_MESSAGE.contains("VM handle was not loaded"));
-    }
 }

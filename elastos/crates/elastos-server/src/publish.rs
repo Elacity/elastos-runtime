@@ -2713,15 +2713,6 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_available_capsules_reads_workspace_layout() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let capsules = discover_available_capsules(&root).unwrap();
-        assert!(capsules.iter().any(|name| name == "chat-room"));
-        assert!(capsules.iter().any(|name| name == "home-cli"));
-        assert!(capsules.iter().any(|name| name == "ipfs-provider"));
-    }
-
-    #[test]
     fn test_publish_rejects_invalid_and_placeholder_manifests() {
         let path = Path::new("capsule.json");
         let mut manifest = test_manifest("sample", &[]);

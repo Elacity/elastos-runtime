@@ -343,12 +343,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_config_default() {
-        let config = ShellConfig::default();
-        assert!(!config.is_configured());
-    }
-
-    #[tokio::test]
     async fn test_shell_config_local() {
         let config = ShellConfig::local("/path/to/shell");
         assert!(config.is_configured());

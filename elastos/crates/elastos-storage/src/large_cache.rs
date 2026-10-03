@@ -376,9 +376,6 @@ mod tests {
         cache.register(cid1, 100).await.unwrap();
         assert!(cache.contains(cid1).await);
 
-        // Wait to ensure different timestamps (timestamps are in seconds)
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
         // Add second file (100 bytes)
         let cid2 = "QmSecond100";
         tokio::fs::write(cache.temp_path(cid2), vec![0u8; 100])
@@ -387,9 +384,18 @@ mod tests {
         cache.register(cid2, 100).await.unwrap();
         assert!(cache.contains(cid2).await);
 
-        // Wait and access first to update its timestamp (making it newer than second)
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        cache.get(cid1).await;
+        // Seed second-resolution access times so touching the first file makes
+        // it newer, independently of the wall clock and HashMap iteration order.
+        {
+            let mut index = cache.index.write().await;
+            index.entries.get_mut(cid1).unwrap().last_accessed = 1;
+            index.entries.get_mut(cid2).unwrap().last_accessed = 2;
+        }
+        assert!(cache.get(cid1).await.is_some());
+        {
+            let index = cache.index.read().await;
+            assert!(index.entries[cid1].last_accessed > index.entries[cid2].last_accessed);
+        }
 
         // Add third file (200 bytes) - should evict second (oldest access time)
         let cid3 = "QmThird200";

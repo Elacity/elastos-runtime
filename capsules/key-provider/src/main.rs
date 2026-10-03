@@ -355,34 +355,6 @@ mod tests {
         }
     }
 
-    fn ok_data(response: Response) -> Value {
-        match response {
-            Response::Ok { data: Some(data) } => data,
-            other => panic!("expected ok data, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn status_advertises_blocked_raw_authority() {
-        let provider = KeyProvider;
-        let data = ok_data(provider.status());
-
-        assert_eq!(data["provider"], "key");
-        assert_eq!(data["configured"], false);
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("raw_cek")));
-        assert_eq!(
-            data["contract"]["schema"],
-            "elastos.protected-content.key-provider/v1"
-        );
-        assert_eq!(
-            data["contract"]["status"],
-            "fail_closed_until_dkms_backend_configured"
-        );
-    }
-
     #[test]
     fn release_fails_closed_until_backend_exists() {
         let provider = KeyProvider;

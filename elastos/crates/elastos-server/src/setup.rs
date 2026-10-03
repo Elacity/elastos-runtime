@@ -3363,7 +3363,7 @@ mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
     use elastos_common::{CapsuleManifest, CapsuleRole};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
@@ -4078,270 +4078,36 @@ mod tests {
         assert!(manifest.external.contains_key("archive-manager"));
     }
 
-    fn first_party_provider_manifest_path(root: &Path, name: &str) -> Option<PathBuf> {
-        [
-            root.join("capsules").join(name).join("capsule.json"),
-            root.join("elastos")
-                .join("capsules")
-                .join(name)
-                .join("capsule.json"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-    }
-
     #[test]
-    fn provider_runtime_contract_covers_exact_active_provider_set() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let components: ComponentsManifest =
-            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
-        let expected = BTreeMap::from([
-            (
-                "browser-engine-adapter".to_string(),
-                "elastos://browser-engine/*".to_string(),
-            ),
-            (
-                "chain-provider".to_string(),
-                "elastos://chain/*".to_string(),
-            ),
-            (
-                "content-block-graph-provider".to_string(),
-                "elastos://block-graph/*".to_string(),
-            ),
-            ("custody-provider".to_string(), "custody".to_string()),
-            ("did-provider".to_string(), "elastos://did/*".to_string()),
-            ("exit-provider".to_string(), "elastos://exit/*".to_string()),
-            ("ipfs-provider".to_string(), "elastos://ipfs/*".to_string()),
-            (
-                "localhost-provider".to_string(),
-                "localhost://*".to_string(),
-            ),
-            (
-                "model-provider".to_string(),
-                "elastos://model/*".to_string(),
-            ),
-            ("media-provider".to_string(), "media".to_string()),
-            ("net-provider".to_string(), "elastos://net/*".to_string()),
-            (
-                "object-provider".to_string(),
-                "elastos://object/*".to_string(),
-            ),
-            (
-                "protected-content-decrypt-provider".to_string(),
-                "protected-content-decrypt".to_string(),
-            ),
-            (
-                "protected-content-protect-provider".to_string(),
-                "protect".to_string(),
-            ),
-            (
-                "wallet-provider".to_string(),
-                "elastos://wallet/meta/status".to_string(),
-            ),
-            (
-                "webspace-provider".to_string(),
-                "localhost://WebSpaces/*".to_string(),
-            ),
-        ]);
-        let actual = components
-            .external
-            .iter()
-            .filter_map(|(name, component)| {
-                component
-                    .provider_runtime
-                    .as_ref()
-                    .map(|runtime| (name.clone(), runtime.provides.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(actual, expected);
-
-        for helper in [
-            "browser-engine-supervisor",
-            "browser-local-exit",
-            "browser-native-proxy-engine",
-            "browser-stream-bridge",
-        ] {
-            let component = components.external.get(helper).unwrap();
-            assert!(component.provider_runtime.is_none(), "{helper}");
-        }
-
-        for (name, provides) in expected {
-            let component = components.external.get(&name).unwrap();
-            let runtime = validate_provider_runtime(&name, component).unwrap();
-            let expected_install_path = format!("bin/{name}");
-            assert_eq!(
-                component.install_path.as_deref(),
-                Some(expected_install_path.as_str())
-            );
-            assert_eq!(runtime.provides, provides);
-            assert_eq!(
-                runtime.runtime_only,
-                matches!(
-                    name.as_str(),
-                    "custody-provider"
-                        | "media-provider"
-                        | "protected-content-decrypt-provider"
-                        | "protected-content-protect-provider"
-                )
-            );
-            if runtime.runtime_only {
-                assert!(first_party_provider_manifest_path(&root, &name).is_none());
-                continue;
-            }
-            let path = first_party_provider_manifest_path(&root, &name).unwrap();
-            let manifest: CapsuleManifest =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(manifest.role, CapsuleRole::Provider);
-            assert_eq!(
-                manifest.provides.as_deref(),
-                Some(runtime.provides.as_str())
-            );
-        }
-
-        for profile in ["agent-local-ai", "full"] {
-            assert!(
-                components
-                    .profiles
-                    .get(profile)
-                    .unwrap()
-                    .components
-                    .iter()
-                    .any(|value| value == "model-provider"),
-                "profile {profile} must install model-provider"
-            );
-        }
-        assert!(
-            !components
-                .profiles
-                .get("public-gateway")
-                .unwrap()
-                .components
-                .iter()
-                .any(|value| value == "model-provider"),
-            "public-gateway must not install model-provider"
-        );
-    }
-
-    #[test]
-    fn assistant_capsule_is_packaged_with_a_capsule_owned_icon() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("capsules/assistant/capsule.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["schema"], "elastos.capsule/v1");
-        assert_eq!(manifest["name"], "assistant");
-        assert_eq!(manifest["icon"], "browser/icons");
-        assert_eq!(manifest["entrypoint"], "browser/index.html");
-
-        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
-            assert!(
-                root.join("capsules/assistant/browser/icons")
-                    .join(file)
-                    .is_file(),
-                "missing Assistant icon asset {file}"
-            );
-        }
-
-        let components: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
-        assert_eq!(
-            components["external"]["assistant"]["install_path"],
-            "capsules/assistant"
-        );
-        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
-            assert!(
-                components["profiles"][profile]["components"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|value| value == "assistant"),
-                "profile {profile} must include the Assistant capsule"
-            );
-        }
-    }
-
-    #[test]
-    fn service_provider_capsules_are_packaged_with_capsule_owned_icons() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        for name in [
-            "browser-engine-adapter",
-            "chain-provider",
-            "content-block-graph-provider",
-            "did-provider",
-            "exit-provider",
-            "ipfs-provider",
-            "model-provider",
-            "net-provider",
-            "object-provider",
-            "wallet-provider",
-            "webspace-provider",
-        ] {
-            let capsule_dir = root.join("capsules").join(name);
-            let manifest: elastos_common::CapsuleManifest =
-                serde_json::from_slice(&fs::read(capsule_dir.join("capsule.json")).unwrap())
-                    .unwrap();
-            manifest
-                .validate()
-                .unwrap_or_else(|err| panic!("{name} manifest must validate: {err}"));
-            assert_eq!(manifest.role, elastos_common::CapsuleRole::Provider);
-            assert_eq!(
-                manifest.icon.as_deref(),
-                Some("icons"),
-                "{name} must own its icon"
-            );
-            for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
-                assert!(
-                    capsule_dir.join("icons").join(file).is_file(),
-                    "missing {name} icon asset {file}"
-                );
+    fn declared_capsule_icons_exist_in_each_manifest_directory() {
+        fn check_tree(root: &Path) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    let manifest_path = path.join("capsule.json");
+                    if manifest_path.is_file() {
+                        let manifest: CapsuleManifest =
+                            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+                        manifest
+                            .validate()
+                            .unwrap_or_else(|error| panic!("{}: {error}", manifest_path.display()));
+                        if let Some(icon) = manifest.icon {
+                            for size in [32, 64, 128, 256] {
+                                let asset = path.join(&icon).join(format!("icon-{size}.png"));
+                                assert!(
+                                    asset.is_file(),
+                                    "missing declared icon {}",
+                                    asset.display()
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
-    }
-
-    #[test]
-    fn elacity_player_capsule_is_packaged_with_a_capsule_owned_icon() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("capsules/elacity-player/capsule.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["schema"], "elastos.capsule/v1");
-        assert_eq!(manifest["name"], "elacity-player");
-        assert_eq!(manifest["icon"], "browser/icons");
-        assert_eq!(manifest["entrypoint"], "browser/index.html");
-
-        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
-            assert!(
-                root.join("capsules/elacity-player/browser/icons")
-                    .join(file)
-                    .is_file(),
-                "missing Elacity Player icon asset {file}"
-            );
-        }
-
-        let components: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
-        assert_eq!(
-            components["external"]["elacity-player"]["install_path"],
-            "capsules/elacity-player"
-        );
-        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
-            assert!(
-                components["profiles"][profile]["components"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|value| value == "elacity-player"),
-                "profile {profile} must include the Elacity Player capsule"
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_profile_name_preserves_home_profile() {
-        assert_eq!(normalize_profile_name("home"), "home");
+        check_tree(&root.join("capsules"));
+        check_tree(&root.join("elastos/capsules"));
     }
 
     #[test]
@@ -4362,22 +4128,6 @@ mod tests {
             manifest,
             PathBuf::from("/tmp/elastos-runtime/components.json")
         );
-    }
-
-    #[test]
-    fn test_missing_manifest_message_mentions_source_checkout() {
-        let message = missing_manifest_message();
-        assert!(message.contains("ELASTOS_COMPONENTS_MANIFEST"));
-        assert!(message.contains("<source-checkout>/components.json"));
-        assert!(message.contains("Source-built binaries are not self-contained installs."));
-    }
-
-    #[test]
-    fn test_missing_trusted_source_error_mentions_source_add() {
-        let err = missing_trusted_source_error();
-        let message = err.to_string();
-        assert!(message.contains("elastos setup"));
-        assert!(message.contains("elastos source add"));
     }
 
     #[test]

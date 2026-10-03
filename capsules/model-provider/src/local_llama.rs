@@ -1387,35 +1387,34 @@ mod tests {
         });
         let mut child = Command::new("/usr/bin/python3")
             .arg("-c")
-            .arg("import time; time.sleep(5)")
+            .arg("import threading; threading.Event().wait()")
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
 
-        assert_eq!(
-            wait_until_healthy(
-                &mut child,
-                None,
-                &LocalLlamaEndpoint {
-                    api_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
-                    unix_socket: None,
-                    model: "unpredictable-expected-alias".into(),
-                    enable_thinking: false,
-                },
-                "unpredictable-expected-alias",
-                Duration::from_millis(100),
-            )
-            .await,
-            Err(LocalLlamaFault::Timeout)
-        );
-        terminate_child(&mut child, &mut None, None, Duration::from_millis(100))
-            .await
-            .unwrap();
+        let readiness = wait_until_healthy(
+            &mut child,
+            None,
+            &LocalLlamaEndpoint {
+                api_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                unix_socket: None,
+                model: "unpredictable-expected-alias".into(),
+                enable_thinking: false,
+            },
+            "unpredictable-expected-alias",
+            Duration::from_millis(100),
+        )
+        .await;
+        let cleanup =
+            terminate_child(&mut child, &mut None, None, Duration::from_millis(100)).await;
         stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(("127.0.0.1", port));
         server.join().unwrap();
+        cleanup.unwrap();
+        assert_eq!(readiness, Err(LocalLlamaFault::Timeout));
     }
 
     fn respond_with_wrong_model(stream: &mut TcpStream) {

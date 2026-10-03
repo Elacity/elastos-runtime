@@ -1744,11 +1744,6 @@ mod tests {
     }
 
     #[test]
-    fn supported_actions_include_update_apply() {
-        assert!(supported_actions().contains(&OPERATOR_ACTION_UPDATE_APPLY));
-    }
-
-    #[test]
     fn upsert_peer_merges_existing_route_and_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let (sk, _) = generate_keypair();

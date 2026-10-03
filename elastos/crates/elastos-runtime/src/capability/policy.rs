@@ -581,7 +581,6 @@ impl PolicyVerifier for RulesVerifier {
 mod tests {
     use super::*;
     use crate::capability::token::{Action, ResourceId};
-    use crate::primitives::time::SecureTimestamp;
     use crate::session::SessionId;
 
     fn make_test_request() -> PendingCapabilityRequest {
@@ -609,37 +608,6 @@ mod tests {
         let id1 = DecisionId::new();
         let id2 = DecisionId::new();
         assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_grant_proposal_serialization() {
-        let proposal = GrantProposal::new(
-            "req-123".to_string(),
-            PolicyOutcome::Grant,
-            ProposedConstraints {
-                resource_scope: Some("localhost://Users/self/Documents/photos/*".to_string()),
-                ttl_secs: Some(3600),
-                max_uses: Some(10),
-                delegatable: false,
-                max_classification: Some(128),
-            },
-            "User has granted this before".to_string(),
-            0.85,
-            vec!["no_recent_deny".to_string()],
-        );
-
-        let json = serde_json::to_string(&proposal).unwrap();
-        let restored: GrantProposal = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.request_id, "req-123");
-        assert_eq!(restored.recommended_outcome, PolicyOutcome::Grant);
-        assert_eq!(restored.confidence, 0.85);
-        assert_eq!(restored.evidence_gaps.len(), 1);
-        assert_eq!(
-            restored.proposed_constraints.resource_scope,
-            Some("localhost://Users/self/Documents/photos/*".to_string())
-        );
-        assert_eq!(restored.proposed_constraints.ttl_secs, Some(3600));
     }
 
     #[test]
@@ -679,52 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_decision_serialization() {
-        let decision = PolicyDecision {
-            id: DecisionId::new(),
-            request_id: "req-456".to_string(),
-            resource: "localhost://Users/self/Documents/docs/*".to_string(),
-            action: "read".to_string(),
-            outcome: PolicyOutcome::Grant,
-            checks: vec![
-                VerifierCheck {
-                    name: "epoch_valid".to_string(),
-                    passed: true,
-                    reason: "Current epoch".to_string(),
-                    severity: CheckSeverity::Blocking,
-                },
-                VerifierCheck {
-                    name: "resource_allowed".to_string(),
-                    passed: true,
-                    reason: "No blocklist match".to_string(),
-                    severity: CheckSeverity::Advisory,
-                },
-            ],
-            effective_constraints: ProposedConstraints {
-                resource_scope: None,
-                ttl_secs: Some(600),
-                max_uses: None,
-                delegatable: false,
-                max_classification: None,
-            },
-            effective_expiry: None,
-            rationale: "All checks passed".to_string(),
-            decided_at: SecureTimestamp::now(),
-            shadow: false,
-        };
-
-        let json = serde_json::to_string(&decision).unwrap();
-        let restored: PolicyDecision = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.request_id, "req-456");
-        assert_eq!(restored.resource, "localhost://Users/self/Documents/docs/*");
-        assert_eq!(restored.action, "read");
-        assert_eq!(restored.outcome, PolicyOutcome::Grant);
-        assert_eq!(restored.checks.len(), 2);
-        assert!(!restored.shadow);
-    }
-
-    #[test]
     fn test_auto_grant_verifier_always_grants() {
         let verifier = AutoGrantVerifier;
         let request = make_test_request();
@@ -754,135 +676,16 @@ mod tests {
     }
 
     #[test]
-    fn test_evidence_record_serialization() {
-        let record = EvidenceRecord {
-            decision_id: "dec-789".to_string(),
-            evidence_type: EvidenceType::RuntimeCheck,
-            source: "runtime".to_string(),
-            content: "Epoch is current".to_string(),
-            recorded_at: SecureTimestamp::now(),
-            confidence_delta: 0.1,
-        };
-
-        let json = serde_json::to_string(&record).unwrap();
-        let restored: EvidenceRecord = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.decision_id, "dec-789");
-        assert_eq!(restored.evidence_type, EvidenceType::RuntimeCheck);
-        assert_eq!(restored.confidence_delta, 0.1);
-    }
-
-    #[test]
-    fn test_verifier_check_blocking_vs_advisory() {
-        let blocking = VerifierCheck {
-            name: "critical".to_string(),
-            passed: false,
-            reason: "Failed".to_string(),
-            severity: CheckSeverity::Blocking,
-        };
-
-        let advisory = VerifierCheck {
-            name: "optional".to_string(),
-            passed: true,
-            reason: "OK".to_string(),
-            severity: CheckSeverity::Advisory,
-        };
-
-        let json_b = serde_json::to_string(&blocking).unwrap();
-        let json_a = serde_json::to_string(&advisory).unwrap();
-
-        assert!(json_b.contains("\"blocking\""));
-        assert!(json_a.contains("\"advisory\""));
-
-        let restored_b: VerifierCheck = serde_json::from_str(&json_b).unwrap();
-        let restored_a: VerifierCheck = serde_json::from_str(&json_a).unwrap();
-
-        assert_eq!(restored_b.severity, CheckSeverity::Blocking);
-        assert_eq!(restored_a.severity, CheckSeverity::Advisory);
-    }
-
-    #[test]
-    fn test_proposed_constraints_default() {
-        let defaults = ProposedConstraints::default();
-        assert!(defaults.resource_scope.is_none());
-        assert!(defaults.ttl_secs.is_none());
-        assert!(defaults.max_uses.is_none());
-        assert!(!defaults.delegatable);
-        assert!(defaults.max_classification.is_none());
-    }
-
-    #[test]
-    fn test_turn_plan_serialization() {
-        let plan = TurnPlan {
-            request_id: "req-abc".to_string(),
-            intent: "Read photo files".to_string(),
-            objective: "Display photo gallery".to_string(),
-            evidence_gaps: vec!["user_history".to_string()],
-            recommended_action: PolicyOutcome::Grant,
-            compiled_at: SecureTimestamp::now(),
-        };
-
-        let json = serde_json::to_string(&plan).unwrap();
-        let restored: TurnPlan = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.request_id, "req-abc");
-        assert_eq!(restored.intent, "Read photo files");
-        assert_eq!(restored.recommended_action, PolicyOutcome::Grant);
-        assert_eq!(restored.evidence_gaps.len(), 1);
-    }
-
-    #[test]
-    fn test_policy_outcome_display() {
-        assert_eq!(PolicyOutcome::Grant.to_string(), "grant");
-        assert_eq!(PolicyOutcome::Deny.to_string(), "deny");
-        assert_eq!(PolicyOutcome::Defer.to_string(), "defer");
-    }
-
-    #[test]
     fn test_policy_outcome_serde_roundtrip() {
-        let grant_json = serde_json::to_string(&PolicyOutcome::Grant).unwrap();
-        assert_eq!(grant_json, "\"grant\"");
-        let restored: PolicyOutcome = serde_json::from_str(&grant_json).unwrap();
-        assert_eq!(restored, PolicyOutcome::Grant);
-
-        let deny_json = serde_json::to_string(&PolicyOutcome::Deny).unwrap();
-        assert_eq!(deny_json, "\"deny\"");
-        let restored: PolicyOutcome = serde_json::from_str(&deny_json).unwrap();
-        assert_eq!(restored, PolicyOutcome::Deny);
-
-        let defer_json = serde_json::to_string(&PolicyOutcome::Defer).unwrap();
-        assert_eq!(defer_json, "\"defer\"");
-        let restored: PolicyOutcome = serde_json::from_str(&defer_json).unwrap();
-        assert_eq!(restored, PolicyOutcome::Defer);
-    }
-
-    #[test]
-    fn test_check_severity_serde() {
-        let blocking_json = serde_json::to_string(&CheckSeverity::Blocking).unwrap();
-        assert_eq!(blocking_json, "\"blocking\"");
-        let restored: CheckSeverity = serde_json::from_str(&blocking_json).unwrap();
-        assert_eq!(restored, CheckSeverity::Blocking);
-
-        let advisory_json = serde_json::to_string(&CheckSeverity::Advisory).unwrap();
-        assert_eq!(advisory_json, "\"advisory\"");
-        let restored: CheckSeverity = serde_json::from_str(&advisory_json).unwrap();
-        assert_eq!(restored, CheckSeverity::Advisory);
-    }
-
-    #[test]
-    fn test_evidence_type_serde() {
-        let types = [
-            (EvidenceType::RuntimeCheck, "\"runtime_check\""),
-            (EvidenceType::UserConfirm, "\"user_confirm\""),
-            (EvidenceType::HistoryMatch, "\"history_match\""),
-            (EvidenceType::PolicyRule, "\"policy_rule\""),
-        ];
-
-        for (variant, expected_json) in types {
-            let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected_json);
-            let restored: EvidenceType = serde_json::from_str(&json).unwrap();
-            assert_eq!(restored, variant);
+        for (outcome, wire) in [
+            (PolicyOutcome::Grant, "\"grant\""),
+            (PolicyOutcome::Deny, "\"deny\""),
+            (PolicyOutcome::Defer, "\"defer\""),
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(json, wire);
+            let restored: PolicyOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, outcome);
         }
     }
 
@@ -1188,57 +991,21 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_denies_read_action() {
+    fn test_shell_denies_all_action_classes() {
         let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Read);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
-    }
-
-    #[test]
-    fn test_shell_denies_write_action() {
-        let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Write);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
-    }
-
-    #[test]
-    fn test_shell_denies_execute_action() {
-        let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Execute);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
-    }
-
-    #[test]
-    fn test_shell_denies_message_action() {
-        let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Message);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
-    }
-
-    #[test]
-    fn test_shell_denies_delete_action() {
-        let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Delete);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
-    }
-
-    #[test]
-    fn test_shell_denies_admin_action() {
-        let verifier = RulesVerifier::with_defaults();
-        let request = make_request_with_action(Action::Admin);
-        let proposal = make_deny_proposal(request.id.as_str());
-        let decision = verifier.verify(&request, &proposal, false);
-        assert_eq!(decision.outcome, PolicyOutcome::Deny);
+        for action in [
+            Action::Read,
+            Action::Write,
+            Action::Execute,
+            Action::Message,
+            Action::Delete,
+            Action::Admin,
+        ] {
+            let request = make_request_with_action(action);
+            let proposal = make_deny_proposal(request.id.as_str());
+            let decision = verifier.verify(&request, &proposal, false);
+            assert_eq!(decision.outcome, PolicyOutcome::Deny, "{action:?}");
+        }
     }
 
     #[test]

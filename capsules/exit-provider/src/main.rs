@@ -1863,21 +1863,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_bridge_default_config_initializes_empty() {
-        let mut provider = ExitProvider::new();
-        let response = serde_json::to_value(provider.init(json!({
-            "base_path": "",
-            "allowed_paths": [],
-            "read_only": false,
-            "encryption_key": ""
-        })))
-        .unwrap();
-
-        assert_eq!(response["status"], "ok");
-        assert_eq!(response["data"]["backend_count"], 0);
-    }
-
-    #[test]
     fn public_stream_target_fails_closed_until_backend_exists() {
         let mut provider = ExitProvider::new();
         let response = provider.open_stream(

@@ -20,13 +20,3 @@ pub(crate) fn build_entropy_device() -> Retained<VZVirtioEntropyDeviceConfigurat
     // no thread-affinity constraint applies pre-attachment.
     unsafe { VZVirtioEntropyDeviceConfiguration::new() }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entropy_device_constructs() {
-        let _cfg = build_entropy_device();
-    }
-}

@@ -3455,6 +3455,23 @@ pub(crate) mod tests {
         .proof_binding_id
     }
 
+    pub(crate) async fn connect_peer_pair(
+        a: &crate::carrier::CarrierNode,
+        b: &crate::carrier::CarrierNode,
+    ) {
+        let addr_a = crate::carrier::tests::wait_for_direct_endpoint_addr(&a.endpoint).await;
+        let addr_b = crate::carrier::tests::wait_for_direct_endpoint_addr(&b.endpoint).await;
+        a.memory_lookup.add_endpoint_info(addr_b.clone());
+        b.memory_lookup.add_endpoint_info(addr_a.clone());
+        for (endpoint, address) in [(&a.endpoint, addr_b), (&b.endpoint, addr_a)] {
+            let client =
+                crate::carrier::CarrierClient::connect_known_endpoint(endpoint, address, 5)
+                    .await
+                    .unwrap();
+            client.close().await;
+        }
+    }
+
     pub(crate) async fn direct_peer_pair(root: &Path) -> DirectPeerPair {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let key_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
@@ -3532,6 +3549,7 @@ pub(crate) mod tests {
         let mut watch_b = node_b.endpoint.watch_addr();
         node_a.memory_lookup.add_endpoint_info(watch_b.get());
         node_b.memory_lookup.add_endpoint_info(watch_a.get());
+        connect_peer_pair(&node_a, &node_b).await;
         DirectPeerPair {
             key_a,
             key_b,
@@ -3907,6 +3925,7 @@ pub(crate) mod tests {
         node_b
             .memory_lookup
             .add_endpoint_info(node_a.endpoint.watch_addr().get());
+        connect_peer_pair(&node_a, &node_b).await;
         DurableProfilePeerPair {
             trusted,
             identity_a,

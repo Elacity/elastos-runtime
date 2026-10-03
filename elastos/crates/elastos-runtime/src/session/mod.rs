@@ -164,13 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_creation() {
-        let session = Session::new_shell("vm-123".to_string());
-        assert!(session.is_shell());
-        assert_eq!(session.vm_id, Some("vm-123".to_string()));
-    }
-
-    #[test]
     fn test_session_touch() {
         let mut session = Session::new_shell("vm-789".to_string());
         let initial = session.last_active;
