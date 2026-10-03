@@ -1001,38 +1001,11 @@ async fn readiness_http_response_refuses_status_and_size_before_use() {
     }
 }
 
-<<<<<<< HEAD
 fn owner_queue_fixture() -> (PrivateFixture, UpdateRequest) {
-=======
-#[test]
-fn recovered_consumed_request_reports_terminal_result_after_readiness() {
-    let (_, request, _) = choice_fixture();
-    assert_eq!(
-        initial_ready_result(None, &request.current_version)
-            .unwrap()
-            .0,
-        "ready"
-    );
-    for (version, phase) in [
-        (&request.new_version, "updated"),
-        (&request.current_version, "restored"),
-    ] {
-        assert_eq!(
-            initial_ready_result(Some(&request), version).unwrap().0,
-            phase
-        );
-    }
-    assert!(initial_ready_result(Some(&request), "unapproved version").is_err());
-}
-
-#[tokio::test]
-async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
->>>>>>> fix/109-update-restart
     let fixture = PrivateFixture::new();
     publish_retained_receipt(&fixture);
     crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
     let (_, request, _) = choice_fixture();
-<<<<<<< HEAD
     publish_owner_queue_status(&fixture, &request, "ready", None);
     assert!(!has_queued_update(&fixture.data).unwrap());
     reserve_owner_update(
@@ -1408,7 +1381,35 @@ fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
     )
     .unwrap();
     assert!(has_queued_update(&fixture.data).unwrap());
-=======
+}
+
+#[test]
+fn recovered_consumed_request_reports_terminal_result_after_readiness() {
+    let (_, request, _) = choice_fixture();
+    assert_eq!(
+        initial_ready_result(None, &request.current_version)
+            .unwrap()
+            .0,
+        "ready"
+    );
+    for (version, phase) in [
+        (&request.new_version, "updated"),
+        (&request.current_version, "restored"),
+    ] {
+        assert_eq!(
+            initial_ready_result(Some(&request), version).unwrap().0,
+            phase
+        );
+    }
+    assert!(initial_ready_result(Some(&request), "unapproved version").is_err());
+}
+
+#[tokio::test]
+async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
+    let (_, request, _) = choice_fixture();
     let mut command = tokio::process::Command::new("/bin/true");
     let child = child::OwnedChild::spawn(&mut command).unwrap();
     let mut controller = Controller {
@@ -1434,5 +1435,4 @@ fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
     assert_eq!(status.current_version, request.current_version);
     assert!(controller.child.is_some(), "recovered child was replaced");
     controller.stop_child().await.unwrap();
->>>>>>> fix/109-update-restart
 }
