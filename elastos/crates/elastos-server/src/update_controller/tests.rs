@@ -1,4 +1,7 @@
 use super::*;
+use elastos_common::localhost::{
+    installation_release_head_path, installation_release_manifest_path,
+};
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -46,14 +49,50 @@ impl PrivateFixture {
     }
 
     fn publish_installed_release(&self) -> TrustedSource {
-        let manifest = publisher_release_manifest_path(&self.data);
-        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let components =
+            br#"{"schema":"elastos.components/v1","external":{},"capsules":{},"profiles":{}}"#;
+        self.file(&self.data.join("components.json"), components, 0o600);
+        let binary = fs::read(&self.binary).unwrap();
+        let descriptor = |bytes: &[u8]| {
+            json!({
+                "cid": raw_cid(bytes), "sha256": digest(bytes), "size": bytes.len()
+            })
+        };
+        let release = signed(
+            json!({
+                "schema":"elastos.release/v1", "version":"0.7.0", "channel":"stable",
+                "platforms": {(crate::update::detect_release_platform()): {
+                    "binary": descriptor(&binary), "components": descriptor(components)
+                }}
+            }),
+            "elastos.release.v1",
+        );
+        let head = signed(
+            json!({
+                "schema":"elastos.release.head/v1", "version":"0.7.0", "channel":"stable",
+                "latest_release_cid": raw_cid(&release), "release_sha256":digest(&release)
+            }),
+            "elastos.release.head.v1",
+        );
+        let mut config = source_config(&self.binary);
+        config.sources[0].head_cid = raw_cid(&head);
+        // Bootstrap refusal tests snapshot after the same persisted writer lock exists.
+        drop(
+            crate::install_transaction::InstallationGuard::acquire(self.binary.parent().unwrap())
+                .unwrap(),
+        );
+        crate::sources::save_trusted_sources(&self.data, &config).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.data.join("installation"))
+            .unwrap();
+        self.file(&installation_release_head_path(&self.data), &head, 0o600);
         self.file(
-            &manifest,
-            &signed_release(&digest(b"signed fixture Runtime")),
+            &installation_release_manifest_path(&self.data),
+            &release,
             0o600,
         );
-        source_config(&self.binary).sources.remove(0)
+        config.sources.remove(0)
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -927,7 +966,7 @@ fn first_start_enospc_refuses_existing_authority_busy_or_unsafe_bootstrap_state(
                 0o600,
             ),
             "invalid signature" => fs::write(
-                publisher_release_manifest_path(&fixture.data),
+                installation_release_manifest_path(&fixture.data),
                 b"invalid signed installed release",
             )
             .unwrap(),
@@ -1284,17 +1323,23 @@ async fn pre_restart_reconciliation_retires_only_consumed_request_after_both_loc
         ),
         (
             ReleaseFile::ReleaseHead,
-            elastos_common::localhost::publisher_release_head_path(&fixture.data),
+            elastos_common::localhost::installation_release_head_path(&fixture.data),
             b"old head".as_slice(),
         ),
         (
             ReleaseFile::ReleaseManifest,
-            publisher_release_manifest_path(&fixture.data),
+            installation_release_manifest_path(&fixture.data),
             b"old release".as_slice(),
         ),
     ];
     for (_, path, bytes) in &metadata {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("release-head.json" | "release.json")
+        ) {
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fixture.file(path, bytes, 0o600);
     }
     let candidate = [
@@ -2192,14 +2237,7 @@ async fn initial_home_readiness_has_a_finite_budget_beyond_the_restart_limit() {
 async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_installation() {
     let fixture = PrivateFixture::new();
     publish_retained_receipt(&fixture);
-    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
-    let manifest = publisher_release_manifest_path(&fixture.data);
-    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-    fixture.file(
-        &manifest,
-        &signed_release(&digest(b"signed fixture Runtime")),
-        0o600,
-    );
+    fixture.publish_installed_release();
     let before = fixture.snapshot();
     let mut controller = Controller {
         receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
@@ -2242,5 +2280,78 @@ async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_install
     let after = fixture.snapshot();
     for (path, entry) in before {
         assert_eq!(after.get(&path), Some(&entry), "{}", path.display());
+    }
+}
+
+#[test]
+fn migration_space_refusal_reuses_only_the_exact_current_signed_controller() {
+    for case in [
+        "current",
+        "missing controller",
+        "changed controller",
+        "unsafe controller",
+        "pending journal",
+        "partial consumed",
+    ] {
+        let fixture = PrivateFixture::new();
+        let source = fixture.publish_installed_release();
+        publish_retained_receipt(&fixture);
+        let publisher = elastos_common::localhost::publisher_release_head_path(&fixture.data)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::create_dir_all(publisher.parent().unwrap()).unwrap();
+        fs::rename(fixture.data.join("installation"), &publisher).unwrap();
+        match case {
+            "current" => {}
+            "missing controller" => fs::remove_file(fixture.controller()).unwrap(),
+            "changed controller" => {
+                fs::write(fixture.controller(), b"foreign controller bytes").unwrap()
+            }
+            "unsafe controller" => {
+                fs::set_permissions(fixture.controller(), fs::Permissions::from_mode(0o755))
+                    .unwrap()
+            }
+            "pending journal" => fixture.file(
+                &fixture.data.join(".elastos.update-journal.json"),
+                b"{}",
+                0o600,
+            ),
+            "partial consumed" => {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(fixture.data.join("installation"))
+                    .unwrap();
+                fixture.file(
+                    &installation_release_head_path(&fixture.data),
+                    b"partial consumed state",
+                    0o600,
+                );
+            }
+            _ => unreachable!(),
+        }
+        let _lease = acquire_lease(&fixture.directory).unwrap();
+        let _writer = crate::install_transaction::InstallationGuard::acquire(
+            fixture.binary.parent().unwrap(),
+        )
+        .unwrap();
+        let before = fixture.snapshot();
+        let result = reuse_home_inputs_after_space_refusal(
+            &fixture.data,
+            &fixture.binary,
+            &source,
+            &fixture.directory,
+            Err(crate::install_transaction::DiskReserveError.into()),
+        );
+        assert_eq!(result.is_ok(), case == "current", "{case}");
+        assert_eq!(fixture.snapshot(), before, "{case}");
+        if case == "current" {
+            assert_eq!(
+                result.unwrap().binary_sha256,
+                digest(b"signed fixture Runtime")
+            );
+            assert!(!fixture.data.join("installation").exists());
+            assert!(!fixture.data.join(".elastos.installation-migrate").exists());
+        }
     }
 }

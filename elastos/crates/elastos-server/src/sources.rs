@@ -3,7 +3,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use elastos_common::localhost::publisher_release_head_path;
+use elastos_common::localhost::installation_release_head_path;
 
 use crate::ownership;
 
@@ -484,11 +484,20 @@ fn run_source_command_with_confirmation(
             let source = config
                 .source_named(name.as_deref())
                 .ok_or_else(|| anyhow::anyhow!("Trusted source not found"))?;
-            let head_path = publisher_release_head_path(data_dir);
+            let binary = Path::new(&source.install_path);
+            let parent = std::fs::canonicalize(
+                binary
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("Installed binary parent is unavailable"))?,
+            )?;
+            let guard = crate::install_transaction::InstallationGuard::acquire(&parent)?;
+            let installed =
+                crate::installed_release::load_or_migrate(data_dir, binary, source, &guard)?;
+            let head_path = installation_release_head_path(data_dir);
             if !head_path.exists() {
                 anyhow::bail!("No local release head found at {}", head_path.display());
             }
-            let head_bytes = std::fs::read(&head_path)?;
+            let head_bytes = installed.head;
             let (head, signer) = crate::crypto::verify_release_envelope_against_dids(
                 &head_bytes,
                 "elastos.release.head.v1",
