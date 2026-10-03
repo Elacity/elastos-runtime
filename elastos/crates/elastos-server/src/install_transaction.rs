@@ -1255,47 +1255,22 @@ pub(crate) fn authorize_host_start_with_generation(
     generation: Option<&str>,
     process_id: u32,
 ) -> anyhow::Result<()> {
-    let parent = binary.parent().context("host binary parent missing")?;
-    let path = parent.join(JOURNAL);
-    let file = match open_read(&path) {
-        Ok(file) => file,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(error),
+    let Some(journal) = read_host_start_journal(data_dir, binary)? else {
+        return Ok(());
     };
-    check_file(&file, &path, true)?;
-    if file.metadata()?.len() > MAX_JOURNAL {
-        bail!("installation journal exceeds size limit");
+    if journal.schema == "elastos.install-transaction/v1" {
+        bail!("{}", pending_home_recovery_hint(&journal));
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
-    let journal: Journal = serde_json::from_slice(&bytes)?;
-    validate_restart_record(&journal)?;
-    if journal.data_dir != fs::canonicalize(data_dir)?
-        || journal.binary_basename
-            != binary
-                .file_name()
-                .context("host binary basename missing")?
-                .to_string_lossy()
-        || journal.schema != "elastos.install-transaction/v2"
-    {
-        bail!("installation recovery is pending; start Home through its installed controller");
-    }
-    let restart = journal
-        .restart
-        .context("installation recovery is pending")?;
+    let restart = journal.restart.context(
+        "Home restart recovery is pending. Start the retained update controller with its receipt.",
+    )?;
     validate_restart_plan(&restart.plan)?;
     let generation = generation.unwrap_or_default();
     if generation.len() != 32
         || generation != restart.generation
         || restart.pid.is_some_and(|pid| pid != process_id)
     {
-        bail!("Home start differs from the controller's claimed generation");
+        bail!("Home start differs from the controller's claimed generation. Start the retained update controller with its receipt.");
     }
     let previous = match restart.phase {
         RestartPhase::CandidateStartClaimed | RestartPhase::CandidateRunning => false,
@@ -1324,6 +1299,62 @@ pub(crate) fn authorize_host_start_with_generation(
         bail!("claimed Runtime binary changed before startup");
     }
     Ok(())
+}
+
+pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    if let Some(journal) = read_host_start_journal(data_dir, binary)? {
+        bail!("{}", pending_home_recovery_hint(&journal));
+    }
+    Ok(())
+}
+
+fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
+    if journal.schema == "elastos.install-transaction/v1" {
+        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
+    } else {
+        "Home restart recovery is pending. Start the retained update controller with its receipt."
+    }
+}
+
+fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
+    let parent = binary.parent().context("host binary parent missing")?;
+    let path = parent.join(JOURNAL);
+    let file = match open_read(&path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file, &path, true)?;
+    if file.metadata()?.len() > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
+    let journal: Journal = serde_json::from_slice(&bytes)?;
+    validate_restart_record(&journal)?;
+    if journal.data_dir != fs::canonicalize(data_dir)?
+        || journal.binary_basename
+            != binary
+                .file_name()
+                .context("host binary basename missing")?
+                .to_string_lossy()
+    {
+        bail!("Installation recovery belongs to a different Home. Retain its files for operator repair.");
+    }
+    anyhow::ensure!(
+        matches!(
+            journal.schema.as_str(),
+            "elastos.install-transaction/v1" | "elastos.install-transaction/v2"
+        ),
+        "Installation recovery format is unknown. Retain its files for operator repair."
+    );
+    Ok(Some(journal))
 }
 
 fn sync_directory(path: &Path) -> anyhow::Result<()> {

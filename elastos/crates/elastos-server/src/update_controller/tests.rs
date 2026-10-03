@@ -1054,3 +1054,143 @@ async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
     assert!(controller.child.is_some(), "recovered child was replaced");
     controller.stop_child().await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn initial_home_readiness_has_a_finite_budget_beyond_the_restart_limit() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    let capsule = fixture.data.join("capsules/home");
+    fs::create_dir_all(capsule.join("browser")).unwrap();
+    fixture.file(
+        &capsule.join("capsule.json"),
+        &serde_json::to_vec(&json!({
+            "schema":"elastos.capsule/v1", "name":"home", "version":"0.1.0",
+            "description":"Readiness deadline fixture", "author":"fixture",
+            "role":"app", "type":"data", "entrypoint":"browser/index.html"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(
+        &capsule.join("browser/index.html"),
+        b"private Home document",
+        0o600,
+    );
+    fixture.file(
+        &fixture.data.join("components.json"),
+        &serde_json::to_vec(&json!({
+            "external":{"home":{"install_path":"capsules/home","platforms":{}}},
+            "capsules":{}, "profiles":{}
+        }))
+        .unwrap(),
+        0o600,
+    );
+    assert_eq!(
+        home_digest(&fixture.data).unwrap(),
+        digest(b"private Home document")
+    );
+    assert!(!crate::runtime_control::gateway_runtime_coord_path(&fixture.data).exists());
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("600");
+    let child = child::OwnedChild::spawn(&mut command).unwrap();
+    let pid = child.pid();
+    let process_birth = process_start(pid).unwrap();
+    let generation = "a".repeat(32);
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(child),
+        request: None,
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: generation.clone(),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+    };
+
+    let binary_hash = digest(b"signed fixture Runtime");
+    for restarting in [false, true] {
+        let started = tokio::time::Instant::now();
+        let message = {
+            let proof = controller.wait_ready(&generation, "0.7.0", &binary_hash, restarting);
+            tokio::pin!(proof);
+            if !restarting {
+                tokio::select! {
+                    result = &mut proof => panic!("initial readiness ended before 31 seconds: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_secs(31)) => {},
+                }
+            }
+            proof.await.unwrap_err().to_string()
+        };
+        let expected = Duration::from_secs(if restarting { 30 } else { 120 });
+        assert!(started.elapsed() >= expected);
+        assert!(started.elapsed() <= expected + Duration::from_millis(50));
+        assert!(
+            message.contains(&format!("within {} seconds", expected.as_secs())),
+            "{message}"
+        );
+        assert!(!controller.host_ready);
+        assert_eq!(controller.child.as_ref().unwrap().pid(), pid);
+        assert!(controller
+            .child
+            .as_ref()
+            .unwrap()
+            .observed_exit()
+            .unwrap()
+            .is_none());
+        assert!(!fixture.directory.join(STATUS).exists());
+    }
+    // Restore wall time for the operating system's signal delivery and reap.
+    tokio::time::resume();
+    controller.stop_child().await.unwrap();
+    assert!(controller.child.is_none());
+    assert!(child::generation_gone(pid, &process_birth).unwrap());
+}
+
+#[tokio::test]
+async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_installation() {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
+    let manifest = publisher_release_manifest_path(&fixture.data);
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fixture.file(
+        &manifest,
+        &signed_release(&digest(b"signed fixture Runtime")),
+        0o600,
+    );
+    let before = fixture.snapshot();
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: None,
+        request: None,
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: String::new(),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+    };
+    // The signed fixture bytes have no native executable format.
+    let message = controller.start_initial().await.unwrap_err().to_string();
+    assert!(
+        message.contains("Home could not start. Check the startup log"),
+        "{message}"
+    );
+    assert!(
+        message.contains(fixture.directory.join("runtime.log").to_str().unwrap()),
+        "{message}"
+    );
+    assert!(message.contains("before starting Home again"), "{message}");
+    assert!(controller.child.is_none());
+    assert!(!controller.host_ready);
+    assert!(!fixture.directory.join(STATUS).exists());
+    assert!(!InstallTransaction::has_pending_recovery(&fixture.binary));
+    let after = fixture.snapshot();
+    for (path, entry) in before {
+        assert_eq!(after.get(&path), Some(&entry), "{}", path.display());
+    }
+    controller.stop_child().await.unwrap();
+}
