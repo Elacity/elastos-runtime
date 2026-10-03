@@ -9,7 +9,10 @@
       "source": {
         "checksum": "sha512:86f9c07bca62d09839e53553df0f81bc306364b1467a459d52f3e4505cc948d196ed0c219c03c667cd681e057bb24bbfc0e0eebf4b83bc64a36a0e9923a60e05",
         "max_bytes": 536870912,
-        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz"
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
       },
       "format": "tar.gz",
       "root": "kubo",
@@ -55,7 +58,10 @@
       "source": {
         "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
         "max_bytes": 536870912,
-        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz"
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
       },
       "format": "tar.gz",
       "root": "kubo",
@@ -101,7 +107,10 @@
       "source": {
         "checksum": "sha512:13b6d5dc04e661bfde6b8ba469bcf5b19d9d0062fe8ed50c7aadd8a078f500d0bceee4be7c9bfa476b48c4eb84c246ba083605ed1ed24d16b98e6cd0f09140bb",
         "max_bytes": 536870912,
-        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz"
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
       },
       "format": "tar.gz",
       "root": "kubo",

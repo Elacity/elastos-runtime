@@ -272,6 +272,34 @@ class UpstreamTest(unittest.TestCase):
                 upstream.response(source)
             build.return_value.open.return_value.close.assert_called_once()
 
+    def test_kubo_recipes_accept_official_asset_redirect_and_refuse_unlisted_host(self):
+        inventory = json.loads(Path(__file__).with_name("release-upstream-recipes.json").read_text())
+        recipes = [recipe for recipe in inventory["recipes"] if recipe["component"] == "kubo"]
+        self.assertEqual({recipe["platform"] for recipe in recipes},
+                         {"linux-amd64", "linux-arm64", "darwin-arm64"})
+        self.assertEqual(len(recipes), 3)
+        for recipe in recipes:
+            source = upstream.source_spec(recipe["source"])
+            for host, accepted in (("release-assets.githubusercontent.com", True),
+                                   ("unlisted.example.test", False)):
+                with self.subTest(platform=recipe["platform"], host=host):
+                    target = "https://" + host + "/fixture/" + source["url"].rsplit("/", 1)[-1]
+                    redirect = urllib.error.HTTPError(source["url"], 302, "redirect",
+                                                      {"Location": target}, io.BytesIO())
+                    reply = io.BytesIO(b"inert archive")
+                    reply.status = 200
+                    reply.headers = {"Content-Length": str(len(reply.getvalue()))}
+                    with reply, patch.object(upstream.urllib.request, "build_opener") as build:
+                        build.return_value.open.side_effect = [redirect, reply]
+                        if accepted:
+                            self.assertIs(upstream.response(source), reply)
+                            self.assertEqual(build.return_value.open.call_count, 2)
+                            self.assertEqual(build.return_value.open.call_args.args[0].full_url, target)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "allowlist"):
+                                upstream.response(source)
+                            self.assertEqual(build.return_value.open.call_count, 1)
+
     def model_recipe(self):
         recipe = self.recipe(b"GGUFfixture weights")
         recipe["component"] = "model-fixture"
