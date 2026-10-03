@@ -8,10 +8,10 @@ isolated Mac HOME; the existing Mac account and Home data stay in place.
 ## Approved input identities
 
 - Repository: `Elacity/elastos-runtime`.
-- Source: `5814b06b0b5e1f42d05ab60002af9c548ec9d9b2`.
-- Source tree: `72785a23bbed468f3460acbe998e99bb74c55906`.
-- Source CI: <https://github.com/Elacity/elastos-runtime/actions/runs/37073055811>.
-- Native builder: <https://github.com/Elacity/elastos-runtime/actions/runs/37084288629>.
+- Source: `8a9dec16b4febfac5759883ec7462e1ea780dd59`.
+- Source tree: `e18d17a3431b4d2548796347528e28afee909e35`.
+- Source CI: <https://github.com/Elacity/elastos-runtime/actions/runs/37086607684>.
+- Native builder: use the replacement run linked in #89 for this exact source.
 - Draft versions: V1 `0.8.0-alpha.1`, V2 `0.8.0-alpha.2`; channel `canary`.
 - Origin: `https://elastos.elacitylabs.com`.
 - Public signer: `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`.
@@ -30,11 +30,15 @@ Stable signing retains the version-tag-on-main gate.
 
 ## 1. Download and verify
 
+Use one dedicated Bash shell for the Mac commands below, and a separate Bash
+shell on the seed. Each block stops if a check fails.
+
 Use the completed **handoff packaging run and artifact name linked in #89**.
 Set `HANDOFF_RUN` and `HANDOFF_ARTIFACT` to those exact values. Download to a
 new stable directory with at least 15% free disk after extraction:
 
 ```bash
+set -euo pipefail
 umask 077
 HANDOFF_RUN='COPY_THE_COMPLETED_PACKAGING_RUN_ID_FROM_89'
 HANDOFF_ARTIFACT='COPY_THE_EXACT_PACKAGED_ARTIFACT_NAME_FROM_89'
@@ -69,9 +73,12 @@ V1 envelope CIDs are required to finalize V2's chain. Keep N1/N2, the original
 ## 2. Qualify the seed receipt and custody policy
 
 The operator compares `public-baseline/suggested-publish-state.json` with the
-existing seed Runtime's actual public Publisher receipt, including prior head
-and release CIDs. If they differ, ask the key-free builder to re-prepare V1
-against the actual receipt. Preserve the existing receipt and holder identity.
+existing seed Runtime's actual public Publisher receipt: compare the public
+signer, version, head CID and release CID. If these fields differ, ask the
+key-free builder to re-prepare V1 against the actual receipt. Retain the seed's
+actual publication timestamp, which can record import time rather than the
+signed head time. The suggested CI receipt is comparison evidence; the seed
+keeps its actual receipt and holder identity.
 Canonical Runtime derives its Publisher state path from its selected data root;
 `ELASTOS_PUBLISH_STATE_DIR` alone does not select that root.
 
@@ -83,6 +90,7 @@ single-link key file with mode 0600. Python/OpenSSL pins above were qualified fo
 Anders's Mac account; a different custodian account qualifies ownership anew.
 
 ```bash
+set -euo pipefail
 CUSTODY="$HOME/.local/share/elastos-canary-custody"
 test ! -e "$CUSTODY"
 mkdir -p "$CUSTODY"
@@ -114,6 +122,7 @@ no secret command argument, environment value, output or intermediate key file.
 The DER form is PKCS#8 Ed25519 (RFC 8410).
 
 ```bash
+set -euo pipefail
 HEX_KEY='/OPERATOR/EXISTING_PROTECTED_HEX_KEY'
 env -i "$PINNED_PYTHON" -I -S - "$HEX_KEY" "$PEM_KEY" "$PINNED_OPENSSL" <<'PY'
 import base64, os, re, stat, subprocess, sys
@@ -167,6 +176,7 @@ absent before this command. Signing performs public source, file, DID and
 signature checks before retaining its read-only set.
 
 ```bash
+set -euo pipefail
 SIGNED_V1="$CUSTODY/signed-V1"
 env -i "$PINNED_PYTHON" -I -S "$INSTALLED_SIGNER" \
   --policy "$CUSTODY/V1-policy.json" \
@@ -180,6 +190,7 @@ directory, represented below by `SEED_ALIAS` and `SEED_STAGE`. Copy the **signed
 public set and checksum receipt only**; the custody key and policy stay on Mac.
 
 ```bash
+set -euo pipefail
 SEED_ALIAS='OPERATOR_EXISTING_SSH_ALIAS'
 SEED_STAGE='/OPERATOR/OWNED_STABLE_CANARY_STAGE'
 scp -r "$SIGNED_V1" "$CUSTODY/signed-V1-SHA256SUMS" "$SEED_ALIAS:$SEED_STAGE/"
@@ -208,6 +219,7 @@ verified absolute paths. Run in the existing instance's approved HOME/data-root
 environment. For V1 and V2 alike:
 
 ```bash
+set -euo pipefail
 V1='0.8.0-alpha.1'
 DID='did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe'
 "$SEED_RUNTIME" publish-release --version "$V1" --channel canary \
@@ -234,6 +246,7 @@ verified against **signed V1**. This is the accepted CLI-only first hop;
 normal Home acceptance still has the signed capsule-delivery gate in #217.
 
 ```bash
+set -euo pipefail
 TEST_HOME="$HOME/.local/share/elastos-real-key-m1m2/home"
 test ! -e "$TEST_HOME"
 mkdir -p "$TEST_HOME"
@@ -277,6 +290,7 @@ its final read-only unsigned root. Install its approved policy at
 `$CUSTODY/V2-policy.json`, with the same custody tool/key paths. Then:
 
 ```bash
+set -euo pipefail
 SIGNED_V2="$CUSTODY/signed-V2"
 env -i "$PINNED_PYTHON" -I -S "$INSTALLED_SIGNER" \
   --policy "$CUSTODY/V2-policy.json" \
@@ -295,6 +309,7 @@ Use the same Mac test HOME and frozen installation. These plain commands select
 its saved Carrier source; retain their output and transport evidence:
 
 ```bash
+set -euo pipefail
 env -i HOME="$TEST_HOME" PATH="$TEST_PATH" "$MAC_RUNTIME" update --check
 env -i HOME="$TEST_HOME" PATH="$TEST_PATH" "$MAC_RUNTIME" update
 env -i HOME="$TEST_HOME" PATH="$TEST_PATH" "$MAC_RUNTIME" --version
