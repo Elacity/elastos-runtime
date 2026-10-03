@@ -874,3 +874,106 @@ Record safe run, artifact, source, hash, and installed idle-recovery results in
 custody. Remove the rollback set when this installed acceptance gate closes.
 This holder qualification supports the canary journey; broader release and
 installed Home gates keep their own acceptance evidence.
+
+
+## Gateway Runtime and provider installation after qualification
+
+Runtime selects the gateway role and sends it through its verified private
+provider Init. This upgrade installs Runtime, `ipfs-provider`, and their full
+helper source from one reviewed source tree. The earlier provider-only procedure
+remains the accepted idle-recovery installation. The new gateway role needs
+explicit approval for the Runtime upgrade and the reviewed manifest candidate.
+
+After the source merges into `develop`, use the Canary Linux publisher workflow
+on its workflow-only branch. Supply `source_commit`, `source_tree`, and
+`source_ci_run` from the exact merged source and its completed successful CI.
+Select `always_on=true` and supply `lifecycle_proof_run` from a completed
+successful Canary Linux holder run for that same source tree. The lifecycle run
+can have a different source commit only when its tree is identical. The builder
+checks merge ancestry, CI identity, the authenticated lifecycle artifact digest,
+its source tree, real idle time, first complete Carrier read, and cleanup.
+
+```bash
+gh workflow run canary-publisher-linux.yml --repo Elacity/elastos-runtime \
+  --ref fix/89-canary-inputs \
+  -f source_commit="$GATEWAY_SOURCE_COMMIT" \
+  -f source_tree="$GATEWAY_SOURCE_TREE" \
+  -f source_ci_run="$GATEWAY_SOURCE_CI_RUN" \
+  -f lifecycle_proof_run="$GATEWAY_LIFECYCLE_RUN" \
+  -f always_on=true
+```
+
+The original frozen dispatch defaults support the earlier publisher rehearsal.
+A new source package requires the explicit lifecycle mode. The approved helper
+root remains `/home/wau/.local/share/elastos-canary/source`; the operator installs
+the complete `source.tar.gz` there as the existing service owner.
+
+Download the exact completed run and artifact recorded in the operator approval,
+using the new private transfer directory and outer archive verification in step
+5. Require the publisher workflow path, workflow-only branch, `completed` and
+`success`. Check the approved GitHub artifact digest and outer archive hash
+before extraction. Refuse archive links, absolute paths and parent traversal.
+Verify `SHA256SUMS` and these public package records:
+
+- `receipts/admission.json` binds the merged source, successful source CI,
+  helper-root approval and requested lifecycle mode.
+- `receipts/build.json` binds both package binary hashes and sizes, the approved
+  helper root, source parity, version, publication tests and Linux ABI.
+- `receipts/lifecycle-admission.json` binds the separate source qualification.
+  Its `tested_runtime` and `tested_provider` hashes belong to the CI proof at
+  its CI helper root. `seed_bytes_lifecycle_tested=false` in the build receipt
+  states that the package binaries were rebuilt at the approved seed root.
+- The three `receipts/tested-*.json` files retain the authenticated lifecycle
+  observations and binary build records. They prove real elapsed idle time,
+  unchanged Kubo generation, the first complete Carrier read and cleanup.
+- `installed-component.json` binds the package IPFS checksum and size to
+  `linux-amd64`, its native provider ABI, both source identities and the hash
+  of `receipts/build.json`. Its local overlay omits old fetch provenance.
+
+Prepare the manifest candidate from the actual installed manifest bytes.
+Preserve its other entries, profiles, provider ABI and install paths. Replace
+only the existing Linux IPFS platform pin with the package pin; remove its stale
+CID, URL and release fetch path. Keep the new Runtime hash in the installation
+receipt. The source-tree `components.json` remains source provenance and does
+not replace the operator's installed manifest. Review the candidate diff, bind
+its hash and the previous manifest hash in a receipt, and obtain approval for
+that exact candidate and both binary hashes before the service window.
+
+Record the current installed and running Runtime/provider hashes, helper-source
+identity, manifest bytes and service configuration. Keep one approved rollback
+set for the previous Runtime, provider, manifest and helper source, with a size,
+reason and cleanup condition in the private lifecycle inventory. Include only
+intentional release files; keep the existing data root, identity, provider
+configuration, Kubo binary/repo and publication receipts in place. Check the
+whole staging and rollback size against the disk floor before copying.
+
+Stage both verified binaries beside their stable destinations. Extract the
+complete helper archive into a new empty sibling directory, with the existing
+service owner and private root mode; preserve reviewed executable modes. Verify
+every helper file against `receipts/source-files.json`. Stage the approved
+manifest candidate separately. After approval, stop the service through its
+established manager and confirm its owned Runtime/provider processes exit.
+Replace the full helper tree as a unit at its exact embedded root, then replace
+the binaries and manifest from the verified staged files. Keep the service
+stopped if a replacement fails, restore the complete approved rollback set,
+and verify its parity before restart. Start the same service with its retained
+gateway arguments and environment.
+
+Compare the installed and running Runtime/provider hashes and sizes with
+`receipts/build.json`, verify the installed IPFS pin with the reviewed
+`installed-provider-verify.sh --require-verified ipfs-provider`, and recheck the
+helper-source hashes. Confirm that the provider received the Runtime-owned
+Gateway role. Let Kubo remain idle for more than 600 seconds without content,
+health or preparation requests. Observe its unchanged process identity and
+unchanged `last_used` coordinates locally. The first operation after idle is
+an isolated consumer's typed Content fetch over Carrier for the complete release
+binary. Verify its signed hash, full size and version, and record read latency
+plus unchanged Kubo, Runtime and provider generations. Keep the consumer's
+local IPFS provider and Kubo absent. The earlier frozen-user recovery receipt
+remains separate evidence for default-user idle stop and restart behavior.
+
+Verify the public gateway and current publication after restart. Stop all
+isolated consumer processes and retain their safe receipts under the approved
+custody. Record exact package source, artifact, installed parity and idle/read
+results in #89. Remove the rollback set when the installed acceptance gate
+closes.

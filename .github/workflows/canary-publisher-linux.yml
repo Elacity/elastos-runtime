@@ -2,10 +2,32 @@
 name: Canary Linux publisher
 
 on:
-  push:
-    branches: [fix/89-canary-inputs]
-    paths: [.github/workflows/canary-publisher-linux.yml]
   workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact reviewed source commit merged into develop
+        required: true
+        default: 8a9dec16b4febfac5759883ec7462e1ea780dd59
+        type: string
+      source_tree:
+        description: Exact source tree of that commit
+        required: true
+        default: e18d17a3431b4d2548796347528e28afee909e35
+        type: string
+      source_ci_run:
+        description: Completed successful same-source CI run
+        required: true
+        default: '37086607684'
+        type: string
+      lifecycle_proof_run:
+        description: Successful Canary Linux holder run for the same source tree (always_on only)
+        required: false
+        type: string
+      always_on:
+        description: Require successful matching-tree gateway lifetime proof before packaging
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -16,9 +38,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_COMMIT: 8a9dec16b4febfac5759883ec7462e1ea780dd59
-  SOURCE_TREE: e18d17a3431b4d2548796347528e28afee909e35
-  ACCEPTED_CI_RUN: '37086607684'
+  SOURCE_COMMIT: ${{ inputs.source_commit || '8a9dec16b4febfac5759883ec7462e1ea780dd59' }}
+  SOURCE_TREE: ${{ inputs.source_tree || 'e18d17a3431b4d2548796347528e28afee909e35' }}
+  ACCEPTED_CI_RUN: ${{ inputs.source_ci_run || '37086607684' }}
+  ALWAYS_ON: ${{ inputs.always_on == true && 'true' || 'false' }}
+  LIFECYCLE_PROOF_RUN: ${{ inputs.lifecycle_proof_run || '' }}
   HELPER_APPROVAL_COMMENT: '5969584669'
   HELPER_APPROVAL_SHA256: 635aa0a1cb223111ab430beb8cfe888887767e90da56ce7c6fb6dd3a6eba3d04
   ELASTOS_RELEASE_VERSION: 0.8.0-alpha.1
@@ -34,7 +58,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: check out frozen reviewed source
+      - name: check out exact reviewed source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_COMMIT }}
@@ -49,6 +73,9 @@ jobs:
           umask 077
           [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
           [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/Linux/X64 ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ACCEPTED_CI_RUN" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ALWAYS_ON" == false || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
           [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
@@ -70,9 +97,17 @@ jobs:
           commit, tree = os.environ['SOURCE_COMMIT'], os.environ['SOURCE_TREE']
           run = api(f"/repos/{repository}/actions/runs/{os.environ['ACCEPTED_CI_RUN']}")
           assert run['status'] == 'completed' and run['conclusion'] == 'success' and run['head_sha'] == commit
+          assert run['head_repository']['full_name'] == repository
+          assert run['path'] == '.github/workflows/ci.yml'
+          if os.environ['ALWAYS_ON'] == 'true':
+              assert (Path('scripts/holder-idle-ci.py')).is_file()
+              assert re.fullmatch(r'[1-9][0-9]*', os.environ['LIFECYCLE_PROOF_RUN'])
+          else:
+              assert commit == '8a9dec16b4febfac5759883ec7462e1ea780dd59', 'New source requires the always-on qualification'
           head = api(f'/repos/{repository}/git/ref/heads/develop')['object']['sha']
           comparison = api(f'/repos/{repository}/compare/{commit}...{head}?per_page=1')
           assert comparison['status'] in ('ahead', 'identical') and comparison['behind_by'] == 0
+          assert comparison['base_commit']['sha'] == commit
           decision = api(f"/repos/{repository}/issues/comments/{os.environ['HELPER_APPROVAL_COMMENT']}")
           assert decision['user']['login'] == 'andersalm'
           assert hashlib.sha256(decision['body'].encode()).hexdigest() == os.environ['HELPER_APPROVAL_SHA256']
@@ -88,7 +123,8 @@ jobs:
               'source_commit': commit, 'source_tree': tree, 'source_ci': run['html_url'],
               'develop_oid_observed': head, 'helper_root': root,
               'helper_approval': decision['html_url'], 'helper_approval_sha256': os.environ['HELPER_APPROVAL_SHA256'],
-              'operator_gate': 'Install the full frozen source tree at this root as the existing service owner.'}, indent=2) + '\n')
+              'always_on_requested': os.environ['ALWAYS_ON'] == 'true',
+              'operator_gate': 'Exact Runtime, provider, helper source and manifest upgrade needs operator approval.'}, indent=2) + '\n')
           free = shutil.disk_usage(output)
           assert free.free * 100 > free.total * 15 and free.free > 20 * 1024**3
           with open(os.environ['GITHUB_ENV'], 'a') as environment:
@@ -97,6 +133,117 @@ jobs:
           PY
           git archive --format=tar "$SOURCE_COMMIT" > "$RUNNER_TEMP/seed-source.tar"
           gzip -n -c "$RUNNER_TEMP/seed-source.tar" > "$RUNNER_TEMP/seed-publisher/source.tar.gz"
+      - name: admit the matching-source lifecycle proof separately from seed binary qualification
+        if: ${{ env.ALWAYS_ON == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import hashlib, io, json, os, re, stat, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path
+          repository = 'Elacity/elastos-runtime'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+          def api(path):
+              request = urllib.request.Request('https://api.github.com' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with opener.open(request, timeout=30) as response:
+                  payload = response.read(2 * 1024**2 + 1)
+                  assert len(payload) <= 2 * 1024**2
+                  return json.loads(payload)
+          run_id = os.environ['LIFECYCLE_PROOF_RUN']
+          run = api(f'/repos/{repository}/actions/runs/{run_id}')
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['path'] == '.github/workflows/canary-holder-linux.yml'
+          assert run['head_repository']['full_name'] == repository
+          assert run['event'] in ('pull_request', 'workflow_dispatch')
+          items = api(f'/repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+          assert items['total_count'] <= 100
+          name = 'holder-idle-observations-' + str(run['run_attempt'])
+          matches = [item for item in items['artifacts'] if item['name'] == name]
+          assert len(matches) == 1
+          artifact = matches[0]
+          assert not artifact['expired'] and artifact['workflow_run']['id'] == int(run_id)
+          assert artifact['workflow_run']['head_sha'] == run['head_sha']
+          assert 0 < artifact['size_in_bytes'] <= 128 * 1024**2
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest'])
+          try:
+              api(f"/repos/{repository}/actions/artifacts/{artifact['id']}/zip")
+              raise ValueError('Expected authenticated artifact redirect')
+          except urllib.error.HTTPError as response:
+              assert response.code == 302
+              location = response.headers['Location']
+          url = urllib.parse.urlsplit(location)
+          assert url.scheme == 'https' and url.hostname and not url.username and not url.password
+          archive = io.BytesIO()
+          with opener.open(location, timeout=60) as response:
+              while chunk := response.read(1024**2):
+                  archive.write(chunk)
+                  assert archive.tell() <= artifact['size_in_bytes']
+          assert archive.tell() == artifact['size_in_bytes']
+          assert 'sha256:' + hashlib.sha256(archive.getbuffer()).hexdigest() == artifact['digest']
+          archive.seek(0)
+          records = {}
+          with zipfile.ZipFile(archive) as zipped:
+              assert len(zipped.infolist()) <= 256
+              assert len(zipped.namelist()) == len(set(zipped.namelist()))
+              for filename in ('holder-always-on.json', 'gateway-runtime-build.json', 'provider-build.json'):
+                  member = zipped.getinfo(filename)
+                  assert stat.S_IFMT(member.external_attr >> 16) in (0, stat.S_IFREG)
+                  assert 0 < member.file_size <= 1024**2 and not member.flag_bits & 1
+                  records[filename] = zipped.read(member)
+          proof = json.loads(records['holder-always-on.json'])
+          runtime = json.loads(records['gateway-runtime-build.json'])
+          provider = json.loads(records['provider-build.json'])
+          assert proof['schema'] == 'elastos.issue89.holder-always-on/v1'
+          assert proof['passed'] and 'failure' not in proof and proof['fixture_removed']
+          assert proof['candidate_helper_removed'] and proof['cleanup']['remaining_pids'] == []
+          assert proof['cleanup']['errors'] == [] and not proof['source_modified']
+          assert proof['role'] == 'gateway' and proof['same_kubo_generation']
+          assert proof['service_restarts'] == proof['provider_restarts'] == 0
+          assert proof['clock'] == 'real monotonic elapsed idle; no coordination clock changes'
+          assert proof['idle_elapsed_seconds'] >= 665
+          assert proof['last_used_before'] == proof['last_used_after_idle']
+          read = proof['carrier_read']
+          assert not read['consumer_local_backend'] and not read['legacy_content_fetch_journey']
+          assert read['size'] == 114187264
+          assert read['sha256'] == '4bddc736f6bca7871218172067edc55c1337672eaff260b0272f48f35366457a'
+          assert read['version'] == 'elastos ' + os.environ['ELASTOS_RELEASE_VERSION']
+          assert read['transport'] == 'typed availability / Carrier provider_invoke / holder Content / native IPFS cat'
+          assert proof['consumer_source_commit'] == '8a9dec16b4febfac5759883ec7462e1ea780dd59'
+          assert proof['consumer_source_tree'] == 'e18d17a3431b4d2548796347528e28afee909e35'
+          assert proof['consumer_runtime']['sha256'] == read['sha256']
+          assert proof['consumer_runtime']['size'] == read['size']
+          localhost = proof['localhost_fixture']
+          assert localhost['source_commit'] == proof['consumer_source_commit']
+          assert localhost['source_tree'] == proof['consumer_source_tree'] and not localhost['seed_package']
+          assert 0 < read['elapsed_seconds'] <= read['immediate_read_bound_seconds'] == 15
+          assert runtime == proof['installed_runtime'] and provider == proof['installed_provider']
+          assert proof['source_commit'] == runtime['source_commit'] == provider['source_commit'] == run['head_sha']
+          assert proof['source_tree'] == runtime['source_tree'] == provider['source_tree'] == os.environ['SOURCE_TREE']
+          commit = api(f"/repos/{repository}/git/commits/{proof['source_commit']}")
+          assert commit['tree']['sha'] == os.environ['SOURCE_TREE']
+          assert runtime['helper_root'] == '/home/runner/.local/share/elastos-issue89-candidate/source'
+          assert not runtime['seed_package'] and not proof['seed_package']
+          for record in (runtime, provider):
+              assert re.fullmatch(r'[0-9a-f]{64}', record['sha256']) and record['size'] > 0
+          receipts = Path(os.environ['PUBLISHER_ARTIFACT']) / 'receipts'
+          for filename, payload in records.items():
+              (receipts / ('tested-' + filename)).write_bytes(payload)
+          (receipts / 'lifecycle-admission.json').write_text(json.dumps({
+              'run': run['html_url'], 'run_id': int(run_id), 'run_attempt': run['run_attempt'],
+              'run_head_sha': run['head_sha'], 'artifact_id': artifact['id'], 'artifact_digest': artifact['digest'],
+              'tested_source_commit': proof['source_commit'], 'source_tree': proof['source_tree'],
+              'package_source_commit': os.environ['SOURCE_COMMIT'],
+              'tested_runtime': runtime, 'tested_provider': provider,
+              'qualification': 'Matching source tree; real 665-second CI gateway lifecycle proof at its CI helper root.',
+              'operator_gate': 'Rebuilt seed Runtime/provider bytes require installed same-generation idle and first Carrier read proof.'}, indent=2) + '\n')
+          PY
       - name: place source at its qualified compile-time root
         run: |
           set -euo pipefail
@@ -135,7 +282,7 @@ jobs:
           python3 -c 'import shutil; d=shutil.disk_usage("."); assert d.free*100>d.total*15'
           CARGO_TARGET_DIR="$SEED_HELPER_ROOT/elastos/target" cargo build --locked --release \
             --target x86_64-unknown-linux-gnu --manifest-path "$SEED_HELPER_ROOT/capsules/ipfs-provider/Cargo.toml"
-      - name: run frozen signed-publication refused cases
+      - name: run same-source signed-publication refused cases
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -201,7 +348,37 @@ jobs:
                      'publish_help': help_result.stdout.decode(), 'owned_processes': [],
                      'qualification_home_removed': True,
                      'operator_gate': 'Seed upgrade, Kubo/provider qualification and real signed import remain operator proof.'}
+          if os.environ['ALWAYS_ON'] == 'true':
+              lifecycle = json.loads((output / 'receipts/lifecycle-admission.json').read_bytes())
+              assert lifecycle['source_tree'] == receipt['source_tree']
+              receipt['lifecycle_source_qualification'] = lifecycle
+              receipt['seed_bytes_lifecycle_tested'] = False
+              receipt['operator_gate'] = 'Approve this Runtime+provider+helper+manifest set; installed idle/Carrier acceptance remains required.'
           (output / 'receipts/build.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          entry = json.loads((root / 'components.json').read_bytes())['external']['ipfs-provider']
+          provider = next(item for item in records if item['name'] == 'ipfs-provider')
+          assert entry['install_path'] == 'bin/ipfs-provider'
+          assert entry['provider_runtime']['role'] == 'provider'
+          assert entry['provider_runtime']['substrate'] == 'native'
+          assert entry['provider_runtime']['runtime_abi'] == 'elastos.provider-stdio/v1'
+          entry['platforms'] = {'linux-amd64': {'install_path': 'bin/ipfs-provider',
+              'checksum': 'sha256:' + provider['sha256'], 'size': provider['size']}}
+          (output / 'installed-component.json').write_text(json.dumps({
+              'name': 'ipfs-provider', 'entry': entry,
+              'source_commit': receipt['source_commit'], 'source_tree': receipt['source_tree'],
+              'runtime_source_commit': receipt['source_commit'], 'runtime_source_tree': receipt['source_tree'],
+              'management': 'operator-managed-local-overlay',
+              'build_receipt_sha256': hashlib.sha256((output / 'receipts/build.json').read_bytes()).hexdigest(),
+              'operator_gate': 'Preserve the installed manifest; replace only its reviewed Linux IPFS pin.'}, indent=2) + '\n')
+          PY
+      - name: seal the qualified public package
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          output = Path(os.environ['PUBLISHER_ARTIFACT'])
           free = shutil.disk_usage(output)
           assert free.free * 100 > free.total * 15
           files = sorted(path for path in output.rglob('*') if path.is_file())
