@@ -1,4 +1,4 @@
-//! Offline release-file transaction. Destinations retain their installed paths.
+//! Installed release-file transaction. Journal schemas bind their fixed destinations.
 //! Installer adoption of this lock is a separate release-owner integration.
 
 use std::collections::{BTreeMap, BTreeSet};

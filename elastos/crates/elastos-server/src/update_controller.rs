@@ -853,8 +853,8 @@ impl Controller {
             self.request.is_some(),
             "Pending update has no consumed request; preserve its recovery owner."
         );
-        // Before activation no new host has a start claim. The unchanged v1 files
-        // can recover under both locks, then the consumed request is retired.
+        // Before activation no new host has a start claim. Unchanged CLI files
+        // recover in their journal namespace under both locks, then retire the request.
         let Some(record) = transaction.restart_record_if_any()? else {
             let offline = crate::host_lock::acquire_host_process_lock(
                 &self.receipt.data_dir,
