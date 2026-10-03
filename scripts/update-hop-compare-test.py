@@ -841,7 +841,7 @@ class CliFixtureTests(unittest.TestCase):
             for name in ("ipfs-provider", "kubo", "localhost-provider")}})
         return support
 
-    def initial_home_fixture(self):
+    def initial_home_fixture(self, home_url="http://localhost:8090/home/"):
         support = self.qualified_home_support()
         entry, paths, descriptor = observer.cli_qualified_home(support, "darwin-arm64")
         mapping = {}
@@ -895,7 +895,7 @@ class CliFixtureTests(unittest.TestCase):
                   "message": "ready fixture", "controller_pid": 45001, "controller_start": identities[45001]["start"],
                   "host_pid": 45002, "generation": "a" * 32}
         coords = {"api_url": "http://127.0.0.1:60123", "attach_secret": "b" * 64, "pid": 45002, "runtime_kind": "gateway",
-                  "binary_sha256": observer.digest(binary), "generation": status["generation"], "home_url": "http://localhost:8090/home/"}
+                  "binary_sha256": observer.digest(binary), "generation": status["generation"], "home_url": home_url}
         lock = {"pid": 45002, "role": "gateway", "addr": "localhost:8090", "generation": status["generation"]}
         for path, value in ((controller_directory / "receipt.json", receipt), (controller_directory / "status.json", status),
                             (directory / "gateway-runtime-coords.json", coords), (directory / "host-process.lock", lock)):
@@ -912,12 +912,12 @@ class CliFixtureTests(unittest.TestCase):
             if url.endswith("/api/health"):
                 self.assertEqual(token, "private fixture token")
                 return json.dumps({"version": self.manifest["old"]["version"]}).encode()
-            self.assertEqual(url, "http://127.0.0.1:8090/home/")
+            self.assertEqual(url, home_url)
             return (directory / self.manifest["initial_home"]["entrypoint"]).read_bytes()
         return home, directory, process, status, identities, executables, response
 
     def test_initial_home_matches_signed_controller_live_generation_and_private_attach(self):
-        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture("http://[::1]:8090/home/")
         observer.cli_admit_home_support(self.root, self.manifest)
         manager = SimpleNamespace(roots={})
         with patch.object(observer, "cli_process_identity", side_effect=identities.get), \
@@ -925,6 +925,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "lock_state", return_value="held"):
             proof = observer.cli_observe_initial_home(manager, self.manifest, home, process, status)
         self.assertTrue(proof["authenticated_health"])
+        self.assertEqual(proof["home_url"], "http://[::1]:8090/home/")
         self.assertEqual(proof["host"], identities[45002])
         self.assertEqual(proof["home_sha256"], observer.digest(directory / self.manifest["initial_home"]["entrypoint"]))
         self.assertNotIn("attach_secret", json.dumps(proof))
@@ -1075,7 +1076,12 @@ class CliFixtureTests(unittest.TestCase):
         path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "ownership"):
             observer.cli_private_json(path)
-        for value in ("https://localhost:8090/home/", "http://example.test:8090/home/", "http://localhost:8090/home/?secret=x"):
+        for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"):
+            with self.subTest(accepted=value):
+                self.assertEqual(observer.cli_home_base(value, public=True).port, 8090)
+        for value in ("https://localhost:8090/home/", "http://example.test:8090/home/", "http://localhost:8090/home/?secret=x",
+                      "http://[::1]:8091/home/", "http://[::1]:8090/", "http://[::1]:8090/home/#fragment",
+                      "http://owner@[::1]:8090/home/", "http://[::2]:8090/home/"):
             with self.assertRaises(ValueError):
                 observer.cli_home_base(value, public=True)
 

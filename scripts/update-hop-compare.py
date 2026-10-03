@@ -1617,11 +1617,11 @@ def cli_private_json(path, limit=256 * 1024):
 
 def cli_home_base(value, public=False):
     url = urllib.parse.urlsplit(value)
-    need(url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1") and url.port
+    need(url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1") and url.port
          and not url.username and not url.password and not url.query and not url.fragment,
          "Home readiness address is not exact loopback HTTP")
     need(url.path == ("/home/" if public else ""), "Home readiness address has an unexpected path")
-    need(not public or value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/"),
+    need(not public or value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"),
          "Home readiness listener differs")
     return url
 
@@ -1704,7 +1704,7 @@ def cli_observe_initial_home(processes, manifest, home_path, process, status):
     health_reply = json.loads(cli_home_response(coords["api_url"] + "/api/health", 4096, token=token))
     need(health_reply["version"] == manifest["old"]["version"], "authenticated Home health version differs")
     document = directory / manifest["initial_home"]["entrypoint"]
-    served = cli_home_response("http://127.0.0.1:8090/home/", 2 * 1024 * 1024)
+    served = cli_home_response(coords["home_url"], 2 * 1024 * 1024)
     need(hashlib.sha256(served).hexdigest() == digest(document), "served Home differs from its installed capsule")
     need(cli_process_identity(process.pid) == controller_identity and cli_process_identity(host_identity["pid"]) == host_identity
          and cli_private_json(coords_path) == coords and process.poll() is None, "Home generation changed during readiness proof")
