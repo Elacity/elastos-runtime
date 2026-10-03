@@ -13,6 +13,7 @@ use elastos_common::localhost::{publisher_release_head_path, publisher_release_m
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+const INSTALL_LOCK: &str = ".elastos.install.lock";
 const JOURNAL: &str = ".elastos.update-journal.json";
 const JOURNAL_TMP: &str = ".elastos.update-journal.tmp";
 const STAGE: &str = ".elastos.update-stage";
@@ -81,8 +82,46 @@ struct Journal {
     entries: Vec<Entry>,
 }
 
-pub(crate) struct InstallTransaction {
+/// Serializes installation writers at the resolved binary parent. The lock path
+/// stays in place after the guard closes its file and releases the flock.
+pub(crate) struct InstallationGuard {
     _lock: File,
+}
+
+impl InstallationGuard {
+    pub(crate) fn acquire(binary_parent: &Path) -> anyhow::Result<Self> {
+        if !binary_parent.is_absolute() {
+            bail!("installation binary parent must be an absolute existing path");
+        }
+        let binary_parent =
+            fs::canonicalize(binary_parent).context("resolve installation binary parent")?;
+        check_directory(&binary_parent)?;
+        let lock_path = binary_parent.join(INSTALL_LOCK);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .context("open installation lock")?;
+        check_file(&lock, &lock_path, true)?;
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("another writer owns the installation lock");
+        }
+        Ok(Self { _lock: lock })
+    }
+}
+
+pub(crate) struct InstallTransaction {
+    _guard: InstallationGuard,
     data_dir: PathBuf,
     binary: PathBuf,
     destinations: BTreeMap<ReleaseFile, PathBuf>,
@@ -111,26 +150,7 @@ impl InstallTransaction {
         }
         let binary = bin_parent.join(basename);
         file_state(&binary)?;
-        let lock_path = bin_parent.join(".elastos.install.lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
-            .context("open installation lock")?;
-        check_file(&lock, &lock_path, true)?;
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&lock),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("another writer owns the installation lock");
-        }
+        let guard = InstallationGuard::acquire(&bin_parent)?;
         let destinations = BTreeMap::from([
             (ReleaseFile::RuntimeBinary, binary.clone()),
             (ReleaseFile::Components, data_dir.join("components.json")),
@@ -148,7 +168,7 @@ impl InstallTransaction {
             bail!("release destinations overlap");
         }
         let tx = Self {
-            _lock: lock,
+            _guard: guard,
             data_dir,
             binary,
             destinations,
@@ -190,7 +210,7 @@ impl InstallTransaction {
             self.binary.clone(),
             self.journal_path(),
             self.binary.parent().unwrap().join(JOURNAL_TMP),
-            self.binary.parent().unwrap().join(".elastos.install.lock"),
+            self.binary.parent().unwrap().join(INSTALL_LOCK),
         ]);
         for parent in self.parents() {
             paths.insert(parent.join(STAGE));
@@ -977,6 +997,224 @@ mod tests {
     }
 
     #[test]
+    fn installation_guard_and_transaction_share_ownership_until_drop() {
+        let fixture = Fixture::new();
+        let parent = fixture.binary.parent().unwrap();
+        let guard = InstallationGuard::acquire(parent).unwrap();
+        assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
+        drop(guard);
+        let writer = fixture.writer();
+        assert!(InstallationGuard::acquire(parent).is_err());
+        drop(writer);
+        let guard = InstallationGuard::acquire(parent).unwrap();
+        let inode = fs::metadata(parent.join(INSTALL_LOCK)).unwrap().ino();
+        drop(guard);
+        assert_eq!(
+            fs::metadata(parent.join(INSTALL_LOCK)).unwrap().ino(),
+            inode
+        );
+        let _writer = fixture.writer();
+    }
+
+    #[test]
+    fn installation_guard_resolves_aliases_and_keeps_distinct_parents_independent() {
+        let fixture = Fixture::new();
+        let parent = fixture.binary.parent().unwrap();
+        let alias = fixture._root.path().join("bin-alias");
+        symlink(parent, &alias).unwrap();
+        let other = fixture._root.path().join("other-bin");
+        fs::create_dir(&other).unwrap();
+        let guard = InstallationGuard::acquire(&alias).unwrap();
+        assert!(InstallationGuard::acquire(&parent.join(".")).is_err());
+        assert!(InstallTransaction::acquire(&fixture.data, &alias.join("elastos")).is_err());
+        let _other_guard = InstallationGuard::acquire(&other).unwrap();
+        drop(guard);
+        let _writer = fixture.writer();
+    }
+
+    #[test]
+    fn installation_guard_preserves_journal_scratch_and_release_files() {
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
+            let mut entries = BTreeMap::new();
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_name().unwrap() == INSTALL_LOCK {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let bytes = metadata.is_file().then(|| fs::read(&path).unwrap());
+                entries.insert(path.clone(), (metadata.mode(), bytes));
+                if metadata.is_dir() {
+                    entries.extend(snapshot(&path));
+                }
+            }
+            entries
+        }
+
+        let fixture = Fixture::new();
+        let writer = fixture.writer();
+        fixture.old_files(&writer, false);
+        writer.prepare(&candidate()).unwrap();
+        let parent = fixture.binary.parent().unwrap();
+        drop(writer);
+        fs::remove_file(parent.join(INSTALL_LOCK)).unwrap();
+        let before = snapshot(fixture._root.path());
+        let guard = InstallationGuard::acquire(parent).unwrap();
+        assert_eq!(snapshot(fixture._root.path()), before);
+        let lock = parent.join(INSTALL_LOCK);
+        assert!(fs::read(&lock).unwrap().is_empty());
+        assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+        drop(guard);
+        assert_eq!(snapshot(fixture._root.path()), before);
+        assert!(lock.exists());
+    }
+
+    // A child uses the raw flock interface, independently of InstallationGuard.
+    // Only the parent test selects this helper and supplies its isolated inputs.
+    #[test]
+    #[ignore]
+    fn installation_guard_raw_flock_child() {
+        use std::os::fd::AsRawFd;
+
+        let parent = std::env::var_os("ELASTOS_INSTALL_LOCK_TEST_PARENT").unwrap();
+        let action = std::env::var("ELASTOS_INSTALL_LOCK_TEST_ACTION").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(Path::new(&parent).join(INSTALL_LOCK))
+            .unwrap();
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if action == "busy" {
+            assert_eq!(result, -1);
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            );
+            println!("\ninstallation-raw-lock:busy");
+        } else {
+            assert_eq!(action, "free");
+            assert_eq!(result, 0);
+            println!("\ninstallation-raw-lock:acquired");
+        }
+    }
+
+    #[test]
+    fn installation_guard_interoperates_with_raw_flock_in_another_process() {
+        use std::process::Command;
+
+        let fixture = Fixture::new();
+        let parent = fixture.binary.parent().unwrap();
+        let test = format!(
+            "{}::installation_guard_raw_flock_child",
+            module_path!().split_once("::").unwrap().1
+        );
+        let child_command = |action: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .env("ELASTOS_INSTALL_LOCK_TEST_PARENT", parent)
+                .env("ELASTOS_INSTALL_LOCK_TEST_ACTION", action)
+                .args(["--exact", &test, "--ignored", "--nocapture"]);
+            command
+        };
+        let guard = InstallationGuard::acquire(parent).unwrap();
+        let output = child_command("busy").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "installation-raw-lock:busy"));
+        drop(guard);
+
+        let output = child_command("free").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "installation-raw-lock:acquired"));
+        let _guard = InstallationGuard::acquire(parent).unwrap();
+    }
+
+    #[test]
+    fn installation_guard_refuses_unsafe_locks_and_preserves_their_state() {
+        for mutation in [
+            "hardlink",
+            "directory",
+            "0640",
+            "0601",
+            "0660",
+            "4600",
+            "2600",
+        ] {
+            let fixture = Fixture::new();
+            let lock = fixture.binary.parent().unwrap().join(INSTALL_LOCK);
+            let protected = fixture.data.join("owner-data");
+            match mutation {
+                "hardlink" => {
+                    fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::hard_link(&protected, &lock).unwrap();
+                }
+                "directory" => fs::create_dir(&lock).unwrap(),
+                mode => {
+                    fs::write(&lock, b"preserve lock bytes").unwrap();
+                    fs::set_permissions(
+                        &lock,
+                        fs::Permissions::from_mode(u32::from_str_radix(mode, 8).unwrap()),
+                    )
+                    .unwrap();
+                }
+            }
+            let before = fs::symlink_metadata(&lock).unwrap();
+            assert!(
+                InstallationGuard::acquire(fixture.binary.parent().unwrap()).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err(),
+                "{mutation}"
+            );
+            let after = fs::symlink_metadata(&lock).unwrap();
+            assert_eq!(
+                (after.ino(), after.mode(), after.nlink()),
+                (before.ino(), before.mode(), before.nlink())
+            );
+            if after.is_file() {
+                assert_eq!(
+                    fs::read(&lock).unwrap(),
+                    if mutation == "hardlink" {
+                        b"data written by owner".as_slice()
+                    } else {
+                        b"preserve lock bytes".as_slice()
+                    }
+                );
+            }
+            assert_eq!(fs::read(protected).unwrap(), b"data written by owner");
+        }
+    }
+
+    #[test]
+    fn installation_guard_refuses_unsafe_missing_and_relative_parents() {
+        let fixture = Fixture::new();
+        let parent = fixture.binary.parent().unwrap();
+        let missing = parent.join("missing");
+        assert!(InstallationGuard::acquire(&missing).is_err());
+        assert!(!missing.exists());
+        assert!(InstallationGuard::acquire(Path::new(".")).is_err());
+        let file = fixture.data.join("owner-data");
+        assert!(InstallationGuard::acquire(&file).is_err());
+        for mode in [0o770, 0o707] {
+            fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(InstallationGuard::acquire(parent).is_err());
+            assert!(!parent.join(INSTALL_LOCK).exists());
+            assert_eq!(fs::metadata(parent).unwrap().mode() & 0o777, mode);
+        }
+        assert_eq!(fs::read(file).unwrap(), b"data written by owner");
+    }
+
+    #[test]
     fn every_late_file_failure_restores_complete_previous_release() {
         for absent in [false, true] {
             for fault in ReleaseFile::ALL {
@@ -1105,14 +1343,11 @@ mod tests {
         let writer = fixture.writer();
         assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
         drop(writer);
-        let lock = fixture
-            .binary
-            .parent()
-            .unwrap()
-            .join(".elastos.install.lock");
+        let lock = fixture.binary.parent().unwrap().join(INSTALL_LOCK);
         fs::remove_file(&lock).unwrap();
         let protected = fixture.data.join("owner-data");
         symlink(&protected, &lock).unwrap();
+        assert!(InstallationGuard::acquire(fixture.binary.parent().unwrap()).is_err());
         assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
         assert_eq!(fs::read(&protected).unwrap(), b"data written by owner");
         fs::remove_file(lock).unwrap();
