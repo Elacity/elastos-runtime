@@ -262,21 +262,29 @@ jobs:
               matches = re.findall(re.escape(marker) + r" <<'PY'\n(.*?)\nPY", runbook, re.S)
               assert len(matches) == 1
               return matches[0]
-          public_program = operator_python('"$PINNED_PYTHON" -I -S - "$INPUTS" "$CUSTODY/verified-baseline-receipt.json"')
           permission_program = operator_python('python3 -I -S - "$SEED_DATA_DIR"')
           seed_program = operator_python('python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT"')
           migration = scratch / 'migration-qualification'
           migration.mkdir(mode=0o700)
           baseline = migration / 'verified-baseline-receipt.json'
-          if os.environ['FINALIZE_V2'] == 'true':
-              # V1 now owns the live origin. Use the previously verified old
-              # baseline only for isolated filesystem refusal tests; the V2
-              # branch below verifies the live signed V1 and its real CIDs.
-              baseline.write_bytes((root / 'public-baseline/suggested-publish-state.json').read_bytes())
-              baseline.chmod(0o600)
-          else:
-              subprocess.run([sys.executable, '-I', '-S', '-', str(root), str(baseline)],
-                             input=public_program.encode(), env={'PATH': '/usr/bin:/bin'}, check=True, capture_output=True, timeout=90)
+          # The accepted original artifact already binds this signed baseline.
+          # Filesystem qualification uses those authenticated retained bytes,
+          # so an operator upgrade window or published V1 cannot invalidate it.
+          # The operator still checks the live chain before its first import;
+          # V2 finalization below verifies the actual live signed V1 and CIDs.
+          public_proof = read_json(root / 'receipts/public-verification.json')
+          baseline_record = read_json(root / 'public-baseline/suggested-publish-state.json')
+          head_bytes = (root / 'public-baseline/release-head.json').read_bytes()
+          release_bytes = (root / 'public-baseline/release.json').read_bytes()
+          assert public_proof['signatures'] == 'OpenSSL 3 Ed25519 verification passed'
+          assert public_proof['source_commit'] == commit and public_proof['source_tree'] == tree
+          assert signer.sha256(head_bytes) == public_proof['head_sha256']
+          assert signer.sha256(release_bytes) == public_proof['release_sha256']
+          assert baseline_record['publisher_did'] == public_proof['baseline_did']
+          assert baseline_record['last_head_cid'] == signer.unixfs_metadata_cid(head_bytes) == manifests['unsigned-V1']['head']['prev_head_cid']
+          assert baseline_record['last_release_cid'] == signer.unixfs_metadata_cid(release_bytes) == manifests['unsigned-V1']['release']['prev_release_cid']
+          baseline.write_bytes((root / 'public-baseline/suggested-publish-state.json').read_bytes())
+          baseline.chmod(0o600)
           checks = []
           def provision(data, succeeds):
               result = subprocess.run([sys.executable, '-I', '-S', '-', str(data), str(baseline)],
@@ -378,7 +386,8 @@ jobs:
           shutil.rmtree(migration)
           (root / 'receipts/migration-qualification.json').write_text(json.dumps({
               'checks': checks, 'all_passed': True, 'isolated_data_removed': True,
-              'old_baseline_online_verified': os.environ['FINALIZE_V2'] != 'true',
+              'old_baseline_online_verified': False,
+              'baseline_verification': 'authenticated original artifact and operator live-chain comparison before import',
               'runbook_sha256': hashlib.sha256(runbook.encode()).hexdigest(),
               'operator_gate': 'Anders approves the real seed migration and upgrade/import window.'}, indent=2) + '\n')
           v2_state = 'PROVISIONAL; real signed V1 CIDs required'
