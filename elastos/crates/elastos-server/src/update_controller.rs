@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -531,7 +531,7 @@ impl Controller {
         )?;
         self.previous_binary_sha256 =
             admit_installed_release(&signed, &source, &self.receipt.binary)?;
-        self.previous_version = source.installed_version;
+        self.previous_version = source.installed_version.clone();
         let client =
             Arc::new(crate::carrier::CarrierClient::connect_trusted_source(&source, 15).await?);
         self.carrier = Some(client.clone());
