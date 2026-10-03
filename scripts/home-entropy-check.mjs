@@ -1906,7 +1906,7 @@ const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
 const homeGuiAssetVersion = "home-20260813a";
-const homeShellHostAssetVersion = "home-20260802a";
+const homeShellHostAssetVersion = "home-update-20261003a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -5534,7 +5534,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-models-20260923a";
+const systemAssetVersion = "system-update-20261003a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {

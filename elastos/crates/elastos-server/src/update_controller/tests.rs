@@ -1006,3 +1006,385 @@ async fn readiness_http_response_refuses_status_and_size_before_use() {
         }
     }
 }
+
+fn owner_queue_fixture() -> (PrivateFixture, UpdateRequest) {
+    let fixture = PrivateFixture::new();
+    publish_retained_receipt(&fixture);
+    crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
+    let (_, request, _) = choice_fixture();
+    publish_owner_queue_status(&fixture, &request, "ready", None);
+    assert!(!has_queued_update(&fixture.data).unwrap());
+    reserve_owner_update(
+        &fixture.data,
+        &request,
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+        false,
+    )
+    .unwrap();
+    (fixture, request)
+}
+
+fn publish_owner_queue_status(
+    fixture: &PrivateFixture,
+    request: &UpdateRequest,
+    phase: &str,
+    completed_version: Option<&str>,
+) {
+    write_private(
+        &fixture.directory.join(STATUS),
+        &UpdateStatus {
+            id: (phase != "ready").then(|| request.id.clone()),
+            phase: phase.into(),
+            current_version: completed_version.unwrap_or(&request.current_version).into(),
+            new_version: (phase != "ready").then(|| request.new_version.clone()),
+            message: "isolated owner queue fixture".into(),
+            controller_pid: std::process::id(),
+            controller_start: process_start(std::process::id()).unwrap(),
+            host_pid: Some(std::process::id()),
+            generation: "d".repeat(32),
+        },
+    )
+    .unwrap();
+}
+
+fn owner_effect_sha() -> String {
+    digest(b"isolated exact owner approval intent")
+}
+
+#[test]
+fn owner_update_queue_records_one_private_effect_and_retries_exactly() {
+    let (fixture, request) = owner_queue_fixture();
+    queue_owner_update(
+        &fixture.data,
+        request.clone(),
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+    )
+    .unwrap();
+    assert!(has_queued_update(&fixture.data).unwrap());
+    let queued: UpdateRequest = read_private_json(&fixture.directory.join(REQUEST)).unwrap();
+    assert_eq!(queued, request);
+    let receipt_path = fixture.directory.join("owner-action.json");
+    let receipt: OwnerActionReceipt = read_private_json(&receipt_path).unwrap();
+    assert!(receipt.queued);
+    assert_eq!(receipt.request, request);
+    assert_eq!(receipt.effect_id, "passkey:step-up:fixture");
+    assert_eq!(receipt.request_sha256, owner_effect_sha());
+    assert_eq!(fs::metadata(receipt_path).unwrap().mode() & 0o7777, 0o600);
+    assert_eq!(
+        fs::metadata(fixture.directory.join(REQUEST))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    let queued_snapshot = fixture.snapshot();
+    for recovered in [false, true] {
+        reserve_owner_update(
+            &fixture.data,
+            &request,
+            "passkey:step-up:fixture",
+            &owner_effect_sha(),
+            recovered,
+        )
+        .unwrap();
+        queue_owner_update(
+            &fixture.data,
+            request.clone(),
+            "passkey:step-up:fixture",
+            &owner_effect_sha(),
+        )
+        .unwrap();
+        assert_eq!(fixture.snapshot(), queued_snapshot);
+    }
+}
+
+#[test]
+fn owner_update_recovery_requires_its_retained_effect_receipt() {
+    let (fixture, request) = owner_queue_fixture();
+    fs::remove_file(fixture.directory.join("owner-action.json")).unwrap();
+    assert!(queue_owner_update(
+        &fixture.data,
+        request,
+        "passkey:step-up:missing",
+        &owner_effect_sha()
+    )
+    .is_err());
+    for name in [REQUEST, ACTIVE_REQUEST, "owner-action.json"] {
+        assert!(
+            !fixture.directory.join(name).exists(),
+            "recovery wrote {name}"
+        );
+    }
+    assert!(!has_queued_update(&fixture.data).unwrap());
+}
+
+#[test]
+fn owner_update_replay_binds_effect_hash_and_every_request_field() {
+    let (fixture, request) = owner_queue_fixture();
+    queue_owner_update(
+        &fixture.data,
+        request.clone(),
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+    )
+    .unwrap();
+    let before = fixture.snapshot();
+    for field in [
+        "id",
+        "source_name",
+        "channel",
+        "publisher_did",
+        "current_version",
+        "new_version",
+        "head_cid",
+        "release_cid",
+    ] {
+        let mut changed = serde_json::to_value(&request).unwrap();
+        changed[field] = json!("different approved intent");
+        let changed = serde_json::from_value(changed).unwrap();
+        assert!(
+            queue_owner_update(
+                &fixture.data,
+                changed,
+                "passkey:step-up:fixture",
+                &owner_effect_sha()
+            )
+            .is_err(),
+            "{field}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{field}");
+    }
+    assert!(queue_owner_update(
+        &fixture.data,
+        request.clone(),
+        "passkey:step-up:fixture",
+        &digest(b"changed intent")
+    )
+    .is_err());
+    for recovered in [false, true] {
+        assert!(reserve_owner_update(
+            &fixture.data,
+            &request,
+            "passkey:step-up:another",
+            &owner_effect_sha(),
+            recovered
+        )
+        .is_err());
+        assert!(queue_owner_update(
+            &fixture.data,
+            request.clone(),
+            "passkey:step-up:another",
+            &owner_effect_sha()
+        )
+        .is_err());
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn owner_update_recovery_finishes_both_interrupted_queue_receipts() {
+    for request_was_written in [false, true] {
+        let (fixture, request) = owner_queue_fixture();
+        write_private(
+            &fixture.directory.join("owner-action.json"),
+            &OwnerActionReceipt {
+                schema: "elastos.home-update-owner/v1".into(),
+                effect_id: "passkey:step-up:fixture".into(),
+                request_sha256: owner_effect_sha(),
+                request: request.clone(),
+                queued: false,
+            },
+        )
+        .unwrap();
+        if request_was_written {
+            queue_update(&fixture.data, request.clone()).unwrap();
+            publish_owner_queue_status(&fixture, &request, "staging", None);
+        }
+        queue_owner_update(
+            &fixture.data,
+            request.clone(),
+            "passkey:step-up:fixture",
+            &owner_effect_sha(),
+        )
+        .unwrap();
+        let queued: UpdateRequest = read_private_json(&fixture.directory.join(REQUEST)).unwrap();
+        assert_eq!(queued, request);
+        let receipt: OwnerActionReceipt =
+            read_private_json(&fixture.directory.join("owner-action.json")).unwrap();
+        assert!(receipt.queued);
+        assert_eq!(receipt.request, request);
+    }
+}
+
+#[test]
+fn queued_and_active_update_retries_require_the_exact_request() {
+    for active in [false, true] {
+        let (fixture, request) = owner_queue_fixture();
+        queue_owner_update(
+            &fixture.data,
+            request.clone(),
+            "passkey:step-up:fixture",
+            &owner_effect_sha(),
+        )
+        .unwrap();
+        if active {
+            fs::rename(
+                fixture.directory.join(REQUEST),
+                fixture.directory.join(ACTIVE_REQUEST),
+            )
+            .unwrap();
+        }
+        assert!(has_queued_update(&fixture.data).unwrap());
+        publish_owner_queue_status(&fixture, &request, "restarting", None);
+        let before = fixture.snapshot();
+        queue_update(&fixture.data, request.clone()).unwrap();
+        assert_eq!(fixture.snapshot(), before);
+        let mut changed = request;
+        changed.new_version = "0.7.2".into();
+        assert!(queue_update(&fixture.data, changed).is_err());
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn retired_update_retry_requires_terminal_status_bound_to_owner_request() {
+    for phase in ["updated", "restored", "failed"] {
+        let (fixture, request) = owner_queue_fixture();
+        queue_owner_update(
+            &fixture.data,
+            request.clone(),
+            "passkey:step-up:fixture",
+            &owner_effect_sha(),
+        )
+        .unwrap();
+        fs::remove_file(fixture.directory.join(REQUEST)).unwrap();
+        assert!(!has_queued_update(&fixture.data).unwrap());
+        let version = if phase == "updated" { "0.7.1" } else { "0.7.0" };
+        publish_owner_queue_status(&fixture, &request, phase, Some(version));
+        let before = fixture.snapshot();
+        queue_update(&fixture.data, request.clone()).unwrap();
+        assert_eq!(fixture.snapshot(), before);
+        assert!(!fixture.directory.join(REQUEST).exists());
+        let mut changed = request.clone();
+        changed.head_cid = raw_cid(b"different retired signed choice");
+        assert!(queue_update(&fixture.data, changed).is_err());
+        assert_eq!(fixture.snapshot(), before);
+        publish_owner_queue_status(&fixture, &request, "staging", None);
+        assert!(queue_update(&fixture.data, request.clone()).is_err());
+        assert!(!fixture.directory.join(REQUEST).exists());
+        publish_owner_queue_status(&fixture, &request, phase, Some(version));
+        fs::remove_file(fixture.directory.join("owner-action.json")).unwrap();
+        assert!(queue_update(&fixture.data, request).is_err());
+        assert!(!fixture.directory.join(REQUEST).exists());
+    }
+}
+
+#[test]
+fn owner_update_refuses_malformed_unsafe_or_substituted_effect_receipts() {
+    for refusal in ["schema", "malformed", "unsafe mode", "symlink", "hard link"] {
+        let (fixture, request) = owner_queue_fixture();
+        let path = fixture.directory.join("owner-action.json");
+        let valid = serde_json::to_vec(&OwnerActionReceipt {
+            schema: if refusal == "schema" {
+                "foreign receipt"
+            } else {
+                "elastos.home-update-owner/v1"
+            }
+            .into(),
+            effect_id: "passkey:step-up:fixture".into(),
+            request_sha256: owner_effect_sha(),
+            request: request.clone(),
+            queued: true,
+        })
+        .unwrap();
+        match refusal {
+            "schema" => fixture.file(&path, &valid, 0o600),
+            "malformed" => fixture.file(&path, b"{incomplete effect", 0o600),
+            "unsafe mode" => fixture.file(&path, &valid, 0o640),
+            "symlink" | "hard link" => {
+                let other = fixture.data.join("foreign-owner-action.json");
+                fixture.file(&other, &valid, 0o600);
+                if refusal == "symlink" {
+                    symlink(other, &path).unwrap();
+                } else {
+                    fs::hard_link(other, &path).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(
+            queue_owner_update(
+                &fixture.data,
+                request,
+                "passkey:step-up:fixture",
+                &owner_effect_sha()
+            )
+            .is_err(),
+            "{refusal}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(!fixture.directory.join(REQUEST).exists());
+    }
+}
+
+#[test]
+fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
+    let (fixture, request) = owner_queue_fixture();
+    // A completed prior action can retire its queue while keeping its last receipt.
+    queue_owner_update(
+        &fixture.data,
+        request.clone(),
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+    )
+    .unwrap();
+    fs::remove_file(fixture.directory.join(REQUEST)).unwrap();
+    reserve_owner_update(
+        &fixture.data,
+        &request,
+        "passkey:step-up:second",
+        &owner_effect_sha(),
+        false,
+    )
+    .unwrap();
+    let reserved = fixture.snapshot();
+    // A crash after reservation, before or after consumption, keeps B retryable.
+    for recovered in [false, true] {
+        reserve_owner_update(
+            &fixture.data,
+            &request,
+            "passkey:step-up:second",
+            &owner_effect_sha(),
+            recovered,
+        )
+        .unwrap();
+        assert_eq!(fixture.snapshot(), reserved);
+    }
+    assert!(reserve_owner_update(
+        &fixture.data,
+        &request,
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+        true
+    )
+    .is_err());
+    assert!(queue_owner_update(
+        &fixture.data,
+        request.clone(),
+        "passkey:step-up:fixture",
+        &owner_effect_sha()
+    )
+    .is_err());
+    assert_eq!(fixture.snapshot(), reserved);
+    queue_owner_update(
+        &fixture.data,
+        request,
+        "passkey:step-up:second",
+        &owner_effect_sha(),
+    )
+    .unwrap();
+    assert!(has_queued_update(&fixture.data).unwrap());
+}

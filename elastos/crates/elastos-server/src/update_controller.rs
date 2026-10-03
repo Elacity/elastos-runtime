@@ -108,7 +108,7 @@ struct Receipt {
     launch_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateRequest {
     pub id: String,
@@ -133,6 +133,167 @@ pub struct UpdateStatus {
     pub controller_start: String,
     pub host_pid: Option<u32>,
     pub generation: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerActionReceipt {
+    schema: String,
+    effect_id: String,
+    request_sha256: String,
+    request: UpdateRequest,
+    queued: bool,
+}
+
+fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, File)> {
+    let data_dir = fs::canonicalize(data_dir)?;
+    let directory = controller_directory(&data_dir)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("owner-action.lock"))?;
+    check_private_file(&lock)?;
+    anyhow::ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "Another Home owner action is in progress."
+    );
+    Ok((directory, lock))
+}
+
+fn check_owner_effect(
+    receipt: &OwnerActionReceipt,
+    request: &UpdateRequest,
+    effect_id: &str,
+    request_sha256: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        receipt.schema == "elastos.home-update-owner/v1"
+            && receipt.effect_id == effect_id
+            && receipt.request_sha256 == request_sha256
+            && receipt.request == *request,
+        "Home approval intent changed."
+    );
+    Ok(())
+}
+
+/// Called only after the passkey helper verifies the complete approval binding,
+/// and before it writes the consumed marker. Thus both first and later actions
+/// retain a recoverable intent through cancellation or a crash before queueing.
+pub(crate) fn reserve_owner_update(
+    data_dir: &Path,
+    request: &UpdateRequest,
+    effect_id: &str,
+    request_sha256: &str,
+    recovered: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !effect_id.is_empty()
+            && effect_id.len() <= 256
+            && !effect_id.chars().any(char::is_control)
+            && valid_hash(request_sha256),
+        "Invalid Home approval effect."
+    );
+    let (directory, _lock) = owner_action_guard(data_dir)?;
+    let path = directory.join("owner-action.json");
+    if path_present(&path)? {
+        let previous: OwnerActionReceipt = read_private_json(&path)?;
+        anyhow::ensure!(
+            previous.schema == "elastos.home-update-owner/v1",
+            "Unknown Home approval receipt."
+        );
+        if previous.effect_id == effect_id {
+            return check_owner_effect(&previous, request, effect_id, request_sha256);
+        }
+        anyhow::ensure!(
+            !recovered,
+            "Home approval effect belongs to an earlier action."
+        );
+        anyhow::ensure!(
+            !path_present(&directory.join(REQUEST))?
+                && !path_present(&directory.join(ACTIVE_REQUEST))?,
+            "Another Home update is pending."
+        );
+    } else {
+        anyhow::ensure!(!recovered, "Home approval effect has no recovery receipt.");
+    }
+    write_private(
+        &path,
+        &OwnerActionReceipt {
+            schema: "elastos.home-update-owner/v1".into(),
+            effect_id: effect_id.into(),
+            request_sha256: request_sha256.into(),
+            request: request.clone(),
+            queued: false,
+        },
+    )
+}
+
+pub(crate) fn owner_update_is_queued(
+    data_dir: &Path,
+    request: &UpdateRequest,
+    effect_id: &str,
+    request_sha256: &str,
+) -> Result<bool> {
+    let directory = data_dir.join(DIRECTORY);
+    let receipt: OwnerActionReceipt = read_private_json(&directory.join("owner-action.json"))?;
+    check_owner_effect(&receipt, request, effect_id, request_sha256)?;
+    if receipt.queued {
+        return Ok(true);
+    }
+    // Queue creation and marking its receipt are separate durable writes. The
+    // controller may consume the request between them; preserve that exact effect.
+    let mut dispatched = false;
+    for name in [REQUEST, ACTIVE_REQUEST] {
+        let path = directory.join(name);
+        if path_present(&path)? {
+            let existing: UpdateRequest = read_private_json(&path)?;
+            anyhow::ensure!(existing == *request, "Another update identity is pending.");
+            dispatched = true;
+        }
+    }
+    if dispatched {
+        return Ok(true);
+    }
+    if let Some(status) = status(data_dir)? {
+        if status.id.as_deref() == Some(request.id.as_str()) {
+            anyhow::ensure!(
+                status.new_version.as_deref() == Some(request.new_version.as_str())
+                    && (status.current_version == request.current_version
+                        || status.current_version == request.new_version)
+                    && matches!(
+                        status.phase.as_str(),
+                        "staging" | "restarting" | "updated" | "restored" | "failed"
+                    ),
+                "Retained update result differs from the approved intent."
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Queue only the intent reserved before approval consumption; an exact
+/// lost-response retry returns the retained result without writing a second request.
+pub(crate) fn queue_owner_update(
+    data_dir: &Path,
+    request: UpdateRequest,
+    effect_id: &str,
+    request_sha256: &str,
+) -> Result<()> {
+    let (directory, _lock) = owner_action_guard(data_dir)?;
+    let path = directory.join("owner-action.json");
+    let mut receipt: OwnerActionReceipt = read_private_json(&path)?;
+    check_owner_effect(&receipt, &request, effect_id, request_sha256)?;
+    if receipt.queued {
+        return Ok(());
+    }
+    queue_update(data_dir, request)?;
+    receipt.queued = true;
+    write_private(&path, &receipt)
 }
 
 /// Used by the existing Home browser entry. Source Homes keep their current launcher.
@@ -242,10 +403,41 @@ pub fn status(data_dir: &Path) -> Result<Option<UpdateStatus>> {
     Ok(Some(status))
 }
 
+pub(crate) fn has_queued_update(data_dir: &Path) -> Result<bool> {
+    let directory = data_dir.join(DIRECTORY);
+    Ok(path_present(&directory.join(REQUEST))? || path_present(&directory.join(ACTIVE_REQUEST))?)
+}
+
 /// The existing owner/passkey action supplies this exact signed release choice.
 pub fn queue_update(data_dir: &Path, request: UpdateRequest) -> Result<()> {
+    // Only the owner-effect recovery path uses a repeated request identity.
+    for name in [REQUEST, ACTIVE_REQUEST] {
+        let path = data_dir.join(DIRECTORY).join(name);
+        if path_present(&path)? {
+            let existing: UpdateRequest = read_private_json(&path)?;
+            anyhow::ensure!(
+                existing == request,
+                "Another update is queued. Wait for it to finish."
+            );
+            return Ok(());
+        }
+    }
     let status = status(data_dir)?
         .context("Start Home with the signed installed Runtime before updating.")?;
+    if status.id.as_deref() == Some(request.id.as_str()) {
+        let owner: OwnerActionReceipt =
+            read_private_json(&data_dir.join(DIRECTORY).join("owner-action.json"))?;
+        anyhow::ensure!(
+            owner.schema == "elastos.home-update-owner/v1"
+                && owner.request == request
+                && matches!(status.phase.as_str(), "updated" | "restored" | "failed")
+                && status.new_version.as_deref() == Some(request.new_version.as_str())
+                && (status.current_version == request.current_version
+                    || status.current_version == request.new_version),
+            "Update recovery identity changed."
+        );
+        return Ok(());
+    }
     anyhow::ensure!(
         matches!(
             status.phase.as_str(),

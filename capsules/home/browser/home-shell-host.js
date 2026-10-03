@@ -14,10 +14,11 @@ import {
   SYSTEM_APP_ID,
   homeActiveShellName,
   hasHomeAuthorityToken,
+  clearHomeAuthorityToken,
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260802a";
+} from "./shell-core.js?v=home-update-20261003a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -27,11 +28,11 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260802a";
+} from "./shell-auth.js?v=home-update-20261003a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260802a";
+} from "./home-wallet-connector-host.js?v=home-update-20261003a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
@@ -44,7 +45,9 @@ const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
 const HOME_EVENTS_WAIT_MS = 25_000;
 const HOME_EVENTS_RETRY_MS = 2_000;
-const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
+const HOME_EVENTS_MAX_RECONNECT_ATTEMPTS = 15;
+const HOME_EVENTS_RECONNECT_TIMEOUT_MS = 10_000;
+const HOME_EVENTS_POLL_TIMEOUT_MS = HOME_EVENTS_WAIT_MS + HOME_EVENTS_RECONNECT_TIMEOUT_MS;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const PRESENCE_HEARTBEAT_MS = 15_000;
@@ -95,6 +98,10 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
+let homeEventsReconnectAttempts = 0;
+let homeEventsReconnectInFlight = null;
+let homeEventsChannelGeneration = 0;
+let homeEventsPollController = null;
 const pendingActiveShellReady = {
   target: "",
   route: "",
@@ -2171,6 +2178,7 @@ function startShellTimers() {
       if (document.hidden) {
         return;
       }
+      homeEventsReconnectAttempts = 0;
       requestShellSummaryRefresh({ reason: "visibilitychange", delay: 0 });
       ensureHomeEventChannel();
     });
@@ -2291,8 +2299,9 @@ function refreshSignedHomeSession() {
 async function refreshShellSummary({
   deferHomeGuiForBootHint = false,
   deferHomeGuiForRuntimeSettle = false,
+  signal,
 } = {}) {
-  const summary = await fetchJson("/api/apps/home/summary");
+  const summary = await fetchJson("/api/apps/home/summary", { signal });
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = refreshShellSummary;
   document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
@@ -2314,7 +2323,8 @@ async function refreshShellSummary({
 
 function ensureHomeEventChannel() {
   if (
-    !homeSummarySignedIn(shellState.currentSummary)
+    !homeSummarySignedIn(shellState.currentSummary) ||
+    homeEventsReconnectAttempts >= HOME_EVENTS_MAX_RECONNECT_ATTEMPTS
   ) {
     return;
   }
@@ -2330,6 +2340,10 @@ function ensureHomeEventChannel() {
 }
 
 function stopHomeEventChannel() {
+  homeEventsChannelGeneration += 1;
+  homeEventsPollController?.abort();
+  homeEventsPollController = null;
+  homeEventsReconnectAttempts = 0;
   shellState.homeEventsCursor = "";
   shellState.homeEventsInFlight = false;
   shellState.homeEventsStreamFailed = false;
@@ -2341,67 +2355,155 @@ function stopHomeEventChannel() {
   shellState.homeEventsTimer = null;
 }
 
-function ensureHomeEventStream() {
+function refreshHomeAfterEventReconnect() {
+  if (!homeEventsReconnectInFlight) {
+    const generation = homeEventsChannelGeneration;
+    homeEventsReconnectInFlight = Promise.resolve()
+      .then(() => homeSummaryHasProofBoundSession(shellState.currentSummary)
+        ? refreshHomeSession({ signal: AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS) })
+        : null)
+      .then(() => generation === homeEventsChannelGeneration
+        ? refreshShellSummary({ signal: AbortSignal.timeout(HOME_EVENTS_RECONNECT_TIMEOUT_MS) })
+        : null)
+      .then((summary) => {
+        if (generation === homeEventsChannelGeneration && homeSummarySignedIn(summary)) {
+          broadcastHomeRuntimeEvents([{
+            kind: "home.summary.changed",
+            scope: "home",
+            at: Math.floor(Date.now() / 1000),
+          }]);
+        }
+        return summary;
+      })
+      .finally(() => {
+        homeEventsReconnectInFlight = null;
+      });
+  }
+  return homeEventsReconnectInFlight;
+}
+
+function retryHomeEventChannel(error) {
+  if (isHomeAuthError(error)) {
+    clearHomeAuthorityToken();
+    stopHomeEventChannel();
+    showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
+      console.error("home unlock failed", unlockError);
+    });
+    return;
+  }
+  homeEventsReconnectAttempts += 1;
+  if (homeEventsReconnectAttempts < HOME_EVENTS_MAX_RECONNECT_ATTEMPTS) {
+    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
+  } else {
+    window.clearTimeout(shellState.homeEventsTimer);
+    shellState.homeEventsTimer = null;
+    console.warn("Home updates paused. Return to Home to reconnect.");
+  }
+}
+
+function ensureHomeEventStream({ refreshOnOpen = true } = {}) {
   if (shellState.homeEventsSource) {
     return;
   }
   window.clearTimeout(shellState.homeEventsTimer);
   const source = new EventSource(HOME_EVENTS_STREAM_URL, { withCredentials: true });
   shellState.homeEventsSource = source;
+  const reconnect = (error) => {
+    if (shellState.homeEventsSource !== source) {
+      return;
+    }
+    source.close();
+    shellState.homeEventsSource = null;
+    if (!homeSummarySignedIn(shellState.currentSummary)) {
+      stopHomeEventChannel();
+      return;
+    }
+    shellState.homeEventsStreamFailed = true;
+    retryHomeEventChannel(error);
+  };
+  source.addEventListener("open", () => {
+    if (!refreshOnOpen || shellState.homeEventsSource !== source) {
+      return;
+    }
+    refreshHomeAfterEventReconnect()
+      .then(() => {
+        if (shellState.homeEventsSource === source) homeEventsReconnectAttempts = 0;
+      })
+      .catch(reconnect);
+  });
   source.addEventListener("runtime-events", (event) => {
+    if (shellState.homeEventsSource !== source) {
+      return;
+    }
     try {
       handleHomeEventsPayload(JSON.parse(event.data || "{}"), { broadcastInitial: true });
     } catch (error) {
       console.warn("home event stream returned invalid payload", error);
     }
   });
-  source.onerror = () => {
-    if (!homeSummarySignedIn(shellState.currentSummary)) {
-      stopHomeEventChannel();
-      return;
-    }
-    shellState.homeEventsStreamFailed = true;
-    source.close();
-    if (shellState.homeEventsSource === source) {
-      shellState.homeEventsSource = null;
-    }
-    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
-  };
+  source.onerror = reconnect;
 }
 
 async function pollHomeEvents() {
+  if (shellState.homeEventsInFlight || shellState.homeEventsSource) {
+    return;
+  }
   if (!homeSummarySignedIn(shellState.currentSummary)) {
     stopHomeEventChannel();
     return;
   }
   if (document.hidden) {
-    scheduleHomeEventPoll(HOME_EVENTS_HIDDEN_RETRY_MS);
     return;
   }
   shellState.homeEventsInFlight = true;
+  const generation = homeEventsChannelGeneration;
+  const controller = new AbortController();
+  homeEventsPollController = controller;
+  const reconnecting = shellState.homeEventsStreamFailed || homeEventsReconnectAttempts > 0;
   const params = new URLSearchParams({
-    wait_ms: String(HOME_EVENTS_WAIT_MS),
+    wait_ms: String(reconnecting ? 0 : HOME_EVENTS_WAIT_MS),
   });
   if (shellState.homeEventsCursor) {
     params.set("cursor", shellState.homeEventsCursor);
   }
   const hadCursor = Boolean(shellState.homeEventsCursor);
+  let restartStream = false;
   try {
-    const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`);
-    handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
-    scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
-  } catch (error) {
-    if (isHomeAuthError(error)) {
-      stopHomeEventChannel();
-      showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
-        console.error("home unlock failed", unlockError);
-      });
+    const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(
+        reconnecting ? HOME_EVENTS_RECONNECT_TIMEOUT_MS : HOME_EVENTS_POLL_TIMEOUT_MS,
+      )]),
+    });
+    if (generation !== homeEventsChannelGeneration) {
       return;
     }
-    console.warn("home event channel failed", error);
-    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
+    if (reconnecting) {
+      await refreshHomeAfterEventReconnect();
+    }
+    if (generation !== homeEventsChannelGeneration || !homeSummarySignedIn(shellState.currentSummary)) {
+      return;
+    }
+    handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
+    homeEventsReconnectAttempts = 0;
+    if (window.EventSource) {
+      shellState.homeEventsStreamFailed = false;
+      restartStream = homeSummarySignedIn(shellState.currentSummary);
+    } else {
+      scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
+    }
+  } catch (error) {
+    if (generation === homeEventsChannelGeneration) {
+      console.warn("home event channel failed", error);
+      retryHomeEventChannel(error);
+    }
   } finally {
-    shellState.homeEventsInFlight = false;
+    if (homeEventsPollController === controller) {
+      homeEventsPollController = null;
+      shellState.homeEventsInFlight = false;
+    }
+  }
+  if (restartStream) {
+    ensureHomeEventStream({ refreshOnOpen: false });
   }
 }
 
