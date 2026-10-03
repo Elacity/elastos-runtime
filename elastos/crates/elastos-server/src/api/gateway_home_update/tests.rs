@@ -66,7 +66,7 @@ async fn completed_check(
                 .read(key.clone(), std::time::Instant::now(), unexpected_check)
                 .await
             {
-                UpdateCheckSnapshot::Completed(check) => return check,
+                UpdateCheckSnapshot::Completed(check) => return check.map(|check| *check),
                 UpdateCheckSnapshot::Checking => tokio::task::yield_now().await,
             }
         }

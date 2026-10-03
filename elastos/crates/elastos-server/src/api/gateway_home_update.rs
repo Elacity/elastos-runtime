@@ -88,7 +88,7 @@ struct RunningCheck {
 
 pub(super) enum UpdateCheckSnapshot {
     Checking,
-    Completed(Option<crate::operator_control::OperatorUpdateCheck>),
+    Completed(Option<Box<crate::operator_control::OperatorUpdateCheck>>),
 }
 
 #[derive(Default)]
@@ -117,7 +117,7 @@ impl UpdateCheckCache {
             .is_some_and(|running| running.task.is_finished())
         {
             let running = self.running.take().expect("finished update check is owned");
-            self.completed = Some(running.task.await.unwrap_or_else(|_| CachedCheck {
+            self.completed = Some(running.task.await.unwrap_or(CachedCheck {
                 key: running.key,
                 completed_at: now,
                 check: None,
@@ -128,7 +128,7 @@ impl UpdateCheckCache {
                 && now.saturating_duration_since(completed.completed_at)
                     < std::time::Duration::from_secs(CHECK_CACHE_SECONDS)
         }) {
-            return UpdateCheckSnapshot::Completed(completed.check.clone());
+            return UpdateCheckSnapshot::Completed(completed.check.clone().map(Box::new));
         }
         if self.running.is_none() {
             let task_key = key.clone();
@@ -243,7 +243,7 @@ where
     let checking = matches!(snapshot, UpdateCheckSnapshot::Checking);
     let check = match &snapshot {
         UpdateCheckSnapshot::Checking => None,
-        UpdateCheckSnapshot::Completed(check) => check.as_ref(),
+        UpdateCheckSnapshot::Completed(check) => check.as_deref(),
     };
     let available = check.is_some_and(|check| check.update_available);
     let can_apply = available
