@@ -80,6 +80,45 @@ struct Journal {
     binary_basename: String,
     phase: Phase,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<RestartRecord>,
+}
+
+/// A restart controller keeps this record and the verified rollback until Home is ready.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartPlan {
+    pub request_id: String,
+    pub controller_sha256: String,
+    pub launch_plan_sha256: String,
+    pub support_sha256: String,
+    pub previous_version: String,
+    pub candidate_version: String,
+    pub previous_binary_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestartPhase {
+    CandidatePending,
+    CandidateStartClaimed,
+    CandidateRunning,
+    CandidateReady,
+    Restoring,
+    Restored,
+    PreviousStartClaimed,
+    PreviousRunning,
+    PreviousReady,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartRecord {
+    pub plan: RestartPlan,
+    pub phase: RestartPhase,
+    pub generation: String,
+    pub pid: Option<u32>,
+    pub process_start: Option<String>,
 }
 
 /// Serializes installation writers at an absolute, resolved binary parent.
@@ -119,6 +158,46 @@ impl InstallationGuard {
     }
 }
 
+/// Ordinary installed writers use the persisted binary location, so replacing source
+/// settings cannot redirect them away from a retained transaction or its lock.
+/// A fresh source has no installation yet; installer/bootstrap ownership covers that path.
+pub(crate) fn acquire_installed_writer(
+    data_dir: &Path,
+) -> anyhow::Result<Option<InstallationGuard>> {
+    let retained = crate::update_controller::installed_writer_binary(data_dir)?;
+    let binary = match retained {
+        Some(binary) => binary,
+        None => {
+            let sources = crate::sources::load_trusted_sources(data_dir)?;
+            let Some(source) = sources
+                .default_source()
+                .filter(|source| !source.install_path.is_empty())
+            else {
+                return Ok(None);
+            };
+            PathBuf::from(&source.install_path)
+        }
+    };
+    if !binary.is_absolute() {
+        bail!("installed writer binary path must be absolute");
+    }
+    let parent = binary.parent().context("installed writer parent missing")?;
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let guard = InstallationGuard::acquire(&parent)?;
+    match fs::symlink_metadata(parent.join(JOURNAL)) {
+        Ok(_) => {
+            bail!("A signed update requires recovery; preserve its release files and support.")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(guard))
+}
+
 pub(crate) struct InstallTransaction {
     _guard: InstallationGuard,
     data_dir: PathBuf,
@@ -130,7 +209,10 @@ impl InstallTransaction {
     pub(crate) fn has_pending_recovery(binary: &Path) -> bool {
         binary
             .parent()
-            .is_some_and(|parent| fs::symlink_metadata(parent.join(JOURNAL)).is_ok())
+            .is_some_and(|parent| match fs::symlink_metadata(parent.join(JOURNAL)) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
     }
     pub(crate) fn acquire(data_dir: &Path, binary: &Path) -> anyhow::Result<Self> {
         if !data_dir.is_absolute() || !binary.is_absolute() {
@@ -266,6 +348,9 @@ impl InstallTransaction {
             self.require_empty_scratch()?;
             return Ok(());
         };
+        if journal.restart.is_some() && !rollback_committed {
+            bail!("Home restart is pending; use the installed restart controller to recover");
+        }
         // Every finalized scratch file is hash/mode bound before any release
         // restoration. Partial writes have distinct names and only staging owns them.
         self.validate_scratch(&journal)?;
@@ -321,6 +406,12 @@ impl InstallTransaction {
                 }
             }
             journal.phase = Phase::Recovering;
+            if let Some(restart) = &mut journal.restart {
+                restart.phase = RestartPhase::Restoring;
+                restart.generation.clear();
+                restart.pid = None;
+                restart.process_start = None;
+            }
             self.write_journal(&journal)?;
             for entry in &journal.entries {
                 let current = file_state(&self.destinations[&entry.id])?;
@@ -352,6 +443,13 @@ impl InstallTransaction {
                     entry.original_mode,
                 )?;
             }
+        }
+        if let Some(restart) = &mut journal.restart {
+            restart.phase = RestartPhase::Restored;
+            restart.generation.clear();
+            restart.pid = None;
+            restart.process_start = None;
+            return self.write_journal(&journal);
         }
         self.cleanup(&journal)
     }
@@ -401,6 +499,7 @@ impl InstallTransaction {
                 .to_string(),
             phase: Phase::Staging,
             entries,
+            restart: None,
         };
         self.write_journal(&journal)?;
         let result = (|| {
@@ -469,6 +568,169 @@ impl InstallTransaction {
         self.commit_with(|_| Ok(()), check)
     }
 
+    pub(crate) fn prepare_restart(&self, plan: RestartPlan) -> anyhow::Result<()> {
+        validate_restart_plan(&plan)?;
+        let mut journal = self
+            .read_journal()?
+            .context("prepared release journal missing")?;
+        if journal.phase != Phase::Prepared || journal.restart.is_some() {
+            bail!("release is not prepared for a new restart");
+        }
+        if journal
+            .entries
+            .iter()
+            .any(|entry| entry.original_sha256.is_none())
+            || journal
+                .entries
+                .iter()
+                .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+                .and_then(|entry| entry.original_sha256.as_deref())
+                != Some(&plan.previous_binary_sha256)
+        {
+            bail!("automatic recovery requires a verified previous complete release");
+        }
+        journal.schema = "elastos.install-transaction/v2".into();
+        journal.restart = Some(RestartRecord {
+            plan,
+            phase: RestartPhase::CandidatePending,
+            generation: String::new(),
+            pid: None,
+            process_start: None,
+        });
+        self.write_journal(&journal)
+    }
+
+    pub(crate) fn restart_record(&self) -> anyhow::Result<RestartRecord> {
+        self.restart_record_if_any()?
+            .context("restart journal missing")
+    }
+
+    pub(crate) fn restart_record_if_any(&self) -> anyhow::Result<Option<RestartRecord>> {
+        Ok(self.read_journal()?.and_then(|journal| journal.restart))
+    }
+
+    /// Controller loss before restart planning leaves an unchanged v1 staging journal.
+    /// Recover only that pre-activation state; other v1 work keeps its original owner.
+    pub(crate) fn recover_before_restart(&self) -> anyhow::Result<bool> {
+        let Some(journal) = self.read_journal()? else {
+            return Ok(false);
+        };
+        if journal.restart.is_some() {
+            return Ok(false);
+        }
+        if !matches!(journal.phase, Phase::Staging | Phase::Prepared) {
+            bail!("Pending release has no controller restart receipt; use its original recovery owner.");
+        }
+        self.recover()?;
+        Ok(true)
+    }
+
+    pub(crate) fn claim_start(&self, previous: bool) -> anyhow::Result<RestartRecord> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        let expected = if previous {
+            RestartPhase::Restored
+        } else {
+            RestartPhase::CandidatePending
+        };
+        if restart.phase != expected || (!previous && journal.phase != Phase::Committed) {
+            bail!("restart start claim already consumed or release is not activated");
+        }
+        restart.phase = if previous {
+            RestartPhase::PreviousStartClaimed
+        } else {
+            RestartPhase::CandidateStartClaimed
+        };
+        restart.generation = hex::encode(rand::random::<[u8; 16]>());
+        restart.pid = None;
+        restart.process_start = None;
+        let record = restart.clone();
+        self.write_journal(&journal)?;
+        Ok(record)
+    }
+
+    pub(crate) fn record_started(
+        &self,
+        generation: &str,
+        pid: u32,
+        process_start: String,
+    ) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        if restart.generation != generation
+            || pid == 0
+            || process_start.is_empty()
+            || process_start.len() > 128
+        {
+            bail!("restart process identity is invalid");
+        }
+        restart.phase = match restart.phase {
+            RestartPhase::CandidateStartClaimed => RestartPhase::CandidateRunning,
+            RestartPhase::PreviousStartClaimed => RestartPhase::PreviousRunning,
+            _ => bail!("restart start claim is not available"),
+        };
+        restart.pid = Some(pid);
+        restart.process_start = Some(process_start);
+        self.write_journal(&journal)
+    }
+
+    pub(crate) fn record_ready(&self, generation: &str, pid: u32) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        if restart.generation != generation || restart.pid != Some(pid) {
+            bail!("ready Home differs from the claimed generation");
+        }
+        restart.phase = match restart.phase {
+            RestartPhase::CandidateRunning => RestartPhase::CandidateReady,
+            RestartPhase::PreviousRunning => RestartPhase::PreviousReady,
+            _ => bail!("restart process is not awaiting readiness"),
+        };
+        self.write_journal(&journal)
+    }
+
+    /// Caller first stops and reaps its exact candidate generation and acquires the host lock.
+    pub(crate) fn restore_for_restart(&self) -> anyhow::Result<()> {
+        let record = self.restart_record()?;
+        if matches!(
+            record.phase,
+            RestartPhase::CandidateReady
+                | RestartPhase::PreviousStartClaimed
+                | RestartPhase::PreviousRunning
+                | RestartPhase::PreviousReady
+        ) {
+            bail!(
+                "restart restoration is unavailable after readiness or a previous-host start claim"
+            );
+        }
+        self.recover_inner(true)
+    }
+
+    pub(crate) fn finish_restart(&self) -> anyhow::Result<()> {
+        let journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_ref().context("restart record missing")?;
+        let previous = match restart.phase {
+            RestartPhase::CandidateReady => false,
+            RestartPhase::PreviousReady => true,
+            _ => bail!("retain rollback until the claimed Home is ready"),
+        };
+        for entry in &journal.entries {
+            self.require_state(
+                entry.id,
+                if previous {
+                    entry.original_sha256.as_deref()
+                } else {
+                    Some(&entry.staged_sha256)
+                },
+                if previous {
+                    entry.original_mode
+                } else {
+                    Some(entry.staged_mode)
+                },
+            )?;
+        }
+        self.cleanup(&journal)
+    }
+
     fn commit_with(
         &self,
         mut after_rename: impl FnMut(ReleaseFile) -> anyhow::Result<()>,
@@ -518,7 +780,11 @@ impl InstallTransaction {
             self.write_journal(&journal)
         })();
         self.restore_on_error(result)?;
-        self.cleanup(&journal)
+        if journal.restart.is_some() {
+            Ok(())
+        } else {
+            self.cleanup(&journal)
+        }
     }
 
     fn restore_on_error(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
@@ -581,8 +847,12 @@ impl InstallTransaction {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let journal: Journal = serde_json::from_slice(&bytes)?;
-        if journal.schema != "elastos.install-transaction/v1"
-            || journal.data_dir != self.data_dir
+        if (journal.schema != "elastos.install-transaction/v1" || journal.restart.is_some())
+            && (journal.schema != "elastos.install-transaction/v2" || journal.restart.is_none())
+        {
+            bail!("installation journal schema is incompatible with this writer");
+        }
+        if journal.data_dir != self.data_dir
             || journal.binary_basename != self.binary.file_name().unwrap().to_str().unwrap()
             || journal.transaction_id.len() != 32
             || !journal
@@ -599,6 +869,7 @@ impl InstallTransaction {
         {
             bail!("installation journal identity is incompatible with this writer");
         }
+        validate_restart_record(&journal)?;
         for entry in &journal.entries {
             if !valid_hash(&entry.staged_sha256)
                 || entry
@@ -864,6 +1135,197 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn validate_restart_plan(plan: &RestartPlan) -> anyhow::Result<()> {
+    if plan.request_id.len() != 32
+        || !plan.request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || [
+            &plan.controller_sha256,
+            &plan.launch_plan_sha256,
+            &plan.support_sha256,
+            &plan.previous_binary_sha256,
+        ]
+        .iter()
+        .any(|hash| !valid_hash(hash))
+        || semver::Version::parse(&plan.previous_version).is_err()
+        || semver::Version::parse(&plan.candidate_version).is_err()
+    {
+        bail!("restart plan is invalid");
+    }
+    Ok(())
+}
+
+fn validate_restart_record(journal: &Journal) -> anyhow::Result<()> {
+    let Some(restart) = &journal.restart else {
+        return Ok(());
+    };
+    if journal.schema != "elastos.install-transaction/v2"
+        || journal.transaction_id.len() != 32
+        || !journal
+            .transaction_id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || journal.entries.len() != ReleaseFile::ALL.len()
+        || journal
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>()
+            != ReleaseFile::ALL.into_iter().collect()
+        || journal.entries.iter().any(|entry| {
+            !valid_hash(&entry.staged_sha256)
+                || entry
+                    .original_sha256
+                    .as_ref()
+                    .is_none_or(|hash| !valid_hash(hash))
+                || entry
+                    .original_mode
+                    .is_none_or(|mode| mode & !0o777 != 0 || mode & 0o022 != 0)
+                || entry.staged_mode & !0o777 != 0
+                || entry.staged_mode & 0o022 != 0
+        })
+    {
+        bail!("restart journal release entries are invalid");
+    }
+    validate_restart_plan(&restart.plan)?;
+    let (claimed, running, outer_valid) = match restart.phase {
+        RestartPhase::CandidatePending => (
+            false,
+            false,
+            matches!(
+                journal.phase,
+                Phase::Prepared | Phase::Committing | Phase::Committed
+            ),
+        ),
+        RestartPhase::CandidateStartClaimed => (true, false, journal.phase == Phase::Committed),
+        RestartPhase::CandidateRunning | RestartPhase::CandidateReady => {
+            (true, true, journal.phase == Phase::Committed)
+        }
+        RestartPhase::Restoring | RestartPhase::Restored => {
+            (false, false, journal.phase == Phase::Recovering)
+        }
+        RestartPhase::PreviousStartClaimed => (true, false, journal.phase == Phase::Recovering),
+        RestartPhase::PreviousRunning | RestartPhase::PreviousReady => {
+            (true, true, journal.phase == Phase::Recovering)
+        }
+    };
+    let generation_valid = if claimed {
+        restart.generation.len() == 32 && restart.generation.bytes().all(|b| b.is_ascii_hexdigit())
+    } else {
+        restart.generation.is_empty()
+    };
+    if !outer_valid
+        || !generation_valid
+        || running != restart.pid.is_some()
+        || running != restart.process_start.is_some()
+        || restart.pid == Some(0)
+        || restart
+            .process_start
+            .as_ref()
+            .is_some_and(|start| start.is_empty() || start.len() > 128)
+        || journal
+            .entries
+            .iter()
+            .any(|entry| entry.original_sha256.is_none())
+        || journal
+            .entries
+            .iter()
+            .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+            .and_then(|entry| entry.original_sha256.as_deref())
+            != Some(&restart.plan.previous_binary_sha256)
+    {
+        bail!("restart journal identity or phase is invalid");
+    }
+    Ok(())
+}
+
+/// A pending transaction admits only its controller's claimed host generation.
+/// This read precedes host startup side effects; the controller retains the writer lock.
+pub(crate) fn authorize_host_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    authorize_host_start_with_generation(
+        data_dir,
+        binary,
+        std::env::var("ELASTOS_UPDATE_GENERATION").ok().as_deref(),
+        std::process::id(),
+    )
+}
+
+pub(crate) fn authorize_host_start_with_generation(
+    data_dir: &Path,
+    binary: &Path,
+    generation: Option<&str>,
+    process_id: u32,
+) -> anyhow::Result<()> {
+    let parent = binary.parent().context("host binary parent missing")?;
+    let path = parent.join(JOURNAL);
+    let file = match open_read(&path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file, &path, true)?;
+    if file.metadata()?.len() > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
+    let journal: Journal = serde_json::from_slice(&bytes)?;
+    validate_restart_record(&journal)?;
+    if journal.data_dir != fs::canonicalize(data_dir)?
+        || journal.binary_basename
+            != binary
+                .file_name()
+                .context("host binary basename missing")?
+                .to_string_lossy()
+        || journal.schema != "elastos.install-transaction/v2"
+    {
+        bail!("installation recovery is pending; start Home through its installed controller");
+    }
+    let restart = journal
+        .restart
+        .context("installation recovery is pending")?;
+    validate_restart_plan(&restart.plan)?;
+    let generation = generation.unwrap_or_default();
+    if generation.len() != 32
+        || generation != restart.generation
+        || restart.pid.is_some_and(|pid| pid != process_id)
+    {
+        bail!("Home start differs from the controller's claimed generation");
+    }
+    let previous = match restart.phase {
+        RestartPhase::CandidateStartClaimed | RestartPhase::CandidateRunning => false,
+        RestartPhase::PreviousStartClaimed | RestartPhase::PreviousRunning => true,
+        _ => bail!("installation is not ready for a claimed Home start"),
+    };
+    let entry = journal
+        .entries
+        .iter()
+        .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+        .context("restart Runtime entry missing")?;
+    let expected = if previous {
+        entry.original_sha256.as_deref()
+    } else {
+        Some(entry.staged_sha256.as_str())
+    };
+    if !state_matches(
+        &file_state(binary)?,
+        expected,
+        if previous {
+            entry.original_mode
+        } else {
+            Some(entry.staged_mode)
+        },
+    ) {
+        bail!("claimed Runtime binary changed before startup");
+    }
+    Ok(())
+}
+
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -890,6 +1352,15 @@ fn require_disk_reserve(total: u128, available: u128, needed: u128) -> anyhow::R
     }
     Ok(())
 }
+
+pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyhow::Result<()> {
+    let (total, available) = disk_space(path)?;
+    require_disk_reserve(total, available, u128::from(needed))
+}
+
+#[cfg(test)]
+#[path = "install_transaction/restart_tests.rs"]
+mod restart_tests;
 
 #[cfg(test)]
 mod tests {

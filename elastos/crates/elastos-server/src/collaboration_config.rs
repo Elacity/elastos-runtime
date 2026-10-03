@@ -824,6 +824,8 @@ mod tests {
                 binary_sha256: String::new(),
                 policy_sha256: String::new(),
                 dependency_sha256: String::new(),
+                generation: String::new(),
+                home_url: String::new(),
             },
         )
         .unwrap();

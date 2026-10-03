@@ -3,6 +3,7 @@
 //!
 //! CLI and operator entry points share signed head discovery and admission.
 
+use anyhow::Context as _;
 use std::cmp::Ordering;
 use std::future::Future;
 use std::io::IsTerminal;
@@ -13,6 +14,7 @@ use elastos_common::localhost::{publisher_release_head_path, publisher_release_m
 
 use crate::crypto::{verify_release_envelope, verify_release_envelope_against_dids};
 use crate::install_transaction::{InstallTransaction, ReleaseFile};
+use crate::install_transaction::{RestartPlan, RestartRecord};
 use crate::sources::{
     default_data_dir, default_install_path, load_trusted_sources, normalize_gateways,
     save_trusted_sources, TrustedSource,
@@ -687,6 +689,45 @@ enum ApplyMode {
     FrozenOffline,
 }
 
+pub(crate) trait RestartOwner: Send {
+    fn plan(
+        &self,
+        support_sha256: String,
+        previous_version: &str,
+        candidate_version: &str,
+    ) -> anyhow::Result<RestartPlan>;
+    fn start<'a>(
+        &'a mut self,
+        transaction: &'a InstallTransaction,
+        record: RestartRecord,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+    fn stop<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+}
+
+pub(crate) async fn run_restarting_update(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    head_cid: String,
+    owner: &mut dyn RestartOwner,
+) -> anyhow::Result<()> {
+    run_update_with_restart(
+        data_dir,
+        fetch_fn,
+        None,
+        false,
+        Some(head_cid),
+        false,
+        Vec::new(),
+        env!("ELASTOS_VERSION"),
+        true,
+        false,
+        crate::setup::FirstPartyCarrierContext::Setup,
+        ApplyMode::FrozenOffline,
+        Some(owner),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_update_for_data_dir_with_mode(
     data_dir: &Path,
@@ -701,6 +742,40 @@ async fn run_update_for_data_dir_with_mode(
     force: bool,
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
+) -> anyhow::Result<()> {
+    run_update_with_restart(
+        data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+        carrier_context,
+        apply_mode,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_update_with_restart(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+    apply_mode: ApplyMode,
+    restart_owner: Option<&mut dyn RestartOwner>,
 ) -> anyhow::Result<()> {
     if !check_only {
         recover_pending_installation(data_dir)?;
@@ -845,7 +920,7 @@ async fn run_update_for_data_dir_with_mode(
     let release_cid = head["payload"]["latest_release_cid"].as_str().unwrap_or("");
     let release_object_cid = optional_release_object_cid(&head)?;
 
-    run_upgrade_from_head(
+    run_upgrade_with_restart(
         fetch_fn,
         &head,
         &head_bytes,
@@ -864,6 +939,7 @@ async fn run_update_for_data_dir_with_mode(
         working_gateway.as_deref(),
         carrier_context,
         apply_mode,
+        restart_owner,
     )
     .await
 }
@@ -908,6 +984,7 @@ fn verify_release_binding(
 
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn run_upgrade_from_head(
     fetch_fn: &FetchFn,
     head: &serde_json::Value,
@@ -927,6 +1004,52 @@ async fn run_upgrade_from_head(
     working_gateway: Option<&str>,
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
+) -> anyhow::Result<()> {
+    run_upgrade_with_restart(
+        fetch_fn,
+        head,
+        head_bytes,
+        resolved_head_cid,
+        version,
+        release_cid,
+        release_object_cid,
+        current_version,
+        source,
+        data_dir,
+        check_only,
+        ordered_gateways,
+        auto_confirm,
+        force,
+        discovery_method,
+        working_gateway,
+        carrier_context,
+        apply_mode,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_upgrade_with_restart(
+    fetch_fn: &FetchFn,
+    head: &serde_json::Value,
+    head_bytes: &[u8],
+    resolved_head_cid: Option<&str>,
+    version: &str,
+    release_cid: &str,
+    release_object_cid: Option<&str>,
+    current_version: &str,
+    source: &TrustedSource,
+    data_dir: &Path,
+    check_only: bool,
+    ordered_gateways: &[String],
+    auto_confirm: bool,
+    force: bool,
+    discovery_method: &str,
+    working_gateway: Option<&str>,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+    apply_mode: ApplyMode,
+    mut restart_owner: Option<&mut dyn RestartOwner>,
 ) -> anyhow::Result<()> {
     // Admit the exact signed publication before check-only/version success or artifacts.
     if release_cid.is_empty() {
@@ -1351,7 +1474,20 @@ async fn run_upgrade_from_head(
             Err(recovery) => Err(error.context(format!("release recovery required: {recovery:#}"))),
         };
     }
-    transaction.commit_checked(|| {
+    if let Some(owner) = restart_owner.as_ref() {
+        let prepared = owner
+            .plan(support.clone(), current_version, version)
+            .and_then(|plan| transaction.prepare_restart(plan));
+        if let Err(error) = prepared {
+            return match transaction.abort() {
+                Ok(()) => Err(error),
+                Err(recovery) => {
+                    Err(error.context(format!("release recovery required: {recovery:#}")))
+                }
+            };
+        }
+    }
+    let activation = transaction.commit_checked(|| {
         if frozen_support_snapshot(
             data_dir,
             &old_components,
@@ -1363,7 +1499,49 @@ async fn run_upgrade_from_head(
             anyhow::bail!("installed support changed during activation");
         }
         Ok(())
-    })?;
+    });
+    if let Some(owner) = restart_owner.as_mut() {
+        drop(_offline);
+        let candidate = match activation {
+            Ok(()) => {
+                let record = transaction.claim_start(false)?;
+                owner.start(&transaction, record).await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = candidate {
+            owner
+                .stop()
+                .await
+                .context("candidate cleanup failed; retain rollback")?;
+            let offline = crate::host_lock::acquire_host_process_lock(
+                data_dir,
+                "update-recovery",
+                "offline",
+            )?;
+            transaction.restore_for_restart()?;
+            verify_restart_support(&transaction)?;
+            drop(offline);
+            let previous = transaction.claim_start(true)?;
+            if let Err(previous_error) = owner.start(&transaction, previous).await {
+                owner
+                    .stop()
+                    .await
+                    .context("previous Home cleanup failed; retain recovery journal")?;
+                return Err(previous_error
+                    .context("previous Home did not become ready; retain recovery journal"));
+            }
+            finish_ready_restart(&transaction)?;
+            transaction.finish_restart()?;
+            return Err(
+                error.context("previous release restored and Home restarted; user data preserved")
+            );
+        }
+        finish_ready_restart(&transaction)?;
+        transaction.finish_restart()?;
+        return Ok(());
+    }
+    activation?;
 
     println!();
     println!(
@@ -1373,6 +1551,30 @@ async fn run_upgrade_from_head(
     println!();
 
     Ok(())
+}
+
+/// A ready host is accepted only while the frozen support still matches its durable plan.
+pub(crate) fn verify_restart_support(transaction: &InstallTransaction) -> anyhow::Result<()> {
+    let record = transaction.restart_record()?;
+    let components = std::fs::read(transaction.data_dir().join("components.json"))?;
+    if frozen_support_snapshot(
+        transaction.data_dir(),
+        &components,
+        &components,
+        &crate::setup::detect_platform(),
+        &transaction.excluded_paths(),
+    )? != record.plan.support_sha256
+    {
+        anyhow::bail!("Installed support changed; retain recovery journal for repair.");
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_ready_restart(transaction: &InstallTransaction) -> anyhow::Result<()> {
+    verify_restart_support(transaction)?;
+    let record = transaction.restart_record()?;
+    let pid = record.pid.context("ready host identity is missing")?;
+    transaction.record_ready(&record.generation, pid)
 }
 
 async fn wait_for_runtime_host_release(data_dir: &Path) -> anyhow::Result<()> {

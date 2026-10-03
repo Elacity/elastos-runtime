@@ -66,4 +66,5 @@ pub mod shell_cmd;
 pub mod sources;
 pub mod supervisor;
 pub mod update;
+pub mod update_controller;
 pub mod vm_provider;
