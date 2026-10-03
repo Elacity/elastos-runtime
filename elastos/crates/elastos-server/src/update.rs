@@ -946,7 +946,7 @@ async fn run_update_with_restart(
 
 /// Bind a verified release envelope to the exact bytes chosen by its signed head.
 /// This digest is additional envelope evidence; the CID remains content identity.
-fn verify_release_binding(
+pub(crate) fn verify_release_binding(
     head: &serde_json::Value,
     release_bytes: &[u8],
     release: &serde_json::Value,
