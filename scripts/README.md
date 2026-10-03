@@ -315,6 +315,73 @@ a hash cycle; the signed head binds the final
 release CID and installer hash. Carrier holder identity and ticket remain
 public transport inputs, separate from the signer identity.
 
+### Publisher-keys custody preparation
+
+The same installed signer accepts a protected policy with
+`signing_role: "publisher-keys"`. An omitted role keeps the existing `release`
+mode. The policy selects the operation and signing domain; candidate metadata
+supplies only the approved payload. Release mode accepts its release manifest,
+and publisher-keys mode accepts this exact unsigned manifest shape:
+
+```json
+{
+  "source": {"commit": "APPROVED_COMMIT", "tree": "APPROVED_TREE"},
+  "statement": {
+    "schema": "elastos.publisher-keys/v1",
+    "version": 1,
+    "channel": "canary",
+    "root_did": "ROOT_DID",
+    "previous_root_did": null,
+    "issued_at": 0,
+    "expires_at": 1,
+    "release_dids": ["DELEGATED_RELEASE_DID"]
+  }
+}
+```
+
+Replace the illustrative values with approved source OIDs, canonical Ed25519
+DIDs, a positive integer statement version, and current Unix timestamps in
+seconds. The root owns delegation. Each of the up to 16 distinct release DIDs
+identifies a separate delegated signer. An empty list revokes all release
+delegates. The root and previous root stay outside that list. The input contains
+the fields shown above; candidate signatures,
+roles and domains are refused. Its exact SHA-256 is the protected policy's
+`manifest_sha256`.
+
+The statement policy retains the existing repository, source commit/tree,
+source authority SemVer `version`, public `publisher_did`, tool/interpreter/
+OpenSSL pins, key path and file/snapshot quotas. It also requires three explicit
+integer bounds:
+`max_statement_lifetime` (positive seconds), `max_future_skew` (nonnegative
+seconds), and `minimum_statement_version` (positive integer). Each bound is
+below `2**63`. These are operator approvals; the signer supplies no defaults.
+The statement's integer version is separate from the policy's source authority
+SemVer. Its channel matches the protected policy's publication channel.
+
+Both custody roles use the same channel-specific source gate. For `canary`, the
+policy pins the approved remote `develop_oid`; a moved head needs a new approval.
+For `stable` and `jetson-test`, the policy pins the matching version `tag` and
+`tag_oid`, and the approved tagged commit belongs to `main`. Statement custody
+preserves this gate, including the policy's source authority SemVer.
+
+The signer fixes admission time once, checks the version floor and lifetime,
+and bounds future issue time. `issued_at` precedes `expires_at`; expiry must be
+later than admission time. Clock skew never extends expiry. Run the same
+protected-policy command above, with an approved statement input and a new
+output directory. The confirmation identifies the statement operation and
+requires the complete public DID. The output contains only
+`publisher-keys.json`, with `payload` and a `signatures` array containing this
+custodian's one signature. Its domain is `elastos.publisher.keys.v1`, using
+the same compact sorted UTF-8 JSON and domain-separated SHA-256 convention.
+
+For a root handover, `previous_root_did` names a distinct old root. The approved
+policy's `publisher_did` selects either that root or the new `root_did` as the
+actual signer. Each custody run emits one partial signature. A later process
+must verify both roots' signatures on the same payload before treating the
+handover as complete. This preparation mode leaves public heads, installer
+trust, client version persistence and publication on their existing contract.
+Client expiry/freshness rules and the complete handover remain separate gates.
+
 On the publication host, inspect the frozen set before committing it:
 
 ```sh

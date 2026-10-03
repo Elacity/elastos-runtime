@@ -668,6 +668,298 @@ class SignerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 S.unixfs_metadata_cid(value)
 
+    def statement_policy(self):
+        self.canary_policy()
+        self.policy.update(signing_role="publisher-keys", max_statement_lifetime=1000,
+                           max_future_skew=60, minimum_statement_version=2)
+        self.manifest = {"source": {"commit": COMMIT, "tree": TREE}, "statement": {
+            "schema": "elastos.publisher-keys/v1", "version": 2, "channel": "canary",
+            "root_did": DID, "previous_root_did": None, "issued_at": 900,
+            "expires_at": 1100, "release_dids": [S.public_did(bytes(32))]}}
+        self.approve_manifest()
+
+    def prepare_statement(self):
+        return S.prepare(self.policy, self.root, "signing-input.json", self.fetch, self.snapshot, now=1000)
+
+    def test_statement_mode_signs_only_approved_frozen_payload_in_its_domain(self):
+        self.statement_policy()
+        prepared = self.prepare_statement()
+        approved = copy.deepcopy(self.manifest["statement"])
+        self.manifest["statement"]["release_dids"] = [DID]
+        self.approve_manifest()
+        backend = FakeBackend()
+        output = dict(S.sign_publication(prepared, backend))
+        self.assertEqual(set(output), {"publisher-keys.json"})
+        statement = S.parse_json(output["publisher-keys.json"])
+        self.assertEqual(statement, {"payload": approved, "signatures": [
+            {"signer_did": DID, "signature": bytes(64).hex()}]})
+        expected = hashlib.sha256(b"elastos.publisher.keys.v1\0" + S.json_bytes(approved)).digest()
+        self.assertEqual([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"], [("sign", expected)])
+        self.assertEqual(list(self.snapshot.iterdir()), [])
+        self.assertFalse(self.marker.exists())
+
+    def test_statement_publication_channel_preserves_source_authority(self):
+        self.statement_policy()
+        self.prepare_statement()
+        self.assertTrue(any("/git/ref/heads/develop" in path for path in self.requests))
+        self.assertFalse(any("/git/ref/heads/main" in path or "/git/ref/tags/" in path for path in self.requests))
+        self.policy.update(tag="v1.2.3", tag_oid=COMMIT)
+        self.api[f"/repos/{S.REPOSITORY}/git/ref/tags/v1.2.3"] = {
+            "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}}
+        for channel in ("stable", "jetson-test"):
+            self.requests.clear()
+            self.policy["channel"] = self.manifest["statement"]["channel"] = channel
+            self.approve_manifest()
+            self.prepare_statement()
+            self.assertEqual(self.policy["channel"], channel)
+            self.assertTrue(any("/git/ref/heads/main" in path for path in self.requests))
+            self.assertTrue(any("/git/ref/tags/v1.2.3" in path for path in self.requests))
+            self.assertFalse(any("/git/ref/heads/develop" in path or "/git/blobs/" in path for path in self.requests))
+        self.policy["channel"] = self.manifest["statement"]["channel"] = "canary"
+        self.policy["develop_oid"] = COMMIT
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "develop ref moved"):
+            self.prepare_statement()
+
+    def test_stable_statement_develop_source_without_main_tag_refused_before_backend(self):
+        self.statement_policy()
+        self.policy["channel"] = self.manifest["statement"]["channel"] = "stable"
+        self.approve_manifest()
+        path = self.base / "operator-policy.json"
+        output = self.base / "publication"
+        prefix = f"/repos/{S.REPOSITORY}"
+        cases = [{}, {"tag": "v1.2.3", "tag_oid": COMMIT},
+                 {"tag": "v1.2.3", "tag_oid": COMMIT, "outside_main": True}]
+        for case in cases:
+            self.policy.update({field: value for field, value in case.items() if field != "outside_main"})
+            if case.get("outside_main"):
+                self.api[f"{prefix}/git/ref/tags/v1.2.3"] = {
+                    "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}}
+                self.api[f"{prefix}/compare/{COMMIT}...{MAIN}?per_page=1"]["status"] = "diverged"
+            path.write_bytes(S.json_bytes(self.policy))
+            with self.subTest(case=case), \
+                 mock.patch.object(sys, "argv", [str(SOURCE), "--policy", str(path), "--input-root", str(self.root), "--output-root", str(output)]), \
+                 mock.patch.object(S, "pinned_tools"), mock.patch.object(S, "github_json", side_effect=self.fetch), \
+                 mock.patch.object(S, "OpenSSLBackend") as backend:
+                with self.assertRaises(ValueError):
+                    S.main()
+                backend.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_statement_revoke_all_delegates_emits_approved_empty_list(self):
+        self.statement_policy()
+        self.manifest["statement"]["release_dids"] = []
+        self.approve_manifest()
+        backend = FakeBackend()
+        publication = dict(S.sign_publication(self.prepare_statement(), backend))
+        statement = S.parse_json(publication["publisher-keys.json"])
+        self.assertEqual(statement["payload"], self.manifest["statement"])
+        self.assertEqual(statement["payload"]["release_dids"], [])
+        self.assertEqual(statement["signatures"], [{"signer_did": DID, "signature": bytes(64).hex()}])
+        self.assertEqual(len([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"]), 1)
+
+    def test_statement_mode_and_release_mode_refuse_each_others_inputs_before_backend(self):
+        release = copy.deepcopy(self.manifest)
+        self.statement_policy()
+        statement = copy.deepcopy(self.manifest)
+        for role, manifest in (("publisher-keys", release), ("release", statement), ("candidate-selected", statement)):
+            self.policy["signing_role"] = role
+            self.manifest = manifest
+            self.approve_manifest()
+            path = self.base / "operator-policy.json"
+            path.write_bytes(S.json_bytes(self.policy))
+            output = self.base / "publication"
+            with self.subTest(role=role), \
+                 mock.patch.object(sys, "argv", [str(SOURCE), "--policy", str(path), "--input-root", str(self.root), "--output-root", str(output)]), \
+                 mock.patch.object(S, "pinned_tools"), mock.patch.object(S, "github_json", side_effect=self.fetch), \
+                 mock.patch.object(S.time, "time", return_value=1000), mock.patch.object(S, "OpenSSLBackend") as backend:
+                with self.assertRaises(ValueError):
+                    S.main()
+                backend.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_statement_rejects_candidate_roles_domains_signatures_and_source_changes(self):
+        self.statement_policy()
+        approved = copy.deepcopy(self.manifest)
+        changes = [{"signing_role": "release"}, {"domain": "elastos.release.v1"},
+                   {"signatures": []}, {"source": {"commit": MAIN, "tree": TREE}},
+                   {"source": {"commit": COMMIT, "tree": TREE, "extra": True}}]
+        for change in changes:
+            self.manifest = {**approved, **change}
+            self.approve_manifest()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.prepare_statement()
+        self.manifest = approved
+        for extra in ("signature", "signatures", "signer_did", "domain", "signing_role"):
+            self.manifest = copy.deepcopy(approved)
+            self.manifest["statement"][extra] = []
+            self.approve_manifest()
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.prepare_statement()
+        self.manifest = approved
+        self.approve_manifest()
+        (self.root / "signing-input.json").write_bytes(b"{}")
+        with self.assertRaisesRegex(ValueError, "operator approval"):
+            self.prepare_statement()
+        data = S.json_bytes(approved).replace(b'"version":2', b'"version":2,"version":3')
+        (self.root / "signing-input.json").write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+        with self.assertRaisesRegex(ValueError, "duplicate JSON field"):
+            self.prepare_statement()
+
+    def test_statement_strict_payload_roots_and_delegate_bounds(self):
+        self.statement_policy()
+        approved = copy.deepcopy(self.manifest["statement"])
+        other = S.public_did(bytes(32))
+        changes = [{"schema": "elastos.release/v1"}, {"channel": "stable"}, {"channel": "unknown"},
+                   {"root_did": "did:key:invalid"}, {"root_did": other},
+                   {"previous_root_did": DID}, {"previous_root_did": "did:key:invalid"},
+                   {"release_dids": [DID]}, {"release_dids": [other, other]},
+                   {"release_dids": ["did:key:invalid"]}, {"release_dids": [other] * (S.MAX_RELEASE_DIDS + 1)},
+                   {"release_dids": other}, {"previous_root_did": other, "release_dids": [other]}]
+        for change in changes:
+            self.manifest["statement"] = {**approved, **change}
+            self.approve_manifest()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.prepare_statement()
+        self.manifest["statement"] = {field: value for field, value in approved.items() if field != "previous_root_did"}
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "fields refused"):
+            self.prepare_statement()
+
+    def test_statement_nonobject_manifests_and_untyped_policy_channels_are_refused(self):
+        self.statement_policy()
+        for data in (b"[]", b"null", b"true", b'"statement"', b"1"):
+            (self.root / "signing-input.json").write_bytes(data)
+            self.policy["manifest_sha256"] = S.sha256(data)
+            with self.subTest(data=data), self.assertRaisesRegex(ValueError, "JSON object required"):
+                self.prepare_statement()
+        self.approve_manifest()
+        for channel in (True, False, None, [], {}, 1, "unknown"):
+            self.policy["channel"] = channel
+            with self.subTest(channel=channel), self.assertRaisesRegex(ValueError, "trusted statement channel"):
+                self.prepare_statement()
+
+    def test_statement_versions_times_and_explicit_policy_limits(self):
+        self.statement_policy()
+        approved = copy.deepcopy(self.manifest["statement"])
+        for field, values in (("version", [0, 1, True, "2", 2**63]),
+                              ("issued_at", [-1, True, "900", 1100, 1061]),
+                              ("expires_at", [-1, True, "1100", 900, 1000, 1901])):
+            for value in values:
+                self.manifest["statement"] = {**approved, field: value}
+                self.approve_manifest()
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    self.prepare_statement()
+        self.manifest["statement"] = {**approved, "issued_at": 1060}
+        self.approve_manifest()
+        self.prepare_statement()
+        self.manifest["statement"] = {**approved, "expires_at": 1001}
+        self.approve_manifest()
+        self.prepare_statement()
+        self.manifest["statement"] = approved
+        self.approve_manifest()
+        original_policy = copy.deepcopy(self.policy)
+        for field in ("max_statement_lifetime", "max_future_skew", "minimum_statement_version"):
+            for value in (None, True, "1", -1, 2**63):
+                self.policy = {**original_policy, field: value}
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "explicit statement"):
+                    self.prepare_statement()
+            self.policy = copy.deepcopy(original_policy)
+            del self.policy[field]
+            with self.assertRaisesRegex(ValueError, "explicit statement"):
+                self.prepare_statement()
+        self.policy = {**original_policy, "max_future_skew": 0}
+        self.prepare_statement()
+        for now in (True, -1, 2**63):
+            with self.subTest(now=now), self.assertRaisesRegex(ValueError, "admission time"):
+                S.prepare(self.policy, self.root, "signing-input.json", self.fetch, self.snapshot, now=now)
+
+    def test_rotation_output_has_only_the_explicitly_approved_roots_one_signature(self):
+        self.statement_policy()
+        previous = S.public_did(bytes(32))
+        delegate = S.public_did(bytes(reversed(PUBLIC)))
+        self.manifest["statement"].update(previous_root_did=previous, release_dids=[delegate])
+        self.approve_manifest()
+        for signer, public in ((DID, PUBLIC), (previous, bytes(32))):
+            self.policy["publisher_did"] = signer
+            prepared = self.prepare_statement()
+            backend = FakeBackend()
+            backend.public = public
+            output = S.parse_json(dict(S.sign_publication(prepared, backend))["publisher-keys.json"])
+            self.assertEqual(output["signatures"], [{"signer_did": signer, "signature": bytes(64).hex()}])
+        self.policy["publisher_did"] = delegate
+        with self.assertRaisesRegex(ValueError, "outside statement roots"):
+            self.prepare_statement()
+
+    def test_statement_backend_refusals_and_cancellation(self):
+        self.statement_policy()
+        prepared = self.prepare_statement()
+        for attribute, value, reason in (("public", bytes(32), "DID"), ("signature", bytes(63), "length"), ("verified", False, "verification")):
+            backend = FakeBackend()
+            setattr(backend, attribute, value)
+            with self.subTest(attribute=attribute), self.assertRaisesRegex(ValueError, reason):
+                S.sign_publication(prepared, backend)
+        prompt = io.StringIO()
+        self.assertFalse(S.confirmed(prepared, io.StringIO("\n"), prompt))
+        self.assertIn("one root signature", prompt.getvalue())
+        self.assertTrue(S.confirmed(prepared, io.StringIO(DID + "\n"), io.StringIO()))
+
+    def test_statement_cli_uses_one_admission_time_rechecks_develop_and_writes_only_statement(self):
+        self.statement_policy()
+        path = self.base / "operator-policy.json"
+        path.write_bytes(S.json_bytes(self.policy))
+        output = self.base / "publication"
+        backend = FakeBackend()
+        with mock.patch.object(sys, "argv", [str(SOURCE), "--policy", str(path), "--input-root", str(self.root), "--output-root", str(output)]), \
+             mock.patch.object(S, "pinned_tools"), mock.patch.object(S, "github_json", side_effect=self.fetch), \
+             mock.patch.object(S.time, "time", return_value=1000) as clock, \
+             mock.patch.object(sys, "stdin", io.StringIO(DID + "\n")), \
+             mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()), \
+             mock.patch.object(S, "OpenSSLBackend", return_value=backend) as factory:
+            S.main()
+        clock.assert_called_once_with()
+        factory.assert_called_once()
+        self.assertEqual(sum(path.endswith("/git/ref/heads/develop") for path in self.requests), 2)
+        self.assertEqual([path.name for path in output.iterdir()], ["publisher-keys.json"])
+        self.assertEqual((output / "publisher-keys.json").stat().st_mode & 0o777, 0o444)
+        self.assertEqual(S.parse_json((output / "publisher-keys.json").read_bytes())["payload"], self.manifest["statement"])
+        self.assertIn("close", backend.calls)
+        self.assertFalse(any(path.name.startswith(".elastos-signing-") for path in self.base.iterdir()))
+
+    def test_statement_input_uses_held_descriptor_and_refuses_links_and_disk_floor(self):
+        self.statement_policy()
+        self.root.rename(self.base / "held-candidate")
+        self.root.mkdir()
+        # Descriptor holding is exercised directly with the original directory.
+        held = S.directory_fd(self.base / "held-candidate")
+        try:
+            prepared = S.prepare_statement(self.policy, S.signing_source_policy(self.policy), self.root,
+                                          "signing-input.json", self.fetch, self.snapshot, held, 1000)
+            self.assertEqual(S.parse_json(prepared.statement), self.manifest["statement"])
+        finally:
+            os.close(held)
+        source = self.base / "held-candidate/signing-input.json"
+        candidate = self.root / "signing-input.json"
+        candidate.symlink_to(source)
+        with self.assertRaises(OSError):
+            self.prepare_statement()
+        candidate.unlink()
+        os.link(source, candidate)
+        with self.assertRaisesRegex(ValueError, "regular unlinked file"):
+            self.prepare_statement()
+        candidate.unlink()
+        candidate.write_bytes(source.read_bytes())
+        with mock.patch.object(S.shutil, "disk_usage", return_value=SimpleNamespace(total=100, free=14)), \
+             self.assertRaisesRegex(ValueError, "free-space floor"):
+            self.prepare_statement()
+        for quota in ("max_file_bytes", "max_snapshot_bytes"):
+            original = self.policy[quota]
+            self.policy[quota] = 1
+            with self.subTest(quota=quota), self.assertRaisesRegex(ValueError, "snapshot quota"):
+                self.prepare_statement()
+            self.policy[quota] = original
+
 
 if __name__ == "__main__":
     unittest.main()
