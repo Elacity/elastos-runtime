@@ -490,9 +490,14 @@ fn run_source_command_with_confirmation(
                     .parent()
                     .ok_or_else(|| anyhow::anyhow!("Installed binary parent is unavailable"))?,
             )?;
+            let binary = parent.join(
+                binary
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Installed binary basename is unavailable"))?,
+            );
             let guard = crate::install_transaction::InstallationGuard::acquire(&parent)?;
             let installed =
-                crate::installed_release::load_or_migrate(data_dir, binary, source, &guard)?;
+                crate::installed_release::load_or_migrate(data_dir, &binary, source, &guard)?;
             let head_path = installation_release_head_path(data_dir);
             if !head_path.exists() {
                 anyhow::bail!("No local release head found at {}", head_path.display());

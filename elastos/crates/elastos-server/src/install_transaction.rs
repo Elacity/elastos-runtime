@@ -148,8 +148,7 @@ impl InstallationGuard {
         if !binary_parent.is_absolute() {
             bail!("installation binary parent must be an absolute existing path");
         }
-        let binary_parent = fs::canonicalize(binary_parent)?;
-        check_directory(&binary_parent)?;
+        check_directory(binary_parent)?;
         let lock_path = binary_parent.join(INSTALL_LOCK);
         let lock = OpenOptions::new()
             .read(true)
@@ -172,17 +171,18 @@ impl InstallationGuard {
         }
         Ok(Self {
             _lock: lock,
-            binary_parent,
+            binary_parent: binary_parent.to_path_buf(),
         })
     }
 
     pub(crate) fn require_binary(&self, binary: &Path) -> anyhow::Result<()> {
         if !binary.is_absolute()
-            || fs::canonicalize(binary.parent().context("installed binary parent missing")?)?
-                != self.binary_parent
+            || binary.parent().context("installed binary parent missing")?
+                != self.binary_parent.as_path()
         {
             bail!("installed release writer owns a different binary parent");
         }
+        check_directory(&self.binary_parent)?;
         let path = self.binary_parent.join(INSTALL_LOCK);
         check_file(&self._lock, &path, true)?;
         let held = self._lock.metadata()?;
@@ -511,6 +511,7 @@ impl InstallTransaction {
             // Commit already verified the installed set. Cleanup owns only the
             // journal and scratch; later safe owner changes belong to the live set.
             for entry in &journal.entries {
+                self.check_metadata_custody(entry.id)?;
                 if file_state(&self.destinations[&entry.id])?.is_none() {
                     bail!(
                         "release file {} is missing; retain journal for recovery",
@@ -1794,6 +1795,31 @@ mod tests {
     }
 
     #[test]
+    fn installation_guard_requires_its_resolved_parent_for_binary_admission() {
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let alias = parent.with_file_name("bin-alias");
+        let other = parent.with_file_name("other-bin");
+        fs::create_dir(&other).unwrap();
+        symlink(&parent, &alias).unwrap();
+        let guard = InstallationGuard::acquire(&parent).unwrap();
+        guard.require_binary(&parent.join("elastos")).unwrap();
+        assert!(guard.require_binary(&alias.join("elastos")).is_err());
+        assert!(guard.require_binary(&other.join("elastos")).is_err());
+        fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        guard.require_binary(&parent.join("elastos")).unwrap();
+        assert!(guard.require_binary(&alias.join("elastos")).is_err());
+
+        let moved = parent.with_file_name("moved-bin");
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&other, &parent).unwrap();
+        assert!(guard.require_binary(&parent.join("elastos")).is_err());
+        assert!(moved.join(INSTALL_LOCK).is_file());
+        assert!(!other.join(INSTALL_LOCK).exists());
+    }
+
+    #[test]
     fn transaction_keeps_resolved_binary_parent_after_alias_retarget() {
         let fixture = Fixture::new();
         let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
@@ -2252,43 +2278,153 @@ mod tests {
 
     #[test]
     fn committed_cleanup_preserves_later_owner_bytes_and_modes() {
+        assert_committed_cleanup_preserves_owner_edits(ReleaseLayout::Consumed);
+    }
+
+    #[test]
+    fn legacy_committed_cleanup_preserves_publisher_owner_bytes_and_modes() {
+        assert_committed_cleanup_preserves_owner_edits(ReleaseLayout::LegacyPublisher);
+    }
+
+    fn assert_committed_cleanup_preserves_owner_edits(layout: ReleaseLayout) {
         let fixture = Fixture::new();
         let writer = fixture.writer();
         fixture.old_files(&writer, false);
         fixture.commit_before_cleanup(&writer);
+        if layout == ReleaseLayout::LegacyPublisher {
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            let publisher = publisher_release_head_path(&fixture.data)
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            writer
+                .check_parent(publisher.parent().unwrap(), true)
+                .unwrap();
+            fs::rename(
+                writer.destinations[&ReleaseFile::ReleaseHead]
+                    .parent()
+                    .unwrap(),
+                publisher,
+            )
+            .unwrap();
+            journal.schema = "elastos.install-transaction/v1".into();
+            writer.write_journal(&journal).unwrap();
+        }
+        drop(writer);
+        let writer = fixture.writer();
+        assert_eq!(writer.layout, layout);
+        let independent_metadata = if layout == ReleaseLayout::Consumed {
+            [
+                publisher_release_head_path(&fixture.data),
+                publisher_release_manifest_path(&fixture.data),
+            ]
+        } else {
+            [
+                installation_release_head_path(&fixture.data),
+                installation_release_manifest_path(&fixture.data),
+            ]
+        };
+        for path in &independent_metadata {
+            writer.check_parent(path.parent().unwrap(), true).unwrap();
+            write_new(path, b"independent signed input", 0o600).unwrap();
+        }
         fs::remove_file(writer.scratch(ReleaseFile::RuntimeBinary, ROLLBACK)).unwrap();
+        let modes: BTreeMap<_, _> = ReleaseFile::ALL
+            .map(|id| {
+                let mode = match (id, layout) {
+                    (ReleaseFile::RuntimeBinary, _) => 0o750,
+                    (
+                        ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest,
+                        ReleaseLayout::Consumed,
+                    ) => 0o600,
+                    _ => 0o640,
+                };
+                (id, mode)
+            })
+            .into_iter()
+            .collect();
         for id in ReleaseFile::ALL {
             let destination = &writer.destinations[&id];
             fs::write(destination, format!("later owner {}", id.name())).unwrap();
-            let mode = if id == ReleaseFile::RuntimeBinary {
-                0o750
-            } else {
-                0o640
-            };
-            fs::set_permissions(destination, fs::Permissions::from_mode(mode)).unwrap();
+            fs::set_permissions(destination, fs::Permissions::from_mode(modes[&id])).unwrap();
         }
         drop(writer);
         let resumed = fixture.writer();
         resumed.recover().unwrap();
         resumed.require_empty_scratch().unwrap();
         resumed.recover().unwrap();
+        for metadata in [
+            publisher_release_head_path(&fixture.data),
+            installation_release_head_path(&fixture.data),
+        ] {
+            for directory in [STAGE, ROLLBACK] {
+                assert_eq!(
+                    fs::symlink_metadata(metadata.parent().unwrap().join(directory))
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::NotFound,
+                );
+            }
+        }
+        assert!(!resumed.journal_path().exists());
         for id in ReleaseFile::ALL {
             let destination = &resumed.destinations[&id];
             assert_eq!(
                 fs::read(destination).unwrap(),
                 format!("later owner {}", id.name()).as_bytes()
             );
-            let mode = if id == ReleaseFile::RuntimeBinary {
-                0o750
-            } else {
-                0o640
-            };
-            assert_eq!(fs::metadata(destination).unwrap().mode() & 0o777, mode);
+            assert_eq!(
+                fs::metadata(destination).unwrap().mode() & 0o777,
+                modes[&id]
+            );
+        }
+        for path in independent_metadata {
+            assert_eq!(fs::read(&path).unwrap(), b"independent signed input");
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
         }
         assert_eq!(
             fs::read(fixture.data.join("owner-data")).unwrap(),
             b"data written by owner"
         );
+    }
+
+    #[test]
+    fn committed_cleanup_refuses_nonprivate_consumed_metadata_and_preserves_custody() {
+        for (id, mode) in [ReleaseFile::ReleaseHead, ReleaseFile::ReleaseManifest]
+            .into_iter()
+            .flat_map(|id| [0o640, 0o644].into_iter().map(move |mode| (id, mode)))
+        {
+            let fixture = Fixture::new();
+            let writer = fixture.writer();
+            fixture.old_files(&writer, false);
+            fixture.commit_before_cleanup(&writer);
+            let destination = &writer.destinations[&id];
+            fs::write(destination, b"preserve later owner input").unwrap();
+            fs::set_permissions(destination, fs::Permissions::from_mode(mode)).unwrap();
+            let paths: Vec<_> = writer
+                .destinations
+                .values()
+                .cloned()
+                .chain(ReleaseFile::ALL.map(|id| writer.scratch(id, ROLLBACK)))
+                .chain(std::iter::once(writer.journal_path()))
+                .collect();
+            let before: Vec<_> = paths
+                .iter()
+                .map(|path| (fs::read(path).unwrap(), fs::metadata(path).unwrap().mode()))
+                .collect();
+            let error = writer.recover().unwrap_err();
+            assert!(error.to_string().contains("owner-only files"));
+            drop(writer);
+            assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
+            for (path, (bytes, mode)) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert_eq!(fs::metadata(path).unwrap().mode(), mode);
+            }
+            assert_eq!(
+                fs::read(fixture.data.join("owner-data")).unwrap(),
+                b"data written by owner"
+            );
+        }
     }
 
     #[test]
