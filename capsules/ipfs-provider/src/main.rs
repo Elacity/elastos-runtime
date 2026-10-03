@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Only Runtime's typed local Registry methods dispatch the private operations.
@@ -373,7 +374,7 @@ impl IpfsProvider {
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
 
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
@@ -401,7 +402,7 @@ impl IpfsProvider {
     fn fetch_to_path(&mut self, arg: &str, dest: &Path) -> Result<u64, String> {
         // Dest copies borrow a local repo hit, then Content fails over to
         // Carrier. Pin/add and gateway fallback search the public swarm.
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             self.kubo_cat_to_path(arg, dest, LARGE_HTTP_TIMEOUT)
         } else {
             Err("local dest cat backend is not ready".into())
@@ -597,10 +598,20 @@ impl IpfsProvider {
     // ── Ensure Kubo is running ──────────────────────────────────────
 
     fn ensure_kubo(&mut self) -> Result<(), String> {
+        // Reap an owned daemon after the idle watcher or a crash stops it.
+        if self
+            .kubo_child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+        {
+            self.kubo_child = None;
+        }
         if self.state == KuboState::Ready {
             // Verify still alive
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
+                    self.api_port = coord.api_port;
+                    self.gateway_port = coord.gateway_port;
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
@@ -865,7 +876,7 @@ impl IpfsProvider {
     // ── Read ops ────────────────────────────────────────────────────
 
     fn cat_bounded(
-        &self,
+        &mut self,
         cid: &str,
         path: Option<&str>,
         invocation: Option<&serde_json::Value>,
@@ -943,6 +954,14 @@ impl IpfsProvider {
             if self.state != KuboState::Ready || self.api_port == 0 {
                 return Err("bounded read backend is not ready".into());
             }
+            let coord =
+                read_coord_file(&self.data_dir).filter(|coord| is_pid_alive(coord.kubo_pid));
+            let Some(coord) = coord else {
+                self.state = KuboState::Cold;
+                return Err("bounded read backend is not ready".into());
+            };
+            self.api_port = coord.api_port;
+            self.gateway_port = coord.gateway_port;
             let arg = if path.is_empty() {
                 cid.to_string()
             } else {
@@ -1066,7 +1085,7 @@ impl IpfsProvider {
 
     fn ls(&mut self, cid: &str) -> Response {
         // Try Kubo first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1136,7 +1155,7 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+            let bytes = if self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
                 match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
@@ -1448,7 +1467,7 @@ impl IpfsProvider {
 
     fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
         // Try Kubo API first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1850,7 +1869,7 @@ fn collect_ls_entries(json: &serde_json::Value, prefix: &str, out: &mut Vec<serd
 }
 
 fn collect_ls_files_recursive(
-    provider: &IpfsProvider,
+    provider: &mut IpfsProvider,
     json: &serde_json::Value,
     prefix: &str,
     out: &mut Vec<String>,
@@ -1873,6 +1892,9 @@ fn collect_ls_files_recursive(
                     match link_type {
                         1 if !hash.is_empty() => {
                             // Directory — recurse
+                            if provider.ensure_kubo().is_err() {
+                                continue;
+                            }
                             let url = format!("{}/api/v0/ls?arg={}", provider.api_url(), hash);
                             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                                 if resp.status() == 200 {
@@ -1899,10 +1921,12 @@ fn collect_ls_files_recursive(
 
 // ── Idle timeout (background thread) ────────────────────────────────
 
-fn spawn_idle_watcher(data_dir: PathBuf) {
+fn spawn_idle_watcher(data_dir: PathBuf, activity: Arc<Mutex<()>>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(IDLE_CHECK_INTERVAL);
+            // The provider keeps startup and active reads ahead of an idle stop.
+            let _activity = activity.lock().unwrap();
             if let Some(coord) = read_coord_file(&data_dir) {
                 let idle_secs = now_unix_secs().saturating_sub(coord.last_used);
                 if idle_secs > IDLE_TIMEOUT_SECS {
@@ -1923,11 +1947,7 @@ fn spawn_idle_watcher(data_dir: PathBuf) {
                             .output();
                     }
                     remove_coord_file(&data_dir);
-                    break;
                 }
-            } else {
-                // No coord file — Kubo not running, exit watcher
-                break;
             }
         }
     });
@@ -1940,8 +1960,8 @@ fn main() {
 
     let mut provider = IpfsProvider::new();
 
-    // Start idle watcher thread
-    spawn_idle_watcher(provider.data_dir.clone());
+    let activity = Arc::new(Mutex::new(()));
+    let mut idle_watcher_started = false;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1968,7 +1988,13 @@ fn main() {
         };
 
         let is_shutdown = matches!(request, Request::Shutdown);
+        let _activity = activity.lock().unwrap();
         let response = provider.handle(request);
+        if !idle_watcher_started && provider.state == KuboState::Ready {
+            // Init has selected the data root before this daemon becomes ready.
+            spawn_idle_watcher(provider.data_dir.clone(), Arc::clone(&activity));
+            idle_watcher_started = true;
+        }
 
         let json = serde_json::to_string(&response).unwrap();
         writeln!(stdout, "{}", json).unwrap();
@@ -2223,6 +2249,63 @@ mod tests {
             data_dir: root.to_path_buf(),
             repo_dir: root.join("unused-repo"),
         }
+    }
+
+    #[test]
+    fn bounded_read_after_idle_stop_refuses_within_deadline_without_startup() {
+        for missing_coord in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut provider =
+                bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+            provider.kubo_binary = Some(root.path().join("must-not-execute"));
+            if missing_coord {
+                remove_coord_file(root.path());
+            } else {
+                let mut coord = read_coord_file(root.path()).unwrap();
+                coord.kubo_pid = 999999;
+                assert!(!is_pid_alive(coord.kubo_pid));
+                write_coord_file(root.path(), &coord);
+            }
+            let started = Instant::now();
+            let response =
+                provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap());
+            assert!(started.elapsed() < BOUNDED_READ_TIMEOUT);
+            assert!(
+                matches!(response, Response::Error { code, .. } if code == "bounded_read_failed")
+            );
+            assert_eq!(provider.state, KuboState::Cold);
+            assert!(provider.kubo_child.is_none());
+            assert!(!provider.repo_dir.exists());
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn unbounded_read_refreshes_ready_backend_ports_from_coord() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider =
+            bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+        provider.api_port = 0;
+        provider.gateway_port = 0;
+        let backend = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89ab")
+                .unwrap();
+            headers
+        });
+        assert_eq!(provider.fetch_bytes("release-cid").unwrap(), b"89ab");
+        assert!(backend
+            .join()
+            .unwrap()
+            .starts_with("POST /api/v0/cat?arg=release-cid"));
+        assert_eq!(provider.state, KuboState::Ready);
+        assert!(provider.kubo_child.is_none());
     }
 
     fn complete_metadata_request(max: u64) -> serde_json::Value {

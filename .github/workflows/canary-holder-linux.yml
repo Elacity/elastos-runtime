@@ -1,0 +1,627 @@
+# Issue #89: qualify a reviewed provider with the accepted Runtime and helpers.
+name: Canary Linux holder
+
+on:
+  pull_request:
+    paths: [capsules/ipfs-provider/**, .github/workflows/canary-holder-linux.yml]
+  push:
+    branches: [fix/89-canary-inputs]
+    paths: [.github/workflows/canary-holder-linux.yml]
+  workflow_dispatch:
+    inputs:
+      provider_commit:
+        description: Exact reviewed provider source commit (premerge proof or merged handoff)
+        required: true
+        type: string
+      provider_tree:
+        description: Exact tree of the provider source commit
+        required: true
+        type: string
+      package_merged:
+        description: Package only after this exact provider commit is merged into develop
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: canary-holder-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: 8a9dec16b4febfac5759883ec7462e1ea780dd59
+  SOURCE_TREE: e18d17a3431b4d2548796347528e28afee909e35
+  PROVIDER_COMMIT: ${{ inputs.provider_commit || github.event.pull_request.head.sha || github.sha }}
+  PROVIDER_TREE: ${{ inputs.provider_tree || '' }}
+  PACKAGE_MERGED: ${{ inputs.package_merged == true && 'true' || 'false' }}
+  PUBLISHER_RUN: '37126984153'
+  PUBLISHER_WORKFLOW_COMMIT: f05bf12d7e6b9e35ff0d8d02728fa8ad8d2f8fac
+  PUBLISHER_ARTIFACT_ID: '11275219630'
+  PUBLISHER_ZIP_SHA256: 9a9df833cced46f26e87fcf5cda66609bcc464b153c467cbc46c3a905ad1ed32
+  OBSERVER_COMMIT: 5814b06b0b5e1f42d05ab60002af9c548ec9d9b2
+  OBSERVER_SHA256: ed49b619f39fd154475a0f8627676aa9cc0a23deb87687f4abd6d064eeef0a96
+  ELASTOS_RELEASE_VERSION: 0.8.0-alpha.1
+  CARGO_BUILD_JOBS: '4'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  holder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.PROVIDER_COMMIT }}
+          path: provider-source
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.OBSERVER_COMMIT }}
+          path: observer
+          persist-credentials: false
+      - name: authenticate and restore the accepted Linux binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs || "$GITHUB_EVENT_NAME" == pull_request || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/Linux/X64 ]]
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          [[ "$PROVIDER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git -C ../provider-source rev-parse HEAD)" == "$PROVIDER_COMMIT" ]]
+          if [[ -n "$PROVIDER_TREE" ]]; then
+            [[ "$PROVIDER_TREE" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$(git -C ../provider-source rev-parse HEAD^{tree})" == "$PROVIDER_TREE" ]]
+          else
+            printf 'PROVIDER_TREE=%s\n' "$(git -C ../provider-source rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          fi
+          [[ -z "$(git -C ../provider-source status --porcelain=v1 --untracked-files=all)" ]]
+          python3 - <<'PY'
+          import hashlib, json, os, re, shutil, stat, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          repository = 'Elacity/elastos-runtime'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+          def api(path):
+              request = urllib.request.Request('https://api.github.com' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with opener.open(request, timeout=30) as response:
+                  payload = response.read(2 * 1024**2 + 1)
+                  assert len(payload) <= 2 * 1024**2
+                  return json.loads(payload)
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          run = api(f"/repos/{repository}/actions/runs/{os.environ['PUBLISHER_RUN']}")
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['head_sha'] == os.environ['PUBLISHER_WORKFLOW_COMMIT']
+          assert run['path'] == '.github/workflows/canary-publisher-linux.yml'
+          artifact = api(f"/repos/{repository}/actions/artifacts/{os.environ['PUBLISHER_ARTIFACT_ID']}")
+          assert artifact['workflow_run']['id'] == int(os.environ['PUBLISHER_RUN'])
+          assert artifact['workflow_run']['head_sha'] == run['head_sha'] and not artifact['expired']
+          assert artifact['name'] == 'seed-publisher-x86_64-linux-' + os.environ['SOURCE_COMMIT'] + '-1'
+          assert artifact['digest'] == 'sha256:' + os.environ['PUBLISHER_ZIP_SHA256']
+          assert 0 < artifact['size_in_bytes'] <= 128 * 1024**2
+          observer = Path(os.environ['GITHUB_WORKSPACE']) / 'observer/scripts/update-hop-compare.py'
+          assert sha(observer) == os.environ['OBSERVER_SHA256']
+          output = Path(os.environ['RUNNER_TEMP']) / 'holder-output'
+          output.mkdir(mode=0o700)
+          scratch = Path(os.environ['RUNNER_TEMP']) / 'holder-input'
+          scratch.mkdir(mode=0o700)
+          free = shutil.disk_usage(output)
+          assert free.free > 8 * 1024**3 and free.free * 100 > free.total * 15
+          try:
+              api(f"/repos/{repository}/actions/artifacts/{artifact['id']}/zip")
+              raise ValueError('Expected authenticated artifact redirect')
+          except urllib.error.HTTPError as response:
+              assert response.code == 302
+              location = response.headers['Location']
+          url = urllib.parse.urlsplit(location)
+          assert url.scheme == 'https' and url.hostname and not url.username and not url.password
+          archive = scratch / 'accepted.zip'
+          size = 0
+          with opener.open(location, timeout=60) as response, archive.open('xb') as target:
+              while chunk := response.read(1024**2):
+                  size += len(chunk)
+                  assert size <= artifact['size_in_bytes']
+                  target.write(chunk)
+          assert size == artifact['size_in_bytes'] and sha(archive) == os.environ['PUBLISHER_ZIP_SHA256']
+          with zipfile.ZipFile(archive) as zipped:
+              assert set(zipped.namelist()) == {'seed-publisher.tar.gz', 'seed-publisher.tar.gz.sha256'}
+              for member in zipped.infolist():
+                  assert stat.S_IFMT(member.external_attr >> 16) in (0, stat.S_IFREG)
+                  assert 0 < member.file_size <= 128 * 1024**2 and not member.flag_bits & 1
+                  with zipped.open(member) as source, (scratch / member.filename).open('xb') as target:
+                      shutil.copyfileobj(source, target)
+          expected = (scratch / 'seed-publisher.tar.gz.sha256').read_text().strip()
+          assert expected == sha(scratch / 'seed-publisher.tar.gz') + '  seed-publisher.tar.gz'
+          accepted = scratch / 'accepted'
+          accepted.mkdir(mode=0o700)
+          total = 0
+          with tarfile.open(scratch / 'seed-publisher.tar.gz') as archive:
+              members = archive.getmembers()
+              assert len(members) <= 32 and len({m.name for m in members}) == len(members)
+              for member in members:
+                  name = member.name.removeprefix('./')
+                  assert name in ('', '.') or (not PurePosixPath(name).is_absolute()
+                      and all(part not in ('', '.', '..') for part in name.split('/')))
+                  assert member.isdir() or member.isfile()
+                  assert 0 <= member.size <= 128 * 1024**2
+                  total += member.size
+                  assert total <= 256 * 1024**2
+              archive.extractall(accepted, filter='data')
+          recorded = {}
+          for line in (accepted / 'SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+              assert match
+              digest, name = match.groups()
+              assert name not in recorded and not PurePosixPath(name).is_absolute()
+              assert all(part not in ('', '.', '..') for part in name.split('/'))
+              recorded[name] = digest
+          assert {p.relative_to(accepted).as_posix() for p in accepted.rglob('*') if p.is_file()} == set(recorded) | {'SHA256SUMS'}
+          assert all(sha(accepted / name) == digest for name, digest in recorded.items())
+          receipt = json.loads((accepted / 'receipts/build.json').read_bytes())
+          assert receipt['source_commit'] == os.environ['SOURCE_COMMIT'] and receipt['source_tree'] == os.environ['SOURCE_TREE']
+          assert receipt['workflow_commit'] == run['head_sha'] and str(receipt['run']) == os.environ['PUBLISHER_RUN']
+          assert receipt['target'] == 'x86_64-unknown-linux-gnu' and receipt['version'] == os.environ['ELASTOS_RELEASE_VERSION']
+          root = Path(receipt['helper_root'])
+          assert str(root) == '/home/wau/.local/share/elastos-canary/source'
+          assert not root.exists() and not root.is_symlink()
+          for record in receipt['binaries']:
+              name = record['name']
+              assert name in ('elastos', 'ipfs-provider')
+              assert sha(accepted / name) == record['sha256'] and (accepted / name).stat().st_size == record['size']
+              (accepted / name).chmod(0o700)
+          assert {record['name'] for record in receipt['binaries']} == {'elastos', 'ipfs-provider'}
+          shutil.copyfile(accepted / 'receipts/build.json', output / 'accepted-build.json')
+          (output / 'admission.json').write_text(json.dumps({'run': run['html_url'], 'artifact_id': artifact['id'],
+              'zip_sha256': sha(scratch / 'accepted.zip'), 'source_commit': receipt['source_commit'],
+              'source_tree': receipt['source_tree'], 'helper_root': str(root), 'observer_commit': os.environ['OBSERVER_COMMIT'],
+              'observer_sha256': sha(observer)}, indent=2) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write('ACCEPTED_INPUT=' + str(accepted) + '\n')
+              environment.write('HOLDER_OUTPUT=' + str(output) + '\n')
+              environment.write('SEED_HELPER_ROOT=' + str(root) + '\n')
+          PY
+      - name: restore the frozen helper tree at its embedded root
+        run: |
+          set -euo pipefail
+          sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$SEED_HELPER_ROOT"
+          git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SEED_HELPER_ROOT"
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['SEED_HELPER_ROOT'])
+          hashes = json.loads((Path(os.environ['ACCEPTED_INPUT']) / 'receipts/source-files.json').read_bytes())
+          assert all(hashlib.sha256((root / name).read_bytes()).hexdigest() == digest for name, digest in hashes.items())
+          assert str(root / 'elastos/crates/elastos-server').encode() in (Path(os.environ['ACCEPTED_INPUT']) / 'elastos').read_bytes()
+          PY
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+      - name: build the exact reviewed provider while retaining accepted Runtime bytes
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+            --manifest-path "$GITHUB_WORKSPACE/provider-source/capsules/ipfs-provider/Cargo.toml"
+          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/ipfs-provider" "$ACCEPTED_INPUT/ipfs-provider"
+          git -C "$GITHUB_WORKSPACE/provider-source" archive --format=tar "$PROVIDER_COMMIT" | gzip -n > "$ACCEPTED_INPUT/provider-source.tar.gz"
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          path = Path(os.environ['ACCEPTED_INPUT']) / 'ipfs-provider'
+          with path.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          linkage = subprocess.check_output(['ldd', str(path)], text=True)
+          assert 'not found' not in linkage
+          (Path(os.environ['HOLDER_OUTPUT']) / 'provider-build.json').write_text(json.dumps({
+              'source_commit': os.environ['PROVIDER_COMMIT'], 'source_tree': os.environ['PROVIDER_TREE'],
+              'sha256': digest, 'size': path.stat().st_size, 'ldd': linkage,
+              'runtime_source_commit': os.environ['SOURCE_COMMIT'], 'runtime_source_tree': os.environ['SOURCE_TREE'],
+              'runtime_artifact_id': int(os.environ['PUBLISHER_ARTIFACT_ID']),
+              'command': 'cargo build --locked --release --manifest-path capsules/ipfs-provider/Cargo.toml',
+              'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}, indent=2) + '\n')
+          PY
+      - name: test the exact reviewed provider source
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+            --manifest-path "$GITHUB_WORKSPACE/provider-source/capsules/ipfs-provider/Cargo.toml"
+      - name: seed the checksum-pinned isolated Kubo prerequisite
+        run: |
+          set -euo pipefail
+          # Issue #217 owns replacing this accepted build-time prerequisite.
+          scripts/seed-kubo-cache.sh "$RUNNER_TEMP/holder-kubo-cache" "$ACCEPTED_INPUT/kubo-input" linux-amd64
+      - name: prove repeated watcher stops and uncached gateway and Carrier recovery
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import base64, hashlib, importlib.util, json, os, re, select, shutil, socket, subprocess, time, urllib.error, urllib.request
+          from pathlib import Path
+          observer_path = Path(os.environ['GITHUB_WORKSPACE']) / 'observer/scripts/update-hop-compare.py'
+          assert hashlib.sha256(observer_path.read_bytes()).hexdigest() == os.environ['OBSERVER_SHA256']
+          spec = importlib.util.spec_from_file_location('accepted_observer', observer_path)
+          observer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(observer)
+          output, accepted = Path(os.environ['HOLDER_OUTPUT']), Path(os.environ['ACCEPTED_INPUT'])
+          processes = observer.CliProcesses(output)
+          root = Path.home() / '.local/share/elastos-issue89-holder'
+          assert not root.exists() and not root.is_symlink()
+          root.mkdir(mode=0o700, parents=True)
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          result = {'schema': 'elastos.issue89.holder-idle/v1', 'source_commit': os.environ['SOURCE_COMMIT'],
+                    'source_tree': os.environ['SOURCE_TREE'], 'provider_commit': os.environ['PROVIDER_COMMIT'],
+                    'provider_tree': os.environ['PROVIDER_TREE'], 'passed': False,
+                    'clock': 'production watcher, fixture last_used aged to now-601; no elapsed-time claim',
+                    'source_modified': False, 'service_restarts': 0, 'provider_restarts': 0, 'reads': [], 'idle_stops': []}
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          def env(home):
+              return {**observer.cli_environment(home), 'XDG_DATA_HOME': str(home / '.local/share'),
+                      'ELASTOS_DATA_DIR': str(home / '.local/share/elastos')}
+          def port(kind=socket.SOCK_STREAM):
+              with socket.socket(socket.AF_INET, kind) as probe:
+                  probe.bind(('127.0.0.1', 0))
+                  return probe.getsockname()[1]
+          def command(home, argv, label):
+              response = processes.command(argv, env(home), home, label, timeout=90)
+              assert response['exit'] == 0, label + ' failed; see fixture logs'
+              return processes.text(label).strip()
+          def get(url, bound=128 * 1024**2, timeout=90):
+              with opener.open(url, timeout=timeout) as response:
+                  assert response.status == 200
+                  payload = response.read(bound + 1)
+                  assert len(payload) <= bound
+                  return payload
+          def ready(home, host, http_port):
+              deadline = time.monotonic() + 60
+              while time.monotonic() < deadline and host.poll() is None:
+                  try:
+                      get(f'http://127.0.0.1:{http_port}/healthz', 65536, 2)
+                      return
+                  except (OSError, urllib.error.URLError):
+                      time.sleep(.2)
+              raise AssertionError('gateway readiness failed; see fixture logs')
+          def child_identity(pid):
+              path = Path('/proc') / str(pid)
+              return {'pid': pid, 'start_time': (path / 'stat').read_text().rsplit(')', 1)[1].split()[19],
+                      'exe': os.readlink(path / 'exe')}
+          def provider_identity(host, provider):
+              matches = [row for row in observer.cli_census() if row['group'] == host.pid
+                         and row['command'].split(' ', 1)[0] == str(provider)]
+              assert len(matches) == 1, 'exact single native provider generation required'
+              return child_identity(matches[0]['pid'])
+          def read(home, http_port, cid, expected, label):
+              cache = home / 'gateway-cache' / (cid + '.raw')
+              assert not cache.exists(), 'qualification read must be uncached'
+              record = {'label': label, 'cid': cid, 'expected_sha256': sha(expected), 'cache_absent': True}
+              try:
+                  payload = get(f'http://127.0.0.1:{http_port}/content/{cid}')
+                  record.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+                  record['passed'] = record['size'] == expected.stat().st_size and record['sha256'] == record['expected_sha256']
+              except (OSError, urllib.error.URLError, AssertionError) as error:
+                  record.update(passed=False, error_type=type(error).__name__)
+              result['reads'].append(record)
+              return record['passed']
+          def idle_stop(data, owner, identity, label, log_label):
+              coord_path = data / 'ipfs-coords.json'
+              coord = json.loads(coord_path.read_bytes())
+              before = child_identity(coord['kubo_pid'])
+              assert before['exe'] == str(data / 'bin/kubo')
+              aged = {**coord, 'last_used': int(time.time()) - 601}
+              # The fixture changes only its clock input. The production watcher
+              # owns SIGTERM, coordination cleanup and the next cycle.
+              temporary = coord_path.with_suffix('.fixture-clock')
+              temporary.write_text(json.dumps(aged))
+              temporary.chmod(0o600)
+              temporary.replace(coord_path)
+              started, deadline = time.monotonic(), time.monotonic() + 75
+              initial_stops = len(re.findall(r'Kubo idle for [0-9]+s \(threshold 600s\), stopping', processes.text(log_label, 'stderr')))
+              while time.monotonic() < deadline:
+                  assert owner.poll() is None and child_identity(identity['pid']) == identity
+                  if not coord_path.exists():
+                      break
+                  current = json.loads(coord_path.read_bytes())
+                  assert current['kubo_pid'] == coord['kubo_pid'] and current['last_used'] == aged['last_used']
+                  time.sleep(.2)
+              else:
+                  raise AssertionError('production idle watcher did not stop Kubo within 75s')
+              stop_count = len(re.findall(r'Kubo idle for [0-9]+s \(threshold 600s\), stopping', processes.text(log_label, 'stderr')))
+              assert stop_count == initial_stops + 1
+              exit_deadline = time.monotonic() + 15
+              while time.monotonic() < exit_deadline:
+                  try:
+                      state = (Path('/proc') / str(coord['kubo_pid']) / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                  except FileNotFoundError:
+                      state = 'absent'
+                  with socket.socket() as probe:
+                      probe.settimeout(.2)
+                      closed = probe.connect_ex(('127.0.0.1', coord['api_port'])) != 0
+                  if closed and state in ('absent', 'Z'):
+                      break
+                  time.sleep(.2)
+              assert closed and state in ('absent', 'Z'), 'Kubo must stop before the recovery read'
+              result['idle_stops'].append({'label': label, 'elapsed_seconds': time.monotonic() - started,
+                  'original_last_used': coord['last_used'], 'fixture_last_used': aged['last_used'],
+                  'coord_removed': True, 'old_api_closed': True, 'old_process_state': state,
+                  'provider': identity, 'kubo': before, 'watcher_log_observed': True})
+              return coord
+          def restarted(data, before, label):
+              after = json.loads((data / 'ipfs-coords.json').read_bytes())
+              assert after['kubo_pid'] != before['kubo_pid']
+              assert child_identity(after['kubo_pid'])['exe'] == str(data / 'bin/kubo')
+              result.setdefault('restarts', []).append({'label': label, 'before_pid': before['kubo_pid'],
+                  'after_pid': after['kubo_pid'], 'api_port': after['api_port']})
+              # ensure_kubo reaps the stopped owned child before a successful read.
+              assert not (Path('/proc') / str(before['kubo_pid'])).exists(), 'stopped owned Kubo child was not reaped'
+          try:
+              frozen = json.loads(Path('components.json').read_bytes())
+              installed = {}
+              for role in ('holder', 'consumer', 'bounded'):
+                  home = root / role
+                  home.mkdir(mode=0o700)
+                  data = home / '.local/share/elastos'
+                  (data / 'bin').mkdir(mode=0o700, parents=True)
+                  (home / '.local/bin').mkdir(mode=0o700, parents=True)
+                  runtime = home / '.local/bin/elastos'
+                  shutil.copyfile(accepted / 'elastos', runtime)
+                  runtime.chmod(0o700)
+                  manifest = {'external': {}, 'profiles': {}, 'capsules': {}}
+                  for name in ('ipfs-provider', 'kubo'):
+                      source = accepted / name if name != 'kubo' else accepted / 'kubo-input/bin/kubo'
+                      target = data / 'bin' / name
+                      shutil.copyfile(source, target)
+                      target.chmod(0o700)
+                      assert sha(target) == sha(source)
+                      entry = json.loads(json.dumps(frozen['external'][name]))
+                      entry['platforms'] = {'linux-amd64': {**entry['platforms']['linux-amd64'],
+                          'checksum': 'sha256:' + sha(target), 'size': target.stat().st_size}}
+                      manifest['external'][name] = entry
+                      processes.roots[str(target)] = {sha(target)}
+                  (data / 'components.json').write_text(json.dumps(manifest))
+                  (data / 'components.json').chmod(0o600)
+                  processes.roots[str(runtime)] = {sha(runtime)}
+                  http_port, carrier_port = port(), port(socket.SOCK_DGRAM)
+                  (data / 'config.toml').write_text('carrier_bind_addr = "127.0.0.1:' + str(carrier_port) + '"\n'
+                      'gateway_public_publisher_bootstrap = true\ngateway_allowed_hosts = ["127.0.0.1"]\n')
+                  (data / 'config.toml').chmod(0o600)
+                  command(home, [str(runtime), 'node', 'info', '--json'], role + '-identity')
+                  kubo_env = {**env(home), 'IPFS_PATH': str(data / 'ipfs-repo')}
+                  reply = processes.command([str(data / 'bin/kubo'), 'init', '--profile=test'], kubo_env, home, role + '-kubo-init')
+                  assert reply['exit'] == 0
+                  config_path = data / 'ipfs-repo/config'
+                  config = json.loads(config_path.read_bytes())
+                  config['Bootstrap'] = []
+                  config['Addresses']['Swarm'] = []
+                  config['Routing']['Type'] = 'none'
+                  config['Discovery']['MDNS']['Enabled'] = False
+                  config['AutoConf']['Enabled'] = False
+                  config_path.write_text(json.dumps(config))
+                  installed[role] = (home, data, runtime, http_port)
+              home, data, runtime, holder_port = installed['holder']
+              warmup = root / 'warmup.bin'
+              warmup.write_bytes(b'issue89 real holder content fixture\n' * 4096)
+              cids = []
+              generic = root / 'generic.bin'
+              generic.write_bytes(hashlib.sha256(b'issue89 generic file').digest() * 65536 + b'complete')
+              for label, content in [('warmup', warmup), ('release-binary', runtime), ('generic', generic)]:
+                  kubo_env = {**env(home), 'IPFS_PATH': str(data / 'ipfs-repo')}
+                  reply = processes.command([str(data / 'bin/kubo'), 'add', '--quiet', '--cid-version=1', '--pin=true', str(content)],
+                                            kubo_env, home, label + '-add')
+                  assert reply['exit'] == 0
+                  cid = processes.text(label + '-add').strip()
+                  assert re.fullmatch(r'b[a-z2-7]+', cid)
+                  cids.append(cid)
+              holder = processes.spawn([str(runtime), 'gateway', '--addr', '127.0.0.1:' + str(holder_port),
+                  '--cache-dir', str(home / 'gateway-cache')], env(home), home, 'holder')
+              ready(home, holder, holder_port)
+              bootstrap = json.loads(get(f'http://127.0.0.1:{holder_port}/.well-known/elastos/carrier-bootstrap.json?role=publisher', 65536))
+              did = json.loads(processes.text('holder-identity'))['did']
+              observer.cli_holder_bootstrap(bootstrap, observer.cli_holder_node_id(did))
+              consumer_home, consumer_data, consumer_runtime, consumer_port = installed['consumer']
+              command(consumer_home, [str(consumer_runtime), 'node', 'peer', 'add', '--did', did,
+                  '--ticket', bootstrap['ticket'], '--json'], 'consumer-local-holder-peer')
+              consumer = processes.spawn([str(consumer_runtime), 'gateway', '--addr', '127.0.0.1:' + str(consumer_port),
+                  '--cache-dir', str(consumer_home / 'gateway-cache')], env(consumer_home), consumer_home, 'consumer')
+              ready(consumer_home, consumer, consumer_port)
+              assert read(home, holder_port, cids[0], warmup, 'gateway-before-idle')
+              assert read(consumer_home, consumer_port, cids[0], warmup, 'carrier-before-idle')
+              provider_before = provider_identity(holder, data / 'bin/ipfs-provider')
+              # Both caches have only the warmup CID. This is the actual accepted
+              # release Runtime, through the unbounded Content/Carrier file path.
+              before = idle_stop(data, holder, provider_before, 'carrier-release-binary', 'holder')
+              assert read(consumer_home, consumer_port, cids[1], runtime, 'carrier-release-binary-after-idle')
+              restarted(data, before, 'carrier-release-binary')
+              before = idle_stop(data, holder, provider_before, 'gateway-release-binary', 'holder')
+              assert read(home, holder_port, cids[1], runtime, 'gateway-release-binary-after-idle')
+              restarted(data, before, 'gateway-release-binary')
+              before = idle_stop(data, holder, provider_before, 'carrier-generic-file', 'holder')
+              assert read(consumer_home, consumer_port, cids[2], generic, 'carrier-generic-file-after-idle')
+              restarted(data, before, 'carrier-generic-file')
+              assert holder.poll() is None and consumer.poll() is None
+              assert provider_identity(holder, data / 'bin/ipfs-provider') == provider_before
+              result['same_provider_generation'] = True
+              result['same_holder_generation'] = child_identity(holder.pid)
+              # This separate fixture proves the native bounded backend contract.
+              # Carrier bounded routing remains covered by Runtime's existing
+              # tests; the gateway HTTP endpoint above uses unbounded Content.
+              bounded_home, bounded_data, _, _ = installed['bounded']
+              kubo_env = {**env(bounded_home), 'IPFS_PATH': str(bounded_data / 'ipfs-repo')}
+              reply = processes.command([str(bounded_data / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
+                  '--pin=true', str(generic)], kubo_env, bounded_home, 'bounded-content-add')
+              assert reply['exit'] == 0
+              bounded_cid = processes.text('bounded-content-add').strip()
+              assert bounded_cid == cids[2]
+              diagnostic = (output / 'bounded.stderr').open('wb')
+              native = subprocess.Popen([str(bounded_data / 'bin/ipfs-provider')], env=env(bounded_home),
+                  cwd=bounded_home, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=diagnostic,
+                  start_new_session=True)
+              processes.processes.append(native)
+              processes.streams.extend([diagnostic, native.stdin, native.stdout])
+              native_identity = child_identity(native.pid)
+              def native_request(request, timeout=70):
+                  assert native.poll() is None and child_identity(native.pid) == native_identity
+                  native.stdin.write(json.dumps(request).encode() + b'\n')
+                  native.stdin.flush()
+                  assert select.select([native.stdout], [], [], timeout)[0], 'native request deadline'
+                  line = native.stdout.readline(128 * 1024)
+                  assert line.endswith(b'\n')
+                  return json.loads(line)
+              assert native_request({'op': 'init', 'config': {'base_path': str(bounded_data)}})['status'] == 'ok'
+              assert native_request({'op': 'runtime_prepare_backend'})['status'] == 'ok'
+              bounded_request = {'op': 'cat', 'bounded_read': True, 'cid': bounded_cid,
+                  '_runtime_invocation': {'schema': 'elastos.provider.invocation/v1', 'source': 'content-provider',
+                      'target': 'ipfs', 'op': 'cat', 'transport': 'runtime-local-provider-plane',
+                      'transfer': 'bytes', 'range': {'start': 8, 'end': 65543},
+                      'progress': {'request_id': 'issue89-bounded', 'expected_bytes': 65536}}}
+              def bounded_hit(label):
+                  started = time.monotonic()
+                  response = native_request(bounded_request, 6)
+                  assert response['status'] == 'ok'
+                  body = base64.b64decode(response['data']['data'], validate=True)
+                  assert body == generic.read_bytes()[8:65544]
+                  assert response['data']['_runtime_applied_range'] == {
+                      'schema': 'elastos.provider.applied-range/v1', 'cid': bounded_cid,
+                      'path': '', 'start': 8, 'end': 65543}
+                  elapsed = time.monotonic() - started
+                  assert elapsed <= 5.5
+                  result['reads'].append({'label': label, 'ingress': 'native-provider-stdio',
+                      'carrier_claim': False, 'size': len(body), 'sha256': hashlib.sha256(body).hexdigest(),
+                      'elapsed_seconds': elapsed, 'passed': True})
+              bounded_hit('bounded-before-idle')
+              for cycle in (1, 2):
+                  label = 'bounded-cycle-' + str(cycle)
+                  before = idle_stop(bounded_data, native, native_identity, label, 'bounded')
+                  started = time.monotonic()
+                  miss = native_request(bounded_request, 6)
+                  elapsed = time.monotonic() - started
+                  assert miss == {'status': 'error', 'code': 'bounded_read_failed', 'message': 'Bounded content read failed'}
+                  assert elapsed <= 5.5 and not (bounded_data / 'ipfs-coords.json').exists()
+                  result['reads'].append({'label': label + '-cold-refusal', 'ingress': 'native-provider-stdio',
+                      'elapsed_seconds': elapsed, 'code': miss['code'], 'passed': True})
+                  # The first post-stop operation was the bounded read. The
+                  # fixture now performs Runtime's private prepare and one retry.
+                  assert native_request({'op': 'runtime_prepare_backend'})['status'] == 'ok'
+                  bounded_hit(label + '-prepare-retry')
+                  restarted(bounded_data, before, label)
+              result['bounded_backend_contract'] = 'real native process; cold refusal then Runtime-owned prepare/retry sequence'
+              result['installed_binaries'] = {name: {'sha256': sha(data / 'bin' / name), 'size': (data / 'bin' / name).stat().st_size}
+                  for name in ('ipfs-provider', 'kubo')}
+              result['installed_runtime_sha256'] = sha(runtime)
+              result['installed_manifest_sha256'] = sha(data / 'components.json')
+              for checkout in ('source', 'provider-source', 'observer'):
+                  assert not subprocess.check_output(['git', '-C', str(Path(os.environ['GITHUB_WORKSPACE']) / checkout),
+                      'status', '--porcelain=v1', '--untracked-files=all'], text=True).strip(), 'source changed during qualification'
+              result['passed'] = True
+          except Exception as error:
+              result['failure'] = {'type': type(error).__name__, 'message': str(error)}
+              raise
+          finally:
+              result['cleanup'] = processes.cleanup()
+              # Identity, repository and Home state stay outside the public artifact.
+              if not result['cleanup']['errors'] and result['cleanup']['remaining_pids'] == []:
+                  shutil.rmtree(root)
+                  result['fixture_removed'] = True
+              else:
+                  result['passed'] = False
+              (output / 'holder-idle.json').write_text(json.dumps(result, indent=2) + '\n')
+              assert not result['cleanup']['errors'] and result['cleanup']['remaining_pids'] == [], 'fixture cleanup incomplete'
+          PY
+      - name: package only a passed provider qualification
+        if: ${{ env.PACKAGE_MERGED == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, tarfile, urllib.request
+          from pathlib import Path
+          accepted, output = Path(os.environ['ACCEPTED_INPUT']), Path(os.environ['HOLDER_OUTPUT'])
+          receipt = json.loads((output / 'holder-idle.json').read_bytes())
+          assert receipt['passed'] and receipt['fixture_removed']
+          repository = 'Elacity/elastos-runtime'
+          request = urllib.request.Request('https://api.github.com/repos/' + repository + '/compare/' +
+              os.environ['PROVIDER_COMMIT'] + '...develop?per_page=1', headers={
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              comparison = json.load(response)
+          assert comparison['status'] in ('ahead', 'identical') and comparison['behind_by'] == 0
+          assert comparison['base_commit']['sha'] == os.environ['PROVIDER_COMMIT']
+          package = output / 'qualified-holder'
+          package.mkdir(mode=0o700)
+          for name in ('ipfs-provider', 'provider-source.tar.gz'):
+              shutil.copyfile(accepted / name, package / name)
+              (package / name).chmod(0o700 if name == 'ipfs-provider' else 0o600)
+          shutil.copyfile(accepted / 'source.tar.gz', package / 'runtime-helper-source.tar.gz')
+          provider_build = json.loads((output / 'provider-build.json').read_bytes())
+          frozen = json.loads(Path('components.json').read_bytes())
+          entry = frozen['external']['ipfs-provider']
+          entry['platforms'] = {'linux-amd64': {**entry['platforms']['linux-amd64'],
+              'checksum': 'sha256:' + provider_build['sha256'], 'size': provider_build['size']}}
+          assert entry['provider_runtime']['role'] == 'provider'
+          assert entry['provider_runtime']['substrate'] == 'native'
+          assert entry['provider_runtime']['runtime_abi'] == 'elastos.provider-stdio/v1'
+          assert entry['install_path'] == 'bin/ipfs-provider'
+          (package / 'installed-component.json').write_text(json.dumps({'name': 'ipfs-provider', 'entry': entry,
+              'source_commit': provider_build['source_commit'], 'source_tree': provider_build['source_tree'],
+              'runtime_source_commit': os.environ['SOURCE_COMMIT'], 'runtime_source_tree': os.environ['SOURCE_TREE'],
+              'operator_gate': 'Preserve existing manifest fields; replace only the linux-amd64 IPFS binary pin after approval.'}, indent=2) + '\n')
+          shutil.copyfile(output / 'holder-idle.json', package / 'holder-idle.json')
+          shutil.copyfile(output / 'accepted-build.json', package / 'accepted-build.json')
+          shutil.copyfile(output / 'admission.json', package / 'admission.json')
+          shutil.copyfile(output / 'provider-build.json', package / 'provider-build.json')
+          sums = []
+          for path in sorted(package.iterdir()):
+              with path.open('rb') as stream:
+                  sums.append(hashlib.file_digest(stream, 'sha256').hexdigest() + '  ' + path.name + '\n')
+          (package / 'SHA256SUMS').write_text(''.join(sums))
+          with tarfile.open(output / 'qualified-holder.tar.gz', 'w:gz') as archive:
+              archive.add(package, arcname='qualified-holder')
+          with (output / 'qualified-holder.tar.gz').open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          (output / 'qualified-holder.tar.gz.sha256').write_text(digest + '  qualified-holder.tar.gz\n')
+          PY
+      - name: upload passed operator provider handoff
+        if: ${{ env.PACKAGE_MERGED == 'true' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: qualified-holder-linux-${{ env.PROVIDER_COMMIT }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/holder-output/qualified-holder.tar.gz
+            ${{ runner.temp }}/holder-output/qualified-holder.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+      - name: upload qualification observations
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: holder-idle-observations-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/holder-output/*.json
+            ${{ runner.temp }}/holder-output/*.stdout
+            ${{ runner.temp }}/holder-output/*.stderr
+          if-no-files-found: warn
+          retention-days: 7
