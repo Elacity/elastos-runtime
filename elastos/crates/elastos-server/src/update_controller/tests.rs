@@ -529,6 +529,7 @@ fn launch_capture_and_retained_commands_exclude_unrelated_credentials() {
         ("PATH", "/usr/bin:/private/native-support/bin"),
         ("CARGO_HOME", "/private/tools/cargo"),
         ("RUSTUP_HOME", "/private/tools/rustup"),
+        ("COINGECKO_DEMO_API_KEY", "fake-wallet-price-key"),
         (
             "ELASTOS_CAPSULE_BIN_DIR",
             "/private/Home fixture/data/elastos/bin",
@@ -554,7 +555,6 @@ fn launch_capture_and_retained_commands_exclude_unrelated_credentials() {
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GITHUB_TOKEN",
-        "COINGECKO_DEMO_API_KEY",
         "ELASTOS_AVAILABILITY_AUTHORIZATION",
         "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_AUTHORIZATION",
         "ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG",
@@ -612,6 +612,227 @@ fn launch_capture_and_retained_commands_exclude_unrelated_credentials() {
         values[&OsString::from("ELASTOS_UPDATE_GENERATION")],
         "a".repeat(32).as_str()
     );
+}
+
+#[test]
+fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
+    for value in [
+        "http://localhost:8090/home/",
+        "http://127.0.0.1:8090/home/",
+        "http://[::1]:8090/home/",
+    ] {
+        assert_eq!(approved_home_url(value).unwrap().as_str(), value);
+    }
+    for value in [
+        "https://localhost:8090/home/",
+        "http://localhost/home/",
+        "http://localhost:8091/home/",
+        "http://localhost:8090/home",
+        "http://localhost:8090/home/?key=fixture",
+        "http://localhost:8090/home/#fixture",
+        "http://user:fixture@localhost:8090/home/",
+        "http://127.0.0.2:8090/home/",
+        "http://[::1]:8091/home/",
+        "http://[::2]:8090/home/",
+        "http://localhost:8090/other/",
+        "http://localhost:8090/other/../home/",
+        "http://example.test:8090/home/",
+        "http://localhost:8090/home/%2e%2e/",
+    ] {
+        assert!(approved_home_url(value).is_err(), "{value}");
+    }
+}
+
+#[tokio::test]
+async fn desktop_and_wallet_bindings_reach_captured_and_retained_child_commands() {
+    let fixture = PrivateFixture::new();
+    let bindings = [
+        ("DISPLAY", ":91"),
+        ("WAYLAND_DISPLAY", "fixture-wayland"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/private/fixture/bus"),
+        ("XAUTHORITY", "/private/fixture/xauthority"),
+        ("BROWSER", "/private/fixture/browser --new-window"),
+        ("WSL_INTEROP", "/run/fixture/interop.sock"),
+        ("WSL_DISTRO_NAME", "FixtureLinux"),
+        ("COINGECKO_DEMO_API_KEY", "fake-wallet-price-key"),
+    ];
+    let mut environment = bindings
+        .iter()
+        .map(|(key, value)| (OsString::from(*key), OsString::from(*value)))
+        .collect::<Vec<_>>();
+    environment.extend(
+        [
+            ("AWS_SECRET_ACCESS_KEY", "unrelated-fixture-secret"),
+            ("OPENAI_API_KEY", "unrelated-fixture-secret"),
+        ]
+        .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    );
+    let mut captured = LaunchPlan::capture_environment(environment, fixture.data.clone());
+    captured.args = ["-c", r#"
+        test -z "${AWS_SECRET_ACCESS_KEY+x}" || exit 90
+        test -z "${OPENAI_API_KEY+x}" || exit 91
+        printf '%s\n' "$DISPLAY" "$WAYLAND_DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$XAUTHORITY" "$BROWSER" "$WSL_INTEROP" "$WSL_DISTRO_NAME" "$COINGECKO_DEMO_API_KEY"
+    "#].map(|arg| BASE64.encode(arg.as_bytes())).to_vec();
+    let path = fixture.directory.join("desktop-plan.json");
+    write_private(&path, &captured).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    let mut retained: LaunchPlan = read_private_json(&path).unwrap();
+    retained
+        .environment
+        .extend(["AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY"].map(|key| {
+            (
+                BASE64.encode(key.as_bytes()),
+                BASE64.encode(b"legacy-unrelated-fixture-secret"),
+            )
+        }));
+    let expected = bindings
+        .iter()
+        .map(|(_, value)| format!("{value}\n"))
+        .collect::<String>();
+    for plan in [captured, retained] {
+        let hash = plan.sha256().unwrap();
+        let output = plan
+            .command(Path::new("/bin/sh"), &"a".repeat(32), false)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child rejected its environment: {:?}",
+            output.status
+        );
+        assert_eq!(output.stdout, expected.as_bytes());
+        assert_eq!(plan.sha256().unwrap(), hash);
+    }
+}
+
+#[tokio::test]
+async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_bytes() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fixture = PrivateFixture::new();
+    let listener = tokio::net::TcpListener::bind("[::1]:8090").await.unwrap();
+    let fetched = Arc::new(AtomicUsize::new(0));
+    let observed = fetched.clone();
+    let health_observed = fetched.clone();
+    let attach_observed = fetched.clone();
+    let document = b"owned IPv6 Home document";
+    let router = Router::new()
+        .route(
+            "/api/health",
+            get(move || {
+                health_observed.fetch_add(1, Ordering::SeqCst);
+                async { Json(json!({"version":"0.7.0"})) }
+            }),
+        )
+        .route(
+            "/api/auth/attach",
+            post(move |Json(input): Json<Value>| {
+                attach_observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(input["secret"], "fixture-attach-secret");
+                    Json(json!({"token":"fixture-attach-token"}))
+                }
+            }),
+        )
+        .route(
+            "/home/",
+            get(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async move { document.as_slice() }
+            }),
+        );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let pid = std::process::id();
+    let generation = "a".repeat(32);
+    let binary_hash = digest(b"fixture owned gateway binary");
+    let mut coords = json!({
+        "api_url":"http://[::1]:8090", "home_url":"http://[::1]:8090/home/",
+        "attach_secret":"fixture-attach-secret", "runtime_kind":"gateway",
+        "pid":pid, "generation":generation, "binary_sha256":binary_hash,
+    });
+    let coords_path = crate::runtime_control::gateway_runtime_coord_path(&fixture.data);
+    write_private(&coords_path, &coords).unwrap();
+    write_private(
+        &fixture.data.join("host-process.lock"),
+        &json!({"pid":pid, "generation":generation, "role":"gateway"}),
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let installed_hash = digest(document);
+    let ready = prove_ready(
+        &client,
+        &fixture.data,
+        pid,
+        &generation,
+        "0.7.0",
+        &binary_hash,
+        &installed_hash,
+    )
+    .await;
+    let wrong_document = prove_ready(
+        &client,
+        &fixture.data,
+        pid,
+        &generation,
+        "0.7.0",
+        &binary_hash,
+        &digest(b"foreign Home document"),
+    )
+    .await;
+    coords["generation"] = json!("b".repeat(32));
+    write_private(&coords_path, &coords).unwrap();
+    let wrong_generation = prove_ready(
+        &client,
+        &fixture.data,
+        pid,
+        &generation,
+        "0.7.0",
+        &binary_hash,
+        &installed_hash,
+    )
+    .await;
+    coords["generation"] = json!(generation);
+    write_private(&coords_path, &coords).unwrap();
+    write_private(
+        &fixture.data.join("host-process.lock"),
+        &json!({"pid":pid, "generation":"b".repeat(32), "role":"gateway"}),
+    )
+    .unwrap();
+    let wrong_host_lock = prove_ready(
+        &client,
+        &fixture.data,
+        pid,
+        &generation,
+        "0.7.0",
+        &binary_hash,
+        &installed_hash,
+    )
+    .await;
+    let _ = shutdown.send(());
+    server.await.unwrap();
+    assert!(ready.is_ok(), "{ready:?}");
+    assert!(wrong_document.is_err());
+    assert!(wrong_generation.is_err());
+    assert!(wrong_host_lock.is_err());
+    assert_eq!(fetched.load(Ordering::SeqCst), 6);
 }
 
 #[test]
@@ -2001,7 +2222,18 @@ async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_install
         "{message}"
     );
     assert!(message.contains("before starting Home again"), "{message}");
+    let spawned = controller.child.as_ref().map(|child| {
+        let pid = child.pid();
+        (
+            pid,
+            process_start(pid).expect("owned child retains its kernel birth until reap"),
+        )
+    });
+    controller.stop_child().await.unwrap();
     assert!(controller.child.is_none());
+    if let Some((pid, birth)) = spawned {
+        assert!(child::generation_gone(pid, &birth).unwrap());
+    }
     assert!(!controller.host_ready);
     assert!(!fixture.directory.join(STATUS).exists());
     assert!(!InstallTransaction::has_pending_recovery(&fixture.binary));
@@ -2009,5 +2241,4 @@ async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_install
     for (path, entry) in before {
         assert_eq!(after.get(&path), Some(&entry), "{}", path.display());
     }
-    controller.stop_child().await.unwrap();
 }

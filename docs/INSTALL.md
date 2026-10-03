@@ -189,13 +189,15 @@ The controller verifies its signed Runtime, retained launch settings and saved
 release before it starts Home. Keep this terminal open. Initial startup has a
 120-second limit; update and rollback startup have a 30-second limit. A startup
 failure names the private `update-controller/runtime.log` file to inspect
-before trying again. The receipt keeps only Home paths, locale and
-Runtime launch bindings. Provider and Browser settings stay in their installed
+before trying again. The receipt keeps Home paths, locale, desktop opener settings and Runtime launch
+bindings. It also retains the configured Wallet price API key, which Wallet reads
+from the environment. Other provider and Browser settings stay in their installed
 private configuration files. Keep the receipt's owner-only permissions and
 share only a safe error summary.
 
 Home reuses a verified controller when its signed Runtime already matches.
-If a new controller cannot fit, ordinary Home can open with updates unavailable.
+If a new controller cannot fit, ordinary Home can open with Home update controls
+unavailable.
 Free disk space before updating. An interrupted update or uncertain controller
 ownership keeps its recovery step.
 

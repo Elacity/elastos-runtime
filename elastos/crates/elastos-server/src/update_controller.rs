@@ -40,7 +40,8 @@ const INITIAL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Home reads provider and Browser settings from its installed private config files.
-// Persist only the paths, locale, and Runtime bindings needed to restart this Home.
+// Persist the paths, desktop session, locale, and Runtime bindings needed to restart this Home.
+// Wallet's existing API key binding remains in the same owner-only receipt.
 const LAUNCH_ENVIRONMENT: &[&str] = &[
     "HOME",
     "XDG_DATA_HOME",
@@ -54,6 +55,14 @@ const LAUNCH_ENVIRONMENT: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "TMPDIR",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XAUTHORITY",
+    "BROWSER",
+    "WSL_INTEROP",
+    "WSL_DISTRO_NAME",
+    "COINGECKO_DEMO_API_KEY",
     "ELASTOS_CAPSULE_BIN_DIR",
     "ELASTOS_IPFS_KUBO_PATH",
     "ELASTOS_IPFS_PROVIDER_BIN",
@@ -1629,6 +1638,19 @@ async fn response_bytes(response: reqwest::Response, limit: usize) -> Result<Vec
     Ok(bytes)
 }
 
+fn approved_home_url(value: &str) -> Result<url::Url> {
+    anyhow::ensure!(
+        matches!(
+            value,
+            "http://localhost:8090/home/"
+                | "http://127.0.0.1:8090/home/"
+                | "http://[::1]:8090/home/"
+        ),
+        "Home listener has not reported an approved readiness URL"
+    );
+    Ok(url::Url::parse(value)?)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn prove_ready(
     client: &reqwest::Client,
@@ -1660,6 +1682,7 @@ async fn prove_ready(
             && metadata["role"] == "gateway",
         "Home host lock differs from the claimed generation"
     );
+    let home_url = approved_home_url(&coords.home_url)?;
     let base = crate::local_http::LoopbackHttpBaseUrl::parse(&coords.api_url)?;
     let health: serde_json::Value = serde_json::from_slice(
         &response_bytes(client.get(base.join("/api/health")?).send().await?, 4096).await?,
@@ -1685,17 +1708,7 @@ async fn prove_ready(
             .is_some_and(|token| !token.is_empty()),
         "Home control identity refused the private attach secret"
     );
-    anyhow::ensure!(
-        coords.home_url == "http://localhost:8090/home/"
-            || coords.home_url == "http://127.0.0.1:8090/home/",
-        "Home listener has not reported readiness"
-    );
-    let home_base = crate::local_http::LoopbackHttpBaseUrl::parse("http://127.0.0.1:8090")?;
-    let served = response_bytes(
-        client.get(home_base.join("/home/")?).send().await?,
-        2 * 1024 * 1024,
-    )
-    .await?;
+    let served = response_bytes(client.get(home_url).send().await?, 2 * 1024 * 1024).await?;
     anyhow::ensure!(
         digest(&served) == home_sha256,
         "Served Home differs from the installed capsule"
