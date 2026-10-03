@@ -38,6 +38,7 @@ import {
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
 } from "./home-agent-message-contract.js?v=home-20260813a";
+import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20260813a";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "assistant";
@@ -403,8 +404,9 @@ function onFrameMessage(event) {
 
 /* ---- Face ------------------------------------------------------------------ */
 
-/* The toggle exists only when the capsule is installed; it wears the capsule's
-   own declared icon like every other dock item. */
+/* The toggle exists only when the capsule is installed. Unlike other dock
+   items it wears Home's own Assistant mark (shell-assistant-mark.js), not the
+   capsule's icon: the mark is part of the face cadence Home owns. */
 export function syncAssistantFaceAvailability(summary) {
   const toggle = toggleEl();
   if (!toggle || !deps) {
@@ -412,9 +414,7 @@ export function syncAssistantFaceAvailability(summary) {
   }
   const target = deps.targetById(summary, TARGET_ID);
   toggle.hidden = !target;
-  if (target) {
-    deps.mountGlyph(toggle.querySelector(".taskbar-item-icon"), TARGET_ID);
-  } else if (assistantFaceActive()) {
+  if (!target && assistantFaceActive()) {
     retireAssistantSpace();
   }
 }
@@ -502,7 +502,7 @@ export function hideAssistantFace({ instant = false } = {}) {
     setFaceOpen(false);
     setPhase(taskbar, "");
     closing = false;
-    toggleEl()?.focus({ preventScroll: true });
+    deps.restoreDockFocus(toggleEl());
   };
 
   if (instant || reducedMotion()) {
@@ -549,7 +549,7 @@ export function hideAssistantFace({ instant = false } = {}) {
       after(RETURN_MS + 16, () => {
         setPhase(taskbar, "");
         closing = false;
-        toggleEl()?.focus({ preventScroll: true });
+        deps.restoreDockFocus(toggleEl());
       });
     });
   });
@@ -567,8 +567,8 @@ export function toggleAssistantFace() {
  * Wire the face once the GUI template is in the DOM.
  * @param {{
  *   easeDockPillWidth: (fromW: number, durationName?: string) => void,
+ *   restoreDockFocus: (item: HTMLElement | null) => void,
  *   targetById: (summary: unknown, targetId: string) => unknown,
- *   mountGlyph: (container: Element | null, targetId: string) => void,
  *   launchHomeTarget: (targetId: string, query: object) => Promise<object>,
  *   iframeSandboxForLaunch: (launched: object) => string,
  *   iframeAllowForLaunch: (launched: object) => string,
@@ -588,7 +588,11 @@ export function bindAssistantFace(dependencies) {
     open: () => showAssistantFace(),
     close: () => hideAssistantFace(),
   });
-  toggleEl()?.addEventListener("click", () => toggleAssistantFace());
+  bindAssistantMark(toggleEl(), {
+    onActivate: () => toggleAssistantFace(),
+    /* Only an opening earns the chevron contact; closing is immediate. */
+    animate: () => !assistantFaceActive() && !taskbarEl()?.dataset.assistantMorph,
+  });
   document.querySelector("#assistant-space-retry")?.addEventListener("click", () => {
     void mountAssistantFrame();
   });
