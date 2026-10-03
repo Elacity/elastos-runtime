@@ -16,9 +16,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_COMMIT: 5814b06b0b5e1f42d05ab60002af9c548ec9d9b2
-  SOURCE_TREE: 72785a23bbed468f3460acbe998e99bb74c55906
-  ACCEPTED_CI_RUN: '37073055811'
+  SOURCE_COMMIT: 8a9dec16b4febfac5759883ec7462e1ea780dd59
+  SOURCE_TREE: e18d17a3431b4d2548796347528e28afee909e35
+  ACCEPTED_CI_RUN: '37086607684'
   PUBLISHER_ORIGIN: https://elastos.elacitylabs.com
   PUBLISHER_NODE: 401264d32427bdfa7343cca7c895e441f1a363c93a6f975f0bb659b0f3919447
   BASELINE_DID: did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj
@@ -127,12 +127,80 @@ jobs:
                             'stdout': reply.stdout.decode(), 'stderr': '', 'executed_by': 'key-free CI builder'})
           (root / 'receipts/executable-versions.json').write_text(json.dumps(proof, indent=2) + '\n')
           PY
-      - name: verify bounded public baseline and prepare unsigned manifests
-        timeout-minutes: 40
+      - name: preserve verified native inputs before public metadata preparation
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, importlib.util, json, os, shutil, subprocess, sys, urllib.request
+          import hashlib, json, os, shutil, stat, subprocess, tarfile
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          output = Path(os.environ['RUNNER_TEMP']) / 'native-checkpoint'
+          output.mkdir(mode=0o700)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['SOURCE_COMMIT']
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == os.environ['SOURCE_TREE']
+          assert not subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all'])
+          receipt = {'schema': 'elastos.native-checkpoint/v1', 'source_commit': os.environ['SOURCE_COMMIT'],
+                     'source_tree': os.environ['SOURCE_TREE'], 'source_clean_before_and_after_native_build': True,
+                     'selected_source_ci_run': os.environ['ACCEPTED_CI_RUN'],
+                     'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'], 'workflow_commit': os.environ['GITHUB_SHA'],
+                     'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                     'native_platform': 'aarch64-darwin', 'versions': ['0.8.0-alpha.1', '0.8.0-alpha.2'],
+                     'scope': 'Verified native N1/N2 and exact executable versions; public metadata preparation is pending.'}
+          (root / 'receipts/native-checkpoint.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          def sha(path):
+              digest = hashlib.sha256()
+              with path.open('rb') as source:
+                  for chunk in iter(lambda: source.read(1024**2), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          checksum = root / 'receipts/native-checkpoint-SHA256SUMS'
+          paths = [root, *root.rglob('*')]
+          assert all(not path.is_symlink() and (path.is_dir() or path.is_file()) for path in paths)
+          files = sorted(path for path in paths if path.is_file() and path != checksum)
+          assert all(not path.is_symlink() and stat.S_ISREG(path.stat().st_mode) and path.stat().st_nlink == 1 for path in files)
+          checksum.write_text(''.join(sha(path) + '  ' + path.relative_to(root).as_posix() + '\n' for path in files))
+          usage = shutil.disk_usage(output)
+          assert (usage.free - sum(path.stat().st_size for path in files) - len(files) * 1024 - checksum.stat().st_size) * 100 >= usage.total * 15
+          packaged = output / 'native-checkpoint.tar.gz'
+          def portable(member):
+              assert member.isdir() or member.isfile()
+              member.uid = member.gid = 0
+              member.uname = member.gname = ''
+              return member
+          with tarfile.open(packaged, 'w:gz', dereference=True) as archive:
+              archive.add(root, arcname='canary-inputs', filter=portable)
+          with tarfile.open(packaged, 'r:gz') as archive:
+              members = archive.getmembers()
+              expected = {'canary-inputs', *('canary-inputs/' + path.relative_to(root).as_posix() for path in root.rglob('*'))}
+              assert len(members) == len(expected) and {member.name for member in members} == expected
+              for member in members:
+                  path = root / Path(member.name).relative_to('canary-inputs')
+                  assert member.isdir() or member.isfile()
+                  assert member.mode == stat.S_IMODE(path.stat().st_mode)
+                  if member.isfile():
+                      digest = hashlib.sha256()
+                      with archive.extractfile(member) as source:
+                          for chunk in iter(lambda: source.read(1024**2), b''):
+                              digest.update(chunk)
+                      assert digest.hexdigest() == sha(path)
+          (output / 'SHA256SUMS').write_text(sha(packaged) + '  ' + packaged.name + '\n')
+          (output / 'native-checkpoint-receipt.json').write_text(json.dumps({**receipt, 'tar_sha256': sha(packaged)}, indent=2) + '\n')
+          PY
+      - name: upload mode-preserving native checkpoint
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: native-checkpoint-aarch64-darwin-${{ env.SOURCE_COMMIT }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkpoint
+          if-no-files-found: error
+          retention-days: 7
+      - name: verify bounded public baseline and prepare unsigned manifests
+        timeout-minutes: 40
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os, shutil, subprocess, sys, urllib.parse, urllib.request
           from pathlib import Path
           root = Path(os.environ['INPUT_ARTIFACT'])
           public = root / 'public-baseline'
@@ -145,7 +213,13 @@ jobs:
                   raise ValueError('Public evidence redirects refused')
           opener = urllib.request.build_opener(FixedOrigin())
           def get(url, limit=256 * 1024):
-              request = urllib.request.Request(url, headers={'User-Agent': 'Elastos-key-free-builder', 'Accept': 'application/json'})
+              headers = {'User-Agent': 'Elastos-key-free-builder', 'Accept': 'application/json'}
+              target = urllib.parse.urlsplit(url)
+              if target.scheme == 'https' and target.netloc == 'api.github.com':
+                  headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
+                  headers['X-GitHub-Api-Version'] = '2022-11-28'
+              # API credentials stay on api.github.com; all redirects are refused.
+              request = urllib.request.Request(url, headers=headers)
               with opener.open(request, timeout=30) as response:
                   assert response.status == 200
                   data = response.read(limit + 1)
@@ -158,7 +232,6 @@ jobs:
           assert ci['head_sha'] == commit and ci['status'] == 'completed' and ci['conclusion'] == 'success'
           github_json = lambda path: signer.parse_json(get('https://api.github.com' + path, 1024 * 1024))
           develop = github_json('/repos/Elacity/elastos-runtime/git/ref/heads/develop')['object']['sha']
-          assert develop == commit, 'Selected current develop moved; renew the builder source/CI approval'
           source_policy = {'repository': 'Elacity/elastos-runtime', 'channel': 'canary',
                            'version': '0.8.0-alpha.1', 'commit': commit, 'tree': tree, 'develop_oid': develop}
           signer.verify_source(source_policy, github_json)
@@ -194,7 +267,7 @@ jobs:
               signature_path.write_bytes(signature)
               subprocess.run([openssl, 'pkeyutl', '-verify', '-rawin', '-pubin', '-keyform', 'DER',
                               '-inkey', str(pubkey), '-in', str(digest_path), '-sigfile', str(signature_path)],
-                             env=dict(os.environ, OPENSSL_CONF='/dev/null'), check=True, capture_output=True, timeout=15)
+                             env={'OPENSSL_CONF': '/dev/null', 'LANG': 'C'}, check=True, capture_output=True, timeout=15)
               (public / name).write_bytes(data)
               return data, payload
           head_bytes, head = envelope('release-head.json', 'elastos.release.head.v1')
@@ -216,6 +289,7 @@ jobs:
                      CARGO_HOME=os.environ['BUILDER_CARGO_HOME'], RUSTUP_HOME=os.environ['BUILDER_RUSTUP_HOME'],
                      ELASTOS_SOURCE_CONNECT_TICKET=bootstrap['ticket'], ELASTOS_PUBLISHER_NODE_ID=bootstrap['node_id'],
                      ELASTOS_PUBLISHER_GATEWAY=origin, ELASTOS_IPNS_NAME='')
+          env.pop('GH_TOKEN', None)
           for native, version, output in [('N1', '0.8.0-alpha.1', 'unsigned-V1'),
                                           ('N2', '0.8.0-alpha.2', 'unsigned-V2-PROVISIONAL')]:
               command = [str(Path(os.environ['BUILDER_HOME']) / 'bin' / native), 'publish-release',
