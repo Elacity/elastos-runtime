@@ -261,12 +261,15 @@ impl InstallTransaction {
             return self.cleanup(&journal);
         }
         if journal.phase == Phase::Committed && !rollback_committed {
+            // Commit already verified the installed set. Cleanup owns only the
+            // journal and scratch; later safe owner changes belong to the live set.
             for entry in &journal.entries {
-                self.require_state(
-                    entry.id,
-                    Some(&entry.staged_sha256),
-                    Some(entry.staged_mode),
-                )?;
+                if file_state(&self.destinations[&entry.id])?.is_none() {
+                    bail!(
+                        "release file {} is missing; retain journal for recovery",
+                        entry.id.name()
+                    );
+                }
             }
         } else {
             // Validate the complete restore plan before changing a release file.
@@ -951,6 +954,22 @@ mod tests {
                 b"data written by owner"
             );
         }
+
+        fn commit_before_cleanup(&self, writer: &InstallTransaction) {
+            writer.prepare(&candidate()).unwrap();
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            journal.phase = Phase::Committing;
+            writer.write_journal(&journal).unwrap();
+            for entry in &journal.entries {
+                fs::rename(
+                    writer.scratch(entry.id, STAGE),
+                    &writer.destinations[&entry.id],
+                )
+                .unwrap();
+            }
+            journal.phase = Phase::Committed;
+            writer.write_journal(&journal).unwrap();
+        }
     }
 
     fn candidate() -> [(ReleaseFile, &'static [u8]); 5] {
@@ -1168,19 +1187,7 @@ mod tests {
         let fixture = Fixture::new();
         let writer = fixture.writer();
         fixture.old_files(&writer, false);
-        writer.prepare(&candidate()).unwrap();
-        let mut journal = writer.read_journal().unwrap().unwrap();
-        journal.phase = Phase::Committing;
-        writer.write_journal(&journal).unwrap();
-        for entry in &journal.entries {
-            fs::rename(
-                writer.scratch(entry.id, STAGE),
-                &writer.destinations[&entry.id],
-            )
-            .unwrap();
-        }
-        journal.phase = Phase::Committed;
-        writer.write_journal(&journal).unwrap();
+        fixture.commit_before_cleanup(&writer);
         fs::remove_file(writer.scratch(ReleaseFile::RuntimeBinary, ROLLBACK)).unwrap();
         fs::remove_dir(
             writer
@@ -1196,6 +1203,111 @@ mod tests {
             assert_eq!(fs::read(destination).unwrap(), b"candidate bytes");
         }
         resumed.require_empty_scratch().unwrap();
+    }
+
+    #[test]
+    fn committed_cleanup_preserves_later_owner_bytes_and_modes() {
+        let fixture = Fixture::new();
+        let writer = fixture.writer();
+        fixture.old_files(&writer, false);
+        fixture.commit_before_cleanup(&writer);
+        fs::remove_file(writer.scratch(ReleaseFile::RuntimeBinary, ROLLBACK)).unwrap();
+        for id in ReleaseFile::ALL {
+            let destination = &writer.destinations[&id];
+            fs::write(destination, format!("later owner {}", id.name())).unwrap();
+            let mode = if id == ReleaseFile::RuntimeBinary {
+                0o750
+            } else {
+                0o640
+            };
+            fs::set_permissions(destination, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        drop(writer);
+        let resumed = fixture.writer();
+        resumed.recover().unwrap();
+        resumed.require_empty_scratch().unwrap();
+        resumed.recover().unwrap();
+        for id in ReleaseFile::ALL {
+            let destination = &resumed.destinations[&id];
+            assert_eq!(
+                fs::read(destination).unwrap(),
+                format!("later owner {}", id.name()).as_bytes()
+            );
+            let mode = if id == ReleaseFile::RuntimeBinary {
+                0o750
+            } else {
+                0o640
+            };
+            assert_eq!(fs::metadata(destination).unwrap().mode() & 0o777, mode);
+        }
+        assert_eq!(
+            fs::read(fixture.data.join("owner-data")).unwrap(),
+            b"data written by owner"
+        );
+    }
+
+    #[test]
+    fn committed_cleanup_refuses_unsafe_live_changes_after_lock_acquisition() {
+        for (id, mutation) in ReleaseFile::ALL.into_iter().flat_map(|id| {
+            ["symlink", "hardlink", "writable", "missing"]
+                .into_iter()
+                .map(move |mutation| (id, mutation))
+        }) {
+            let fixture = Fixture::new();
+            let writer = fixture.writer();
+            fixture.old_files(&writer, false);
+            fixture.commit_before_cleanup(&writer);
+            let destination = &writer.destinations[&id];
+            let owner_data = fixture.data.join("owner-data");
+            match mutation {
+                "symlink" => {
+                    fs::remove_file(destination).unwrap();
+                    symlink(&owner_data, destination).unwrap();
+                }
+                "hardlink" => {
+                    fs::remove_file(destination).unwrap();
+                    fs::hard_link(&owner_data, destination).unwrap();
+                }
+                "missing" => fs::remove_file(destination).unwrap(),
+                _ => fs::set_permissions(destination, fs::Permissions::from_mode(0o666)).unwrap(),
+            }
+            assert!(writer.recover().is_err(), "{}: {mutation}", id.name());
+            assert!(writer.journal_path().exists());
+            for id in ReleaseFile::ALL {
+                assert!(writer.scratch(id, ROLLBACK).exists());
+            }
+            assert_eq!(fs::read(owner_data).unwrap(), b"data written by owner");
+        }
+    }
+
+    #[test]
+    fn committed_cleanup_retains_changed_scratch_and_later_owner_data() {
+        for mutation in ["corrupt", "foreign"] {
+            let fixture = Fixture::new();
+            let writer = fixture.writer();
+            fixture.old_files(&writer, false);
+            fixture.commit_before_cleanup(&writer);
+            let destination = &writer.destinations[&ReleaseFile::Sources];
+            fs::write(destination, b"later owner sources").unwrap();
+            let changed_scratch = if mutation == "corrupt" {
+                writer.scratch(ReleaseFile::Sources, ROLLBACK)
+            } else {
+                writer
+                    .scratch(ReleaseFile::Sources, ROLLBACK)
+                    .with_file_name("foreign")
+            };
+            fs::write(&changed_scratch, b"preserve changed scratch").unwrap();
+            assert!(writer.recover().is_err(), "{mutation}");
+            assert!(writer.journal_path().exists());
+            for id in ReleaseFile::ALL {
+                assert!(writer.scratch(id, ROLLBACK).exists());
+            }
+            assert_eq!(fs::read(destination).unwrap(), b"later owner sources");
+            assert_eq!(
+                fs::read(changed_scratch).unwrap(),
+                b"preserve changed scratch"
+            );
+        }
     }
 
     #[test]
