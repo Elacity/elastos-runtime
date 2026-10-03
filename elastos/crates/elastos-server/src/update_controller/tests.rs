@@ -3,6 +3,9 @@ use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+type SnapshotEntry = (u32, Option<Vec<u8>>, Option<PathBuf>);
+type Snapshot = std::collections::BTreeMap<PathBuf, SnapshotEntry>;
+
 struct PrivateFixture {
     _root: tempfile::TempDir,
     data: PathBuf,
@@ -42,17 +45,8 @@ impl PrivateFixture {
         self.directory.join("runtime")
     }
 
-    fn snapshot(
-        &self,
-    ) -> std::collections::BTreeMap<PathBuf, (u32, Option<Vec<u8>>, Option<PathBuf>)> {
-        fn collect(
-            root: &Path,
-            path: &Path,
-            result: &mut std::collections::BTreeMap<
-                PathBuf,
-                (u32, Option<Vec<u8>>, Option<PathBuf>),
-            >,
-        ) {
+    fn snapshot(&self) -> Snapshot {
+        fn collect(root: &Path, path: &Path, result: &mut Snapshot) {
             let metadata = fs::symlink_metadata(path).unwrap();
             let bytes = metadata.is_file().then(|| fs::read(path).unwrap());
             let target = metadata
