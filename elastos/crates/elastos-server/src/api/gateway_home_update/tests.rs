@@ -108,16 +108,22 @@ async fn system_update_cache_returns_pending_then_completed_without_duplicate_wo
         )
         .await;
     assert!(matches!(fresh, UpdateCheckSnapshot::Completed(Some(_))));
+    let (finished, completion) = tokio::sync::oneshot::channel();
     assert!(matches!(
         cache
             .read(
                 key.clone(),
                 std::time::Instant::now() + std::time::Duration::from_secs(31),
-                || async { None },
+                || async move {
+                    finished.send(()).unwrap();
+                    None
+                },
             )
             .await,
         UpdateCheckSnapshot::Checking
     ));
+    // The expiry read advances only its clock; finish the replacement before live-clock reads.
+    completion.await.unwrap();
     assert!(completed_check(&mut cache, &key).await.is_none());
 }
 
@@ -136,17 +142,23 @@ async fn system_update_cache_refreshes_failed_checks_after_completion_expiry() {
         UpdateCheckSnapshot::Completed(None)
     ));
     let (release, paused) = tokio::sync::oneshot::channel();
+    let (finished, completion) = tokio::sync::oneshot::channel();
     assert!(matches!(
         cache
             .read(
                 key.clone(),
                 std::time::Instant::now() + std::time::Duration::from_secs(31),
-                || async move { paused.await.unwrap() },
+                || async move {
+                    let check = paused.await.unwrap();
+                    finished.send(()).unwrap();
+                    check
+                },
             )
             .await,
         UpdateCheckSnapshot::Checking
     ));
     release.send(Some(cached_offer())).unwrap();
+    completion.await.unwrap();
     assert!(completed_check(&mut cache, &key).await.is_some());
 }
 
@@ -414,15 +426,47 @@ async fn system_update_post_requires_system_launch_and_admin_role() {
     );
     let mut body = intent.clone();
     body["step_up_token"] = json!(approval);
-    for token in [
-        "",
-        owner.home_token.as_str(),
-        owner.people_token.as_str(),
-        member.system_token.as_str(),
+    for (token, expected_status, expected_error) in [
+        ("", StatusCode::FORBIDDEN, None),
+        (owner.home_token.as_str(), StatusCode::FORBIDDEN, None),
+        (
+            owner.people_token.as_str(),
+            StatusCode::UNAUTHORIZED,
+            Some("Open System from Home and sign in again."),
+        ),
+        (
+            member.system_token.as_str(),
+            StatusCode::FORBIDDEN,
+            Some("Ask the Home owner to install this update."),
+        ),
     ] {
-        let (status, _) =
-            home_test_post_json(&app, UPDATE_APPLY_ROUTE, token, "null", body.clone()).await;
-        assert!(status.is_client_error(), "token boundary returned {status}");
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(UPDATE_APPLY_ROUTE)
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if let Some(error) = expected_error {
+            let payload: Value = serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(payload, json!({"error": error}));
+        } else {
+            // Gateway admission rejects these callers before the System JSON handler.
+            assert_eq!(
+                response_body.as_ref(),
+                b"Gateway request requires an admitted host and caller"
+            );
+        }
         assert_update_stays_unqueued(dir.path());
     }
 }

@@ -1936,6 +1936,8 @@ fn owner_update_refuses_malformed_unsafe_or_substituted_effect_receipts() {
     for refusal in ["schema", "malformed", "unsafe mode", "symlink", "hard link"] {
         let (fixture, request) = owner_queue_fixture();
         let path = fixture.directory.join("owner-action.json");
+        // The fixture reserves a valid action first; replace only that fixture-owned file.
+        fs::remove_file(&path).unwrap();
         let valid = serde_json::to_vec(&OwnerActionReceipt {
             schema: if refusal == "schema" {
                 "foreign receipt"
@@ -1964,7 +1966,7 @@ fn owner_update_refuses_malformed_unsafe_or_substituted_effect_receipts() {
             }
             _ => unreachable!(),
         }
-        let before = fs::read(&path).unwrap();
+        let before = fixture.snapshot();
         assert!(
             queue_owner_update(
                 &fixture.data,
@@ -1975,7 +1977,7 @@ fn owner_update_refuses_malformed_unsafe_or_substituted_effect_receipts() {
             .is_err(),
             "{refusal}"
         );
-        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(fixture.snapshot(), before, "{refusal}");
         assert!(!fixture.directory.join(REQUEST).exists());
     }
 }
