@@ -82,8 +82,9 @@ struct Journal {
     entries: Vec<Entry>,
 }
 
-/// Serializes installation writers at the resolved binary parent. The lock path
-/// stays in place after the guard closes its file and releases the flock.
+/// Serializes installation writers at an absolute, resolved binary parent.
+/// Writers resolve the parent once and use the same path for their destinations.
+/// The lock path stays in place after the guard closes its file and releases the flock.
 pub(crate) struct InstallationGuard {
     _lock: File,
 }
@@ -93,12 +94,6 @@ impl InstallationGuard {
         if !binary_parent.is_absolute() {
             bail!("installation binary parent must be an absolute existing path");
         }
-        let binary_parent =
-            fs::canonicalize(binary_parent).context("resolve installation binary parent")?;
-        Self::acquire_resolved(&binary_parent)
-    }
-
-    fn acquire_resolved(binary_parent: &Path) -> anyhow::Result<Self> {
         check_directory(binary_parent)?;
         let lock_path = binary_parent.join(INSTALL_LOCK);
         let lock = OpenOptions::new()
@@ -154,7 +149,7 @@ impl InstallTransaction {
         }
         let binary = bin_parent.join(basename);
         file_state(&binary)?;
-        let guard = InstallationGuard::acquire_resolved(&bin_parent)?;
+        let guard = InstallationGuard::acquire(&bin_parent)?;
         let destinations = BTreeMap::from([
             (ReleaseFile::RuntimeBinary, binary.clone()),
             (ReleaseFile::Components, data_dir.join("components.json")),
@@ -1021,14 +1016,16 @@ mod tests {
     }
 
     #[test]
-    fn installation_guard_resolves_aliases_and_keeps_distinct_parents_independent() {
+    fn installation_guard_uses_resolved_aliases_and_keeps_distinct_parents_independent() {
         let fixture = Fixture::new();
-        let parent = fixture.binary.parent().unwrap();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
         let alias = fixture._root.path().join("bin-alias");
-        symlink(parent, &alias).unwrap();
-        let other = fixture._root.path().join("other-bin");
+        symlink(&parent, &alias).unwrap();
+        let other = parent.with_file_name("other-bin");
         fs::create_dir(&other).unwrap();
-        let guard = InstallationGuard::acquire(&alias).unwrap();
+        let resolved = fs::canonicalize(&alias).unwrap();
+        assert!(InstallationGuard::acquire(&alias).is_err());
+        let guard = InstallationGuard::acquire(&resolved).unwrap();
         assert!(InstallationGuard::acquire(&parent.join(".")).is_err());
         assert!(InstallTransaction::acquire(&fixture.data, &alias.join("elastos")).is_err());
         let _other_guard = InstallationGuard::acquire(&other).unwrap();
@@ -1067,7 +1064,7 @@ mod tests {
         let moved_before = snapshot(&moved);
         let other_before = snapshot(&other);
 
-        assert!(InstallationGuard::acquire_resolved(&parent).is_err());
+        assert!(InstallationGuard::acquire(&parent).is_err());
 
         assert_eq!(snapshot(&moved), moved_before);
         assert_eq!(snapshot(&other), other_before);
@@ -1100,7 +1097,8 @@ mod tests {
             parent.join(STAGE).join("runtime_binary")
         );
         assert!(InstallationGuard::acquire(&parent).is_err());
-        let _other_guard = InstallationGuard::acquire(&alias).unwrap();
+        let resolved_other = fs::canonicalize(&alias).unwrap();
+        let _other_guard = InstallationGuard::acquire(&resolved_other).unwrap();
         writer.prepare(&candidate()).unwrap();
         writer.commit().unwrap();
         assert_eq!(
