@@ -21,7 +21,9 @@ use elastos_common::{
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 
-use elastos_vz::{is_supported, VmConfig, VzConfig, VzProvider};
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use elastos_vz::is_supported;
+use elastos_vz::{VmConfig, VzConfig, VzProvider};
 
 fn microvm_manifest(name: &str) -> CapsuleManifest {
     CapsuleManifest {

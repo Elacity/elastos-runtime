@@ -672,10 +672,10 @@ jobs:
               raise SystemExit('hop builder cleanup is incomplete; disposable runner retains files until teardown')
           shutil.rmtree(root)
           PY
-      - name: native VZ test fixture ownership
+      - name: native VZ tests and fixture ownership
         working-directory: elastos
         timeout-minutes: 15
-        run: cargo test -p elastos-vz --bin browser-vz-engine-supervisor kernel_lifetime_lock_releases_after_owner_process_death -- --nocapture
+        run: cargo test -p elastos-vz --no-fail-fast
       # Packages are uploaded only for tags, main and dispatch runs; PR runs
       # already proved the release build through setup-source-home.
       - name: build and package release binaries

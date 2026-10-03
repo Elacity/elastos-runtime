@@ -4253,9 +4253,37 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
         check_tree(&root.join("capsules"));
         check_tree(&root.join("elastos/capsules"));
+        for name in [
+            "browser-engine-adapter",
+            "chain-provider",
+            "content-block-graph-provider",
+            "did-provider",
+            "exit-provider",
+            "ipfs-provider",
+            "model-provider",
+            "net-provider",
+            "object-provider",
+            "wallet-provider",
+            "webspace-provider",
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_slice(
+                &fs::read(root.join("capsules").join(name).join("capsule.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(manifest.icon.is_some(), "{name} declares its required icon");
+        }
         let components: ComponentsManifest =
             serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
         for name in ["assistant", "elacity-player"] {
+            let capsule_dir = root.join("capsules").join(name);
+            let manifest: CapsuleManifest =
+                serde_json::from_slice(&fs::read(capsule_dir.join("capsule.json")).unwrap())
+                    .unwrap();
+            assert!(manifest.icon.is_some(), "{name} declares its required icon");
+            assert!(
+                capsule_dir.join(&manifest.entrypoint).is_file(),
+                "{name} entrypoint exists in its installed capsule"
+            );
             let install_path = format!("capsules/{name}");
             assert_eq!(
                 components.external[name].install_path.as_deref(),

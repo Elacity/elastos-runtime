@@ -1546,6 +1546,30 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
 
+    #[tokio::test]
+    async fn test_fetch_cid_via_gateways_uses_ipfs_path() {
+        use axum::{body::Body, extract::Path as AxumPath, http::StatusCode};
+
+        async fn handler(AxumPath(cid): AxumPath<String>) -> (StatusCode, Body) {
+            assert_eq!(cid, "bafy-test-cid");
+            (StatusCode::OK, Body::from("gateway-bytes"))
+        }
+
+        let app = Router::new().route("/ipfs/:cid", get(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let bytes = fetch_cid_via_gateways("bafy-test-cid", &[format!("http://{}", addr)])
+            .await
+            .unwrap();
+        server.shutdown().await;
+        assert_eq!(bytes, b"gateway-bytes");
+    }
+
     fn raw_cid(bytes: &[u8]) -> String {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(bytes);
