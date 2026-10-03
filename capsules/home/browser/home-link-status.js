@@ -39,6 +39,13 @@ export function createHomeLinkStatus({
       retryTimer = null;
     }
   };
+  const markReachable = () => {
+    cancelRetry();
+    if (!reachable) {
+      reachable = true;
+      announce();
+    }
+  };
 
   return {
     reachable: () => reachable,
@@ -46,6 +53,10 @@ export function createHomeLinkStatus({
     // nothing more to report); false for any answer the gateway gave.
     reportFailure(error) {
       if (!isGatewayUnreachable(error)) {
+        // Any other HTTP status is an answer, so the link is back.
+        if (Number.isInteger(error?.status)) {
+          markReachable();
+        }
         return false;
       }
       if (reachable) {
@@ -59,13 +70,7 @@ export function createHomeLinkStatus({
       }, retryMs);
       return true;
     },
-    reportSuccess() {
-      cancelRetry();
-      if (!reachable) {
-        reachable = true;
-        announce();
-      }
-    },
+    reportSuccess: markReachable,
     // A reloaded shell starts out reachable; tell it again while down.
     replay() {
       if (!reachable) {

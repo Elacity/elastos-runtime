@@ -79,6 +79,20 @@ test("the retry asks the gateway again until an answer clears the state", () => 
   assert.equal(link.reachable(), true);
 });
 
+test("an ordinary HTTP answer after an outage clears the state and leaves the error to the caller", () => {
+  for (const status of [500, 401, 404]) {
+    const { link, posted, timers } = harness();
+    link.reportFailure(httpError(503));
+    assert.equal(link.reportFailure(httpError(status)), false, String(status));
+    assert.equal(link.reachable(), true, String(status));
+    assert.deepEqual(posted, [
+      { type: LINK_STATUS_MESSAGE, reachable: false },
+      { type: LINK_STATUS_MESSAGE, reachable: true },
+    ]);
+    assert.equal(timers.size, 0, "the answer cancels the pending retry");
+  }
+});
+
 test("answers and ordinary refusals while reachable say nothing", () => {
   const { link, posted, timers } = harness();
   link.reportSuccess();
