@@ -656,3 +656,228 @@ Keep the test HOME and its receipts under the agreed retention condition.
 Post the public versions, CI/artifact links, signed hash/CID receipts, operator
 M1/M2 results and any remaining acceptance gap in #89. Broader promotion keeps
 the recovery, #213, installed Home and Anders approval gates.
+
+## Holder provider installation after qualification
+
+The holder keeps its accepted Runtime and frozen helper tree. The repaired
+`ipfs-provider` has its own reviewed source identity. Record both identities in
+#89. The Canary Linux holder workflow accepts an exact provider commit and tree
+for proof. Select `package_merged=true` only after that commit is merged into
+`develop`, the required checks pass, and the independent review passes. The
+workflow also checks merge ancestry before it creates the operator package.
+
+Download the completed `qualified-holder-linux-<provider-commit>-<attempt>`
+artifact from the run recorded in #89. Verify its approved archive hash, then
+verify `qualified-holder/SHA256SUMS`. Its `holder-idle.json` must report
+`passed=true`, completed cleanup, the accepted Runtime identity, and the exact
+merged provider identity. Its gateway and Carrier reads use uncached content
+after real production watcher stops. The fixture records its accelerated
+`last_used` input. The separate bounded proof uses a real native provider;
+Runtime tests own the bounded Carrier prepare/retry proof.
+
+The qualified package is run `37152086972`, artifact `11284442655`, named
+`qualified-holder-linux-c968b440a6410adc7af14704e109b217acf6f159-1`.
+Its ZIP digest is `5ee9d80185617fbe610e1b154a12082b1f9439344cd8aacaf08826b45075b370`.
+Its `qualified-holder.tar.gz` SHA-256 is
+`591f4f98ee9b16485818b987428e63f3832b3454da95238c1239be91a1109ee4`.
+The provider SHA-256 is
+`211a1486303529558200036bacbe94488f4b94d5c49a44819a60a3c47a74042a`
+and its size is 3,945,720 bytes. `installed-component.json` SHA-256 is
+`8fd309c1deef17c82907f4bad8ef85c267043244635a886385149bed627d1e07`.
+The artifact expires on 10 October. Check the event and branch independently
+before accepting its receipts:
+
+```bash
+gh api repos/Elacity/elastos-runtime/actions/runs/37152086972 \
+  --jq '{event,head_branch,head_sha,path,status,conclusion}'
+```
+
+Require `workflow_dispatch`, `develop`,
+`c968b440a6410adc7af14704e109b217acf6f159`,
+`.github/workflows/canary-holder-linux.yml`, `completed`, and `success`.
+Download into a new private directory. On the Mac use `shasum -a 256` in place
+of `sha256sum`:
+
+```bash
+umask 077
+mkdir "$HOLDER_DOWNLOAD"
+gh run download 37152086972 --repo Elacity/elastos-runtime \
+  --name qualified-holder-linux-c968b440a6410adc7af14704e109b217acf6f159-1 \
+  --dir "$HOLDER_DOWNLOAD"
+(cd "$HOLDER_DOWNLOAD" && sha256sum -c qualified-holder.tar.gz.sha256)
+```
+
+Match that tar hash to the approved hash above before extracting it. Its
+members are regular files under `qualified-holder/`; refuse absolute paths,
+parent traversal, symlinks and hardlinks. Copy only verified public package
+files to the seed through the operator's established transfer path.
+
+`provider-build.json` identifies the new binary. `accepted-build.json`
+identifies the previously accepted Runtime and its original build; use its
+`elastos` record for Runtime parity. `provider-source.tar.gz` contains the
+repaired source. `runtime-helper-source.tar.gz` contains the frozen helper
+source used by the accepted Runtime. The provider binary does not embed that
+helper root. The installed Runtime continues to use its approved stable helper
+root. This package changes only the provider.
+
+Anders approves the exact artifact, component pin, and seed service change
+before the operator installs it. Keep the private target paths in operator
+configuration. Set `HOLDER_PACKAGE` to the verified package directory,
+`HOLDER_DATA` to the existing Runtime data root, `HOLDER_RUNTIME` to the existing
+Runtime executable, and `HOLDER_HELPERS` to its approved frozen helper root.
+Prepare a candidate manifest beside the package while the service runs:
+
+```bash
+set -euo pipefail
+export HOLDER_PACKAGE HOLDER_DATA HOLDER_RUNTIME HOLDER_HELPERS
+(cd "$HOLDER_PACKAGE" && sha256sum -c SHA256SUMS)
+python3 - <<'PY'
+import hashlib, json, os
+from pathlib import Path
+package, data = Path(os.environ['HOLDER_PACKAGE']), Path(os.environ['HOLDER_DATA'])
+runtime = Path(os.environ['HOLDER_RUNTIME'])
+assert all(p.is_dir() and not p.is_symlink() for p in (package, data, Path(os.environ['HOLDER_HELPERS'])))
+def sha(path):
+    assert path.is_file() and not path.is_symlink()
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+accepted = json.loads((package / 'accepted-build.json').read_bytes())
+original_runtime = next(item for item in accepted['binaries'] if item['name'] == 'elastos')
+assert sha(runtime) == original_runtime['sha256'] and runtime.stat().st_size == original_runtime['size']
+assert os.environ['HOLDER_HELPERS'] == accepted['helper_root']
+proof = json.loads((package / 'holder-idle.json').read_bytes())
+build = json.loads((package / 'provider-build.json').read_bytes())
+pin = json.loads((package / 'installed-component.json').read_bytes())
+assert proof['passed'] and proof['fixture_removed']
+assert (proof['provider_commit'], proof['provider_tree']) == (build['source_commit'], build['source_tree'])
+assert (pin['source_commit'], pin['source_tree']) == (build['source_commit'], build['source_tree'])
+assert pin['management'] == 'operator-managed-local-overlay'
+assert sha(package / 'provider-build.json') == pin['provider_build_sha256']
+assert sha(package / 'ipfs-provider') == build['sha256']
+assert (package / 'ipfs-provider').stat().st_size == build['size']
+manifest_path = data / 'components.json'
+assert manifest_path.is_file() and not manifest_path.is_symlink()
+manifest_bytes = manifest_path.read_bytes()
+manifest = json.loads(manifest_bytes)
+entry = manifest['external']['ipfs-provider']
+assert entry['install_path'] == pin['entry']['install_path'] == 'bin/ipfs-provider'
+assert entry['provider_runtime'] == pin['entry']['provider_runtime']
+assert entry['provider_runtime']['role'] == 'provider'
+assert entry['provider_runtime']['runtime_abi'] == 'elastos.provider-stdio/v1'
+assert 'linux-amd64' in entry['platforms']
+new_pin = pin['entry']['platforms']['linux-amd64']
+assert new_pin['checksum'] == 'sha256:' + build['sha256'] and new_pin['size'] == build['size']
+entry['platforms']['linux-amd64'] = dict(new_pin)
+candidate = package / 'components.candidate.json'
+with candidate.open('x') as stream:
+    stream.write(json.dumps(manifest, indent=2) + '\n')
+candidate.chmod(0o600)
+receipt = package / 'components.candidate.receipt.json'
+with receipt.open('x') as stream:
+    json.dump({'previous_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+               'candidate_sha256': sha(candidate)}, stream)
+    stream.write('\n')
+receipt.chmod(0o600)
+print('Runtime parity and provider manifest candidate verified')
+print('Candidate manifest SHA-256:', sha(candidate))
+PY
+```
+
+Review the candidate diff against the installed manifest. Only the existing
+Linux IPFS platform pin changes. It keeps the install path, checksum, and size;
+the local overlay receipt replaces the old CID, URL, and release fetch path.
+Record that reviewed candidate SHA-256 in the protected operator approval, then
+export it as `HOLDER_APPROVED_MANIFEST_SHA256` for the replacement step.
+Keep one approved rollback set containing the old provider binary and manifest, with their hashes, reason, and expiry in the
+private lifecycle inventory. The installed data root, Kubo binary and repo,
+identity, provider config, publication receipts, and helper tree stay in place.
+
+After approval, stop the existing holder service with its established service
+manager. Replace `$HOLDER_DATA/bin/ipfs-provider` with the verified binary at
+mode 0700, and replace `$HOLDER_DATA/components.json` with the candidate at
+mode 0600. Stage each replacement beside its destination, verify its hash,
+then rename it into place while the service is stopped. Start the same service
+with its existing arguments and environment. Verify the installed pin:
+
+Use the established service manager to stop the approved service first, and
+confirm its Runtime and provider processes have exited. With the verified
+rollback retained, these commands stage exclusive files beside each target
+and replace only the provider and manifest:
+
+```bash
+umask 077
+python3 - <<'PY'
+import hashlib, json, os, stat
+from pathlib import Path
+package, data = Path(os.environ['HOLDER_PACKAGE']), Path(os.environ['HOLDER_DATA'])
+pin = json.loads((package / 'installed-component.json').read_bytes())
+receipt_path = package / 'components.candidate.receipt.json'
+assert receipt_path.is_file() and not receipt_path.is_symlink()
+receipt = json.loads(receipt_path.read_bytes())
+approved = os.environ['HOLDER_APPROVED_MANIFEST_SHA256']
+assert len(approved) == 64 and approved == receipt['candidate_sha256']
+assert hashlib.sha256((data / 'components.json').read_bytes()).hexdigest() == receipt['previous_sha256']
+def replace(source, destination, mode, expected=None):
+    parent = destination.parent
+    assert parent.is_dir() and not parent.is_symlink()
+    for path in (parent, destination):
+        st = path.lstat()
+        assert st.st_uid == os.geteuid() and not stat.S_ISLNK(st.st_mode)
+        assert not st.st_mode & 0o022
+    content = source.read_bytes()
+    if expected: assert hashlib.sha256(content).hexdigest() == expected
+    staged = parent / (destination.name + '.holder-candidate')
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, destination)
+        directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally:
+        if staged.exists(): staged.unlink()
+replace(package / 'ipfs-provider', data / 'bin/ipfs-provider', 0o700,
+        pin['entry']['platforms']['linux-amd64']['checksum'].removeprefix('sha256:'))
+replace(package / 'components.candidate.json', data / 'components.json', 0o600, approved)
+print('Approved provider and manifest replacement complete')
+PY
+```
+
+If either replacement fails, keep the service stopped and restore both files
+from the verified rollback. Then restart through the same service manager and
+verify the installed pin:
+
+```bash
+ELASTOS_DATA_DIR="$HOLDER_DATA" ELASTOS_COMPONENTS_JSON="$HOLDER_DATA/components.json" \
+  "$HOLDER_HELPERS/scripts/installed-provider-verify.sh" --require-verified ipfs-provider
+sha256sum "$HOLDER_DATA/bin/ipfs-provider" "$HOLDER_RUNTIME"
+```
+
+Match the running provider executable to the installed provider hash and the
+Runtime hash to the accepted receipt. Record the intentional install restart.
+Then let Kubo reach the normal production idle threshold. Observe the watcher
+stop, removed coordination file, old process exit, and closed API socket. Keep
+the holder service and provider processes running. The first operation after
+the stop is an isolated consumer's typed Content fetch over Carrier;
+preparation and health calls come after that read. Use a separate full-serve
+consumer with holder availability and its public ticket, then its private
+`/api/provider/content/fetch` operation for the complete release binary. Match
+those bytes to the signed release hash. Keep the consumer's local IPFS provider
+and Kubo absent, and record the selected holder identity and public ticket in
+its read receipt. The public `/content/:cid` route has a
+smaller rendering bound; use it only for a smaller generic file in the second
+idle cycle. Verify fresh Kubo process identities and unchanged service and
+provider identities. Use isolated consumer state and stop its test processes
+when finished.
+
+Record safe run, artifact, source, hash, and installed idle-recovery results in
+#89. Keep private target paths and raw operator evidence in their existing
+custody. Remove the rollback set when this installed acceptance gate closes.
+This holder qualification supports the canary journey; broader release and
+installed Home gates keep their own acceptance evidence.
