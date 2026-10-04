@@ -327,6 +327,27 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+      # Playwright 1.59.1's installer hangs extracting Chromium under Node 26;
+      # the smokes themselves run on Node 26 below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install browser layout smoke tools
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+          npm ci --prefix elastos/tools/browser-playwright-engine
+          npx --prefix elastos/tools/browser-playwright-engine playwright install --with-deps chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      # The smokes default to a macOS Brave install unless BRAVE_BIN is set.
+      - name: browser layout smokes
+        run: |
+          BRAVE_BIN="$(cd elastos/tools/browser-playwright-engine && node -p "require('playwright').chromium.executablePath()")"
+          export BRAVE_BIN
+          just product-ui-browser
 
       - name: list own-workspace capsule tests
         run: |
