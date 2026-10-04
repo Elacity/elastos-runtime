@@ -1,9 +1,9 @@
-# Issue #89: qualify a reviewed provider with the accepted Runtime and helpers.
+# Issue #89: qualify user recovery with frozen Runtime and gateway lifetime with candidate Runtime.
 name: Canary Linux holder
 
 on:
   pull_request:
-    paths: [capsules/ipfs-provider/**, .github/workflows/canary-holder-linux.yml]
+    paths: [capsules/ipfs-provider/**, elastos/crates/elastos-runtime/src/provider/registry.rs, elastos/crates/elastos-server/src/ipfs.rs, elastos/crates/elastos-server/src/server_infra.rs, elastos/crates/elastos-server/src/gateway_entry.rs, elastos/crates/elastos-server/src/gateway_cmd.rs, scripts/holder-idle-ci.py, .github/workflows/canary-holder-linux.yml]
   push:
     branches: [fix/89-canary-inputs]
     paths: [.github/workflows/canary-holder-linux.yml]
@@ -18,7 +18,7 @@ on:
         required: true
         type: string
       package_merged:
-        description: Package only after this exact provider commit is merged into develop
+        description: Reserved; always-on Runtime and provider packaging requires separate operator approval
         required: true
         default: false
         type: boolean
@@ -79,6 +79,7 @@ jobs:
           umask 077
           [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs || "$GITHUB_EVENT_NAME" == pull_request || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/Linux/X64 ]]
+          [[ "$PACKAGE_MERGED" == false ]] || { echo 'Always-on needs a separately approved Runtime+provider package; provider-only packaging is unavailable.' >&2; exit 1; }
           [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
           [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
@@ -676,6 +677,73 @@ jobs:
               (output / 'holder-idle.json').write_text(json.dumps(result, indent=2) + '\n')
               assert not result['cleanup']['errors'] and result['cleanup']['remaining_pids'] == [], 'fixture cleanup incomplete'
           PY
+      - name: build and test candidate Runtime for the gateway role proof
+        run: |
+          set -euo pipefail
+          # Candidate helpers stay separate from the accepted Runtime's frozen root.
+          CI_GATEWAY_HELPER_ROOT=/home/runner/.local/share/elastos-issue89-candidate/source
+          export CI_GATEWAY_HELPER_ROOT
+          git -C "$GITHUB_WORKSPACE/provider-source" archive --format=tar "$PROVIDER_COMMIT" | gzip -n > "$HOLDER_OUTPUT/gateway-source.tar.gz"
+          python3 - <<'PY_CANDIDATE_SOURCE'
+          import hashlib, json, os, shutil, tarfile
+          from pathlib import Path, PurePosixPath
+          root = Path(os.environ['CI_GATEWAY_HELPER_ROOT'])
+          assert str(root) == '/home/runner/.local/share/elastos-issue89-candidate/source'
+          assert not root.parent.exists() and not root.parent.is_symlink()
+          free = shutil.disk_usage(root.parent.parent)
+          assert free.free > 8 * 1024**3 and free.free * 100 > free.total * 15
+          root.parent.mkdir(mode=0o700)
+          root.mkdir(mode=0o700)
+          with tarfile.open(Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source.tar.gz', 'r:gz') as archive:
+              for member in archive.getmembers():
+                  name = PurePosixPath(member.name)
+                  assert not name.is_absolute() and '..' not in name.parts
+                  assert member.isfile() or member.isdir(), 'candidate source archive must contain ordinary files'
+              archive.extractall(root, filter='data')
+          inventory = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(root.rglob('*')) if path.is_file()}
+          (Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source-files.json').write_text(json.dumps(inventory, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write('CI_GATEWAY_HELPER_ROOT=' + str(root) + '\n')
+          PY_CANDIDATE_SOURCE
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+            --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --bin elastos
+          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/elastos" "$ACCEPTED_INPUT/gateway-elastos"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+            --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib runtime_host_role_init
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+            --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib browser_home_public_mode_refuses_before_provider_setup
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+            --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib public_gateway_ipfs_refresh
+          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+            --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-runtime private_ipfs_generic_and_remote_dispatch_rejected_before_transmission
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'provider-source'
+          runtime = Path(os.environ['ACCEPTED_INPUT']) / 'gateway-elastos'
+          assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == os.environ['PROVIDER_COMMIT']
+          assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == os.environ['PROVIDER_TREE']
+          helper_root = Path(os.environ['CI_GATEWAY_HELPER_ROOT'])
+          assert str(helper_root / 'elastos/crates/elastos-server').encode() in runtime.read_bytes()
+          with runtime.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          record = {'purpose': 'CI-only gateway role proof; operator Runtime upgrade remains approval-gated',
+              'seed_package': False, 'source_commit': os.environ['PROVIDER_COMMIT'], 'source_tree': os.environ['PROVIDER_TREE'],
+              'sha256': digest, 'size': runtime.stat().st_size, 'helper_root': os.environ['CI_GATEWAY_HELPER_ROOT'],
+              'helper_source_archive_sha256': hashlib.sha256((Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source.tar.gz').read_bytes()).hexdigest(),
+              'helper_source_files_sha256': hashlib.sha256((Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source-files.json').read_bytes()).hexdigest(),
+              'consumer_helper_root': os.environ['SEED_HELPER_ROOT'],
+              'command': 'cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos',
+              'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}
+          (Path(os.environ['HOLDER_OUTPUT']) / 'gateway-runtime-build.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: prove gateway Kubo remains alive through real idle time and immediate Carrier read
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -S "$GITHUB_WORKSPACE/provider-source/scripts/holder-idle-ci.py"
       - name: package only a passed provider qualification
         if: ${{ env.PACKAGE_MERGED == 'true' }}
         env:
@@ -749,6 +817,7 @@ jobs:
           name: holder-idle-observations-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/holder-output/*.json
+            ${{ runner.temp }}/holder-output/gateway-source.tar.gz
             ${{ runner.temp }}/holder-output/*.stdout
             ${{ runner.temp }}/holder-output/*.stderr
           if-no-files-found: warn
