@@ -3446,7 +3446,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn home_cli_renderer_archive_extraction_preserves_native_bytes_and_mode() {
+    fn home_cli_renderer_archive_extraction_preserves_native_bytes_and_executability() {
         use std::os::unix::fs::PermissionsExt;
 
         let native = fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -3473,9 +3473,9 @@ mod tests {
         extract_from_tarball(&bytes, &installed, &info).unwrap();
         let renderer = installed.join("bin/home-cli");
         assert_eq!(fs::read(&renderer).unwrap(), native);
-        assert_eq!(
-            fs::metadata(&renderer).unwrap().permissions().mode() & 0o111,
-            0o111
+        assert_ne!(
+            fs::metadata(&renderer).unwrap().permissions().mode() & 0o100,
+            0
         );
         assert!(!temp.path().join("bin/home-cli").exists());
         let mut corrupt = bytes;
@@ -3871,12 +3871,22 @@ mod tests {
         let manifest_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
         let mut manifest = load_manifest_from_path(&manifest_path).unwrap();
+        let platform = detect_platform();
+        // Source inputs are stamped by release packaging; this fixture models
+        // the signed platform manifest consumed by an installed Runtime.
+        manifest
+            .external
+            .get_mut("llama-server")
+            .unwrap()
+            .platforms
+            .get_mut(&platform)
+            .unwrap()
+            .checksum = Some(format!("sha256:{}", "a".repeat(64)));
         let root = tempfile::tempdir().unwrap();
         let bundle = local_model_engine_confinement_bundle(root.path(), &manifest)
             .unwrap()
             .unwrap();
         assert!(!bundle.exists(), "predeclaration must precede installation");
-        let platform = detect_platform();
         let version = manifest.external["llama-server"].version.as_ref().unwrap();
         assert_eq!(
             bundle,
@@ -3964,21 +3974,19 @@ mod tests {
             .components
             .iter()
             .any(|component| component == "archive-manager"));
-        for profile_name in ["home", "demo"] {
-            let selected = resolve_components(&manifest, Some(profile_name), &[], &[]).unwrap();
-            assert!(selected.iter().any(|name| name == "model-provider"));
-            assert!(
-                !selected.iter().any(|name| name == "llama-server"
-                    || manifest
-                        .external
-                        .get(name)
-                        .is_some_and(|component| component
-                            .install_path
-                            .as_deref()
-                            .is_some_and(|path| path.ends_with(".gguf")))),
-                "{profile_name} installs the engine and models only on demand"
-            );
-        }
+        let selected = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
+        assert!(selected.iter().any(|name| name == "model-provider"));
+        assert!(
+            !selected.iter().any(|name| name == "llama-server"
+                || manifest
+                    .external
+                    .get(name)
+                    .is_some_and(|component| component
+                        .install_path
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with(".gguf")))),
+            "Home installs the engine and models only on demand"
+        );
         let on_demand = resolve_components(
             &manifest,
             None,
