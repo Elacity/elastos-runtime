@@ -1,0 +1,434 @@
+# Key-free native pair. The dispatch workflow admits the merged product source.
+name: Canary union Mac inputs
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      source_tree:
+        required: true
+        type: string
+      source_ci_run:
+        required: true
+        type: string
+      published_at:
+        required: true
+        type: string
+      publisher_did:
+        type: string
+        default: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+      prepare_models:
+        type: boolean
+        default: false
+
+    outputs:
+      artifact_name:
+        description: Unsigned native pair handoff artifact
+        value: ${{ jobs.native-pair.outputs.artifact_name }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-pair:
+    name: unsigned Apple silicon V3 and frozen-support V4
+    runs-on: macos-14
+    timeout-minutes: 360
+    outputs:
+      artifact_name: ${{ steps.artifact.outputs.name }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      SOURCE_TREE: ${{ inputs.source_tree }}
+      SOURCE_CI_RUN: ${{ inputs.source_ci_run }}
+      PUBLISHED_AT: ${{ inputs.published_at }}
+      PUBLISHER_DID: ${{ inputs.publisher_did }}
+      PREPARE_MODELS: ${{ inputs.prepare_models && 'true' || 'false' }}
+      CARGO_BUILD_JOBS: '4'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: check out the admitted union source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - name: read the shared admission from this dispatch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/union-mac-admission
+      - name: bind source and allocate owned paths
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || exit 1
+          [[ "$GITHUB_WORKFLOW_REF" == Elacity/elastos-runtime/.github/workflows/canary-union-handoff.yml@refs/heads/fix/89-canary-inputs ]] || exit 1
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/macOS/ARM64 ]] || exit 1
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$SOURCE_CI_RUN" =~ ^[1-9][0-9]*$ && "$PUBLISHED_AT" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$PUBLISHER_DID" == did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || exit 1
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]] || exit 1
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || exit 1
+          OWNED_ROOT="$RUNNER_TEMP/union-mac-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "$OWNED_ROOT" && ! -L "$OWNED_ROOT" ]] || exit 1
+          install -d -m 700 "$OWNED_ROOT/inputs/receipts" "$OWNED_ROOT/package" "$OWNED_ROOT/home"
+          echo "OWNED_ROOT=$OWNED_ROOT" >> "$GITHUB_ENV"
+          echo "INPUT_ARTIFACT=$OWNED_ROOT/inputs" >> "$GITHUB_ENV"
+          echo "BUILDER_HOME=$OWNED_ROOT/home" >> "$GITHUB_ENV"
+          git archive --format=tar.gz --output="$OWNED_ROOT/inputs/source.tar.gz" "$SOURCE_COMMIT"
+          python3 -I -S - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'union-mac-admission/union-admission.json'
+          if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024:
+              raise RuntimeError('Shared union admission file differs')
+          data = path.read_bytes()
+          admission = json.loads(data)
+          expected = {'schema': 'elastos.canary-union-admission/v1',
+              'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
+              'source_ci_run': int(os.environ['SOURCE_CI_RUN']), 'workflow_commit': os.environ['GITHUB_SHA'],
+              'union_pr': 230, 'published_at': os.environ['PUBLISHED_AT'],
+              'mac_versions': ['0.8.0-alpha.3', '0.8.0-alpha.4'], 'seed_version': '0.8.0-alpha.3'}
+          if any(admission.get(key) != value for key, value in expected.items()):
+              raise RuntimeError('Shared union admission pins differ')
+          receipts = Path(os.environ['RUNNER_TEMP']) / ('union-mac-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']) / 'inputs/receipts'
+          (receipts / 'union-admission.json').write_bytes(data)
+          (receipts / 'union-admission.sha256').write_text(hashlib.sha256(data).hexdigest() + '  union-admission.json\n')
+          PYCODE
+      - name: install the pinned native toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+          targets: wasm32-unknown-unknown,aarch64-apple-darwin
+      - name: prepare hosted capacity and native tools
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          brew install e2fsprogs coturn pkg-config openssl@3
+          python3 -I -S - <<'PYCODE'
+          import importlib.util, json, os, shutil
+          from pathlib import Path
+          planned = (70 if os.environ['PREPARE_MODELS'] == 'true' else 50) * 1024**3
+          spec = importlib.util.spec_from_file_location('capacity', 'scripts/update-hop-compare.py')
+          capacity = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(capacity)
+          original = capacity.cli_reclaim_xcode
+          capacity.cli_reclaim_xcode = lambda apps, protected, growth, measure, remove: original(apps, protected, planned, measure, remove)
+          reclaimed = capacity.cli_prepare_ci_disk()
+          Path(os.environ['INPUT_ARTIFACT'], 'receipts/hosted-capacity.json').write_text(json.dumps(reclaimed, indent=2) + '\n')
+          usage = shutil.disk_usage(os.environ['OWNED_ROOT'])
+          # Both native inputs include four licensed model archives. Export also
+          # retains CARs and Kubo blocks. Each fresh Cargo domain is removed
+          # after output verification, before the next build and archive creation.
+          growth = planned
+          if (usage.free - growth) * 100 < usage.total * 15:
+              raise SystemExit(f'Hosted Mac needs {growth} planned bytes plus its 15% disk reserve; free={usage.free}, total={usage.total}')
+          Path(os.environ['INPUT_ARTIFACT'], 'receipts/disk-budget.json').write_text(json.dumps({
+              'free_bytes': usage.free, 'total_bytes': usage.total,
+              'planned_growth_bytes': growth, 'reserve_percent': 15}, indent=2) + '\n')
+          PYCODE
+      - name: start isolated build Kubo for the optional public model export
+        if: inputs.prepare_models
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          scripts/seed-kubo-cache.sh "$OWNED_ROOT/kubo-cache" "$BUILDER_HOME/data" darwin-arm64
+          python3 -I -S - <<'PYCODE'
+          import json, os, subprocess, time, urllib.request
+          from pathlib import Path
+          root = Path(os.environ['OWNED_ROOT'])
+          binary = root / 'home/data/bin/kubo'
+          repo = root / 'model-kubo'
+          environment = dict(os.environ, IPFS_PATH=str(repo))
+          subprocess.run([str(binary), 'init', '--profile=test'], env=environment, check=True, timeout=30)
+          subprocess.run([str(binary), 'config', 'Addresses.API', '/ip4/127.0.0.1/tcp/0'], env=environment, check=True, timeout=30)
+          subprocess.run([str(binary), 'config', 'Addresses.Gateway', '/ip4/127.0.0.1/tcp/0'], env=environment, check=True, timeout=30)
+          log = (root / 'inputs/receipts/model-kubo.log').open('xb')
+          child = subprocess.Popen([str(binary), 'daemon', '--offline'], env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+          log.close()
+          (root / 'kubo-process.json').write_text(json.dumps({'pid': child.pid, 'binary': str(binary), 'repo': str(repo)}) + '\n')
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          deadline = time.monotonic() + 60
+          while time.monotonic() < deadline:
+              if child.poll() is not None:
+                  raise RuntimeError('Build Kubo exited before its local API became ready')
+              try:
+                  address = (repo / 'api').read_text().strip()
+                  prefix = '/ip4/127.0.0.1/tcp/'
+                  if not address.startswith(prefix) or not address[len(prefix):].isdigit():
+                      raise ValueError('Build Kubo API address differs')
+                  with opener.open(urllib.request.Request('http://127.0.0.1:' + address[len(prefix):] + '/api/v0/version', method='POST'), timeout=2) as response:
+                      version = json.loads(response.read(4096))
+                  if version['Version'] != '0.40.1':
+                      raise ValueError('Build Kubo version differs from the source recipe')
+                  break
+              except (OSError, ValueError):
+                  time.sleep(0.25)
+          else:
+              raise RuntimeError('Build Kubo local API readiness timed out')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('MODEL_KUBO_BIN=' + str(binary) + '\nMODEL_KUBO_REPO=' + str(repo) + '\n')
+          PYCODE
+      - name: prepare V3 with fresh Cargo outputs
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          umask 077
+          export HOME="$BUILDER_HOME"
+          export CARGO_HOME="${CARGO_HOME:-/Users/runner/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-/Users/runner/.rustup}"
+          export CARGO_TARGET_DIR="$OWNED_ROOT/cargo-V3"
+          export CARGO_BUILD_BUILD_DIR="$OWNED_ROOT/cargo-build-V3"
+          [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" ]] || exit 1
+          [[ ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]] || exit 1
+          install -d -m 700 "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+          python3 -I -S - <<'PYCODE'
+          import json, os, stat
+          from pathlib import Path
+          records = {}
+          for name in ('CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR'):
+              path = Path(os.environ[name])
+              if list(path.iterdir()) or stat.S_IMODE(path.stat().st_mode) != 0o700:
+                  raise RuntimeError('Fresh Cargo directory differs')
+              records[name] = {'path': str(path), 'initially_empty': True, 'mode': '0700'}
+          Path(os.environ['INPUT_ARTIFACT'], 'receipts/V3-cargo-domains.json').write_text(json.dumps(records, indent=2) + '\n')
+          PYCODE
+          unset ELASTOS_RELEASE_MODEL_KUBO_BIN ELASTOS_RELEASE_MODEL_KUBO_REPO \
+            ELASTOS_RELEASE_MODEL_PUBLISHED_AT ELASTOS_RELEASE_MODEL_PUBLISHER_DID \
+            ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
+          # These are the five documented fresh model preparation inputs.
+          if [[ "$PREPARE_MODELS" == true ]]; then
+            export ELASTOS_RELEASE_MODEL_KUBO_BIN="$MODEL_KUBO_BIN"
+            export ELASTOS_RELEASE_MODEL_KUBO_REPO="$MODEL_KUBO_REPO"
+            export ELASTOS_RELEASE_MODEL_PUBLISHED_AT="$PUBLISHED_AT"
+            export ELASTOS_RELEASE_MODEL_PUBLISHER_DID="$PUBLISHER_DID"
+            export ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT="$INPUT_ARTIFACT/N3-model-handoff"
+          fi
+          unset ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.3 --output "$INPUT_ARTIFACT/N3"
+          python3 -I -S scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N3" > "$INPUT_ARTIFACT/receipts/N3-verify.json"
+          rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+      - name: prepare V4 with fresh Cargo outputs and exact V3 support
+        timeout-minutes: 100
+        run: |
+          set -euo pipefail
+          umask 077
+          export HOME="$BUILDER_HOME"
+          export CARGO_HOME="${CARGO_HOME:-/Users/runner/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-/Users/runner/.rustup}"
+          export CARGO_TARGET_DIR="$OWNED_ROOT/cargo-V4"
+          export CARGO_BUILD_BUILD_DIR="$OWNED_ROOT/cargo-build-V4"
+          [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" ]] || exit 1
+          [[ ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]] || exit 1
+          install -d -m 700 "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+          python3 -I -S - <<'PYCODE'
+          import json, os, stat
+          from pathlib import Path
+          records = {}
+          for name in ('CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR'):
+              path = Path(os.environ[name])
+              if list(path.iterdir()) or stat.S_IMODE(path.stat().st_mode) != 0o700:
+                  raise RuntimeError('Fresh Cargo directory differs')
+              records[name] = {'path': str(path), 'initially_empty': True, 'mode': '0700'}
+          Path(os.environ['INPUT_ARTIFACT'], 'receipts/V4-cargo-domains.json').write_text(json.dumps(records, indent=2) + '\n')
+          PYCODE
+          unset ELASTOS_RELEASE_MODEL_KUBO_BIN ELASTOS_RELEASE_MODEL_KUBO_REPO \
+            ELASTOS_RELEASE_MODEL_PUBLISHED_AT ELASTOS_RELEASE_MODEL_PUBLISHER_DID \
+            ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.4 --output "$INPUT_ARTIFACT/N4" --reuse-support "$INPUT_ARTIFACT/N3"
+          python3 -I -S scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N4" > "$INPUT_ARTIFACT/receipts/N4-verify.json"
+          rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+      - name: verify native versions, source and support parity
+        run: |
+          set -euo pipefail
+          python3 -I -S - <<'PYCODE'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          if (root / 'N4/support-input.json').read_bytes() != (root / 'N3/platform-input.json').read_bytes():
+              raise RuntimeError('V4 original support receipt differs from V3')
+          records = []
+          for name, version in [('N3', '0.8.0-alpha.3'), ('N4', '0.8.0-alpha.4')]:
+              receipt = json.loads((root / name / 'platform-input.json').read_bytes())
+              if receipt['source']['commit'] != os.environ['SOURCE_COMMIT'] or receipt['source']['tree'] != os.environ['SOURCE_TREE']:
+                  raise RuntimeError('Native source binding differs')
+              if receipt['platform'] != 'aarch64-darwin' or receipt['version'] != version:
+                  raise RuntimeError('Native platform or version differs')
+              binary = root / name / 'artifacts/elastos-aarch64-darwin'
+              environment = dict(os.environ, HOME=os.environ['BUILDER_HOME'], ELASTOS_DATA_DIR=os.environ['BUILDER_HOME'] + '/data')
+              result = subprocess.run([str(binary), '--version'], env=environment, capture_output=True, check=True, timeout=30)
+              if result.stdout != ('elastos ' + version + '\n').encode() or result.stderr:
+                  raise RuntimeError('Native executable version or stderr differs')
+              records.append({'input': name, 'version': version, 'stdout': result.stdout.decode(), 'stderr': '',
+                              'binary_sha256': receipt['files']['artifacts/elastos-aarch64-darwin']['sha256'],
+                              'fresh_cargo_target': str(Path(os.environ['OWNED_ROOT']) / ('cargo-V' + name[1:]))})
+          if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['SOURCE_COMMIT']:
+              raise RuntimeError('Source commit changed during preparation')
+          if subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() != os.environ['SOURCE_TREE'] or subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all']):
+              raise RuntimeError('Source tree changed during preparation')
+          (root / 'receipts/native-pair.json').write_text(json.dumps({
+              'schema': 'elastos.canary-union-native-pair/v1', 'source_commit': os.environ['SOURCE_COMMIT'],
+              'source_tree': os.environ['SOURCE_TREE'], 'source_ci_run': os.environ['SOURCE_CI_RUN'],
+              'parent_workflow_ref': os.environ['GITHUB_WORKFLOW_REF'], 'workflow_commit': os.environ['GITHUB_SHA'],
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'source_clean_before_and_after': True, 'support_origin_matches_V3': True,
+              'models_exported': os.environ['PREPARE_MODELS'] == 'true', 'published_at': os.environ['PUBLISHED_AT'],
+              'publisher_did': os.environ['PUBLISHER_DID'], 'native': records,
+              'scope': 'Unsigned native pair; catalogue and release signing remain operator steps.',
+              'operator_gate': 'Restore an exact source Git checkout using the matching same-dispatch seed source.tar.gz and source-git.tar.gz, or a fresh checkout of source_commit. Then finalize the original N3 model input with the approved signed catalogue before release metadata preparation; V4 support must follow that finalized input.'}, indent=2) + '\n')
+          PYCODE
+      - name: stop owned build processes and remove fresh build outputs
+        if: always() && env.OWNED_ROOT != ''
+        run: |
+          set -euo pipefail
+          python3 -I -S - <<'PYCODE'
+          import json, os, shutil, signal, subprocess, time
+          from pathlib import Path
+          root = Path(os.environ['OWNED_ROOT'])
+          record = root / 'kubo-process.json'
+          stopped = None
+          forced = False
+          if record.exists():
+              process = json.loads(record.read_bytes())
+              pid, binary = process['pid'], process['binary']
+              if type(pid) is not int or pid <= 1 or not str(binary).startswith(str(root) + '/home/data/bin/'):
+                  raise RuntimeError('Owned Kubo receipt differs')
+              def alive():
+                  result = subprocess.run(['ps', '-p', str(pid), '-o', 'uid=', '-o', 'stat=', '-o', 'command='], capture_output=True, text=True)
+                  if result.returncode == 1 and not result.stdout.strip(): return False
+                  if result.returncode != 0: raise RuntimeError('Owned Kubo status query failed')
+                  uid, status, command = result.stdout.strip().split(None, 2)
+                  if status.startswith('Z'): return False
+                  if int(uid) != os.getuid() or command != binary + ' daemon --offline':
+                      raise RuntimeError('Owned Kubo process identity differs')
+                  return True
+              if alive():
+                  os.killpg(pid, signal.SIGTERM)
+                  deadline = time.monotonic() + 15
+                  while alive() and time.monotonic() < deadline: time.sleep(0.25)
+                  if alive():
+                      os.killpg(pid, signal.SIGKILL)
+                      forced = True
+                      deadline = time.monotonic() + 5
+                      while alive() and time.monotonic() < deadline: time.sleep(0.25)
+                      if alive(): raise RuntimeError('Owned build Kubo remains alive after bounded cleanup')
+              stopped = pid
+          for name in ('home', 'cargo-V3', 'cargo-V4', 'cargo-build-V3', 'cargo-build-V4', 'kubo-cache', 'model-kubo'):
+              path = root / name
+              if path.is_symlink(): raise RuntimeError('Owned cleanup root is a symlink')
+              if path.exists(): shutil.rmtree(path)
+          (root / 'inputs/receipts/process-cleanup.json').write_text(json.dumps({
+              'owned_kubo_pid': stopped, 'forced_kubo_stop': forced, 'remaining_pids': [], 'errors': [],
+              'builder_home_removed': True, 'fresh_cargo_targets_removed': True,
+              'build_kubo_state_removed': True}, indent=2) + '\n')
+          PYCODE
+      - name: seal a mode-preserving native handoff
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          python3 -I -S - <<'PYCODE'
+          import gzip, hashlib, json, os, shutil, stat, tarfile
+          from pathlib import Path
+          root = Path(os.environ['INPUT_ARTIFACT'])
+          output = Path(os.environ['OWNED_ROOT']) / 'package'
+          def sha(path):
+              value = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024**2), b''): value.update(chunk)
+              return value.hexdigest()
+          files = sorted(path for path in root.rglob('*') if path.is_file())
+          for path in [root, *root.rglob('*')]:
+              if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                  raise RuntimeError('Handoff contains a link or special file')
+          inventory = {path.relative_to(root).as_posix(): {'sha256': sha(path), 'size': path.stat().st_size,
+                       'mode': stat.S_IMODE(path.stat().st_mode)} for path in files}
+          (root / 'receipts/file-inventory.json').write_text(json.dumps(inventory, sort_keys=True) + '\n')
+          files.append(root / 'receipts/file-inventory.json')
+          (root / 'SHA256SUMS').write_text(''.join(sha(path) + '  ' + path.relative_to(root).as_posix() + '\n' for path in sorted(files)))
+          usage = shutil.disk_usage(output)
+          total = sum(path.stat().st_size for path in root.rglob('*') if path.is_file())
+          if (usage.free - total - 1024**3) * 100 < usage.total * 15:
+              raise RuntimeError('Native archive would breach the 15% disk reserve')
+          # Write directly to bounded parts; keep one archive copy on the runner.
+          class Parts:
+              def __init__(self): self.stream = None; self.size = 0; self.index = 0; self.records = []; self.digest = None
+              def write(self, data):
+                  offset = 0
+                  while offset < len(data):
+                      if self.stream is None:
+                          self.path = output / f'canary-union-mac.tar.gz.part{self.index:03d}'
+                          self.stream = self.path.open('xb'); self.digest = hashlib.sha256(); self.size = 0
+                      chunk = data[offset:offset + min(len(data) - offset, 2 * 1024**3 - self.size)]
+                      self.stream.write(chunk); self.digest.update(chunk); self.size += len(chunk); offset += len(chunk)
+                      if self.size == 2 * 1024**3: self.finish()
+                  return len(data)
+              def finish(self):
+                  if self.stream is not None:
+                      self.stream.close(); self.records.append({'name': self.path.name, 'size': self.size, 'sha256': self.digest.hexdigest()})
+                      self.stream = None; self.index += 1
+              def flush(self):
+                  if self.stream is not None: self.stream.flush()
+          writer = Parts()
+          def portable(member):
+              if not (member.isfile() or member.isdir()): raise RuntimeError('Archive member type refused')
+              member.uid = member.gid = 0; member.uname = member.gname = ''
+              return member
+          with gzip.GzipFile(fileobj=writer, mode='wb', compresslevel=1, mtime=0) as compressed:
+              with tarfile.open(fileobj=compressed, mode='w|', dereference=True) as archive:
+                  archive.add(root, arcname='canary-union-mac', filter=portable)
+          writer.finish()
+          class JoinedParts:
+              def __init__(self): self.paths = iter(writer.records); self.stream = None
+              def read(self, length):
+                  result = bytearray()
+                  while len(result) < length:
+                      if self.stream is None:
+                          try: self.stream = (output / next(self.paths)['name']).open('rb')
+                          except StopIteration: break
+                      chunk = self.stream.read(length - len(result))
+                      if chunk: result.extend(chunk)
+                      else: self.stream.close(); self.stream = None
+                  return bytes(result)
+          seen = set()
+          with tarfile.open(fileobj=JoinedParts(), mode='r|gz') as archive:
+              for member in archive:
+                  if member.name in seen or not (member.isdir() or member.isfile()):
+                      raise RuntimeError('Sealed archive member type or duplicate refused')
+                  seen.add(member.name)
+                  path = root.parent / member.name.replace('canary-union-mac', root.name, 1)
+                  if member.mode != stat.S_IMODE(path.stat().st_mode):
+                      raise RuntimeError('Sealed archive mode differs')
+                  if member.isfile():
+                      value = hashlib.sha256()
+                      with archive.extractfile(member) as stream:
+                          for chunk in iter(lambda: stream.read(1024**2), b''): value.update(chunk)
+                      if member.size != path.stat().st_size or value.hexdigest() != sha(path):
+                          raise RuntimeError('Sealed archive bytes differ')
+          expected = {'canary-union-mac', *('canary-union-mac/' + path.relative_to(root).as_posix() for path in root.rglob('*'))}
+          if seen != expected: raise RuntimeError('Sealed archive inventory differs')
+          (output / 'archive-parts.json').write_text(json.dumps({'schema': 'elastos.split-native-handoff/v1',
+              'archive': 'canary-union-mac.tar.gz', 'parts': writer.records,
+              'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
+              'restore': 'Concatenate numbered parts in order, verify every part hash, inspect regular archive members, then extract into a new protected directory.'}, indent=2) + '\n')
+          (output / 'SHA256SUMS').write_text(''.join(sha(path) + '  ' + path.name + '\n' for path in sorted(output.iterdir()) if path.is_file()))
+          PYCODE
+      - name: identify the native handoff artifact
+        id: artifact
+        run: |
+          echo "name=canary-union-mac-aarch64-darwin-${SOURCE_COMMIT}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: upload the unsigned native pair
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ env.OWNED_ROOT }}/package
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7

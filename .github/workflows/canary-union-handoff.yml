@@ -1,0 +1,146 @@
+# Key-free #89 package preparation. Operator signing and installed proof follow.
+name: Canary union handoff
+
+on:
+  push:
+    branches: [fix/89-canary-inputs]
+    paths:
+      - .github/workflows/canary-union-handoff.yml
+      - .github/workflows/canary-union-mac.yml
+      - .github/workflows/canary-union-seed.yml
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: PR230 normal merge commit on develop
+        required: true
+        type: string
+      source_tree:
+        description: Exact tree of that develop commit
+        required: true
+        type: string
+      source_ci_run:
+        description: Successful Runtime CI run for the merged PR230 tree
+        required: true
+        type: string
+      published_at:
+        description: Proposed model catalogue Unix timestamp in seconds
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: canary-union-handoff-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  admit:
+    name: admit merged union source once
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_commit: ${{ steps.admit.outputs.source_commit }}
+      source_tree: ${{ steps.admit.outputs.source_tree }}
+      source_ci_run: ${{ steps.admit.outputs.source_ci_run }}
+      published_at: ${{ steps.admit.outputs.published_at }}
+    steps:
+      - name: admit exact PR230 merge and successful union CI
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TREE: ${{ inputs.source_tree }}
+          SOURCE_CI_RUN: ${{ inputs.source_ci_run }}
+          PUBLISHED_AT: ${{ inputs.published_at }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == Elacity/elastos-runtime ]]
+          [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
+          python3 - <<'PY'
+          import json, os, pathlib, re, urllib.request
+          commit, tree, run_id, stamp = (os.environ[k] for k in
+              ('SOURCE_COMMIT', 'SOURCE_TREE', 'SOURCE_CI_RUN', 'PUBLISHED_AT'))
+          if not all(re.fullmatch(r'[0-9a-f]{40}', p) for p in (commit, tree)):
+              raise SystemExit('Exact commit and tree SHAs are required')
+          if not re.fullmatch(r'[1-9][0-9]*', run_id):
+              raise SystemExit('A numeric Runtime CI run is required')
+          if not re.fullmatch(r'[1-9][0-9]{0,9}', stamp):
+              raise SystemExit('Proposed catalogue time must use Unix seconds')
+          def api(path):
+              request = urllib.request.Request('https://api.github.com/repos/Elacity/elastos-runtime/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          if api('issues/89')['state'] != 'open':
+              raise SystemExit('#89 is closed; package preparation has ended')
+          pr = api('pulls/230')
+          if not pr['merged'] or pr['base']['ref'] != 'develop' or pr['merge_commit_sha'] != commit:
+              raise SystemExit('Source must be the completed PR230 merge into develop')
+          source = api('git/commits/' + commit)
+          if source['tree']['sha'] != tree or len(source['parents']) != 2:
+              raise SystemExit('Source must match the normal merge commit and exact tree')
+          head = pr['head']['sha']
+          if head not in [p['sha'] for p in source['parents']]:
+              raise SystemExit('Normal merge must retain the reviewed union head')
+          if api('git/commits/' + head)['tree']['sha'] != tree:
+              raise SystemExit('Merge tree changed from the reviewed union tree')
+          comparison = api('compare/' + commit + '...develop')
+          if comparison['status'] not in ('ahead', 'identical'):
+              raise SystemExit('Develop must contain the union merge commit')
+          run = api('actions/runs/' + run_id)
+          if (run['status'], run['conclusion']) != ('completed', 'success'):
+              raise SystemExit('Union Runtime CI must finish successfully')
+          if run['path'].split('@')[0] != '.github/workflows/ci.yml':
+              raise SystemExit('Admission requires the Runtime CI workflow')
+          if run['head_repository']['full_name'] != 'Elacity/elastos-runtime':
+              raise SystemExit('CI source repository differs')
+          if run['head_sha'] not in (head, commit):
+              raise SystemExit('CI must bind the exact union head or its develop merge')
+          if api('git/commits/' + run['head_sha'])['tree']['sha'] != tree:
+              raise SystemExit('Successful CI tree differs from the package source')
+          receipt = {'schema': 'elastos.canary-union-admission/v1', 'source_commit': commit,
+              'source_tree': tree, 'union_pr': 230, 'union_head': head,
+              'source_ci_run': int(run_id), 'ci_attempt': run['run_attempt'],
+              'workflow_commit': os.environ['GITHUB_SHA'], 'published_at': stamp,
+              'mac_versions': ['0.8.0-alpha.3', '0.8.0-alpha.4'],
+              'seed_version': '0.8.0-alpha.3',
+              'scope': 'key-free package inputs; operator owns signing and installation'}
+          pathlib.Path('union-admission.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key, value in [('source_commit', commit), ('source_tree', tree),
+                                 ('source_ci_run', run_id), ('published_at', stamp)]:
+                  out.write(key + '=' + value + '\n')
+          PY
+      - name: retain shared source admission
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: union-admission.json
+          if-no-files-found: error
+          retention-days: 7
+
+  mac:
+    name: Apple silicon V3 and V4
+    needs: admit
+    uses: ./.github/workflows/canary-union-mac.yml
+    with:
+      source_commit: ${{ needs.admit.outputs.source_commit }}
+      source_tree: ${{ needs.admit.outputs.source_tree }}
+      source_ci_run: ${{ needs.admit.outputs.source_ci_run }}
+      published_at: ${{ needs.admit.outputs.published_at }}
+      prepare_models: true
+
+  seed:
+    name: matching Linux seed package
+    needs: admit
+    uses: ./.github/workflows/canary-union-seed.yml
+    with:
+      source_commit: ${{ needs.admit.outputs.source_commit }}
+      source_tree: ${{ needs.admit.outputs.source_tree }}
+      source_ci_run: ${{ needs.admit.outputs.source_ci_run }}

@@ -1,0 +1,332 @@
+# Package the paired canary source for an operator-managed Linux seed.
+name: Canary union seed package
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      source_tree:
+        required: true
+        type: string
+      source_ci_run:
+        required: true
+        type: string
+    outputs:
+      artifact_name:
+        description: Sealed Linux Runtime, provider and exact helper-source package
+        value: ${{ jobs.seed.outputs.artifact_name }}
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_COMMIT: ${{ inputs.source_commit }}
+  SOURCE_TREE: ${{ inputs.source_tree }}
+  SOURCE_CI_RUN: ${{ inputs.source_ci_run }}
+  ELASTOS_RELEASE_VERSION: 0.8.0-alpha.3
+  HELPER_APPROVAL_COMMENT: '5969584669'
+  HELPER_APPROVAL_SHA256: 635aa0a1cb223111ab430beb8cfe888887767e90da56ce7c6fb6dd3a6eba3d04
+  CARGO_BUILD_JOBS: '4'
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_CONFIG_GLOBAL: /dev/null
+  GIT_CONFIG_SYSTEM: /dev/null
+
+jobs:
+  seed:
+    name: same-source Linux seed package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: check out the admitted source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: reviewed
+          fetch-depth: 1
+          persist-credentials: false
+      - name: read the shared source admission from this dispatch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/union-seed-admission
+      - name: admit source and resolve the approved helper root
+        working-directory: reviewed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_REPOSITORY" == Elacity/elastos-runtime ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_WORKFLOW_REF" == Elacity/elastos-runtime/.github/workflows/canary-union-handoff.yml@refs/heads/fix/89-canary-inputs ]]
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == true/github-hosted/Linux/X64 ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_CI_RUN" =~ ^[1-9][0-9]*$ ]]
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          python3 -I -S - <<'PY'
+          import hashlib, json, os, re, shutil, urllib.request
+          from pathlib import Path
+          repository = 'Elacity/elastos-runtime'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  raise ValueError('API redirect refused')
+          def api(path):
+              request = urllib.request.Request('https://api.github.com' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                  payload = response.read(2 * 1024**2 + 1)
+                  assert len(payload) <= 2 * 1024**2
+                  return json.loads(payload)
+          commit, tree = os.environ['SOURCE_COMMIT'], os.environ['SOURCE_TREE']
+          shared_path = Path(os.environ['RUNNER_TEMP']) / 'union-seed-admission/union-admission.json'
+          assert shared_path.is_file() and not shared_path.is_symlink() and shared_path.stat().st_size <= 16 * 1024
+          shared_bytes = shared_path.read_bytes()
+          shared = json.loads(shared_bytes)
+          assert shared['schema'] == 'elastos.canary-union-admission/v1'
+          assert shared['source_commit'] == commit and shared['source_tree'] == tree
+          assert shared['source_ci_run'] == int(os.environ['SOURCE_CI_RUN'])
+          assert shared['workflow_commit'] == os.environ['GITHUB_SHA'] and shared['union_pr'] == 230
+          assert shared['seed_version'] == os.environ['ELASTOS_RELEASE_VERSION']
+          assert shared['mac_versions'] == ['0.8.0-alpha.3', '0.8.0-alpha.4']
+          decision = api(f"/repos/{repository}/issues/comments/{os.environ['HELPER_APPROVAL_COMMENT']}")
+          assert decision['user']['login'] == 'andersalm'
+          assert hashlib.sha256(decision['body'].encode()).hexdigest() == os.environ['HELPER_APPROVAL_SHA256']
+          match = re.search(r'stable seed helper root is `([^`]+)`', decision['body'])
+          assert match is not None
+          root = Path(match[1])
+          assert re.fullmatch(r'/home/[a-z_][a-z0-9_-]{0,31}/\.local/share/elastos-canary/source', str(root))
+          assert not root.exists() and not any(path.is_symlink() for path in (root, *root.parents))
+          output = Path(os.environ['RUNNER_TEMP']) / 'union-seed-package'
+          domains = Path(os.environ['RUNNER_TEMP']) / 'union-seed-cargo'
+          assert not output.exists() and not domains.exists()
+          free = shutil.disk_usage(output.parent)
+          assert free.free * 100 > free.total * 15 and free.free > 20 * 1024**3
+          output.mkdir(mode=0o700)
+          (output / 'receipts').mkdir(mode=0o700)
+          domains.mkdir(mode=0o700)
+          paths = {}
+          for name in ('runtime-target', 'runtime-build', 'provider-target', 'provider-build'):
+              path = domains / name
+              path.mkdir(mode=0o700)
+              assert path.stat().st_mode & 0o777 == 0o700 and not list(path.iterdir())
+              paths[name] = str(path)
+          (output / 'receipts/admission.json').write_text(json.dumps({
+              'schema': 'elastos.canary-union-seed-admission/v1',
+              'source_commit': commit, 'source_tree': tree,
+              'source_ci': f"https://github.com/{repository}/actions/runs/{os.environ['SOURCE_CI_RUN']}",
+              'shared_source_admission': shared, 'shared_source_admission_sha256': hashlib.sha256(shared_bytes).hexdigest(),
+              'helper_root': str(root),
+              'helper_approval': decision['html_url'], 'helper_approval_sha256': os.environ['HELPER_APPROVAL_SHA256'],
+              'cargo_domains': paths, 'cargo_domains_initially_empty': True,
+              'operator_gate': 'Operator owns installation, signing and installed lifecycle acceptance.'}, indent=2) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write('SEED_HELPER_ROOT=' + str(root) + '\n')
+              environment.write('SEED_PACKAGE=' + str(output) + '\n')
+              for name, path in paths.items():
+                  environment.write('SEED_' + name.replace('-', '_').upper() + '=' + path + '\n')
+          PY
+          git archive --format=tar "$SOURCE_COMMIT" > "$RUNNER_TEMP/union-seed-source.tar"
+          { git rev-list --objects --no-object-names "$SOURCE_COMMIT^{tree}"; printf '%s\n' "$SOURCE_COMMIT"; } |
+            git pack-objects --stdout > "$RUNNER_TEMP/union-seed-source.pack"
+          gzip -n -c "$RUNNER_TEMP/union-seed-source.tar" > "$RUNNER_TEMP/union-seed-package/source.tar.gz"
+      - name: reconstruct exact helper source with a minimal shallow Git graph
+        run: |
+          set -euo pipefail
+          umask 077
+          sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$SEED_HELPER_ROOT"
+          tar -xf "$RUNNER_TEMP/union-seed-source.tar" -C "$SEED_HELPER_ROOT"
+          git -C "$SEED_HELPER_ROOT" init --quiet --template= --initial-branch=qualified-source
+          git -C "$SEED_HELPER_ROOT" unpack-objects < "$RUNNER_TEMP/union-seed-source.pack"
+          printf '%s\n' "$SOURCE_COMMIT" > "$SEED_HELPER_ROOT/.git/shallow"
+          git -C "$SEED_HELPER_ROOT" -c core.logAllRefUpdates=false update-ref refs/heads/qualified-source "$SOURCE_COMMIT"
+          git -C "$SEED_HELPER_ROOT" read-tree HEAD
+          git -C "$SEED_HELPER_ROOT" fsck --strict --no-reflogs
+          [[ "$(git -C "$SEED_HELPER_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git -C "$SEED_HELPER_ROOT" rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git -C "$SEED_HELPER_ROOT" status --porcelain=v1 --untracked-files=all)" ]]
+          [[ -z "$(git -C "$SEED_HELPER_ROOT" remote)" ]]
+          python3 -I -S - <<'PY'
+          import hashlib, json, os, subprocess, tarfile
+          from pathlib import Path
+          root, output = Path(os.environ['SEED_HELPER_ROOT']), Path(os.environ['SEED_PACKAGE'])
+          def git(*args):
+              return subprocess.check_output(['git', '-C', str(root), *args])
+          objects = git('cat-file', '--batch-all-objects', '--batch-check=%(objectname) %(objecttype)').decode().splitlines()
+          assert [line.split()[0] for line in objects if line.endswith(' commit')] == [os.environ['SOURCE_COMMIT']]
+          assert all(line.split()[1] in ('commit', 'tree', 'blob') for line in objects)
+          assert git('show', os.environ['SOURCE_COMMIT'] + ':scripts/install.sh') == (root / 'scripts/install.sh').read_bytes()
+          assert git('archive', '--format=tar', os.environ['SOURCE_COMMIT']) == (Path(os.environ['RUNNER_TEMP']) / 'union-seed-source.tar').read_bytes()
+          hashes = {}
+          with tarfile.open(Path(os.environ['RUNNER_TEMP']) / 'union-seed-source.tar') as archive:
+              for member in archive:
+                  if member.isfile():
+                      path = root / member.name
+                      expected = hashlib.sha256(archive.extractfile(member).read()).hexdigest()
+                      assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+                      hashes[member.name] = {'sha256': expected, 'mode': path.stat().st_mode & 0o777}
+          (output / 'receipts/source-files.json').write_text(json.dumps(hashes, sort_keys=True) + '\n')
+          for name in ('publish-release.sh', 'release-platform-input.py', 'release-signer.py',
+                       'components-release-integrity-check.py', 'model-package-handoff.py'):
+              assert (root / 'scripts' / name).is_file()
+          PY
+          tar -czf "$SEED_PACKAGE/source-git.tar.gz" -C "$SEED_HELPER_ROOT" .git
+      - name: install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+          targets: x86_64-unknown-linux-gnu
+      - name: build Runtime and IPFS provider in fresh Cargo domains
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$SEED_HELPER_ROOT/elastos"
+          CARGO_TARGET_DIR="$SEED_RUNTIME_TARGET" CARGO_BUILD_BUILD_DIR="$SEED_RUNTIME_BUILD" \
+            cargo build --locked --release --target x86_64-unknown-linux-gnu -p elastos-server --bin elastos
+          python3 -I -S -c 'import shutil; d=shutil.disk_usage("."); assert d.free*100>d.total*15'
+          CARGO_TARGET_DIR="$SEED_PROVIDER_TARGET" CARGO_BUILD_BUILD_DIR="$SEED_PROVIDER_BUILD" \
+            cargo build --locked --release --target x86_64-unknown-linux-gnu \
+            --manifest-path "$SEED_HELPER_ROOT/capsules/ipfs-provider/Cargo.toml"
+      - name: check signed-publication admission from the same source
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$SEED_HELPER_ROOT/elastos"
+          CARGO_TARGET_DIR="$SEED_RUNTIME_TARGET" CARGO_BUILD_BUILD_DIR="$SEED_RUNTIME_BUILD" \
+            cargo test --locked --release --target x86_64-unknown-linux-gnu -p elastos-server --lib release_publication::
+      - name: qualify source, binary ABI, version and installed provider overlay
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -S - <<'PY'
+          import hashlib, json, os, re, shutil, stat, subprocess
+          from pathlib import Path
+          root, output = Path(os.environ['SEED_HELPER_ROOT']), Path(os.environ['SEED_PACKAGE'])
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          def command(args, **options):
+              result = subprocess.run(args, capture_output=True, timeout=30, check=True, **options)
+              return result.stdout.decode(), result.stderr.decode()
+          hashes = json.loads((output / 'receipts/source-files.json').read_bytes())
+          for name, record in hashes.items():
+              path = root / name
+              assert path.is_file() and not path.is_symlink()
+              assert sha(path) == record['sha256'] and path.stat().st_mode & 0o777 == record['mode']
+          assert command(['git', '-C', str(root), 'rev-parse', 'HEAD'])[0].strip() == os.environ['SOURCE_COMMIT']
+          assert command(['git', '-C', str(root), 'rev-parse', 'HEAD^{tree}'])[0].strip() == os.environ['SOURCE_TREE']
+          assert command(['git', '-C', str(root), 'status', '--porcelain=v1', '--untracked-files=all'])[0] == ''
+          records = []
+          for name, domain in [('elastos', 'SEED_RUNTIME_TARGET'), ('ipfs-provider', 'SEED_PROVIDER_TARGET')]:
+              binary = Path(os.environ[domain]) / 'x86_64-unknown-linux-gnu/release' / name
+              assert stat.S_ISREG(binary.lstat().st_mode) and binary.stat().st_mode & 0o111
+              target = output / name
+              shutil.copyfile(binary, target)
+              target.chmod(0o700)
+              assert sha(target) == sha(binary)
+              header, _ = command(['readelf', '-h', str(target)])
+              assert 'Advanced Micro Devices X86-64' in header
+              linkage, _ = command(['ldd', str(target)])
+              assert 'not found' not in linkage
+              symbols, _ = command(['readelf', '--version-info', str(target)])
+              versions = sorted({tuple(map(int, item.split('.'))) for item in re.findall(r'GLIBC_([0-9]+\.[0-9]+)', symbols)})
+              assert versions and versions[-1] <= (2, 39)
+              dynamic, _ = command(['readelf', '-d', str(target)])
+              programs, _ = command(['readelf', '-l', str(target)])
+              records.append({'name': name, 'sha256': sha(target), 'size': target.stat().st_size,
+                  'mode': target.stat().st_mode & 0o777, 'source_commit': os.environ['SOURCE_COMMIT'],
+                  'source_tree': os.environ['SOURCE_TREE'], 'elf_header': header, 'ldd': linkage,
+                  'dynamic': dynamic, 'program_headers': programs, 'glibc_versions': versions})
+          isolated = output / 'qualification-home'
+          isolated.mkdir(mode=0o700)
+          environment = {'HOME': str(isolated), 'PATH': '/usr/bin:/bin', 'XDG_DATA_HOME': str(isolated / 'data')}
+          try:
+              version_out, version_err = command([str(output / 'elastos'), '--version'], env=environment)
+              assert version_out == 'elastos ' + os.environ['ELASTOS_RELEASE_VERSION'] + '\n' and version_err == ''
+              help_out, help_err = command([str(output / 'elastos'), 'publish-release', '--help'], env=environment)
+              assert help_err == ''
+              for option in ('--signed-publication', '--allow-signer-rotation', '--preflight-only', '--prepare-only'):
+                  assert option in help_out
+              assert str(root / 'elastos/crates/elastos-server').encode() in (output / 'elastos').read_bytes()
+          finally:
+              shutil.rmtree(isolated)
+          rustc, _ = command(['rustc', '-Vv'])
+          cargo, _ = command(['cargo', '--version'])
+          libc, _ = command(['getconf', 'GNU_LIBC_VERSION'])
+          assert rustc.startswith('rustc 1.91.0 ') and libc.strip() == 'glibc 2.39'
+          admission = json.loads((output / 'receipts/admission.json').read_bytes())
+          receipt = {'schema': 'elastos.canary-union-seed-build/v1',
+              'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
+              'source_ci_run': os.environ['SOURCE_CI_RUN'], 'workflow_commit': os.environ['GITHUB_SHA'],
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'helper_root': str(root), 'target': 'x86_64-unknown-linux-gnu',
+              'version': os.environ['ELASTOS_RELEASE_VERSION'], 'rustc': rustc, 'cargo': cargo, 'libc': libc,
+              'binaries': records, 'cargo_domains': admission['cargo_domains'], 'cargo_domains_initially_empty': True,
+              'source_archive_sha256': sha(output / 'source.tar.gz'),
+              'source_git_archive_sha256': sha(output / 'source-git.tar.gz'),
+              'source_git_restore': 'With umask 077, extract source.tar.gz and source-git.tar.gz into the approved helper root; verify HEAD, tree and clean status.',
+              'git_history': 'Selected shallow commit and its complete tree/blob graph; credential-free local repository.',
+              'source_files_unchanged': True, 'signed_publication_refused_cases': 'cargo release_publication:: passed',
+              'version_stdout': version_out, 'version_stderr': version_err, 'publish_help': help_out,
+              'qualification_home_removed': True, 'owned_processes': [], 'installed_lifecycle_accepted': False,
+              'operator_gate': 'Operator owns installation, signing and installed lifecycle acceptance.'}
+          (output / 'receipts/build.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          entry = json.loads((root / 'components.json').read_bytes())['external']['ipfs-provider']
+          provider = next(item for item in records if item['name'] == 'ipfs-provider')
+          assert entry['install_path'] == 'bin/ipfs-provider'
+          assert entry['provider_runtime']['role'] == 'provider'
+          assert entry['provider_runtime']['substrate'] == 'native'
+          assert entry['provider_runtime']['runtime_abi'] == 'elastos.provider-stdio/v1'
+          entry['platforms'] = {'linux-amd64': {'install_path': 'bin/ipfs-provider',
+              'checksum': 'sha256:' + provider['sha256'], 'size': provider['size']}}
+          (output / 'installed-component.json').write_text(json.dumps({
+              'name': 'ipfs-provider', 'entry': entry, 'source_commit': receipt['source_commit'],
+              'source_tree': receipt['source_tree'], 'runtime_source_commit': receipt['source_commit'],
+              'runtime_source_tree': receipt['source_tree'], 'management': 'operator-managed-local-overlay',
+              'build_receipt_sha256': sha(output / 'receipts/build.json'),
+              'operator_gate': 'Preserve the installed manifest; replace only its reviewed Linux IPFS pin.'}, indent=2) + '\n')
+          PY
+      - name: seal the package
+        id: package
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -S - <<'PY'
+          import hashlib, os, shutil, stat
+          from pathlib import Path
+          output = Path(os.environ['SEED_PACKAGE'])
+          free = shutil.disk_usage(output)
+          assert free.free * 100 > free.total * 15
+          files = sorted(path for path in output.rglob('*') if path.is_file())
+          for path in files:
+              assert stat.S_ISREG(path.lstat().st_mode) and not path.stat().st_mode & 0o077
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          (output / 'SHA256SUMS').write_text(''.join(sha(path) + '  ' + path.relative_to(output).as_posix() + '\n' for path in files))
+          PY
+          tar -czf "$RUNNER_TEMP/seed-publisher.tar.gz" -C "$SEED_PACKAGE" .
+          cd "$RUNNER_TEMP"
+          sha256sum seed-publisher.tar.gz > seed-publisher.tar.gz.sha256
+          printf 'artifact_name=union-seed-x86_64-linux-%s-%s\n' "$SOURCE_COMMIT" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: upload the sealed seed package
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/seed-publisher.tar.gz
+            ${{ runner.temp }}/seed-publisher.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
