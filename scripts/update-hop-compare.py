@@ -90,6 +90,15 @@ HEAD_CID blank. Atomic runtime ticket/node overrides select the local holder.
 Run performs both selectors, retains private split output and data, and checks
 all owned process groups and verified holder/consumer executable roots during
 cleanup. Self-tests prove the observer only; installed proof needs real-runtime.
+
+For an approved local Mac rehearsal, pass
+--local-rehearsal local-rehearsal:<40-character-source-commit>:<fixture-name>
+to build-ci-hop, generate-ci-hop, inspect and run. This selector requires the
+clean source of this harness, absent CI/GITHUB_ACTIONS authority and an empty
+artifact retrieval reference. Build and fixture receipts bind the same local
+scope and reference. Local results keep command details in private split logs;
+the safe result reports the failed step and exit code. The full install, Home,
+Carrier update and refusal journey uses the same frozen support gates as CI.
 """
 
 import argparse
@@ -703,7 +712,26 @@ def cli_admit_model_fixture(root, manifest):
              "model fixture catalogue closure differs")
 
 
-def cli_admit(config):
+def cli_local_rehearsal(reference):
+    match = re.fullmatch(r"local-rehearsal:([0-9a-f]{40}):([A-Za-z0-9][A-Za-z0-9_.-]{0,127})", reference)
+    need(match is not None, "local rehearsal requires an exact source commit and fixture name")
+    need(sys.platform == "darwin", "local rehearsal requires native Mac")
+    need(not os.environ.get("CI") and not os.environ.get("GITHUB_ACTIONS"),
+         "local rehearsal requires absent hosted CI authority")
+    need(not os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE"),
+         "local rehearsal requires an empty artifact retrieval reference")
+    need(os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "") in ("", "local-rehearsal"),
+         "local rehearsal proof scope differs")
+    repository = Path(__file__).resolve().parents[1]
+    need(not subprocess.check_output(["git", "status", "--porcelain"], cwd=repository, text=True).strip(),
+         "local rehearsal requires a clean admitted source")
+    source = {key: subprocess.check_output(["git", "rev-parse", ref], cwd=repository, text=True).strip()
+              for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
+    need(source["commit"] == match[1], "local rehearsal source commit differs from its selector")
+    return source
+
+
+def cli_admit(config, local_rehearsal=None):
     need(config["schema"] == "elastos.update-hop.fixture/v1", "unknown fixture schema")
     need(config["mode"] == CLI_MODE, "unknown fixture mode")
     root = Path(config["root"])
@@ -724,9 +752,17 @@ def cli_admit(config):
          and manifest["reference"] == reference, "fixture manifest identity differs")
     need(isinstance(manifest["approval"], str) and manifest["approval"].strip(), "fixture approval required")
     scope = manifest.get("proof_scope", "production-positive")
-    need(scope in ("production-positive", "ci-rehearsal") and
-         scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
-    refusals = CLI_REFUSALS if scope == "ci-rehearsal" else ()
+    if local_rehearsal is not None:
+        need(scope == "local-rehearsal" and reference == local_rehearsal,
+             "local rehearsal fixture scope or reference differs")
+        need(manifest["source"] == cli_local_rehearsal(local_rehearsal), "local rehearsal source tree differs")
+        need(all(manifest[name]["source"] == manifest["source"] for name in ("old", "new")),
+             "local compiled Runtime source differs")
+    else:
+        need(scope in ("production-positive", "ci-rehearsal") and
+             scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
+        need(not reference.startswith("local-rehearsal:"), "local fixture requires its explicit selector")
+    refusals = CLI_REFUSALS if scope in ("ci-rehearsal", "local-rehearsal") else ()
     need(manifest["proof_kind"] in ("real-runtime", "harness-self-test"), "unknown proof kind")
     need(os.environ.get("ELASTOS_CI_REQUIRE_REAL_RUNTIME") != "1" or manifest["proof_kind"] == "real-runtime", "hosted acceptance requires real-runtime fixture")
     need(sys.platform == "darwin" or manifest["proof_kind"] == "harness-self-test", "CLI installed proof requires native Mac")
@@ -789,6 +825,11 @@ def cli_admit(config):
     old = manifest["publications"]["old"]
     new = manifest["publications"].get("new", old)
     need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
+    if local_rehearsal is None and manifest.get("build"):
+        build = cli_json(cli_path(root, manifest["build"]))
+        build_reference = build.get("reference", "")
+        need(build.get("proof_scope") != "local-rehearsal" and isinstance(build_reference, str)
+             and not build_reference.startswith("local-rehearsal:"), "local build requires its explicit selector")
     if refusals:
         wrong_version = manifest["publications"]["wrong-version"]
         need(manifest["files"][wrong_version["binary"]]["sha256"] == manifest["files"][old["binary"]]["sha256"], "wrong-version must retain the baseline Runtime bytes")
@@ -797,6 +838,9 @@ def cli_admit(config):
         need(build["schema"] == "elastos.update-hop.build/v1" and build["status"] == "passed"
              and build["cleanup"]["passed"] and build["source"] == manifest["source"]
              and build["command"] == ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"], "compiled CI hop provenance differs")
+        need(build.get("proof_scope", "ci-rehearsal") == scope, "compiled hop proof scope differs")
+        if local_rehearsal is not None:
+            need(build.get("reference") == local_rehearsal, "compiled local hop reference differs")
         for name, publication in (("old", old), ("new", new)):
             need(build[name]["source"] == manifest[name]["source"] and build[name]["version"] == manifest[name]["version"]
                  and build[name]["sha256"] == manifest["files"][publication["binary"]]["sha256"], "compiled CI Runtime receipt differs")
@@ -841,9 +885,9 @@ def cli_admit(config):
             need(any(target == relative or target.startswith(relative + "/") for target in manifest["consumer"]["files"]), "preservation bytes missing")
     if "initial_home" in manifest:
         cli_admit_home_support(root, manifest)
-    need(scope != "ci-rehearsal" or manifest["proof_kind"] != "real-runtime" or "initial_home" in manifest,
+    need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "initial_home" in manifest,
          "native CI rehearsal requires the installed Home startup fixture")
-    need(scope != "ci-rehearsal" or manifest["proof_kind"] != "real-runtime" or "model_fixture" in manifest,
+    need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "model_fixture" in manifest,
          "native CI rehearsal requires the signed model catalogue fixture")
     disk = shutil.disk_usage(root)
     growth = 8 * sum(value["bytes"] for value in manifest["files"].values())
@@ -878,8 +922,8 @@ def cli_safe_error(error):
     return str(error)
 
 
-def cli_inspect(config):
-    manifest = cli_admit(config)
+def cli_inspect(config, local_rehearsal=None):
+    manifest = cli_admit(config, local_rehearsal)
     return {"mode": CLI_MODE, "status": "admitted", "proof_kind": manifest["proof_kind"],
             "proof_scope": manifest.get("proof_scope", "production-positive"),
             "manifest_sha256": config["immutable"]["sha256"], "source": manifest["source"],
@@ -1007,10 +1051,12 @@ def cli_prepare_ci_disk():
     return receipt
 
 
-def cli_build_hop(root, runtime):
+def cli_build_hop(root, runtime, local_rehearsal=None):
     """Compile N+1 through the existing build.rs version input; keep actual N."""
-    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
-         and sys.platform == "darwin", "disposable hop build requires native Mac CI")
+    local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
+    if local_source is None:
+        need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+             and sys.platform == "darwin", "disposable hop build requires native Mac CI")
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable build root required")
     need(runtime.is_file() and not runtime.is_symlink(), "built Runtime input is unavailable")
@@ -1018,7 +1064,7 @@ def cli_build_hop(root, runtime):
     need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
     need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(), "hop build requires a clean admitted source")
     root.mkdir(mode=0o700)
-    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+    source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
               for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
     old = root / "elastos-old"
     shutil.copyfile(runtime, old)
@@ -1028,6 +1074,8 @@ def cli_build_hop(root, runtime):
     processes = CliProcesses(root)
     command = ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"]
     receipt = {"schema": "elastos.update-hop.build/v1", "source": source, "command": command, "status": "failed"}
+    if local_rehearsal is not None:
+        receipt.update(proof_scope="local-rehearsal", reference=local_rehearsal)
     try:
         reply = processes.command([str(old), "--version"], cli_environment(root), root, "old-version", timeout=15)
         version = processes.text("old-version")
@@ -1053,6 +1101,8 @@ def cli_build_hop(root, runtime):
         need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
              and all(subprocess.check_output(["git", "rev-parse", ref], text=True).strip() == source[key]
                      for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))), "hop source changed during build")
+        if local_rehearsal is not None:
+            need(cli_local_rehearsal(local_rehearsal) == source, "local hop source changed during build")
         receipt["status"] = "passed"
     finally:
         receipt["cleanup"] = processes.cleanup()
@@ -1164,10 +1214,12 @@ def cli_admit_home_support(root, manifest):
              "initial Home support CID closure differs")
 
 
-def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
-    """Generate a disposable signed positive hop and refusal set in CI."""
-    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
-         and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
+def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, local_rehearsal=None):
+    """Generate a disposable signed positive hop and refusal set for its admitted scope."""
+    local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
+    if local_source is None:
+        need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+             and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
     component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
@@ -1183,12 +1235,12 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
     root.mkdir(mode=0o700)
     scratch = root / "generator"
     scratch.mkdir(mode=0o700)
-    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+    source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
               for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
     manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": CLI_MODE,
-                "proof_scope": "ci-rehearsal", "proof_kind": "real-runtime",
+                "proof_scope": "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal", "proof_kind": "real-runtime",
                 "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5972959202",
-                "reference": "ci-rehearsal:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
+                "reference": local_rehearsal if local_rehearsal is not None else "ci-rehearsal:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
                 "source": source, "channel": "canary", "platform": "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin",
                 "files": {}, "publications": {}, "holder": {"files": {}, "content": {}},
                 "selectors": {name: {"positive": positive, "refusals": list(CLI_REFUSALS)}
@@ -1246,7 +1298,8 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
                        "weights.gguf": b"GGUF synthetic fixture metadata only; no inference model.\n",
                        "LICENSE": b"Synthetic fixture bytes licensed under Apache-2.0.\n",
                        "LICENSE.base": b"Synthetic base fixture bytes licensed under Apache-2.0.\n",
-                       "PROVENANCE.md": b"Owned CI fixture bytes only. No downloaded weights or inference claim.\n"}
+                       "PROVENANCE.md": b"Owned local rehearsal fixture bytes only. No downloaded weights or inference claim.\n" if local_rehearsal is not None
+                                        else b"Owned CI fixture bytes only. No downloaded weights or inference claim.\n"}
         model_mapping = {name: add("model-fixture/" + name, raw) for name, raw in sorted(model_bytes.items())}
         for relative in model_mapping.values():
             content(relative, raw=True)
@@ -1310,6 +1363,13 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
         need(execute([str(root / next_relative), "--version"]).decode() == "elastos " + new_version + "\n", "next Runtime must be a real compiled N+1")
         build = cli_json(build_receipt)
         need(build["status"] == "passed" and build["cleanup"]["passed"] and build["source"] == source, "hop build receipt differs")
+        need(build.get("proof_scope", "ci-rehearsal") == manifest["proof_scope"], "hop build proof scope differs")
+        if local_rehearsal is not None:
+            need(build.get("reference") == local_rehearsal, "local hop build reference differs")
+        else:
+            build_reference = build.get("reference", "")
+            need(isinstance(build_reference, str) and not build_reference.startswith("local-rehearsal:"),
+                 "local build requires its explicit selector")
         for name, relative, version in (("old", runtime_relative, old_version), ("new", next_relative, new_version)):
             need(build[name]["sha256"] == manifest["files"][relative]["sha256"] and build[name]["version"] == version
                  and build[name]["source"] == source, "hop build Runtime binding differs")
@@ -1354,17 +1414,19 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
                 if path.is_file():
                     relative = str(path.relative_to(scratch / "ipfs-repo"))
                     manifest["holder"]["files"][CLI_DATA + "/ipfs-repo/" + relative] = add("repository/" + relative, path)
-        manifest["consumer"] = {"files": {"config/fixture.json": add("consumer/config.json", {"owner": "isolated CI refusal test"}),
+        manifest["consumer"] = {"files": {"config/fixture.json": add("consumer/config.json", {"owner": "isolated local rehearsal" if local_rehearsal is not None else "isolated CI refusal test"}),
                                            "state/sentinel": add("consumer/state", b"preserve user data"),
                                            "capsules/sentinel/data": add("consumer/support", b"preserve support")}}
         manifest["consumer"]["files"].update(home_mapping)
         manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(home_mapping)}
         manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]}
+        if local_rehearsal is not None:
+            need(cli_local_rehearsal(local_rehearsal) == source, "local hop source changed during generation")
         write(root / "manifest.json", manifest)
         config = {"schema": manifest["schema"], "mode": CLI_MODE, "root": str(root),
                   "immutable": {"reference": manifest["reference"], "manifest": "manifest.json", "sha256": digest(root / "manifest.json")}}
         write(root / "fixture.json", config)
-        return {"status": "generated", "proof_scope": "ci-rehearsal", "manifest_sha256": config["immutable"]["sha256"],
+        return {"status": "generated", "proof_scope": manifest["proof_scope"], "reference": manifest["reference"], "manifest_sha256": config["immutable"]["sha256"],
                 "source": source, "signer_did": manifest["signer_did"], "keys_removed": True}
     finally:
         shutil.rmtree(scratch)
@@ -1984,8 +2046,8 @@ def cli_initial_home(processes, manifest, home_path, evidence=None):
     return proof
 
 
-def cli_run(config, output):
-    manifest = cli_admit(config)
+def cli_run(config, output, local_rehearsal=None):
+    manifest = cli_admit(config, local_rehearsal)
     root = Path(config["root"])
     need(output == cli_path(root, "results"), "CLI run requires its fresh root/results directory")
     output.mkdir(mode=0o700, exist_ok=False)
@@ -2160,7 +2222,7 @@ def cli_run(config, output):
             result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
                 processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"])
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
-        if result["proof_scope"] in ("production-positive", "ci-rehearsal"):
+        if result["proof_scope"] in ("production-positive", "ci-rehearsal", "local-rehearsal"):
             phase("new")
             result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
             reply = command(consumer, ["update", "--check"], "m2-check")
@@ -2233,6 +2295,8 @@ def cli_run(config, output):
             need(all(entry["clean"] for entry in result["holder_output"]), "holder output contains an endpoint error")
             cli_inventory(root, manifest)
             need(digest(root / "manifest.json") == config["immutable"]["sha256"], "manifest changed during run")
+            if local_rehearsal is not None:
+                need(cli_local_rehearsal(local_rehearsal) == manifest["source"], "local hop source changed during run")
             need(lock_state(holder_data / "host-process.lock") != "held" and (port is None or not health(port)), "holder remains active after cleanup")
             if carrier_port is not None:
                 need(holder_config.read_text() == holder_config_text and holder_config.stat().st_mode & 0o777 == 0o600,
@@ -2256,10 +2320,14 @@ def main():
     parser.add_argument("--next-runtime", type=Path, help="compiled N+1 Runtime for CI hop generation")
     parser.add_argument("--build-receipt", type=Path, help="exact CI Runtime build receipt")
     parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
+    parser.add_argument("--local-rehearsal", metavar="REFERENCE", help="approved local-rehearsal:<source-commit>:<fixture-name> selector")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("terminated")))
     try:
+        if args.local_rehearsal is not None:
+            need(args.operation in ("build-ci-hop", "generate-ci-hop", "inspect", "run"),
+                 "local rehearsal applies only to CLI fixture build, generation, inspect and run")
         if args.operation == "prepare-ci-disk":
             need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.build_receipt, args.support_home)), "hosted capacity operation has fixed inputs")
             print(json.dumps(cli_prepare_ci_disk()))
@@ -2267,21 +2335,27 @@ def main():
         need(args.input is not None, "fixture input required")
         if args.operation == "build-ci-hop":
             need(args.runtime is not None and args.output is None and args.root is None, "hop build requires a Runtime input")
-            print(json.dumps(cli_build_hop(args.input, args.runtime)))
+            print(json.dumps(cli_build_hop(args.input, args.runtime, args.local_rehearsal)))
             return 0
         if args.operation == "generate-ci-hop":
             need(all(path is not None for path in (args.runtime, args.next_runtime, args.build_receipt, args.support_home)) and args.output is None and args.root is None,
                  "hop generation requires both Runtimes, build receipt and support-home inputs")
-            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home)))
+            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home, args.local_rehearsal)))
             return 0
         value = read(args.input)
+        if args.local_rehearsal is not None:
+            need(value.get("mode") == CLI_MODE, "local rehearsal applies only to CLI fixtures")
         if args.root is not None:
             need(value.get("mode") == CLI_MODE, "--root applies only to CLI fixtures")
             value["root"] = str(args.root)
         if args.operation == "run":
             need(args.output is not None and args.output.is_absolute(), "run requires a new absolute receipt directory")
-            return run(value, args.output)
-        print(json.dumps(inspect(value) if args.operation == "inspect" else compare(value), indent=2))
+            return cli_run(value, args.output, args.local_rehearsal) if args.local_rehearsal is not None else run(value, args.output)
+        if args.local_rehearsal is not None:
+            result = cli_inspect(value, args.local_rehearsal)
+        else:
+            result = inspect(value) if args.operation == "inspect" else compare(value)
+        print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError, TypeError, KeyError, StopIteration, subprocess.SubprocessError) as error:
         reason = cli_safe_error(error) if isinstance(locals().get("value"), dict) and value.get("mode") == CLI_MODE else str(error)
