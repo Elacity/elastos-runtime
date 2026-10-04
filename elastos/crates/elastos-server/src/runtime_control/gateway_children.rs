@@ -376,32 +376,72 @@ fn direct_child_anchor(record: &Record) -> anyhow::Result<bool> {
 }
 
 fn checked_signal(record: &Record, signal: i32) -> anyhow::Result<()> {
-    let exited = process_ownership::observe_exit(record.pid)
-        .context("observe managed runtime exit before group signal")?;
     // The caller already proved this direct child's birth and process group.
     // Its unreaped PID keeps that anchor when macOS hides its exited birth.
-    if exited.is_none() {
-        validate_record_birth(record)
-            .context("validate live managed runtime birth before signal")?;
-        anyhow::ensure!(
-            process_ownership::process_group(record.pid)
-                .context("read live managed runtime group before signal")?
-                == Some(record.pid),
-            "managed runtime group differs from its ownership record"
-        );
-    }
+    observe_anchored_exit(
+        || {
+            process_ownership::observe_exit(record.pid)
+                .context("observe managed runtime exit before group signal")
+        },
+        || {
+            validate_record_birth(record)
+                .context("validate live managed runtime birth before signal")?;
+            let group = process_ownership::process_group(record.pid)
+                .context("read live managed runtime group before signal")?;
+            let Some(group) = group else {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                    .context("live managed runtime group became unavailable before signal");
+            };
+            anyhow::ensure!(
+                group == record.pid,
+                "managed runtime group differs from its ownership record"
+            );
+            Ok(())
+        },
+    )?;
     process_ownership::signal_group(record.pid, signal).context("signal managed runtime group")?;
     Ok(())
 }
 
+/// The caller retains a direct child with a previously proved birth and group.
+fn observe_anchored_exit(
+    mut observe: impl FnMut() -> anyhow::Result<Option<ExitStatus>>,
+    inspect_live: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<Option<ExitStatus>> {
+    let exited = observe()?;
+    if exited.is_some() {
+        return Ok(exited);
+    }
+    if let Err(error) = inspect_live() {
+        #[cfg(any(target_os = "macos", test))]
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+        {
+            // Darwin can hide the birth/group after the preceding live event.
+            if let Some(exited) =
+                observe().context("reobserve retained managed runtime child after ESRCH")?
+            {
+                return Ok(Some(exited));
+            }
+        }
+        return Err(error);
+    }
+    Ok(None)
+}
+
 fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
     if entry.anchored {
-        let exited = process_ownership::observe_exit(entry.record.pid)
-            .context("observe managed runtime exit during settlement")?;
-        if exited.is_none() {
-            validate_record_birth(&entry.record)
-                .context("validate live managed runtime birth during settlement")?;
-        }
+        let exited = observe_anchored_exit(
+            || {
+                process_ownership::observe_exit(entry.record.pid)
+                    .context("observe managed runtime exit during settlement")
+            },
+            || {
+                validate_record_birth(&entry.record)
+                    .context("validate live managed runtime birth during settlement")
+            },
+        )?;
         if force && !entry.killed {
             checked_signal(&entry.record, libc::SIGKILL)
                 .context("send managed runtime group KILL during settlement")?;
@@ -504,7 +544,7 @@ pub(crate) async fn test_child(owner: &Owner, coords_path: &Path) -> (StartingCh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     fn fixture_owner(data: &Path, generation: &str) -> (GatewayRuntimeCoordsGuard, Owner) {
         let coords = RuntimeCoords {
@@ -546,6 +586,92 @@ mod tests {
         )
         .unwrap();
         assert!(Owner::read_for_generation(temp.path(), owner.pid, "gateway-fixture").is_err());
+    }
+
+    #[test]
+    fn retained_anchor_retries_only_lost_darwin_visibility_with_an_exited_child() {
+        let io_error = |errno| anyhow::Error::from(std::io::Error::from_raw_os_error(errno));
+        for case in [
+            "already exited",
+            "valid live child",
+            "birth vanished during exit",
+            "group vanished during exit",
+            "birth mismatch",
+            "group mismatch",
+            "permission denied",
+            "other lookup failure",
+            "lookup lost child ownership",
+            "still live after ESRCH",
+            "reaped after ESRCH",
+            "uncertain after ESRCH",
+            "initial child ownership lost",
+            "initial exit uncertain",
+            "initial ESRCH",
+        ] {
+            let status = ExitStatus::from_raw(15);
+            let before = match case {
+                "already exited" => Ok(Some(status)),
+                "initial child ownership lost" => Err(io_error(libc::ECHILD)),
+                "initial exit uncertain" => Err(io_error(libc::EPERM)),
+                "initial ESRCH" => Err(io_error(libc::ESRCH)),
+                _ => Ok(None),
+            };
+            let after = match case {
+                "still live after ESRCH" => Ok(None),
+                "reaped after ESRCH" => Err(io_error(libc::ECHILD)),
+                "uncertain after ESRCH" => Err(io_error(libc::EPERM)),
+                _ => Ok(Some(status)),
+            };
+            let inspection = match case {
+                "valid live child" => Ok(()),
+                "birth mismatch" => Err(anyhow::anyhow!("managed runtime birth differs")),
+                "group mismatch" => Err(anyhow::anyhow!("managed runtime group differs")),
+                "permission denied" => Err(io_error(libc::EPERM)),
+                "other lookup failure" => Err(io_error(libc::EACCES)),
+                "lookup lost child ownership" => Err(io_error(libc::ECHILD)),
+                _ => Err(io_error(libc::ESRCH)),
+            };
+            let mut observations = vec![after, before];
+            let mut observed = 0;
+            let mut inspected = false;
+            let result = observe_anchored_exit(
+                || {
+                    observed += 1;
+                    observations.pop().unwrap()
+                },
+                || {
+                    inspected = true;
+                    inspection.context("inspect retained live child")
+                },
+            );
+            match case {
+                "already exited" | "birth vanished during exit" | "group vanished during exit" => {
+                    assert_eq!(result.unwrap(), Some(status), "{case}");
+                }
+                "valid live child" => assert!(result.unwrap().is_none(), "{case}"),
+                _ => assert!(result.is_err(), "{case}"),
+            }
+            let retry = matches!(
+                case,
+                "birth vanished during exit"
+                    | "group vanished during exit"
+                    | "still live after ESRCH"
+                    | "reaped after ESRCH"
+                    | "uncertain after ESRCH"
+            );
+            assert_eq!(observed, if retry { 2 } else { 1 }, "{case}");
+            assert_eq!(
+                inspected,
+                !matches!(
+                    case,
+                    "already exited"
+                        | "initial child ownership lost"
+                        | "initial exit uncertain"
+                        | "initial ESRCH"
+                ),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
