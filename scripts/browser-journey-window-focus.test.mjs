@@ -21,6 +21,7 @@ const menuListener = guiSource.match(/  desktopContextMenu\?\.addEventListener\(
 // Use Home's actual menu, dispatch and focus functions. Only unrelated shell
 // services and fixture creation/close are substitutes; pointer hit testing is real.
 const program = `
+document.body.dataset.homeStatus = "ready";
 const shellState = { windows: new Map(), zIndexCounter: 10, currentSummary: {}, contextMenuTarget: { kind: "target", source: "taskbar", targetId: "browser" } };
 const desktopContextMenu = document.querySelector("#desktop-context-menu");
 const evidence = window.evidence = { actions: [], closes: [], contextClicks: [] };
@@ -81,7 +82,7 @@ test("real Home menu focuses captured Browser through overlap; launcher binds fo
       args: ["--disable-background-networking", "--disable-component-update", "--no-first-run"] });
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
     const errors = []; page.on("pageerror", error => errors.push(error.message));
-    const globals = { URL, URLSearchParams, Date, HOME_URL: `${origin}/apps/home/`,
+    const globals = { URL, URLSearchParams, Date, CHECK_BROWSER_CONTROLLED_JOURNEY: false, HOME_URL: `${origin}/apps/home/`,
       delay: ms => new Promise(resolve => setTimeout(resolve, ms)), assert: (value, message) => assert.ok(value, message) };
     for (const name of ["launchTokenFromRoute", "assertIsolatedLaunchRoute", "assertBrowserWindowIdentity", "captureBrowserWindowIdentity",
       "focusCapturedBrowserWindow", "clickBrowserWindowClose", "waitForBrowserWindowDetached"]) {

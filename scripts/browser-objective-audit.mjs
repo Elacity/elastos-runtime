@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import process from "node:process";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   sha256File,
@@ -317,7 +321,8 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
         "capsules/browser/browser/browser-input-surface.js",
         "capsules/browser/browser/browser-remote-display.js",
         "scripts/browser-display-mode-smoke.mjs",
-        "scripts/browser-entropy-check.mjs",
+        "scripts/browser-native-operator-config.mjs",
+        "scripts/browser-native-target-preflight.sh",
         "docs/BROWSER_CAPSULE.md",
         "scripts/browser-kasm-control-service.mjs",
       ],
@@ -359,7 +364,19 @@ function main() {
   const decisionReport = readRepo("scripts/browser-provider-decision-report.mjs");
   const decisionReportSmoke = readRepo("scripts/browser-provider-decision-report-smoke.sh");
   const runbook = readRepo("scripts/browser-provider-runbook.mjs");
-  const entropy = readRepo("scripts/browser-entropy-check.mjs");
+  const configFixture = fs.mkdtempSync(join(tmpdir(), "browser-objective-config-"));
+  let nativeMediaDefaultsOff = false;
+  try {
+    const config = JSON.parse(execFileSync(process.execPath, [
+      fileURLToPath(new URL("scripts/browser-native-operator-config.mjs", repoRoot)),
+      "--out-dir", configFixture, "--browser-program", "/fixture/browser",
+      "--supervisor-bin", "/fixture/supervisor", "--proxy-engine-bin", "/fixture/proxy",
+    ], { encoding: "utf8" }));
+    const adapter = JSON.parse(fs.readFileSync(join(configFixture, "browser-engine-adapter.json"), "utf8"));
+    const supervisor = JSON.parse(adapter.adapters[0].supervisor.env.ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG);
+    nativeMediaDefaultsOff = config.native_audio_declared === false && config.native_video_declared === false &&
+      supervisor.display_capabilities.audio === false && supervisor.display_capabilities.video === false;
+  } finally { fs.rmSync(configFixture, { recursive: true, force: true }); }
   const browserUi = [
     readRepo("capsules/browser/browser/browser.js"),
     readRepo("capsules/browser/browser/browser-input-surface.js"),
@@ -473,13 +490,12 @@ function main() {
         nativeConfig.includes("nativeVideo: false") &&
         nativeConfig.includes("--native-audio") &&
         nativeConfig.includes("--native-video") &&
-        entropy.includes("Native Browser namespace/proxy smokes must not pretend fake browser processes prove native audio or video"),
+        nativeMediaDefaultsOff,
       [
         "elastos/tools/browser-engine-supervisor/src/main.rs",
         "scripts/browser-native-operator-config.mjs",
-        "scripts/browser-entropy-check.mjs",
       ],
-      "Default native media off and enforce this in entropy checks.",
+      "Keep generated native media declarations off until the operator provides capabilities; product media needs accepted target evidence.",
     ),
     criterion(
       "native_media_preflight_gate",
@@ -557,7 +573,7 @@ function main() {
     objective: {
       source: "thread goal",
       restatement:
-        "Determine the best Browser architecture path, implement fail-closed provider gates, enable/prove audio through the chosen product provider, and verify with entropy/alignment/manual UX evidence.",
+        "Determine the best Browser architecture path, implement fail-closed provider gates, enable/prove audio through the chosen product provider, and verify with behaviour tests, target artifacts, and manual UX evidence.",
     },
     prompt_to_artifact_checklist: promptToArtifactChecklist({
       criteria,

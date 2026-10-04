@@ -3,7 +3,7 @@
  * This file lives at capsules/_shared/elastos-ui.css and is VENDORED into each
  * participating capsule's browser/ dir by `just vendor-ui` (no gateway route,
  * no shared runtime surface — capsules stay self-contained). Edit THIS file,
- * then run `just vendor-ui`; `just alignment-check` fails on drift.
+ * then run `just vendor-ui`; `scripts/vendor-ui-tokens.sh --check` fails on drift.
  *
  * Contents: Inter (OFL, latin variable subset), palette, type scale, radii,
  * hairlines, blur/elevation steps, motion tokens, and minimal control

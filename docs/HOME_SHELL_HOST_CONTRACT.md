@@ -317,7 +317,7 @@ node scripts/home-shell-system-switch-smoke.mjs
 node scripts/home-shell-switchback-recovery-smoke.mjs
 node scripts/home-cli-browser-smoke.mjs
 node scripts/wallet-connector-transaction-smoke.mjs
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 node scripts/home-shell-objective-audit.mjs
 (cd elastos && cargo test -p elastos-server test_home_launch -- --nocapture)
 ```
