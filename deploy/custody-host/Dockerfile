@@ -114,7 +114,13 @@ case "${TARGETARCH}" in
 esac
 kubo_tarball="kubo_${KUBO_VERSION}_linux-${TARGETARCH}.tar.gz"
 kubo_url="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${kubo_tarball}"
-curl -fsSL -o "/tmp/${kubo_tarball}" "${kubo_url}"
+# The same release tarball is mirrored on GitHub; the original pin below
+# verifies either route before extraction. A bad checksum fails this RUN.
+if ! curl -fsSL --connect-timeout 30 --max-time 300 -o "/tmp/${kubo_tarball}" "${kubo_url}"; then
+    rm -f "/tmp/${kubo_tarball}"
+    curl -fsSL --connect-timeout 30 --max-time 300 -o "/tmp/${kubo_tarball}" \
+        "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${kubo_tarball}"
+fi
 echo "${kubo_sha256}  /tmp/${kubo_tarball}" | sha256sum -c -
 tar -xzf "/tmp/${kubo_tarball}" -C /tmp kubo/ipfs
 mv /tmp/kubo/ipfs /tmp/kubo-binary

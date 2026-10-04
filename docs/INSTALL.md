@@ -178,6 +178,26 @@ elastos update --no-p2p --gateway GATEWAY_URL
 
 Replace `CID` and `GATEWAY_URL` with the source values.
 
+## Compare and change the release signer
+
+Compare an announced release DID with the staged root DID in the repository
+[README](../README.md#install-from-the-publisher) before installing or changing
+a source. The source owner can re-trust an existing source explicitly:
+
+```sh
+elastos source add --name EXISTING_SOURCE --publisher NEW_DID
+```
+
+Runtime asks for the complete new DID. Entering another value cancels the
+change. This step keeps the source's channel, install path, Carrier ticket and
+gateways. After confirmation, Runtime accepts release signatures from the new
+DID and refuses signatures from the former DID.
+
+An existing Home that keeps its old source pin refuses a release signed by the
+new maintainer with a signer-mismatch error. That Home continues to trust the
+old key and remains exposed if a copy of that key exists. The owner must compare
+the public DID and complete the explicit re-trust step before its next update.
+
 ## Installed files
 
 When XDG variables are unset, the default paths are:

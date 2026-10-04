@@ -14,9 +14,12 @@ automatically a stable end-user command.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
-- `publish-release.sh` is the low-level release publisher. Use
-  `elastos publish-release --version <version> --dry-run` for read-only planning;
-  the low-level script rejects that flag before side effects.
+- `publish-release.sh` prepares unsigned native release inputs. Use
+  `elastos publish-release --version <version> --dry-run` for read-only planning.
+  Runtime imports frozen signed output through `--signed-publication`.
+- `release-signer.py` is the separately installed custodian tool. The operator
+  pins its interpreter, OpenSSL and source, and owns all release-key access.
+  The existing release-input CI suite runs its refused-case tests.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
   manifest exports, native/guest target selection and the staged artifact gate
   without signing or uploading. CI and `just verify` run these checks.
@@ -39,6 +42,138 @@ tests, and the separate Browser local-exit checks. `just verify-release` adds
 browser-based UI source checks, local Carrier setup and Home front-door proofs.
 Publishing trust and signer verification are separate release gates.
 
+## Local pre-push gate
+
+Before each push, fetch and merge current `origin/develop` into the task branch,
+commit the candidate, then run `just ci-local-prepush`. Resolve the source and
+base before Git resolves the push object. The hook fetches develop and verifies
+its ancestry; it keeps the checked HEAD fixed. A moving base, a dirty source,
+hidden index flags, or a pushed object from another worktree stops the push.
+
+The gate runs the product-data checks, `cargo fmt --all -- --check` for Runtime,
+chain-provider and checked workspaces, then `cargo check --workspace
+--all-targets` for Runtime, touched standalone workspaces and related consumers.
+A Runtime Rust source or input change triggers metadata discovery of tracked
+standalone workspaces. Declared path dependencies identify direct and transitive
+consumers, including dependencies through other Runtime members. These consumers
+receive workspace/all-targets checks. Clippy and unit tests cover directly
+touched crates and Runtime consumers of changed product data or scripts;
+dependent consumers retain their own behavior acceptance gates. Shared Runtime
+WIT, configuration, manifest and lockfile inputs select every Runtime package
+for Clippy and unit tests. Literal repository file and specific directory
+references identify Runtime consumers of embedded data, component and model
+catalogues, capsule manifests and Browser assets. Runtime script filename
+literals also resolve chained joins beneath the repository scripts directory.
+References inside consumed scripts and capsule tools cover their local helper
+dependencies. Each uncertain product
+input widens selection to all Runtime packages; generic unreferenced CI,
+Python and Node tools retain their own checks. Capsule template manifests are input data;
+the gate checks their Runtime consumers and keeps them outside product crate
+discovery.
+The gate uses Cargo metadata to select touched crates for Clippy with warnings
+denied and their enabled lib/bin unit targets. It verifies conventional Rust module declarations
+and available test names before selecting exact test names for a module. Module names and
+unit-test names can differ, so uncertain mappings widen to a full unit target
+or touched crate. Test listing and a positive passed-test count protect against
+zero-test success. Broad selection keeps that refusal for a target with zero
+enabled tests; source test attributes alone do not prove host coverage.
+Selected server process tests first build their three
+candidate provider inputs and set their test paths under the same lease.
+Workspace manifests, lockfiles and Rust configuration widen the Rust scope.
+Unrelated standalone workspaces keep their own checks. Documentation changes
+retain the Runtime check and skip standalone dependency discovery. Capsule
+suites and Linux/Browser journeys keep their own gates. A
+removed package needs an explicit acceptance plan. Run the small decision
+fixtures with `just test-ci-local-prepush`; the source CI gate also runs them.
+Each fixture clears Git's repository-local environment variables before it
+creates its owned repository. A disposable sentinel regression verifies that
+running a fixture from a hook preserves the caller's HEAD, tree, index and status.
+The gate retains hook Git variables for its own repository checks and clears
+Git's full repository-local variable list from product child environments.
+Ambient `ELASTOS_TEST_*_BIN` paths carry no candidate receipt, so the gate clears
+them before checks. Its provider preparation supplies candidate test paths;
+other explicit binary inputs need a source receipt and the owning test contract.
+
+Each worktree and each local heavy operator shares the persistent lock file
+`local-ai-heavy-build.lock` in `git rev-parse --path-format=absolute
+--git-common-dir`. Acquire its exclusive `fcntl.flock` lease before a heavy
+command and keep the file after releasing the lease. A busy lease stops the
+gate. It runs Cargo commands in sequence and settles its child command on
+interruption. The gate owns the lease descriptor and closes it after settling
+the command group; child commands receive no lease descriptor. Operators keep
+heavy tools in that group rather than detaching them. Continue light source work and reviews while another operator
+owns the lease. The default shared intermediate directory is `target-build`
+beside the common Git directory. An explicit `CARGO_BUILD_BUILD_DIR` selects
+another shared directory; each workspace keeps its own final target directory.
+The gate sets both Cargo target-directory environment variables to that
+workspace's `target` directory. Before compile checks, it cleans the complete
+resolved repository path-package scope with `cargo clean -p`, retaining the
+shared directory. The caller-selected directory is the repository's rebuildable
+intermediate cache. Each clean removes all compiled artifacts with the selected
+repository package or crate names in that profile, including matches from other
+resolved graphs. Artifacts with distinct package names and distinct normalized
+crate names, plus registry source/download caches, stay preserved. Prepared
+process providers receive the same package-scoped clean in the release profile
+before their builds. An external dependency package-name collision, or a
+normalized crate-name collision with its library or proc-macro target, stops
+the gate before cleaning that scope. This check uses the current resolved
+graph. Declared foreign tests, examples, benches and ordinary binaries are
+outside the dependency compile graph and its target-name collision check.
+
+Full metadata resolution keeps committed workspace locks fixed with `--locked`.
+Ignored generated locks follow normal online Cargo resolution and can update
+when their manifests change. An untracked, unignored workspace lock path stops
+the gate before resolution creates source dirt. The gate logs each resolved
+lock's SHA-256 with its candidate receipt. Cold caches can fetch dependencies
+during metadata resolution; the following package clean uses `--locked --offline`.
+The source and shared-build volumes each need at least 15% free space for this gate.
+
+If the cause of your last failed Mac install, update, or Home startup step is
+unclear, reproduce that exact step locally before the next push. Hold the same
+lease, use the task's approved isolated fixture, and record the candidate,
+command and result in its issue. Repair the failure, then repeat that step.
+The hook prints this operator requirement; it does not claim an installed
+journey passed. Review a large diff with Opus before starting long Mac CI. At
+the first CI failure caused by your candidate, cancel its remaining jobs. If CI is the only
+remaining work, end the turn and check again in 15 minutes.
+
+Activate the committed hook in each owned worktree after reviewing it. The
+following recipe requires worktree configuration and preserves existing hooks.
+When it stops for an existing hook configuration, keep that configuration and
+agree how its owner will chain both hooks before changing it. The recipe changes
+only the current worktree's hook path:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+
+def git(*args):
+    return subprocess.check_output(["git", *args], text=True).strip()
+
+root = Path(git("rev-parse", "--show-toplevel"))
+desired = root / ".githooks"
+enabled = subprocess.run(["git", "config", "--bool", "--get", "extensions.worktreeConfig"],
+                         text=True, stdout=subprocess.PIPE)
+if enabled.stdout.strip() != "true":
+    raise SystemExit("Enable worktree configuration through the repository owner first.")
+configured = subprocess.run(["git", "config", "--get", "core.hooksPath"],
+                            text=True, stdout=subprocess.PIPE)
+if configured.returncode == 0:
+    existing = Path(configured.stdout.strip()).expanduser()
+    existing = existing if existing.is_absolute() else root / existing
+    if existing.resolve() != desired.resolve():
+        raise SystemExit("Preserve the existing hook configuration and agree hook chaining first.")
+else:
+    default = Path(git("rev-parse", "--path-format=absolute", "--git-path", "hooks"))
+    if default.exists() and any(not p.name.endswith(".sample") for p in default.iterdir()):
+        raise SystemExit("Preserve the existing hooks and agree hook chaining first.")
+if not (desired / "pre-push").is_file():
+    raise SystemExit("The reviewed committed pre-push hook is required.")
+subprocess.run(["git", "config", "--worktree", "core.hooksPath", str(desired)], check=True)
+PY
+```
+
 ## Native platform inputs
 
 Run the preparation worker from one reviewed, clean checkout on each native
@@ -46,7 +181,7 @@ builder. It supports Linux x86_64, Linux ARM64 and macOS Apple silicon. Choose
 an absent output directory outside the checkout:
 
 ```sh
-scripts/prepare-release-platform.sh --version 0.7.1 --output /path/to/new-platform-input
+scripts/prepare-release-platform.sh --version VERSION --output /path/to/new-platform-input
 python3 scripts/release-platform-input.py verify /path/to/new-platform-input
 ```
 
@@ -77,6 +212,26 @@ Publisher import, signing and promotion follow this preparation boundary and
 remain separate release work. These commands perform local file operations;
 the builds can fetch Cargo dependencies. Keep their output through candidate
 review, then remove it after adoption or abandonment.
+
+For a staged update that keeps its support inventory fixed, prepare the next
+Runtime with the first version's verified native input:
+
+```sh
+scripts/prepare-release-platform.sh --version NEXT_VERSION \
+  --reuse-support /path/to/first-platform-input --output /path/to/next-platform-input
+python3 scripts/release-platform-input.py verify /path/to/next-platform-input
+```
+
+This path builds only Runtime. It copies the exact component manifest, provider,
+capsule and catalogue files from the first input. Both inputs use the same
+platform and component template. The next receipt binds its Runtime source and
+version, and `support_origin` binds the first receipt stored as
+`support-input.json`. Use an original native input as the support source; a
+receipt that already reuses support is refused. Keep both receipts with the
+staging handoff so the operator can verify the support's original qualification.
+Use the same installer source blob and public bootstrap stamps for both signed
+sets to keep their installer bytes fixed. Signing and publication still follow
+the separate operator procedure below.
 
 ## Public-install proof
 
@@ -145,9 +300,10 @@ Common branch gates include:
 
 `public-copy-entropy-check.mjs` checks selected public manifests, static HTML,
 accessibility labels, and Home CLI command copy for Home, People, Spaces,
-Services, and System. `check-wci-alignment.sh` owns canonical architecture terms
-and retired product terms. Both run directly; this checkout has no separate
-`terminology-lint` recipe.
+Services, and System. `node scripts/check-product-data.mjs` validates capsule
+authority and interface metadata, setup profiles, release asset metadata,
+model catalog bindings, and install icons. Behaviour tests prove Runtime
+authority and UI journeys.
 
 ## Browser capacity proof
 
@@ -220,3 +376,96 @@ for the explicit simulation boundary and the operator flow it supports.
 - Keep installed mode explicit where a command supports both source and
   installed paths.
 - Keep host-specific secrets and private maintenance commands outside the repo.
+
+## Signing and publication ownership
+
+Builders prepare inert inputs. The custodian signs their approved hashes. The
+publication host imports that frozen output and announces it through Carrier.
+Each host has a separate account and role; the publication host receives the
+public DID and signed files.
+
+The key-free builder checks that the prepared Runtime's `--version` prints
+exactly `elastos VERSION` on stdout with empty stderr, and records its hash.
+Candidate executables run in that builder account; the custodian receives
+inert files. Pin the publication Runtime and provider paths and hashes, and
+retain the reviewed source checkout that supplies the Runtime's compiled-in
+helper paths. Use isolated builder and publication accounts with approved
+state; unsigned preparation also imports files through its selected provider.
+
+For a canary on Apple silicon, the builder can prepare one qualified native
+input. Run this from the reviewed source checkout, with an absent output
+directory outside it:
+
+```sh
+ELASTOS_PUBLISHER_GATEWAY=https://staging.example.invalid \
+ELASTOS_PUBLISHER_NODE_ID=HOLDER_NODE_ID \
+ELASTOS_SOURCE_CONNECT_TICKET=HOLDER_TICKET \
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --platform-input aarch64-darwin=/path/to/native-input \
+  --preview-platform aarch64-darwin --prepare-only /path/to/unsigned-input \
+  --publisher-did DID --ipfs-provider-bin /path/to/qualified-ipfs-provider
+```
+
+Select the staging HTTPS origin and public holder node/ticket before preparation;
+the same installer stamps remain fixed across the two staged versions.
+
+The resulting `signing-input.json` binds the source commit/tree, artifact
+hashes, sizes and CIDs, release data and public installer stamps. The operator
+records its SHA-256 in a protected policy outside the input directory. That
+policy also pins the repository, exact source `commit` and `tree`, version,
+channel, public DID, file/total quotas and the trusted Python, OpenSSL and
+signer tool paths and SHA-256 hashes. For `canary`, the policy pins the current
+remote `develop` head in `develop_oid`; the source commit must be that head or
+its ancestor. For `stable` and `jetson-test`, the policy pins `tag` as `vVERSION`
+and `tag_oid` as the remote tag object; the tagged source commit must belong to
+`main`. The signer selects these fixed repository branches from the channel.
+
+Before approving a canary policy, the operator verifies the exact candidate
+commit/tree against its merged pull request on GitHub and the successful
+required checks for that commit. The installed signer also comes from a
+reviewed commit merged into `develop` with successful required checks. The
+operator verifies its source commit/tree and installed file hash, and records
+the canonical GitHub pull request and check links in the owning issue. The
+protected policy approval carries this review and CI acceptance; the signer's
+GitHub source checks prove commit/tree identity and branch membership. Anders
+approves each canary signing and publication. The operator alone
+sets the protected Ed25519 PEM key path. Use the signer from its installed,
+reviewed path, with a clean environment and its pinned Python:
+
+```sh
+env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+  --policy /path/to/operator-policy.json --input-root /path/to/unsigned-input \
+  --output-root /path/to/new-signed-set
+```
+
+The tool verifies the pinned remote `develop` head and candidate ancestry for
+canary, or the approved remote version tag and `main` ancestry for the other
+channels. A moved `develop` head requires a fresh operator policy approval.
+The tool reads candidate files as data and asks the operator to confirm the
+complete public signer DID before signing. It fetches the installer template
+from that approved tree. Its frozen installer keeps `HEAD_CID` empty to avoid
+a hash cycle; the signed head binds the final
+release CID and installer hash. Carrier holder identity and ticket remain
+public transport inputs, separate from the signer identity.
+
+On the publication host, inspect the frozen set before committing it:
+
+```sh
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID --dry-run
+/path/to/reviewed-elastos publish-release --version VERSION --channel canary \
+  --signed-publication /path/to/new-signed-set --publisher-did DID \
+  --ipfs-provider-bin /path/to/qualified-ipfs-provider
+```
+
+A saved pin change requires `--allow-signer-rotation` and confirmation of the
+complete public DID. Include the flag in both the dry-run and import commands
+when the saved pin changes. Runtime verifies signatures, exact artifact hashes and
+imported CIDs, promotes the public pin and files before the head, and restores
+the prior set if promotion fails. A complete rollback removes the backup links
+and commits the original signed head again, so cached HTTP reads can admit the
+restored set. A restoration, cleanup or final-head failure reports incomplete
+recovery and retains the attempt directory for operator inspection. A committed
+set can be retried to finish its ledger and Carrier announcement. The HTTP
+gateway serves each release file when the saved public pin and complete signed
+set agree; `install.sh` stays byte-identical across gateway hosts.

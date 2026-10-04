@@ -4,6 +4,19 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Fixed
+
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output, and unexpected version
+  output preserve the previous installation.
+
+### Added
+
+- An internal offline update foundation stages and verifies release files with
+  unchanged support assets, an installation lock and journal, and restoration
+  after failed or interrupted activation. The default CLI update flow is preserved.
+  Home restart ownership and integration remain a follow-up.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for
