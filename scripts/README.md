@@ -62,8 +62,10 @@ dependent consumers retain their own behavior acceptance gates. Shared Runtime
 WIT, configuration, manifest and lockfile inputs select every Runtime package
 for Clippy and unit tests. Literal repository file and specific directory
 references identify Runtime consumers of embedded data, component and model
-catalogues, capsule manifests and Browser assets. References inside consumed
-scripts also cover their local script dependencies. Each uncertain product
+catalogues, capsule manifests and Browser assets. Runtime script filename
+literals also resolve chained joins beneath the repository scripts directory.
+References inside consumed scripts and capsule tools cover their local helper
+dependencies. Each uncertain product
 input widens selection to all Runtime packages; generic unreferenced CI,
 Python and Node tools retain their own checks. Capsule template manifests are input data;
 the gate checks their Runtime consumers and keeps them outside product crate

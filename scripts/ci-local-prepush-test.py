@@ -429,6 +429,37 @@ class PrepushTests(unittest.TestCase):
         self.commit()
         self.assert_server_input_units()
 
+    def test_runtime_chained_join_script_name_selects_runtime_units(self):
+        script = "scripts/setup-source-home.sh"
+        self.external_baseline('fn read() { let script = fs::read_to_string(\n'
+                               'Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")\n'
+                               '.join("scripts").join("setup-source-home.sh")).unwrap(); }\n',
+                               {script: '# input\n'})
+        self.write(script, '# changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_rust_lifetimes_and_character_quotes_preserve_path_literals(self):
+        script = "scripts/runtime-owned.sh"
+        self.external_baseline("fn read<'a>(source: &'a str) { let delimiter = '\"';\n"
+                               'let script = Path::new(env!("CARGO_MANIFEST_DIR"))\n'
+                               '.join("../../../scripts/runtime-owned.sh"); fs::read_to_string(script).unwrap(); }\n',
+                               {script: '# input\n'})
+        self.write(script, '# changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_capsule_tools_helper_dependencies_select_runtime_units(self):
+        tool = "capsules/tools/runtime-helper.sh"
+        helper = "capsules/tools/input-helper.py"
+        self.external_baseline('fn launch() { Command::new("bash")\n'
+                               '.arg(repo.join("capsules/tools/runtime-helper.sh")).spawn(); }\n',
+                               {tool: 'helper="$(dirname "${BASH_SOURCE[0]}")/input-helper.py"\npython3 "$helper"\n',
+                                helper: '# input\n'})
+        self.write(helper, '# changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
     def test_deleted_transitive_runtime_script_selects_runtime_units(self):
         wrapper = "scripts/browser-vm-remote-vz-launcher.integration.mjs"
         launcher = "scripts/browser-vm-remote-vz-launcher.mjs"

@@ -144,7 +144,16 @@ def metadata(root, manifest, lease):
 
 def referenced_inputs(root, source, folder, files, directories):
     text = source.read_text()
-    literals = re.findall(r'''["']([^"'\r\n]+)["']''', text)
+    quoted = r'"((?:\\.|[^"\\])*)"'
+    if source.suffix == ".rs":
+        # Lifetimes are identifiers; character tokens can contain a quote.
+        # Consume chars separately so only double-quoted strings supply paths.
+        character = r"'(?:\\.|[^'\\\r\n])'"
+        literals = [match.group(1) for match in re.finditer(character + "|" + quoted, text)
+                    if match.group(1) is not None]
+    else:
+        single = r"'((?:\\.|[^'\\])*)'"
+        literals = [double or single for double, single in re.findall(quoted + "|" + single, text)]
     literals += re.findall(r"\bscripts/[\w./-]+", text)
     if source.suffix == ".sh":
         # Shell helpers often join a computed script directory with a literal
@@ -159,6 +168,10 @@ def referenced_inputs(root, source, folder, files, directories):
             literal = literal.lstrip("/")  # concat!(env!("CARGO_MANIFEST_DIR"), "/../../../...")
         if Path(literal).is_absolute() or "$" in literal or "{" in literal:
             continue
+        if source.suffix == ".rs" and "/" not in literal and Path(literal).suffix in {".sh", ".py", ".mjs", ".js"}:
+            # Chained joins can split the repository scripts directory from
+            # its filename. Match that literal name, rather than every script.
+            found.update(path for path in files if path.name == literal and path.is_relative_to(root / "scripts"))
         for base in (root, source.parent, folder):
             candidate = Path(os.path.abspath(base / literal))
             if candidate in files:
@@ -201,8 +214,8 @@ def external_input_owners(root, packages, paths):
                 continue
             visited.add(source)
             references = referenced_inputs(root, source, folder, files, directories)
-            pending.extend(path for path in references if path.is_relative_to(root / "scripts")
-                           and path.suffix in {".sh", ".py", ".mjs", ".js"})
+            pending.extend(path for path in references if path.suffix in {".sh", ".py", ".mjs", ".js"}
+                           and {"scripts", "tools"}.intersection(path.relative_to(root).parts))
             for changed in external:
                 parts = changed.relative_to(root).parts
                 template = root.joinpath(*parts[:3]) if parts[:2] == ("templates", "capsules") else None
