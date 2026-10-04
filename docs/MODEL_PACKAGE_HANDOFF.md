@@ -124,12 +124,22 @@ on macOS.
 
 1. Confirm the Runtime's Kubo is the pinned version with the canonical import
    profile, and install the platform llama.cpp engine if the Runtime does not
-   already hold its verified receipt:
+   already hold its verified receipt. Use the installed Runtime with its trusted
+   publisher and admitted signed release. Setup fetches the release's components
+   manifest and pinned model catalogue over Carrier, verifies both, then fetches
+   the engine capsule at its signed `release_path` and checks its checksum:
 
    ```bash
    python3 scripts/model-package-handoff.py verify-kubo --data-dir "$DATA_DIR"
    elastos setup --with llama-server
    ```
+
+   The signed release must contain an engine for this platform. Model delivery
+   uses signed capsules over Carrier; upstream URLs, including Hugging Face,
+   belong to publisher ingestion rather than receiver downloads.
+   `scripts/fetch/fetch-model.sh` refuses URL fetching and points here. Use
+   Assistant for signed model preparation. Continue below only for an explicit
+   operator CAR handoff into Kubo.
 
 2. Check the CAR against its receipt before Kubo sees it. This recomputes the
    size and SHA-256 by streaming the file and refuses a truncated or altered

@@ -13,7 +13,7 @@ pub(in crate::api) mod preparation;
 const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
-const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 8;
 
 pub(crate) struct VerifiedModelCatalogEntry {
