@@ -186,13 +186,14 @@ a {
   background: var(--bg);
 }
 
-/* Collapsed: keep leading chrome column so traffic lights stay over material. */
-.documents-shell[data-sidebar-collapsed="true"] {
+/* Collapsed: keep leading chrome column so traffic lights stay over material.
+   The phone drawer always shows the list, whatever the desktop chose. */
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] {
   grid-template-columns: 220px minmax(0, 1fr);
 }
 
-.documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
-.documents-shell[data-sidebar-collapsed="true"] .documents-list {
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-list {
   display: none;
 }
 

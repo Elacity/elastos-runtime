@@ -623,6 +623,8 @@ async function run() {
     assert(readMode.highlights >= 2, "Documents read view must keep preview find highlights visible.");
 
     await assertNoHorizontalOverflow(page, "wide");
+    // A list hidden on the desktop must still fill the phone drawer.
+    await page.locator("#sidebar-toggle").click();
     await page.setViewportSize(PHONE_VIEWPORT);
     await assertNoHorizontalOverflow(page, "narrow");
 
@@ -630,6 +632,15 @@ async function run() {
     await setPhoneFormFactor(page);
     await page.waitForTimeout(DRAWER_SETTLE_MS);
     await assertNoHorizontalOverflow(page, "phone");
+    const phoneList = await page.evaluate(() => ({
+      collapsed: document.querySelector(".documents-shell")?.dataset.sidebarCollapsed || "",
+      list: getComputedStyle(document.getElementById("documents-list")).display,
+      search: getComputedStyle(document.querySelector(".sidebar-search")).display,
+    }));
+    assert(
+      phoneList.collapsed === "true" && phoneList.list !== "none" && phoneList.search !== "none",
+      `Documents phone: a list hidden on the desktop must still fill the drawer. Got ${JSON.stringify(phoneList)}`,
+    );
     const phoneEditor = await page.evaluate(() => {
       const editor = document.getElementById("editor").getBoundingClientRect();
       const hidden = (id) => getComputedStyle(document.getElementById(id)).display === "none";
@@ -659,6 +670,8 @@ async function run() {
       screenshot: PHONE_DRAWER_SCREENSHOT,
     });
     await setPhoneFormFactor(page, false);
+    const desktopList = await page.evaluate(() => getComputedStyle(document.getElementById("documents-list")).display);
+    assert(desktopList === "none", `Documents desktop: Hide list must still hide the list after the phone layout. Got ${desktopList}`);
 
     await page.close();
     resetDocumentsFixture();
