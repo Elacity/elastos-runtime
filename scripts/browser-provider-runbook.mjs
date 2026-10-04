@@ -293,8 +293,7 @@ ${shellBlock([
   "scripts/browser-provider-decision-report-smoke.sh",
   "scripts/browser-provider-runbook-smoke.sh",
   "node scripts/browser-display-mode-smoke.mjs",
-  "node scripts/home-entropy-check.mjs",
-  "scripts/check-wci-alignment.sh",
+  "node scripts/check-product-data.mjs",
 ])}
 
 ## Expected-Failing Completion Audit

@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-echo "[carrier-only] alignment gate"
-bash scripts/check-wci-alignment.sh
+echo "[carrier-only] capsule and component data"
+node scripts/check-product-data.mjs
 
 echo "[carrier-only] runtime Carrier tests"
 (cd elastos && cargo test -p elastos-runtime carrier -- --nocapture)
@@ -39,7 +39,7 @@ cat <<'JSON'
   "schema": "elastos.carrier-only-authority-check/v1",
   "ok": true,
   "covered_contracts": [
-    "wci_alignment_gate",
+    "product_data_validation",
     "runtime_carrier",
     "server_carrier_provider_plane",
     "remote_carrier_exit_bridge",

@@ -8,7 +8,7 @@ const stageSource = fs.readFileSync(
   "utf8",
 );
 const patchFunction = stageSource.match(
-  /^def patch_selkies_signaling_retries\(source\):\n[\s\S]*?(?=^main_text = patch_selkies_signaling_retries\()/m,
+  /^def patch_selkies_signaling_retries\(source\):\n[\s\S]*?(?=^def )/m,
 )?.[0];
 assert.ok(patchFunction, "stage must apply the extracted signaling retry patch");
 

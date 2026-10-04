@@ -62,9 +62,7 @@ Run from a clean candidate checkout:
 ```bash
 git diff --check
 node scripts/public-copy-entropy-check.mjs
-node scripts/home-entropy-check.mjs
-node scripts/browser-entropy-check.mjs
-bash scripts/check-wci-alignment.sh
+node scripts/check-product-data.mjs
 node scripts/check-elastos-bus-wit.mjs
 node scripts/check-capsule-templates.mjs
 bash scripts/audit-linux-runtime-portability.sh

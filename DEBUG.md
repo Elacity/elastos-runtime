@@ -16,10 +16,9 @@ work log.
 - Prefer product-level smoke tests for Home, app launch, Browser, Wallet,
   pairing, sharing, and mobile/touch behavior.
 - Prefer focused tests for the authority boundary being changed.
-- Run `node scripts/home-entropy-check.mjs` after UI, naming, routing, token,
-  People, Services, or ontology changes.
-- Run `node scripts/browser-entropy-check.mjs` after Browser, Browser Engine,
-  Exit, WebRTC, VM, or wallet-bridge changes.
+- Run `node scripts/check-product-data.mjs` after capsule manifest, component,
+  model catalog, or install asset changes. Run the relevant behaviour tests
+  after Home, Browser, provider, or authority changes.
 - Run `git diff --check` and Rust/JS syntax checks before handing off.
 - Keep historical transcripts out of active docs. Git history already preserves
   them.
