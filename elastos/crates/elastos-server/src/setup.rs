@@ -1915,6 +1915,24 @@ pub(crate) async fn ensure_local_model_engine(
     use std::os::unix::fs::MetadataExt as _;
 
     let manifest: ComponentsManifest = serde_json::from_slice(manifest_bytes)?;
+    let component = manifest
+        .external
+        .get("llama-server")
+        .ok_or_else(|| anyhow::anyhow!("local model engine is unavailable"))?;
+    let platform = detect_platform();
+    let info = component
+        .platforms
+        .get(&platform)
+        .ok_or_else(|| anyhow::anyhow!("local model engine platform is unavailable"))?;
+    let install_path = resolve_install_path(component, Some(info))
+        .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
+    // An installed engine is verified against its receipt and used without
+    // the installation writer, so a running update does not block model offers.
+    match fs::symlink_metadata(data_dir.join(install_path)) {
+        Ok(_) => return verified_local_model_engine(data_dir, &manifest),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let writer = crate::install_transaction::acquire_installed_writer(data_dir)?;
     let sources = crate::sources::load_trusted_sources(data_dir)?;
     let source = sources.default_source();
@@ -1941,22 +1959,6 @@ pub(crate) async fn ensure_local_model_engine(
     } else {
         None
     };
-    let component = manifest
-        .external
-        .get("llama-server")
-        .ok_or_else(|| anyhow::anyhow!("local model engine is unavailable"))?;
-    let platform = detect_platform();
-    let info = component
-        .platforms
-        .get(&platform)
-        .ok_or_else(|| anyhow::anyhow!("local model engine platform is unavailable"))?;
-    let install_path = resolve_install_path(component, Some(info))
-        .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
-    match fs::symlink_metadata(data_dir.join(install_path)) {
-        Ok(_) => return verified_local_model_engine(data_dir, &manifest),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
     let release_path = info
         .release_path
         .as_deref()
@@ -6737,6 +6739,33 @@ pub(crate) mod tests {
             server.close().await;
             assert_eq!(serving.await.unwrap(), fetches, "{fault}");
         }
+    }
+
+    #[tokio::test]
+    async fn on_demand_engine_fetches_signed_bundle_over_carrier_then_reuses_it() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("components.json"),
+            br#"{"external":{},"profiles":{}}"#,
+        )
+        .unwrap();
+        let (server, serving, bundle) = signed_engine_fixture(root.path(), "none").await;
+        let manifest = fs::read(root.path().join("components.json")).unwrap();
+        let first = ensure_local_model_engine(root.path(), &manifest).await;
+        assert!(first.is_ok(), "{:#}", first.err().unwrap());
+        assert!(
+            bundle.join("llama-server").is_file(),
+            "engine binary extracted"
+        );
+        assert!(
+            bundle.join("libfixture.so").is_file(),
+            "engine library extracted"
+        );
+        // An installed engine is verified and reused; Carrier is not asked again.
+        let second = ensure_local_model_engine(root.path(), &manifest).await;
+        assert!(second.is_ok(), "{:#}", second.err().unwrap());
+        server.close().await;
+        assert_eq!(serving.await.unwrap(), 1);
     }
 
     fn signed_setup_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
