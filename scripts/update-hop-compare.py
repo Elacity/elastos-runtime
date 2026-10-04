@@ -78,10 +78,18 @@ The operator owns real release signing and publication. Native Mac CI creates
 and removes disposable signing keys through generate-ci-hop, using Runtime's
 sign-payload command and offline Kubo content from the existing Mac build.
 Each scope has its own frozen installer, holder, consumers and receipt.
-Generated native CI packages also pin the qualified localhost provider and the
-complete installed source Home capsule, keeping its qualified source descriptor.
-This frozen support proof does not qualify release archives or component downloads.
-Before M2 activation, a separate M1 Home starts
+Generated native CI packages pin the qualified localhost provider and complete
+source Home bytes through fixture archive and native artifact descriptors. Setup
+proves downloads from the isolated fixture publisher. Production release archives,
+model inference and manual UX remain with their separate acceptance gates.
+Qualified localhost capsule metadata retains its original archive checksum,
+size and extraction paths. Its admitted archive and complete extracted file
+inventory join the setup closure when that source descriptor requires them.
+Generation requires that original archive through --localhost-metadata.
+Successful M1 and refusal-seed installs run installed default setup over Carrier
+before their installed metadata and support are checked. The fixture packages
+the qualified source Home and native executables; setup must produce those exact
+bytes before preservation sentinels are copied. A separate M1 Home starts
 through `home --browser` and its signed retained controller. The observer checks
 its live gateway generation, private attach, served Home bytes and owned shutdown.
 This initial-start proof keeps the offline CLI snapshots and refusal checks intact.
@@ -107,6 +115,7 @@ import datetime
 import errno
 import ctypes
 import fcntl
+import gzip
 import hashlib
 import http.server
 import io
@@ -885,6 +894,7 @@ def cli_admit(config, local_rehearsal=None):
             need(any(target == relative or target.startswith(relative + "/") for target in manifest["consumer"]["files"]), "preservation bytes missing")
     if "initial_home" in manifest:
         cli_admit_home_support(root, manifest)
+    cli_admit_setup(root, manifest)
     need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "initial_home" in manifest,
          "native CI rehearsal requires the installed Home startup fixture")
     need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "model_fixture" in manifest,
@@ -1175,7 +1185,7 @@ def cli_admit_home_support(root, manifest):
          and fixture["entrypoint"] == "capsules/home/browser/index.html", "initial Home fixture differs")
     mapping = manifest["consumer"]["files"]
     native_paths = {"bin/ipfs-provider", "bin/kubo", "bin/localhost-provider"}
-    expected = {target for target in mapping if target.startswith("capsules/home/") or target in native_paths or target == "fixture-tools/open"}
+    expected = set(cli_setup_files(manifest)) | {"fixture-tools/open"}
     need(fixture["files"] == sorted(expected) and native_paths <= expected
          and "fixture-tools/open" in expected and "capsules/home/capsule.json" in expected and fixture["entrypoint"] in expected,
          "initial Home support closure is incomplete")
@@ -1214,7 +1224,209 @@ def cli_admit_home_support(root, manifest):
              "initial Home support CID closure differs")
 
 
-def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, local_rehearsal=None):
+CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider")
+CLI_SETUP_ARTIFACTS = ("home.tar.gz", "ipfs-provider", "kubo", "localhost-provider")
+CLI_HOME_CACHE = (".elastos-cid", ".elastos-artifact-sha256")
+CLI_LOCALHOST_METADATA = "localhost-provider-capsule-metadata.tar.gz"
+
+
+def cli_localhost_metadata_info(descriptor, platform_name):
+    metadata = descriptor.get("capsule_metadata")
+    if metadata is None:
+        return None
+    need(isinstance(metadata, dict) and isinstance(metadata.get("platforms"), dict),
+         "localhost metadata descriptor is invalid")
+    aliases = {"darwin-arm64": ("aarch64-darwin",), "aarch64-darwin": ("darwin-arm64",)}.get(platform_name, ())
+    selected = next((metadata["platforms"][key] for key in (platform_name, *aliases, "*")
+                     if key in metadata["platforms"]), None)
+    need(isinstance(selected, dict)
+         and selected.get("install_path", metadata.get("install_path")) == "capsules/localhost-provider"
+         and selected.get("extract_path") == "localhost-provider"
+         and selected.get("release_path") == CLI_LOCALHOST_METADATA
+         and re.fullmatch(r"sha256:[0-9a-f]{64}", selected.get("checksum", ""))
+         and isinstance(selected.get("size"), int) and 0 < selected["size"] <= 16 * 1024**2
+         and not any(selected.get(key) for key in ("url", "source", "strategy", "binary_path")),
+         "localhost metadata archive binding differs")
+    return selected
+
+
+def cli_localhost_metadata_files(raw, selected):
+    need(len(raw) == selected["size"] and "sha256:" + hashlib.sha256(raw).hexdigest() == selected["checksum"],
+         "qualified localhost metadata archive checksum or size differs")
+    files, seen, total = {}, set(), 0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as compressed:
+            tar_bytes = compressed.read(16 * 1024**2 + 1)
+        need(len(tar_bytes) <= 16 * 1024**2, "localhost metadata archive expansion exceeds bound")
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+            for member in archive:
+                name = member.name.removeprefix("./").rstrip("/")
+                path = Path(name)
+                need(len(seen) < 1024 and name and not path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+                     and (name == "localhost-provider" or name.startswith("localhost-provider/"))
+                     and name not in seen and (member.isdir() or member.isfile())
+                     and member.mode in (0o600, 0o644, 0o700, 0o755), "unsafe localhost metadata archive member")
+                seen.add(name)
+                if member.isdir():
+                    continue
+                relative = path.relative_to("localhost-provider").as_posix()
+                need(relative != "." and not set(path.parts) & {"identity", ".git", "target", "node_modules"}
+                     and path.name not in CLI_HOME_CACHE and path.suffix not in (".key", ".pem", ".p12"),
+                     "unsafe localhost metadata archive file")
+                total += member.size
+                need(0 <= member.size <= 16 * 1024**2 and total <= 16 * 1024**2,
+                     "localhost metadata archive expansion exceeds bound")
+                data = archive.extractfile(member).read()
+                need(len(data) == member.size, "localhost metadata archive member is truncated")
+                # Runtime's tar xzf inherits main's owner-only umask; fs::copy keeps that mode.
+                files["capsules/localhost-provider/" + relative] = (data, member.mode & ~0o077)
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise ValueError("qualified localhost metadata archive is invalid") from error
+    file_names = {"localhost-provider/" + target.removeprefix("capsules/localhost-provider/") for target in files}
+    need(not any(parent.as_posix() in file_names for name in seen for parent in Path(name).parents),
+         "localhost metadata archive file is used as a directory")
+    capsule = files.get("capsules/localhost-provider/capsule.json")
+    need(capsule is not None, "localhost metadata archive capsule manifest is absent")
+    document = json.loads(capsule[0])
+    need(isinstance(document, dict), "localhost metadata archive capsule manifest is invalid")
+    icon = document.get("icon", "")
+    need(isinstance(icon, str) and icon and not Path(icon).is_absolute()
+         and Path(icon).as_posix() == icon and ".." not in Path(icon).parts
+         and all("capsules/localhost-provider/" + icon + "/icon-" + str(size) + ".png" in files
+                 for size in (32, 64, 128, 256)), "localhost metadata archive icon closure is incomplete")
+    return files
+
+
+def cli_setup_files(manifest):
+    return {target: relative for target, relative in manifest["consumer"]["files"].items()
+            if target.startswith(("capsules/home/", "capsules/localhost-provider/")) or target in
+            ("bin/ipfs-provider", "bin/kubo", "bin/localhost-provider")}
+
+
+def cli_home_archive(root, manifest, mapping):
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for target, relative in sorted(mapping.items()):
+                if not target.startswith("capsules/home/"):
+                    continue
+                raw = cli_path(root, relative).read_bytes()
+                binding = manifest["files"][relative]
+                need(len(raw) == binding["bytes"] and hashlib.sha256(raw).hexdigest() == binding["sha256"],
+                     "Home archive input differs from inventory")
+                member = tarfile.TarInfo("home/" + target.removeprefix("capsules/home/"))
+                member.size, member.mode, member.mtime = len(raw), binding["mode"], 0
+                archive.addfile(member, io.BytesIO(raw))
+    return output.getvalue()
+
+
+def cli_admit_setup(root, manifest):
+    setup = manifest.get("setup")
+    if setup is None:
+        need(manifest["proof_kind"] == "harness-self-test",
+             "real Runtime fixture requires signed setup artifacts")
+        return {}
+    has_metadata = "localhost_metadata" in setup
+    need(set(setup) == ({"artifacts", "localhost_metadata"} if has_metadata else {"artifacts"})
+         and set(setup["artifacts"]) == set(CLI_SETUP_ARTIFACTS) | ({CLI_LOCALHOST_METADATA} if has_metadata else set()),
+         "fixed setup artifact closure required")
+    mapping = cli_setup_files(manifest)
+    need(all("bin/" + name in mapping for name in CLI_SETUP_COMPONENTS[1:])
+         and "capsules/home/capsule.json" in mapping and "capsules/home/browser/index.html" in mapping,
+         "setup output inventory is incomplete")
+    need(not any(Path(target).name in CLI_HOME_CACHE for target in mapping),
+         "setup cache metadata belongs to installed setup")
+    archive_relative = setup["artifacts"]["home.tar.gz"]
+    need(archive_relative in manifest["files"], "Home setup archive missing from inventory")
+    need(cli_path(root, archive_relative).read_bytes() == cli_home_archive(root, manifest, mapping),
+         "Home setup archive differs from qualified bytes")
+    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+    for publication in manifest["publications"].values():
+        components = cli_json(cli_path(root, publication["components"]))
+        need(components.get("profiles", {}).get("home", {}).get("components") == list(CLI_SETUP_COMPONENTS),
+             "fixed nonempty setup Home profile required")
+        for name, artifact in zip(CLI_SETUP_COMPONENTS, CLI_SETUP_ARTIFACTS):
+            relative = setup["artifacts"][artifact]
+            need(relative in manifest["files"], "setup artifact missing from inventory")
+            binding = manifest["files"][relative]
+            component = components["external"][name]
+            need(name == "localhost-provider" or "capsule_metadata" not in component,
+                 "setup component has unmodeled capsule metadata")
+            selected = component["platforms"][platform_name]
+            target = "capsules/home" if name == "home" else "bin/" + name
+            need(selected.get("release_path") == artifact and selected.get("install_path") == target
+                 and not any(selected.get(key) for key in ("url", "source", "strategy"))
+                 and selected.get("cid") == binding.get("cid")
+                 and selected.get("checksum") == "sha256:" + binding["sha256"]
+                 and selected.get("size") == binding["bytes"], "signed setup artifact binding differs")
+            need(manifest["holder"]["content"].get(binding["cid"]) == relative,
+                 "setup holder artifact is missing")
+            if name == "home":
+                entry = components["capsules"]["home"]
+                need(selected.get("extract_path") == "home"
+                     and entry["cid"] == binding["cid"] and entry["sha256"] == "sha256:" + binding["sha256"]
+                     and entry["size"] == binding["bytes"], "Home setup package identity differs")
+            else:
+                need(relative == mapping[target] and binding["mode"] & 0o111
+                     and not selected.get("extract_path"), "native setup artifact differs from output inventory")
+        selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
+        need((selected is not None) == has_metadata, "localhost metadata setup closure differs")
+        metadata_targets = {target for target in mapping if target.startswith("capsules/localhost-provider/")}
+        if has_metadata:
+            closure = setup["localhost_metadata"]
+            need(set(closure) == {"artifact", "files"} and closure["artifact"] == CLI_LOCALHOST_METADATA,
+                 "localhost metadata setup declaration differs")
+            relative = setup["artifacts"][CLI_LOCALHOST_METADATA]
+            binding = manifest["files"][relative]
+            need(selected.get("cid") == binding.get("cid") and binding["sha256"] == selected["checksum"].removeprefix("sha256:")
+                 and binding["bytes"] == selected["size"] and manifest["holder"]["content"].get(binding["cid"]) == relative,
+                 "signed localhost metadata artifact differs")
+            expected = cli_localhost_metadata_files(cli_path(root, relative).read_bytes(), selected)
+            need(closure["files"] == sorted(expected) and metadata_targets == set(expected),
+                 "localhost metadata output inventory is incomplete")
+            for target, (raw, mode) in expected.items():
+                output = manifest["files"][mapping[target]]
+                need(output["bytes"] == len(raw) and output["sha256"] == hashlib.sha256(raw).hexdigest()
+                     and output["mode"] == mode, "localhost metadata output binding differs")
+        else:
+            need(not metadata_targets, "localhost metadata output has no signed archive")
+    return mapping
+
+
+def cli_verify_setup_support(root, manifest, home_path):
+    if "setup" not in manifest:
+        need(manifest["proof_kind"] == "harness-self-test", "real Runtime setup closure is absent")
+        return
+    directory = home_path / CLI_DATA
+    for target, relative in cli_setup_files(manifest).items():
+        path, binding = cli_path(directory, target), manifest["files"][relative]
+        info = path.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+             and digest(path) == binding["sha256"] and info.st_size == binding["bytes"]
+             and stat.S_IMODE(info.st_mode) == binding["mode"],
+             "installed setup support differs: " + target)
+    components = cli_json(directory / "components.json")
+    entry = components["capsules"]["home"]
+    caches = [("capsules/home", (entry["cid"], entry["sha256"]))]
+    if "localhost_metadata" in manifest["setup"]:
+        platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+        selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
+        caches.append(("capsules/localhost-provider", (selected["cid"], selected["checksum"])))
+        folder = directory / "capsules/localhost-provider"
+        actual = {path.relative_to(directory).as_posix() for path in folder.rglob("*") if not path.is_dir()}
+        expected = {target for target in cli_setup_files(manifest) if target.startswith("capsules/localhost-provider/")}
+        need(actual == expected | {"capsules/localhost-provider/" + name for name in CLI_HOME_CACHE},
+             "installed localhost metadata output closure differs")
+    for folder, values in caches:
+        for name, expected in zip(CLI_HOME_CACHE, values):
+            path = cli_path(directory, folder + "/" + name)
+            info = path.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                 and stat.S_IMODE(info.st_mode) == 0o600
+                 and path.read_text() == expected + "\n", "installed setup cache identity differs")
+
+
+def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, local_rehearsal=None, localhost_metadata=None):
     """Generate a disposable signed positive hop and refusal set for its admitted scope."""
     local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
     if local_source is None:
@@ -1224,13 +1436,28 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
     component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
     home_descriptor, home_paths, localhost_descriptor = cli_qualified_home(support_home, component_platform)
+    metadata_info = cli_localhost_metadata_info(localhost_descriptor, component_platform)
+    metadata_files = {}
+    if metadata_info is not None:
+        need(localhost_metadata is not None, "qualified localhost metadata archive input is required")
+        info = localhost_metadata.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+             and not info.st_mode & 0o022 and info.st_size == metadata_info["size"],
+             "qualified localhost metadata archive custody or size differs")
+        metadata_raw = localhost_metadata.read_bytes()
+        metadata_files = cli_localhost_metadata_files(metadata_raw, metadata_info)
+        if metadata_info.get("cid"):
+            cli_metadata_cid(metadata_info["cid"], metadata_raw)
+    else:
+        need(localhost_metadata is None, "localhost metadata archive input has no source descriptor")
     for path in (runtime, next_runtime, build_receipt, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
         need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
     disk = shutil.disk_usage(root.parent)
     # Two Runtime copies plus their CID blocks, native support, package copies
     # and eight isolated installed Homes fit within this conservative bound.
     growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
-                                                   for name in ("ipfs-provider", "kubo", "localhost-provider")) + sum(path.stat().st_size for path in home_paths))
+                                                   for name in ("ipfs-provider", "kubo", "localhost-provider")) + sum(path.stat().st_size for path in home_paths)
+                   + sum(len(raw) for raw, _ in metadata_files.values()) + (len(metadata_raw) if metadata_info else 0))
     need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
     root.mkdir(mode=0o700)
     scratch = root / "generator"
@@ -1328,12 +1555,20 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
         content(opener)
         for path in home_paths:
             target = path.relative_to(support_home).as_posix()
+            if path.parent == support_home / "capsules/home" and path.name in CLI_HOME_CACHE:
+                continue
             relative = add("home-support/" + target, path)
             content(relative, raw=True)
             home_mapping[target] = relative
-        # This exact source activation descriptor selects the already copied
-        # Home tree. Its release archive is outside this frozen support proof.
-        external = {"home": cli_home_activation_descriptor(qualified, component_platform)}
+        home_archive = add("home.tar.gz", cli_home_archive(root, manifest, home_mapping))
+        content(home_archive)
+        archive_binding = manifest["files"][home_archive]
+        home_descriptor = {**home_descriptor, "cid": archive_binding["cid"],
+                           "sha256": "sha256:" + archive_binding["sha256"], "size": archive_binding["bytes"]}
+        external = {"home": {"install_path": "capsules/home", "platforms": {component_platform: {
+            "release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home",
+            "cid": archive_binding["cid"], "checksum": "sha256:" + archive_binding["sha256"],
+            "size": archive_binding["bytes"]}}}}
         for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
             descriptor = qualified["external"][name]
             if name == "ipfs-provider":
@@ -1343,15 +1578,37 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
             external[name] = {"install_path": "bin/" + name, "platforms": {component_platform: {
                 "checksum": "sha256:" + manifest["files"][relative]["sha256"],
                 "cid": manifest["files"][relative]["cid"],
-                "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name}}}
+                "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name,
+                "release_path": name}}}
             if "provider_runtime" in descriptor:
                 external[name]["provider_runtime"] = descriptor["provider_runtime"]
         # Preserve the qualified source descriptor and add the fixture CID pin.
         external["localhost-provider"] = {**localhost_descriptor, "platforms": {component_platform: {
             "install_path": "bin/localhost-provider", "checksum": "sha256:" + manifest["files"][localhost_relative]["sha256"],
-            "size": manifest["files"][localhost_relative]["bytes"], "cid": manifest["files"][localhost_relative]["cid"]}}}
+            "size": manifest["files"][localhost_relative]["bytes"], "cid": manifest["files"][localhost_relative]["cid"],
+            "release_path": "localhost-provider"}}}
+        metadata_relative = None
+        if metadata_info is not None:
+            metadata_relative = add(CLI_LOCALHOST_METADATA, metadata_raw)
+            metadata_cid = content(metadata_relative)
+            metadata = json.loads(json.dumps(localhost_descriptor["capsule_metadata"]))
+            external["localhost-provider"]["capsule_metadata"] = metadata
+            selected = cli_localhost_metadata_info(external["localhost-provider"], component_platform)
+            need(not selected.get("cid") or selected["cid"] == metadata_cid,
+                 "qualified localhost metadata CID differs from its archive")
+            selected["cid"] = metadata_cid
+            for target, (raw, mode) in sorted(metadata_files.items()):
+                relative = add("localhost-metadata/" + target, raw, mode)
+                content(relative, raw=True)
+                home_mapping[target] = relative
         components = add("components.json", {"schema": "elastos.components/v1", "capsules": {"home": home_descriptor}, "external": external,
-                         "profiles": {}, "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
+                         "profiles": {"home": {"description": "Qualified fixture Home", "components": list(CLI_SETUP_COMPONENTS)}},
+                         "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
+        manifest["setup"] = {"artifacts": dict(zip(CLI_SETUP_ARTIFACTS,
+            (home_archive, provider_relative, kubo_relative, localhost_relative)))}
+        if metadata_relative is not None:
+            manifest["setup"]["artifacts"][CLI_LOCALHOST_METADATA] = metadata_relative
+            manifest["setup"]["localhost_metadata"] = {"artifact": CLI_LOCALHOST_METADATA, "files": sorted(metadata_files)}
         content(components)
         content(runtime_relative)
         content(next_relative)
@@ -2059,7 +2316,7 @@ def cli_run(config, output, local_rehearsal=None):
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
-              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}, "coordination": {}}
+              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}, "coordination": {}, "setup": {}}
     if manifest.get("build"):
         result["build"] = cli_json(cli_path(root, manifest["build"]))
     holder = output / "homes/holder"
@@ -2103,6 +2360,8 @@ def cli_run(config, output, local_rehearsal=None):
                     CLI_PUBLISHER + "/artifacts/elastos-" + manifest["platform"]: publication["binary"],
                     CLI_PUBLISHER + "/artifacts/components-" + manifest["platform"] + ".json": publication["components"],
                     CLI_PUBLISHER + "/artifacts/model-catalog.json": publication["catalogue"]}
+        snapshot.update({CLI_PUBLISHER + "/artifacts/" + name: relative
+                         for name, relative in manifest.get("setup", {}).get("artifacts", {}).items()})
         cli_copy(root, manifest, snapshot, holder_data)
         label = "holder-" + str(len(processes.processes))
         holder_labels.append(label)
@@ -2135,8 +2394,25 @@ def cli_run(config, output, local_rehearsal=None):
         finally:
             installer_bootstrap.enabled = False
 
+    def setup(home_path, label):
+        track(home_path, {CLI_DATA + "/" + target: relative for target, relative in cli_setup_files(manifest).items()})
+        evidence = {"status": "failed"}
+        result["setup"][label] = evidence
+        reply = command(home_path, ["setup"], label, evidence)
+        need(cli_success(processes, label, reply), "installed setup failed; command exit " + str(reply["exit"])
+             + cli_ci_stderr_detail(processes, manifest, label, label))
+        for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
+            need(digest(home_path / CLI_DATA / filename) == manifest["files"][manifest["publications"]["old"][key]]["sha256"],
+                 "installed setup " + key + " hash differs")
+        cli_verify_setup_support(root, manifest, home_path)
+        evidence["status"] = "passed"
+
     def prepare(home_path, label):
-        cli_copy(root, manifest, manifest["consumer"]["files"], home_path / CLI_DATA)
+        cli_verify_setup_support(root, manifest, home_path)
+        setup_targets = cli_setup_files(manifest) if "setup" in manifest else {}
+        mapping = {target: relative for target, relative in manifest["consumer"]["files"].items()
+                   if target not in setup_targets}
+        cli_copy(root, manifest, mapping, home_path / CLI_DATA)
         track(home_path, {CLI_DATA + "/" + target: relative for target, relative in manifest["consumer"]["files"].items()})
         need(command(home_path, ["node", "info", "--json"], label + "-identity")["exit"] == 0, "consumer fixture identity failed")
         for group, values in cli_state(manifest, home_path)["preserved"].items():
@@ -2206,6 +2482,7 @@ def cli_run(config, output, local_rehearsal=None):
         result["paths"]["m1-install"] = {"status": "failed", "checks": {}}
         reply = install(consumer, "m1-install")
         need(cli_success(processes, "m1-install", reply), "fresh installer failed")
+        setup(consumer, "m1-setup")
         verify(consumer, "old", "m1-version")
         result["paths"]["m1-install"]["checks"]["positive"] = {"status": "passed", **reply}
         prepare(consumer, "main")
@@ -2215,6 +2492,7 @@ def cli_run(config, output, local_rehearsal=None):
             initial.mkdir(mode=0o700)
             processes.roots[str(initial / ".local/bin/elastos")] = {manifest["files"][manifest["publications"]["old"]["binary"]]["sha256"]}
             need(cli_success(processes, "initial-home-install", install(initial, "initial-home-install")), "initial Home installer failed")
+            setup(initial, "initial-home-setup")
             verify(initial, "old", "initial-home-version")
             prepare(initial, "initial-home")
             result["paths"]["m1-install"]["checks"]["initial-home"] = {
@@ -2261,6 +2539,7 @@ def cli_run(config, output, local_rehearsal=None):
             target.mkdir(mode=0o700)
             processes.roots[str(target / ".local/bin/elastos")] = {manifest["files"][manifest["publications"]["old"]["binary"]]["sha256"]}
             need(cli_success(processes, "seed-" + case, install(target, "seed-" + case)), "old refusal consumer installation failed")
+            setup(target, "seed-setup-" + case)
             verify(target, "old", "seed-version-" + case)
             prepare(target, "seed-" + case)
             original = cli_state(manifest, target)
@@ -2320,11 +2599,14 @@ def main():
     parser.add_argument("--next-runtime", type=Path, help="compiled N+1 Runtime for CI hop generation")
     parser.add_argument("--build-receipt", type=Path, help="exact CI Runtime build receipt")
     parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
+    parser.add_argument("--localhost-metadata", type=Path, help="original qualified localhost capsule metadata archive")
     parser.add_argument("--local-rehearsal", metavar="REFERENCE", help="approved local-rehearsal:<source-commit>:<fixture-name> selector")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("terminated")))
     try:
+        need(args.localhost_metadata is None or args.operation == "generate-ci-hop",
+             "localhost metadata input applies only to fixture generation")
         if args.local_rehearsal is not None:
             need(args.operation in ("build-ci-hop", "generate-ci-hop", "inspect", "run"),
                  "local rehearsal applies only to CLI fixture build, generation, inspect and run")
@@ -2340,7 +2622,8 @@ def main():
         if args.operation == "generate-ci-hop":
             need(all(path is not None for path in (args.runtime, args.next_runtime, args.build_receipt, args.support_home)) and args.output is None and args.root is None,
                  "hop generation requires both Runtimes, build receipt and support-home inputs")
-            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home, args.local_rehearsal)))
+            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home,
+                                             args.local_rehearsal, args.localhost_metadata)))
             return 0
         value = read(args.input)
         if args.local_rehearsal is not None:

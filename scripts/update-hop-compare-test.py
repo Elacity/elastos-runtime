@@ -1053,6 +1053,353 @@ class CliFixtureTests(unittest.TestCase):
         observer.write(support / "components.json", registry)
         return support
 
+    def qualified_localhost_metadata(self, support, fault=None):
+        files = {"capsule.json": json.dumps({"schema": "elastos.capsule/v1", "name": "localhost-provider",
+                 "version": "0.1.0", "role": "provider", "type": "microvm", "entrypoint": "rootfs.ext4",
+                 "icon": "icons", "provides": "localhost://*"}).encode(),
+                 **{"icons/icon-" + str(size) + ".png": b"fixture icon " + str(size).encode() for size in (32, 64, 128, 256)}}
+        if fault == "missing manifest":
+            del files["capsule.json"]
+        elif fault == "missing icon":
+            del files["icons/icon-256.png"]
+        output = io.BytesIO()
+        with observer.tarfile.open(fileobj=output, mode="w:gz") as archive:
+            for name in ("localhost-provider", "localhost-provider/icons"):
+                member = observer.tarfile.TarInfo(name)
+                member.type, member.mode = observer.tarfile.DIRTYPE, 0o755
+                archive.addfile(member)
+            for name, raw in sorted(files.items()):
+                member = observer.tarfile.TarInfo("localhost-provider/" + name)
+                member.size, member.mode = len(raw), 0o644
+                archive.addfile(member, io.BytesIO(raw))
+            if fault in ("traversal", "link", "hard link", "unsafe mode"):
+                member = observer.tarfile.TarInfo("../escaped" if fault == "traversal" else "localhost-provider/extra")
+                member.mode = 0o777 if fault == "unsafe mode" else 0o644
+                if fault in ("link", "hard link"):
+                    member.type = observer.tarfile.SYMTYPE if fault == "link" else observer.tarfile.LNKTYPE
+                    member.linkname = "../../foreign"
+                archive.addfile(member, io.BytesIO(b""))
+            elif fault == "entry count":
+                for index in range(1024):
+                    member = observer.tarfile.TarInfo("localhost-provider/empty-" + str(index))
+                    member.type, member.mode = observer.tarfile.DIRTYPE, 0o755
+                    archive.addfile(member)
+            elif fault == "oversized member":
+                member = observer.tarfile.TarInfo("localhost-provider/oversized")
+                member.size, member.mode = 16 * 1024**2 + 1, 0o644
+                archive.addfile(member)
+        path = self.root / observer.CLI_LOCALHOST_METADATA
+        path.write_bytes(b"invalid archive bytes" if fault == "invalid tar" else output.getvalue())
+        path.chmod(0o600)
+        registry = observer.cli_json(support / "components.json")
+        registry["external"]["localhost-provider"]["capsule_metadata"] = {
+            "install_path": "capsules/localhost-provider", "platforms": {"*": {
+                "checksum": "sha256:" + observer.digest(path), "size": path.stat().st_size,
+                "release_path": observer.CLI_LOCALHOST_METADATA, "extract_path": "localhost-provider",
+                "install_path": "capsules/localhost-provider"}}}
+        observer.write(support / "components.json", registry)
+        return path
+
+    def setup_fixture(self, initial_home=False, support=None, metadata=False):
+        support = support or self.qualified_home_support()
+        metadata_path = self.qualified_localhost_metadata(support) if metadata else None
+        entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
+        mapping = {}
+        for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
+            target = path.relative_to(support).as_posix()
+            mapping[target] = self.add("setup/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
+        mapping["fixture-tools/open"] = self.add("setup/opener", b"fixture no-op utility", 0o700)
+        self.manifest["consumer"]["files"].update(mapping)
+        for relative in mapping.values():
+            self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+        archive = self.add("setup/home.tar.gz", observer.cli_home_archive(self.root, self.manifest, mapping))
+        self.manifest["holder"]["content"][self.manifest["files"][archive]["cid"]] = archive
+        artifacts = dict(zip(observer.CLI_SETUP_ARTIFACTS,
+                             (archive, mapping["bin/ipfs-provider"], mapping["bin/kubo"], mapping["bin/localhost-provider"])))
+        self.manifest["setup"] = {"artifacts": artifacts}
+        components = observer.cli_json(self.root / self.manifest["publications"]["old"]["components"])
+        components["schema"] = "elastos.components/v1"
+        components["profiles"] = {"home": {"components": list(observer.CLI_SETUP_COMPONENTS)}}
+        for name, artifact in zip(observer.CLI_SETUP_COMPONENTS, observer.CLI_SETUP_ARTIFACTS):
+            binding = self.manifest["files"][artifacts[artifact]]
+            target = "capsules/home" if name == "home" else "bin/" + name
+            selected = {"release_path": artifact, "install_path": target, "cid": binding["cid"],
+                        "checksum": "sha256:" + binding["sha256"], "size": binding["bytes"]}
+            if name == "home":
+                selected["extract_path"] = "home"
+                components["capsules"]["home"] = {**entry, "cid": binding["cid"],
+                    "sha256": "sha256:" + binding["sha256"], "size": binding["bytes"]}
+            components["external"][name] = {"install_path": target, "platforms": {"darwin-arm64": selected}}
+        if metadata_path is not None:
+            qualified = observer.cli_json(support / "components.json")
+            descriptor = qualified["external"]["localhost-provider"]
+            selected = observer.cli_localhost_metadata_info(descriptor, "darwin-arm64")
+            expected = observer.cli_localhost_metadata_files(metadata_path.read_bytes(), selected)
+            relative = self.add("setup/" + observer.CLI_LOCALHOST_METADATA, metadata_path.read_bytes())
+            self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+            selected["cid"] = self.manifest["files"][relative]["cid"]
+            components["external"]["localhost-provider"]["capsule_metadata"] = descriptor["capsule_metadata"]
+            self.manifest["setup"]["artifacts"][observer.CLI_LOCALHOST_METADATA] = relative
+            self.manifest["setup"]["localhost_metadata"] = {"artifact": observer.CLI_LOCALHOST_METADATA, "files": sorted(expected)}
+            for target, (raw, mode) in expected.items():
+                relative = self.add("setup/" + target, raw, mode)
+                mapping[target] = relative
+                self.manifest["consumer"]["files"][target] = relative
+                self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+        relative = self.add("components.json", components)
+        binding = self.manifest["files"][relative]
+        self.manifest["holder"]["content"][binding["cid"]] = relative
+        for phase, publication in self.manifest["publications"].items():
+            release = observer.cli_json(self.root / publication["release"])
+            selected = next(iter(release["payload"]["platforms"].values()))
+            selected["components"] = {"cid": binding["cid"], "sha256": binding["sha256"], "size": binding["bytes"]}
+            publication["release"] = self.add(phase + "/release.json", release)
+            head = observer.cli_json(self.root / publication["head"])
+            head["payload"].update(latest_release_cid=self.manifest["files"][publication["release"]]["cid"],
+                                   release_sha256=self.manifest["files"][publication["release"]]["sha256"])
+            publication["head"] = self.add(phase + "/head.json", head)
+            publication["receipt"] = self.add(phase + "/receipt.json", {
+                "last_head_cid": self.manifest["files"][publication["head"]]["cid"],
+                "last_release_cid": self.manifest["files"][publication["release"]]["cid"]}, cid=False)
+            for key in ("head", "release"):
+                self.manifest["holder"]["content"][self.manifest["files"][publication[key]]["cid"]] = publication[key]
+        self.manifest["preserve"]["support"] = ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]
+        if initial_home:
+            self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
+        self.manifest["holder"]["content"] = {cid: relative for cid, relative in self.manifest["holder"]["content"].items()
+                                              if self.manifest["files"][relative].get("cid") == cid}
+        self.freeze()
+
+    def test_setup_archive_and_artifact_closure_are_deterministic_and_admitted(self):
+        self.setup_fixture()
+        self.admit()
+        mapping = observer.cli_admit_setup(self.root, self.manifest)
+        archive = self.root / self.manifest["setup"]["artifacts"]["home.tar.gz"]
+        self.assertEqual(archive.read_bytes(), observer.cli_home_archive(self.root, self.manifest, mapping))
+        self.assertEqual(archive.read_bytes()[4:8], b"\0" * 4)
+        with observer.tarfile.open(archive, "r:gz") as package:
+            members = package.getmembers()
+            expected = {"home/" + target.removeprefix("capsules/home/"): relative
+                        for target, relative in mapping.items() if target.startswith("capsules/home/")}
+            self.assertEqual([member.name for member in members], sorted(expected))
+            for member in members:
+                self.assertTrue(member.isfile())
+                self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
+                self.assertEqual(package.extractfile(member).read(), (self.root / expected[member.name]).read_bytes())
+
+    def test_setup_admission_refuses_incomplete_or_unmodeled_artifacts(self):
+        self.setup_fixture()
+        components_path = self.root / self.manifest["publications"]["old"]["components"]
+        original = components_path.read_bytes()
+        for fault in ("empty profile", "missing artifact", "blank release path", "artifact hash", "capsule metadata", "archive bytes", "holder route"):
+            with self.subTest(fault=fault):
+                manifest = json.loads(json.dumps(self.manifest))
+                components = json.loads(original)
+                if fault == "empty profile":
+                    components["profiles"]["home"]["components"] = []
+                elif fault == "missing artifact":
+                    del manifest["setup"]["artifacts"]["kubo"]
+                elif fault == "blank release path":
+                    components["external"]["kubo"]["platforms"]["darwin-arm64"]["release_path"] = ""
+                elif fault == "artifact hash":
+                    components["external"]["kubo"]["platforms"]["darwin-arm64"]["checksum"] = "sha256:" + "0" * 64
+                elif fault == "capsule metadata":
+                    components["external"]["localhost-provider"]["capsule_metadata"] = {"platforms": {}}
+                elif fault == "holder route":
+                    binding = manifest["files"][manifest["setup"]["artifacts"]["kubo"]]
+                    del manifest["holder"]["content"][binding["cid"]]
+                else:
+                    manifest["setup"]["artifacts"]["home.tar.gz"] = manifest["setup"]["artifacts"]["kubo"]
+                observer.write(components_path, components)
+                with self.assertRaises(ValueError):
+                    observer.cli_admit_setup(self.root, manifest)
+        components_path.write_bytes(original)
+
+    def test_generator_requires_qualified_localhost_metadata_before_signing_or_mutation(self):
+        support = self.qualified_home_support()
+        archive = self.qualified_localhost_metadata(support)
+        generated = self.root / "generated"
+        runtime = self.root / "retained-runtime"
+        runtime.write_bytes(b"prior Runtime remains")
+        before = runtime.read_bytes()
+        original = archive.read_bytes()
+        for fault in ("absent", "tampered", "wrong size"):
+            with self.subTest(fault=fault):
+                registry = observer.cli_json(support / "components.json")
+                registry["external"]["localhost-provider"]["capsule_metadata"]["platforms"]["*"]["size"] = len(original) + int(fault == "wrong size")
+                observer.write(support / "components.json", registry)
+                archive.write_bytes(original + (b"tampered" if fault == "tampered" else b""))
+                with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), \
+                     patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
+                     patch.object(observer.subprocess, "run") as command, self.assertRaises(ValueError):
+                    observer.cli_generate_hop(generated, runtime, runtime, runtime, support,
+                                             localhost_metadata=None if fault == "absent" else archive)
+                command.assert_not_called()
+                self.assertFalse(generated.exists())
+                self.assertEqual(runtime.read_bytes(), before)
+
+    def test_localhost_metadata_archive_refuses_traversal_links_modes_and_incomplete_entries(self):
+        support = self.qualified_home_support()
+        for fault in ("traversal", "link", "hard link", "unsafe mode", "missing manifest", "missing icon",
+                      "entry count", "oversized member", "invalid tar"):
+            with self.subTest(fault=fault):
+                archive = self.qualified_localhost_metadata(support, fault)
+                descriptor = observer.cli_json(support / "components.json")["external"]["localhost-provider"]
+                selected = observer.cli_localhost_metadata_info(descriptor, "darwin-arm64")
+                with self.assertRaises(ValueError):
+                    observer.cli_localhost_metadata_files(archive.read_bytes(), selected)
+
+    def test_localhost_metadata_platform_selection_matches_runtime_exact_alias_and_wildcard(self):
+        support = self.qualified_home_support()
+        self.qualified_localhost_metadata(support)
+        descriptor = observer.cli_json(support / "components.json")["external"]["localhost-provider"]
+        binding = descriptor["capsule_metadata"]["platforms"]["*"]
+        for platform_name, keys, expected in (
+                ("darwin-amd64", ("darwin-amd64", "*"), "darwin-amd64"),
+                ("darwin-amd64", ("x86_64-darwin", "*"), "*"),
+                ("darwin-arm64", ("darwin-arm64", "aarch64-darwin", "*"), "darwin-arm64"),
+                ("darwin-arm64", ("aarch64-darwin", "*"), "aarch64-darwin"),
+                ("aarch64-darwin", ("darwin-arm64", "*"), "darwin-arm64"),
+                ("darwin-arm64", ("*",), "*")):
+            with self.subTest(platform=platform_name, keys=keys):
+                platforms = {key: {**binding, "note": key} for key in keys}
+                descriptor["capsule_metadata"]["platforms"] = platforms
+                self.assertIs(observer.cli_localhost_metadata_info(descriptor, platform_name), platforms[expected])
+        descriptor["capsule_metadata"]["platforms"] = {"x86_64-darwin": binding}
+        with self.assertRaisesRegex(ValueError, "archive binding differs"):
+            observer.cli_localhost_metadata_info(descriptor, "darwin-amd64")
+
+    def test_localhost_metadata_setup_admission_requires_artifact_route_and_complete_outputs(self):
+        self.setup_fixture(initial_home=True, metadata=True)
+        self.admit()
+        for fault in ("missing artifact", "missing route", "missing icon", "output hash", "output mode"):
+            with self.subTest(fault=fault):
+                manifest = json.loads(json.dumps(self.manifest))
+                artifact = manifest["setup"]["artifacts"][observer.CLI_LOCALHOST_METADATA]
+                icon = "capsules/localhost-provider/icons/icon-256.png"
+                if fault == "missing artifact":
+                    del manifest["setup"]["artifacts"][observer.CLI_LOCALHOST_METADATA]
+                elif fault == "missing route":
+                    del manifest["holder"]["content"][manifest["files"][artifact]["cid"]]
+                elif fault == "missing icon":
+                    del manifest["consumer"]["files"][icon]
+                elif fault == "output hash":
+                    manifest["files"][manifest["consumer"]["files"][icon]]["sha256"] = "0" * 64
+                else:
+                    manifest["files"][manifest["consumer"]["files"][icon]]["mode"] = 0o644
+                with self.assertRaises(ValueError):
+                    observer.cli_admit_setup(self.root, manifest)
+
+    def test_qualified_source_kubo_metadata_is_omitted_from_fixed_setup_fixture(self):
+        support = self.qualified_home_support()
+        registry = observer.cli_json(support / "components.json")
+        registry["external"]["kubo"]["capsule_metadata"] = {"platforms": {"darwin-arm64": {
+            "release_path": "kubo-capsule.tar.gz", "install_path": "capsules/kubo"}}}
+        observer.write(support / "components.json", registry)
+        observer.cli_qualified_home(support, "darwin-arm64")
+        self.setup_fixture(support=support)
+        components = observer.cli_json(self.root / self.manifest["publications"]["old"]["components"])
+        self.assertTrue(all("capsule_metadata" not in components["external"][name]
+                            for name in observer.CLI_SETUP_COMPONENTS))
+        observer.cli_admit_setup(self.root, self.manifest)
+
+    def test_real_runtime_requires_setup_closure_while_self_tests_still_run_setup(self):
+        manifest = json.loads(json.dumps(self.manifest))
+        manifest["proof_kind"] = "real-runtime"
+        with self.assertRaisesRegex(ValueError, "requires signed setup artifacts"):
+            observer.cli_admit_setup(self.root, manifest)
+        code, calls, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        self.assertTrue(any(argv[1:] == ["setup"] for argv, _ in calls))
+        self.assertTrue(all(receipt["status"] == "passed" for receipt in result["setup"].values()))
+
+    def test_runner_setup_precedes_verification_and_every_baseline_seed(self):
+        self.setup_fixture(initial_home=True, metadata=True)
+        with patch.object(observer, "cli_initial_home", return_value={"status": "passed"}):
+            code, calls, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        self.assertEqual(len(result["setup"]), 2 + len(observer.CLI_REFUSALS))
+        for home in ("cli", "initial-home", *("m2-" + case for case in observer.CLI_REFUSALS)):
+            commands = [argv for argv, env in calls if Path(env["HOME"]).name == home]
+            install = next(index for index, argv in enumerate(commands) if argv[0] == "/bin/bash")
+            setup = next(index for index, argv in enumerate(commands) if argv[1:] == ["setup"])
+            version = next(index for index, argv in enumerate(commands) if argv[1:] == ["--version"])
+            self.assertLess(install, setup)
+            self.assertLess(setup, version)
+        self.assertTrue(result["cleanup"]["passed"])
+        self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+        self.assertFalse(any(argv[1:] == ["home", "--browser"] for argv, _ in calls))
+
+    def test_runner_setup_failure_keeps_receipt_stops_before_update_and_cleans(self):
+        self.setup_fixture()
+        roots_at_setup = {}
+        spawn = observer.CliProcesses.spawn
+        def observe(manager, argv, *args):
+            if argv[1:] == ["setup"]:
+                roots_at_setup.update(manager.roots)
+            return spawn(manager, argv, *args)
+        with patch.object(observer.CliProcesses, "spawn", observe):
+            code, calls, result = self.fake_run(setup_exit=7)
+        self.assertEqual(code, 1)
+        self.assertIn("installed setup failed; command exit 7", result["failure"])
+        self.assertEqual(result["setup"]["m1-setup"]["exit"], 7)
+        self.assertTrue(all(str(self.root / "results/homes/cli" / observer.CLI_DATA / ("bin/" + name)) in roots_at_setup
+                            for name in observer.CLI_SETUP_COMPONENTS[1:]))
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_refuses_missing_corrupt_or_unsafe_setup_outputs_before_preservation(self):
+        self.setup_fixture(metadata=True)
+        original_root = self.root
+        for action, relative in (("omit", "components.json"), ("omit", "model-catalog.json"),
+                                 ("omit", "bin/kubo"), ("corrupt", "capsules/home/browser/index.html"),
+                                 ("mode", "bin/ipfs-provider"), ("mode", "capsules/home/.elastos-cid"),
+                                 ("omit", "capsules/localhost-provider/capsule.json"),
+                                 ("omit", "capsules/localhost-provider/icons/icon-256.png"),
+                                 ("corrupt", "capsules/localhost-provider/.elastos-cid"),
+                                 ("corrupt", "capsules/localhost-provider/.elastos-artifact-sha256"),
+                                 ("mode", "capsules/localhost-provider/icons/icon-32.png")):
+            with self.subTest(action=action, relative=relative):
+                code, calls, result = self.fake_run(setup_fault=(action, relative))
+                self.assertEqual(code, 1, result)
+                self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+                self.assertFalse((self.root / "results/homes/cli" / observer.CLI_DATA / "state/value").exists())
+                self.assertTrue(result["cleanup"]["passed"], result["cleanup"])
+                self.assertEqual((self.root / "results/homes/cli/.local/bin/elastos").read_bytes(), b"old")
+                shutil.rmtree(original_root / "results")
+
+    def test_prepare_preservation_copies_cannot_mask_setup_support(self):
+        self.setup_fixture(metadata=True)
+        copy = observer.cli_copy
+        copied = []
+        def observe(root, manifest, mapping, destination):
+            if destination == self.root / "results/homes/cli" / observer.CLI_DATA:
+                copied.extend(mapping)
+                self.assertFalse(set(mapping) & set(observer.cli_setup_files(manifest)))
+            return copy(root, manifest, mapping, destination)
+        with patch.object(observer, "cli_copy", observe):
+            code, _, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        self.assertIn("state/value", copied)
+        self.assertIn("fixture-tools/open", copied)
+
+    def test_prepare_refuses_setup_support_drift_before_copying_sentinels(self):
+        self.setup_fixture()
+        verify, checks = observer.cli_verify_setup_support, []
+        def observe(root, manifest, home_path):
+            if home_path.name == "cli":
+                checks.append(home_path)
+                if len(checks) == 2:
+                    (home_path / observer.CLI_DATA / "capsules/home/browser/index.html").write_bytes(b"drift after setup check")
+            return verify(root, manifest, home_path)
+        with patch.object(observer, "cli_verify_setup_support", observe):
+            code, calls, result = self.fake_run()
+        self.assertEqual(code, 1, result)
+        self.assertIn("installed setup support differs", result["failure"])
+        self.assertFalse((self.root / "results/homes/cli" / observer.CLI_DATA / "state/value").exists())
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertTrue(result["cleanup"]["passed"], result["cleanup"])
+
     def initial_home_fixture(self, home_url="http://localhost:8090/home/"):
         support = self.qualified_home_support()
         entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
@@ -1439,10 +1786,13 @@ class CliFixtureTests(unittest.TestCase):
     def test_local_generator_binds_reference_and_keeps_key_support_and_signature_gates(self):
         self.assert_generated_signed_fixture("local-rehearsal:" + "a" * 40 + ":UP-03-test")
 
+    def test_generator_preserves_qualified_localhost_metadata_archive_and_complete_setup_closure(self):
+        self.assert_generated_signed_fixture(metadata=True)
+
     def test_local_build_receipt_is_refused_by_ci_generation_and_keys_are_removed(self):
         self.assert_generated_signed_fixture(foreign_build=True)
 
-    def assert_generated_signed_fixture(self, local_rehearsal=None, foreign_build=False):
+    def assert_generated_signed_fixture(self, local_rehearsal=None, foreign_build=False, metadata=False):
         # Fake command delivery exercises generation; existing RFC 8032 test
         # signing supplies valid signatures to the actual installer verifier.
         # This proves observer admission only, and reports harness-self-test.
@@ -1461,6 +1811,7 @@ class CliFixtureTests(unittest.TestCase):
             build.update(proof_scope="local-rehearsal", reference=local_rehearsal or "local-rehearsal:" + "a" * 40 + ":UP-03-test")
             observer.write(build_receipt, build)
         support = self.qualified_home_support()
+        metadata_path = self.qualified_localhost_metadata(support) if metadata else None
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
         def command(argv, **kwargs):
@@ -1508,7 +1859,7 @@ class CliFixtureTests(unittest.TestCase):
                 self.assertTrue(all(not path.exists() for path in key_paths))
                 self.assertFalse((generated / "generator").exists())
                 return
-            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, local_rehearsal)
+            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, local_rehearsal, metadata_path)
         self.assertEqual(receipt["proof_scope"], "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal")
         if local_rehearsal is not None:
             self.assertEqual(receipt["reference"], local_rehearsal)
@@ -1547,11 +1898,21 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
         components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
         qualified = observer.cli_json(support / "components.json")
+        if metadata:
+            selected = observer.cli_localhost_metadata_info(components["external"]["localhost-provider"], "darwin-arm64")
+            original = observer.cli_localhost_metadata_info(qualified["external"]["localhost-provider"], "darwin-arm64")
+            self.assertEqual({key: value for key, value in selected.items() if key != "cid"}, original)
+            relative = generated_manifest["setup"]["artifacts"][observer.CLI_LOCALHOST_METADATA]
+            self.assertEqual((generated / relative).read_bytes(), metadata_path.read_bytes())
+            expected = observer.cli_localhost_metadata_files(metadata_path.read_bytes(), original)
+            self.assertEqual(generated_manifest["setup"]["localhost_metadata"]["files"], sorted(expected))
+            self.assertEqual({target: generated_manifest["files"][generated_manifest["consumer"]["files"][target]]["mode"]
+                              for target in expected}, {target: 0o600 for target in expected})
         consumer_data = generated / "copied-consumer" / observer.CLI_DATA
         observer.cli_copy(generated, generated_manifest, generated_manifest["consumer"]["files"], consumer_data)
-        self.assertEqual(components["external"]["home"], qualified["external"]["home"])
+        self.assertEqual(components["external"]["home"]["platforms"]["darwin-arm64"]["release_path"], "home.tar.gz")
         home_activation = observer.cli_home_activation_descriptor(components, "darwin-arm64")
-        active_home = consumer_data / home_activation["platforms"]["*"]["install_path"]
+        active_home = consumer_data / home_activation["platforms"]["darwin-arm64"]["install_path"]
         self.assertTrue(active_home.is_dir())
         copied_home = observer.cli_json(active_home / "capsule.json")
         self.assertEqual(copied_home["name"], "home")
@@ -1572,7 +1933,11 @@ class CliFixtureTests(unittest.TestCase):
             self.assertEqual(selected["cid"], binding["cid"])
             if "provider_runtime" in qualified["external"][name]:
                 self.assertEqual(components["external"][name]["provider_runtime"], qualified["external"][name]["provider_runtime"])
-        self.assertEqual(components["capsules"]["home"], observer.cli_json(support / "components.json")["capsules"]["home"])
+        package_fields = {"cid", "sha256", "size"}
+        self.assertEqual({key: value for key, value in components["capsules"]["home"].items() if key not in package_fields},
+                         {key: value for key, value in qualified["capsules"]["home"].items() if key not in package_fields})
+        observer.cli_admit_setup(generated, generated_manifest)
+        self.assertEqual(components["profiles"]["home"]["components"], list(observer.CLI_SETUP_COMPONENTS))
         self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
                             for target in generated_manifest["initial_home"]["files"]))
         native = generated_manifest["files"][generated_manifest["consumer"]["files"]["bin/localhost-provider"]]
@@ -1626,6 +1991,7 @@ class CliFixtureTests(unittest.TestCase):
             environment.update(CI="", GITHUB_ACTIONS="", ELASTOS_CI_FIXTURE_REFERENCE="", ELASTOS_CI_FIXTURE_SCOPE="")
         with patch.dict(observer.os.environ, environment), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
+             patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}):
             receipt = observer.cli_build_hop(destination, runtime, local_rehearsal)
         self.assertEqual(receipt["status"], "passed")
@@ -1650,6 +2016,7 @@ class CliFixtureTests(unittest.TestCase):
             return "" if argv[1] == "status" else "a" * 40 + "\n"
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
+             patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
              self.assertRaisesRegex(ValueError, "next Runtime build failed"):
             observer.cli_build_hop(destination, runtime)
@@ -1658,6 +2025,26 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(receipt["cleanup"]["passed"])
         self.assertEqual((destination / "elastos-old").read_bytes(), original)
         self.assertFalse((destination / "elastos-new").exists())
+
+    def test_hop_builder_low_reserve_refuses_before_commands_or_mutation(self):
+        runtime = self.root / "built-runtime"
+        original = b"retained old Runtime bytes"
+        runtime.write_bytes(original)
+        before = runtime.stat()
+        paths = set(self.root.iterdir())
+        destination = self.root / "build-inputs"
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=18 * 1024**3)), \
+             patch.object(observer.subprocess, "check_output") as git, patch.object(observer.CliProcesses, "command") as command, \
+             patch.object(observer.CliProcesses, "cleanup") as cleanup, patch.object(observer.shutil, "copyfile") as copy, \
+             patch.object(observer.Path, "mkdir") as mkdir, self.assertRaisesRegex(ValueError, "hop rebuild would breach the disk reserve"):
+            observer.cli_build_hop(destination, runtime)
+        for action in (git, command, cleanup, copy, mkdir):
+            action.assert_not_called()
+        self.assertFalse(destination.exists())
+        self.assertEqual(set(self.root.iterdir()), paths)
+        self.assertEqual(runtime.read_bytes(), original)
+        self.assertEqual((runtime.stat().st_ino, runtime.stat().st_mode), (before.st_ino, before.st_mode))
 
     def test_generator_command_failure_removes_keys_and_repository(self):
         support = self.qualified_home_support()
@@ -1678,8 +2065,9 @@ class CliFixtureTests(unittest.TestCase):
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
                  config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None,
-                 apply_exit=0, local_rehearsal=None):
+                 apply_exit=0, local_rehearsal=None, setup_exit=0, setup_fault=None):
         manifest, root, calls, processes = self.manifest, self.root, [], []
+        self_test = self
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
         initial_holder_config = None
@@ -1691,10 +2079,12 @@ class CliFixtureTests(unittest.TestCase):
             directory = home_path / observer.CLI_DATA
             directory.mkdir(parents=True, exist_ok=True)
             for key, target in (("binary", home_path / ".local/bin/elastos"), ("components", directory / "components.json"), ("catalogue", directory / "model-catalog.json")):
+                if first and key != "binary":
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((root / pub[key]).read_bytes())
             if first:
-                self.installed_metadata_fixture(home_path, name, consumed=False)
+                self.installed_metadata_fixture(home_path, name, consumed="setup" in manifest)
                 if metadata_drift == "legacy":
                     (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"substituted legacy release")
                 source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": public_ticket(),
@@ -1741,6 +2131,55 @@ class CliFixtureTests(unittest.TestCase):
                     stdout = json.dumps({"did": local_did if self.home.name == "holder" else "did:key:consumer"})
                 elif argv[0].endswith("/kubo"):
                     Path(kwargs["env"]["IPFS_PATH"]).mkdir(parents=True)
+                elif args == ["setup"]:
+                    directory = self.home / observer.CLI_DATA
+                    self_test.assertFalse((directory / "components.json").exists())
+                    self_test.assertFalse((directory / "model-catalog.json").exists())
+                    stderr = "ElastOS fixture — setup for darwin-arm64\n"
+                    if setup_exit:
+                        self.returncode = setup_exit
+                    else:
+                        publication = manifest["publications"]["old"]
+                        for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
+                            (directory / filename).write_bytes((root / publication[key]).read_bytes())
+                        if "setup" in manifest:
+                            observer.cli_admit_setup(root, manifest)
+                            for artifact in manifest["setup"]["artifacts"]:
+                                source = holder_data / observer.CLI_PUBLISHER / "artifacts" / artifact
+                                if artifact.endswith(".tar.gz"):
+                                    with observer.tarfile.open(fileobj=io.BytesIO(source.read_bytes()), mode="r:gz") as archive:
+                                        for member in archive.getmembers():
+                                            if member.isdir():
+                                                continue
+                                            target = directory / "capsules" / member.name
+                                            target.parent.mkdir(parents=True, exist_ok=True)
+                                            target.write_bytes(archive.extractfile(member).read())
+                                            target.chmod(member.mode & ~0o077)
+                                else:
+                                    target = directory / "bin" / artifact
+                                    target.parent.mkdir(parents=True, exist_ok=True)
+                                    target.write_bytes(source.read_bytes())
+                                    target.chmod(0o755)
+                            entry = observer.cli_json(directory / "components.json")["capsules"]["home"]
+                            caches = [("capsules/home", (entry["cid"], entry["sha256"]))]
+                            if "localhost_metadata" in manifest["setup"]:
+                                components = observer.cli_json(directory / "components.json")
+                                selected = observer.cli_localhost_metadata_info(components["external"]["localhost-provider"], "darwin-arm64")
+                                caches.append(("capsules/localhost-provider", (selected["cid"], selected["checksum"])))
+                            for folder, values in caches:
+                                for filename, value in zip(observer.CLI_HOME_CACHE, values):
+                                    target = directory / folder / filename
+                                    target.write_text(value + "\n")
+                                    target.chmod(0o600)
+                        if setup_fault:
+                            action, relative = setup_fault
+                            target = directory / relative
+                            if action == "omit":
+                                target.unlink()
+                            elif action == "mode":
+                                target.chmod(0o777)
+                            else:
+                                target.write_bytes(b"wrong setup output")
                 elif argv[0] == "/bin/bash" or args[0] == "update":
                     name = phase()
                     if name in observer.CLI_REFUSALS:
