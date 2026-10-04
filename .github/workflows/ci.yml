@@ -145,9 +145,8 @@ jobs:
           candidates = {path: identity(path) for path in unused_xcodes(applications, selected)}
           usage = shutil.disk_usage(".")
           # setup-source-home documents a roughly 10 GiB cold-build footprint.
-          # Leave 12 GiB for that build and retain 12% for installed journeys.
-          required = max((usage.total * 15 + 99) // 100,
-                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          # Reserve 15% after an estimated 12 GiB build allowance.
+          required = (usage.total * 15 + 99) // 100 + 12 * 1024**3
           print(json.dumps({"stage": "before", "total_bytes": usage.total,
                             "available_bytes": usage.free, "required_bytes": required,
                             "selected": [str(path.resolve(strict=True)) for path in selected],
@@ -241,8 +240,7 @@ jobs:
           python3 - <<'PYCODE'
           import json, shutil
           usage = shutil.disk_usage(".")
-          required = max((usage.total * 15 + 99) // 100,
-                         (usage.total * 12 + 99) // 100 + 12 * 1024**3)
+          required = (usage.total * 15 + 99) // 100 + 12 * 1024**3
           print(json.dumps({"stage": "before_source_home", "total_bytes": usage.total,
                             "available_bytes": usage.free, "required_bytes": required}), flush=True)
           if usage.free < required:
@@ -253,7 +251,43 @@ jobs:
             RUSTUP_HOME="$PROOF_OPERATOR_RUSTUP_HOME" \
             PATH="${PROOF_OPERATOR_CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}" \
             SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$media_tools" \
-            scripts/setup-source-home.sh > "${CI_SOURCE_HOME}/setup-source-home.private.log" 2>&1
+            scripts/setup-source-home.sh > "${CI_SOURCE_HOME}/setup-source-home.private.log" 2>&1 || {
+              setup_status=$?
+              SETUP_EXIT_STATUS="$setup_status" python3 - <<'PYCODE' || true
+          import hashlib, json, os, re, shutil
+          from pathlib import Path
+          log = Path(os.environ["CI_SOURCE_HOME"]) / "setup-source-home.private.log"
+          raw = log.read_bytes()
+          lines = raw.decode("utf-8", errors="replace").splitlines()
+          # Report fixed stage names and error categories; raw paths and state
+          # stay in the private log.
+          known_stages = {
+              "build runtime server", "build Browser VZ engine supervisor", "build native provider binaries",
+              "build Home CLI native renderer", "build app WASM capsules", "install native providers and stamp manifest",
+              "install signed model catalog", "install content publish backend before final manifest stamp",
+              "install Kubo for Library/Documents publish", "build licensed llama-server prerequisite",
+              "finalize source-home component selection", "install app capsules and manifest entrypoints",
+              "install Browser runtime helper scripts", "configure launch-owned Browser VZ TURN",
+              "write Browser source-home provider config",
+          }
+          stages = [line.removeprefix("[setup-source-home] ") for line in lines
+                    if line.removeprefix("[setup-source-home] ") in known_stages]
+          categories = []
+          if b"less than 15% free disk space" in raw:
+              categories.append("recipe_disk_reserve")
+          if any(re.match(r"^error(?:\[E[0-9]+\])?:", line) for line in lines):
+              categories.append("rust_build")
+          if b"Traceback (most recent call last):" in raw:
+              categories.append("python_helper")
+          usage = shutil.disk_usage(".")
+          print(json.dumps({"stage": "source_home_failure", "exit_code": int(os.environ["SETUP_EXIT_STATUS"]),
+                            "last_setup_stage": stages[-1] if stages else "unavailable",
+                            "error_categories": categories,
+                            "private_log_sha256": hashlib.sha256(raw).hexdigest(),
+                            "total_bytes": usage.total, "available_bytes": usage.free}), flush=True)
+          PYCODE
+              exit "$setup_status"
+            }
           ELASTOS_DATA_DIR="${CI_SOURCE_HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh --require-verified model-provider
       - name: verify installation receipt and artifact parity
