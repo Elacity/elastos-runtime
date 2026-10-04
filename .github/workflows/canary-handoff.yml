@@ -1,0 +1,667 @@
+# Repackage the accepted key-free builder artifact; this job does not rebuild it.
+name: Canary handoff
+
+on:
+  push:
+    branches: [fix/89-canary-inputs]
+    paths: [.github/workflows/canary-handoff.yml, .github/canary-operator-runbook.md]
+  workflow_dispatch:
+    inputs:
+      original_run:
+        description: Accepted canary-inputs run to package
+        default: '37088374176'
+        required: true
+        type: string
+      finalize_v2:
+        description: Finalize V2 metadata after the operator publishes the real signed V1
+        default: false
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: canary-handoff-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: 8a9dec16b4febfac5759883ec7462e1ea780dd59
+  SOURCE_TREE: e18d17a3431b4d2548796347528e28afee909e35
+  ORIGINAL_RUN: ${{ inputs.original_run || '37088374176' }}
+  ORIGINAL_WORKFLOW_COMMIT: 7eeb93f9f6e3ae70b8e5d67816c0c0a5f7b73dfe
+  CANARY_DID: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+  PUBLISHER_ORIGIN: https://elastos.elacitylabs.com
+  V1_RELEASE_CID: QmPwpaXwp4biZ3ZvSExLgBoTADCXkFrY8kggDYTXGJE9h8
+  V1_HEAD_CID: QmeAK6hudaKZPANVEE5FXVh9dP6agcWLK5LCschg3ZzBte
+  FINALIZE_V2: ${{ inputs.finalize_v2 == true && 'true' || 'false' }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  package:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'handoff-ready') }}
+    name: authenticate and preserve prepared input modes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: check out trusted source metadata tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: check out this workflow and its operator instructions
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          path: builder
+          persist-credentials: false
+      - name: authenticate, restore modes and package the original artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
+          [[ "$GITHUB_ACTIONS/$RUNNER_ENVIRONMENT/$RUNNER_OS" == true/github-hosted/Linux ]]
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD^{tree})" == "$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          python3 - <<'PY'
+          import base64, gzip, hashlib, importlib.util, ipaddress, json, os, re, shutil, stat, subprocess, sys, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          repository = 'Elacity/elastos-runtime'
+          run_id = os.environ['ORIGINAL_RUN']
+          assert run_id == '37088374176', 'Original run requires a separately reviewed workflow change'
+          commit, tree = os.environ['SOURCE_COMMIT'], os.environ['SOURCE_TREE']
+          scratch = Path(os.environ['RUNNER_TEMP']) / 'canary-handoff'
+          scratch.mkdir(mode=0o700)
+          root = scratch / 'inputs'
+          root.mkdir(mode=0o700)
+          output = scratch / 'output'
+          output.mkdir(mode=0o700)
+          bound = 8 * 1024**3
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect())
+          def api(path):
+              request = urllib.request.Request('https://api.github.com' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'Elastos-canary-handoff'})
+              return opener.open(request, timeout=60)
+          def api_json(path):
+              with api(path) as reply:
+                  data = reply.read(2 * 1024**2 + 1)
+                  assert len(data) <= 2 * 1024**2
+                  return json.loads(data)
+          run = api_json(f'/repos/{repository}/actions/runs/{run_id}')
+          assert run['id'] == int(run_id) and run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['head_sha'] == os.environ['ORIGINAL_WORKFLOW_COMMIT'] and run['head_branch'] == 'fix/89-canary-inputs'
+          assert run['path'] == '.github/workflows/canary-inputs.yml'
+          name = f"canary-inputs-aarch64-darwin-{commit}-{run['run_attempt']}"
+          listing = api_json(f'/repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+          assert listing['total_count'] <= 100
+          matches = [item for item in listing['artifacts'] if item['name'] == name]
+          assert len(matches) == 1
+          artifact = matches[0]
+          assert artifact['expired'] is False and 0 < artifact['size_in_bytes'] <= bound
+          assert artifact['workflow_run']['id'] == int(run_id)
+          assert artifact['workflow_run']['head_sha'] == run['head_sha']
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest'])
+          archive = scratch / 'original.zip'
+          usage = shutil.disk_usage(scratch)
+          assert (usage.free - artifact['size_in_bytes']) * 100 >= usage.total * 15
+          try:
+              api(f"/repos/{repository}/actions/artifacts/{artifact['id']}/zip")
+              raise ValueError('Expected authenticated artifact download redirect')
+          except urllib.error.HTTPError as reply:
+              assert reply.code == 302
+              location = reply.headers['Location']
+          target = urllib.parse.urlsplit(location)
+          assert target.scheme == 'https' and target.hostname and not target.username and not target.password
+          # The API supplies the signed download URL. Keep API credentials on api.github.com.
+          digest, size = hashlib.sha256(), 0
+          with opener.open(urllib.request.Request(location), timeout=60) as reply, archive.open('xb') as destination:
+              while chunk := reply.read(1024**2):
+                  size += len(chunk)
+                  assert size <= bound and size <= artifact['size_in_bytes']
+                  digest.update(chunk)
+                  destination.write(chunk)
+          assert size == artifact['size_in_bytes'] and 'sha256:' + digest.hexdigest() == artifact['digest']
+          def relative(name):
+              assert isinstance(name, str) and len(name) <= 240 and '\\' not in name
+              parts = name.split('/')
+              assert len(parts) <= 16 and all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', part)
+                                             and part not in ('.', '..') for part in parts)
+              assert not PurePosixPath(name).is_absolute()
+              return name
+          with zipfile.ZipFile(archive) as zipped:
+              members = zipped.infolist()
+              assert 0 < len(members) <= 4096
+              names, total = set(), 0
+              for member in members:
+                  relative(member.filename)
+                  assert member.filename not in names and not member.is_dir()
+                  names.add(member.filename)
+                  mode = member.external_attr >> 16
+                  assert stat.S_IFMT(mode) in (0, stat.S_IFREG), 'Special ZIP member refused'
+                  assert not member.flag_bits & 1 and 0 <= member.file_size <= bound
+                  total += member.file_size
+                  assert total <= bound
+              usage = shutil.disk_usage(scratch)
+              assert (usage.free - 2 * total - len(members) * 1024) * 100 >= usage.total * 15
+              for member in members:
+                  destination = root / member.filename
+                  destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                  count = 0
+                  with zipped.open(member) as source, destination.open('xb') as target:
+                      while chunk := source.read(1024**2):
+                          count += len(chunk)
+                          assert count <= member.file_size
+                          target.write(chunk)
+                  assert count == member.file_size
+          def sha(path):
+              digest = hashlib.sha256()
+              with path.open('rb') as source:
+                  for chunk in iter(lambda: source.read(1024**2), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          sums = root / 'SHA256SUMS'
+          assert sums.stat().st_size <= 1024**2
+          recorded = {}
+          for line in sums.read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+              assert match
+              expected, name = match.groups()
+              relative(name)
+              assert name not in recorded and name != 'SHA256SUMS'
+              recorded[name] = expected
+          assert names == set(recorded) | {'SHA256SUMS'}, 'Complete checksum inventory required'
+          for name, expected in recorded.items():
+              assert sha(root / name) == expected, name
+          def read_json(path):
+              assert path.stat().st_size <= 2 * 1024**2
+              return json.loads(path.read_bytes())
+          build = read_json(root / 'receipts/build.json')
+          assert build['source_commit'] == commit and build['source_tree'] == tree
+          assert build['workflow_commit'] == run['head_sha'] and build['source_clean_before_and_after'] is True
+          assert build['workflow_ref'] == repository + '/.github/workflows/canary-inputs.yml@refs/heads/fix/89-canary-inputs'
+          assert build['run'] == run_id and int(build['attempt']) == run['run_attempt']
+          cleanup = read_json(root / 'receipts/process-cleanup.json')
+          assert cleanup['owned_kubo_stopped'] is True and cleanup['ephemeral_builder_home_removed'] is True
+          # Byte-compare the uncompressed source archive with Git's exact pinned archive.
+          original_source_digest = hashlib.sha256()
+          uncompressed = 0
+          with gzip.open(root / 'source.tar.gz', 'rb') as source:
+              while chunk := source.read(1024**2):
+                  uncompressed += len(chunk)
+                  assert uncompressed <= bound
+                  original_source_digest.update(chunk)
+          reconstructed = hashlib.sha256()
+          with subprocess.Popen(['git', 'archive', '--format=tar', commit], stdout=subprocess.PIPE) as process:
+              for chunk in iter(lambda: process.stdout.read(1024**2), b''):
+                  reconstructed.update(chunk)
+              assert process.wait() == 0
+          assert reconstructed.digest() == original_source_digest.digest(), 'Pinned source archive differs'
+          for path in [root, *root.rglob('*')]:
+              assert not path.is_symlink()
+              path.chmod(0o700 if path.is_dir() else 0o600)
+          spec = importlib.util.spec_from_file_location('native_input', Path('scripts/release-platform-input.py').resolve())
+          native = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = native
+          spec.loader.exec_module(native)
+          for label, version in [('N1', '0.8.0-alpha.1'), ('N2', '0.8.0-alpha.2')]:
+              base = root / label
+              receipt = read_json(base / 'platform-input.json')
+              assert receipt['source']['commit'] == commit and receipt['source']['tree'] == tree
+              assert receipt['platform'] == 'aarch64-darwin' and receipt['version'] == version
+              assert 0 < len(receipt['files']) <= 512
+              assert {path.relative_to(base).as_posix() for path in base.rglob('*') if path.is_file()} == set(receipt['files']) | {'platform-input.json'}
+              for name, record in receipt['files'].items():
+                  relative(name)
+                  path = base / name
+                  assert type(record['executable']) is bool and type(record['size']) is int
+                  assert path.stat().st_size == record['size'] and sha(path) == record['sha256']
+                  path.chmod(0o700 if record['executable'] else 0o600)
+              native.verify(base)
+          assert (root / 'N2/support-input.json').read_bytes() == (root / 'N1/platform-input.json').read_bytes()
+          spec = importlib.util.spec_from_file_location('release_signer', Path('scripts/release-signer.py').resolve())
+          signer = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = signer
+          spec.loader.exec_module(signer)
+          assert sha(root / 'release-signer.py') == sha(Path('scripts/release-signer.py'))
+          manifests = {}
+          for label, version in [('unsigned-V1', '0.8.0-alpha.1'), ('unsigned-V2-PROVISIONAL', '0.8.0-alpha.2')]:
+              base = root / label
+              manifest = signer.parse_json((base / 'signing-input.json').read_bytes())
+              manifests[label] = manifest
+              assert manifest['source'] == {'commit': commit, 'tree': tree}
+              assert manifest['version'] == version and manifest['channel'] == 'canary'
+              assert {path.relative_to(base).as_posix() for path in base.rglob('*') if path.is_file()} == set(manifest['files']) | {'signing-input.json'}
+              for name, record in manifest['files'].items():
+                  relative(name)
+                  path = base / name
+                  assert sha(path) == record['sha256'] and path.stat().st_size == record['size']
+              rendered = signer.render_installer(Path('scripts/install.sh').read_bytes(), manifest['installer']['stamps'], os.environ['CANARY_DID'])
+              assert rendered == (root / 'frozen-install.sh').read_bytes()
+              assert signer.sha256(rendered) == manifest['release']['installer_sha256']
+              assert manifest['installer'] == read_json(root / ('receipts/' + label + '-stamps.json'))
+              assert {name: record['cid'] for name, record in manifest['files'].items()} == read_json(root / ('receipts/' + label + '-cids.json'))
+              for path in base.rglob('*'):
+                  if path.is_file():
+                      path.chmod(0o400)
+          assert read_json(root / 'policy-drafts/unsigned-V2-PROVISIONAL.json')['manifest_sha256'] is None
+          # Qualify the operator's public-receipt migration commands in an isolated
+          # hosted-runner data root. The real seed and custody paths stay outside CI.
+          runbook = Path('../builder/.github/canary-operator-runbook.md').read_text()
+          def operator_python(marker):
+              matches = re.findall(re.escape(marker) + r" <<'PY'\n(.*?)\nPY", runbook, re.S)
+              assert len(matches) == 1
+              return matches[0]
+          permission_program = operator_python('python3 -I -S - "$SEED_DATA_DIR"')
+          seed_program = operator_python('python3 -I -S - "$SEED_DATA_DIR" "$BASELINE_RECEIPT"')
+          migration = scratch / 'migration-qualification'
+          migration.mkdir(mode=0o700)
+          baseline = migration / 'verified-baseline-receipt.json'
+          # The accepted original artifact already binds this signed baseline.
+          # Filesystem qualification uses those authenticated retained bytes,
+          # so an operator upgrade window or published V1 cannot invalidate it.
+          # The operator still checks the live chain before its first import;
+          # V2 finalization below verifies the actual live signed V1 and CIDs.
+          public_proof = read_json(root / 'receipts/public-verification.json')
+          baseline_record = read_json(root / 'public-baseline/suggested-publish-state.json')
+          head_bytes = (root / 'public-baseline/release-head.json').read_bytes()
+          release_bytes = (root / 'public-baseline/release.json').read_bytes()
+          assert public_proof['signatures'] == 'OpenSSL 3 Ed25519 verification passed'
+          assert public_proof['source_commit'] == commit and public_proof['source_tree'] == tree
+          assert signer.sha256(head_bytes) == public_proof['head_sha256']
+          assert signer.sha256(release_bytes) == public_proof['release_sha256']
+          assert baseline_record['publisher_did'] == public_proof['baseline_did']
+          assert baseline_record['last_head_cid'] == signer.unixfs_metadata_cid(head_bytes) == manifests['unsigned-V1']['head']['prev_head_cid']
+          assert baseline_record['last_release_cid'] == signer.unixfs_metadata_cid(release_bytes) == manifests['unsigned-V1']['release']['prev_release_cid']
+          baseline.write_bytes((root / 'public-baseline/suggested-publish-state.json').read_bytes())
+          baseline.chmod(0o600)
+          checks = []
+          def provision(data, succeeds):
+              result = subprocess.run([sys.executable, '-I', '-S', '-', str(data), str(baseline)],
+                                      input=seed_program.encode(), env={'PATH': '/usr/bin:/bin'}, capture_output=True, timeout=30)
+              assert (result.returncode == 0) == succeeds
+          data = migration / 'data'
+          data.mkdir(mode=0o700)
+          provision(data, True)
+          receipt = data / 'ElastOS/SystemServices/Publisher/publish-state.json'
+          assert receipt.read_bytes() == baseline.read_bytes() and stat.S_IMODE(receipt.stat().st_mode) == 0o600
+          assert receipt.stat().st_nlink == 1 and receipt.stat().st_uid == os.getuid()
+          checks.append('verified baseline and exclusive protected receipt creation')
+          before = receipt.read_bytes(), receipt.stat().st_mode
+          provision(data, False)
+          assert (receipt.read_bytes(), receipt.stat().st_mode) == before
+          checks.append('existing receipt refused and preserved')
+          for kind in ['symlink', 'hardlink']:
+              alias_data = migration / kind
+              parent = alias_data / 'ElastOS/SystemServices/Publisher'
+              parent.mkdir(mode=0o700, parents=True)
+              destination = parent / 'publish-state.json'
+              if kind == 'symlink':
+                  destination.symlink_to(baseline)
+              else:
+                  os.link(baseline, destination)
+              provision(alias_data, False)
+              assert baseline.read_bytes() == receipt.read_bytes()
+              checks.append(kind + ' destination refused and public input preserved')
+          writable = migration / 'group-writable-data'
+          writable.mkdir(mode=0o770)
+          writable.chmod(0o770)
+          provision(writable, False)
+          assert not (writable / 'ElastOS').exists()
+          checks.append('writable data parent refused before receipt creation')
+          def legacy_tree(label, mode=0o775):
+              data = migration / label
+              data.mkdir(mode=0o700)
+              directories = []
+              current = data
+              for name in ['ElastOS', 'SystemServices', 'Publisher']:
+                  current = current / name
+                  current.mkdir(mode=0o700)
+                  current.chmod(mode)
+                  directories.append(current)
+              return data, directories
+          def normalize(data, succeeds):
+              result = subprocess.run([sys.executable, '-I', '-S', '-', str(data)],
+                                      input=permission_program.encode(), env={'PATH': '/usr/bin:/bin'}, capture_output=True, timeout=30)
+              assert (result.returncode == 0) == succeeds
+          for mode in [0o775, 0o2775, 0o1775]:
+              legacy, directories = legacy_tree('legacy-mode-' + oct(mode), mode)
+              preserved = directories[-1] / 'preserved-public-input.json'
+              preserved.write_bytes(baseline.read_bytes())
+              preserved.chmod(0o600)
+              normalize(legacy, True)
+              assert all(stat.S_IMODE(path.stat().st_mode) == mode & ~stat.S_IWGRP for path in directories)
+              assert stat.S_IMODE(legacy.stat().st_mode) == 0o700
+              assert preserved.read_bytes() == baseline.read_bytes() and stat.S_IMODE(preserved.stat().st_mode) == 0o600
+              provision(legacy, True)
+              assert (directories[-1] / 'publish-state.json').read_bytes() == baseline.read_bytes()
+              checks.append('legacy ' + oct(mode) + ' removes only group write and admits the strict migration')
+          def unchanged(paths):
+              return [(path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_uid,
+                       stat.S_IMODE(path.lstat().st_mode)) for path in paths]
+          for level in range(4):
+              legacy, directories = legacy_tree('legacy-link-' + str(level))
+              target = [legacy, *directories][level]
+              moved = target.with_name(target.name + '-preserved')
+              target.rename(moved)
+              target.symlink_to(moved, target_is_directory=True)
+              paths = [legacy, *directories, moved]
+              before = unchanged(paths)
+              normalize(legacy, False)
+              assert unchanged(paths) == before
+              checks.append('legacy directory link at level ' + str(level) + ' refused before permission changes')
+          legacy, directories = legacy_tree('legacy-ancestor-target')
+          alias = migration / 'legacy-ancestor-link'
+          alias.symlink_to(migration, target_is_directory=True)
+          paths = [legacy, *directories, alias]
+          before = unchanged(paths)
+          normalize(alias / legacy.name, False)
+          assert unchanged(paths) == before
+          checks.append('legacy data ancestor link refused before permission changes')
+          for failure in ['foreign-owner', 'world-write', 'writable-data']:
+              legacy, directories = legacy_tree('legacy-' + failure)
+              if failure == 'foreign-owner':
+                  # Fixture ownership is changed only inside this disposable
+                  # hosted runner. The operator procedure uses its own UID.
+                  subprocess.run(['sudo', 'chown', '0:0', str(directories[-1])], check=True, timeout=15)
+              elif failure == 'world-write':
+                  directories[-1].chmod(0o777)
+              else:
+                  legacy.chmod(0o770)
+              paths = [legacy, *directories]
+              before = unchanged(paths)
+              normalize(legacy, False)
+              assert unchanged(paths) == before
+              checks.append('legacy ' + failure + ' refused before permission changes')
+          shutil.rmtree(migration)
+          (root / 'receipts/migration-qualification.json').write_text(json.dumps({
+              'checks': checks, 'all_passed': True, 'isolated_data_removed': True,
+              'old_baseline_online_verified': False,
+              'baseline_verification': 'authenticated original artifact and operator live-chain comparison before import',
+              'runbook_sha256': hashlib.sha256(runbook.encode()).hexdigest(),
+              'operator_gate': 'Anders approves the real seed migration and upgrade/import window.'}, indent=2) + '\n')
+          v2_state = 'PROVISIONAL; real signed V1 CIDs required'
+          if os.environ['FINALIZE_V2'] == 'true':
+              v1 = manifests['unsigned-V1']
+              provisional = manifests['unsigned-V2-PROVISIONAL']
+              stamps = provisional['installer']['stamps']
+              assert v1['installer'] == provisional['installer']
+              origin = os.environ['PUBLISHER_ORIGIN']
+              assert stamps['PUBLISHER_GATEWAY'] == origin and stamps['MAINTAINER_DID'] == os.environ['CANARY_DID']
+              public = root / 'public-V1'
+              public.mkdir(mode=0o700)
+              def public_bytes(name, limit):
+                  # Public verification uses fixed HTTPS paths and carries no API credentials.
+                  request = urllib.request.Request(origin + '/' + name, headers={'User-Agent': 'Elastos-canary-handoff'})
+                  with opener.open(request, timeout=30) as reply:
+                      assert reply.status == 200
+                      data = reply.read(limit + 1)
+                      assert 0 < len(data) <= limit
+                  return data
+              openssl = shutil.which('openssl')
+              assert openssl and subprocess.check_output([openssl, 'version'], text=True).startswith('OpenSSL 3.')
+              did = os.environ['CANARY_DID']
+              signer.check_did(did)
+              number = 0
+              for char in did[len('did:key:z'):]:
+                  number = number * 58 + signer.BASE58.index(char)
+              public_key = public / 'public-key.der'
+              public_key.write_bytes(bytes.fromhex('302a300506032b6570032100') + number.to_bytes(34, 'big')[2:])
+              def verified_envelope(name, domain):
+                  data = public_bytes(name, 256 * 1024)
+                  envelope = signer.parse_json(data)
+                  assert set(envelope) == {'payload', 'signature', 'signer_did'} and envelope['signer_did'] == did
+                  assert re.fullmatch(r'[0-9a-f]{128}', envelope['signature'])
+                  payload = envelope['payload']
+                  assert type(payload) is dict
+                  digest_file, signature_file = public / (name + '.digest'), public / (name + '.signature')
+                  digest_file.write_bytes(signer.signature_digest(domain, signer.json_bytes(payload)))
+                  signature_file.write_bytes(bytes.fromhex(envelope['signature']))
+                  subprocess.run([openssl, 'pkeyutl', '-verify', '-rawin', '-pubin', '-keyform', 'DER',
+                                  '-inkey', str(public_key), '-in', str(digest_file), '-sigfile', str(signature_file)],
+                                 env={'OPENSSL_CONF': '/dev/null', 'LANG': 'C'}, capture_output=True, check=True, timeout=15)
+                  (public / name).write_bytes(data)
+                  return data, payload
+              release_bytes, release = verified_envelope('release.json', 'elastos.release.v1')
+              head_bytes, head = verified_envelope('release-head.json', 'elastos.release.head.v1')
+              assert release == v1['release'], 'Public signed V1 differs from the prepared V1 payload'
+              release_cid, head_cid = signer.unixfs_metadata_cid(release_bytes), signer.unixfs_metadata_cid(head_bytes)
+              assert release_cid == os.environ['V1_RELEASE_CID'] and head_cid == os.environ['V1_HEAD_CID']
+              expected_head = {'schema': 'elastos.release.head/v1', 'channel': 'canary', 'version': '0.8.0-alpha.1',
+                               'latest_release_cid': release_cid, 'release_sha256': signer.sha256(release_bytes),
+                               'updated_at': v1['head']['updated_at'], 'signer_did': did,
+                               'prev_head_cid': v1['head']['prev_head_cid']}
+              assert head == expected_head, 'Public signed V1 head differs from the prepared chain'
+              installer = public_bytes('install.sh', 2 * 1024**2)
+              assert installer == (root / 'frozen-install.sh').read_bytes()
+              assert signer.sha256(installer) == release['installer_sha256']
+              (public / 'install.sh').write_bytes(installer)
+              bootstrap_bytes = public_bytes('.well-known/elastos/carrier-bootstrap.json?role=publisher', 16 * 1024)
+              bootstrap = signer.parse_json(bootstrap_bytes)
+              assert bootstrap['schema'] == 'elastos.carrier.bootstrap/v1' and bootstrap['role'] == 'publisher'
+              # The frozen installer keeps its ticket. A restarted holder may
+              # change only the optional IPv6 port in its current public ticket.
+              # Every other decoded field remains exactly the frozen value.
+              def ticket_content(encoded, node):
+                  assert type(encoded) is str and 0 < len(encoded) <= 16 * 1024
+                  assert re.fullmatch(r'[a-z2-7]+', encoded)
+                  raw = base64.b32decode(encoded.upper() + '=' * (-len(encoded) % 8))
+                  assert base64.b32encode(raw).decode().rstrip('=').lower() == encoded
+                  document = signer.parse_json(raw)
+                  assert type(document) is dict and set(document) == {'endpoints', 'topic'} and document['topic'] is None
+                  endpoints = document['endpoints']
+                  assert type(endpoints) is list and len(endpoints) == 1
+                  endpoint = endpoints[0]
+                  assert type(endpoint) is dict and set(endpoint) == {'id', 'addrs'} and endpoint['id'] == node
+                  addresses = endpoint['addrs']
+                  assert type(addresses) is list and len(addresses) == 4
+                  ports = []
+                  for record in addresses:
+                      assert type(record) is dict and set(record) == {'Ip'} and type(record['Ip']) is str
+                      address = record['Ip']
+                      if address.startswith('['):
+                          match = re.fullmatch(r'\[([^\]]+)\]:([1-9][0-9]{0,4})', address)
+                          assert match and str(ipaddress.IPv6Address(match[1])) == match[1]
+                          port = int(match[2])
+                          assert port <= 65535
+                          ports.append(port)
+                          record['Ip'] = '[' + match[1] + ']:optional-port'
+                      else:
+                          host, port = address.rsplit(':', 1)
+                          assert str(ipaddress.IPv4Address(host)) == host and port == '4433'
+                  assert len(ports) == 1
+                  return document, ports[0]
+              frozen_ticket = stamps['SOURCE_CONNECT_TICKET']
+              node = stamps['PUBLISHER_NODE_ID']
+              frozen_content, frozen_port = ticket_content(frozen_ticket, node)
+              def verify_bootstrap_ticket(document):
+                  assert type(document) is dict and document['node_id'] == node
+                  content, port = ticket_content(document['ticket'], node)
+                  assert content == frozen_content
+                  return port
+              routing_checks = []
+              original_document = signer.parse_json(base64.b32decode(frozen_ticket.upper() + '=' * (-len(frozen_ticket) % 8)))
+              def encoded_ticket(document):
+                  return base64.b32encode(signer.json_bytes(document)).decode().rstrip('=').lower()
+              assert verify_bootstrap_ticket({'node_id': node, 'ticket': frozen_ticket}) == frozen_port
+              routing_checks.append('exact frozen ticket accepted')
+              changed = signer.parse_json(signer.json_bytes(original_document))
+              ipv6_index = next(index for index, record in enumerate(changed['endpoints'][0]['addrs']) if record['Ip'].startswith('['))
+              changed['endpoints'][0]['addrs'][ipv6_index]['Ip'] = changed['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':1'
+              assert verify_bootstrap_ticket({'node_id': node, 'ticket': encoded_ticket(changed)}) == 1
+              routing_checks.append('optional IPv6 port change accepted with all other fields exact')
+              def refused(label, mutate):
+                  fixture = signer.parse_json(signer.json_bytes(original_document))
+                  mutate(fixture)
+                  try:
+                      verify_bootstrap_ticket({'node_id': node, 'ticket': encoded_ticket(fixture)})
+                  except (AssertionError, ValueError, KeyError, TypeError):
+                      routing_checks.append(label + ' refused')
+                  else:
+                      raise AssertionError(label + ' was accepted')
+              refused('wrong holder identity', lambda fixture: fixture['endpoints'][0].update(id='0' * 64))
+              refused('changed IPv6 address', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip='[::1]:4433'))
+              refused('changed IPv4 address', lambda fixture: fixture['endpoints'][0]['addrs'][0].update(Ip='192.0.2.1:4433'))
+              refused('changed IPv4 port', lambda fixture: fixture['endpoints'][0]['addrs'][0].update(Ip=fixture['endpoints'][0]['addrs'][0]['Ip'].rsplit(':', 1)[0] + ':4434'))
+              refused('missing route', lambda fixture: fixture['endpoints'][0]['addrs'].pop(0))
+              refused('added route', lambda fixture: fixture['endpoints'][0]['addrs'].append({'Ip': '192.0.2.1:4433'}))
+              refused('reordered routes', lambda fixture: fixture['endpoints'][0]['addrs'].reverse())
+              refused('extra endpoint', lambda fixture: fixture['endpoints'].append(fixture['endpoints'][0]))
+              refused('changed topic', lambda fixture: fixture.update(topic='changed'))
+              refused('extra ticket field', lambda fixture: fixture.update(extra=True))
+              refused('zero IPv6 port', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip=fixture['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':0'))
+              refused('out-of-range IPv6 port', lambda fixture: fixture['endpoints'][0]['addrs'][ipv6_index].update(Ip=fixture['endpoints'][0]['addrs'][ipv6_index]['Ip'].rsplit(':', 1)[0] + ':65536'))
+              for label, document in [
+                  ('wrong bootstrap node', {'node_id': '0' * 64, 'ticket': frozen_ticket}),
+                  ('malformed ticket encoding', {'node_id': node, 'ticket': '!'}),
+                  ('duplicate ticket field', {'node_id': node, 'ticket': base64.b32encode(b'{"endpoints":[],"endpoints":[],"topic":null}').decode().rstrip('=').lower()}),
+              ]:
+                  try:
+                      verify_bootstrap_ticket(document)
+                  except (AssertionError, ValueError, KeyError, TypeError):
+                      routing_checks.append(label + ' refused')
+                  else:
+                      raise AssertionError(label + ' was accepted')
+              public_port = verify_bootstrap_ticket(bootstrap)
+              (public / 'carrier-bootstrap.json').write_bytes(bootstrap_bytes)
+              (public / 'frozen-ticket.json').write_bytes(signer.json_bytes(original_document))
+              (public / 'current-ticket.json').write_bytes(signer.json_bytes(signer.parse_json(base64.b32decode(bootstrap['ticket'].upper() + '=' * (-len(bootstrap['ticket']) % 8)))))
+              (root / 'receipts/bootstrap-routing-verification.json').write_text(json.dumps({
+                  'node_id': node, 'frozen_ticket_sha256': signer.sha256(frozen_ticket.encode()),
+                  'public_ticket_sha256': signer.sha256(bootstrap['ticket'].encode()),
+                  'public_bootstrap_sha256': signer.sha256(bootstrap_bytes),
+                  'frozen_ipv6_port': frozen_port, 'public_ipv6_port': public_port,
+                  'rule': 'Complete decoded ticket equality except the optional IPv6 port; frozen installer unchanged.',
+                  'checks': routing_checks, 'all_passed': True,
+                  'operator_gate': 'Final V2 policy signing/publication and Mac M2 require Anders approval.'}, indent=2) + '\n')
+              source_policy = {'repository': repository, 'channel': 'canary', 'version': '0.8.0-alpha.2',
+                               'commit': commit, 'tree': tree,
+                               'develop_oid': api_json(f'/repos/{repository}/git/ref/heads/develop')['object']['sha']}
+              signer.verify_source(source_policy, api_json)
+              additional = sum(record['size'] for record in provisional['files'].values())
+              usage = shutil.disk_usage(scratch)
+              assert (usage.free - total - 3 * additional - 8 * signer.MAX_JSON) * 100 >= usage.total * 15
+              metadata = scratch / 'V2-metadata'
+              metadata.mkdir(mode=0o700)
+              stage = metadata / 'stage'
+              full_cids = read_json(root / 'receipts/unsigned-V2-PROVISIONAL-cids.json')
+              n2 = read_json(root / 'N2/platform-input.json')
+              native_names = {name.removeprefix('artifacts/') for name in n2['files'] if name.startswith('artifacts/')}
+              assert set(full_cids) == native_names | {'components-aarch64-darwin.json'}
+              for name in native_names:
+                  assert provisional['files'][name]['sha256'] == n2['files']['artifacts/' + name]['sha256']
+                  assert provisional['files'][name]['size'] == n2['files']['artifacts/' + name]['size']
+              native_cids = {name: full_cids[name] for name in sorted(native_names)}
+              native_map, full_map, stamp_file = metadata / 'native-cids.json', metadata / 'full-cids.json', metadata / 'stamps.json'
+              native_map.write_bytes(signer.json_bytes(native_cids))
+              full_map.write_bytes(signer.json_bytes(full_cids))
+              stamp_file.write_bytes(signer.json_bytes(stamps))
+              helper = [sys.executable, 'scripts/release-platform-input.py']
+              preview = ['--preview-platform', 'aarch64-darwin']
+              subprocess.run([*helper, 'stage-inputs', '--input', 'aarch64-darwin=' + str(root / 'N2'),
+                              '--version', '0.8.0-alpha.2', '--output', str(stage), *preview], check=True, timeout=300)
+              subprocess.run([*helper, 'attach-cids', str(stage), '--cids', str(native_map), *preview], check=True, timeout=300)
+              assert (stage / 'artifacts/components-aarch64-darwin.json').read_bytes() == (root / 'unsigned-V2-PROVISIONAL/components-aarch64-darwin.json').read_bytes()
+              finalized = root / 'unsigned-V2'
+              subprocess.run([*helper, 'signing-input', str(stage), '--cids', str(full_map), '--stamps', str(stamp_file),
+                              '--channel', 'canary', '--output', str(finalized), '--prev-release-cid', release_cid,
+                              '--prev-head-cid', head_cid, *preview], check=True, timeout=300)
+              final_bytes = (finalized / 'signing-input.json').read_bytes()
+              final = signer.parse_json(final_bytes)
+              assert {key: value for key, value in final.items() if key not in ('release', 'head')} == {
+                  key: value for key, value in provisional.items() if key not in ('release', 'head')}
+              assert {key: value for key, value in final['release'].items() if key not in ('released_at', 'prev_release_cid')} == {
+                  key: value for key, value in provisional['release'].items() if key not in ('released_at', 'prev_release_cid')}
+              assert set(final['head']) == {'updated_at', 'prev_head_cid'}
+              assert final['release']['prev_release_cid'] == release_cid and final['head']['prev_head_cid'] == head_cid
+              assert type(final['release']['released_at']) is int and final['release']['released_at'] == final['head']['updated_at']
+              assert final['head']['updated_at'] >= head['updated_at']
+              assert {path.relative_to(finalized).as_posix() for path in finalized.rglob('*') if path.is_file()} == set(final['files']) | {'signing-input.json'}
+              for name, record in final['files'].items():
+                  assert sha(finalized / name) == sha(root / 'unsigned-V2-PROVISIONAL' / name) == record['sha256']
+                  assert (finalized / name).stat().st_size == record['size']
+              assert signer.render_installer(Path('scripts/install.sh').read_bytes(), final['installer']['stamps'], did) == installer
+              for path in finalized.rglob('*'):
+                  if path.is_file():
+                      assert stat.S_IMODE(path.stat().st_mode) == 0o400
+              policy = read_json(root / 'policy-drafts/unsigned-V2-PROVISIONAL.json')
+              policy['manifest_sha256'] = signer.sha256(final_bytes)
+              policy['develop_oid'] = source_policy['develop_oid']
+              (root / 'policy-drafts/unsigned-V2.json').write_text(json.dumps(policy, indent=2) + '\n')
+              public_receipt = {'publisher_did': did, 'last_release_cid': release_cid, 'last_head_cid': head_cid,
+                                'last_version': release['version'], 'last_published_at': head['updated_at']}
+              (public / 'suggested-publish-state.json').write_text(json.dumps(public_receipt, indent=2) + '\n')
+              (root / 'receipts/V2-finalization.json').write_text(json.dumps({
+                  'source_commit': commit, 'source_tree': tree, 'develop_oid': source_policy['develop_oid'],
+                  'public_origin': origin, 'publisher_did': did, 'release_cid': release_cid, 'head_cid': head_cid,
+                  'release_sha256': signer.sha256(release_bytes), 'head_sha256': signer.sha256(head_bytes),
+                  'installer_sha256': signer.sha256(installer), 'manifest_sha256': signer.sha256(final_bytes),
+                  'public_signatures_verified': True, 'N2_and_support_origin_unchanged': True,
+                  'files_cids_components_installer_unchanged': True,
+                  'operator_gate': 'Compare the suggested V1 receipt with the actual seed receipt and approve the new V2 policy.'}, indent=2) + '\n')
+              native.verify(root / 'N2')
+              shutil.rmtree(metadata)
+              v2_state = 'FINAL metadata; operator receipt comparison and policy approval required'
+          runbook = Path(os.environ['GITHUB_WORKSPACE']) / 'builder/.github/canary-operator-runbook.md'
+          assert runbook.is_file() and not runbook.is_symlink()
+          shutil.copyfile(runbook, root / 'operator-runbook.md')
+          (root / 'operator-runbook.md').chmod(0o600)
+          sums.rename(root / 'receipts/original-SHA256SUMS')
+          provenance = {'schema': 'elastos.canary-handoff-receipt/v1', 'original_run': int(run_id),
+                        'original_workflow_commit': run['head_sha'], 'original_artifact_id': artifact['id'],
+                        'original_artifact_name': artifact['name'], 'original_zip_digest': artifact['digest'],
+                        'source_commit': commit, 'source_tree': tree, 'source_archive_git_tar_sha256': reconstructed.hexdigest(),
+                        'native_modes': 'verified receipt executable=true:0700; false:0600; receipt:0600',
+                        'unsigned_modes': 'files:0400; directories:0700', 'native_verification': ['N1', 'N2'],
+                        'support_origin_matches_N1': True, 'frozen_installer_verified': True,
+                        'handoff_workflow_commit': os.environ['GITHUB_SHA'], 'handoff_run': os.environ['GITHUB_RUN_ID'],
+                        'operator_runbook_sha256': sha(runbook), 'V2': v2_state}
+          (root / 'receipts/handoff.json').write_text(json.dumps(provenance, indent=2) + '\n')
+          files = sorted(path for path in root.rglob('*') if path.is_file())
+          sums.write_text(''.join(sha(path) + '  ' + path.relative_to(root).as_posix() + '\n' for path in files))
+          sums.chmod(0o600)
+          packaged = output / 'canary-handoff.tar.gz'
+          def portable(member):
+              assert member.isdir() or member.isfile()
+              member.uid = member.gid = 0
+              member.uname = member.gname = ''
+              return member
+          with tarfile.open(packaged, 'w:gz', dereference=True) as archive:
+              archive.add(root, arcname='canary-inputs', filter=portable)
+          with tarfile.open(packaged, 'r:gz') as archive:
+              members = archive.getmembers()
+              expected = {'canary-inputs': root, **{'canary-inputs/' + path.relative_to(root).as_posix(): path for path in root.rglob('*')}}
+              assert len(members) == len(expected) and {member.name for member in members} == set(expected)
+              for member in members:
+                  assert member.mode == stat.S_IMODE(expected[member.name].stat().st_mode)
+                  assert member.isdir() or member.isfile()
+                  if member.isfile():
+                      digest = hashlib.sha256()
+                      with archive.extractfile(member) as source:
+                          for chunk in iter(lambda: source.read(1024**2), b''):
+                              digest.update(chunk)
+                      assert digest.hexdigest() == sha(expected[member.name])
+          (output / 'SHA256SUMS').write_text(sha(packaged) + '  ' + packaged.name + '\n')
+          (output / 'handoff-receipt.json').write_text(json.dumps({**provenance, 'tar_sha256': sha(packaged)}, indent=2) + '\n')
+          assert not subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all'])
+          print('Verified original artifact, native modes, frozen installer and completed mode-preserving handoff archive.')
+          PY
+      - name: upload mode-preserving operator handoff
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: canary-handoff-aarch64-darwin-${{ env.SOURCE_COMMIT }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary-handoff/output
+          if-no-files-found: error
+          retention-days: 7
