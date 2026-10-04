@@ -1062,10 +1062,27 @@ def cli_build_hop(root, runtime):
     return receipt
 
 
+def cli_home_activation_descriptor(registry, component_platform):
+    descriptor = registry.get("external", {}).get("home")
+    need(isinstance(descriptor, dict) and isinstance(descriptor.get("platforms"), dict),
+         "Home activation binding is absent or invalid")
+    platforms = descriptor["platforms"]
+    aliases = {"darwin-arm64": ("aarch64-darwin",), "aarch64-darwin": ("darwin-arm64",)}.get(component_platform, ())
+    selected = next((platforms[key] for key in (component_platform, *aliases, "*") if key in platforms), None)
+    need(isinstance(selected, dict), "Home activation binding has no valid platform")
+    install_path = selected.get("install_path")
+    if install_path is None:
+        install_path = descriptor.get("install_path")
+    need(install_path == "capsules/home",
+         "Home activation binding must resolve to capsules/home")
+    return descriptor
+
+
 def cli_qualified_home(support_home, component_platform):
     """Admit only the already built source Home and its native provider."""
     support_home = support_home.resolve()
     registry = cli_json(cli_path(support_home, "components.json"))
+    cli_home_activation_descriptor(registry, component_platform)
     native = cli_path(support_home, "bin/localhost-provider")
     info = native.lstat()
     need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_mode & 0o111,
@@ -1115,6 +1132,8 @@ def cli_admit_home_support(root, manifest):
     need(all(any(target == path or target.startswith(path + "/") for path in manifest["preserve"]["support"])
              for target in native_paths), "initial Home native support preservation is incomplete")
     components = cli_json(cli_path(root, manifest["publications"]["old"]["components"]))
+    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+    cli_home_activation_descriptor(components, platform_name)
     entry = components["capsules"]["home"]
     need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
          "signed Home entrypoint differs")
@@ -1128,7 +1147,6 @@ def cli_admit_home_support(root, manifest):
                "size": manifest["files"][mapping[target]]["bytes"]}
               for target in sorted(expected) if target.startswith("capsules/home/browser/")]
     need(entry["browser_assets"] == assets, "signed Home browser closure differs from the inventory")
-    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
     for target in sorted(native_paths):
         native = manifest["files"][mapping[target]]
         descriptor = components["external"][Path(target).name]
@@ -1260,7 +1278,9 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
             relative = add("home-support/" + target, path)
             content(relative, raw=True)
             home_mapping[target] = relative
-        external = {}
+        # This exact source activation descriptor selects the already copied
+        # Home tree. Its release archive is outside this frozen support proof.
+        external = {"home": cli_home_activation_descriptor(qualified, component_platform)}
         for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
             descriptor = qualified["external"][name]
             if name == "ipfs-provider":
