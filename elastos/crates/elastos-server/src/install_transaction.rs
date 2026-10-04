@@ -252,7 +252,31 @@ fn read_journal_file(path: &Path) -> anyhow::Result<Option<Journal>> {
 pub(crate) fn acquire_installed_writer(
     data_dir: &Path,
 ) -> anyhow::Result<Option<InstallationGuard>> {
-    let retained = crate::update_controller::installed_writer_binary(data_dir)?;
+    let Some(binary) = installed_binary(
+        data_dir,
+        crate::update_controller::installed_writer_binary(data_dir)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    let parent = binary.parent().context("installed writer parent missing")?;
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let guard = InstallationGuard::acquire(&parent)?;
+    match fs::symlink_metadata(parent.join(JOURNAL)) {
+        Ok(_) => {
+            bail!("A signed update requires recovery; preserve its release files and support.")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(guard))
+}
+
+fn installed_binary(data_dir: &Path, retained: Option<PathBuf>) -> anyhow::Result<Option<PathBuf>> {
     let binary = match retained {
         Some(binary) => binary,
         None => {
@@ -269,21 +293,7 @@ pub(crate) fn acquire_installed_writer(
     if !binary.is_absolute() {
         bail!("installed writer binary path must be absolute");
     }
-    let parent = binary.parent().context("installed writer parent missing")?;
-    let parent = match fs::canonicalize(parent) {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let guard = InstallationGuard::acquire(&parent)?;
-    match fs::symlink_metadata(parent.join(JOURNAL)) {
-        Ok(_) => {
-            bail!("A signed update requires recovery; preserve its release files and support.")
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(Some(guard))
+    Ok(Some(binary))
 }
 
 pub(crate) struct InstallTransaction {
@@ -1618,7 +1628,8 @@ pub(crate) fn authorize_host_start_with_generation(
 }
 
 pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
-    if let Some(journal) = read_host_start_journal(data_dir, binary)? {
+    // Controller preflight already selects its installed binary and can repair a prior receipt.
+    if let Some(journal) = read_host_start_journal_at(data_dir, binary)? {
         bail!("{}", pending_home_recovery_hint(&journal));
     }
     Ok(())
@@ -1633,6 +1644,35 @@ fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
 }
 
 fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
+    let installed = installed_binary(
+        data_dir,
+        crate::update_controller::installed_host_binary(data_dir)?,
+    )?;
+    // Installation ownership precedes the invoking binary's own recovery fence.
+    for journal_binary in installed
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(binary))
+    {
+        let Some(journal) = read_host_start_journal_at(data_dir, journal_binary)? else {
+            continue;
+        };
+        let owner = installed.as_deref().unwrap_or(binary);
+        if fs::canonicalize(binary.parent().context("host binary parent missing")?)?
+            != fs::canonicalize(owner.parent().context("installed binary parent missing")?)?
+            || binary.file_name() != owner.file_name()
+        {
+            bail!(
+                "Home start differs from the installation retained for recovery. {}",
+                pending_home_recovery_hint(&journal)
+            );
+        }
+        return Ok(Some(journal));
+    }
+    Ok(None)
+}
+
+fn read_host_start_journal_at(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
     let parent = binary.parent().context("host binary parent missing")?;
     let path = parent.join(JOURNAL);
     let Some(journal) = read_journal_file(&path)? else {
@@ -1705,6 +1745,8 @@ mod tests {
     fn previous(id: ReleaseFile) -> Vec<u8> {
         if id == ReleaseFile::RuntimeBinary {
             b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n".to_vec()
+        } else if id == ReleaseFile::Sources {
+            br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.0"}]}"#.to_vec()
         } else {
             format!("previous {}", id.name()).into_bytes()
         }
@@ -1815,7 +1857,15 @@ mod tests {
     }
 
     fn candidate() -> [(ReleaseFile, &'static [u8]); 5] {
-        ReleaseFile::ALL.map(|id| (id, b"candidate bytes".as_slice()))
+        ReleaseFile::ALL.map(|id| (id, candidate_bytes(id)))
+    }
+
+    fn candidate_bytes(id: ReleaseFile) -> &'static [u8] {
+        if id == ReleaseFile::Sources {
+            br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.1"}]}"#
+        } else {
+            b"candidate bytes"
+        }
     }
 
     #[test]
@@ -2424,8 +2474,8 @@ mod tests {
                 // The corrected retry uses the real paths and leaves one complete candidate.
                 writer.prepare(&candidate()).unwrap();
                 writer.commit().unwrap();
-                for path in writer.destinations.values() {
-                    assert_eq!(fs::read(path).unwrap(), b"candidate bytes");
+                for (id, path) in &writer.destinations {
+                    assert_eq!(fs::read(path).unwrap(), candidate_bytes(*id));
                 }
             }
         }
@@ -2619,8 +2669,8 @@ mod tests {
         drop(writer);
         let resumed = fixture.writer();
         resumed.recover().unwrap();
-        for destination in resumed.destinations.values() {
-            assert_eq!(fs::read(destination).unwrap(), b"candidate bytes");
+        for (id, destination) in &resumed.destinations {
+            assert_eq!(fs::read(destination).unwrap(), candidate_bytes(*id));
         }
         resumed.require_empty_scratch().unwrap();
     }
