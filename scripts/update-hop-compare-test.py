@@ -578,6 +578,96 @@ class CliFixtureTests(unittest.TestCase):
         lock.chmod(0o600)
         return home, lock
 
+    def installed_metadata_fixture(self, home, name="old", consumed=True):
+        directory = home / observer.CLI_DATA / ("installation" if consumed else observer.CLI_PUBLISHER)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        for key, filename in (("head", "release-head.json"), ("release", "release.json")):
+            path = directory / filename
+            path.write_bytes((self.root / self.manifest["publications"][name][key]).read_bytes())
+            path.chmod(0o600)
+        return directory
+
+    def test_consumed_metadata_is_authoritative_snapshot_and_publisher_is_preserved_data(self):
+        home, _ = self.coordination_fixture()
+        publisher = self.installed_metadata_fixture(home, consumed=False)
+        legacy = observer.cli_state(self.manifest, home)
+        self.assertIsNone(legacy["installed_metadata"])
+        self.assertEqual(observer.cli_legacy_installed_metadata(home), observer.cli_expected_installed_metadata(self.manifest, "old"))
+        for path in publisher.iterdir():
+            path.chmod(0o644)  # Frozen installer metadata uses its historical accepted mode.
+        self.assertEqual(observer.cli_legacy_installed_metadata(home), observer.cli_expected_installed_metadata(self.manifest, "old"))
+        legacy_release = publisher / "release.json"
+        legacy_release.chmod(0o666)
+        with self.assertRaisesRegex(ValueError, "legacy installed metadata ownership/mode/bound"):
+            observer.cli_legacy_installed_metadata(home)
+        legacy_release.chmod(0o644)
+        installed = self.installed_metadata_fixture(home, "new")
+        current = observer.cli_state(self.manifest, home)
+        self.assertEqual(current["installed_metadata"], observer.cli_expected_installed_metadata(self.manifest, "new"))
+        self.assertEqual(legacy["data"], current["data"])
+        self.assertTrue(all(relative not in current["data"] for relative in observer.CLI_INSTALLED_METADATA))
+        self.assertIn(observer.CLI_PUBLISHER + "/release.json", current["data"])
+        (installed / "release.json").write_bytes(b"substituted consumed release")
+        changed = observer.cli_state(self.manifest, home)
+        self.assertNotEqual(current, changed)
+        self.assertEqual(current["data"], changed["data"])
+        (publisher / "release.json").write_bytes(b"changed publication")
+        self.assertNotEqual(changed["data"], observer.cli_state(self.manifest, home)["data"])
+
+    def test_consumed_metadata_refuses_partial_unsafe_or_unknown_inventory(self):
+        for case in ("partial", "symlink file", "symlink directory", "file mode", "directory mode", "hard link", "unknown", "fifo"):
+            with self.subTest(case=case):
+                home = self.root / ("metadata-" + case.replace(" ", "-"))
+                installed = self.installed_metadata_fixture(home)
+                target = installed / "release.json"
+                if case == "partial":
+                    target.unlink()
+                elif case == "symlink file":
+                    target.unlink()
+                    target.symlink_to(self.root / self.manifest["publications"]["old"]["release"])
+                elif case == "symlink directory":
+                    other = installed.with_name("foreign-installation")
+                    installed.rename(other)
+                    installed.symlink_to(other, target_is_directory=True)
+                elif case == "file mode":
+                    target.chmod(0o644)
+                elif case == "directory mode":
+                    installed.chmod(0o755)
+                elif case == "hard link":
+                    os.link(target, home / "foreign-link")
+                elif case == "unknown":
+                    (installed / "migration-scratch").write_bytes(b"unclassified authority")
+                else:
+                    target.unlink()
+                    os.mkfifo(target, 0o600)
+                with self.assertRaises((ValueError, OSError)):
+                    observer.cli_installed_metadata(home)
+
+    def test_migration_scratch_remains_in_ordinary_preservation_snapshot(self):
+        home, _ = self.coordination_fixture()
+        before = observer.cli_state(self.manifest, home)
+        stage = home / observer.CLI_DATA / ".elastos.installation-migrate"
+        stage.mkdir(mode=0o700)
+        (stage / "release.json").write_bytes(b"incomplete migration")
+        after = observer.cli_state(self.manifest, home)
+        self.assertNotEqual(before["data"], after["data"])
+        self.assertIn(".elastos.installation-migrate/release.json", after["data"])
+
+    def test_consumed_metadata_refuses_foreign_file_owner_and_oversize(self):
+        home = self.root / "metadata-owner"
+        installed = self.installed_metadata_fixture(home)
+        fstat = observer.os.fstat
+        def foreign_file(descriptor):
+            info = fstat(descriptor)
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1,
+                                   st_nlink=info.st_nlink, st_size=info.st_size)
+        with patch.object(observer.os, "fstat", side_effect=foreign_file), self.assertRaisesRegex(ValueError, "file ownership"):
+            observer.cli_installed_metadata(home)
+        (installed / "release.json").write_bytes(b"x" * (256 * 1024 + 1))
+        with self.assertRaisesRegex(ValueError, "file ownership/mode/bound"):
+            observer.cli_installed_metadata(home)
+
     def test_coordination_pid_change_is_separate_from_user_data_and_other_locks(self):
         home, lock = self.coordination_fixture()
         other = lock.with_name("user.lock")
@@ -818,6 +908,415 @@ class CliFixtureTests(unittest.TestCase):
             for changed_stdout, changed_stderr, unchanged in ((stdout, "Carrier connection failed", True), (stdout, stderr, False)):
                 self.assertEqual(observer.cli_refusal(case, failure, changed_stdout, changed_stderr, unchanged)["status"], "failed")
 
+    def qualified_home_support(self):
+        support = self.root / "support"
+        (support / "bin").mkdir(parents=True, exist_ok=True)
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            path = support / "bin" / name
+            path.write_bytes(name.encode())
+            path.chmod(0o755)
+        capsule = support / "capsules/home"
+        (capsule / "browser").mkdir(parents=True, exist_ok=True)
+        observer.write(capsule / "capsule.json", {"schema": "elastos.capsule/v1", "name": "home", "role": "app",
+                       "type": "wasm", "entrypoint": "browser/index.html", "execution": "web-projection"})
+        (capsule / "browser/index.html").write_bytes(b"<html>installed Home fixture</html>")
+        (capsule / "browser/shell.js").write_bytes(b"export const home = true;")
+        document = capsule / "browser/index.html"
+        entry = {"cid": "", "sha256": "", "size": 0, "install_path": "capsules/home", "entrypoint": "browser/index.html",
+                 "entrypoint_sha256": "sha256:" + observer.digest(document), "entrypoint_size": document.stat().st_size,
+                 "platforms": ["darwin-arm64"], "browser_assets": [{"path": path.relative_to(capsule).as_posix(),
+                 "sha256": "sha256:" + observer.digest(path), "size": path.stat().st_size} for path in sorted((capsule / "browser").rglob("*")) if path.is_file()]}
+        registry = {"capsules": {"home": entry}, "external": {name: {
+            "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
+            for name in ("ipfs-provider", "kubo", "localhost-provider")}}
+        for name, provides in (("ipfs-provider", "elastos://ipfs/*"), ("localhost-provider", "localhost://*")):
+            registry["external"][name]["provider_runtime"] = {"role": "provider", "substrate": "native",
+                "runtime_abi": "elastos.provider-stdio/v1", "execution": "native-provider", "provides": provides}
+        registry["external"]["home"] = {"install_path": "capsules/home", "description": "Qualified source Home",
+            "platforms": {"*": {"release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home"}}}
+        observer.write(support / "components.json", registry)
+        return support
+
+    def initial_home_fixture(self, home_url="http://localhost:8090/home/"):
+        support = self.qualified_home_support()
+        entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
+        mapping = {}
+        for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
+            target = path.relative_to(support).as_posix()
+            mapping[target] = self.add("initial/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
+        mapping["fixture-tools/open"] = self.add("initial/opener", b"fixture no-op utility", 0o700)
+        self.manifest["consumer"]["files"].update(mapping)
+        for relative in mapping.values():
+            self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
+        self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
+        self.manifest["preserve"]["support"] = ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]
+        components_path = self.root / self.manifest["publications"]["old"]["components"]
+        components = observer.cli_json(components_path)
+        components["capsules"]["home"] = entry
+        qualified = observer.cli_json(support / "components.json")
+        components["external"]["home"] = qualified["external"]["home"]
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            native = self.manifest["files"][mapping["bin/" + name]]
+            selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/" + name}
+            components["external"][name] = {**qualified["external"][name], "platforms": {"darwin-arm64": selected}}
+        observer.write(components_path, components)
+        home = self.root / "initial-home"
+        home.mkdir()
+        directory = home / observer.CLI_DATA
+        directory.mkdir(parents=True)
+        observer.cli_copy(self.root, self.manifest, self.manifest["consumer"]["files"], directory)
+        binary = home / ".local/bin/elastos"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes((self.root / self.manifest["publications"]["old"]["binary"]).read_bytes())
+        binary.chmod(0o755)
+        for name, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
+            (directory / name).write_bytes((self.root / self.manifest["publications"]["old"][key]).read_bytes())
+        sources = {"default_source": "default", "sources": [{"name": "default", "publisher_dids": [self.manifest["signer_did"]],
+                   "channel": "canary", "installed_version": self.manifest["old"]["version"], "install_path": str(binary)}]}
+        observer.write(directory / "sources.json", sources)
+        self.installed_metadata_fixture(home, consumed=False)
+        self.installed_metadata_fixture(home)
+        key = directory / "identity/device.key"
+        key.parent.mkdir()
+        key.write_bytes(b"isolated fixture identity")
+        controller_directory = directory / "update-controller"
+        controller_directory.mkdir()
+        controller = controller_directory / "runtime"
+        controller.write_bytes(binary.read_bytes())
+        controller.chmod(0o700)
+        encode = lambda value: base64.b64encode(os.fsencode(value)).decode()
+        launch = {"args": [encode("home"), encode("--browser")], "environment": [], "cwd": encode(home)}
+        receipt = {"schema": "elastos.update-controller/v1", "data_dir": str(directory), "binary": str(binary), "controller": str(controller),
+                   "controller_sha256": observer.digest(binary), "signed_controller_release": base64.b64encode(
+                       (self.root / self.manifest["publications"]["old"]["release"]).read_bytes()).decode(),
+                   "trusted_source": sources["sources"][0], "launch": launch,
+                   "launch_sha256": hashlib.sha256(json.dumps(launch, separators=(",", ":")).encode()).hexdigest()}
+        identities = {45001: {"pid": 45001, "parent": os.getpid(), "group": 45001, "start": "macos:100:12"},
+                      45002: {"pid": 45002, "parent": 45001, "group": 45002, "start": "macos:101:34"}}
+        status = {"id": None, "phase": "ready", "current_version": self.manifest["old"]["version"], "new_version": None,
+                  "message": "ready fixture", "controller_pid": 45001, "controller_start": identities[45001]["start"],
+                  "host_pid": 45002, "generation": "a" * 32}
+        coords = {"api_url": "http://127.0.0.1:60123", "attach_secret": "b" * 64, "pid": 45002, "runtime_kind": "gateway",
+                  "binary_sha256": observer.digest(binary), "generation": status["generation"], "home_url": home_url}
+        lock = {"pid": 45002, "role": "gateway", "addr": "localhost:8090", "generation": status["generation"]}
+        for path, value in ((controller_directory / "receipt.json", receipt), (controller_directory / "status.json", status),
+                            (directory / "gateway-runtime-coords.json", coords), (directory / "host-process.lock", lock)):
+            observer.write(path, value)
+            path.chmod(0o600)
+        (controller_directory / "controller.lock").write_bytes(b"")
+        (controller_directory / "controller.lock").chmod(0o600)
+        process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None)
+        executables = {45001: str(controller), 45002: str(binary)}
+        def response(url, limit, payload=None, token=None):
+            if url.endswith("/api/auth/attach"):
+                self.assertEqual(payload, {"secret": "b" * 64, "scope": "client"})
+                return b'{"token":"private fixture token","session_type":"capsule"}'
+            if url.endswith("/api/health"):
+                self.assertEqual(token, "private fixture token")
+                return json.dumps({"version": self.manifest["old"]["version"]}).encode()
+            self.assertEqual(url, home_url)
+            return (directory / self.manifest["initial_home"]["entrypoint"]).read_bytes()
+        return home, directory, process, status, identities, executables, response
+
+    def test_initial_home_matches_signed_controller_live_generation_and_private_attach(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture("http://[::1]:8090/home/")
+        observer.cli_admit_home_support(self.root, self.manifest)
+        manager = SimpleNamespace(roots={})
+        with patch.object(observer, "cli_process_identity", side_effect=identities.get), \
+             patch.object(observer, "cli_process_executable", side_effect=executables.get), \
+             patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "lock_state", return_value="held"):
+            proof = observer.cli_observe_initial_home(manager, self.manifest, home, process, status)
+        self.assertTrue(proof["authenticated_health"])
+        self.assertEqual(proof["home_url"], "http://[::1]:8090/home/")
+        self.assertEqual(proof["host"], identities[45002])
+        self.assertEqual(proof["home_sha256"], observer.digest(directory / self.manifest["initial_home"]["entrypoint"]))
+        self.assertNotIn("attach_secret", json.dumps(proof))
+        self.assertNotIn("private fixture token", json.dumps(proof))
+
+    def test_initial_home_admission_requires_signed_native_support_and_preservation(self):
+        self.initial_home_fixture()
+        observer.cli_admit_home_support(self.root, self.manifest)
+        for target in ("bin/ipfs-provider", "bin/kubo"):
+            for refusal in ("missing", "substituted", "nonexecutable", "unpreserved"):
+                with self.subTest(target=target, refusal=refusal):
+                    changed = json.loads(json.dumps(self.manifest))
+                    if refusal == "missing":
+                        del changed["consumer"]["files"][target]
+                        changed["initial_home"]["files"].remove(target)
+                    elif refusal == "substituted":
+                        changed["consumer"]["files"][target] = changed["consumer"]["files"]["bin/localhost-provider"]
+                    elif refusal == "nonexecutable":
+                        changed["files"][changed["consumer"]["files"][target]]["mode"] = 0o600
+                    else:
+                        changed["preserve"]["support"].remove(target)
+                    with self.assertRaisesRegex(ValueError, "support.*incomplete|signed native Home support"):
+                        observer.cli_admit_home_support(self.root, changed)
+
+    def test_home_qualification_and_admission_match_activation_resolution_and_refusals(self):
+        self.initial_home_fixture()
+        for scope, path in (("qualified", self.root / "support/components.json"),
+                            ("signed", self.root / self.manifest["publications"]["old"]["components"])):
+            original = path.read_bytes()
+            for case, accepted in (("missing", False), ("substituted", False), ("wrong component path", False),
+                                   ("wrong selected path", False), ("missing platform", False),
+                                   ("alias conflicts with wildcard", False), ("alias precedes wildcard", True),
+                                   ("direct precedes alias", True), ("direct refusal precedes alias", False),
+                                   ("null path uses component", True), ("empty path", False)):
+                with self.subTest(scope=scope, case=case):
+                    registry = json.loads(original)
+                    if case == "missing":
+                        del registry["external"]["home"]
+                    elif case == "substituted":
+                        registry["external"]["home"] = registry["external"]["localhost-provider"]
+                    elif case == "wrong component path":
+                        registry["external"]["home"]["install_path"] = "capsules/sibling"
+                        del registry["external"]["home"]["platforms"]["*"]["install_path"]
+                    elif case == "wrong selected path":
+                        registry["external"]["home"]["platforms"]["*"]["install_path"] = "capsules/sibling"
+                    elif case == "missing platform":
+                        registry["external"]["home"]["platforms"] = {}
+                    else:
+                        platforms = registry["external"]["home"]["platforms"]
+                        if case == "alias conflicts with wildcard":
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/sibling"}
+                        elif case == "alias precedes wildcard":
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/home"}
+                            platforms["*"]["install_path"] = "capsules/sibling"
+                        elif case == "direct precedes alias":
+                            platforms["darwin-arm64"] = {"install_path": "capsules/home"}
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/sibling"}
+                        elif case == "direct refusal precedes alias":
+                            platforms["darwin-arm64"] = {"install_path": "capsules/sibling"}
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/home"}
+                        else:
+                            platforms["*"]["install_path"] = None if case == "null path uses component" else ""
+                    observer.write(path, registry)
+                    def admit():
+                        if scope == "qualified":
+                            return observer.cli_qualified_home(self.root / "support", "darwin-arm64")
+                        return observer.cli_admit_home_support(self.root, self.manifest)
+                    if accepted:
+                        admit()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Home activation binding"):
+                            admit()
+            path.write_bytes(original)
+        observer.cli_admit_home_support(self.root, self.manifest)
+
+    def test_initial_home_snapshot_preserves_ipfs_provider_and_kubo_bytes(self):
+        home, directory, _, _, _, _, _ = self.initial_home_fixture()
+        before = observer.cli_home_snapshot(self.manifest, home)
+        for target in ("bin/ipfs-provider", "bin/kubo"):
+            with self.subTest(target=target):
+                path = directory / target
+                original = path.read_bytes()
+                self.assertEqual(before["preserved"]["support"][target], {".": observer.digest(path)})
+                path.write_bytes(b"changed signed support")
+                self.assertNotEqual(observer.cli_home_snapshot(self.manifest, home), before)
+                path.write_bytes(original)
+
+    def test_initial_home_refuses_substituted_signed_receipt_or_child_generation(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        receipt_path = directory / "update-controller/receipt.json"
+        receipt = observer.read(receipt_path)
+        coords_path = directory / "gateway-runtime-coords.json"
+        coords = observer.read(coords_path)
+        for refusal in ("signed release", "launch intent", "executable", "parent", "birth", "generation", "served bytes"):
+            with self.subTest(refusal=refusal):
+                changed_receipt, changed_status, changed_coords = (json.loads(json.dumps(value)) for value in (receipt, status, coords))
+                changed_identities = {key: dict(value) for key, value in identities.items()}
+                changed_executables = dict(executables)
+                if refusal == "signed release":
+                    changed_receipt["signed_controller_release"] = base64.b64encode(b"foreign release").decode()
+                elif refusal == "launch intent":
+                    changed_receipt["launch"]["args"] = [base64.b64encode(b"serve").decode()]
+                elif refusal == "executable":
+                    changed_executables[45001] = str(home / ".local/bin/elastos")
+                elif refusal == "parent":
+                    changed_identities[45002]["parent"] = 999
+                elif refusal == "birth":
+                    changed_status["controller_start"] = "macos:2:3"
+                elif refusal == "generation":
+                    changed_coords["generation"] = "c" * 32
+                observer.write(receipt_path, changed_receipt)
+                observer.write(coords_path, changed_coords)
+                def reply(url, *args, **kwargs):
+                    return b"foreign Home" if refusal == "served bytes" and url.endswith("/home/") else response(url, *args, **kwargs)
+                with patch.object(observer, "cli_process_identity", side_effect=changed_identities.get), \
+                     patch.object(observer, "cli_process_executable", side_effect=changed_executables.get), \
+                     patch.object(observer, "cli_home_response", side_effect=reply), patch.object(observer, "lock_state", return_value="held"), \
+                     self.assertRaises(ValueError):
+                    observer.cli_observe_initial_home(SimpleNamespace(roots={}), self.manifest, home, process, changed_status)
+
+    def test_qualified_home_refuses_unpinned_or_escaping_support_before_signing(self):
+        support = self.qualified_home_support()
+        provider = support / "bin/localhost-provider"
+        provider.write_bytes(b"substituted provider")
+        with self.assertRaisesRegex(ValueError, "provider binding"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+        provider.write_bytes(b"localhost-provider")
+        extra = support / "capsules/home/browser/uninventoried.js"
+        extra.write_bytes(b"unqualified script")
+        with self.assertRaisesRegex(ValueError, "asset closure"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+        extra.unlink()
+        extra.symlink_to(self.root / "manifest.json")
+        with self.assertRaisesRegex(ValueError, "symlink|escapes"):
+            observer.cli_qualified_home(support, "darwin-arm64")
+
+    def test_initial_home_owner_stop_preserves_data_and_proves_all_owned_absence(self):
+        home, directory, process, status, identities, executables, response = self.initial_home_fixture()
+        shutil.rmtree(directory / "installation")
+        running = True
+        captured = []
+        process.poll = lambda: None if running else 0
+        def wait(timeout):
+            self.assertEqual(timeout, 35)
+            process.returncode = 0
+            return 0
+        process.wait = wait
+        def stop(pid, sig):
+            nonlocal running
+            self.assertEqual((pid, sig), (45001, observer.signal.SIGTERM))
+            running = False
+            (directory / "gateway-runtime-coords.json").unlink()
+        def spawn(argv, env, cwd, label):
+            captured.append((argv, env, cwd, label))
+            self.installed_metadata_fixture(home)
+            return process
+        manager = SimpleNamespace(roots={}, spawn=spawn)
+        real_observe = observer.cli_observe_initial_home
+        def observe(*args):
+            with patch.object(observer, "lock_state", return_value="held"):
+                return real_observe(*args)
+        with patch.object(observer, "cli_process_identity", side_effect=lambda pid: identities.get(pid) if running else None), \
+             patch.object(observer, "cli_process_executable", side_effect=executables.get), \
+             patch.object(observer, "cli_home_response", side_effect=response), patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
+             patch.object(observer, "cli_port_released") as ports, patch.object(observer, "cli_census", return_value=[]), \
+             patch.object(observer, "lock_state", return_value="released"), patch.object(observer.os, "killpg", side_effect=stop):
+            proof = observer.cli_initial_home(manager, self.manifest, home, {"status": "failed"})
+        self.assertEqual(proof["status"], "passed")
+        self.assertTrue(proof["cleanup"]["reaped"] and proof["cleanup"]["data_preserved"])
+        self.assertTrue(proof["desktop_opener"]["suppressed"])
+        self.assertEqual(ports.call_count, 5)
+        argv, env, cwd, label = captured[0]
+        self.assertEqual(argv[1:], ["home", "--browser"])
+        self.assertEqual(env["PATH"].split(":")[0], str(directory / "fixture-tools"))
+        self.assertEqual(env["ELASTOS_CARRIER_MDNS"], "0")
+
+    def test_initial_home_refuses_foreign_consumed_authority_before_spawn(self):
+        home, directory, _, _, _, _, _ = self.initial_home_fixture()
+        self.installed_metadata_fixture(home, "new")
+        manager = SimpleNamespace(roots={}, spawn=unittest.mock.Mock())
+        with self.assertRaisesRegex(ValueError, "installed metadata differs from signed old release"):
+            observer.cli_initial_home(manager, self.manifest, home)
+        manager.spawn.assert_not_called()
+        shutil.rmtree(directory / "installation")
+        (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"substituted legacy release")
+        with self.assertRaisesRegex(ValueError, "legacy metadata differs from signed old release"):
+            observer.cli_initial_home(manager, self.manifest, home)
+        manager.spawn.assert_not_called()
+
+    def test_initial_home_failure_paths_stop_owner_and_retain_refusals(self):
+        home, directory, _, status, identities, _, _ = self.initial_home_fixture()
+        coords_path = directory / "gateway-runtime-coords.json"
+        coords = observer.read(coords_path)
+        sentinel = directory / "state/value"
+        original = sentinel.read_bytes()
+        for refusal in ("readiness", "readiness nonzero CI", "readiness nonzero operator", "readiness missing CI log",
+                        "owned group", "held lock", "listener", "user data", "live metadata", "shutdown metadata", "publisher"):
+            with self.subTest(refusal=refusal):
+                running = True
+                observer.write(coords_path, coords)
+                coords_path.chmod(0o600)
+                sentinel.write_bytes(original)
+                self.installed_metadata_fixture(home)
+                self.installed_metadata_fixture(home, consumed=False)
+                process = SimpleNamespace(pid=45001, returncode=None, poll=lambda: None if running else 0)
+                def wait(timeout):
+                    process.returncode = 1 if "nonzero" in refusal else 0
+                    return process.returncode
+                process.wait = wait
+                def stop(pid, sig):
+                    nonlocal running
+                    self.assertEqual((pid, sig), (45001, observer.signal.SIGTERM))
+                    running = False
+                    coords_path.unlink()
+                    if refusal == "user data":
+                        sentinel.write_bytes(b"changed user data")
+                    if refusal == "shutdown metadata":
+                        (directory / "installation/release.json").write_bytes(b"changed consumed release")
+                    if refusal == "publisher":
+                        (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"changed publication")
+                def observe(*args):
+                    if refusal.startswith("readiness"):
+                        raise ValueError("injected initial readiness refusal")
+                    if refusal == "live metadata":
+                        (directory / "installation/release.json").write_bytes(b"changed consumed release")
+                    return {"status": "passed", "controller": identities[45001], "host": identities[45002],
+                            "home_url": coords["home_url"], "api_url": coords["api_url"]}
+                def port(value):
+                    if refusal == "listener" and not running:
+                        raise ValueError("initial Home listener survives shutdown")
+                manager = SimpleNamespace(roots={}, spawn=lambda *args: process)
+                manifest = dict(self.manifest)
+                evidence = {}
+                if "nonzero" in refusal:
+                    manager.output = self.root
+                    (self.root / "initial-home-start.stdout").write_bytes(b"fixture Home output")
+                    (self.root / "initial-home-start.stderr").write_text("x" * 5000 + "\nprivate controller cause")
+                    manifest["proof_scope"] = "ci-rehearsal" if refusal.endswith("CI") else "production-positive"
+                if "missing" in refusal:
+                    manager.output = self.root
+                    for stream in ("stdout", "stderr"):
+                        (self.root / ("initial-home-start." + stream)).unlink(missing_ok=True)
+                with patch.object(observer, "cli_observe_initial_home", side_effect=observe), \
+                     patch.object(observer, "cli_process_identity", return_value=None), patch.object(observer, "cli_port_released", side_effect=port), \
+                     patch.object(observer, "lock_state", return_value="held" if refusal == "held lock" else "released"), \
+                     patch.object(observer, "cli_census", return_value=[{"group": 45002}] if refusal == "owned group" else []), \
+                     patch.object(observer.os, "killpg", side_effect=stop) as killed, self.assertRaises(ValueError) as raised:
+                    observer.cli_initial_home(manager, manifest, home, evidence)
+                self.assertFalse(running)
+                self.assertEqual(process.returncode, 1 if "nonzero" in refusal else 0)
+                if refusal.startswith("readiness"):
+                    self.assertTrue(str(raised.exception).startswith("injected initial readiness refusal"))
+                if "nonzero" in refusal:
+                    self.assertIn("controller exit 1", str(raised.exception))
+                    self.assertEqual("private controller cause" in str(raised.exception), refusal.endswith("CI"))
+                    self.assertLess(len(str(raised.exception)), 1200)
+                    for stream in ("stdout", "stderr"):
+                        self.assertEqual(evidence["controller_" + stream + "_sha256"],
+                                         observer.digest(self.root / ("initial-home-start." + stream)))
+                if "missing" in refusal:
+                    self.assertIn("CI controller diagnostic is unavailable", str(raised.exception))
+                killed.assert_called_once()
+
+    def test_initial_home_response_and_private_records_keep_their_bounds(self):
+        with patch.object(observer.urllib.request, "build_opener") as opener:
+            reply = opener.return_value.open.return_value.__enter__.return_value
+            reply.status = 200
+            reply.read.return_value = b"too large"
+            with self.assertRaisesRegex(ValueError, "exceeds its bound"):
+                observer.cli_home_response("http://127.0.0.1:8090/home/", 2)
+            reply.read.assert_called_once_with(3)
+        path = self.root / "private-home-record"
+        path.write_bytes(b'{"pid":1,"pid":2}')
+        path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "repeats a field"):
+            observer.cli_private_json(path)
+        path.write_bytes(b'{"pid":1}')
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            observer.cli_private_json(path)
+        for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"):
+            with self.subTest(accepted=value):
+                self.assertEqual(observer.cli_home_base(value, public=True).port, 8090)
+        for value in ("https://localhost:8090/home/", "http://example.test:8090/home/", "http://localhost:8090/home/?secret=x",
+                      "http://[::1]:8091/home/", "http://[::1]:8090/", "http://[::1]:8090/home/#fragment",
+                      "http://owner@[::1]:8090/home/", "http://[::2]:8090/home/"):
+            with self.assertRaises(ValueError):
+                observer.cli_home_base(value, public=True)
+
     def test_generator_uses_explicit_disposable_keys_and_real_signature_admission(self):
         # Fake command delivery exercises generation; existing RFC 8032 test
         # signing supplies valid signatures to the actual installer verifier.
@@ -832,12 +1331,7 @@ class CliFixtureTests(unittest.TestCase):
             "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
             "status": "passed", "cleanup": {"passed": True}, **{name: {"source": source, "version": version,
             "sha256": observer.digest(path), "version_environment": version} for name, path, version in (("old", native, "0.7.1"), ("new", next_runtime, "0.7.2"))}})
-        support = self.root / "support"
-        (support / "bin").mkdir(parents=True)
-        for name in ("ipfs-provider", "kubo"):
-            (support / "bin" / name).write_bytes(name.encode())
-        observer.write(support / "components.json", {"external": {name: {"platforms": {"darwin-arm64": {
-            "checksum": "sha256:" + observer.digest(support / "bin" / name)}}} for name in ("ipfs-provider", "kubo")}})
+        support = self.qualified_home_support()
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
         def command(argv, **kwargs):
@@ -856,8 +1350,18 @@ class CliFixtureTests(unittest.TestCase):
                     (repo / "blocks").mkdir(parents=True)
                     return subprocess.CompletedProcess(argv, 0, b"", b"")
                 raw = Path(argv[-1]).read_bytes()
-                cid = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("=")
-                (repo / "blocks" / cid).write_bytes(raw)
+                codec, block = 0x55, raw
+                if "--raw-leaves=false" in argv:
+                    def varint(value):
+                        result = bytearray()
+                        while value >= 128:
+                            result.append((value & 127) | 128)
+                            value >>= 7
+                        return bytes(result + bytes([value]))
+                    unixfs = b"\x08\x02\x12" + varint(len(raw)) + raw + b"\x18" + varint(len(raw))
+                    codec, block = 0x70, b"\x0a" + varint(len(unixfs)) + unixfs
+                cid = "b" + base64.b32encode(bytes([1, codec, 0x12, 0x20]) + hashlib.sha256(block).digest()).decode().lower().rstrip("=")
+                (repo / "blocks" / cid).write_bytes(block)
                 return subprocess.CompletedProcess(argv, 0, (cid + "\n").encode(), b"")
             return real_run(argv, **kwargs)
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
@@ -869,7 +1373,62 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in key_paths))
         self.assertFalse((generated / "generator").exists())
         generated_manifest = observer.cli_json(generated / "manifest.json")
+        observer.cli_admit_model_fixture(generated, generated_manifest)
+        model_fixture = generated_manifest["model_fixture"]
+        catalogue_path = generated / generated_manifest["publications"]["old"]["catalogue"]
+        original_catalogue = catalogue_path.read_bytes()
+        for refusal in ("empty entries", "missing publication time", "closure digest", "missing package file", "holder CID"):
+            with self.subTest(model_refusal=refusal):
+                changed = json.loads(json.dumps(generated_manifest))
+                catalogue = json.loads(original_catalogue)
+                if refusal == "empty entries":
+                    catalogue["payload"]["entries"] = []
+                elif refusal == "missing publication time":
+                    del catalogue["payload"]["published_at"]
+                elif refusal == "closure digest":
+                    catalogue["payload"]["entries"][0]["object_manifest"]["content_digest"] = "sha256:" + "0" * 64
+                elif refusal == "missing package file":
+                    del changed["model_fixture"]["files"]["LICENSE"]
+                else:
+                    cid = changed["files"][model_fixture["package"]]["cid"]
+                    del changed["holder"]["content"][cid]
+                observer.write(catalogue_path, catalogue)
+                with self.assertRaises(ValueError):
+                    observer.cli_admit_model_fixture(generated, changed)
+        catalogue_path.write_bytes(original_catalogue)
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
+        components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
+        qualified = observer.cli_json(support / "components.json")
+        consumer_data = generated / "copied-consumer" / observer.CLI_DATA
+        observer.cli_copy(generated, generated_manifest, generated_manifest["consumer"]["files"], consumer_data)
+        self.assertEqual(components["external"]["home"], qualified["external"]["home"])
+        home_activation = observer.cli_home_activation_descriptor(components, "darwin-arm64")
+        active_home = consumer_data / home_activation["platforms"]["*"]["install_path"]
+        self.assertTrue(active_home.is_dir())
+        copied_home = observer.cli_json(active_home / "capsule.json")
+        self.assertEqual(copied_home["name"], "home")
+        self.assertEqual(observer.digest(active_home / copied_home["entrypoint"]),
+                         components["capsules"]["home"]["entrypoint_sha256"].removeprefix("sha256:"))
+        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+            target = "bin/" + name
+            relative = generated_manifest["consumer"]["files"][target]
+            binding = generated_manifest["files"][relative]
+            if name != "localhost-provider":
+                self.assertEqual(generated_manifest["holder"]["files"][observer.CLI_DATA + "/" + target], relative)
+            self.assertEqual(observer.digest(consumer_data / target), binding["sha256"])
+            self.assertTrue((consumer_data / target).stat().st_mode & 0o111)
+            self.assertIn(target, generated_manifest["preserve"]["support"])
+            selected = components["external"][name]["platforms"]["darwin-arm64"]
+            self.assertEqual(selected["checksum"], "sha256:" + binding["sha256"])
+            self.assertEqual(selected["size"], binding["bytes"])
+            self.assertEqual(selected["cid"], binding["cid"])
+            if "provider_runtime" in qualified["external"][name]:
+                self.assertEqual(components["external"][name]["provider_runtime"], qualified["external"][name]["provider_runtime"])
+        self.assertEqual(components["capsules"]["home"], observer.cli_json(support / "components.json")["capsules"]["home"])
+        self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
+                            for target in generated_manifest["initial_home"]["files"]))
+        native = generated_manifest["files"][generated_manifest["consumer"]["files"]["bin/localhost-provider"]]
+        self.assertEqual(components["external"]["localhost-provider"]["platforms"]["darwin-arm64"]["cid"], native["cid"])
         self.assertNotEqual(generated_manifest["signer_did"], observer.cli_json(generated / generated_manifest["publications"]["wrong-signer-head"]["head"])["signer_did"])
         generated_manifest["proof_kind"] = "harness-self-test"
         observer.write(generated / "manifest.json", generated_manifest)
@@ -938,10 +1497,7 @@ class CliFixtureTests(unittest.TestCase):
         self.assertFalse((destination / "elastos-new").exists())
 
     def test_generator_command_failure_removes_keys_and_repository(self):
-        support = self.root / "support"
-        (support / "bin").mkdir(parents=True)
-        for name in ("ipfs-provider", "kubo"):
-            (support / "bin" / name).write_bytes(name.encode())
+        support = self.qualified_home_support()
         runtime = self.root / "runtime"
         runtime.write_bytes(b"Runtime command substitute")
         generated = self.root / "generated"
@@ -958,7 +1514,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
-                 config_drift=False, user_data_drift=False, coordination_pid_drift=False):
+                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
@@ -974,12 +1530,22 @@ class CliFixtureTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((root / pub[key]).read_bytes())
             if first:
+                self.installed_metadata_fixture(home_path, name, consumed=False)
+                if metadata_drift == "legacy":
+                    (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"substituted legacy release")
                 source = {"name": "default", "publisher_dids": [manifest["signer_did"]], "channel": "canary", "connect_ticket": public_ticket(),
                           "publisher_node_id": HOLDER_NODE, "install_path": str(home_path / ".local/bin/elastos"), "installed_version": manifest[name]["version"], "head_cid": "", "gateways": [gateway]}
                 observer.write(directory / "sources.json", {"default_source": "default", "sources": [source]})
             else:
+                self.installed_metadata_fixture(home_path, name)
+                if metadata_drift == "consumed":
+                    (directory / "installation/release.json").write_bytes(b"substituted consumed release")
+                if metadata_drift == "publisher":
+                    (directory / observer.CLI_PUBLISHER / "release.json").write_bytes(b"changed publication")
                 sources = observer.read(directory / "sources.json")
                 sources["sources"][0].update(installed_version=manifest[name]["version"], head_cid=manifest["files"][pub["head"]]["cid"])
+                if metadata_drift == "head CID":
+                    sources["sources"][0]["head_cid"] = manifest["files"][manifest["publications"]["old"]["head"]]["cid"]
                 observer.write(directory / "sources.json", sources)
         class Process:
             def __init__(self, argv, **kwargs):
@@ -1095,6 +1661,44 @@ class CliFixtureTests(unittest.TestCase):
             code = observer.cli_run(self.config, self.root / "results")
         return code, calls, observer.read(self.root / "results/result.json")
 
+    def test_runner_registers_copied_native_support_before_initial_home_and_cleans_orphans(self):
+        for name in ("ipfs-provider", "kubo"):
+            target = "bin/" + name
+            self.manifest["consumer"]["files"][target] = self.manifest["holder"]["files"][observer.CLI_DATA + "/" + target]
+            self.manifest["preserve"]["support"].append(target)
+        self.manifest["initial_home"] = {"files": []}
+        self.freeze()
+        owned_roots = {}
+        def initial_home(manager, manifest, home, evidence):
+            for name in ("ipfs-provider", "kubo"):
+                target = "bin/" + name
+                path = str(home / observer.CLI_DATA / target)
+                expected = manifest["files"][manifest["consumer"]["files"][target]]["sha256"]
+                self.assertEqual(manager.roots[path], {expected})
+                self.assertEqual(observer.digest(Path(path)), expected)
+                owned_roots[path] = manager.roots[path]
+            return {**evidence, "status": "passed"}
+        with patch.object(observer, "cli_initial_home", side_effect=initial_home) as initial:
+            code, _, result = self.fake_run()
+        self.assertEqual(code, 0, result)
+        initial.assert_called_once()
+        manager = observer.CliProcesses(self.root)
+        manager.roots.update(owned_roots)
+        rows = []
+        for index, path in enumerate(owned_roots):
+            pid = 32000 + index * 2
+            rows.extend(({"pid": pid, "parent": 1, "group": pid, "command": path},
+                         {"pid": pid + 1, "parent": pid, "group": pid, "command": "/usr/bin/owned-child"}))
+        expected_pids = {row["pid"] for row in rows}
+        def stop(pid, sig):
+            rows[:] = [row for row in rows if row["pid"] != pid]
+        with patch.object(observer, "cli_census", side_effect=lambda: list(rows)), \
+             patch.object(observer.os, "kill", side_effect=stop) as pids, patch.object(observer.time, "sleep"):
+            cleanup = manager.cleanup()
+        self.assertEqual({call.args[0] for call in pids.call_args_list}, expected_pids)
+        self.assertEqual(cleanup["remaining_pids"], [])
+        self.assertFalse(cleanup["errors"])
+
     def test_actual_runner_orders_fresh_install_plain_check_apply_repeat_and_all_refusals(self):
         code, calls, result = self.fake_run()
         self.assertEqual(code, 0, result)
@@ -1124,6 +1728,31 @@ class CliFixtureTests(unittest.TestCase):
 
     def test_runner_rejects_changed_user_data_despite_valid_coordination(self):
         code, _, result = self.fake_run(user_data_drift=True)
+        self.assertEqual(code, 1)
+        self.assertIn("config/data/support preservation differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_substituted_legacy_metadata_before_update(self):
+        code, calls, result = self.fake_run(metadata_drift="legacy")
+        self.assertEqual(code, 1)
+        self.assertIn("old legacy installed metadata hash differs", result["failure"])
+        self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_substituted_consumed_metadata_after_apply(self):
+        code, _, result = self.fake_run(metadata_drift="consumed")
+        self.assertEqual(code, 1)
+        self.assertIn("installed consumed metadata hash differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_consumed_head_cid_mismatch(self):
+        code, _, result = self.fake_run(metadata_drift="head CID")
+        self.assertEqual(code, 1)
+        self.assertIn("installed consumed head CID differs", result["failure"])
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_runner_rejects_publisher_changes_after_apply(self):
+        code, _, result = self.fake_run(metadata_drift="publisher")
         self.assertEqual(code, 1)
         self.assertIn("config/data/support preservation differs", result["failure"])
         self.assertTrue(result["cleanup"]["passed"])
