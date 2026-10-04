@@ -57,12 +57,15 @@ A Runtime Rust source or input change triggers metadata discovery of tracked
 standalone workspaces. Declared path dependencies identify direct and transitive
 consumers, including dependencies through other Runtime members. These consumers
 receive workspace/all-targets checks. Clippy and unit tests cover directly
-touched crates and Runtime consumers of changed template or fixture data;
+touched crates and Runtime consumers of changed product data or scripts;
 dependent consumers retain their own behavior acceptance gates. Shared Runtime
 WIT, configuration, manifest and lockfile inputs select every Runtime package
-for Clippy and unit tests. Literal embedded data identifies its consuming
-Runtime package. A changed data file with an uncertain consumer widens that
-selection to all Runtime packages. Capsule template manifests are input data;
+for Clippy and unit tests. Literal repository file and specific directory
+references identify Runtime consumers of embedded data, component and model
+catalogues, capsule manifests and Browser assets. References inside consumed
+scripts also cover their local script dependencies. Each uncertain product
+input widens selection to all Runtime packages; generic unreferenced CI,
+Python and Node tools retain their own checks. Capsule template manifests are input data;
 the gate checks their Runtime consumers and keeps them outside product crate
 discovery.
 The gate uses Cargo metadata to select touched crates for Clippy with warnings
@@ -70,7 +73,9 @@ denied and their enabled lib/bin unit targets. It verifies conventional Rust mod
 and available test names before selecting exact test names for a module. Module names and
 unit-test names can differ, so uncertain mappings widen to a full unit target
 or touched crate. Test listing and a positive passed-test count protect against
-zero-test success. Selected server process tests first build their three
+zero-test success. Broad selection keeps that refusal for a target with zero
+enabled tests; source test attributes alone do not prove host coverage.
+Selected server process tests first build their three
 candidate provider inputs and set their test paths under the same lease.
 Workspace manifests, lockfiles and Rust configuration widen the Rust scope.
 Unrelated standalone workspaces keep their own checks. Documentation changes

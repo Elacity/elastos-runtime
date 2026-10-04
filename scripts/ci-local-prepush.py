@@ -142,31 +142,75 @@ def metadata(root, manifest, lease):
     return Path(value["workspace_root"]), [p for p in value["packages"] if p["id"] in members]
 
 
+def referenced_inputs(root, source, folder, files, directories):
+    text = source.read_text()
+    literals = re.findall(r'''["']([^"'\r\n]+)["']''', text)
+    literals += re.findall(r"\bscripts/[\w./-]+", text)
+    if source.suffix == ".sh":
+        # Shell helpers often join a computed script directory with a literal
+        # suffix, for example $(dirname "${BASH_SOURCE[0]}")/helper.py.
+        literals += [suffix.lstrip("/") for suffix in
+                     re.findall(r"/(?:[\w.-]+/)*[\w.-]+\.(?:sh|py|mjs|js)\b", text)]
+    found = set()
+    for literal in literals:
+        if not ("/" in literal or "." in literal) or any(char.isspace() for char in literal):
+            continue
+        if literal.startswith("/../"):
+            literal = literal.lstrip("/")  # concat!(env!("CARGO_MANIFEST_DIR"), "/../../../...")
+        if Path(literal).is_absolute() or "$" in literal or "{" in literal:
+            continue
+        for base in (root, source.parent, folder):
+            candidate = Path(os.path.abspath(base / literal))
+            if candidate in files:
+                found.add(candidate)
+            elif candidate in directories:
+                found.update(path for path in files if path.is_relative_to(candidate))
+    return found
+
+
+def product_input(path):
+    parts = Path(path).parts
+    if {"templates", "fixtures"}.intersection(parts) or path in {"components.json", "model-catalog.json"}:
+        return True
+    capsule = parts[0] == "capsules" or parts[:2] == ("elastos", "capsules")
+    return capsule and (Path(path).name == "capsule.json" or "browser" in parts or
+                        Path(path).suffix in {".json", ".wasm", ".html", ".js", ".mjs", ".css", ".svg", ".png"})
+
+
 def external_input_owners(root, packages, paths):
-    external = {root / path for path in paths
-                if "templates" in Path(path).parts or "fixtures" in Path(path).parts}
+    # Literal file/directory references also cover data read at test execution
+    # and Runtime-launched scripts. Generic CI tooling keeps its own checks.
+    tooling = {".githooks/pre-push", "scripts/ci-local-prepush.sh",
+               "scripts/ci-local-prepush.py", "scripts/ci-local-prepush-test.py"}
+    external = {root / path for path in paths if path not in tooling}
     if not external:
         return set()
+    files = {root / path for path in paths_from_git(root, "ls-files", "-z")} | external
+    # A bare "scripts" or "capsules" string cannot identify every descendant.
+    directories = {parent for path in files for parent in path.parents
+                   if parent.is_relative_to(root) and len(parent.relative_to(root).parts) >= 2}
     owners = set()
     matched = set()
-    rust = paths_from_git(root, "ls-files", "-z", "*.rs")
     for package in packages:
         folder = Path(package["manifest_path"]).parent
-        for path in rust:
-            source = root / path
-            if not source.is_relative_to(folder) or not source.is_file():
+        pending = [path for path in files if path.suffix == ".rs" and path.is_relative_to(folder)]
+        visited = set()
+        while pending:
+            source = pending.pop()
+            if source in visited or not source.is_file():
                 continue
-            includes = re.findall(r'\binclude_(?:str|bytes)\s*!\s*\(\s*"([^"]+)"', source.read_text())
-            for literal in includes:
-                included = (source.parent / literal).resolve()
-                for changed in external:
-                    parts = changed.relative_to(root).parts
-                    template = root.joinpath(*parts[:3]) if parts[:2] == ("templates", "capsules") else None
-                    if included == changed.resolve() or (template and included.is_relative_to(template)):
-                        owners.add(folder.resolve())
-                        matched.add(changed)
-    # Dynamic fixture reads and unrecognised template inputs widen to Runtime.
-    if external - matched:
+            visited.add(source)
+            references = referenced_inputs(root, source, folder, files, directories)
+            pending.extend(path for path in references if path.is_relative_to(root / "scripts")
+                           and path.suffix in {".sh", ".py", ".mjs", ".js"})
+            for changed in external:
+                parts = changed.relative_to(root).parts
+                template = root.joinpath(*parts[:3]) if parts[:2] == ("templates", "capsules") else None
+                if changed in references or (template and any(path.is_relative_to(template) for path in references)):
+                    owners.add(folder.resolve())
+                    matched.add(changed)
+    # Each uncertain product input widens scope, including mixed known/unknown inputs.
+    if any(product_input(path.relative_to(root).as_posix()) for path in external - matched):
         owners.update(Path(package["manifest_path"]).parent.resolve() for package in packages)
     return owners
 

@@ -133,7 +133,9 @@ class PrepushTests(unittest.TestCase):
                 binary.chmod(0o755)
             elif args[0] == "test":
                 if "--list" in args:
-                    empty = os.environ.get("PREPUSH_NO_TESTS") or (os.environ.get("PREPUSH_EMPTY_BIN") and "--bin" in args)
+                    empty = (os.environ.get("PREPUSH_NO_TESTS") or
+                             os.environ.get("PREPUSH_EMPTY_PACKAGE") == args[args.index("-p") + 1] or
+                             (os.environ.get("PREPUSH_EMPTY_BIN") and "--bin" in args))
                     listed = os.environ.get("PREPUSH_TESTS", "release_cmd::tests::updates: test")
                     if "--lib" in args:
                         listed = os.environ.get("PREPUSH_LIB_TESTS", listed)
@@ -369,6 +371,108 @@ class PrepushTests(unittest.TestCase):
                                         "-p", "common", "--", "-D", "warnings"])
         self.assertEqual({c["args"][2] for c in self.commands() if c["args"][0] == "test"},
                          {"server", "other", "common"})
+
+    def external_baseline(self, source, inputs):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/crates/server/src/consumer.rs", source)
+        for path, text in inputs.items():
+            self.write(path, text)
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+
+    def assert_server_input_units(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        clippy = [c for c in commands if c["args"][0] == "clippy" and c["cwd"] == str(self.root / "elastos")]
+        self.assertEqual([c["args"] for c in clippy],
+                         [["clippy", "--all-targets", "-p", "server", "--", "-D", "warnings"]])
+        tests = [c for c in commands if c["args"][0] == "test" and c["args"][2] == "server"
+                 and "--nocapture" in c["args"]]
+        self.assertEqual(len(tests), 2)
+        self.assertTrue(any("--lib" in c["args"] for c in tests))
+        self.assertTrue(any("--bin" in c["args"] for c in tests))
+
+    def test_components_manifest_reads_select_runtime_units(self):
+        self.external_baseline('fn read() { let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");\n'
+                               'fs::read(root.join("components.json")).unwrap(); }\n', {"components.json": '{}\n'})
+        self.write("components.json", '{"changed":true}\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_capsule_manifest_reads_select_runtime_and_capsule_units(self):
+        capsule = "capsules/chain-provider/capsule.json"
+        self.external_baseline('fn read() { let path = Path::new(env!("CARGO_MANIFEST_DIR"))\n'
+                               '.join("../../../capsules/chain-provider/capsule.json"); fs::read(path).unwrap(); }\n',
+                               {capsule: '{}\n'})
+        self.write(capsule, '{"changed":true}\n')
+        self.commit()
+        self.assert_server_input_units()
+        self.assertTrue(any(c["args"][:3] == ["test", "-p", "chain-provider"] and "--nocapture" in c["args"]
+                            for c in self.commands()))
+
+    def test_home_browser_directory_reads_select_runtime_units(self):
+        asset = "capsules/home/browser/shell-auth.js"
+        self.external_baseline('fn read() { let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");\n'
+                               'copy_home(&repo.join("capsules/home/browser"), &home); }\n',
+                               {asset: 'export const input = false;\n'})
+        self.write(asset, 'export const input = true;\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_runtime_launched_script_selects_runtime_units(self):
+        script = "scripts/browser-vm-remote-vz-launcher.integration.mjs"
+        self.external_baseline('fn launch() { let script = Path::new(env!("CARGO_MANIFEST_DIR"))\n'
+                               '.join("../../../scripts/browser-vm-remote-vz-launcher.integration.mjs");\n'
+                               'Command::new("node").arg(script).spawn(); }\n', {script: '// input\n'})
+        self.write(script, '// changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_deleted_transitive_runtime_script_selects_runtime_units(self):
+        wrapper = "scripts/browser-vm-remote-vz-launcher.integration.mjs"
+        launcher = "scripts/browser-vm-remote-vz-launcher.mjs"
+        self.external_baseline('fn launch() { let script = Path::new(env!("CARGO_MANIFEST_DIR"))\n'
+                               '.join("../../../scripts/browser-vm-remote-vz-launcher.integration.mjs");\n'
+                               'Command::new("node").arg(script).spawn(); }\n',
+                               {wrapper: 'const wrapper = new URL("./browser-vm-remote-vz-launcher.mjs", import.meta.url);\n',
+                                launcher: '// input\n'})
+        self.git("rm", launcher)
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_computed_shell_helper_dependency_selects_runtime_units(self):
+        script = "scripts/publish-release.sh"
+        helper = "scripts/discover-source-bootstrap.py"
+        self.external_baseline('fn publish() { Command::new("bash")\n'
+                               '.arg(workspace_root.join("scripts/publish-release.sh")).spawn(); }\n',
+                               {script: 'helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/discover-source-bootstrap.py"\n'
+                                        'python3 "$helper"\n', helper: '# input\n'})
+        self.write(helper, '# changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_unreferenced_ci_python_node_tools_keep_their_own_checks(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/crates/server/src/lib.rs", 'const TOOLS: &str = "scripts";\n')
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        for path in ("scripts/ci-example.py", "scripts/ci-example.mjs", "scripts/ci-local-prepush.py"):
+            self.write(path, "// owned tooling\n")
+        self.commit()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            owners = GATE.external_input_owners(self.root,
+                                               [{"manifest_path": str(self.root / "elastos/crates/server/Cargo.toml")}],
+                                               ["scripts/ci-example.py", "scripts/ci-example.mjs", "scripts/ci-local-prepush.py"])
+        self.assertEqual(owners, set())
+
+    def test_broad_runtime_input_refuses_a_selected_target_with_zero_tests(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/config/input.json", '{}\n')
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "other"})
+        self.assert_stopped(result, "other has zero unit tests")
+        self.assertTrue(any(c["args"][0] == "clippy" and "other" in c["args"] for c in self.commands()))
 
     def test_hook_git_environment_cannot_mutate_owned_sentinel_repository(self):
         sentinel = self.tmp / "sentinel"
