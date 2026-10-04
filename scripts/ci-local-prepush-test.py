@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise pre-push decisions with local Git fixtures and fake Cargo/Node."""
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -63,6 +64,10 @@ class PrepushTests(unittest.TestCase):
         self.write("capsules/chat-room-ui/src/lib.rs", "// fixture\n")
         for name in ("protected-content-protect-provider", "protected-content-decrypt-provider", "custody-provider"):
             self.write("capsules/" + name + "/Cargo.toml", '[package]\nname = "' + name + '"\n')
+        for workspace in ("elastos", "capsules/chain-provider", "capsules/wallet-provider",
+                          "capsules/chat-room-ui", "capsules/protected-content-protect-provider",
+                          "capsules/protected-content-decrypt-provider", "capsules/custody-provider"):
+            self.write(workspace + "/Cargo.lock", "version = 4\n# committed fixture lock\n")
         self.write("README.md", "Fixture\n")
         self.write(".gitignore", "**/target/\n/target-build/\n")
         self.commit()
@@ -101,6 +106,16 @@ class PrepushTests(unittest.TestCase):
                     time.sleep(30)
                 manifest = pathlib.Path(args[args.index("--manifest-path") + 1])
                 workspace = manifest.parent
+                if "--no-deps" not in args:
+                    lock = workspace / "Cargo.lock"
+                    relative = workspace.relative_to(root).as_posix()
+                    if "--offline" in args and os.environ.get("PREPUSH_COLD_METADATA") == relative:
+                        sys.exit("uncached metadata dependency requires a fetch")
+                    update = os.environ.get("PREPUSH_UPDATE_LOCK") == relative
+                    if "--locked" in args and (not lock.exists() or update):
+                        sys.exit("workspace lock needs an update but --locked was supplied")
+                    if not lock.exists() or update:
+                        lock.write_text("version = 4\\n# generated fixture lock\\n")
                 def package(name, folder, kinds):
                     graph = json.loads(os.environ.get("PREPUSH_GRAPH", "{}"))
                     dependencies = []
@@ -652,7 +667,9 @@ class PrepushTests(unittest.TestCase):
         graph = {"elastos/crates/server": ["capsules/custody-provider"],
                  "capsules/custody-provider": ["capsules/chain-provider"],
                  "capsules/chain-provider": ["elastos/crates/common"]}
-        foreign = [self.dependency_package("server-extension", "registry+fixture"),
+        # Cargo strips the hash before matching fingerprint/build package
+        # names, and normalizes the compiled crate name to server_extension.
+        foreign = [self.dependency_package("server-extension", "registry+fixture", target="server-extension"),
                    self.dependency_package("git-library", "git+fixture"),
                    self.dependency_package("external-library", None),
                    self.dependency_package("registry-library", "registry+fixture", self.root / "vendor/registry-library")]
@@ -673,7 +690,7 @@ class PrepushTests(unittest.TestCase):
         self.assertTrue(all(commands.index(c) < first_build for c in cleans))
         resolved = [c for c in commands if c["args"][0] == "metadata" and "--no-deps" not in c["args"]]
         self.assertEqual(len(resolved), 2)
-        self.assertTrue(all("--locked" in c["args"] and "--offline" in c["args"] for c in resolved))
+        self.assertTrue(all("--locked" in c["args"] and "--offline" not in c["args"] for c in resolved))
         self.assertTrue(all(c["args"][-1] == str(Path(c["cwd"]) / "Cargo.toml") for c in resolved))
 
     def test_registry_and_git_package_name_collisions_refuse_before_clean(self):
@@ -706,11 +723,86 @@ class PrepushTests(unittest.TestCase):
 
     def test_empty_repository_clean_scope_refuses_before_clean_command(self):
         foreign = self.dependency_package("external-library", None)
-        with mock.patch.object(GATE, "run", return_value=json.dumps({"packages": [foreign]})) as run:
+        with mock.patch.object(GATE, "run", side_effect=["elastos/Cargo.lock\0", json.dumps({"packages": [foreign]})]) as run:
             with self.assertRaisesRegex(GATE.GateError, "empty scope"):
                 GATE.clean_repository_packages(self.root, self.root / "elastos", None)
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args.args[0][1], "metadata")
+
+    def test_missing_ignored_workspace_lock_is_generated_and_receipted(self):
+        relative = "capsules/chain-provider/Cargo.lock"
+        self.git("rm", "-q", relative)
+        self.write(".gitignore", (self.root / ".gitignore").read_text() + relative + "\n")
+        self.write("capsules/chain-provider/src/main.rs", "// changed\n")
+        self.commit()
+        candidate = self.git("rev-parse", "HEAD")
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lock = self.root / relative
+        self.assertTrue(lock.exists())
+        self.assertIn("cargo-lock=" + relative + " sha256=" + hashlib.sha256(lock.read_bytes()).hexdigest() +
+                      " policy=ignored-generated", result.stdout)
+        metadata, = [c for c in self.commands() if c["args"][0] == "metadata" and
+                     "--no-deps" not in c["args"] and c["cwd"] == str(lock.parent)]
+        self.assertNotIn("--locked", metadata["args"])
+        self.assertNotIn("--offline", metadata["args"])
+        clean, = [c for c in self.commands() if c["args"][0] == "clean" and c["cwd"] == str(lock.parent)]
+        self.assertIn("--locked", clean["args"])
+        self.assertIn("--offline", clean["args"])
+        self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), candidate)
+
+    def test_existing_ignored_workspace_lock_updates_with_its_manifest(self):
+        relative = "capsules/chain-provider/Cargo.lock"
+        lock = self.root / relative
+        old = lock.read_bytes()
+        self.git("rm", "-q", relative)
+        self.write(".gitignore", (self.root / ".gitignore").read_text() + relative + "\n")
+        self.write("capsules/chain-provider/Cargo.toml", '[package]\nname = "chain-provider"\n# dependency changed\n')
+        self.commit()
+        lock.write_bytes(old)
+        result = self.invoke(extra={"PREPUSH_UPDATE_LOCK": "capsules/chain-provider"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(lock.read_bytes(), old)
+        self.assertIn("cargo-lock=" + relative + " sha256=" + hashlib.sha256(lock.read_bytes()).hexdigest() +
+                      " policy=ignored-generated", result.stdout)
+        metadata, = [c for c in self.commands() if c["args"][0] == "metadata" and
+                     "--no-deps" not in c["args"] and c["cwd"] == str(lock.parent)]
+        self.assertNotIn("--locked", metadata["args"])
+        self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
+
+    def test_cold_metadata_fetch_preserves_the_committed_lock(self):
+        lock = self.root / "elastos/Cargo.lock"
+        old = lock.read_bytes()
+        result = self.invoke(extra={"PREPUSH_COLD_METADATA": "elastos"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata, = [c for c in self.commands() if c["args"][0] == "metadata" and "--no-deps" not in c["args"]]
+        self.assertIn("--locked", metadata["args"])
+        self.assertNotIn("--offline", metadata["args"])
+        self.assertEqual(lock.read_bytes(), old)
+        self.assertIn("cargo-lock=elastos/Cargo.lock sha256=" + hashlib.sha256(old).hexdigest() + " policy=tracked",
+                      result.stdout)
+
+    def test_committed_lock_update_refuses_before_cleaning(self):
+        lock = self.root / "elastos/Cargo.lock"
+        old = lock.read_bytes()
+        result = self.invoke(extra={"PREPUSH_UPDATE_LOCK": "elastos"})
+        self.assert_stopped(result, "command failed: cargo metadata --locked")
+        self.assertIn("workspace lock needs an update but --locked was supplied", result.stderr)
+        self.assertEqual(lock.read_bytes(), old)
+        self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"} for c in self.commands()))
+
+    def test_missing_unignored_workspace_lock_refuses_before_resolution(self):
+        relative = "capsules/chain-provider/Cargo.lock"
+        self.git("rm", "-q", relative)
+        self.write("capsules/chain-provider/src/main.rs", "// changed\n")
+        self.commit()
+        result = self.invoke()
+        self.assert_stopped(result, "commit or ignore the workspace lockfile before resolution: " + relative)
+        self.assertFalse((self.root / relative).exists())
+        self.assertFalse(any(c["args"][0] == "metadata" and "--no-deps" not in c["args"] and
+                             c["cwd"] == str((self.root / relative).parent) for c in self.commands()))
+        self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
 
     def test_inherited_output_directories_are_overridden_for_each_workspace(self):
         self.write("capsules/chain-provider/src/main.rs", "// changed\n")

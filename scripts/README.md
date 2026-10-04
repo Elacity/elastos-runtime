@@ -111,11 +111,19 @@ resolved repository path-package scope with `cargo clean -p`, retaining the
 shared directory. The caller-selected directory is the repository's rebuildable
 intermediate cache. Each clean removes all compiled artifacts with the selected
 repository package or crate names in that profile, including matches from other
-resolved graphs. Artifacts with distinct names and registry source/download
-caches stay preserved. Prepared process providers receive the same
-package-scoped clean in the release profile before their builds. A package or
-crate-name collision with an external dependency in the current resolved graph
+resolved graphs. Artifacts with distinct package names and distinct normalized
+crate names, plus registry source/download caches, stay preserved. Prepared
+process providers receive the same package-scoped clean in the release profile
+before their builds. A package or crate-name collision with an external
+dependency in the current resolved graph
 stops the gate before cleaning that scope.
+
+Full metadata resolution keeps committed workspace locks fixed with `--locked`.
+Ignored generated locks follow normal online Cargo resolution and can update
+when their manifests change. An untracked, unignored workspace lock path stops
+the gate before resolution creates source dirt. The gate logs each resolved
+lock's SHA-256 with its candidate receipt. Cold caches can fetch dependencies
+during metadata resolution; the following package clean uses `--locked --offline`.
 The source and shared-build volumes each need at least 15% free space for this gate.
 
 If the cause of your last failed Mac install, update, or Home startup step is

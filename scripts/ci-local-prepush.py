@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the current worktree and the exact object supplied by Git pre-push."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -153,11 +154,22 @@ def metadata(root, manifest, lease):
 
 def clean_repository_packages(root, workspace, lease, release=False):
     # A shared build dir can treat older worktree sources as fresh. Refresh
-    # every resolved repository package while retaining external dependencies.
+    # every resolved repository package while retaining distinct artifacts.
+    lock = workspace / "Cargo.lock"
+    relative_lock = lock.relative_to(root).as_posix()
+    tracked = bool(paths_from_git(root, "ls-files", "-z", "--", relative_lock))
+    if not tracked and subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", relative_lock], cwd=root).returncode:
+        raise GateError("commit or ignore the workspace lockfile before resolution: " + relative_lock)
+    # Committed locks bind the candidate. Ignored locks follow normal Cargo
+    # resolution, including manifest updates and cold-cache dependency fetches.
     value = json.loads(run([
-        "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+        "cargo", "metadata", *(["--locked"] if tracked else []), "--format-version", "1",
         "--manifest-path", str(workspace / "Cargo.toml"),
     ], workspace, capture=True, lease=lease))
+    print("cargo-lock={} sha256={} policy={}".format(
+        relative_lock, hashlib.sha256(lock.read_bytes()).hexdigest(),
+        "tracked" if tracked else "ignored-generated"), flush=True)
     local = [package for package in value["packages"]
              if package.get("source") is None and
              Path(package["manifest_path"]).resolve().is_relative_to(root.resolve())]
