@@ -29,24 +29,29 @@ def run(args, cwd, capture=False, lease=None):
     try:
         output, _ = process.communicate()
     except BaseException:
-        # Settle the owned command before releasing the heavy-build lease.
+        # A second interrupt stays pending until the owned group is settled.
+        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        # Cargo can exit before a rustc/helper descendant. Settle the whole
-        # owned group, including children which ignored the first signal.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        if process.stdout:
-            process.stdout.close()
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            finally:
+                # Cargo can exit before a rustc/helper descendant.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                if process.stdout:
+                    process.stdout.close()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         raise
     if process.returncode:
         if capture and output:
@@ -126,10 +131,21 @@ def metadata(root, manifest, lease):
 
 def touched_workspaces(root, paths, lease):
     workspaces = {}
-    workspace, packages = metadata(root, root / "elastos/Cargo.toml", lease)
-    workspaces[workspace] = packages
+    runtime, runtime_packages = metadata(root, root / "elastos/Cargo.toml", lease)
+    workspaces[runtime] = runtime_packages
     manifests = {root / path for path in paths_from_git(root, "ls-files", "-z", "*Cargo.toml")}
+    discoverable = {manifest for manifest in manifests
+                    if not {"templates", "fixtures"}.intersection(manifest.relative_to(root).parts)}
     broad = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
+    runtime_input = broad or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
+                                 or path.startswith(("elastos/.cargo/", "elastos/wit/")) for path in paths)
+    seeds = set()
+    for package in runtime_packages:
+        folder = Path(package["manifest_path"]).parent
+        local_input = any((root / path).is_relative_to(folder) and
+                          Path(path).suffix not in {".md", ".txt"} for path in paths)
+        if runtime_input or local_input:
+            seeds.add(folder.resolve())
     # Resolve touched standalone workspaces, including tools and capsules.
     candidates = set()
     for path in paths:
@@ -142,15 +158,43 @@ def touched_workspaces(root, paths, lease):
         elif path.endswith("/Cargo.toml") or path.endswith(".rs"):
             raise GateError("changed Rust package was removed or has no manifest: " + path)
     if broad:
-        candidates.update(manifest for manifest in manifests
-                          if "templates" not in manifest.parts and "fixtures" not in manifest.parts)
+        candidates.update(discoverable)
     for manifest in sorted(candidates):
-        if not any(manifest == Path(p["manifest_path"])
-                   for ps in workspaces.values() for p in ps):
+        known = {workspace / "Cargo.toml" for workspace in workspaces}
+        known.update(Path(p["manifest_path"]) for ps in workspaces.values() for p in ps)
+        if manifest not in known:
             workspace, packages = metadata(root, manifest, lease)
             workspaces[workspace] = packages
+    checked = set(workspaces)
+    if seeds:
+        # --no-deps retains all declared path edges, including dev/build,
+        # optional and target-specific dependencies. Discover each workspace
+        # once, then follow dependency -> consumer through Runtime and capsules.
+        for manifest in sorted(discoverable):
+            known = {workspace / "Cargo.toml" for workspace in workspaces}
+            known.update(Path(p["manifest_path"]) for ps in workspaces.values() for p in ps)
+            if manifest not in known:
+                workspace, packages = metadata(root, manifest, lease)
+                workspaces[workspace] = packages
+        consumers = {}
+        for packages in workspaces.values():
+            for package in packages:
+                consumer = Path(package["manifest_path"]).parent.resolve()
+                for dependency in package.get("dependencies", []):
+                    if dependency.get("path"):
+                        consumers.setdefault(Path(dependency["path"]).resolve(), set()).add(consumer)
+        related = set(seeds)
+        pending = list(seeds)
+        while pending:
+            for consumer in consumers.get(pending.pop(), set()) - related:
+                related.add(consumer)
+                pending.append(consumer)
+        checked.update(workspace for workspace, packages in workspaces.items()
+                       if any(Path(p["manifest_path"]).parent.resolve() in related for p in packages))
     touched = {}
     for workspace, packages in workspaces.items():
+        if workspace not in checked:
+            continue
         relative = workspace.relative_to(root).as_posix()
         workspace_change = broad or any(path in {
             relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",

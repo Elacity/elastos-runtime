@@ -51,17 +51,24 @@ its ancestry; it keeps the checked HEAD fixed. A moving base, a dirty source,
 hidden index flags, or a pushed object from another worktree stops the push.
 
 The gate runs the product-data checks, `cargo fmt --all -- --check` for Runtime,
-chain-provider and touched workspaces, then `cargo check --workspace
---all-targets` for Runtime and touched standalone workspaces. It uses Cargo
-metadata to select touched crates for Clippy with warnings denied and their
-enabled lib/bin unit targets. It verifies conventional Rust module declarations
+chain-provider and checked workspaces, then `cargo check --workspace
+--all-targets` for Runtime, touched standalone workspaces and related consumers.
+A Runtime Rust source or input change triggers metadata discovery of tracked
+standalone workspaces. Declared path dependencies identify direct and transitive
+consumers, including dependencies through other Runtime members. These consumers
+receive workspace/all-targets checks. Clippy and unit tests cover directly
+touched crates; dependent consumers retain their own behavior acceptance gates.
+The gate uses Cargo metadata to select touched crates for Clippy with warnings
+denied and their enabled lib/bin unit targets. It verifies conventional Rust module declarations
 and available test names before selecting exact test names for a module. Module names and
 unit-test names can differ, so uncertain mappings widen to a full unit target
 or touched crate. Test listing and a positive passed-test count protect against
 zero-test success. Selected server process tests first build their three
 candidate provider inputs and set their test paths under the same lease.
-Workspace manifests, lockfiles and Rust configuration widen the Rust scope;
-unrelated capsule suites and Linux/Browser journeys keep their own gates. A
+Workspace manifests, lockfiles and Rust configuration widen the Rust scope.
+Unrelated standalone workspaces keep their own checks. Documentation changes
+retain the Runtime check and skip standalone dependency discovery. Capsule
+suites and Linux/Browser journeys keep their own gates. A
 removed package needs an explicit acceptance plan. Run the small decision
 fixtures with `just test-ci-local-prepush`; the source CI gate also runs them.
 

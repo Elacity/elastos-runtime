@@ -44,6 +44,8 @@ class PrepushTests(unittest.TestCase):
         self.write("elastos/crates/server/src/main.rs", "mod release_cmd;\n")
         self.write("elastos/crates/server/src/release_cmd.rs", "// fixture\n")
         self.write("elastos/crates/other/Cargo.toml", '[package]\nname = "other"\n')
+        self.write("elastos/crates/common/Cargo.toml", '[package]\nname = "common"\n')
+        self.write("elastos/crates/common/src/lib.rs", "// fixture\n")
         self.write("capsules/chain-provider/Cargo.toml", '[package]\nname = "chain-provider"\n')
         self.write("capsules/chain-provider/src/main.rs", "// fixture\n")
         self.write("capsules/wallet-provider/Cargo.toml", '[package]\nname = "wallet-provider"\n')
@@ -74,6 +76,9 @@ class PrepushTests(unittest.TestCase):
             if pathlib.Path(sys.argv[0]).name == "node":
                 sys.exit(0)
             if args[0] == "metadata":
+                if os.environ.get("PREPUSH_IGNORE_TERM"):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    pathlib.Path(os.environ["PREPUSH_IGNORE_TERM"]).write_text(str(os.getpid()))
                 if os.environ.get("PREPUSH_CHILD"):
                     subprocess.Popen([sys.executable, "-c", "import os, pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(os.environ['PREPUSH_CHILD']).write_text(str(os.getpid())); time.sleep(30)"])
                 if os.environ.get("PREPUSH_SLEEP"):
@@ -81,12 +86,20 @@ class PrepushTests(unittest.TestCase):
                 manifest = pathlib.Path(args[args.index("--manifest-path") + 1])
                 workspace = manifest.parent
                 def package(name, folder, kinds):
+                    graph = json.loads(os.environ.get("PREPUSH_GRAPH", "{}"))
+                    dependencies = []
+                    for dependency in graph.get(folder.relative_to(root).as_posix(), []):
+                        dependency = {"path": dependency} if isinstance(dependency, str) else dependency.copy()
+                        dependency["path"] = str(root / dependency["path"])
+                        dependencies.append(dependency)
                     return {"id": name, "name": name, "manifest_path": str(folder / "Cargo.toml"),
+                            "dependencies": dependencies,
                             "targets": [{"kind": [kind], "name": name, "test": True,
                                          "src_path": str(folder / "src" / ("main.rs" if kind == "bin" else "lib.rs"))} for kind in kinds]}
                 if workspace == root / "elastos":
                     packages = [package(os.environ.get("PREPUSH_PACKAGE", "server"), workspace / "crates/server", ["lib", "bin"]),
-                                package("other", workspace / "crates/other", ["lib"])]
+                                package("other", workspace / "crates/other", ["lib"]),
+                                package("common", workspace / "crates/common", ["lib"])]
                 else:
                     packages = [package(workspace.name, workspace, ["cdylib" if workspace.name == "chat-room-ui" else "bin"])]
                 print(json.dumps({"workspace_root": str(workspace), "workspace_members": [p["id"] for p in packages],
@@ -241,7 +254,72 @@ class PrepushTests(unittest.TestCase):
                             c["args"] == ["check", "--workspace", "--all-targets"] for c in commands))
         self.assertTrue(any(c["args"][:5] == ["test", "-p", "chain-provider", "--bin", "chain-provider"] for c in commands))
         self.assertTrue(any(c["args"][:3] == ["test", "-p", "other"] for c in commands))
-        self.assertFalse(any("wallet-provider" in str(c) for c in commands))
+        self.assertFalse(any("wallet-provider" in str(c) for c in commands if c["args"][0] != "metadata"))
+
+    def test_runtime_input_checks_direct_and_transitive_path_consumers(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/crates/common/src/lib.rs", "// changed Runtime common crate\n")
+        self.commit()
+        graph = {
+            "elastos/crates/server": ["elastos/crates/common"],
+            "capsules/chain-provider": [{"path": "elastos/crates/server", "name": "alias",
+                                         "rename": "runtime_alias", "kind": "build", "optional": True,
+                                         "target": 'cfg(target_os = "linux")'}],
+            "capsules/wallet-provider": [{"path": "capsules/chain-provider", "kind": "dev"}],
+        }
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        checks = [c for c in commands if c["args"] == ["check", "--workspace", "--all-targets"]]
+        self.assertEqual({c["cwd"] for c in checks}, {str(self.root / "elastos"),
+                         str(self.root / "capsules/chain-provider"), str(self.root / "capsules/wallet-provider")})
+        clippy, = [c for c in commands if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "common", "--", "-D", "warnings"])
+        self.assertTrue(all(c["args"][2] == "common" for c in commands if c["args"][0] == "test"))
+        metadata = [c for c in commands if c["args"][0] == "metadata"]
+        self.assertEqual(len(metadata), len({tuple(c["args"]) for c in metadata}))
+
+    def test_docs_only_change_keeps_standalone_metadata_discovery_outside_gate(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("README.md", "Changed documentation\n")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata = [c for c in self.commands() if c["args"][0] == "metadata"]
+        self.assertEqual(len(metadata), 1)
+        self.assertEqual(metadata[0]["args"][-1], str(self.root / "elastos/Cargo.toml"))
+
+    def test_shared_runtime_input_seeds_all_members(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/wit/input.wit", "// changed shared contract\n")
+        self.commit()
+        graph = {"capsules/chain-provider": ["elastos/crates/common"]}
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "check"
+                            for c in self.commands()))
+
+    def test_discovery_exclusions_use_only_paths_inside_the_repository(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("templates/example/Cargo.toml", "// excluded template\n")
+        self.write("elastos/tests/fixtures/example/Cargo.toml", "// excluded fixture\n")
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write("elastos/crates/server/src/release_cmd.rs", "// changed Runtime source\n")
+        self.commit()
+        moved = self.tmp / "fixtures/source"
+        moved.parent.mkdir()
+        self.root.rename(moved)
+        self.root = moved
+        self.env["PREPUSH_ROOT"] = str(moved)
+        graph = {"capsules/chain-provider": ["elastos/crates/server"]}
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "check"
+                            for c in self.commands()))
+        metadata = [c["args"][-1] for c in self.commands() if c["args"][0] == "metadata"]
+        self.assertNotIn(str(self.root / "templates/example/Cargo.toml"), metadata)
+        self.assertNotIn(str(self.root / "elastos/tests/fixtures/example/Cargo.toml"), metadata)
 
     def test_rename_paths_with_newlines_and_removed_package_are_preserved(self):
         self.git("mv", "elastos/crates/server/src/release_cmd.rs", "capsules/wallet-provider/src/renamed\nmodule.rs")
@@ -346,6 +424,40 @@ class PrepushTests(unittest.TestCase):
                 fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_second_interrupt_waits_until_term_resistant_group_is_settled(self):
+        child_file, cargo_file = self.tmp / "child.pid", self.tmp / "cargo.pid"
+        process = subprocess.Popen([str(SCRIPT)], cwd=self.root,
+                                   env={**self.env, "PREPUSH_SLEEP": "1", "PREPUSH_CHILD": str(child_file),
+                                        "PREPUSH_IGNORE_TERM": str(cargo_file)},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not child_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(child_file.exists(), "TERM-resistant fixture did not start")
+            process.send_signal(signal.SIGTERM)
+            time.sleep(0.2)
+            process.send_signal(signal.SIGINT)
+            _, error = process.communicate(timeout=8)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("pre-push stopped", error)
+            for pid_file in (cargo_file, child_file):
+                status = subprocess.run(["ps", "-p", pid_file.read_text(), "-o", "stat="],
+                                        text=True, stdout=subprocess.PIPE)
+                self.assertTrue(status.returncode != 0 or status.stdout.strip().startswith("Z"),
+                                "owned process survived repeated interruption: " + status.stdout)
+            with (self.root / ".git/local-ai-heavy-build.lock").open("a+") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if process.poll() is None:
+                if cargo_file.exists():
+                    try:
+                        os.killpg(int(cargo_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 process.kill()
                 process.communicate()
 
