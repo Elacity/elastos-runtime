@@ -725,13 +725,6 @@ mod tests {
         assert_eq!(VmState::from(weird), VmState::Unknown(42));
     }
 
-    #[test]
-    fn entitlement_hint_constant_points_at_day_4_script_and_docs() {
-        assert!(ENTITLEMENT_HINT.contains("com.apple.security.virtualization"));
-        assert!(ENTITLEMENT_HINT.contains("scripts/dev/sign-elastos-vz/"));
-        assert!(ENTITLEMENT_HINT.contains("docs/MAC.md"));
-    }
-
     /// When `validateWithError` rejects the configuration for
     /// missing entitlements, the wrapped error string must embed
     /// the signing hint so the operator immediately knows the next

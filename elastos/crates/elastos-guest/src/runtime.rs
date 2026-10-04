@@ -935,43 +935,6 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn test_request_serialization() {
-        let req = RuntimeRequest::RequestCapability {
-            resource: "elastos://did/*".to_string(),
-            action: "execute".to_string(),
-            reason: String::new(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("request_capability"));
-        assert!(json.contains("elastos://did/*"));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_response_serialization() {
-        let resp = RuntimeResponse::ResourceResult {
-            result: serde_json::json!({"status": "ok"}),
-            audit: None,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("resource_result"));
-        assert!(json.contains("ok"));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_envelope_serialization() {
-        let envelope = RequestEnvelope {
-            id: 42,
-            request: RuntimeRequest::Ping,
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        assert!(json.contains("42"));
-        assert!(json.contains("ping"));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
     fn test_carrier_uri_maps_to_host_adapter_scheme() {
         assert_eq!(
             RuntimeClient::provider_scheme_for_uri("localhost://Users/self/Documents/a.md")

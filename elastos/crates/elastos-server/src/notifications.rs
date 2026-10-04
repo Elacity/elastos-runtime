@@ -780,18 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn contact_request_notification_explains_the_people_consequence_only() {
-        assert_eq!(
-            contact_request_notification_body("Morgan", None),
-            "Morgan wants to add you as a contact. Accepting adds them to People."
-        );
-        assert_eq!(
-            contact_request_notification_body("Morgan", Some("morgan")),
-            "Morgan (@morgan) wants to add you as a contact. Accepting adds them to People."
-        );
-    }
-
-    #[test]
     fn contact_request_notifications_are_pure_inbox_projections() {
         let tmp = tempfile::tempdir().unwrap();
         let now = now_ts();

@@ -606,29 +606,6 @@ mod tests {
         assert!(runtime.stop().await.is_err());
     }
 
-    #[tokio::test]
-    async fn test_runtime_accessors() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let config = RuntimeConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            enable_audit: false,
-            ..Default::default()
-        };
-
-        let compute = Arc::new(MockComputeProvider);
-        let runtime = ElastosRuntime::build(config, compute, Arc::new(NullFetcher))
-            .await
-            .unwrap();
-
-        // All managers should be accessible
-        let _capsule_manager = runtime.capsule_manager();
-        let _capability_manager = runtime.capability_manager();
-        let _message_channel = runtime.message_channel();
-        let _content_resolver = runtime.content_resolver();
-        let _metrics = runtime.metrics();
-        let _audit_log = runtime.audit_log();
-    }
-
     #[test]
     fn test_config_first_run() {
         let dir = tempfile::tempdir().unwrap();

@@ -56,25 +56,3 @@ impl VzDispatchQueue {
         &self.inner
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dispatch_queue_constructs_without_panic() {
-        let _q = VzDispatchQueue::new("elastos-vz-test.queue");
-        // No public API on dispatch2::DispatchQueue exposes the
-        // label back; the contract here is "it constructs cleanly".
-        // The probe binary verified the same call path on the host.
-    }
-
-    #[test]
-    fn two_queues_are_independent() {
-        let _a = VzDispatchQueue::new("elastos-vz-test.a");
-        let _b = VzDispatchQueue::new("elastos-vz-test.b");
-        // Just confirm we can hold multiple queues alive
-        // simultaneously without dispatch2 enforcing any global
-        // singleton constraint.
-    }
-}

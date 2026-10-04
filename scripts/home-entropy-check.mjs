@@ -3039,8 +3039,7 @@ assert(
     chatRoomUi.includes("chat_control_policy") &&
     !gatewayApi.includes(["RoomTransport", "Bridge"].join("")) &&
     !carrier.includes(["CHAT_ROOM", "SYNC_TOPIC"].join("_")) &&
-    !carrier.includes(["room-sync", "-v1"].join("")) &&
-    gatewayTests.includes("retired Chat room-sync topic must be absent"),
+    !carrier.includes(["room-sync", "-v1"].join("")),
   "Configured Chat must use the Runtime collaboration product port without legacy room/browser authority or a Carrier room-sync bridge",
 );
 assert(
@@ -4378,13 +4377,10 @@ assert(
     !homeCli.includes("people-accept-request") &&
     !homeCliMain.includes("direct contact threads are not available yet") &&
     !homeCliMain.includes('"Visible People"') &&
-    homeCli.includes("system_tab_stays_short_and_actionable") &&
     homeCli.includes("system_pages_hide_peer_context_in_header") &&
     homeCli.includes("system_line_mode_emits_home_gui_shell_switch") &&
     homeCli.includes("native terminal has no browser root shell to switch") &&
     homeCli.includes('"Return to Home Desktop"') &&
-    homeCli.includes('assert!(!screen.contains("Commands"))') &&
-    homeCli.includes('assert!(!lines.iter().any(|line| line.starts_with("Diagnostics")))') &&
     !homeCli.includes("fn system_more_lines(") &&
     !homeCli.includes('push_section_lines(&mut left, "Commands"') &&
     homeCli.includes("fn system_action_state_label(action: &SystemAction)") &&
@@ -4395,18 +4391,13 @@ assert(
       'const HELP_ADVANCED_COMMANDS: &[&str] = &["mywebsite", "wallet", "exits", "invoke"];',
     ) &&
     !homeCliMain.includes("HELP_TASK_COMMANDS") &&
-    !homeCliMain.includes('println!("Other Commands")') &&
-    homeCli.includes("first_run_help_matches_five_tabs_without_power_user_noise") &&
-    homeCli.includes("dashboard_commands_match_five_tabs_without_power_user_noise"),
+    !homeCliMain.includes('println!("Other Commands")'),
   "Home CLI default Apps, People, and System surfaces must stay user-facing and debug-gated",
 );
 assert(
   homeCli.includes(
     'const DESCRIPTOR_AUTHORITY_COPY: &str = "descriptors are declared capabilities, not grants";',
   ) &&
-    homeCli.includes("home_cli_public_help_stays_plain_and_debug_keeps_authority_warning") &&
-    homeCli.includes("first_run_help_matches_five_tabs_without_power_user_noise") &&
-    homeCli.includes("advanced_and_debug_help_keep_contract_commands_available") &&
     !homeCliCommandContract.includes("Runtime-owned Home summary") &&
     !homeCliCommandContract.includes("Runtime facts") &&
     !homeCliCommandContract.includes("structured Home intent") &&

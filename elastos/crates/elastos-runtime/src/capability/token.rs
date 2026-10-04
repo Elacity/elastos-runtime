@@ -438,14 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn test_token_creation() {
-        let token = create_test_token();
-        assert_eq!(token.version, CapabilityToken::CURRENT_VERSION);
-        assert_eq!(token.capsule, "test-capsule");
-        assert_eq!(token.action, Action::Read);
-    }
-
-    #[test]
     fn test_token_signature() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let verifying_key = signing_key.verifying_key();
@@ -471,23 +463,25 @@ mod tests {
     #[test]
     fn test_token_serialization() {
         let token = create_test_token();
+        let verifying_key = VerifyingKey::from_bytes(&token.issuer).unwrap();
+        let restored_tokens = [
+            (
+                "bytes",
+                CapabilityToken::from_bytes(&token.to_bytes().unwrap()).unwrap(),
+            ),
+            (
+                "base64",
+                CapabilityToken::from_base64(&token.to_base64().unwrap()).unwrap(),
+            ),
+        ];
 
-        let bytes = token.to_bytes().unwrap();
-        let restored = CapabilityToken::from_bytes(&bytes).unwrap();
-
-        assert_eq!(token.id.0, restored.id.0);
-        assert_eq!(token.capsule, restored.capsule);
-        assert_eq!(token.action, restored.action);
-    }
-
-    #[test]
-    fn test_token_base64() {
-        let token = create_test_token();
-
-        let b64 = token.to_base64().unwrap();
-        let restored = CapabilityToken::from_base64(&b64).unwrap();
-
-        assert_eq!(token.id.0, restored.id.0);
+        for (encoding, restored) in restored_tokens {
+            assert_eq!(token.id.0, restored.id.0, "{encoding}");
+            assert_eq!(token.capsule, restored.capsule, "{encoding}");
+            assert_eq!(token.action, restored.action, "{encoding}");
+            assert_eq!(token.signature, restored.signature, "{encoding}");
+            assert!(restored.verify_signature(&verifying_key), "{encoding}");
+        }
     }
 
     #[test]

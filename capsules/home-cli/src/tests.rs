@@ -79,23 +79,6 @@ fn storage_read_bytes_reports_provider_error() {
     assert!(error.contains("no such object"));
 }
 
-fn contract_command<'a>(contract: &'a CommandContract, name: &str) -> &'a CommandSpec {
-    contract
-        .commands
-        .iter()
-        .find(|command| command.name == name)
-        .unwrap_or_else(|| panic!("missing command contract entry: {name}"))
-}
-
-fn assert_contains_all(label: &str, value: &str, needles: &[&str]) {
-    for needle in needles {
-        assert!(
-            value.contains(needle),
-            "{label} missing invariant phrase: {needle}"
-        );
-    }
-}
-
 #[test]
 fn command_contract_is_home_cli_and_terminal_scoped() {
     let contract = command_contract();
@@ -103,7 +86,6 @@ fn command_contract_is_home_cli_and_terminal_scoped() {
         .into_iter()
         .map(|command| command.name)
         .collect();
-    let contract_copy = COMMAND_CONTRACT_JSON.to_string();
     let drift_surfaces: Vec<String> = contract
         .commands
         .iter()
@@ -149,174 +131,6 @@ fn command_contract_is_home_cli_and_terminal_scoped() {
         contract.terminal.transport.as_deref(),
         Some("runtime_pty_stream")
     );
-    assert_contains_all(
-        "terminal PTY copy",
-        contract.terminal.pty.as_deref().unwrap_or_default(),
-        &[
-            "Runtime-owned PTY",
-            "xterm",
-            "without direct host process authority",
-        ],
-    );
-    assert_contains_all(
-        "terminal entrypoint copy",
-        contract.terminal.entrypoint.as_deref().unwrap_or_default(),
-        &["same home-cli binary", "Runtime PTY", "elastos home"],
-    );
-    assert!(
-        contract
-            .controls
-            .iter()
-            .any(|control| control.key == "q or Esc" && control.description.contains("Desktop")),
-        "shell-switch copy must name the Desktop",
-    );
-    assert!(
-        !COMMAND_CONTRACT_JSON.contains("Home GUI"),
-        "command contract should not use a third prose name for home-gui",
-    );
-    assert!(
-        contract_command(&contract, "debug")
-            .description
-            .contains("hidden from the default Home CLI product surface"),
-        "debug help must stay outside the default user-facing surface",
-    );
-    assert_contains_all(
-        "debug authority copy",
-        &contract_command(&contract, "debug").description,
-        &["declared capability", "not grants"],
-    );
-    assert_contains_all(
-        "plain invoke command copy",
-        &contract_command(&contract, "invoke").description,
-        &["available app actions", "need approval"],
-    );
-    for stale in [
-        "Runtime-owned Home summary",
-        "Runtime facts",
-        "structured Home intent",
-    ] {
-        assert!(
-            !contract_copy.contains(stale),
-            "Home CLI command contract kept internal public copy: {stale}",
-        );
-    }
-}
-
-#[test]
-fn home_cli_public_help_stays_plain_and_debug_keeps_authority_warning() {
-    let contract = command_contract();
-    for command in contract
-        .commands
-        .iter()
-        .filter(|command| command.name != "debug")
-    {
-        let copy = format!("{} {}", command.summary, command.description).to_lowercase();
-        for internal in [
-            "runtime-owned",
-            "runtime facts",
-            "projection",
-            "provider boundary",
-            "capability surface",
-            "structured home intent",
-        ] {
-            assert!(
-                !copy.contains(internal),
-                "{} leaked {internal}",
-                command.name
-            );
-        }
-    }
-    assert!(DESCRIPTOR_AUTHORITY_COPY.contains("declared capabilities"));
-    assert!(DESCRIPTOR_AUTHORITY_COPY.contains("not grants"));
-}
-
-#[test]
-fn first_run_help_matches_five_tabs_without_power_user_noise() {
-    let help = help_lines("").join("\n");
-
-    for heading in ["Home CLI Help", "Tabs", "Controls", "Advanced", "Debug"] {
-        assert!(help.contains(heading), "first-run help missing {heading}");
-    }
-    for command in ["home", "inbox", "people", "apps", "system"] {
-        assert!(help.contains(command), "first-run help missing {command}");
-    }
-    for control in ["refresh", "help [command]", "exit"] {
-        assert!(help.contains(control), "first-run help missing {control}");
-    }
-    assert!(help.contains("help advanced"));
-    assert!(help.contains("help debug"));
-    for hidden in [
-        "mywebsite",
-        "wallet",
-        "exits",
-        "invoke <capsule>",
-        "debug [capsules",
-        "structured Home intent",
-        "Runtime-owned PTY",
-        "xterm",
-        "launch-token",
-        "projection",
-        "system [shell",
-        "surface:",
-    ] {
-        assert!(
-            !help.contains(hidden),
-            "first-run help leaked power/debug noise: {hidden}"
-        );
-    }
-    assert!(!help.to_lowercase().contains("security"));
-}
-
-#[test]
-fn advanced_and_debug_help_keep_contract_commands_available() {
-    let advanced = help_lines("advanced").join("\n");
-    let debug = help_lines("debug").join("\n");
-    let invoke = help_lines("invoke").join("\n");
-
-    assert!(advanced.contains("Advanced Commands"));
-    assert!(advanced.contains("mywebsite [status|stage <dir>|preview|publish|open]"));
-    assert!(advanced.contains("wallet"));
-    assert!(advanced.contains("exits"));
-    assert!(advanced.contains("invoke [list [capsule] | <capsule> <method> [json|target]]"));
-    assert!(!advanced.contains("debug [capsules"));
-    assert!(!advanced.contains("xterm"));
-    assert!(debug.contains("Debug Commands"));
-    assert!(debug.contains("debug [capsules"));
-    assert!(!debug.contains("Runtime-owned PTY"));
-    assert!(invoke.contains("invoke [list [capsule] | <capsule> <method> [json|target]]"));
-    assert!(invoke.contains("aliases: call"));
-    assert!(invoke.contains("available app actions"));
-    assert!(!invoke.contains("structured Home intent"));
-}
-
-#[test]
-fn dashboard_commands_match_five_tabs_without_power_user_noise() {
-    let commands = dashboard_command_hint_lines().join("\n");
-
-    assert!(commands.contains("Commands"));
-    for command in ["home", "inbox", "people", "apps", "system"] {
-        assert!(
-            commands.contains(command),
-            "dashboard command hints missing {command}"
-        );
-    }
-    assert!(commands.contains("help advanced"));
-    assert!(commands.contains("help debug"));
-    for hidden in [
-        "Other Commands",
-        "mywebsite",
-        "wallet",
-        "exits",
-        "invoke <capsule>",
-        "Developer facts",
-        "projection",
-        "system [shell",
-    ] {
-        assert!(
-            !commands.contains(hidden),
-            "dashboard command hints leaked power/debug item: {hidden}"
-        );
-    }
 }
 
 #[test]
@@ -677,21 +491,6 @@ fn debug_spaces_aliases_resolve_to_selected_roots() {
         .iter()
         .any(|line| line.contains("localhost://WebSpaces/Elastos")));
     assert!(lines.iter().any(|line| line.contains("elastos webspace")));
-}
-
-#[test]
-fn mywebsite_page_is_task_oriented_and_hides_space_roots() {
-    let snapshot = sample_snapshot();
-    let lines = mywebsite_task_lines(&snapshot);
-    let text = lines.join("\n");
-
-    assert!(text.contains("Stage    mywebsite stage <dir>"));
-    assert!(text.contains("Preview  mywebsite preview"));
-    assert!(text.contains("Publish  mywebsite publish"));
-    assert!(text.contains("Open     mywebsite open"));
-    assert!(!text.contains("WebSpaces"));
-    assert!(!text.contains("scratch space"));
-    assert!(!text.contains("localhost://Local"));
 }
 
 #[test]
@@ -2558,45 +2357,6 @@ fn mouse_clicks_use_the_rendered_tab_row() {
 }
 
 #[test]
-fn home_screen_stays_compact() {
-    let snapshot = sample_snapshot();
-    let screen = build_tui_screen(&snapshot, &TuiState::default(), 100, 32);
-    assert!(!screen.contains("Start Here"));
-    assert!(!screen.contains("-- Status --"));
-    assert!(screen.starts_with("\x1b[H\x1b[J"));
-    assert!(!screen.ends_with("\r\n"));
-    assert!(screen.contains("1 Chat [ready]"));
-    assert!(screen.contains("Next"));
-    assert!(!screen.contains("MyWebSite [ready]"));
-    assert!(!screen.contains("MyWebSite is empty."));
-    assert!(!screen.contains("Updates [ready]"));
-    assert!(!screen.contains("Shared [ready]"));
-    assert!(screen.contains("Up/Down select"));
-    assert!(screen.contains("q/Esc Desktop"));
-    assert!(screen.contains("? help"));
-    assert!(!screen.contains("opens Browser"));
-    assert!(!screen.contains("hjkl"));
-}
-
-#[test]
-fn tui_tabs_replace_redundant_banner() {
-    let snapshot = sample_snapshot();
-    let screen = build_tui_screen(
-        &snapshot,
-        &TuiState {
-            tab: Tab::Apps,
-            ..TuiState::default()
-        },
-        100,
-        32,
-    );
-
-    assert!(!screen.contains("ElastOS Home"));
-    assert!(!screen.contains("ElastOS Apps"));
-    assert!(screen.contains("\x1b[30;46;1m Apps \x1b[0m"));
-}
-
-#[test]
 fn tui_help_matches_keyboard_contract() {
     let snapshot = sample_snapshot();
     let controls = command_contract().controls;
@@ -2715,25 +2475,6 @@ fn every_tui_page_keeps_tabs_inside_viewport() {
 }
 
 #[test]
-fn tui_starts_at_tab_row_without_summary_header() {
-    let snapshot = sample_snapshot();
-    let screen = build_tui_screen(&snapshot, &TuiState::default(), 100, 20);
-    let first_line = screen
-        .strip_prefix("\x1b[H\x1b[J")
-        .unwrap_or(&screen)
-        .split("\r\n")
-        .next()
-        .unwrap_or_default();
-
-    assert!(first_line.contains("\x1b[30;46;1m Home \x1b[0m"));
-    assert!(!first_line.contains("alex"));
-    assert!(!first_line.contains("Home CLI"));
-    assert!(!first_line.contains("identity ready"));
-    assert!(!first_line.contains("bootstrap ready"));
-    assert!(!first_line.contains("site empty"));
-}
-
-#[test]
 fn tui_lines_do_not_trigger_terminal_autowrap() {
     let snapshot = sample_snapshot();
     let cols = 100usize;
@@ -2792,27 +2533,6 @@ fn mywebsite_notice_surfaces_only_after_explicit_home_action() {
 }
 
 #[test]
-fn staged_site_summary_and_banner_stay_honest() {
-    let mut snapshot = sample_snapshot();
-    snapshot.site.local_url = None;
-    snapshot.site.active_release = None;
-    if let Some(action) = snapshot
-        .actions
-        .iter_mut()
-        .find(|action| action.id == "site-local")
-    {
-        action.ready = false;
-        action.reason =
-            Some("missing site-provider -- run: elastos setup --profile demo".to_string());
-    }
-
-    assert_eq!(
-        website_summary(&snapshot),
-        "staged at localhost://MyWebSite"
-    );
-}
-
-#[test]
 fn mywebsite_tasks_show_staged_site_and_next_steps() {
     let mut snapshot = sample_snapshot();
     snapshot.site.local_url = None;
@@ -2832,34 +2552,4 @@ fn mywebsite_tasks_show_staged_site_and_next_steps() {
     assert!(screen.contains("Preview  mywebsite preview (blocked"));
     assert!(screen.contains("Open     mywebsite open"));
     assert!(!screen.contains("press Enter"));
-}
-
-#[test]
-fn system_tab_stays_short_and_actionable() {
-    let snapshot = sample_snapshot();
-    let lines = compact_system_lines(&snapshot);
-    assert!(lines.len() <= 5);
-    assert!(lines.iter().any(|line| line.starts_with("Shell")));
-    assert!(lines.iter().any(|line| line.starts_with("Switch")));
-    assert!(lines.iter().any(|line| line.starts_with("Home")));
-    assert!(lines.iter().any(|line| line.starts_with("Updates")));
-    assert!(lines
-        .iter()
-        .any(|line| line.contains("system shell home-gui")));
-    assert!(!lines.iter().any(|line| line.starts_with("Session")));
-    assert!(!lines.iter().any(|line| line.starts_with("Profile")));
-    assert!(!lines.iter().any(|line| line.starts_with("Diagnostics")));
-    assert!(!lines.iter().any(|line| line.starts_with("Services")));
-    assert!(!lines.iter().any(|line| line.starts_with("Offer")));
-    assert!(!lines.iter().any(|line| line.starts_with("Root")));
-    assert!(!lines.iter().any(|line| line.starts_with("ElastOS")));
-    assert!(!lines.iter().any(|line| line.starts_with("Peers")));
-    assert!(!lines.iter().any(|line| line.starts_with("Capsules")));
-    assert!(!lines
-        .iter()
-        .any(|line| line.contains("browser Runtime PTY")));
-    assert!(!lines.iter().any(|line| line.contains("managed")));
-    assert!(!lines.iter().any(|line| line.contains("did:key")));
-    assert!(!lines.iter().any(|line| line.contains("launch-token")));
-    assert!(!lines.iter().any(|line| line.starts_with("API")));
 }

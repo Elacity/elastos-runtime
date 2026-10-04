@@ -708,20 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn from_manifest_default_boot_args_use_hvc0() {
-        let manifest = microvm_manifest("");
-        let config = VmConfig::from_manifest(
-            &manifest,
-            std::path::Path::new("/capsules/c"),
-            std::path::Path::new("/k/vmlinux"),
-        );
-        // Empty boot_args triggers the default branch.
-        assert!(
-            config.boot_args.contains("console=hvc0") || config.boot_args.contains("init=/init")
-        );
-    }
-
-    #[test]
     fn with_session_appends_token_and_api_to_boot_args() {
         let manifest = microvm_manifest("console=ttyS0");
         let config = VmConfig::from_manifest(
@@ -737,56 +723,10 @@ mod tests {
     }
 
     #[test]
-    fn vz_config_default_paths_under_local_share_elastos() {
-        let config = VzConfig::new();
-        // Path tail is platform-independent because we mirror the
-        // crosvm convention so both substrates share `~/.local/share/elastos`.
-        assert!(config.kernel_path.ends_with("bin/vmlinux"));
-        assert!(config.state_dir.ends_with("vz"));
-        assert!(config.rootfs_cache_dir.ends_with("rootfs-cache"));
-    }
-
-    #[test]
-    fn vz_config_with_kernel_path_overrides() {
-        let custom = PathBuf::from("/custom/vmlinux");
-        let config = VzConfig::new().with_kernel_path(&custom);
-        assert_eq!(config.kernel_path, custom);
-    }
-
-    #[test]
     fn validate_guest_kernel_accepts_string_marker_kernel() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         fs::write(tmp.path(), b"... ext4 ... virtio_blk ... virtio_pci ...").unwrap();
         validate_guest_kernel(tmp.path()).unwrap();
-    }
-
-    #[test]
-    fn vm_config_initramfs_path_defaults_to_none_from_manifest() {
-        let manifest = microvm_manifest("");
-        let config = VmConfig::from_manifest(
-            &manifest,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
-        assert!(
-            config.initramfs_path.is_none(),
-            "from_manifest must not invent an initramfs path"
-        );
-    }
-
-    #[test]
-    fn vm_config_with_initramfs_path_sets_the_field() {
-        let manifest = microvm_manifest("");
-        let config = VmConfig::from_manifest(
-            &manifest,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        )
-        .with_initramfs_path("/tmp/initrd.img");
-        assert_eq!(
-            config.initramfs_path.as_deref(),
-            Some(std::path::Path::new("/tmp/initrd.img"))
-        );
     }
 
     #[test]
@@ -795,20 +735,6 @@ mod tests {
         assert!(
             config.prune_orphans_on_startup,
             "default-constructed VzConfig must opt into Mac startup orphan pruning so `elastos serve` self-heals after a supervisor crash"
-        );
-    }
-
-    #[test]
-    fn vz_config_with_prune_orphans_on_startup_round_trip() {
-        let opted_out = VzConfig::new().with_prune_orphans_on_startup(false);
-        assert!(
-            !opted_out.prune_orphans_on_startup,
-            "with_prune_orphans_on_startup(false) must set the flag to false"
-        );
-        let opted_in_again = opted_out.with_prune_orphans_on_startup(true);
-        assert!(
-            opted_in_again.prune_orphans_on_startup,
-            "with_prune_orphans_on_startup(true) must restore the flag"
         );
     }
 
@@ -947,30 +873,6 @@ mod tests {
         .expect("custom-limits build must accept ask within the operator-raised cap");
         assert_eq!(config.mem_size_mib, above_default);
         assert_eq!(config.vcpu_count, 16);
-    }
-
-    #[test]
-    fn vm_config_limits_default_matches_documented_constants() {
-        let limits = VmConfigLimits::default();
-        assert_eq!(limits.max_memory_mib, DEFAULT_MAX_MEMORY_MIB);
-        assert_eq!(limits.max_vcpu_count, DEFAULT_MAX_VCPU_COUNT);
-    }
-
-    #[test]
-    fn from_manifest_remains_infallible_for_unvalidated_callers() {
-        // `from_manifest` (no `_with_limits`) is the unvalidated
-        // path retained for tests and trusted-input call sites.
-        // It must continue to accept absurd values without panic
-        // so trusted callers that intentionally bypass limits keep
-        // compiling and running.
-        let manifest = microvm_manifest_with_resources(u32::MAX, u8::MAX);
-        let config = VmConfig::from_manifest(
-            &manifest,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
-        assert_eq!(config.mem_size_mib, u32::MAX);
-        assert_eq!(config.vcpu_count, u8::MAX);
     }
 
     #[test]

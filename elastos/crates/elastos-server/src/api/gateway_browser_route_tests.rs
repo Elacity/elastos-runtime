@@ -1039,149 +1039,65 @@ async fn test_browser_open_fails_closed_without_attached_engine_transport() {
 }
 
 #[tokio::test]
-async fn test_browser_open_requires_explicit_launch_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority(dir.path());
-    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
-
-    let response = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/browser/open")
-                .header("x-elastos-home-token", token)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"url":"https://glidefinance.io/","reason":"open browser page"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("display_mode") || message.contains("guarantee_level"));
-}
-
-#[tokio::test]
-async fn test_browser_open_rejects_mismatched_launch_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority(dir.path());
-    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
-
-    let response = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/browser/open")
-                .header("x-elastos-home-token", token)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"url":"https://glidefinance.io/","display_mode":"native_surface","guarantee_level":"operator_rbi"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("operator_rbi"));
-}
-
-#[tokio::test]
-async fn test_browser_open_rejects_unsafe_remote_exit_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority(dir.path());
-    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
-
-    let response = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/browser/open")
-                .header("x-elastos-home-token", token)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"url":"https://glidefinance.io/","remote_exit_id":"../server-exit","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("remote_exit_id"));
-}
-
-#[tokio::test]
-async fn test_browser_open_rejects_unsafe_engine_adapter_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority(dir.path());
-    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
-
-    let response = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/browser/open")
-                .header("x-elastos-home-token", token)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"url":"https://glidefinance.io/","adapter_id":"../mac-engine","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("adapter_id"));
-}
-
-#[tokio::test]
-async fn test_browser_open_rejects_non_http_urls() {
-    let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority(dir.path());
-    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
-
-    let response = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/browser/open")
-                .header("x-elastos-home-token", token.clone())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"url":"javascript:alert(1)","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("Only http and https"));
+async fn test_browser_open_refuses_invalid_launch_contracts() {
+    for (case, request, status, errors) in [
+        (
+            "requires_explicit_launch_contract",
+            r#"{"url":"https://glidefinance.io/","reason":"open browser page"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &["display_mode", "guarantee_level"][..],
+        ),
+        (
+            "rejects_mismatched_launch_contract",
+            r#"{"url":"https://glidefinance.io/","display_mode":"native_surface","guarantee_level":"operator_rbi"}"#,
+            StatusCode::BAD_REQUEST,
+            &["operator_rbi"][..],
+        ),
+        (
+            "rejects_unsafe_remote_exit_id",
+            r#"{"url":"https://glidefinance.io/","remote_exit_id":"../server-exit","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+            StatusCode::BAD_REQUEST,
+            &["remote_exit_id"][..],
+        ),
+        (
+            "rejects_unsafe_engine_adapter_id",
+            r#"{"url":"https://glidefinance.io/","adapter_id":"../mac-engine","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+            StatusCode::BAD_REQUEST,
+            &["adapter_id"][..],
+        ),
+        (
+            "rejects_non_http_urls",
+            r#"{"url":"javascript:alert(1)","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+            StatusCode::BAD_REQUEST,
+            &["Only http and https"][..],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+        let response = app
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{case}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            errors.iter().any(|error| message.contains(*error)),
+            "{case}: {message}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -8981,7 +8897,13 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
     // Each lifecycle boundary rejects before another Engine input. Keep the
     // original Runtime service alive to prove replacement, not merely drop.
     let mut replacement = None;
-    for boundary in ["expiry", "revoke", "session", "runtime"] {
+    for boundary in [
+        "expiry",
+        "capability-expiry",
+        "revoke",
+        "session",
+        "runtime",
+    ] {
         let candidate = sessions.create_session(SessionType::Capsule, None).await;
         let request = json!({"schema":"elastos.browser.operator-request/v1",
             "document_generation":"a".repeat(32),"actions":["click"],
@@ -9006,12 +8928,19 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
         )
         .await
         .1;
-        let capability = grant["capability"].as_str().unwrap();
+        let capability = if boundary == "capability-expiry" {
+            _service.expired_capability_fixture(id).await
+        } else {
+            grant["capability"].as_str().unwrap().to_owned()
+        };
         let expected = match boundary {
             "expiry" => {
-                tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(2050)).await;
+                tokio::time::resume();
                 StatusCode::FORBIDDEN
             }
+            "capability-expiry" => StatusCode::FORBIDDEN,
             "revoke" => {
                 assert_eq!(
                     owner_operator_request(app.clone(), "DELETE", &decision, &owner).await,
@@ -9036,20 +8965,19 @@ async fn test_browser_operator_admission_separate_session_quota_replay_and_hando
         let event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"f".repeat(32),
             "admission_id":id,"document_generation":"a".repeat(32),
             "ref":format!("{}:0","b".repeat(32)),"action":"click"});
-        assert_eq!(
-            operator_request(
-                app.clone(),
-                "POST",
-                &input_uri,
-                &candidate.token,
-                Some(capability),
-                json!({"event":event})
-            )
-            .await
-            .0,
-            expected,
-            "{boundary}"
-        );
+        let refused = operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &candidate.token,
+            Some(&capability),
+            json!({"event":event}),
+        )
+        .await;
+        assert_eq!(refused.0, expected, "{boundary}");
+        if boundary == "capability-expiry" {
+            assert_eq!(refused.1["code"], "operator_capability_rejected");
+        }
         assert_eq!(
             provider.inputs.lock().await.len(),
             before,

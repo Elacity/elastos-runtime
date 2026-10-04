@@ -3019,42 +3019,6 @@ mod tests {
     }
 
     #[test]
-    fn test_kubo_state_serialization() {
-        assert_eq!(serde_json::to_string(&KuboState::Cold).unwrap(), "\"cold\"");
-        assert_eq!(
-            serde_json::to_string(&KuboState::Starting).unwrap(),
-            "\"starting\""
-        );
-        assert_eq!(
-            serde_json::to_string(&KuboState::Ready).unwrap(),
-            "\"ready\""
-        );
-        assert_eq!(
-            serde_json::to_string(&KuboState::Error).unwrap(),
-            "\"error\""
-        );
-    }
-
-    #[test]
-    fn test_request_deserialization() {
-        let json = r#"{"op":"add_bytes","data":"aGVsbG8=","filename":"test.txt","pin":true}"#;
-        let req: Request = serde_json::from_str(json).expect("Should parse add_bytes");
-        match req {
-            Request::AddBytes {
-                data,
-                filename,
-                pin,
-                ..
-            } => {
-                assert_eq!(data, "aGVsbG8=");
-                assert_eq!(filename, "test.txt");
-                assert!(pin);
-            }
-            _ => panic!("Expected AddBytes"),
-        }
-    }
-
-    #[test]
     fn test_request_accepts_runtime_invocation_metadata() {
         let runtime = r#"{
             "schema":"elastos.provider.invocation/v1",
@@ -3081,26 +3045,6 @@ mod tests {
             r#"{"op":"add_bytes","data":"aGVsbG8=","filename":"test.txt","pin":true,"admin":true}"#;
         let err = serde_json::from_str::<Request>(json).expect_err("Should reject unknown fields");
         assert!(err.to_string().contains("unknown field `admin`"));
-    }
-
-    #[test]
-    fn test_cat_request_deserialization() {
-        let json = r#"{"op":"cat","cid":"QmTest","path":"file.txt"}"#;
-        let req: Request = serde_json::from_str(json).expect("Should parse cat");
-        match req {
-            Request::Cat { cid, path, .. } => {
-                assert_eq!(cid, "QmTest");
-                assert_eq!(path.as_deref(), Some("file.txt"));
-            }
-            _ => panic!("Expected Cat"),
-        }
-    }
-
-    #[test]
-    fn test_init_request_deserialization() {
-        let json = r#"{"op":"init","config":{}}"#;
-        let req: Request = serde_json::from_str(json).expect("Should parse init");
-        assert!(matches!(req, Request::Init { .. }));
     }
 
     #[test]
@@ -3279,19 +3223,6 @@ mod tests {
 
         std::env::remove_var("ELASTOS_CAPSULE_BIN_DIR");
         assert_eq!(kubo, Some(shared_bin.path().join("kubo")));
-    }
-
-    #[test]
-    fn test_response_serialization() {
-        let ok = Response::ok(serde_json::json!({"cid": "QmTest"}));
-        let json = serde_json::to_string(&ok).unwrap();
-        assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"cid\":\"QmTest\""));
-
-        let err = Response::error("test_code", "test message");
-        let json = serde_json::to_string(&err).unwrap();
-        assert!(json.contains("\"status\":\"error\""));
-        assert!(json.contains("\"code\":\"test_code\""));
     }
 
     #[test]

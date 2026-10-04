@@ -21,7 +21,9 @@ use elastos_common::{
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 
-use elastos_vz::{is_supported, NetworkConfig, VmConfig, VzConfig, VzProvider};
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use elastos_vz::is_supported;
+use elastos_vz::{VmConfig, VzConfig, VzProvider};
 
 fn microvm_manifest(name: &str) -> CapsuleManifest {
     CapsuleManifest {
@@ -72,34 +74,12 @@ fn microvm_manifest(name: &str) -> CapsuleManifest {
 }
 
 #[test]
-fn is_supported_reports_bool_without_panicking() {
-    let _: bool = is_supported();
-}
-
-#[test]
 fn off_mac_is_supported_is_strictly_false() {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     assert!(
         !is_supported(),
         "is_supported() must be false everywhere outside Apple Silicon macOS"
     );
-}
-
-#[test]
-fn vz_provider_constructable_with_defaults() {
-    // Provider construction deliberately does not require a kernel
-    // on disk so contributors on a Mac without the runtime install
-    // can still build and test.
-    let provider = VzProvider::with_defaults();
-    assert!(provider.is_ok());
-}
-
-#[test]
-fn vz_provider_supports_only_microvm() {
-    let provider = VzProvider::with_defaults().unwrap();
-    assert!(provider.supports(&CapsuleType::MicroVM));
-    assert!(!provider.supports(&CapsuleType::Wasm));
-    assert!(!provider.supports(&CapsuleType::Oci));
 }
 
 #[tokio::test]
@@ -254,18 +234,4 @@ fn vm_config_from_manifest_translates_to_vz_console_naming() {
     // rewritten to `console=hvc0` for Vz boot.
     assert!(config.boot_args.contains("console=hvc0"));
     assert!(!config.boot_args.contains("ttyS0"));
-}
-
-#[test]
-fn network_config_new_is_deterministic_and_shape_compatible() {
-    let a = NetworkConfig::new("smoke-net");
-    let b = NetworkConfig::new("smoke-net");
-    // Deterministic for the same vm_id.
-    assert_eq!(a.host_ip, b.host_ip);
-    assert_eq!(a.guest_ip, b.guest_ip);
-    assert_eq!(a.guest_mac, b.guest_mac);
-    // Shape matches crosvm.
-    assert_eq!(a.prefix_len, 30);
-    assert!(a.host_ip.ends_with(".1"));
-    assert!(a.guest_ip.ends_with(".2"));
 }

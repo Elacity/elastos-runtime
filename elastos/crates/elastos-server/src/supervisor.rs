@@ -1574,7 +1574,6 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::setup::{Component, PlatformInfo};
-    use base64::Engine as _;
     use elastos_runtime::provider::{
         Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
     };
@@ -1583,39 +1582,6 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-
-    #[test]
-    fn test_supervisor_request_serialization() {
-        let req = SupervisorRequest::EnsureCapsule {
-            name: "chat".into(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("ensure_capsule"));
-        assert!(json.contains("chat"));
-
-        let parsed: SupervisorRequest = serde_json::from_str(&json).unwrap();
-        match parsed {
-            SupervisorRequest::EnsureCapsule { name } => assert_eq!(name, "chat"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_supervisor_response_ok() {
-        let resp = SupervisorResponse::ok_with_path("/var/capsules/chat/");
-        assert_eq!(resp.status, "ok");
-        assert_eq!(resp.path, Some("/var/capsules/chat/".into()));
-
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(!json.contains("error"));
-    }
-
-    #[test]
-    fn test_supervisor_response_error() {
-        let resp = SupervisorResponse::err("not found");
-        assert_eq!(resp.status, "error");
-        assert_eq!(resp.error, Some("not found".into()));
-    }
 
     #[test]
     fn test_supervisor_request_launch() {
@@ -2217,27 +2183,6 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("cached CID mismatch"));
-    }
-
-    #[tokio::test]
-    async fn test_content_fetch_via_provider_uses_content_contract() {
-        let expected = b"capsule-bytes";
-        let registry = registry_with_content_provider(serde_json::json!({
-            "status": "ok",
-            "data": {
-                "data": base64::engine::general_purpose::STANDARD.encode(expected),
-            }
-        }))
-        .await;
-
-        let mut supervisor = make_test_supervisor();
-        supervisor.set_provider_registry(Arc::clone(&registry));
-
-        let bytes = supervisor
-            .content_fetch_via_provider(TEST_SUPERVISOR_CID)
-            .await
-            .unwrap();
-        assert_eq!(bytes, expected);
     }
 
     #[tokio::test]

@@ -229,49 +229,6 @@ pub struct ResponseEnvelope {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_request_serialization() {
-        let req = RuntimeRequest::ListCapsules;
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("list_capsules"));
-    }
-
-    #[test]
-    fn test_response_serialization() {
-        let resp = RuntimeResponse::CapsuleList {
-            capsules: vec![CapsuleListEntry {
-                id: "cap-1".to_string(),
-                name: "test".to_string(),
-                status: "running".to_string(),
-            }],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("capsule_list"));
-        assert!(json.contains("cap-1"));
-    }
-
-    #[test]
-    fn test_envelope_roundtrip() {
-        let envelope = RequestEnvelope {
-            id: 42,
-            request: RuntimeRequest::Ping,
-        };
-
-        let json = serde_json::to_string(&envelope).unwrap();
-        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.id, 42);
-        assert!(matches!(parsed.request, RuntimeRequest::Ping));
-    }
-
-    #[test]
-    fn test_error_response() {
-        let resp = RuntimeResponse::error("not_found", "Capsule not found");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("not_found"));
-        assert!(json.contains("Capsule not found"));
-    }
-
     /// Compatibility test: every runtime-control request shape must deserialize.
     ///
     /// This is intentionally not the public capsule-kernel ABI.

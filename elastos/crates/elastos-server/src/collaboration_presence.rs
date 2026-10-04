@@ -1314,21 +1314,30 @@ mod tests {
     fn presence_capacity_prunes_expired_records_and_byte_overflow_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture_at(temp.path());
-        for index in 0..MAX_PRESENCE_RECORDS {
+        // Seed the capacity fixture once. The boundary operation below still
+        // verifies every signed record and proves that overflow preserves it.
+        let mut state = fixture.presence.read_model.empty_state();
+        for index in 0..MAX_PRESENCE_RECORDS - 1 {
             let message = remote_presence(&fixture, &format!("Peer {index}"), None, NOW);
-            if let Err(error) = fixture
+            state.records.push(PresenceRecord {
+                envelope: String::from_utf8(message.envelope_bytes().to_vec()).unwrap(),
+            });
+        }
+        fixture
+            .presence
+            .read_model
+            .ensure_state_directory()
+            .unwrap();
+        fixture.presence.read_model.write_state(&state).unwrap();
+        let final_slot = remote_presence(&fixture, "Final slot", None, NOW);
+        assert_eq!(
+            fixture
                 .presence
                 .read_model
-                .project(message.envelope_bytes(), NOW)
-            {
-                let state_bytes = fs::metadata(fixture.presence.read_model.state_path())
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                panic!(
-                    "presence record {index} exceeded the state after {state_bytes} bytes: {error}"
-                );
-            }
-        }
+                .project(final_slot.envelope_bytes(), NOW)
+                .unwrap(),
+            CollaborationPresenceProjectionOutcome::Applied,
+        );
         assert_eq!(
             fixture.presence.snapshot(NOW).unwrap().records().len(),
             MAX_PRESENCE_RECORDS

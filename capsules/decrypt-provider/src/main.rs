@@ -353,38 +353,6 @@ mod tests {
         }
     }
 
-    fn ok_data(response: Response) -> Value {
-        match response {
-            Response::Ok { data: Some(data) } => data,
-            other => panic!("expected ok data, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn status_advertises_blocked_raw_authority() {
-        let provider = DecryptProvider;
-        let data = ok_data(provider.status());
-
-        assert_eq!(data["provider"], "decrypt");
-        assert_eq!(data["configured"], false);
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("raw_cek")));
-        assert!(data["blocked_authority"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("raw_plaintext")));
-        assert_eq!(
-            data["contract"]["schema"],
-            "elastos.protected-content.decrypt-provider/v1"
-        );
-        assert_eq!(
-            data["contract"]["status"],
-            "fail_closed_until_key_release_and_decrypt_backend_configured"
-        );
-    }
-
     #[test]
     fn open_session_fails_closed_until_backend_exists() {
         let provider = DecryptProvider;

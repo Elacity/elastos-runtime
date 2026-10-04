@@ -5741,11 +5741,26 @@ mod tests {
                 .unwrap();
         println!("ELASTOS_TEST_LIFETIME_LOCK_READY");
         std::io::stdout().flush().unwrap();
-        thread::sleep(Duration::from_secs(60));
+        loop {
+            thread::park();
+        }
     }
 
     #[test]
     fn kernel_lifetime_lock_releases_after_owner_process_death() {
+        struct LockChild {
+            child: std::process::Child,
+            reader: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for LockChild {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("owner-death.lock");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -5756,25 +5771,30 @@ mod tests {
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut lines = std::io::BufReader::new(stdout).lines();
-        let mut ready = false;
-        for _ in 0..20 {
-            let Some(line) = lines.next() else {
-                break;
-            };
-            if line.unwrap().contains("ELASTOS_TEST_LIFETIME_LOCK_READY") {
-                ready = true;
-                break;
-            }
-        }
+        let mut owner = LockChild {
+            child,
+            reader: None,
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        owner.reader = Some(thread::spawn(move || {
+            let ready = std::io::BufReader::new(stdout)
+                .lines()
+                .take(20)
+                .map_while(Result::ok)
+                .any(|line| line.contains("ELASTOS_TEST_LIFETIME_LOCK_READY"));
+            let _ = ready_tx.send(ready);
+        }));
+        let ready = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or(false);
         assert!(ready, "lock-owner child did not acquire its lifetime lock");
         let error = LifetimeFileLock::acquire_lock_file(&lock_path, "test Browser VM resource")
             .unwrap_err();
         let typed: Value = serde_json::from_str(&error).unwrap();
         assert_eq!(typed["code"], "resources_in_use");
 
-        child.kill().unwrap();
-        child.wait().unwrap();
+        owner.child.kill().unwrap();
+        owner.child.wait().unwrap();
 
         LifetimeFileLock::acquire_lock_file(&lock_path, "test Browser VM resource").unwrap();
     }

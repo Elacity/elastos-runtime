@@ -1970,22 +1970,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_connect_uses_direct_join_mode() {
-        assert_eq!(
-            ChatBootstrap::ExplicitConnect("manual-ticket".to_string()).gossip_join_mode(),
-            "direct"
-        );
-    }
-
-    #[test]
-    fn source_seed_uses_direct_join_mode() {
-        assert_eq!(
-            ChatBootstrap::TrustedSourceSeed("seed-ticket".to_string()).gossip_join_mode(),
-            "direct"
-        );
-    }
-
-    #[test]
     fn chat_nickname_prefers_requested_then_local_then_attached_then_env() {
         assert_eq!(
             resolve_chat_nickname(
@@ -2093,129 +2077,33 @@ mod tests {
     }
 
     #[test]
-    fn tty_loop_quit_returns_false() {
-        let client = reqwest::Client::new();
-        let mut input = Cursor::new(b"/quit\r".to_vec());
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
-        let ctx = NativeChatCtx {
-            client: &client,
-            api: "http://127.0.0.1",
-            token: "token",
-            peer_cap: "cap",
-            did_cap: "cap",
-            self_did: "",
-            self_session_id: "",
-            nick: "nick",
-        };
+    fn tty_loop_handles_exit_inputs() {
+        for (case, bytes, expected_home) in [
+            ("quit", b"/quit\r".to_vec(), false),
+            ("home", b"/home\r".to_vec(), true),
+            ("escape", vec![0x1b], true),
+            ("newlines before home", b"\r\n/home\r".to_vec(), true),
+            ("newlines before quit", b"\r\n/quit\r".to_vec(), false),
+        ] {
+            let client = reqwest::Client::new();
+            let mut input = Cursor::new(bytes);
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let ui = ChatTerminalUi::buffer(Arc::clone(&output));
+            let ctx = NativeChatCtx {
+                client: &client,
+                api: "http://127.0.0.1",
+                token: "token",
+                peer_cap: "cap",
+                did_cap: "cap",
+                self_did: "",
+                self_session_id: "",
+                nick: "nick",
+            };
 
-        let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
+            let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
 
-        assert!(!home_requested);
-    }
-
-    #[test]
-    fn tty_loop_home_returns_true() {
-        let client = reqwest::Client::new();
-        let mut input = Cursor::new(b"/home\r".to_vec());
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
-        let ctx = NativeChatCtx {
-            client: &client,
-            api: "http://127.0.0.1",
-            token: "token",
-            peer_cap: "cap",
-            did_cap: "cap",
-            self_did: "",
-            self_session_id: "",
-            nick: "nick",
-        };
-
-        let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
-
-        assert!(home_requested);
-    }
-
-    #[test]
-    fn tty_loop_escape_returns_true() {
-        let client = reqwest::Client::new();
-        let mut input = Cursor::new(vec![0x1b]);
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
-        let ctx = NativeChatCtx {
-            client: &client,
-            api: "http://127.0.0.1",
-            token: "token",
-            peer_cap: "cap",
-            did_cap: "cap",
-            self_did: "",
-            self_session_id: "",
-            nick: "nick",
-        };
-
-        let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
-
-        assert!(home_requested);
-    }
-
-    #[test]
-    fn tty_loop_ignores_leading_newlines_before_home() {
-        let client = reqwest::Client::new();
-        let mut input = Cursor::new(b"\r\n/home\r".to_vec());
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
-        let ctx = NativeChatCtx {
-            client: &client,
-            api: "http://127.0.0.1",
-            token: "token",
-            peer_cap: "cap",
-            did_cap: "cap",
-            self_did: "",
-            self_session_id: "",
-            nick: "nick",
-        };
-
-        let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
-
-        assert!(home_requested);
-    }
-
-    #[test]
-    fn tty_loop_ignores_leading_newlines_before_quit() {
-        let client = reqwest::Client::new();
-        let mut input = Cursor::new(b"\r\n/quit\r".to_vec());
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
-        let ctx = NativeChatCtx {
-            client: &client,
-            api: "http://127.0.0.1",
-            token: "token",
-            peer_cap: "cap",
-            did_cap: "cap",
-            self_did: "",
-            self_session_id: "",
-            nick: "nick",
-        };
-
-        let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
-
-        assert!(!home_requested);
-    }
-
-    #[test]
-    fn native_chat_exit_hint_is_explicit_for_home_launch() {
-        assert_eq!(
-            native_chat_exit_hint(Some("home")),
-            "Type /home to return Home, or /quit to leave chat and return Home."
-        );
-    }
-
-    #[test]
-    fn native_chat_exit_hint_is_explicit_for_terminal_launch() {
-        assert_eq!(
-            native_chat_exit_hint(None),
-            "Type /home to return Home, or /quit to exit to the terminal."
-        );
+            assert_eq!(home_requested, expected_home, "{case}");
+        }
     }
 
     #[test]

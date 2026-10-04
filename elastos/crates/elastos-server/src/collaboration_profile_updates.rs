@@ -861,7 +861,7 @@ mod tests {
         let pair =
             crate::collaboration_discovery_runtime::tests::durable_profile_peer_pair(temp.path())
                 .await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
         let now = crate::auth::now_ts();
         let b_root = temp.path().join("b");
         let profile_b_did = pair.identity_b.profile.document().profile_did.clone();
@@ -986,7 +986,9 @@ mod tests {
             recovered_contacts.contacts()[0].conversation_id(),
             pair.conversation_id
         );
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        crate::collaboration_discovery_runtime::tests::connect_peer_pair(&pair._node_a, &_node_b2)
+            .await;
         service_b2
             .profile_update_service()
             .register_verified_context_for_test(store_b2.clone(), rebound.clone())
@@ -1029,7 +1031,7 @@ mod tests {
         let pair =
             crate::collaboration_discovery_runtime::tests::durable_profile_peer_pair(temp.path())
                 .await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
         let now = crate::auth::now_ts();
         let root_b = temp.path().join("b");
 

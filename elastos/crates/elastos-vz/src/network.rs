@@ -115,6 +115,10 @@ mod tests {
     #[test]
     fn network_config_new_matches_crosvm_shape() {
         let config = NetworkConfig::new("vm-network-shape");
+        let same_vm = NetworkConfig::new("vm-network-shape");
+        assert_eq!(config.host_ip, same_vm.host_ip);
+        assert_eq!(config.guest_ip, same_vm.guest_ip);
+        assert_eq!(config.guest_mac, same_vm.guest_mac);
         assert!(config.tap_name.starts_with("vz"));
         assert!(config.host_ip.starts_with("172.16."));
         assert!(config.host_ip.ends_with(".1"));
