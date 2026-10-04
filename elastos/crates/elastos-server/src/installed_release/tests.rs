@@ -12,6 +12,11 @@ struct Fixture {
     release: Vec<u8>,
 }
 
+type Snapshot = std::collections::BTreeMap<
+    std::path::PathBuf,
+    (u32, Option<Vec<u8>>, Option<std::path::PathBuf>),
+>;
+
 fn key(value: u8) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[value; 32])
 }
@@ -112,6 +117,40 @@ impl Fixture {
         load_or_migrate(&self.data, &self.binary, &self.source, &guard)
     }
 
+    fn publish_consumed_pair(&self) {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.data.join("installation"))
+            .unwrap();
+        write_private(&installation_release_head_path(&self.data), &self.head).unwrap();
+        write_private(
+            &installation_release_manifest_path(&self.data),
+            &self.release,
+        )
+        .unwrap();
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        let mut directories = vec![self.data.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let bytes = metadata.is_file().then(|| fs::read(&path).unwrap());
+                let target = metadata
+                    .file_type()
+                    .is_symlink()
+                    .then(|| fs::read_link(&path).unwrap());
+                if metadata.is_dir() {
+                    directories.push(path.clone());
+                }
+                snapshot.insert(path, (metadata.mode(), bytes, target));
+            }
+        }
+        snapshot
+    }
+
     fn stage(&self) -> std::path::PathBuf {
         let stage = self.data.join(MIGRATION);
         fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
@@ -178,6 +217,15 @@ fn older_empty_head_pin_and_still_pinned_secondary_signer_are_admitted() {
     );
     assert!(!fixture.data.join("installation").exists());
     assert_eq!(fixture.load().unwrap().head, fixture.head);
+    let guard = InstallationGuard::acquire(fixture.binary.parent().unwrap()).unwrap();
+    let before = fixture.snapshot();
+    assert_eq!(
+        read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard)
+            .unwrap()
+            .head,
+        fixture.head
+    );
+    assert_eq!(fixture.snapshot(), before);
 }
 
 #[test]
@@ -244,6 +292,15 @@ fn complete_pair_admission_refuses_every_changed_binding_before_migration() {
         assert!(fixture.load().is_err(), "{case}");
         assert!(!fixture.data.join("installation").exists(), "{case}");
         assert!(!fixture.data.join(MIGRATION).exists(), "{case}");
+        fixture.publish_consumed_pair();
+        let guard = InstallationGuard::acquire(fixture.binary.parent().unwrap()).unwrap();
+        let before = fixture.snapshot();
+        assert_eq!(
+            read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard).is_ok(),
+            case == "components",
+            "setup: {case}"
+        );
+        assert_eq!(fixture.snapshot(), before, "setup: {case}");
     }
 }
 
@@ -280,6 +337,13 @@ fn partial_or_unsafe_consumed_state_has_no_publisher_fallback() {
             _ => unreachable!(),
         }
         assert!(fixture.load().is_err(), "{case}");
+        let guard = InstallationGuard::acquire(fixture.binary.parent().unwrap()).unwrap();
+        let before = fixture.snapshot();
+        assert!(
+            read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard).is_err(),
+            "setup: {case}"
+        );
+        assert_eq!(fixture.snapshot(), before, "setup: {case}");
         assert_eq!(
             fs::read(publisher_release_manifest_path(&fixture.data)).unwrap(),
             fixture.release,
@@ -472,4 +536,207 @@ fn chunked_components_descriptor_uses_signed_checksum_and_size() {
     assert!(fixture.load().is_ok());
     fs::write(fixture.data.join("components.json"), b"foreign components").unwrap();
     assert!(fixture.load().is_err());
+}
+
+#[test]
+fn setup_reader_admits_binary_only_installation_without_support_reads_or_writes() {
+    for case in [
+        "components missing",
+        "components changed",
+        "components directory",
+        "components symlink",
+        "catalogue missing",
+        "catalogue changed",
+        "catalogue symlink",
+        "support missing",
+        "support changed",
+        "support directory",
+        "support symlink",
+    ] {
+        let mut fixture = Fixture::new();
+        let support = b"installed signed kubo";
+        fs::create_dir(fixture.data.join("bin")).unwrap();
+        fs::write(fixture.data.join("bin/kubo"), support).unwrap();
+        let catalogue = signed(
+            crate::api::capsule_inventory::tests::model_catalog_fixture(),
+            "elastos.model.catalog.v1",
+            71,
+        );
+        fs::write(fixture.data.join("model-catalog.json"), &catalogue).unwrap();
+        let components = json!({"schema":"elastos.components/v1", "external":{"kubo":{
+            "version":"fixture", "install_path":"bin/kubo", "platforms":{(crate::setup::detect_platform()):{
+                "strategy":"release", "install_path":"bin/kubo", "cid":raw_cid(support), "checksum":format!("sha256:{}", hex::encode(Sha256::digest(support)))
+            }}
+        }}, "capsules":{}, "profiles":{"home":{"components":["kubo"]}},
+            "model_catalog":{"head_cid":raw_cid(&catalogue), "publisher_dids":[crate::crypto::encode_signing_key_did(&key(71))]}});
+        fs::write(
+            fixture.data.join("components.json"),
+            serde_json::to_vec(&components).unwrap(),
+        )
+        .unwrap();
+        fixture.bind_components();
+        fixture.publish_consumed_pair();
+        assert!(read_without_migration(&fixture.data, &fixture.binary, &fixture.source).is_ok());
+        let (input, mutation) = case.split_once(' ').unwrap();
+        let path = fixture.data.join(match input {
+            "components" => "components.json",
+            "catalogue" => "model-catalog.json",
+            "support" => "bin/kubo",
+            _ => unreachable!(),
+        });
+        fs::remove_file(&path).unwrap();
+        match mutation {
+            "missing" => {}
+            "changed" => fs::write(&path, b"preserve foreign support input").unwrap(),
+            "directory" => fs::create_dir(&path).unwrap(),
+            "symlink" => symlink(&fixture.binary, &path).unwrap(),
+            _ => unreachable!(),
+        }
+        fs::write(
+            publisher_release_head_path(&fixture.data),
+            b"Publisher output",
+        )
+        .unwrap();
+        fs::write(
+            publisher_release_manifest_path(&fixture.data),
+            b"Publisher output",
+        )
+        .unwrap();
+        let guard = InstallationGuard::acquire(fixture.binary.parent().unwrap()).unwrap();
+        let before = fixture.snapshot();
+        let admitted =
+            read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard).unwrap();
+        assert_eq!(admitted.head, fixture.head, "{case}");
+        assert_eq!(admitted.release, fixture.release, "{case}");
+        assert_eq!(
+            admitted.binary_sha256,
+            hex::encode(Sha256::digest(fs::read(&fixture.binary).unwrap())),
+            "{case}"
+        );
+        assert!(
+            read_without_migration(&fixture.data, &fixture.binary, &fixture.source).is_err(),
+            "{case}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{case}");
+        assert!(!fixture.data.join(MIGRATION).exists(), "{case}");
+    }
+}
+
+#[test]
+fn setup_reader_requires_complete_consumed_pair_and_preserves_legacy_and_migration_inputs() {
+    for case in [
+        "legacy only",
+        "empty consumed",
+        "head only",
+        "release only",
+        "migration only",
+        "foreign consumed input",
+    ] {
+        let fixture = Fixture::new();
+        assert!(read_without_migration(&fixture.data, &fixture.binary, &fixture.source).is_ok());
+        if case == "migration only" {
+            let stage = fixture.stage();
+            write_private(&stage.join(HEAD), &fixture.head).unwrap();
+            write_private(&stage.join(RELEASE), &fixture.release).unwrap();
+        } else if case != "legacy only" {
+            let root = fixture.data.join("installation");
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+            match case {
+                "head only" => write_private(&root.join(HEAD), &fixture.head).unwrap(),
+                "release only" => write_private(&root.join(RELEASE), &fixture.release).unwrap(),
+                "foreign consumed input" => {
+                    write_private(&root.join(HEAD), &fixture.head).unwrap();
+                    write_private(&root.join(RELEASE), &fixture.release).unwrap();
+                    write_private(&root.join("owner-file"), b"owner bytes").unwrap();
+                }
+                "empty consumed" => {}
+                _ => unreachable!(),
+            }
+        }
+        let guard = InstallationGuard::acquire(fixture.binary.parent().unwrap()).unwrap();
+        let before = fixture.snapshot();
+        assert!(
+            read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard).is_err(),
+            "{case}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{case}");
+    }
+}
+
+#[test]
+fn setup_reader_requires_exact_guard_current_source_and_pending_free_binary() {
+    for case in [
+        "different guard parent",
+        "replaced lock",
+        "pending file",
+        "pending directory",
+        "pending symlink",
+        "changed source input",
+        "missing publisher pins",
+        "different source binary",
+        "binary symlink",
+        "binary hardlink",
+        "binary directory",
+        "binary unsafe mode",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.publish_consumed_pair();
+        let parent = if case == "different guard parent" {
+            let parent = fixture.data.join("other-bin");
+            fs::create_dir(&parent).unwrap();
+            parent
+        } else {
+            fixture.binary.parent().unwrap().to_path_buf()
+        };
+        let guard = InstallationGuard::acquire(&parent).unwrap();
+        let journal = fixture.data.join(".elastos.update-journal.json");
+        match case {
+            "different guard parent" => {}
+            "replaced lock" => {
+                fs::rename(
+                    fixture.data.join(".elastos.install.lock"),
+                    fixture.data.join("held-lock"),
+                )
+                .unwrap();
+                write_private(&fixture.data.join(".elastos.install.lock"), b"").unwrap();
+            }
+            "pending file" => write_private(&journal, b"pending malformed journal").unwrap(),
+            "pending directory" => fs::create_dir(&journal).unwrap(),
+            "pending symlink" => symlink(&fixture.binary, &journal).unwrap(),
+            "changed source input" => fixture.source.discovery_uri = "changed source".into(),
+            "missing publisher pins" => {
+                fixture.source.publisher_dids.clear();
+                fixture.save_source();
+            }
+            "different source binary" => {
+                let other = fixture.data.join("other-runtime");
+                fs::write(&other, fs::read(&fixture.binary).unwrap()).unwrap();
+                fixture.source.install_path = other.to_str().unwrap().into();
+                fixture.save_source();
+            }
+            "binary symlink" | "binary hardlink" => {
+                let original = fixture.data.join("original-runtime");
+                fs::rename(&fixture.binary, &original).unwrap();
+                if case == "binary symlink" {
+                    symlink(&original, &fixture.binary).unwrap();
+                } else {
+                    fs::hard_link(&original, &fixture.binary).unwrap();
+                }
+            }
+            "binary directory" => {
+                fs::remove_file(&fixture.binary).unwrap();
+                fs::create_dir(&fixture.binary).unwrap();
+            }
+            "binary unsafe mode" => {
+                fs::set_permissions(&fixture.binary, fs::Permissions::from_mode(0o777)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let before = fixture.snapshot();
+        assert!(
+            read_for_setup(&fixture.data, &fixture.binary, &fixture.source, &guard).is_err(),
+            "{case}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{case}");
+    }
 }

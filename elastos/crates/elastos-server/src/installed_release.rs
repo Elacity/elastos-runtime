@@ -43,14 +43,9 @@ pub(crate) fn load_or_migrate(
     let root = data.join("installation");
     let stage = data.join(MIGRATION);
     if consumed_present(data)? {
-        let admitted = read_pair(
-            data,
-            binary,
-            source,
-            &installation_release_head_path(data),
-            &installation_release_manifest_path(data),
-            true,
-        )?;
+        let admitted = read_for_setup(data, binary, source, guard)?;
+        let release = serde_json::from_slice(&admitted.release).context(REPAIR)?;
+        admit_complete_support(data, binary, &release).context(REPAIR)?;
         if present(&stage)? {
             clean_partial_stage(&stage, &admitted)?;
         }
@@ -136,6 +131,29 @@ pub(crate) fn read_without_migration(
     }
 }
 
+/// Setup holds this guard while it obtains signed support for an installed binary.
+/// Its authority starts with Runtime's private pair, before support is present.
+pub(crate) fn read_for_setup(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    guard: &InstallationGuard,
+) -> Result<InstalledRelease> {
+    guard.require_binary(binary)?;
+    require_no_pending(binary)?;
+    require_current_source(data, source)?;
+    anyhow::ensure!(consumed_present(data)?, "{REPAIR}");
+    read_pair_and_binary(
+        data,
+        binary,
+        source,
+        &installation_release_head_path(data),
+        &installation_release_manifest_path(data),
+        true,
+    )
+    .map(|(installed, _)| installed)
+}
+
 /// Recovery owns the namespace permanently selected by its journal schema.
 pub(crate) fn read_for_transaction(
     transaction: &InstallTransaction,
@@ -181,19 +199,45 @@ fn read_pair(
     release: &Path,
     private: bool,
 ) -> Result<InstalledRelease> {
+    let (installed, release) = read_pair_and_binary(data, binary, source, head, release, private)?;
+    admit_complete_support(data, binary, &release).context(REPAIR)?;
+    Ok(installed)
+}
+
+fn admit_complete_support(data: &Path, binary: &Path, release: &serde_json::Value) -> Result<()> {
+    let platform = &release["payload"]["platforms"][crate::update::detect_release_platform()];
+    let components = read_regular(&data.join("components.json"), MAX_COMPONENTS, false)?;
+    let components_sha256 = hex::encode(Sha256::digest(&components));
+    admit_descriptor(
+        &platform["components"],
+        &components_sha256,
+        components.len() as u64,
+    )?;
+    // The signed descriptor binds chunked artifact bytes by checksum and size;
+    // the head/release envelopes additionally have reconstructible metadata CIDs.
+    admit_support(data, binary, &components)
+}
+
+fn read_pair_and_binary(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    head: &Path,
+    release: &Path,
+    private: bool,
+) -> Result<(InstalledRelease, serde_json::Value)> {
     check_parents(data, head.parent().context(REPAIR)?, private)?;
     let head_bytes = read_regular(head, MAX_METADATA, private).context(REPAIR)?;
     let release_bytes = read_regular(release, MAX_METADATA, private).context(REPAIR)?;
-    admit_pair(data, binary, source, &head_bytes, &release_bytes).context(REPAIR)
+    admit_pair_and_binary(binary, source, &head_bytes, &release_bytes).context(REPAIR)
 }
 
-fn admit_pair(
-    data: &Path,
+fn admit_pair_and_binary(
     binary: &Path,
     source: &TrustedSource,
     head_bytes: &[u8],
     release_bytes: &[u8],
-) -> Result<InstalledRelease> {
+) -> Result<(InstalledRelease, serde_json::Value)> {
     anyhow::ensure!(
         !source.publisher_dids.is_empty()
             && source.publisher_dids.iter().all(|did| !did.is_empty()),
@@ -236,21 +280,14 @@ fn admit_pair(
     let platform = &release["payload"]["platforms"][crate::update::detect_release_platform()];
     let (binary_sha256, binary_size) = file_digest(binary)?;
     admit_descriptor(&platform["binary"], &binary_sha256, binary_size)?;
-    let components = read_regular(&data.join("components.json"), MAX_COMPONENTS, false)?;
-    let components_sha256 = hex::encode(Sha256::digest(&components));
-    admit_descriptor(
-        &platform["components"],
-        &components_sha256,
-        components.len() as u64,
-    )?;
-    // The signed descriptor binds chunked artifact bytes by checksum and size;
-    // the head/release envelopes additionally have reconstructible metadata CIDs.
-    admit_support(data, binary, &components)?;
-    Ok(InstalledRelease {
-        head: head_bytes.to_vec(),
-        release: release_bytes.to_vec(),
-        binary_sha256,
-    })
+    Ok((
+        InstalledRelease {
+            head: head_bytes.to_vec(),
+            release: release_bytes.to_vec(),
+            binary_sha256,
+        },
+        release,
+    ))
 }
 
 pub(crate) fn admit_descriptor(
