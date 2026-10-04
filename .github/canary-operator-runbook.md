@@ -18,9 +18,9 @@ isolated Mac HOME; the existing Mac account and Home data stay in place.
 - The public holder node/ticket are retained in `public-baseline/carrier-bootstrap.json`.
   The holder's transport DID is separate from the release signer.
 - Reviewed signer SHA-256: `e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2`.
-- Mac Python: `/opt/homebrew/Cellar/python@3.12/3.12.13_2/Frameworks/Python.framework/Versions/3.12/bin/python3.12`,
+- Mac Python: load `python.path` from the verified policy draft;
   SHA-256 `fe46716a94d8efa4514feb3c39ba3e270deee2187556986f6ddcff54aba7bb9a`.
-- Mac OpenSSL: `/opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl`,
+- Mac OpenSSL: load `openssl.path` from the verified policy draft;
   SHA-256 `5d8f84484b7317ec5639ce68ccecc1d6f565ca6df483c8ae731e25265d83466d`.
 
 The policy drafts contain the exact unsigned-manifest hashes and develop pin.
@@ -99,8 +99,8 @@ chmod 700 "$CUSTODY"
 install -m 600 "$INPUTS/release-signer.py" "$CUSTODY/release-signer.py"
 cp "$INPUTS/policy-drafts/unsigned-V1.json" "$CUSTODY/V1-policy.json"
 chmod 600 "$CUSTODY/V1-policy.json"
-PINNED_PYTHON='/opt/homebrew/Cellar/python@3.12/3.12.13_2/Frameworks/Python.framework/Versions/3.12/bin/python3.12'
-PINNED_OPENSSL='/opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl'
+PINNED_PYTHON=$(python3 -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))["python"]["path"])' "$INPUTS/policy-drafts/unsigned-V1.json")
+PINNED_OPENSSL=$(python3 -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))["openssl"]["path"])' "$INPUTS/policy-drafts/unsigned-V1.json")
 INSTALLED_SIGNER="$CUSTODY/release-signer.py"
 PEM_KEY="$CUSTODY/maintainer-ed25519.pem"
 test "$(shasum -a 256 "$INSTALLED_SIGNER" | cut -d ' ' -f 1)" = 'e8904cfb98a076544264117dbc92e7fbeae11f9cf9173fa07e1782595381d5c2'
@@ -724,7 +724,7 @@ Prepare a candidate manifest beside the package while the service runs:
 set -euo pipefail
 export HOLDER_PACKAGE HOLDER_DATA HOLDER_RUNTIME HOLDER_HELPERS
 (cd "$HOLDER_PACKAGE" && sha256sum -c SHA256SUMS)
-python3 - <<'PY'
+python3 -I -S - <<'PY'
 import hashlib, json, os
 from pathlib import Path
 package, data = Path(os.environ['HOLDER_PACKAGE']), Path(os.environ['HOLDER_DATA'])
@@ -802,7 +802,7 @@ and replace only the provider and manifest:
 
 ```bash
 umask 077
-python3 - <<'PY'
+python3 -I -S - <<'PY'
 import hashlib, json, os, stat
 from pathlib import Path
 package, data = Path(os.environ['HOLDER_PACKAGE']), Path(os.environ['HOLDER_DATA'])
@@ -888,10 +888,27 @@ After the source merges into `develop`, use the Canary Linux publisher workflow
 on its workflow-only branch. Supply `source_commit`, `source_tree`, and
 `source_ci_run` from the exact merged source and its completed successful CI.
 Select `always_on=true` and supply `lifecycle_proof_run` from a completed
-successful Canary Linux holder run for that same source tree. The lifecycle run
-can have a different source commit only when its tree is identical. The builder
-checks merge ancestry, CI identity, the authenticated lifecycle artifact digest,
-its source tree, real idle time, first complete Carrier read, and cleanup.
+successful Canary Linux holder `workflow_dispatch` run on the reviewed task
+branch below for that same source tree. The fixture can run
+before merge; the lifecycle source commit can differ from the package commit
+only when its tree is identical. Dispatch the holder workflow with that exact
+reviewed candidate commit and tree. The package source separately requires
+merged ancestry and successful same-source CI. The builder checks these
+identities, the authenticated lifecycle artifact digest, real idle time, first
+complete Carrier read and cleanup. Pull-request runs remain development evidence.
+The same admission functions qualify inert refused cases before artifact use.
+
+```bash
+gh workflow run canary-holder-linux.yml --repo Elacity/elastos-runtime \
+  --ref fix/89-holder-always-on \
+  -f provider_commit="$GATEWAY_TESTED_SOURCE_COMMIT" \
+  -f provider_tree="$GATEWAY_SOURCE_TREE" \
+  -f package_merged=false
+```
+
+Use the exact reviewed fixture commit for `GATEWAY_TESTED_SOURCE_COMMIT`.
+Wait for its completed successful run and record that run ID in
+`GATEWAY_LIFECYCLE_RUN` before dispatching the publisher:
 
 ```bash
 gh workflow run canary-publisher-linux.yml --repo Elacity/elastos-runtime \
@@ -904,9 +921,9 @@ gh workflow run canary-publisher-linux.yml --repo Elacity/elastos-runtime \
 ```
 
 The original frozen dispatch defaults support the earlier publisher rehearsal.
-A new source package requires the explicit lifecycle mode. The approved helper
-root remains `/home/wau/.local/share/elastos-canary/source`; the operator installs
-the complete `source.tar.gz` there as the existing service owner.
+A new source package requires the explicit lifecycle mode. Read the approved
+helper root from the authenticated approval and build receipts; the operator
+installs the complete `source.tar.gz` there as the existing service owner.
 
 Download the exact completed run and artifact recorded in the operator approval,
 using the new private transfer directory and outer archive verification in step
