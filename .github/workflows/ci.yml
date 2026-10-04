@@ -78,6 +78,7 @@ jobs:
       - name: release artifact source proofs
         run: |
           python3 scripts/ci-release-policy-test.py
+          python3 scripts/install-version-policy-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py

@@ -44,6 +44,7 @@ run agent-shell node scripts/home-agent-shell-smoke.mjs
 run agent-cancellation node --test scripts/home-agent-cancellation.test.mjs
 run people-discovery node scripts/people-discovery-smoke.mjs
 run components python3 scripts/components-release-integrity-check.py --self-test
+run install-version python3 scripts/install-version-policy-test.py
 run publish-platform python3 scripts/publish-platform-artifacts-test.py
 run release-input python3 scripts/release-platform-input-test.py
 run prepare-platform python3 scripts/prepare-release-platform-test.py
