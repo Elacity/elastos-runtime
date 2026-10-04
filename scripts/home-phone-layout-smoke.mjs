@@ -880,6 +880,47 @@ async function bootHome(context, origin) {
   return { page, frame };
 }
 
+// Where the bar's controls sat when a surface did not open, so a failure on an
+// engine or platform this machine cannot run still says what was under the tap.
+async function openFailureState(page, frame) {
+  const host = await page.evaluate(() => {
+    const shell = document.getElementById("active-shell-frame")?.getBoundingClientRect();
+    return {
+      innerWidth,
+      innerHeight,
+      scale: window.visualViewport?.scale ?? null,
+      scrollWidth: document.documentElement.scrollWidth,
+      shellFrame: shell ? [Math.round(shell.x), Math.round(shell.y), Math.round(shell.width), Math.round(shell.height)] : null,
+    };
+  }).catch((error) => String(error));
+  const shell = await frame.evaluate(() => {
+    const box = (node) => {
+      const rect = node.getBoundingClientRect();
+      return [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)];
+    };
+    const bar = document.querySelector(".toolbar");
+    const search = document.getElementById("toolbar-spotlight")?.getBoundingClientRect();
+    const hit = search ? document.elementFromPoint(search.left + search.width / 2, search.top + search.height / 2) : null;
+    const brandImage = document.querySelector("#toolbar-home img");
+    return {
+      innerWidth,
+      innerHeight,
+      formFactor: document.body.dataset.formFactor || null,
+      bodyClasses: [...document.body.classList],
+      bar: bar ? box(bar) : null,
+      barScrollWidth: bar?.scrollWidth ?? null,
+      items: bar
+        ? [...bar.querySelectorAll("button, .toolbar-clock")]
+          .filter((node) => node.getBoundingClientRect().width > 0)
+          .map((node) => `${node.id || String(node.className).slice(0, 24)}:${box(node).join(",")}`)
+        : [],
+      hitAtSearch: hit ? `${hit.tagName}#${hit.id}.${String(hit.className).slice(0, 40)}` : null,
+      brandImage: brandImage ? { box: box(brandImage), natural: [brandImage.naturalWidth, brandImage.naturalHeight], complete: brandImage.complete } : null,
+    };
+  }).catch((error) => String(error));
+  return { host, shell };
+}
+
 async function runProfile(browser, engineId, profile, origin) {
   const dir = join(outputRoot, engineId, profile.id);
   mkdirSync(dir, { recursive: true });
@@ -923,7 +964,12 @@ async function runProfile(browser, engineId, profile, origin) {
       if (surface.phone === false && profile.id.startsWith("phone")) {
         continue;
       }
-      await surface.open(frame);
+      try {
+        await surface.open(frame);
+      } catch (error) {
+        console.error(`[home-phone-layout] ${engineId}/${profile.id}/${surface.id} did not open: ${JSON.stringify(await openFailureState(page, frame))}`);
+        throw error;
+      }
       await sleep(surface.settle);
       const shellSurface = await measure(frame, surface.id);
       if (surface.capsule) {
