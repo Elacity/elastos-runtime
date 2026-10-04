@@ -480,6 +480,8 @@ fn receipt_round_trip_keeps_non_utf8_launch_args_environment_and_working_directo
     let cwd = fixture
         .data
         .join(OsString::from_vec(b"working-\xff".to_vec()));
+    // APFS rejects this non-UTF8 name; command construction does not access cwd.
+    #[cfg(not(target_os = "macos"))]
     fs::create_dir(&cwd).unwrap();
     let encode = |value: &OsStr| BASE64.encode(value.as_bytes());
     let argument = OsString::from_vec(b"argument-\xfe".to_vec());
@@ -1729,7 +1731,8 @@ async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
     publish_retained_receipt(&fixture);
     crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
     let (_, request, _) = choice_fixture();
-    let mut command = tokio::process::Command::new("/bin/true");
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "exit 0"]);
     let child = child::OwnedChild::spawn(&mut command).unwrap();
     let mut controller = Controller {
         receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),

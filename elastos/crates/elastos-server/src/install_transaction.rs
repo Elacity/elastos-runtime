@@ -1719,8 +1719,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let data = root.path().join("data");
-            let binary = root.path().join("bin/elastos");
+            let root_path = fs::canonicalize(root.path()).unwrap();
+            let data = root_path.join("data");
+            let binary = root_path.join("bin/elastos");
             fs::create_dir(&data).unwrap();
             fs::create_dir(binary.parent().unwrap()).unwrap();
             fs::write(data.join("owner-data"), b"data written by owner").unwrap();
