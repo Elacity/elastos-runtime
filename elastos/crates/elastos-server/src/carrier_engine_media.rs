@@ -228,6 +228,7 @@ fn clone_client_handle(client: &super::CarrierClient) -> super::CarrierClient {
         conn: client.conn.clone(),
         _endpoint: client._endpoint.clone(),
         owns_endpoint: false,
+        endpoint_drain: None,
     }
 }
 

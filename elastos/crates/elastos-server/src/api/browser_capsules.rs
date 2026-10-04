@@ -70,6 +70,19 @@ pub async fn serve_home_index(
     serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, None).await
 }
 
+/// The restart owner hashes the same installed document that the Home route serves.
+pub(crate) fn installed_home_document(data_dir: &Path) -> Option<PathBuf> {
+    let capsule = resolve_browser_capsule(data_dir, HOME_CAPSULE_ID).ok()?;
+    validate_file_path(&capsule.entrypoint).ok()?;
+    let root = std::fs::canonicalize(installed_capsules_root(data_dir)).ok()?;
+    let capsule_root = std::fs::canonicalize(capsule.root).ok()?;
+    if !capsule_root.starts_with(root) {
+        return None;
+    }
+    let document = std::fs::canonicalize(capsule_root.join(capsule.entrypoint)).ok()?;
+    document.starts_with(capsule_root).then_some(document)
+}
+
 pub async fn serve_home_asset(
     State(state): State<GatewayState>,
     headers: axum::http::HeaderMap,

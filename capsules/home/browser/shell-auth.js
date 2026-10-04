@@ -2,7 +2,7 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-20260802a";
+} from "./shell-core.js?v=home-update-20261003a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockFace = document.querySelector(".home-unlock-face");
@@ -42,6 +42,7 @@ let recoveryTerminalToken = "";
 const PENDING_REGISTRATION_KEY = "elastos.home.pending-registration/v1";
 const PENDING_REGISTRATION_MS = 12 * 60 * 60 * 1000;
 const MAX_PENDING_REGISTRATION_CHARS = 65536;
+const SESSION_REFRESH_TIMEOUT_MS = 10_000;
 let pendingRegistration = null;
 let pendingRegistrationInvalid = false;
 let enrollmentPurpose = "create";
@@ -226,18 +227,30 @@ export function bindHomeUnlock() {
   });
 }
 
-export function refreshHomeSession() {
+export function refreshHomeSession({ signal } = {}) {
   if (!sessionRefreshInFlight) {
-    sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", { method: "POST" })
+    const controller = signal ? null : new AbortController();
+    const deadline = controller ? window.setTimeout(() => {
+      const error = new Error("Home session refresh timed out.");
+      error.name = "TimeoutError";
+      controller.abort(error);
+    }, SESSION_REFRESH_TIMEOUT_MS) : null;
+    sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", {
+      method: "POST",
+      signal: signal || controller.signal,
+    })
       .then((response) => {
         setHomeAuthorityToken(response?.home_token);
         return response;
       })
       .catch((error) => {
-        clearHomeAuthorityToken();
+        if (isHomeAuthError(error)) {
+          clearHomeAuthorityToken();
+        }
         throw error;
       })
       .finally(() => {
+        window.clearTimeout(deadline);
         sessionRefreshInFlight = null;
       });
   }

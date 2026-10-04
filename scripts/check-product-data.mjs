@@ -187,7 +187,7 @@ export function validateContracts(manifests) {
 const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
   "browser-engine-adapter", "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "browser-local-exit",
-  "webspace-provider", "object-provider", "wallet-provider", "model-provider", "llama-server",
+  "webspace-provider", "object-provider", "wallet-provider", "model-provider",
   "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
@@ -260,14 +260,17 @@ export function validateComponents(components, manifests) {
   }
   const home = components.profiles.home.components;
   for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"]) assert(!home.includes(name), `Home: ${name} belongs to an explicit profile`);
-  assert(!home.some((name) => name.startsWith("model-qwen")), "Home installs models through the signed catalog");
+  // Local AI is optional: Assistant fetches the engine and models from the signed release on demand (#217).
+  // model-provider is the Runtime's model broker, not a model.
+  const localAi = home.filter((name) => name === "llama-server" || (name.startsWith("model-") && name !== "model-provider"));
+  assert(localAi.length === 0, `Home: local AI installs on demand, found ${localAi.join(", ")}`);
   for (const name of ["gba-emulator", "gba-ucity"]) assert(!home.includes(name) && components.profiles.demo.components.includes(name), `${name}: demo profile placement`);
   same(Object.entries(components.profiles).filter(([, profile]) => profile.components.includes("custody-provider")).map(([name]) => name).sort(), ["blockchain", "full"], "Custody profile placement");
   for (const [name, component] of Object.entries(components.external)) {
     assert(object(component.platforms) && Object.keys(component.platforms).length > 0, `${name}: release platforms`);
     for (const [platform, metadata] of Object.entries(component.platforms)) {
       assert(object(metadata), `${name}: ${platform} metadata`);
-      if (["crosvm", "vmlinux", "kubo", "cloudflared", "llama-server"].includes(name) || name.startsWith("model-")) {
+      if (["crosvm", "vmlinux", "cloudflared"].includes(name)) {
         assert(text(metadata.release_path) || text(metadata.url) || text(metadata.cid) || (metadata.strategy === "local-copy" && text(metadata.source)), `${name}: ${platform} artifact source`);
       } else present(metadata.release_path, `${name}: ${platform} release path`);
       const installPath = metadata.install_path ?? component.install_path;
@@ -276,7 +279,7 @@ export function validateComponents(components, manifests) {
       if (metadata.release_path?.endsWith(".tar.gz") && manifests[name]?.execution === "web-projection") present(metadata.extract_path, `${name}: ${platform} archive extraction path`);
     }
   }
-  for (const name of [...homeCore.filter((name) => name !== "llama-server"), "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "availability-provider"]) {
+  for (const name of [...homeCore, "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "availability-provider"]) {
     for (const platform of ["linux-amd64", "linux-arm64"]) assert(components.external[name]?.platforms[platform] ?? components.external[name]?.platforms["*"], `${name}: release metadata for ${platform}`);
   }
   for (const name of archiveAssets) {

@@ -43,6 +43,8 @@ const OPERATOR_RESPONSE_DOMAIN: &str = "elastos.operator.response.v1";
 const OPERATOR_AUDIT_FILE: &str = "operator-control-audit.jsonl";
 const OPERATOR_REQUEST_LOG_FILE: &str = "operator-control-requests.jsonl";
 const OPERATOR_CONNECT_TIMEOUT_SECS: u64 = 10;
+const OPERATOR_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_UPDATE_METADATA_BYTES: usize = 256 * 1024;
 const OPERATOR_TS_SKEW_SECS: u64 = 5 * 60;
 const REQUEST_STATE_RESERVED: &str = "reserved";
 const REQUEST_STATE_COMPLETED: &str = "completed";
@@ -123,6 +125,58 @@ pub struct OperatorUpdateCheck {
     pub head_cid: Option<String>,
     #[serde(default)]
     pub release_cid: Option<String>,
+    #[serde(default)]
+    pub publisher_did: String,
+    #[serde(default)]
+    pub changes: Vec<String>,
+}
+
+/// The operation signals this owner on completion or cancellation. Its separate
+/// task retains the close future until the short-lived endpoint has drained.
+struct OperatorCarrierDrain {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OperatorCarrierDrain {
+    fn new(close: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let (signal, shutdown) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = shutdown.await;
+            close.await;
+        });
+        Self {
+            signal: Some(signal),
+            task: Some(task),
+        }
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.signal.take();
+        self.task
+            .take()
+            .expect("Carrier drain task remains owned")
+            .await
+            .context("drain temporary operator Carrier client")
+    }
+}
+
+struct OperatorCarrierSession {
+    client: Arc<crate::carrier::CarrierClient>,
+    drain: OperatorCarrierDrain,
+}
+
+impl OperatorCarrierSession {
+    fn new(client: crate::carrier::CarrierClient) -> Self {
+        let client = Arc::new(client);
+        let closing = client.clone();
+        let drain = OperatorCarrierDrain::new(async move { closing.close().await });
+        Self { client, drain }
+    }
+
+    async fn finish(self) -> Result<()> {
+        self.drain.finish().await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -433,24 +487,42 @@ pub async fn gather_local_node_status(data_dir: &Path) -> Result<OperatorNodeSta
 
 pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdateCheck> {
     let source = load_default_trusted_source(data_dir)?;
-    let primary_publisher =
-        source.publisher_dids.first().cloned().ok_or_else(|| {
-            anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
-        })?;
-
-    let current_version = source.installed_version.clone();
-    let client = crate::carrier::CarrierClient::connect_trusted_source(
-        &source,
-        OPERATOR_CONNECT_TIMEOUT_SECS,
+    let client = tokio::time::timeout(
+        Duration::from_secs(OPERATOR_CONNECT_TIMEOUT_SECS),
+        crate::carrier::CarrierClient::connect_trusted_source(
+            &source,
+            OPERATOR_CONNECT_TIMEOUT_SECS,
+        ),
     )
     .await
+    .context("trusted source Carrier connection timed out")?
     .with_context(|| {
         format!(
             "Carrier connection to trusted source '{}' failed. Remote operator update check stays Carrier-only.",
             source.name
         )
     })?;
-    let discovered = crate::update::discover_carrier_release_head(&client, &source)
+    let session = OperatorCarrierSession::new(client);
+    let result = tokio::time::timeout(
+        OPERATOR_UPDATE_CHECK_TIMEOUT,
+        gather_update_check_with_client(&session.client, &source),
+    )
+    .await
+    .context("signed update check timed out")
+    .and_then(|result| result);
+    let drained = session.finish().await;
+    result.and_then(|check| drained.map(|()| check))
+}
+
+async fn gather_update_check_with_client(
+    client: &crate::carrier::CarrierClient,
+    source: &TrustedSource,
+) -> Result<OperatorUpdateCheck> {
+    let primary_publisher =
+        source.publisher_dids.first().cloned().ok_or_else(|| {
+            anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
+        })?;
+    let discovered = crate::update::discover_carrier_release_head(client, source)
         .await
         .with_context(|| {
             format!(
@@ -458,43 +530,176 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
                 source.name
             )
         })?;
-    let head_cid = discovered.head_cid;
+    anyhow::ensure!(
+        discovered.bytes.len() <= MAX_UPDATE_METADATA_BYTES,
+        "signed release head is too large"
+    );
     let head = verify_release_envelope(
         &discovered.bytes,
         "elastos.release.head.v1",
         &primary_publisher,
     )?;
-    let latest_version = head["payload"]["version"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let release_cid = head["payload"]["latest_release_cid"]
-        .as_str()
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
+    let release_cid = bounded_release_text(&head["payload"], "latest_release_cid", 128)?;
+    cid::Cid::try_from(release_cid).context("signed release head CID is invalid")?;
+    let release_bytes = client.fetch_content(release_cid, None).await?;
+    verified_update_check(source, &discovered, &release_bytes)
+}
 
-    let channel = normalized_channel(&source);
-    Ok(OperatorUpdateCheck {
-        source_name: source.name,
-        channel,
-        current_version,
-        latest_version: latest_version.clone(),
-        update_available: match crate::update::compare_release_versions(
-            &source.installed_version,
-            &latest_version,
-        )? {
+fn verified_update_check(
+    source: &TrustedSource,
+    discovered: &crate::update::DiscoveredHead,
+    release_bytes: &[u8],
+) -> Result<OperatorUpdateCheck> {
+    anyhow::ensure!(
+        discovered.bytes.len() <= MAX_UPDATE_METADATA_BYTES
+            && release_bytes.len() <= MAX_UPDATE_METADATA_BYTES,
+        "signed update metadata is too large"
+    );
+    anyhow::ensure!(
+        !source.name.is_empty()
+            && source.name.len() <= 128
+            && source.installed_version.len() <= 128
+            && normalized_channel(source).len() <= 64,
+        "trusted update source fields exceed their bounds"
+    );
+    let publisher_did = source
+        .publisher_dids
+        .first()
+        .filter(|did| !did.is_empty() && did.len() <= 256)
+        .context("trusted update source requires a publisher DID")?;
+    let head =
+        verify_release_envelope(&discovered.bytes, "elastos.release.head.v1", publisher_did)?;
+    if let Some(cid) = &discovered.head_cid {
+        anyhow::ensure!(cid.len() <= 128, "signed update head CID is too long");
+        crate::update::verify_release_metadata_cid(cid, &discovered.bytes)?;
+    }
+    let head_payload = &head["payload"];
+    if let Some(signer) = head_payload.get("signer_did") {
+        anyhow::ensure!(
+            signer.as_str() == Some(publisher_did.as_str()),
+            "signed update head publisher differs from its trusted source"
+        );
+    }
+    let release_cid = bounded_release_text(head_payload, "latest_release_cid", 128)?;
+    crate::update::verify_release_metadata_cid(release_cid, release_bytes)?;
+    let (release, _) = verify_release_envelope_against_dids(
+        release_bytes,
+        "elastos.release.v1",
+        &source.publisher_dids,
+    )?;
+    crate::update::verify_release_binding(&head, release_bytes, &release)?;
+    let latest_version = bounded_release_text(head_payload, "version", 128)?;
+    let channel = bounded_release_text(head_payload, "channel", 64)?;
+    crate::update::verify_source_channel(source, channel)?;
+    let payload = &release["payload"];
+    let origin = payload["source"]
+        .as_object()
+        .context("signed release requires source commit and tree")?;
+    anyhow::ensure!(origin.len() == 2, "signed release source fields differ");
+    for field in ["commit", "tree"] {
+        let oid = bounded_release_text(&payload["source"], field, 40)?;
+        anyhow::ensure!(
+            oid.len() == 40
+                && oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "signed release source {field} is invalid"
+        );
+    }
+    if let Some(head_origin) = head_payload.get("source") {
+        anyhow::ensure!(
+            head_origin == &payload["source"],
+            "signed update head and release source differ"
+        );
+    }
+    let platform = &payload["platforms"][crate::update::detect_release_platform()];
+    for artifact in ["binary", "components"] {
+        let descriptor = &platform[artifact];
+        let cid = cid::Cid::try_from(bounded_release_text(descriptor, "cid", 128)?)
+            .with_context(|| format!("signed release {artifact} CID is invalid"))?;
+        anyhow::ensure!(
+            matches!(cid.codec(), 0x55 | 0x70)
+                && cid.hash().code() == 0x12
+                && cid.hash().digest().len() == 32,
+            "signed release {artifact} CID is unsupported"
+        );
+        let hash = bounded_release_text(descriptor, "sha256", 64)?;
+        anyhow::ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && descriptor["size"].as_u64().is_some_and(|size| size > 0),
+            "signed release {artifact} descriptor is invalid"
+        );
+        if cid.codec() == 0x55 {
+            anyhow::ensure!(
+                hex::encode(cid.hash().digest()) == hash,
+                "signed release {artifact} raw CID differs from its SHA-256"
+            );
+        }
+    }
+    let changes = match payload.get("changes") {
+        None => Vec::new(),
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .context("signed release changes must be a string array")?;
+            anyhow::ensure!(entries.len() <= 32, "signed release has too many changes");
+            let mut total = 0usize;
+            let mut changes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let change = entry
+                    .as_str()
+                    .context("signed release changes must be strings")?;
+                total = total.saturating_add(change.len());
+                anyhow::ensure!(
+                    !change.trim().is_empty()
+                        && change.len() <= 500
+                        && total <= 8 * 1024
+                        && !change.chars().any(char::is_control),
+                    "signed release changes exceed their text bounds"
+                );
+                changes.push(change.to_owned());
+            }
+            changes
+        }
+    };
+    let update_available =
+        match crate::update::compare_release_versions(&source.installed_version, latest_version)? {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Equal => false,
             std::cmp::Ordering::Less => anyhow::bail!(
                 "Signed release {latest_version} is older than installed release {}",
                 source.installed_version
             ),
-        },
+        };
+    Ok(OperatorUpdateCheck {
+        source_name: source.name.clone(),
+        channel: channel.to_owned(),
+        current_version: source.installed_version.clone(),
+        latest_version: latest_version.to_owned(),
+        update_available,
         discovery: "Carrier".to_string(),
         working_gateway: None,
-        head_cid,
-        release_cid,
+        head_cid: discovered.head_cid.clone(),
+        release_cid: Some(release_cid.to_owned()),
+        publisher_did: publisher_did.clone(),
+        changes,
     })
+}
+
+fn bounded_release_text<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str> {
+    value[field]
+        .as_str()
+        .filter(|text| {
+            !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+        })
+        .with_context(|| format!("signed release {field} is invalid"))
 }
 
 pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> {
@@ -503,7 +708,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
     let channel = normalized_channel(&source);
     let previous_version = source.installed_version.clone();
 
-    let carrier_client = Arc::new(
+    let session = OperatorCarrierSession::new(
         crate::carrier::CarrierClient::connect_trusted_source(
             &source,
             OPERATOR_CONNECT_TIMEOUT_SECS,
@@ -517,17 +722,19 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         })?,
     );
 
-    let carrier_for_fetch = carrier_client.clone();
+    let carrier_for_fetch = session.client.clone();
     let fetch_fn: crate::update::FetchFn = Box::new(move |cid, _gateways| {
         let client = carrier_for_fetch.clone();
         Box::pin(async move { client.fetch_content(&cid, None).await })
     });
 
-    let try_p2p: crate::update::TryP2pFn = Box::new(|source, publisher_did| {
-        Box::pin(async move { try_operator_p2p_discovery(&source, &publisher_did).await })
+    let carrier_for_discovery = session.client.clone();
+    let try_p2p: crate::update::TryP2pFn = Box::new(move |source, _publisher_did| {
+        let client = carrier_for_discovery.clone();
+        Box::pin(async move { try_operator_p2p_discovery(&client, &source).await })
     });
 
-    crate::update::run_update_for_data_dir_in_context(
+    let result = crate::update::run_update_for_data_dir_in_context(
         data_dir,
         &fetch_fn,
         Some(&try_p2p),
@@ -540,7 +747,11 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         false,
         crate::setup::FirstPartyCarrierContext::Runtime,
     )
-    .await?;
+    .await;
+    drop(fetch_fn);
+    drop(try_p2p);
+    let drained = session.finish().await;
+    result.and(drained)?;
 
     let installed_source = load_default_trusted_source(data_dir)?;
     let installed_version = installed_source.installed_version.clone();
@@ -876,18 +1087,10 @@ fn normalized_channel(source: &TrustedSource) -> String {
 }
 
 async fn try_operator_p2p_discovery(
+    client: &crate::carrier::CarrierClient,
     source: &TrustedSource,
-    _publisher_did: &str,
 ) -> Result<Option<crate::update::DiscoveredHead>> {
-    let Ok(client) = crate::carrier::CarrierClient::connect_trusted_source(
-        source,
-        OPERATOR_CONNECT_TIMEOUT_SECS + 5,
-    )
-    .await
-    else {
-        return Ok(None);
-    };
-    crate::update::discover_carrier_release_head(&client, source)
+    crate::update::discover_carrier_release_head(client, source)
         .await
         .map(Some)
 }
@@ -1657,6 +1860,277 @@ mod tests {
     use axum::{Json, Router};
     use elastos_runtime::signature::generate_keypair;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn operator_carrier_drain_finishes_once_before_returning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let drain = OperatorCarrierDrain::new(async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        drain.finish().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_runs_after_operation_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let result: Result<()> = async {
+            let _drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = closed.send(());
+            });
+            anyhow::bail!("fixture refusal")
+        }
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_survives_operation_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let _drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = closed.send(());
+            });
+            let _ = ready.send(());
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_survives_cancellation_during_close() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let (release, paused) = tokio::sync::oneshot::channel();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = started.send(());
+                let _ = paused.await;
+                let _ = closed.send(());
+            });
+            drain.finish().await
+        });
+        starting.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn signed_check_fixture(
+        change_release: impl FnOnce(&mut serde_json::Value),
+        change_head: impl FnOnce(&mut serde_json::Value),
+    ) -> (TrustedSource, crate::update::DiscoveredHead, Vec<u8>) {
+        use sha2::Digest;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let publisher = crate::crypto::encode_signing_key_did(&key);
+        let raw_cid = |bytes: &[u8]| {
+            let digest = sha2::Sha256::digest(bytes);
+            let hash = cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap();
+            cid::Cid::new_v1(0x55, hash).to_string()
+        };
+        let envelope = |payload: &serde_json::Value, domain: &str| {
+            let (signature, signer_did) =
+                domain_separated_sign(&key, domain, &serde_json::to_vec(payload).unwrap());
+            serde_json::to_vec(&serde_json::json!({
+                "payload": payload, "signature": signature, "signer_did": signer_did
+            }))
+            .unwrap()
+        };
+        let descriptor = |bytes: &[u8]| {
+            serde_json::json!({
+                "cid": raw_cid(bytes), "sha256": hex::encode(sha2::Sha256::digest(bytes)),
+                "size": bytes.len()
+            })
+        };
+        let origin = serde_json::json!({"commit": "a".repeat(40), "tree": "b".repeat(40)});
+        let mut release = serde_json::json!({
+            "schema": "elastos.release/v1", "version": "0.7.2", "channel": "stable",
+            "source": origin, "changes": ["Home can restart after a signed update."],
+            "platforms": {(crate::update::detect_release_platform()): {
+                "binary": descriptor(b"fixture-runtime"), "components": descriptor(b"{}")
+            }}
+        });
+        change_release(&mut release);
+        let release_bytes = envelope(&release, "elastos.release.v1");
+        let release_cid = raw_cid(&release_bytes);
+        let mut head = serde_json::json!({
+            "schema": "elastos.release.head/v1", "version": "0.7.2", "channel": "stable",
+            "source": origin, "signer_did": publisher, "latest_release_cid": release_cid,
+            "release_sha256": hex::encode(sha2::Sha256::digest(&release_bytes))
+        });
+        change_head(&mut head);
+        let head_bytes = envelope(&head, "elastos.release.head.v1");
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [publisher], "channel": "stable",
+            "installed_version": "0.7.1"
+        }))
+        .unwrap();
+        (
+            source,
+            crate::update::DiscoveredHead {
+                head_cid: Some(raw_cid(&head_bytes)),
+                bytes: head_bytes,
+            },
+            release_bytes,
+        )
+    }
+
+    #[test]
+    fn signed_update_check_returns_exact_admitted_choice_and_changes() {
+        let (source, head, release) = signed_check_fixture(|_| {}, |_| {});
+        let check = verified_update_check(&source, &head, &release).unwrap();
+        assert_eq!(check.source_name, source.name);
+        assert_eq!(check.channel, "stable");
+        assert_eq!(check.publisher_did, source.publisher_dids[0]);
+        assert_eq!(check.current_version, "0.7.1");
+        assert_eq!(check.latest_version, "0.7.2");
+        assert!(check.update_available);
+        assert_eq!(check.head_cid, head.head_cid);
+        assert_eq!(
+            check.release_cid.as_deref(),
+            serde_json::from_slice::<serde_json::Value>(&head.bytes).unwrap()["payload"]
+                ["latest_release_cid"]
+                .as_str()
+        );
+        assert_eq!(
+            check.changes,
+            vec!["Home can restart after a signed update."]
+        );
+    }
+
+    #[test]
+    fn signed_update_check_accepts_missing_notes_and_current_version() {
+        let (mut source, head, release) = signed_check_fixture(
+            |release| {
+                release.as_object_mut().unwrap().remove("changes");
+            },
+            |_| {},
+        );
+        source.installed_version = "0.7.2".into();
+        let check = verified_update_check(&source, &head, &release).unwrap();
+        assert!(!check.update_available);
+        assert!(check.changes.is_empty());
+        let legacy: OperatorUpdateCheck = serde_json::from_value(serde_json::json!({
+            "source_name": "fixture", "channel": "stable", "current_version": "0.7.1",
+            "latest_version": "0.7.1", "update_available": false, "discovery": "Carrier"
+        }))
+        .unwrap();
+        assert!(legacy.publisher_did.is_empty() && legacy.changes.is_empty());
+    }
+
+    #[test]
+    fn signed_update_check_refuses_unbound_or_mismatched_metadata() {
+        for field in ["schema", "version", "channel", "release_sha256", "source"] {
+            let (source, head, release) = signed_check_fixture(
+                |_| {},
+                |head| {
+                    head[field] = if field == "source" {
+                        serde_json::json!({"commit": "c".repeat(40), "tree": "b".repeat(40)})
+                    } else {
+                        serde_json::json!("invalid")
+                    };
+                },
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        let (source, head, mut release) = signed_check_fixture(|_| {}, |_| {});
+        release.push(b' ');
+        assert!(verified_update_check(&source, &head, &release).is_err());
+        let mut source = source;
+        source.channel = "canary".into();
+        assert!(verified_update_check(&source, &head, &release[..release.len() - 1]).is_err());
+        source.channel = "stable".into();
+        source.publisher_dids = vec![crate::crypto::encode_signing_key_did(
+            &ed25519_dalek::SigningKey::from_bytes(&[8; 32]),
+        )];
+        assert!(verified_update_check(&source, &head, &release[..release.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn signed_update_check_refuses_invalid_source_platform_or_change_fields() {
+        for field in ["source", "platforms", "changes"] {
+            let (source, head, release) = signed_check_fixture(
+                |release| release[field] = serde_json::json!("invalid"),
+                |_| {},
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        for value in [
+            serde_json::json!(["x".repeat(501)]),
+            serde_json::json!(["line\nbreak"]),
+            serde_json::json!([1]),
+            serde_json::json!([" "]),
+            serde_json::json!(vec!["change"; 33]),
+            serde_json::json!(vec!["x".repeat(500); 17]),
+        ] {
+            let (source, head, release) =
+                signed_check_fixture(|release| release["changes"] = value, |_| {});
+            assert!(verified_update_check(&source, &head, &release).is_err());
+        }
+        for field in ["cid", "sha256", "size"] {
+            let (source, head, release) = signed_check_fixture(
+                |release| {
+                    release["platforms"][crate::update::detect_release_platform()]["binary"]
+                        [field] = serde_json::json!("invalid");
+                },
+                |_| {},
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        let (source, head, release) = signed_check_fixture(
+            |release| {
+                release["platforms"][crate::update::detect_release_platform()]["binary"]
+                    ["sha256"] = serde_json::json!("0".repeat(64));
+            },
+            |_| {},
+        );
+        assert!(verified_update_check(&source, &head, &release).is_err());
+        assert!(
+            verified_update_check(&source, &head, &vec![b' '; MAX_UPDATE_METADATA_BYTES + 1])
+                .is_err()
+        );
+    }
 
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");

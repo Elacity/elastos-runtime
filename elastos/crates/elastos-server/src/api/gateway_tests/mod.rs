@@ -899,3 +899,6 @@ mod remote_model;
 mod room;
 mod site_publication;
 mod wallet;
+
+#[path = "../gateway_home_update/tests.rs"]
+mod home_update;

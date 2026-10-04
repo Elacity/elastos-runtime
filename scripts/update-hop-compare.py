@@ -78,19 +78,47 @@ The operator owns real release signing and publication. Native Mac CI creates
 and removes disposable signing keys through generate-ci-hop, using Runtime's
 sign-payload command and offline Kubo content from the existing Mac build.
 Each scope has its own frozen installer, holder, consumers and receipt.
+Generated native CI packages pin the qualified localhost provider and complete
+source Home bytes through fixture archive and native artifact descriptors. Setup
+proves downloads from the isolated fixture publisher. Production release archives,
+model inference and manual UX remain with their separate acceptance gates.
+Qualified localhost capsule metadata retains its original archive checksum,
+size and extraction paths. Its admitted archive and complete extracted file
+inventory join the setup closure when that source descriptor requires them.
+Generation requires that original archive through --localhost-metadata.
+Successful M1 and refusal-seed installs run installed default setup over Carrier
+before their installed metadata and support are checked. The fixture packages
+the qualified source Home and native executables; setup must produce those exact
+bytes before preservation sentinels are copied. A separate M1 Home starts
+through `home --browser` and its signed retained controller. The observer checks
+its live gateway generation, private attach, served Home bytes and owned shutdown.
+This initial-start proof keeps the offline CLI snapshots and refusal checks intact.
 Frozen installer defaults pin signer_did and leave
 HEAD_CID blank. Atomic runtime ticket/node overrides select the local holder.
 Run performs both selectors, retains private split output and data, and checks
 all owned process groups and verified holder/consumer executable roots during
 cleanup. Self-tests prove the observer only; installed proof needs real-runtime.
+
+For an approved local Mac rehearsal, pass
+--local-rehearsal local-rehearsal:<40-character-source-commit>:<fixture-name>
+to build-ci-hop, generate-ci-hop, inspect and run. This selector requires the
+clean source of this harness, absent CI/GITHUB_ACTIONS authority and an empty
+artifact retrieval reference. Build and fixture receipts bind the same local
+scope and reference. Local results keep command details in private split logs;
+the safe result reports the failed step and exit code. The full install, Home,
+Carrier update and refusal journey uses the same frozen support gates as CI.
 """
 
 import argparse
 import base64
 import datetime
+import errno
+import ctypes
 import fcntl
+import gzip
 import hashlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -103,10 +131,12 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 
 
 def digest(path):
@@ -530,6 +560,7 @@ CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", 
 CLI_PHASES = ("old", "new", *CLI_REFUSALS)
 CLI_DATA = "Library/Application Support/elastos"
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
+CLI_INSTALLED_METADATA = ("installation/release-head.json", "installation/release.json")
 CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("15.0.1", "15.1", "15.2", "15.3", "15.4", "16.1", "16.2"))
 
 
@@ -632,7 +663,84 @@ def cli_inventory(root, manifest):
     need(not any(path.is_symlink() for path in (root / "payload").rglob("*")), "fixture payload contains a symlink")
 
 
-def cli_admit(config):
+def cli_model_fixture_capsule():
+    return {"schema": "elastos.capsule/v1", "version": "0.1.0", "name": "model-update-hop-fixture",
+            "role": "content", "type": "data", "entrypoint": "weights.gguf", "projections": ["content"],
+            "model_content": {"format": "gguf", "quantization": "Q4_K_M", "engine": "llama.cpp",
+                "consumer_interface": "elastos.provider.model", "consumer_interface_version": "0.1.0",
+                "minimum_memory_mb": 8192, "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                "provenance": {"base_repository": "fixture/base", "base_revision": "a" * 40,
+                    "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE.base"},
+                    "quantized_repository": "fixture/quantized", "quantized_revision": "b" * 40,
+                    "path": "PROVENANCE.md"}}}
+
+
+def cli_model_fixture_object(manifest, mapping):
+    entries = [{"path": path, "size": manifest["files"][relative]["bytes"],
+                "sha256": manifest["files"][relative]["sha256"]} for path, relative in sorted(mapping.items())]
+    closure = hashlib.sha256()
+    for entry in entries:
+        for value in (entry["path"], entry["sha256"], str(entry["size"])):
+            closure.update(value.encode() + b"\0")
+    return {"schema": "elastos.content.object.manifest/v1", "kind": "capsule",
+            "content_digest": "sha256:" + closure.hexdigest(), "files": entries}
+
+
+def cli_admit_model_fixture(root, manifest):
+    fixture = manifest["model_fixture"]
+    need(set(fixture) == {"package", "files"}
+         and set(fixture["files"]) == {"capsule.json", "weights.gguf", "LICENSE", "LICENSE.base", "PROVENANCE.md"},
+         "model fixture closure inventory differs")
+    package = fixture["package"]
+    mapping = fixture["files"]
+    need(all(relative in manifest["files"] for relative in (package, *mapping.values())), "model fixture bytes absent")
+    cid = manifest["files"][package]["cid"]
+    encoded = cid[1:].upper()
+    need(cid.startswith("b") and base64.b32decode(encoded + "=" * (-len(encoded) % 8))[:4] == b"\x01\x70\x12\x20",
+         "model fixture package requires DAG-PB SHA-256 CIDv1")
+    for relative in (package, *mapping.values()):
+        binding = manifest["files"][relative]
+        need(0 < binding["bytes"] <= 256 * 1024 and manifest["holder"]["content"].get(binding["cid"]) == relative,
+             "model fixture holder CID mapping differs")
+        cli_metadata_cid(binding["cid"], cli_path(root, relative).read_bytes())
+    with tarfile.open(cli_path(root, package), mode="r:") as archive:
+        members = archive.getmembers()
+        need([member.name for member in members] == sorted(mapping)
+             and all(member.isfile() and member.size == manifest["files"][mapping[member.name]]["bytes"] for member in members),
+             "model fixture package inventory differs")
+        for member in members:
+            with archive.extractfile(member) as stream:
+                need(stream.read() == cli_path(root, mapping[member.name]).read_bytes(), "model fixture package bytes differ")
+    capsule = cli_model_fixture_capsule()
+    need(cli_path(root, mapping["capsule.json"]).read_bytes() == json.dumps(capsule, sort_keys=True, separators=(",", ":")).encode(),
+         "model fixture capsule bytes differ")
+    entry = {"cid": cid, "capsule_manifest": capsule, "object_manifest": cli_model_fixture_object(manifest, mapping)}
+    for publication in manifest["publications"].values():
+        payload = cli_json(cli_path(root, publication["catalogue"]))["payload"]
+        need(payload == {"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None, "entries": [entry]},
+             "model fixture catalogue closure differs")
+
+
+def cli_local_rehearsal(reference):
+    match = re.fullmatch(r"local-rehearsal:([0-9a-f]{40}):([A-Za-z0-9][A-Za-z0-9_.-]{0,127})", reference)
+    need(match is not None, "local rehearsal requires an exact source commit and fixture name")
+    need(sys.platform == "darwin", "local rehearsal requires native Mac")
+    need(not os.environ.get("CI") and not os.environ.get("GITHUB_ACTIONS"),
+         "local rehearsal requires absent hosted CI authority")
+    need(not os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE"),
+         "local rehearsal requires an empty artifact retrieval reference")
+    need(os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "") in ("", "local-rehearsal"),
+         "local rehearsal proof scope differs")
+    repository = Path(__file__).resolve().parents[1]
+    need(not subprocess.check_output(["git", "status", "--porcelain"], cwd=repository, text=True).strip(),
+         "local rehearsal requires a clean admitted source")
+    source = {key: subprocess.check_output(["git", "rev-parse", ref], cwd=repository, text=True).strip()
+              for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
+    need(source["commit"] == match[1], "local rehearsal source commit differs from its selector")
+    return source
+
+
+def cli_admit(config, local_rehearsal=None):
     need(config["schema"] == "elastos.update-hop.fixture/v1", "unknown fixture schema")
     need(config["mode"] == CLI_MODE, "unknown fixture mode")
     root = Path(config["root"])
@@ -653,9 +761,17 @@ def cli_admit(config):
          and manifest["reference"] == reference, "fixture manifest identity differs")
     need(isinstance(manifest["approval"], str) and manifest["approval"].strip(), "fixture approval required")
     scope = manifest.get("proof_scope", "production-positive")
-    need(scope in ("production-positive", "ci-rehearsal") and
-         scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
-    refusals = CLI_REFUSALS if scope == "ci-rehearsal" else ()
+    if local_rehearsal is not None:
+        need(scope == "local-rehearsal" and reference == local_rehearsal,
+             "local rehearsal fixture scope or reference differs")
+        need(manifest["source"] == cli_local_rehearsal(local_rehearsal), "local rehearsal source tree differs")
+        need(all(manifest[name]["source"] == manifest["source"] for name in ("old", "new")),
+             "local compiled Runtime source differs")
+    else:
+        need(scope in ("production-positive", "ci-rehearsal") and
+             scope == os.environ.get("ELASTOS_CI_FIXTURE_SCOPE", "production-positive"), "fixture proof scope differs")
+        need(not reference.startswith("local-rehearsal:"), "local fixture requires its explicit selector")
+    refusals = CLI_REFUSALS if scope in ("ci-rehearsal", "local-rehearsal") else ()
     need(manifest["proof_kind"] in ("real-runtime", "harness-self-test"), "unknown proof kind")
     need(os.environ.get("ELASTOS_CI_REQUIRE_REAL_RUNTIME") != "1" or manifest["proof_kind"] == "real-runtime", "hosted acceptance requires real-runtime fixture")
     need(sys.platform == "darwin" or manifest["proof_kind"] == "harness-self-test", "CLI installed proof requires native Mac")
@@ -718,6 +834,11 @@ def cli_admit(config):
     old = manifest["publications"]["old"]
     new = manifest["publications"].get("new", old)
     need(manifest["files"][old["binary"]]["sha256"] != manifest["files"][new["binary"]]["sha256"], "different old/new binaries required")
+    if local_rehearsal is None and manifest.get("build"):
+        build = cli_json(cli_path(root, manifest["build"]))
+        build_reference = build.get("reference", "")
+        need(build.get("proof_scope") != "local-rehearsal" and isinstance(build_reference, str)
+             and not build_reference.startswith("local-rehearsal:"), "local build requires its explicit selector")
     if refusals:
         wrong_version = manifest["publications"]["wrong-version"]
         need(manifest["files"][wrong_version["binary"]]["sha256"] == manifest["files"][old["binary"]]["sha256"], "wrong-version must retain the baseline Runtime bytes")
@@ -726,6 +847,9 @@ def cli_admit(config):
         need(build["schema"] == "elastos.update-hop.build/v1" and build["status"] == "passed"
              and build["cleanup"]["passed"] and build["source"] == manifest["source"]
              and build["command"] == ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"], "compiled CI hop provenance differs")
+        need(build.get("proof_scope", "ci-rehearsal") == scope, "compiled hop proof scope differs")
+        if local_rehearsal is not None:
+            need(build.get("reference") == local_rehearsal, "compiled local hop reference differs")
         for name, publication in (("old", old), ("new", new)):
             need(build[name]["source"] == manifest[name]["source"] and build[name]["version"] == manifest[name]["version"]
                  and build[name]["sha256"] == manifest["files"][publication["binary"]]["sha256"], "compiled CI Runtime receipt differs")
@@ -760,14 +884,23 @@ def cli_admit(config):
             need(mapped in manifest["files"] and manifest["files"][mapped]["sha256"] == manifest["files"][relative]["sha256"], "holder CID content mapping incomplete")
     need(manifest["files"][holder["files"][".local/bin/elastos"]]["sha256"] in
          {manifest["files"][publication["binary"]]["sha256"] for publication in (old, new)}, "holder Runtime differs from qualified binaries")
+    if "model_fixture" in manifest:
+        cli_admit_model_fixture(root, manifest)
     need({"config", "data", "support"} <= set(manifest["preserve"]), "config/data/support preservation paths required")
     for group, paths in manifest["preserve"].items():
         need(isinstance(paths, list) and paths, "empty preservation group")
         for relative in paths:
             cli_path(root, relative)
             need(any(target == relative or target.startswith(relative + "/") for target in manifest["consumer"]["files"]), "preservation bytes missing")
+    if "initial_home" in manifest:
+        cli_admit_home_support(root, manifest)
+    cli_admit_setup(root, manifest)
+    need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "initial_home" in manifest,
+         "native CI rehearsal requires the installed Home startup fixture")
+    need(scope not in ("ci-rehearsal", "local-rehearsal") or manifest["proof_kind"] != "real-runtime" or "model_fixture" in manifest,
+         "native CI rehearsal requires the signed model catalogue fixture")
     disk = shutil.disk_usage(root)
-    growth = 6 * sum(value["bytes"] for value in manifest["files"].values())
+    growth = 8 * sum(value["bytes"] for value in manifest["files"].values())
     need((disk.free - growth) / disk.total >= 0.15, "fixture copies would breach the 15% disk reserve")
     return manifest
 
@@ -799,8 +932,8 @@ def cli_safe_error(error):
     return str(error)
 
 
-def cli_inspect(config):
-    manifest = cli_admit(config)
+def cli_inspect(config, local_rehearsal=None):
+    manifest = cli_admit(config, local_rehearsal)
     return {"mode": CLI_MODE, "status": "admitted", "proof_kind": manifest["proof_kind"],
             "proof_scope": manifest.get("proof_scope", "production-positive"),
             "manifest_sha256": config["immutable"]["sha256"], "source": manifest["source"],
@@ -928,10 +1061,12 @@ def cli_prepare_ci_disk():
     return receipt
 
 
-def cli_build_hop(root, runtime):
+def cli_build_hop(root, runtime, local_rehearsal=None):
     """Compile N+1 through the existing build.rs version input; keep actual N."""
-    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
-         and sys.platform == "darwin", "disposable hop build requires native Mac CI")
+    local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
+    if local_source is None:
+        need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+             and sys.platform == "darwin", "disposable hop build requires native Mac CI")
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable build root required")
     need(runtime.is_file() and not runtime.is_symlink(), "built Runtime input is unavailable")
@@ -939,7 +1074,7 @@ def cli_build_hop(root, runtime):
     need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
     need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(), "hop build requires a clean admitted source")
     root.mkdir(mode=0o700)
-    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+    source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
               for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
     old = root / "elastos-old"
     shutil.copyfile(runtime, old)
@@ -949,6 +1084,8 @@ def cli_build_hop(root, runtime):
     processes = CliProcesses(root)
     command = ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"]
     receipt = {"schema": "elastos.update-hop.build/v1", "source": source, "command": command, "status": "failed"}
+    if local_rehearsal is not None:
+        receipt.update(proof_scope="local-rehearsal", reference=local_rehearsal)
     try:
         reply = processes.command([str(old), "--version"], cli_environment(root), root, "old-version", timeout=15)
         version = processes.text("old-version")
@@ -974,6 +1111,8 @@ def cli_build_hop(root, runtime):
         need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
              and all(subprocess.check_output(["git", "rev-parse", ref], text=True).strip() == source[key]
                      for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))), "hop source changed during build")
+        if local_rehearsal is not None:
+            need(cli_local_rehearsal(local_rehearsal) == source, "local hop source changed during build")
         receipt["status"] = "passed"
     finally:
         receipt["cleanup"] = processes.cleanup()
@@ -983,29 +1122,352 @@ def cli_build_hop(root, runtime):
     return receipt
 
 
-def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
-    """Generate a disposable signed positive hop and refusal set in CI."""
-    need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
-         and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
+def cli_home_activation_descriptor(registry, component_platform):
+    descriptor = registry.get("external", {}).get("home")
+    need(isinstance(descriptor, dict) and isinstance(descriptor.get("platforms"), dict),
+         "Home activation binding is absent or invalid")
+    platforms = descriptor["platforms"]
+    aliases = {"darwin-arm64": ("aarch64-darwin",), "aarch64-darwin": ("darwin-arm64",)}.get(component_platform, ())
+    selected = next((platforms[key] for key in (component_platform, *aliases, "*") if key in platforms), None)
+    need(isinstance(selected, dict), "Home activation binding has no valid platform")
+    install_path = selected.get("install_path")
+    if install_path is None:
+        install_path = descriptor.get("install_path")
+    need(install_path == "capsules/home",
+         "Home activation binding must resolve to capsules/home")
+    return descriptor
+
+
+def cli_qualified_home(support_home, component_platform):
+    """Admit only the already built source Home and its native provider."""
+    support_home = support_home.resolve()
+    registry = cli_json(cli_path(support_home, "components.json"))
+    cli_home_activation_descriptor(registry, component_platform)
+    native = cli_path(support_home, "bin/localhost-provider")
+    info = native.lstat()
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_mode & 0o111,
+         "qualified localhost provider is unavailable")
+    descriptor = registry["external"]["localhost-provider"]
+    selected = descriptor["platforms"][component_platform]
+    need(selected["checksum"] == "sha256:" + digest(native)
+         and selected.get("install_path", descriptor.get("install_path")) == "bin/localhost-provider",
+         "qualified localhost provider binding differs")
+    entry = registry["capsules"]["home"]
+    need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
+         "qualified Home entrypoint differs")
+    capsule_root = cli_path(support_home, "capsules/home")
+    paths = []
+    for path in sorted(capsule_root.rglob("*")):
+        relative = path.relative_to(support_home).as_posix()
+        cli_path(support_home, relative)
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+             "qualified Home tree contains an unsupported file")
+        if path.is_file():
+            need(not set(path.relative_to(capsule_root).parts) & {"identity", "target", "node_modules", ".git"},
+                 "qualified Home tree contains private or build state")
+            paths.append(path)
+    installed = cli_json(capsule_root / "capsule.json")
+    need(installed["name"] == "home" and installed["entrypoint"] == entry["entrypoint"]
+         and installed["execution"] == "web-projection", "qualified Home manifest differs")
+    document = capsule_root / entry["entrypoint"]
+    need(entry["entrypoint_sha256"] == "sha256:" + digest(document)
+         and entry["entrypoint_size"] == document.stat().st_size, "qualified Home document binding differs")
+    assets = [{"path": path.relative_to(capsule_root).as_posix(), "sha256": "sha256:" + digest(path),
+               "size": path.stat().st_size} for path in paths if path.is_relative_to(capsule_root / "browser")]
+    need(entry["browser_assets"] == assets and assets, "qualified Home browser asset closure differs")
+    return entry, paths, descriptor
+
+
+def cli_admit_home_support(root, manifest):
+    fixture = manifest["initial_home"]
+    need(set(fixture) == {"entrypoint", "files"}
+         and fixture["entrypoint"] == "capsules/home/browser/index.html", "initial Home fixture differs")
+    mapping = manifest["consumer"]["files"]
+    native_paths = {"bin/ipfs-provider", "bin/kubo", "bin/localhost-provider"}
+    expected = set(cli_setup_files(manifest)) | {"fixture-tools/open"}
+    need(fixture["files"] == sorted(expected) and native_paths <= expected
+         and "fixture-tools/open" in expected and "capsules/home/capsule.json" in expected and fixture["entrypoint"] in expected,
+         "initial Home support closure is incomplete")
+    need(all(any(target == path or target.startswith(path + "/") for path in manifest["preserve"]["support"])
+             for target in native_paths), "initial Home native support preservation is incomplete")
+    components = cli_json(cli_path(root, manifest["publications"]["old"]["components"]))
+    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+    cli_home_activation_descriptor(components, platform_name)
+    entry = components["capsules"]["home"]
+    need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
+         "signed Home entrypoint differs")
+    document = manifest["files"][mapping[fixture["entrypoint"]]]
+    need(entry["entrypoint_sha256"] == "sha256:" + document["sha256"] and entry["entrypoint_size"] == document["bytes"],
+         "signed Home document differs from the inventory")
+    installed = cli_json(cli_path(root, mapping["capsules/home/capsule.json"]))
+    need(installed["name"] == "home" and installed["entrypoint"] == entry["entrypoint"]
+         and installed["execution"] == "web-projection", "inventoried Home manifest differs")
+    assets = [{"path": target.removeprefix("capsules/home/"), "sha256": "sha256:" + manifest["files"][mapping[target]]["sha256"],
+               "size": manifest["files"][mapping[target]]["bytes"]}
+              for target in sorted(expected) if target.startswith("capsules/home/browser/")]
+    need(entry["browser_assets"] == assets, "signed Home browser closure differs from the inventory")
+    for target in sorted(native_paths):
+        native = manifest["files"][mapping[target]]
+        descriptor = components["external"][Path(target).name]
+        selected = descriptor["platforms"][platform_name]
+        need(selected["checksum"] == "sha256:" + native["sha256"] and selected["cid"] == native["cid"]
+             and selected["size"] == native["bytes"]
+             and selected.get("install_path", descriptor.get("install_path")) == target
+             and native["mode"] & 0o111, "signed native Home support differs from the inventory")
+    opener = manifest["files"][mapping["fixture-tools/open"]]
+    need(opener["mode"] == 0o700, "initial Home opener ownership mode differs")
+    for target in expected:
+        binding = manifest["files"][mapping[target]]
+        relative = manifest["holder"]["content"].get(binding.get("cid"))
+        need(relative in manifest["files"] and manifest["files"][relative]["sha256"] == binding["sha256"],
+             "initial Home support CID closure differs")
+
+
+CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider")
+CLI_SETUP_ARTIFACTS = ("home.tar.gz", "ipfs-provider", "kubo", "localhost-provider")
+CLI_HOME_CACHE = (".elastos-cid", ".elastos-artifact-sha256")
+CLI_LOCALHOST_METADATA = "localhost-provider-capsule-metadata.tar.gz"
+
+
+def cli_localhost_metadata_info(descriptor, platform_name):
+    metadata = descriptor.get("capsule_metadata")
+    if metadata is None:
+        return None
+    need(isinstance(metadata, dict) and isinstance(metadata.get("platforms"), dict),
+         "localhost metadata descriptor is invalid")
+    aliases = {"darwin-arm64": ("aarch64-darwin",), "aarch64-darwin": ("darwin-arm64",)}.get(platform_name, ())
+    selected = next((metadata["platforms"][key] for key in (platform_name, *aliases, "*")
+                     if key in metadata["platforms"]), None)
+    need(isinstance(selected, dict)
+         and selected.get("install_path", metadata.get("install_path")) == "capsules/localhost-provider"
+         and selected.get("extract_path") == "localhost-provider"
+         and selected.get("release_path") == CLI_LOCALHOST_METADATA
+         and re.fullmatch(r"sha256:[0-9a-f]{64}", selected.get("checksum", ""))
+         and isinstance(selected.get("size"), int) and 0 < selected["size"] <= 16 * 1024**2
+         and not any(selected.get(key) for key in ("url", "source", "strategy", "binary_path")),
+         "localhost metadata archive binding differs")
+    return selected
+
+
+def cli_localhost_metadata_files(raw, selected):
+    need(len(raw) == selected["size"] and "sha256:" + hashlib.sha256(raw).hexdigest() == selected["checksum"],
+         "qualified localhost metadata archive checksum or size differs")
+    files, seen, total = {}, set(), 0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as compressed:
+            tar_bytes = compressed.read(16 * 1024**2 + 1)
+        need(len(tar_bytes) <= 16 * 1024**2, "localhost metadata archive expansion exceeds bound")
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+            for member in archive:
+                name = member.name.removeprefix("./").rstrip("/")
+                path = Path(name)
+                need(len(seen) < 1024 and name and not path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+                     and (name == "localhost-provider" or name.startswith("localhost-provider/"))
+                     and name not in seen and (member.isdir() or member.isfile())
+                     and member.mode in (0o600, 0o644, 0o700, 0o755), "unsafe localhost metadata archive member")
+                seen.add(name)
+                if member.isdir():
+                    continue
+                relative = path.relative_to("localhost-provider").as_posix()
+                need(relative != "." and not set(path.parts) & {"identity", ".git", "target", "node_modules"}
+                     and path.name not in CLI_HOME_CACHE and path.suffix not in (".key", ".pem", ".p12"),
+                     "unsafe localhost metadata archive file")
+                total += member.size
+                need(0 <= member.size <= 16 * 1024**2 and total <= 16 * 1024**2,
+                     "localhost metadata archive expansion exceeds bound")
+                data = archive.extractfile(member).read()
+                need(len(data) == member.size, "localhost metadata archive member is truncated")
+                # Runtime's tar xzf inherits main's owner-only umask; fs::copy keeps that mode.
+                files["capsules/localhost-provider/" + relative] = (data, member.mode & ~0o077)
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise ValueError("qualified localhost metadata archive is invalid") from error
+    file_names = {"localhost-provider/" + target.removeprefix("capsules/localhost-provider/") for target in files}
+    need(not any(parent.as_posix() in file_names for name in seen for parent in Path(name).parents),
+         "localhost metadata archive file is used as a directory")
+    capsule = files.get("capsules/localhost-provider/capsule.json")
+    need(capsule is not None, "localhost metadata archive capsule manifest is absent")
+    document = json.loads(capsule[0])
+    need(isinstance(document, dict), "localhost metadata archive capsule manifest is invalid")
+    icon = document.get("icon", "")
+    need(isinstance(icon, str) and icon and not Path(icon).is_absolute()
+         and Path(icon).as_posix() == icon and ".." not in Path(icon).parts
+         and all("capsules/localhost-provider/" + icon + "/icon-" + str(size) + ".png" in files
+                 for size in (32, 64, 128, 256)), "localhost metadata archive icon closure is incomplete")
+    return files
+
+
+def cli_setup_files(manifest):
+    return {target: relative for target, relative in manifest["consumer"]["files"].items()
+            if target.startswith(("capsules/home/", "capsules/localhost-provider/")) or target in
+            ("bin/ipfs-provider", "bin/kubo", "bin/localhost-provider")}
+
+
+def cli_home_archive(root, manifest, mapping):
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for target, relative in sorted(mapping.items()):
+                if not target.startswith("capsules/home/"):
+                    continue
+                raw = cli_path(root, relative).read_bytes()
+                binding = manifest["files"][relative]
+                need(len(raw) == binding["bytes"] and hashlib.sha256(raw).hexdigest() == binding["sha256"],
+                     "Home archive input differs from inventory")
+                member = tarfile.TarInfo("home/" + target.removeprefix("capsules/home/"))
+                member.size, member.mode, member.mtime = len(raw), binding["mode"], 0
+                archive.addfile(member, io.BytesIO(raw))
+    return output.getvalue()
+
+
+def cli_admit_setup(root, manifest):
+    setup = manifest.get("setup")
+    if setup is None:
+        need(manifest["proof_kind"] == "harness-self-test",
+             "real Runtime fixture requires signed setup artifacts")
+        return {}
+    has_metadata = "localhost_metadata" in setup
+    need(set(setup) == ({"artifacts", "localhost_metadata"} if has_metadata else {"artifacts"})
+         and set(setup["artifacts"]) == set(CLI_SETUP_ARTIFACTS) | ({CLI_LOCALHOST_METADATA} if has_metadata else set()),
+         "fixed setup artifact closure required")
+    mapping = cli_setup_files(manifest)
+    need(all("bin/" + name in mapping for name in CLI_SETUP_COMPONENTS[1:])
+         and "capsules/home/capsule.json" in mapping and "capsules/home/browser/index.html" in mapping,
+         "setup output inventory is incomplete")
+    need(not any(Path(target).name in CLI_HOME_CACHE for target in mapping),
+         "setup cache metadata belongs to installed setup")
+    archive_relative = setup["artifacts"]["home.tar.gz"]
+    need(archive_relative in manifest["files"], "Home setup archive missing from inventory")
+    need(cli_path(root, archive_relative).read_bytes() == cli_home_archive(root, manifest, mapping),
+         "Home setup archive differs from qualified bytes")
+    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+    for publication in manifest["publications"].values():
+        components = cli_json(cli_path(root, publication["components"]))
+        need(components.get("profiles", {}).get("home", {}).get("components") == list(CLI_SETUP_COMPONENTS),
+             "fixed nonempty setup Home profile required")
+        for name, artifact in zip(CLI_SETUP_COMPONENTS, CLI_SETUP_ARTIFACTS):
+            relative = setup["artifacts"][artifact]
+            need(relative in manifest["files"], "setup artifact missing from inventory")
+            binding = manifest["files"][relative]
+            component = components["external"][name]
+            need(name == "localhost-provider" or "capsule_metadata" not in component,
+                 "setup component has unmodeled capsule metadata")
+            selected = component["platforms"][platform_name]
+            target = "capsules/home" if name == "home" else "bin/" + name
+            need(selected.get("release_path") == artifact and selected.get("install_path") == target
+                 and not any(selected.get(key) for key in ("url", "source", "strategy"))
+                 and selected.get("cid") == binding.get("cid")
+                 and selected.get("checksum") == "sha256:" + binding["sha256"]
+                 and selected.get("size") == binding["bytes"], "signed setup artifact binding differs")
+            need(manifest["holder"]["content"].get(binding["cid"]) == relative,
+                 "setup holder artifact is missing")
+            if name == "home":
+                entry = components["capsules"]["home"]
+                need(selected.get("extract_path") == "home"
+                     and entry["cid"] == binding["cid"] and entry["sha256"] == "sha256:" + binding["sha256"]
+                     and entry["size"] == binding["bytes"], "Home setup package identity differs")
+            else:
+                need(relative == mapping[target] and binding["mode"] & 0o111
+                     and not selected.get("extract_path"), "native setup artifact differs from output inventory")
+        selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
+        need((selected is not None) == has_metadata, "localhost metadata setup closure differs")
+        metadata_targets = {target for target in mapping if target.startswith("capsules/localhost-provider/")}
+        if has_metadata:
+            closure = setup["localhost_metadata"]
+            need(set(closure) == {"artifact", "files"} and closure["artifact"] == CLI_LOCALHOST_METADATA,
+                 "localhost metadata setup declaration differs")
+            relative = setup["artifacts"][CLI_LOCALHOST_METADATA]
+            binding = manifest["files"][relative]
+            need(selected.get("cid") == binding.get("cid") and binding["sha256"] == selected["checksum"].removeprefix("sha256:")
+                 and binding["bytes"] == selected["size"] and manifest["holder"]["content"].get(binding["cid"]) == relative,
+                 "signed localhost metadata artifact differs")
+            expected = cli_localhost_metadata_files(cli_path(root, relative).read_bytes(), selected)
+            need(closure["files"] == sorted(expected) and metadata_targets == set(expected),
+                 "localhost metadata output inventory is incomplete")
+            for target, (raw, mode) in expected.items():
+                output = manifest["files"][mapping[target]]
+                need(output["bytes"] == len(raw) and output["sha256"] == hashlib.sha256(raw).hexdigest()
+                     and output["mode"] == mode, "localhost metadata output binding differs")
+        else:
+            need(not metadata_targets, "localhost metadata output has no signed archive")
+    return mapping
+
+
+def cli_verify_setup_support(root, manifest, home_path):
+    if "setup" not in manifest:
+        need(manifest["proof_kind"] == "harness-self-test", "real Runtime setup closure is absent")
+        return
+    directory = home_path / CLI_DATA
+    for target, relative in cli_setup_files(manifest).items():
+        path, binding = cli_path(directory, target), manifest["files"][relative]
+        info = path.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+             and digest(path) == binding["sha256"] and info.st_size == binding["bytes"]
+             and stat.S_IMODE(info.st_mode) == binding["mode"],
+             "installed setup support differs: " + target)
+    components = cli_json(directory / "components.json")
+    entry = components["capsules"]["home"]
+    caches = [("capsules/home", (entry["cid"], entry["sha256"]))]
+    if "localhost_metadata" in manifest["setup"]:
+        platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+        selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
+        caches.append(("capsules/localhost-provider", (selected["cid"], selected["checksum"])))
+        folder = directory / "capsules/localhost-provider"
+        actual = {path.relative_to(directory).as_posix() for path in folder.rglob("*") if not path.is_dir()}
+        expected = {target for target in cli_setup_files(manifest) if target.startswith("capsules/localhost-provider/")}
+        need(actual == expected | {"capsules/localhost-provider/" + name for name in CLI_HOME_CACHE},
+             "installed localhost metadata output closure differs")
+    for folder, values in caches:
+        for name, expected in zip(CLI_HOME_CACHE, values):
+            path = cli_path(directory, folder + "/" + name)
+            info = path.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                 and stat.S_IMODE(info.st_mode) == 0o600
+                 and path.read_text() == expected + "\n", "installed setup cache identity differs")
+
+
+def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, local_rehearsal=None, localhost_metadata=None):
+    """Generate a disposable signed positive hop and refusal set for its admitted scope."""
+    local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
+    if local_source is None:
+        need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
+             and sys.platform == "darwin", "disposable refusal generation requires native Mac CI")
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
+    component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
+    home_descriptor, home_paths, localhost_descriptor = cli_qualified_home(support_home, component_platform)
+    metadata_info = cli_localhost_metadata_info(localhost_descriptor, component_platform)
+    metadata_files = {}
+    if metadata_info is not None:
+        need(localhost_metadata is not None, "qualified localhost metadata archive input is required")
+        info = localhost_metadata.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+             and not info.st_mode & 0o022 and info.st_size == metadata_info["size"],
+             "qualified localhost metadata archive custody or size differs")
+        metadata_raw = localhost_metadata.read_bytes()
+        metadata_files = cli_localhost_metadata_files(metadata_raw, metadata_info)
+        if metadata_info.get("cid"):
+            cli_metadata_cid(metadata_info["cid"], metadata_raw)
+    else:
+        need(localhost_metadata is None, "localhost metadata archive input has no source descriptor")
     for path in (runtime, next_runtime, build_receipt, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
         need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
     disk = shutil.disk_usage(root.parent)
     # Two Runtime copies plus their CID blocks, native support, package copies
-    # and seven isolated installed Homes fit within this conservative bound.
+    # and eight isolated installed Homes fit within this conservative bound.
     growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
-                                                   for name in ("ipfs-provider", "kubo")))
+                                                   for name in ("ipfs-provider", "kubo", "localhost-provider")) + sum(path.stat().st_size for path in home_paths)
+                   + sum(len(raw) for raw, _ in metadata_files.values()) + (len(metadata_raw) if metadata_info else 0))
     need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
     root.mkdir(mode=0o700)
     scratch = root / "generator"
     scratch.mkdir(mode=0o700)
-    source = {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+    source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
               for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
     manifest = {"schema": "elastos.update-hop.fixture/v1", "mode": CLI_MODE,
-                "proof_scope": "ci-rehearsal", "proof_kind": "real-runtime",
-                "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5961095676",
-                "reference": "ci-rehearsal:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
+                "proof_scope": "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal", "proof_kind": "real-runtime",
+                "approval": "https://github.com/Elacity/elastos-runtime/issues/89#issuecomment-5972959202",
+                "reference": local_rehearsal if local_rehearsal is not None else "ci-rehearsal:" + os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"],
                 "source": source, "channel": "canary", "platform": "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin",
                 "files": {}, "publications": {}, "holder": {"files": {}, "content": {}},
                 "selectors": {name: {"positive": positive, "refusals": list(CLI_REFUSALS)}
@@ -1031,6 +1493,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
     runtime_copy = root / runtime_relative
     kubo_relative = add("kubo", support_home / "bin/kubo", 0o755)
     provider_relative = add("ipfs-provider", support_home / "bin/ipfs-provider", 0o755)
+    localhost_relative = add("localhost-provider", support_home / "bin/localhost-provider", 0o755)
     env = cli_environment(scratch)
     env["IPFS_PATH"] = str(scratch / "ipfs-repo")
 
@@ -1057,13 +1520,55 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
             key.write_text(os.urandom(32).hex())
             key.chmod(0o600)
         execute([str(root / kubo_relative), "init", "--profile=test"])
-        catalogue_envelope = sign({"schema": "elastos.model.catalog/v1", "entries": []}, "elastos.model.catalog.v1", keys[0])
+        capsule = cli_model_fixture_capsule()
+        model_bytes = {"capsule.json": json.dumps(capsule, sort_keys=True, separators=(",", ":")).encode(),
+                       "weights.gguf": b"GGUF synthetic fixture metadata only; no inference model.\n",
+                       "LICENSE": b"Synthetic fixture bytes licensed under Apache-2.0.\n",
+                       "LICENSE.base": b"Synthetic base fixture bytes licensed under Apache-2.0.\n",
+                       "PROVENANCE.md": b"Owned local rehearsal fixture bytes only. No downloaded weights or inference claim.\n" if local_rehearsal is not None
+                                        else b"Owned CI fixture bytes only. No downloaded weights or inference claim.\n"}
+        model_mapping = {name: add("model-fixture/" + name, raw) for name, raw in sorted(model_bytes.items())}
+        for relative in model_mapping.values():
+            content(relative, raw=True)
+        package_bytes = io.BytesIO()
+        with tarfile.open(fileobj=package_bytes, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, raw in sorted(model_bytes.items()):
+                member = tarfile.TarInfo(name)
+                member.size, member.mode, member.mtime = len(raw), 0o600, 1
+                archive.addfile(member, io.BytesIO(raw))
+        package = add("model-fixture.tar", package_bytes.getvalue())
+        package_cid = content(package)
+        manifest["model_fixture"] = {"package": package, "files": model_mapping}
+        catalogue_envelope = sign({"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None,
+            "entries": [{"cid": package_cid, "capsule_manifest": capsule,
+                         "object_manifest": cli_model_fixture_object(manifest, model_mapping)}]}, "elastos.model.catalog.v1", keys[0])
         manifest["signer_did"] = catalogue_envelope["signer_did"]
         catalogue = add("catalogue.json", catalogue_envelope)
         content(catalogue, raw=True)
-        component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
         qualified = cli_json(support_home / "components.json")
-        external = {}
+        opener = add("home-opener", Path("/usr/bin/true"), 0o700)
+        home_mapping = {"bin/ipfs-provider": provider_relative, "bin/kubo": kubo_relative,
+                        "bin/localhost-provider": localhost_relative, "fixture-tools/open": opener}
+        content(provider_relative)
+        content(kubo_relative)
+        content(localhost_relative)
+        content(opener)
+        for path in home_paths:
+            target = path.relative_to(support_home).as_posix()
+            if path.parent == support_home / "capsules/home" and path.name in CLI_HOME_CACHE:
+                continue
+            relative = add("home-support/" + target, path)
+            content(relative, raw=True)
+            home_mapping[target] = relative
+        home_archive = add("home.tar.gz", cli_home_archive(root, manifest, home_mapping))
+        content(home_archive)
+        archive_binding = manifest["files"][home_archive]
+        home_descriptor = {**home_descriptor, "cid": archive_binding["cid"],
+                           "sha256": "sha256:" + archive_binding["sha256"], "size": archive_binding["bytes"]}
+        external = {"home": {"install_path": "capsules/home", "platforms": {component_platform: {
+            "release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home",
+            "cid": archive_binding["cid"], "checksum": "sha256:" + archive_binding["sha256"],
+            "size": archive_binding["bytes"]}}}}
         for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
             descriptor = qualified["external"][name]
             if name == "ipfs-provider":
@@ -1072,11 +1577,38 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
             # the installed executable bytes and exposes only local Carrier content.
             external[name] = {"install_path": "bin/" + name, "platforms": {component_platform: {
                 "checksum": "sha256:" + manifest["files"][relative]["sha256"],
-                "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name}}}
+                "cid": manifest["files"][relative]["cid"],
+                "size": manifest["files"][relative]["bytes"], "install_path": "bin/" + name,
+                "release_path": name}}}
             if "provider_runtime" in descriptor:
                 external[name]["provider_runtime"] = descriptor["provider_runtime"]
-        components = add("components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
-                         "profiles": {}, "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
+        # Preserve the qualified source descriptor and add the fixture CID pin.
+        external["localhost-provider"] = {**localhost_descriptor, "platforms": {component_platform: {
+            "install_path": "bin/localhost-provider", "checksum": "sha256:" + manifest["files"][localhost_relative]["sha256"],
+            "size": manifest["files"][localhost_relative]["bytes"], "cid": manifest["files"][localhost_relative]["cid"],
+            "release_path": "localhost-provider"}}}
+        metadata_relative = None
+        if metadata_info is not None:
+            metadata_relative = add(CLI_LOCALHOST_METADATA, metadata_raw)
+            metadata_cid = content(metadata_relative)
+            metadata = json.loads(json.dumps(localhost_descriptor["capsule_metadata"]))
+            external["localhost-provider"]["capsule_metadata"] = metadata
+            selected = cli_localhost_metadata_info(external["localhost-provider"], component_platform)
+            need(not selected.get("cid") or selected["cid"] == metadata_cid,
+                 "qualified localhost metadata CID differs from its archive")
+            selected["cid"] = metadata_cid
+            for target, (raw, mode) in sorted(metadata_files.items()):
+                relative = add("localhost-metadata/" + target, raw, mode)
+                content(relative, raw=True)
+                home_mapping[target] = relative
+        components = add("components.json", {"schema": "elastos.components/v1", "capsules": {"home": home_descriptor}, "external": external,
+                         "profiles": {"home": {"description": "Qualified fixture Home", "components": list(CLI_SETUP_COMPONENTS)}},
+                         "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
+        manifest["setup"] = {"artifacts": dict(zip(CLI_SETUP_ARTIFACTS,
+            (home_archive, provider_relative, kubo_relative, localhost_relative)))}
+        if metadata_relative is not None:
+            manifest["setup"]["artifacts"][CLI_LOCALHOST_METADATA] = metadata_relative
+            manifest["setup"]["localhost_metadata"] = {"artifact": CLI_LOCALHOST_METADATA, "files": sorted(metadata_files)}
         content(components)
         content(runtime_relative)
         content(next_relative)
@@ -1088,6 +1620,13 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
         need(execute([str(root / next_relative), "--version"]).decode() == "elastos " + new_version + "\n", "next Runtime must be a real compiled N+1")
         build = cli_json(build_receipt)
         need(build["status"] == "passed" and build["cleanup"]["passed"] and build["source"] == source, "hop build receipt differs")
+        need(build.get("proof_scope", "ci-rehearsal") == manifest["proof_scope"], "hop build proof scope differs")
+        if local_rehearsal is not None:
+            need(build.get("reference") == local_rehearsal, "local hop build reference differs")
+        else:
+            build_reference = build.get("reference", "")
+            need(isinstance(build_reference, str) and not build_reference.startswith("local-rehearsal:"),
+                 "local build requires its explicit selector")
         for name, relative, version in (("old", runtime_relative, old_version), ("new", next_relative, new_version)):
             need(build[name]["sha256"] == manifest["files"][relative]["sha256"] and build[name]["version"] == version
                  and build[name]["source"] == source, "hop build Runtime binding differs")
@@ -1132,15 +1671,19 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home):
                 if path.is_file():
                     relative = str(path.relative_to(scratch / "ipfs-repo"))
                     manifest["holder"]["files"][CLI_DATA + "/ipfs-repo/" + relative] = add("repository/" + relative, path)
-        manifest["consumer"] = {"files": {"config/fixture.json": add("consumer/config.json", {"owner": "isolated CI refusal test"}),
+        manifest["consumer"] = {"files": {"config/fixture.json": add("consumer/config.json", {"owner": "isolated local rehearsal" if local_rehearsal is not None else "isolated CI refusal test"}),
                                            "state/sentinel": add("consumer/state", b"preserve user data"),
                                            "capsules/sentinel/data": add("consumer/support", b"preserve support")}}
-        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules"]}
+        manifest["consumer"]["files"].update(home_mapping)
+        manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(home_mapping)}
+        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]}
+        if local_rehearsal is not None:
+            need(cli_local_rehearsal(local_rehearsal) == source, "local hop source changed during generation")
         write(root / "manifest.json", manifest)
         config = {"schema": manifest["schema"], "mode": CLI_MODE, "root": str(root),
                   "immutable": {"reference": manifest["reference"], "manifest": "manifest.json", "sha256": digest(root / "manifest.json")}}
         write(root / "fixture.json", config)
-        return {"status": "generated", "proof_scope": "ci-rehearsal", "manifest_sha256": config["immutable"]["sha256"],
+        return {"status": "generated", "proof_scope": manifest["proof_scope"], "reference": manifest["reference"], "manifest_sha256": config["immutable"]["sha256"],
                 "source": source, "signer_did": manifest["signer_did"], "keys_removed": True}
     finally:
         shutil.rmtree(scratch)
@@ -1261,6 +1804,21 @@ def cli_clean_output(processes, label):
 
 def cli_success(processes, label, command):
     return command["exit"] == 0 and cli_clean_output(processes, label)
+
+
+def cli_ci_stderr_detail(processes, manifest, label, description):
+    # The immutable CI fixture uses disposable keys. Operator Runtime logs stay private.
+    if manifest.get("proof_scope") != "ci-rehearsal" or not hasattr(processes, "output"):
+        return ""
+    stderr = processes.output / (label + ".stderr")
+    try:
+        with stderr.open("rb") as stream:
+            stream.seek(max(0, stderr.stat().st_size - 4096))
+            tail = stream.read(4096).decode(errors="replace")
+        tail = re.sub(r"\x1b\[[0-9;]*m", "", tail).strip()
+        return "; CI " + description + " stderr: " + tail[-1024:] if tail else ""
+    except OSError:
+        return "; CI " + description + " diagnostic is unavailable"
 
 
 class CliBootstrap:
@@ -1386,6 +1944,49 @@ def cli_coordination(home_path, required=True):
     return {"status": "released", **metadata}
 
 
+def cli_installed_metadata(home_path):
+    directory = cli_path(home_path, CLI_DATA + "/installation")
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return None
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+         and stat.S_IMODE(info.st_mode) == 0o700, "installed metadata directory ownership/mode differs")
+    need({path.name for path in directory.iterdir()} == {"release-head.json", "release.json"},
+         "installed metadata inventory differs")
+    snapshot = {}
+    for relative in CLI_INSTALLED_METADATA:
+        path = home_path / CLI_DATA / relative
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 256 * 1024,
+                 "installed metadata file ownership/mode/bound differs")
+            raw = stream.read(256 * 1024 + 1)
+            need(len(raw) <= 256 * 1024, "installed metadata file grew beyond its bound")
+            snapshot[relative] = hashlib.sha256(raw).hexdigest()
+    return snapshot
+
+
+def cli_expected_installed_metadata(manifest, publication_name):
+    publication = manifest["publications"][publication_name]
+    return {relative: manifest["files"][publication[key]]["sha256"]
+            for relative, key in zip(CLI_INSTALLED_METADATA, ("head", "release"))}
+
+
+def cli_legacy_installed_metadata(home_path):
+    snapshot = {}
+    for relative in CLI_INSTALLED_METADATA:
+        path, original = cli_copy_target(home_path, CLI_DATA + "/" + CLI_PUBLISHER + "/" + Path(relative).name)
+        need(original is not None, "legacy installed metadata absent")
+        info = path.lstat()
+        need(info.st_nlink == 1 and info.st_mode & 0o7022 == 0 and info.st_size <= 256 * 1024,
+             "legacy installed metadata ownership/mode/bound differs")
+        snapshot[relative] = digest(path)
+    return snapshot
+
+
 def cli_state(manifest, home_path):
     directory = home_path / CLI_DATA
     coordination = cli_coordination(home_path)
@@ -1394,8 +1995,9 @@ def cli_state(manifest, home_path):
     return {"binary": digest(home_path / ".local/bin/elastos"),
             "components": digest(directory / "components.json"),
             "catalogue": digest(directory / "model-catalog.json"), "sources": sources, "coordination": coordination,
+            "installed_metadata": cli_installed_metadata(home_path),
             "data": {relative: binding for relative, binding in (files(directory) or {}).items()
-                     if relative not in ("sources.json", "components.json", "model-catalog.json", "host-process.lock", CLI_PUBLISHER + "/release-head.json", CLI_PUBLISHER + "/release.json")
+                     if relative not in ("sources.json", "components.json", "model-catalog.json", "host-process.lock", *CLI_INSTALLED_METADATA)
                      and not relative.startswith("backups/principal-root-upgrade-")},
             "preserved": {key: {relative: files(cli_path(directory, relative)) for relative in paths}
                           for key, paths in manifest["preserve"].items()}}
@@ -1443,8 +2045,266 @@ def cli_holder_bootstrap(current, node_id):
     # Runtime owns ticket decoding and authenticated Carrier connection checks.
 
 
-def cli_run(config, output):
-    manifest = cli_admit(config)
+def cli_process_identity(pid):
+    """Use the same kernel birth identity as the Runtime controller."""
+    need(type(pid) is int and 0 < pid <= 0x7fffffff, "invalid fixture process identity")
+    if sys.platform == "darwin":
+        class BsdInfo(ctypes.Structure):
+            # Darwin sys/proc_info.h, PROC_PIDTBSDINFO (flavor 3).
+            _fields_ = [(name, ctypes.c_uint32) for name in (
+                "flags", "status", "xstatus", "pid", "parent", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+            _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+            _fields_ += [(name, ctypes.c_uint32) for name in ("nfiles", "group", "jobc", "tdev", "tpgid")]
+            _fields_ += [("nice", ctypes.c_int32), ("seconds", ctypes.c_uint64), ("microseconds", ctypes.c_uint64)]
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        library.proc_pidinfo.restype = ctypes.c_int
+        info = BsdInfo()
+        ctypes.set_errno(0)
+        count = library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if count == 0 and ctypes.get_errno() == errno.ESRCH:  # Other kernel failures retain refusal.
+            return None
+        need(count == ctypes.sizeof(info) and info.pid == pid and info.status != 5,
+             "fixture kernel process identity is incomplete")
+        return {"pid": pid, "parent": info.parent, "group": info.group,
+                "start": f"macos:{info.seconds}:{info.microseconds}"}
+    need(sys.platform.startswith("linux"), "fixture process identity requires Darwin or Linux")
+    path = Path(f"/proc/{pid}/stat")
+    try:
+        value = path.read_text()
+    except FileNotFoundError:
+        return None
+    fields = value[value.rindex(")") + 2:].split()
+    need(len(fields) >= 20 and fields[0] != "Z", "fixture kernel process identity is incomplete")
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return {"pid": pid, "parent": int(fields[1]), "group": int(fields[2]), "start": "linux:" + boot + ":" + fields[19]}
+
+
+def cli_process_executable(pid):
+    if sys.platform == "darwin":
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        library.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        count = library.proc_pidpath(pid, buffer, len(buffer))
+        need(0 < count < len(buffer), "fixture executable kernel path is incomplete")
+        return os.fsdecode(buffer.value)
+    need(sys.platform.startswith("linux"), "fixture executable identity requires Darwin or Linux")
+    return os.readlink(f"/proc/{pid}/exe")
+
+
+def cli_private_json(path, limit=256 * 1024):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+             and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= limit, "private Home record ownership or bound differs")
+        raw = stream.read(limit + 1)
+        need(len(raw) <= limit, "private Home record grew beyond its bound")
+        def unique(pairs):
+            need(len(dict(pairs)) == len(pairs), "private Home record repeats a field")
+            return dict(pairs)
+        return json.loads(raw, object_pairs_hook=unique)
+
+
+def cli_home_base(value, public=False):
+    url = urllib.parse.urlsplit(value)
+    need(url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1") and url.port
+         and not url.username and not url.password and not url.query and not url.fragment,
+         "Home readiness address is not exact loopback HTTP")
+    need(url.path == ("/home/" if public else ""), "Home readiness address has an unexpected path")
+    need(not public or value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"),
+         "Home readiness listener differs")
+    return url
+
+
+def cli_home_response(url, limit, payload=None, token=None):
+    class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            raise ValueError("Home readiness response redirected")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), RefuseRedirect())
+    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    if token is not None:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, data=None if payload is None else json.dumps(payload).encode(), headers=headers)
+    with opener.open(request, timeout=2) as response:
+        need(response.status == 200, "Home readiness response refused")
+        raw = response.read(limit + 1)
+        need(len(raw) <= limit, "Home readiness response exceeds its bound")
+        return raw
+
+
+def cli_home_snapshot(manifest, home_path):
+    directory = home_path / CLI_DATA
+    return {"binary": digest(home_path / ".local/bin/elastos"), "components": digest(directory / "components.json"),
+            "catalogue": digest(directory / "model-catalog.json"), "sources": cli_json(directory / "sources.json"),
+            "identity": digest(directory / "identity/device.key"),
+            "installed_metadata": cli_installed_metadata(home_path),
+            "publisher": files(directory / CLI_PUBLISHER),
+            "preserved": {key: {relative: files(cli_path(directory, relative)) for relative in paths}
+                          for key, paths in manifest["preserve"].items()}}
+
+
+def cli_observe_initial_home(processes, manifest, home_path, process, status):
+    directory = home_path / CLI_DATA
+    expected = manifest["files"][manifest["publications"]["old"]["binary"]]["sha256"]
+    controller = directory / "update-controller/runtime"
+    receipt_path = directory / "update-controller/receipt.json"
+    receipt = cli_private_json(receipt_path)
+    need(receipt["schema"] == "elastos.update-controller/v1" and receipt["data_dir"] == str(directory)
+         and receipt["binary"] == str(home_path / ".local/bin/elastos") and receipt["controller"] == str(controller)
+         and receipt["controller_sha256"] == expected and digest(controller) == expected,
+         "installed controller receipt or Runtime hash differs")
+    info = controller.lstat()
+    need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+         and stat.S_IMODE(info.st_mode) == 0o700, "installed controller ownership differs")
+    signed = base64.b64decode(receipt["signed_controller_release"], validate=True)
+    need(hashlib.sha256(signed).hexdigest() == manifest["files"][manifest["publications"]["old"]["release"]]["sha256"]
+         and receipt["trusted_source"] == source_for_home(home_path), "controller signed release or trust differs")
+    launch = receipt["launch"]
+    need([base64.b64decode(value, validate=True) for value in launch["args"]] == [b"home", b"--browser"]
+         and base64.b64decode(launch["cwd"], validate=True) == os.fsencode(home_path)
+         and hashlib.sha256(json.dumps({key: launch[key] for key in ("args", "environment", "cwd")}, separators=(",", ":")).encode()).hexdigest() == receipt["launch_sha256"],
+         "controller launch receipt differs")
+    controller_identity = cli_process_identity(process.pid)
+    host_identity = cli_process_identity(status["host_pid"])
+    need(controller_identity is not None and controller_identity["group"] == process.pid
+         and status["controller_pid"] == process.pid and status["controller_start"] == controller_identity["start"]
+         and host_identity is not None and host_identity["parent"] == process.pid
+         and host_identity["group"] == host_identity["pid"]
+         and cli_process_executable(process.pid) == str(controller)
+         and cli_process_executable(host_identity["pid"]) == str(home_path / ".local/bin/elastos"),
+         "controller or owned Home child identity differs")
+    generation = status["generation"]
+    need(re.fullmatch(r"[0-9a-f]{32}", generation) and status["phase"] == "ready"
+         and status["current_version"] == manifest["old"]["version"] and status["id"] is None and status["new_version"] is None,
+         "controller initial readiness status differs")
+    coords_path = directory / "gateway-runtime-coords.json"
+    coords = cli_private_json(coords_path)
+    need(coords["runtime_kind"] == "gateway" and coords["pid"] == host_identity["pid"]
+         and coords["generation"] == generation and coords["binary_sha256"] == expected
+         and re.fullmatch(r"[0-9a-f]{64}", coords["attach_secret"]), "live gateway coordinates differ")
+    cli_home_base(coords["home_url"], public=True)
+    cli_home_base(coords["api_url"])
+    host_lock = cli_private_json(directory / "host-process.lock", 4096)
+    need(host_lock["pid"] == host_identity["pid"] and host_lock["role"] == "gateway"
+         and host_lock["addr"] == "localhost:8090" and host_lock["generation"] == generation
+         and lock_state(directory / "host-process.lock") == "held"
+         and lock_state(directory / "update-controller/controller.lock") == "held", "live Home ownership lock differs")
+    attached = json.loads(cli_home_response(coords["api_url"] + "/api/auth/attach", 16 * 1024,
+                                           {"secret": coords["attach_secret"], "scope": "client"}))
+    token = attached.get("token")
+    need(isinstance(token, str) and token and attached.get("session_type") == "capsule", "private Home attach refused")
+    health_reply = json.loads(cli_home_response(coords["api_url"] + "/api/health", 4096, token=token))
+    need(health_reply["version"] == manifest["old"]["version"], "authenticated Home health version differs")
+    document = directory / manifest["initial_home"]["entrypoint"]
+    served = cli_home_response(coords["home_url"], 2 * 1024 * 1024)
+    need(hashlib.sha256(served).hexdigest() == digest(document), "served Home differs from its installed capsule")
+    need(cli_process_identity(process.pid) == controller_identity and cli_process_identity(host_identity["pid"]) == host_identity
+         and cli_private_json(coords_path) == coords and process.poll() is None, "Home generation changed during readiness proof")
+    processes.roots[str(controller)] = {expected}
+    return {"status": "passed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home",
+            "controller": controller_identity, "host": host_identity, "generation": generation,
+            "controller_receipt_sha256": digest(receipt_path), "controller_sha256": expected,
+            "gateway_coords_sha256": digest(coords_path), "home_sha256": hashlib.sha256(served).hexdigest(),
+            "home_url": coords["home_url"], "api_url": coords["api_url"], "authenticated_health": True}
+
+
+def source_for_home(home_path):
+    sources = cli_json(home_path / CLI_DATA / "sources.json")
+    return next(value for value in sources["sources"] if value["name"] == sources["default_source"])
+
+
+def cli_port_released(value):
+    url = urllib.parse.urlsplit(value)
+    for family, kind, protocol, _, address in socket.getaddrinfo(url.hostname, url.port, type=socket.SOCK_STREAM):
+        with socket.socket(family, kind, protocol) as probe:
+            probe.settimeout(.2)
+            need(probe.connect_ex(address) != 0, "initial Home listener survives shutdown")
+
+
+def cli_initial_home(processes, manifest, home_path, evidence=None):
+    """Run the installed entrypoint; Runtime alone admits and owns its child."""
+    before = cli_home_snapshot(manifest, home_path)
+    expected_metadata = cli_expected_installed_metadata(manifest, "old")
+    need(before["installed_metadata"] in (None, expected_metadata), "initial Home installed metadata differs from signed old release")
+    if before["installed_metadata"] is None:
+        need(cli_legacy_installed_metadata(home_path) == expected_metadata, "initial Home legacy metadata differs from signed old release")
+    # Initial Home may migrate the frozen installer's legacy signed pair once.
+    before["installed_metadata"] = expected_metadata
+    directory = home_path / CLI_DATA
+    for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/"):
+        cli_port_released(value)
+    env = cli_environment(home_path)
+    env["ELASTOS_CARRIER_MDNS"] = "0"
+    opener = cli_path(directory, "fixture-tools/open")
+    binding = manifest["files"][manifest["consumer"]["files"]["fixture-tools/open"]]
+    info = opener.lstat()
+    need(digest(opener) == binding["sha256"] and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+         and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700, "initial Home opener differs")
+    env["PATH"] = str(opener.parent) + ":" + env["PATH"]
+    processes.roots[str(opener)] = {binding["sha256"]}
+    process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "initial-home-start")
+    proof, failure, cleanup_failure, exit_code = None, None, None, None
+    evidence = {} if evidence is None else evidence
+    try:
+        deadline = time.monotonic() + 150
+        while process.poll() is None and time.monotonic() < deadline:
+            status_path = directory / "update-controller/status.json"
+            if status_path.exists():
+                status = cli_private_json(status_path)
+                if status.get("phase") == "ready":
+                    proof = cli_observe_initial_home(processes, manifest, home_path, process, status)
+                    break
+            time.sleep(.2)
+        need(proof is not None and process.poll() is None, "installed Home did not reach controller readiness")
+        need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
+    except Exception as error:
+        failure = error
+    finally:
+        try:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            exit_code = process.wait(timeout=35)
+        except Exception as error:
+            cleanup_failure = error
+    evidence["controller_exit"] = exit_code
+    if hasattr(processes, "output"):
+        try:
+            for stream in ("stdout", "stderr"):
+                evidence["controller_" + stream + "_sha256"] = digest(processes.output / ("initial-home-start." + stream))
+        except OSError:
+            if cleanup_failure is None:
+                cleanup_failure = ValueError("initial Home log evidence is unavailable")
+    if failure is not None or cleanup_failure is not None or exit_code != 0:
+        detail = str(failure) if failure is not None else "installed Home controller did not stop cleanly"
+        detail += "; controller exit " + str(exit_code)
+        if cleanup_failure is not None:
+            detail += "; cleanup: " + str(cleanup_failure)
+        detail += cli_ci_stderr_detail(processes, manifest, "initial-home-start", "controller")
+        raise ValueError(detail) from failure
+    need(proof is not None, "initial Home readiness proof is absent")
+    for identity in (proof["controller"], proof["host"]):
+        need(cli_process_identity(identity["pid"]) is None, "initial Home process survives shutdown")
+    groups = {proof["controller"]["group"], proof["host"]["group"]}
+    need(not any(row["group"] in groups for row in cli_census()), "initial Home owned process group survives shutdown")
+    need(not (directory / "gateway-runtime-coords.json").exists()
+         and lock_state(directory / "host-process.lock") == "released"
+         and lock_state(directory / "update-controller/controller.lock") == "released",
+         "initial Home coordinates or ownership survive shutdown")
+    need(not any((directory / "gateway-owned-runtimes").rglob("*.json")), "initial Home owned child record survives shutdown")
+    for value in (proof["home_url"], "http://127.0.0.1:8090/home/", proof["api_url"]):
+        cli_port_released(value)
+    need(cli_home_snapshot(manifest, home_path) == before, "Home shutdown changed installed trust, identity or preserved data")
+    proof["desktop_opener"] = {"suppressed": True, "sha256": binding["sha256"], "manual_ux": "requires operator acceptance"}
+    proof.update({key: value for key, value in evidence.items() if key.startswith("controller_")})
+    proof["cleanup"] = {"controller_exit": process.returncode, "reaped": True, "groups_absent": True,
+                        "ports_released": True, "locks_released": True, "coordinates_removed": True, "data_preserved": True}
+    return proof
+
+
+def cli_run(config, output, local_rehearsal=None):
+    manifest = cli_admit(config, local_rehearsal)
     root = Path(config["root"])
     need(output == cli_path(root, "results"), "CLI run requires its fresh root/results directory")
     output.mkdir(mode=0o700, exist_ok=False)
@@ -1456,7 +2316,7 @@ def cli_run(config, output):
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
-              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}, "coordination": {}}
+              "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": {}, "coordination": {}, "setup": {}}
     if manifest.get("build"):
         result["build"] = cli_json(cli_path(root, manifest["build"]))
     holder = output / "homes/holder"
@@ -1468,9 +2328,11 @@ def cli_run(config, output):
     holder_config = holder_data / "config.toml"
     holder_labels, holder_config_text = [], None
 
-    def command(home_path, args, label):
+    def command(home_path, args, label, evidence=None):
         reply = processes.command([str(home_path / ".local/bin/elastos"), *args],
                                   cli_environment(home_path), home_path, label)
+        if evidence is not None:
+            evidence.update(reply)
         if home_path != holder:
             result["coordination"][label] = cli_coordination(home_path)
         return reply
@@ -1498,6 +2360,8 @@ def cli_run(config, output):
                     CLI_PUBLISHER + "/artifacts/elastos-" + manifest["platform"]: publication["binary"],
                     CLI_PUBLISHER + "/artifacts/components-" + manifest["platform"] + ".json": publication["components"],
                     CLI_PUBLISHER + "/artifacts/model-catalog.json": publication["catalogue"]}
+        snapshot.update({CLI_PUBLISHER + "/artifacts/" + name: relative
+                         for name, relative in manifest.get("setup", {}).get("artifacts", {}).items()})
         cli_copy(root, manifest, snapshot, holder_data)
         label = "holder-" + str(len(processes.processes))
         holder_labels.append(label)
@@ -1530,8 +2394,25 @@ def cli_run(config, output):
         finally:
             installer_bootstrap.enabled = False
 
+    def setup(home_path, label):
+        track(home_path, {CLI_DATA + "/" + target: relative for target, relative in cli_setup_files(manifest).items()})
+        evidence = {"status": "failed"}
+        result["setup"][label] = evidence
+        reply = command(home_path, ["setup"], label, evidence)
+        need(cli_success(processes, label, reply), "installed setup failed; command exit " + str(reply["exit"])
+             + cli_ci_stderr_detail(processes, manifest, label, label))
+        for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
+            need(digest(home_path / CLI_DATA / filename) == manifest["files"][manifest["publications"]["old"][key]]["sha256"],
+                 "installed setup " + key + " hash differs")
+        cli_verify_setup_support(root, manifest, home_path)
+        evidence["status"] = "passed"
+
     def prepare(home_path, label):
-        cli_copy(root, manifest, manifest["consumer"]["files"], home_path / CLI_DATA)
+        cli_verify_setup_support(root, manifest, home_path)
+        setup_targets = cli_setup_files(manifest) if "setup" in manifest else {}
+        mapping = {target: relative for target, relative in manifest["consumer"]["files"].items()
+                   if target not in setup_targets}
+        cli_copy(root, manifest, mapping, home_path / CLI_DATA)
         track(home_path, {CLI_DATA + "/" + target: relative for target, relative in manifest["consumer"]["files"].items()})
         need(command(home_path, ["node", "info", "--json"], label + "-identity")["exit"] == 0, "consumer fixture identity failed")
         for group, values in cli_state(manifest, home_path)["preserved"].items():
@@ -1554,6 +2435,16 @@ def cli_run(config, output):
              and stored["installed_version"] == version, "installed trust/config binding differs")
         if publication_name == "old":
             need(not stored["head_cid"], "frozen installer cached a head CID")
+            need(observation["installed_metadata"] in (None, cli_expected_installed_metadata(manifest, "old")),
+                 "old installed metadata differs")
+            if observation["installed_metadata"] is None:
+                need(cli_legacy_installed_metadata(home_path) == cli_expected_installed_metadata(manifest, "old"),
+                     "old legacy installed metadata hash differs")
+        else:
+            need(observation["installed_metadata"] == cli_expected_installed_metadata(manifest, publication_name),
+                 "installed consumed metadata hash differs")
+            need(stored["head_cid"] == manifest["files"][publication["head"]]["cid"],
+                 "installed consumed head CID differs")
         return observation
 
     try:
@@ -1591,27 +2482,44 @@ def cli_run(config, output):
         result["paths"]["m1-install"] = {"status": "failed", "checks": {}}
         reply = install(consumer, "m1-install")
         need(cli_success(processes, "m1-install", reply), "fresh installer failed")
+        setup(consumer, "m1-setup")
         verify(consumer, "old", "m1-version")
         result["paths"]["m1-install"]["checks"]["positive"] = {"status": "passed", **reply}
         prepare(consumer, "main")
         before = cli_state(manifest, consumer)
+        if "initial_home" in manifest:
+            initial = output / "homes/initial-home"
+            initial.mkdir(mode=0o700)
+            processes.roots[str(initial / ".local/bin/elastos")] = {manifest["files"][manifest["publications"]["old"]["binary"]]["sha256"]}
+            need(cli_success(processes, "initial-home-install", install(initial, "initial-home-install")), "initial Home installer failed")
+            setup(initial, "initial-home-setup")
+            verify(initial, "old", "initial-home-version")
+            prepare(initial, "initial-home")
+            result["paths"]["m1-install"]["checks"]["initial-home"] = {
+                "status": "failed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home"}
+            result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
+                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"])
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
-        if result["proof_scope"] in ("production-positive", "ci-rehearsal"):
+        if result["proof_scope"] in ("production-positive", "ci-rehearsal", "local-rehearsal"):
             phase("new")
             result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
             reply = command(consumer, ["update", "--check"], "m2-check")
             need(cli_success(processes, "m2-check", reply) and "Discovery: Carrier" in processes.text("m2-check")
                  and cli_state(manifest, consumer) == before, "plain Carrier check failed or changed files")
             result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
-            reply = command(consumer, ["update"], "m2-apply")
-            need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
+            apply = {"status": "failed"}
+            result["paths"]["m2-discovery"]["checks"]["apply"] = apply
+            reply = command(consumer, ["update"], "m2-apply", apply)
+            if not (cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply")):
+                raise ValueError("plain Carrier apply failed; command exit " + str(reply["exit"])
+                                 + cli_ci_stderr_detail(processes, manifest, "m2-apply", "m2-apply"))
             need(result["coordination"]["m2-apply"]["pid"] == reply["pid"], "apply coordination PID differs from its owned command")
             after = verify(consumer, "new", "m2-version")
             need(after["coordination"] == result["coordination"]["m2-apply"], "version command changed Runtime coordination metadata")
             expected_sources = json.loads(json.dumps(before["sources"]))
             expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
             need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
-            result["paths"]["m2-discovery"]["checks"]["apply"] = {"status": "passed", **reply}
+            apply["status"] = "passed"
             reply = command(consumer, ["update"], "m2-repeat")
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
@@ -1631,6 +2539,7 @@ def cli_run(config, output):
             target.mkdir(mode=0o700)
             processes.roots[str(target / ".local/bin/elastos")] = {manifest["files"][manifest["publications"]["old"]["binary"]]["sha256"]}
             need(cli_success(processes, "seed-" + case, install(target, "seed-" + case)), "old refusal consumer installation failed")
+            setup(target, "seed-setup-" + case)
             verify(target, "old", "seed-version-" + case)
             prepare(target, "seed-" + case)
             original = cli_state(manifest, target)
@@ -1665,6 +2574,8 @@ def cli_run(config, output):
             need(all(entry["clean"] for entry in result["holder_output"]), "holder output contains an endpoint error")
             cli_inventory(root, manifest)
             need(digest(root / "manifest.json") == config["immutable"]["sha256"], "manifest changed during run")
+            if local_rehearsal is not None:
+                need(cli_local_rehearsal(local_rehearsal) == manifest["source"], "local hop source changed during run")
             need(lock_state(holder_data / "host-process.lock") != "held" and (port is None or not health(port)), "holder remains active after cleanup")
             if carrier_port is not None:
                 need(holder_config.read_text() == holder_config_text and holder_config.stat().st_mode & 0o777 == 0o600,
@@ -1688,10 +2599,17 @@ def main():
     parser.add_argument("--next-runtime", type=Path, help="compiled N+1 Runtime for CI hop generation")
     parser.add_argument("--build-receipt", type=Path, help="exact CI Runtime build receipt")
     parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
+    parser.add_argument("--localhost-metadata", type=Path, help="original qualified localhost capsule metadata archive")
+    parser.add_argument("--local-rehearsal", metavar="REFERENCE", help="approved local-rehearsal:<source-commit>:<fixture-name> selector")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("terminated")))
     try:
+        need(args.localhost_metadata is None or args.operation == "generate-ci-hop",
+             "localhost metadata input applies only to fixture generation")
+        if args.local_rehearsal is not None:
+            need(args.operation in ("build-ci-hop", "generate-ci-hop", "inspect", "run"),
+                 "local rehearsal applies only to CLI fixture build, generation, inspect and run")
         if args.operation == "prepare-ci-disk":
             need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.build_receipt, args.support_home)), "hosted capacity operation has fixed inputs")
             print(json.dumps(cli_prepare_ci_disk()))
@@ -1699,21 +2617,28 @@ def main():
         need(args.input is not None, "fixture input required")
         if args.operation == "build-ci-hop":
             need(args.runtime is not None and args.output is None and args.root is None, "hop build requires a Runtime input")
-            print(json.dumps(cli_build_hop(args.input, args.runtime)))
+            print(json.dumps(cli_build_hop(args.input, args.runtime, args.local_rehearsal)))
             return 0
         if args.operation == "generate-ci-hop":
             need(all(path is not None for path in (args.runtime, args.next_runtime, args.build_receipt, args.support_home)) and args.output is None and args.root is None,
                  "hop generation requires both Runtimes, build receipt and support-home inputs")
-            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home)))
+            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home,
+                                             args.local_rehearsal, args.localhost_metadata)))
             return 0
         value = read(args.input)
+        if args.local_rehearsal is not None:
+            need(value.get("mode") == CLI_MODE, "local rehearsal applies only to CLI fixtures")
         if args.root is not None:
             need(value.get("mode") == CLI_MODE, "--root applies only to CLI fixtures")
             value["root"] = str(args.root)
         if args.operation == "run":
             need(args.output is not None and args.output.is_absolute(), "run requires a new absolute receipt directory")
-            return run(value, args.output)
-        print(json.dumps(inspect(value) if args.operation == "inspect" else compare(value), indent=2))
+            return cli_run(value, args.output, args.local_rehearsal) if args.local_rehearsal is not None else run(value, args.output)
+        if args.local_rehearsal is not None:
+            result = cli_inspect(value, args.local_rehearsal)
+        else:
+            result = inspect(value) if args.operation == "inspect" else compare(value)
+        print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError, TypeError, KeyError, StopIteration, subprocess.SubprocessError) as error:
         reason = cli_safe_error(error) if isinstance(locals().get("value"), dict) and value.get("mode") == CLI_MODE else str(error)

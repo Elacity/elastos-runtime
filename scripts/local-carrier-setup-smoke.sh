@@ -29,14 +29,15 @@ if [[ "${SETUP_PLATFORM}" == linux-arm64 ]]; then
         echo "ELASTOS_LLAMA_ARM64_BUNDLE is required for the ARM64 Carrier smoke." >&2
         exit 1
     }
-    python3 - "${REPO_ROOT}/components.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
+    python3 - "${REPO_ROOT}/scripts/release-upstream-recipes.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
 import hashlib, json, pathlib, sys
-info = json.loads(pathlib.Path(sys.argv[1]).read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
+info = next(recipe['source'] for recipe in json.loads(pathlib.Path(sys.argv[1]).read_text())['recipes']
+            if recipe['component'] == 'llama-server' and recipe['platform'] == 'linux-arm64')
 source = pathlib.Path(sys.argv[2])
-if not source.is_file() or source.is_symlink() or source.stat().st_size != info["size"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive is missing or has the wrong size")
+if not source.is_file() or source.is_symlink() or not 0 < source.stat().st_size <= info["max_bytes"]:
+    raise SystemExit("ARM64 Carrier smoke engine archive is missing or exceeds its recipe bound")
 if "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != info["checksum"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from components.json")
+    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from its build recipe")
 PY
 fi
 
@@ -178,9 +179,8 @@ done
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
 
-# Kubo is an external download (dist.ipfs.tech), not a first-party Carrier
-# component. Seed the pinned, checksum-verified release so an outage there
-# does not fail this Carrier smoke; setup then skips the Kubo download.
+# The publisher owns this build-only Kubo prerequisite. The separate consumer
+# starts without Kubo and receives the licensed release capsule through Carrier.
 "${REPO_ROOT}/scripts/seed-kubo-cache.sh" \
     "${KUBO_CACHE_DIR:-${TEST_ROOT}/kubo-cache}" "${DATA_DIR}" "${SETUP_PLATFORM}"
 
@@ -236,11 +236,14 @@ WALLET_UNISAT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-unisat" \
 WALLET_WALLETCONNECT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-walletconnect" \
 python3 - <<'PY'
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
 import shutil
 import tarfile
+import subprocess
+import tempfile
 
 components_src = pathlib.Path(os.environ["COMPONENTS_SRC"])
 components_dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
@@ -249,6 +252,10 @@ publisher_root = pathlib.Path(os.environ["PUBLISHER_ROOT"])
 artifacts_dir = publisher_root / "artifacts"
 artifacts_dir.mkdir(parents=True, exist_ok=True)
 platform = os.environ["SETUP_PLATFORM"]
+root = components_src.parent
+spec = importlib.util.spec_from_file_location('release_upstream', root / 'scripts/release-upstream-input.py')
+upstream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(upstream)
 
 manifest = json.loads(components_src.read_text())
 
@@ -305,13 +312,39 @@ shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
 media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
 media_info["size"] = media_archive.stat().st_size
 
+cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR', str(data_dir.parent.parent / 'kubo-cache')))
+receipt = json.loads((data_dir / 'receipts/kubo-build.json').read_bytes())
+kubo_archive = artifacts_dir / receipt['release_path']
+shutil.copyfile(cache / 'capsules' / receipt['release_path'], kubo_archive)
+if upstream.digest(kubo_archive) != receipt['checksum'][7:]:
+    raise SystemExit('Kubo capsule differs from its build receipt')
+kubo_info = platform_info('kubo')
+kubo_info.update({key: receipt[key] for key in ('checksum', 'size', 'release_path', 'extract_path', 'install_path')})
+kubo_info.pop('strategy', None)
+manifest['external']['kubo']['capsule_metadata'] = {
+    'role': 'content', 'type': 'data', 'install_path': 'capsules/kubo',
+    'platforms': {platform: receipt['capsule_metadata']}}
+kubo_env = {**os.environ, 'IPFS_PATH': str(data_dir / 'ipfs-repo')}
+subprocess.run([str(data_dir / 'bin/kubo'), 'init', '--profile=test'], env=kubo_env,
+               check=True, stdout=subprocess.DEVNULL)
+cid = subprocess.check_output([str(data_dir / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
+                               '--pin=true', str(kubo_archive)], env=kubo_env, text=True).strip()
+kubo_info['cid'] = cid
+manifest['external']['kubo']['capsule_metadata']['platforms'][platform]['cid'] = cid
+
 if platform == "linux-arm64":
-    engine_info = platform_info("llama-server")
-    engine_archive = artifacts_dir / engine_info["release_path"]
-    shutil.copyfile(os.environ["ELASTOS_LLAMA_ARM64_BUNDLE"], engine_archive)
-    if (engine_archive.stat().st_size != engine_info["size"] or
-            "sha256:" + hashlib.sha256(engine_archive.read_bytes()).hexdigest() != engine_info["checksum"]):
-        raise SystemExit("staged ARM64 engine archive differs from components.json")
+    recipe = next(recipe for recipe in json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
+                  if recipe['component'] == 'llama-server' and recipe['platform'] == platform)
+    recipe['source']['path'] = str(pathlib.Path(os.environ['ELASTOS_LLAMA_ARM64_BUNDLE']).absolute())
+    with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=upstream.directory(cache)) as temporary:
+        engine = upstream.package(recipe, cache, pathlib.Path(temporary))
+        shutil.copyfile(pathlib.Path(temporary) / engine['release_path'], artifacts_dir / engine['release_path'])
+    platform_info('llama-server').update({key: engine[key] for key in
+                                         ('checksum', 'size', 'release_path', 'extract_path', 'install_path', 'binary_path')})
+    platform_info('llama-server').pop('strategy', None)
+    manifest['external']['llama-server']['capsule_metadata'] = {
+        'role': 'content', 'type': 'data', 'install_path': 'capsules/llama-server',
+        'platforms': {platform: engine['capsule_metadata']}}
 
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
@@ -481,10 +514,26 @@ if [[ -z "${CONNECT_TICKET}" || -z "${NODE_ID}" ]]; then
     exit 1
 fi
 
+# The holder keeps its own data and build prerequisite. Only localhost-provider
+# is a fixture startup prerequisite in the consumer; Kubo starts absent.
+PUBLISHER_DATA_DIR="${DATA_DIR}"
+XDG_DATA_HOME="${TEST_ROOT}/consumer-data"
+DATA_DIR="${XDG_DATA_HOME}/elastos"
+[[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
+mkdir -p "${DATA_DIR}/bin"
+cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
+cp "${PUBLISHER_DATA_DIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json"
+install -m 700 "${REPO_ROOT}/elastos/target/release/localhost-provider" \
+    "${DATA_DIR}/bin/localhost-provider"
+[[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]
+
+# This fixture has an unsigned local publisher, so it is a source-checkout
+# setup, not an installed signed release: it sets no install_path. Setup then
+# reads ELASTOS_COMPONENTS_MANIFEST and still fetches every part over Carrier.
+# Installed releases admit their private signed pair first (setup.rs tests).
 SOURCES_PATH="${DATA_DIR}/sources.json"
 CONNECT_TICKET="${CONNECT_TICKET}" \
 NODE_ID="${NODE_ID}" \
-ELASTOS_BIN_PATH="${ELASTOS_BIN}" \
 SOURCES_PATH="${SOURCES_PATH}" \
 python3 - <<'PY'
 import json
@@ -503,7 +552,7 @@ sources = {
             "publisher_node_id": os.environ["NODE_ID"],
             "ipns_name": "",
             "gateways": [],
-            "install_path": os.environ["ELASTOS_BIN_PATH"],
+            "install_path": "",
             "installed_version": "",
             "head_cid": "",
         }
@@ -526,6 +575,9 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
 stop_source_runtime
 
 for installed in \
+    "${DATA_DIR}/bin/kubo" \
+    "${DATA_DIR}/capsules/kubo/capsule.json" \
+    "${DATA_DIR}/capsules/kubo/LICENSE" \
     "${DATA_DIR}/bin/shell" \
     "${DATA_DIR}/bin/localhost-provider" \
     "${DATA_DIR}/bin/did-provider" \
