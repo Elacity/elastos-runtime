@@ -195,7 +195,7 @@ pub(crate) fn observe_exit(pid: u32) -> io::Result<Option<ExitStatus>> {
     }
 }
 
-fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     if unsafe { libc::kill(-(pid as libc::pid_t), signal) } == 0 {
         return Ok(());
     }

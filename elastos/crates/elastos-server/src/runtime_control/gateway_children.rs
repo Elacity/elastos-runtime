@@ -372,30 +372,26 @@ fn direct_child_anchor(record: &Record) -> anyhow::Result<bool> {
 }
 
 fn checked_signal(record: &Record, signal: i32) -> anyhow::Result<()> {
-    validate_record_birth(record)?;
     let exited = process_ownership::observe_exit(record.pid)?;
-    // A previously validated direct child reserves its group ID after exit.
-    // macOS getpgid stops exposing that leader once it becomes a zombie.
+    // The caller already proved this direct child's birth and process group.
+    // Its unreaped PID keeps that anchor when macOS hides its exited birth.
     if exited.is_none() {
+        validate_record_birth(record)?;
         anyhow::ensure!(
             process_ownership::process_group(record.pid)? == Some(record.pid),
             "managed runtime group differs from its ownership record"
         );
     }
-    let result = unsafe { libc::kill(-(record.pid as libc::pid_t), signal) };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error.into());
-        }
-    }
+    process_ownership::signal_group(record.pid, signal)?;
     Ok(())
 }
 
 fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
-    validate_record_birth(&entry.record)?;
     if entry.anchored {
         let exited = process_ownership::observe_exit(entry.record.pid)?;
+        if exited.is_none() {
+            validate_record_birth(&entry.record)?;
+        }
         if force && !entry.killed {
             checked_signal(&entry.record, libc::SIGKILL)?;
             entry.killed = true;
@@ -414,6 +410,7 @@ fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
             if result == 0 {
                 return Ok(false);
             }
+            entry.anchored = false;
         } else {
             return Ok(false);
         }
@@ -531,6 +528,58 @@ mod tests {
         )
         .unwrap();
         assert!(Owner::read_for_generation(temp.path(), owner.pid, "gateway-fixture").is_err());
+    }
+
+    #[tokio::test]
+    async fn anchored_exited_group_retires_after_kernel_hides_birth() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_published, owner) = fixture_owner(temp.path(), "gateway-fixture");
+        let child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut child =
+            StartingChild::new(child, Some(&owner), &temp.path().join("child-coords.json"))
+                .unwrap();
+        let path = child.record.clone().unwrap();
+        let record = read_record(&path).unwrap();
+        validate_record_birth(&record).unwrap();
+        assert!(direct_child_anchor(&record).unwrap());
+        let mut entry = Pending {
+            path: path.clone(),
+            record,
+            anchored: true,
+            killed: false,
+        };
+        let unrelated = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut unrelated =
+            StartingChild::new(unrelated, None, &temp.path().join("unrelated.json")).unwrap();
+        checked_signal(&entry.record, libc::SIGTERM).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_ownership::observe_exit(entry.record.pid)
+            .unwrap()
+            .is_none()
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // A new cleanup scan still refuses the now hidden birth identity.
+            assert!(shutdown(Some(owner)).await.is_err());
+            assert!(path.exists());
+        }
+        assert!(settle_record(&mut entry, true).unwrap());
+        assert!(!entry.anchored);
+        retire_record(entry).unwrap();
+        child.ready();
+        assert!(!path.exists());
+        assert!(unrelated.child.try_wait().unwrap().is_none());
     }
 
     #[tokio::test]
