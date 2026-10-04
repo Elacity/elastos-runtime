@@ -5865,8 +5865,7 @@ body.assistant-space-active #inbox-rail {
 
 /* Phone size class. Mirrors classifyFormFactor() in shell-form-factor.js
    (PHONE_MAX_WIDTH / coarse-pointer landscape) so a rotated phone keeps the
-   phone shell instead of becoming a 390 px-tall desktop. home-entropy-check
-   pins the two together. */
+   phone shell instead of becoming a 390 px-tall desktop. */
 @media (max-width: 640px), (pointer: coarse) and (max-height: 640px), (hover: none) and (max-height: 640px) {
   /* Phone bar: 44 px tall; every control is a 44×44 hit box around the same
      22 px glyph. Wallet and Overview leave the bar — Control Centre keeps
