@@ -24,6 +24,8 @@ struct HostProcessMeta {
     pid: u32,
     role: String,
     addr: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    generation: String,
 }
 
 pub fn acquire_host_process_lock(
@@ -31,6 +33,9 @@ pub fn acquire_host_process_lock(
     role: &str,
     addr: &str,
 ) -> anyhow::Result<HostProcessGuard> {
+    if !matches!(role, "update" | "update-recovery") {
+        authorize_host_process_start(data_dir)?;
+    }
     fs::create_dir_all(data_dir)?;
     let lock_path = host_lock_path(data_dir);
     let mut file = OpenOptions::new()
@@ -63,6 +68,7 @@ pub fn acquire_host_process_lock(
         pid: std::process::id(),
         role: role.to_string(),
         addr: addr.to_string(),
+        generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
     };
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
@@ -71,6 +77,10 @@ pub fn acquire_host_process_lock(
     file.sync_data()?;
 
     Ok(HostProcessGuard { _file: file })
+}
+
+pub fn authorize_host_process_start(data_dir: &Path) -> anyhow::Result<()> {
+    crate::install_transaction::authorize_host_start(data_dir, &std::env::current_exe()?)
 }
 
 pub fn active_host_process(data_dir: &Path) -> anyhow::Result<Option<HostProcessInfo>> {

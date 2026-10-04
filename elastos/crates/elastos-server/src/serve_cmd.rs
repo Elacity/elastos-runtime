@@ -426,6 +426,8 @@ pub async fn run_serve(
         binary_sha256,
         policy_sha256,
         dependency_sha256,
+        generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
+        home_url: String::new(),
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {

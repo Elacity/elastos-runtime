@@ -24,6 +24,11 @@ pub struct RuntimeCoords {
     pub policy_sha256: String,
     #[serde(default)]
     pub dependency_sha256: String,
+    #[serde(default)]
+    pub generation: String,
+    /// Gateway Home URL published after its listener and router are ready.
+    #[serde(default)]
+    pub home_url: String,
 }
 
 pub const RUNTIME_KIND_OPERATOR: &str = "operator";
@@ -1500,7 +1505,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(sha256_bytes(&bytes))
 }

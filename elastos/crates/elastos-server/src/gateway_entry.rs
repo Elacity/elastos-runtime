@@ -15,6 +15,7 @@ pub async fn run_gateway(
 }
 
 pub async fn run_browser_home() -> anyhow::Result<()> {
+    elastos_server::update_controller::enter_browser_home()?;
     elastos_server::gateway_cmd::run_gateway_direct_with_ready(
         "localhost:8090".to_string(),
         false,
@@ -27,6 +28,9 @@ pub async fn run_browser_home() -> anyhow::Result<()> {
 }
 
 fn browser_home_ready(url: &str) {
+    if std::env::var("ELASTOS_UPDATE_RESTART").as_deref() == Ok("1") {
+        return;
+    }
     eprintln!("Home: {url}");
     eprintln!("Keep this terminal open. Press Ctrl+C to stop Home.");
     crate::open_browser(url);
