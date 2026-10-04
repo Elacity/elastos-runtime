@@ -63,27 +63,15 @@ jobs:
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
-      - name: architecture entropy checks
-        run: |
-          bash scripts/check-wci-alignment.sh
-          node scripts/home-entropy-check.mjs
-          node scripts/browser-entropy-check.mjs
+      - name: product data contracts
+        run: node scripts/check-product-data.mjs
+      - name: local pre-push gate behavior
+        run: python3 scripts/ci-local-prepush-test.py
       - name: product UI source proofs
         run: |
           node --version
           node scripts/home-shell-regression-smoke.mjs
           node scripts/home-agent-shell-smoke.mjs
-          node --test scripts/home-agent-cancellation.test.mjs
-          node --test scripts/home-link-status.test.mjs
-          node --test scripts/chat-room-enter.test.mjs
-          node --test scripts/home-form-factor.test.mjs
-          node --test scripts/home-keyboard-inset.test.mjs
-          node --test scripts/home-capsule-layout.test.mjs
-          node --test scripts/home-phone-dock.test.mjs
-          node --test scripts/home-phone-stage.test.mjs
-          node --test scripts/home-sheet-handle.test.mjs
-          node --test scripts/home-touch-long-press.test.mjs
-          node --test scripts/home-phone-home.test.mjs
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |
@@ -95,8 +83,33 @@ jobs:
           python3 scripts/media-tools-build-test.py
           python3 scripts/verify-linux-arm64-package-test.py
           python3 scripts/update-hop-compare-test.py
-      - name: Browser close handshake
-        run: node --test scripts/browser-window-close-handshake.test.mjs
+          python3 scripts/install-bootstrap-test.py
+
+  test-behaviour:
+    name: test-behaviour
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: source-gate
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: install explicit Browser test inputs
+        timeout-minutes: 5
+        env:
+          DEBUG: pw:install
+        run: |
+          npm install --prefix "${RUNNER_TEMP}/behaviour-browser" --no-save --package-lock=false playwright@1.60.0
+          npm install --prefix "${RUNNER_TEMP}/behaviour-core" --no-save --package-lock=false playwright-core@1.59.1
+          "${RUNNER_TEMP}/behaviour-browser/node_modules/.bin/playwright" install chromium --with-deps --only-shell
+      - name: JavaScript behavior tests
+        env:
+          NODE_PATH: ${{ runner.temp }}/behaviour-browser/node_modules
+          BROWSER_OPERATOR_PLAYWRIGHT_CORE: ${{ runner.temp }}/behaviour-core/node_modules/playwright-core
+        run: node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
 
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.
@@ -248,6 +261,22 @@ jobs:
         run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - name: list workspace tests
+        working-directory: elastos
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- --list | tee "${RUNNER_TEMP}/elastos-test-list.txt"
+          total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/elastos-test-list.txt")
+          echo "Workspace listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
+      - name: native network isolation and loopback proxy
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
+          cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
+          git rev-parse HEAD HEAD^{tree}
+          sha256sum elastos/tools/browser-engine-supervisor/target/debug/browser-engine-supervisor elastos/tools/browser-native-proxy-engine/target/debug/browser-native-proxy-engine
+          sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
@@ -321,6 +350,18 @@ jobs:
           BRAVE_BIN="$(cd elastos/tools/browser-playwright-engine && node -p "require('playwright').chromium.executablePath()")"
           export BRAVE_BIN
           just product-ui-browser
+
+      - name: list own-workspace capsule tests
+        run: |
+          set -euo pipefail
+          : > "${RUNNER_TEMP}/capsules-test-list.txt"
+          for lock in capsules/*/Cargo.lock; do
+              capsule="$(dirname "$lock")"
+              echo "== listing $capsule =="
+              (cd "$capsule" && cargo test -- --list) | tee -a "${RUNNER_TEMP}/capsules-test-list.txt"
+          done
+          total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/capsules-test-list.txt")
+          echo "Capsules listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
@@ -815,6 +856,7 @@ jobs:
     needs:
       - lint
       - test-elastos
+      - test-behaviour
       - test-capsules
       - source-home-linux
       - source-home-macos

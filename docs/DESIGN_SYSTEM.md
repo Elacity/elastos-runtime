@@ -45,8 +45,6 @@ actions.
 
 ## Verification
 
-The [Home entropy check](../scripts/home-entropy-check.mjs) freezes selected
-token values for Home, Chat Room, Documents, Inbox, Library, and System. It also
-checks accessible names and stale copy across selected active surfaces. Its
-coverage is limited to those files and does not define a repository-wide
-palette.
+The [product data check](../scripts/check-product-data.mjs) validates capsule
+manifests and install icons. Use the relevant behaviour tests and manual
+journeys to verify accessible controls and the visible design.
