@@ -1,6 +1,7 @@
 //! The gateway owns subordinate process groups, including launches from its PTY.
 use super::*;
 use crate::update_controller::child as process_ownership;
+use anyhow::Context;
 use std::process::{Child, Command};
 
 const OWNER_ENV: &str = "ELASTOS_MANAGED_GATEWAY_OWNER";
@@ -246,10 +247,13 @@ async fn shutdown_with_limits(
                 record.coords_path.starts_with(&owner.data_dir),
                 "managed runtime coordinates are outside their owner data root"
             );
-            validate_record_birth(&record)?;
-            let anchored = direct_child_anchor(&record)?;
+            validate_record_birth(&record)
+                .context("validate managed runtime birth before capture")?;
+            let anchored = direct_child_anchor(&record)
+                .context("capture managed runtime direct child and group")?;
             if anchored {
-                checked_signal(&record, libc::SIGTERM)?;
+                checked_signal(&record, libc::SIGTERM)
+                    .context("send managed runtime group TERM")?;
             }
             Ok(Pending {
                 path,
@@ -260,7 +264,7 @@ async fn shutdown_with_limits(
         })();
         match result {
             Ok(record) => pending.push(record),
-            Err(error) => failures.push(error.to_string()),
+            Err(error) => failures.push(format!("{error:#}")),
         }
     }
     while !pending.is_empty() {
@@ -273,11 +277,11 @@ async fn shutdown_with_limits(
             match settle_record(&mut entry, tokio::time::Instant::now() >= kill_deadline) {
                 Ok(true) => {
                     if let Err(error) = retire_record(entry) {
-                        failures.push(error.to_string());
+                        failures.push(format!("{error:#}"));
                     }
                 }
                 Ok(false) => retained.push(entry),
-                Err(error) => failures.push(error.to_string()),
+                Err(error) => failures.push(format!("{error:#}")),
             }
         }
         pending = retained;
@@ -372,31 +376,42 @@ fn direct_child_anchor(record: &Record) -> anyhow::Result<bool> {
 }
 
 fn checked_signal(record: &Record, signal: i32) -> anyhow::Result<()> {
-    let exited = process_ownership::observe_exit(record.pid)?;
+    let exited = process_ownership::observe_exit(record.pid)
+        .context("observe managed runtime exit before group signal")?;
     // The caller already proved this direct child's birth and process group.
     // Its unreaped PID keeps that anchor when macOS hides its exited birth.
     if exited.is_none() {
-        validate_record_birth(record)?;
+        validate_record_birth(record)
+            .context("validate live managed runtime birth before signal")?;
         anyhow::ensure!(
-            process_ownership::process_group(record.pid)? == Some(record.pid),
+            process_ownership::process_group(record.pid)
+                .context("read live managed runtime group before signal")?
+                == Some(record.pid),
             "managed runtime group differs from its ownership record"
         );
     }
-    process_ownership::signal_group(record.pid, signal)?;
+    process_ownership::signal_group(record.pid, signal).context("signal managed runtime group")?;
     Ok(())
 }
 
 fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
     if entry.anchored {
-        let exited = process_ownership::observe_exit(entry.record.pid)?;
+        let exited = process_ownership::observe_exit(entry.record.pid)
+            .context("observe managed runtime exit during settlement")?;
         if exited.is_none() {
-            validate_record_birth(&entry.record)?;
+            validate_record_birth(&entry.record)
+                .context("validate live managed runtime birth during settlement")?;
         }
         if force && !entry.killed {
-            checked_signal(&entry.record, libc::SIGKILL)?;
+            checked_signal(&entry.record, libc::SIGKILL)
+                .context("send managed runtime group KILL during settlement")?;
             entry.killed = true;
         }
-        if exited.is_some() && process_ownership::group_descendants(entry.record.pid)?.is_empty() {
+        if exited.is_some()
+            && process_ownership::group_descendants(entry.record.pid)
+                .context("inspect managed runtime descendants during settlement")?
+                .is_empty()
+        {
             let result = unsafe {
                 libc::waitpid(
                     entry.record.pid as libc::pid_t,
@@ -405,7 +420,8 @@ fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
                 )
             };
             if result < 0 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(std::io::Error::last_os_error())
+                    .context("reap managed runtime during settlement");
             }
             if result == 0 {
                 return Ok(false);
@@ -416,6 +432,7 @@ fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
         }
     }
     process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)
+        .context("confirm managed runtime generation disappearance after settlement")
 }
 
 fn retire_record(entry: Pending) -> anyhow::Result<()> {
@@ -428,7 +445,8 @@ fn retire_record(entry: Pending) -> anyhow::Result<()> {
         "managed runtime ownership record changed during cleanup"
     );
     anyhow::ensure!(
-        process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)?,
+        process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)
+            .context("confirm managed runtime generation disappearance during retirement")?,
         "managed runtime generation remains during record retirement"
     );
     if read_private_runtime_coords(&entry.record.coords_path)
