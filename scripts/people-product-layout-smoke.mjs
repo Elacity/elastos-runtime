@@ -544,7 +544,7 @@ async function assertFirstRunScenario(frame, width) {
   assert(state.count === "0 contacts", "first run contact count is wrong", state);
   assert(state.title === "Create your Profile", "first run title is wrong", state);
   assert(
-    state.description === "Your Profile is your signed identity for People and Chat.",
+    state.description === "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.",
     "first run explanation is wrong",
     state,
   );

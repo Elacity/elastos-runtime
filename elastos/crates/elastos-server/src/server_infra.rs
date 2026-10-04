@@ -433,11 +433,15 @@ async fn register_media_provider(
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(true).await
+    setup_server_infrastructure_impl(true, elastos_server::ipfs::IpfsHostRole::User).await
 }
 
 pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(false).await
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::User).await
+}
+
+pub(crate) async fn setup_gateway_infrastructure() -> anyhow::Result<ServerInfrastructure> {
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::Gateway).await
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +478,21 @@ pub(crate) async fn register_ipfs_provider_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     binary_path: &Path,
 ) -> anyhow::Result<()> {
-    let bridge = provider::ProviderBridge::spawn(binary_path, Default::default())
+    register_ipfs_provider_plane_with_role(
+        provider_registry,
+        binary_path,
+        elastos_server::ipfs::IpfsHostRole::User,
+    )
+    .await
+}
+
+async fn register_ipfs_provider_plane_with_role(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    role: elastos_server::ipfs::IpfsHostRole,
+) -> anyhow::Result<()> {
+    let config = elastos_server::ipfs::ipfs_provider_config(role);
+    let bridge = provider::ProviderBridge::spawn(binary_path, config)
         .await
         .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -624,6 +642,7 @@ async fn serve_capability_store(
 
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
+    ipfs_role: elastos_server::ipfs::IpfsHostRole,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
@@ -992,10 +1011,13 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match register_ipfs_provider_plane(&provider_registry, &path).await {
-            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
-            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
-        },
+        Ok(Some(path)) => {
+            match register_ipfs_provider_plane_with_role(&provider_registry, &path, ipfs_role).await
+            {
+                Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
+                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+            }
+        }
         Ok(None) => {
             tracing::warn!(
                 "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
