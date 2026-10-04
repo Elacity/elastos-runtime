@@ -378,6 +378,10 @@ fn ordinary_start_and_offline_migration_keep_fresh_or_installed_homes_available(
         let host = crate::host_lock::acquire_host_process_lock(&fixture.data, "gateway", "offline")
             .unwrap();
         drop(host);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(backup.parent().unwrap())
+            .unwrap();
         let receipt =
             crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan, &backup)
                 .unwrap();
