@@ -612,18 +612,21 @@ mod tests {
         let valid_pid = valid.child.id();
         let valid_birth = process_start(valid_pid).unwrap();
         let valid_path = valid.record.clone().unwrap();
-        valid.ready();
-        assert!(shutdown_with_limits(
+        let shutdown_error = shutdown_with_limits(
             Some(owner.clone()),
             Duration::from_millis(20),
-            Duration::from_millis(500)
+            Duration::from_millis(500),
         )
         .await
-        .is_err());
+        .unwrap_err();
         assert!(foreign.child.try_wait().unwrap().is_none());
         assert!(foreign_path.exists());
-        assert!(!valid_path.exists());
+        assert!(
+            !valid_path.exists(),
+            "valid ownership record remains after cleanup: {shutdown_error:#}"
+        );
         assert!(process_ownership::generation_gone(valid_pid, &valid_birth).unwrap());
+        valid.ready();
         assert!(refuse_unreconciled_groups(temp.path()).is_err());
         foreign.child.kill().unwrap();
         foreign.child.wait().unwrap();
