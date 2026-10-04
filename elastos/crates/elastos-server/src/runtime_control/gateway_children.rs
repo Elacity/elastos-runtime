@@ -398,50 +398,80 @@ fn checked_signal(record: &Record, signal: i32) -> anyhow::Result<()> {
             );
             Ok(())
         },
-    )?;
+    )?
+    .require_observed()?;
     process_ownership::signal_group(record.pid, signal).context("signal managed runtime group")?;
     Ok(())
+}
+
+#[derive(Debug)]
+enum AnchoredExit {
+    Observed(Option<ExitStatus>),
+    AwaitingExit(anyhow::Error),
+}
+
+impl AnchoredExit {
+    fn require_observed(self) -> anyhow::Result<Option<ExitStatus>> {
+        match self {
+            Self::Observed(exited) => Ok(exited),
+            Self::AwaitingExit(error) => Err(error),
+        }
+    }
 }
 
 /// The caller retains a direct child with a previously proved birth and group.
 fn observe_anchored_exit(
     mut observe: impl FnMut() -> anyhow::Result<Option<ExitStatus>>,
     inspect_live: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<Option<ExitStatus>> {
+) -> anyhow::Result<AnchoredExit> {
     let exited = observe()?;
     if exited.is_some() {
-        return Ok(exited);
+        return Ok(AnchoredExit::Observed(exited));
     }
     if let Err(error) = inspect_live() {
-        #[cfg(any(target_os = "macos", test))]
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+        if cfg!(any(target_os = "macos", test))
+            && error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
         {
             // Darwin can hide the birth/group after the preceding live event.
-            if let Some(exited) =
-                observe().context("reobserve retained managed runtime child after ESRCH")?
+            return match observe()
+                .context("reobserve retained managed runtime child after ESRCH")?
             {
-                return Ok(Some(exited));
-            }
+                Some(exited) => Ok(AnchoredExit::Observed(Some(exited))),
+                None => Ok(AnchoredExit::AwaitingExit(error)),
+            };
         }
         return Err(error);
     }
-    Ok(None)
+    Ok(AnchoredExit::Observed(None))
 }
 
 fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
-    if entry.anchored {
-        let exited = observe_anchored_exit(
+    settle_record_with_observer(entry, force, |record| {
+        observe_anchored_exit(
             || {
-                process_ownership::observe_exit(entry.record.pid)
+                process_ownership::observe_exit(record.pid)
                     .context("observe managed runtime exit during settlement")
             },
             || {
-                validate_record_birth(&entry.record)
+                validate_record_birth(record)
                     .context("validate live managed runtime birth during settlement")
             },
-        )?;
+        )
+    })
+}
+
+fn settle_record_with_observer(
+    entry: &mut Pending,
+    force: bool,
+    observe: impl FnOnce(&Record) -> anyhow::Result<AnchoredExit>,
+) -> anyhow::Result<bool> {
+    if entry.anchored {
+        let exited = match observe(&entry.record)? {
+            AnchoredExit::Observed(exited) => exited,
+            AnchoredExit::AwaitingExit(_) => return Ok(false),
+        };
         if force && !entry.killed {
             checked_signal(&entry.record, libc::SIGKILL)
                 .context("send managed runtime group KILL during settlement")?;
@@ -643,7 +673,8 @@ mod tests {
                     inspected = true;
                     inspection.context("inspect retained live child")
                 },
-            );
+            )
+            .and_then(AnchoredExit::require_observed);
             match case {
                 "already exited" | "birth vanished during exit" | "group vanished during exit" => {
                     assert_eq!(result.unwrap(), Some(status), "{case}");
@@ -670,6 +701,81 @@ mod tests {
                         | "initial ESRCH"
                 ),
                 "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_exit_preserves_the_signal_error_until_an_exit_is_observed() {
+        let status = ExitStatus::from_raw(15);
+        let mut events = [None, None, None, Some(status)].into_iter();
+        let mut sample = || {
+            observe_anchored_exit(
+                || Ok(events.next().unwrap()),
+                || {
+                    Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                        .context("inspect retained live child birth")
+                },
+            )
+            .unwrap()
+        };
+        let awaiting = sample();
+        assert!(matches!(&awaiting, AnchoredExit::AwaitingExit(_)));
+        let error = awaiting.require_observed().unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(format!("{error:#}").starts_with("inspect retained live child birth:"));
+        assert_eq!(sample().require_observed().unwrap(), Some(status));
+    }
+
+    #[test]
+    fn awaiting_exit_retains_the_record_and_anchor_across_forced_settlement_retries() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        // A synthetic absent PID makes any accidental signal path refuse.
+        let pid = libc::pid_t::MAX as u32;
+        let path = temp.path().join(format!("{pid}.json"));
+        let record = Record {
+            pid,
+            process_start: "macos:fixture:retained-anchor".into(),
+            coords_path: temp.path().join("child-coords.json"),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(file, &record).unwrap();
+        let mut entry = Pending {
+            path: path.clone(),
+            record,
+            anchored: true,
+            killed: false,
+        };
+        for force in [false, true, true] {
+            assert!(!settle_record_with_observer(&mut entry, force, |_| {
+                observe_anchored_exit(
+                    || Ok(None),
+                    || {
+                        Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                            .context("inspect retained live child birth")
+                    },
+                )
+            })
+            .unwrap());
+            assert!(entry.anchored);
+            assert!(!entry.killed);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                read_record(&path).unwrap().process_start,
+                entry.record.process_start
             );
         }
     }
