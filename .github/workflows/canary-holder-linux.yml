@@ -218,13 +218,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: 1.91.0
+      - name: admit fresh Cargo directories for each source path
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          temporary = Path(os.environ['RUNNER_TEMP']).resolve()
+          cargo_version = subprocess.check_output(['cargo', '--version'], text=True).strip()
+          lineages = {}
+          domains = (
+              ('provider', 'provider-source', 'PROVIDER', workspace / 'provider-source',
+               'capsules/ipfs-provider/Cargo.toml', 'HOLDER_PROVIDER_TARGET', 'holder-provider-target'),
+              ('frozen-localhost', 'source', 'SOURCE', workspace / 'source',
+               'elastos/Cargo.toml', 'HOLDER_LOCALHOST_TARGET', 'holder-frozen-localhost-target'),
+              ('gateway', 'provider-source', 'PROVIDER', Path('/home/runner/.local/share/elastos-issue89-candidate/source'),
+               'elastos/Cargo.toml', 'HOLDER_GATEWAY_TARGET', 'holder-gateway-target'))
+          for name, checkout, prefix, root, manifest, variable, directory in domains:
+              commit, tree = os.environ[prefix + '_COMMIT'], os.environ[prefix + '_TREE']
+              assert subprocess.check_output(['git', '-C', str(workspace / checkout), 'rev-parse', 'HEAD'], text=True).strip() == commit
+              assert subprocess.check_output(['git', '-C', str(workspace / checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == tree
+              target = temporary / directory
+              assert not target.exists() and not target.is_symlink(), 'Cargo directory must be fresh: ' + name
+              target.mkdir(mode=0o700)
+              assert not any(target.iterdir())
+              lineages[name] = {'source_commit': commit, 'source_tree': tree,
+                  'source_root': str(root), 'manifest_path': str(root / manifest),
+                  'target_dir': str(target), 'build_dir': str(target), 'cargo_version': cargo_version,
+                  'cache_policy': 'fresh', 'initial_empty': True}
+              with open(os.environ['GITHUB_ENV'], 'a') as environment:
+                  environment.write(variable + '=' + str(target) + '\n')
+          receipt = {'schema': 'elastos.holder.source-build-lineage/v1', 'lineages': lineages,
+              'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}
+          with (Path(os.environ['HOLDER_OUTPUT']) / 'source-build-lineage.json').open('x') as output:
+              output.write(json.dumps(receipt, indent=2) + '\n')
+          PY
       - name: build the exact reviewed provider while retaining accepted Runtime bytes
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+          CARGO_TARGET_DIR="$HOLDER_PROVIDER_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_PROVIDER_TARGET" cargo build --locked --release \
             --manifest-path "$GITHUB_WORKSPACE/provider-source/capsules/ipfs-provider/Cargo.toml"
-          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/ipfs-provider" "$ACCEPTED_INPUT/ipfs-provider"
+          install -m 700 "$HOLDER_PROVIDER_TARGET/release/ipfs-provider" "$ACCEPTED_INPUT/ipfs-provider"
           git -C "$GITHUB_WORKSPACE/provider-source" archive --format=tar "$PROVIDER_COMMIT" | gzip -n > "$ACCEPTED_INPUT/provider-source.tar.gz"
           python3 - <<'PY'
           import hashlib, json, os, subprocess
@@ -234,8 +271,11 @@ jobs:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
           linkage = subprocess.check_output(['ldd', str(path)], text=True)
           assert 'not found' not in linkage
+          lineage = (Path(os.environ['HOLDER_OUTPUT']) / 'source-build-lineage.json').read_bytes()
           (Path(os.environ['HOLDER_OUTPUT']) / 'provider-build.json').write_text(json.dumps({
               'source_commit': os.environ['PROVIDER_COMMIT'], 'source_tree': os.environ['PROVIDER_TREE'],
+              'build_lineage': json.loads(lineage)['lineages']['provider'],
+              'source_build_lineage_sha256': hashlib.sha256(lineage).hexdigest(),
               'sha256': digest, 'size': path.stat().st_size, 'ldd': linkage,
               'runtime_source_commit': os.environ['SOURCE_COMMIT'], 'runtime_source_tree': os.environ['SOURCE_TREE'],
               'runtime_artifact_id': int(os.environ['PUBLISHER_ARTIFACT_ID']),
@@ -248,9 +288,9 @@ jobs:
           set -euo pipefail
           # Full serve requires this host storage provider. It is a fixture-only
           # prerequisite from the accepted Runtime source, outside the seed package.
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+          CARGO_TARGET_DIR="$HOLDER_LOCALHOST_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_LOCALHOST_TARGET" cargo build --locked --release \
             --manifest-path "$GITHUB_WORKSPACE/source/elastos/Cargo.toml" -p localhost-provider
-          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/localhost-provider" "$ACCEPTED_INPUT/localhost-provider"
+          install -m 700 "$HOLDER_LOCALHOST_TARGET/release/localhost-provider" "$ACCEPTED_INPUT/localhost-provider"
           python3 - <<'PY'
           import hashlib, json, os, subprocess
           from pathlib import Path
@@ -259,9 +299,12 @@ jobs:
           assert 'not found' not in linkage
           with binary.open('rb') as stream:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          lineage = (Path(os.environ['HOLDER_OUTPUT']) / 'source-build-lineage.json').read_bytes()
           (Path(os.environ['HOLDER_OUTPUT']) / 'localhost-fixture-build.json').write_text(json.dumps({
               'purpose': 'isolated CI full serve prerequisite', 'seed_package': False,
               'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
+              'build_lineage': json.loads(lineage)['lineages']['frozen-localhost'],
+              'source_build_lineage_sha256': hashlib.sha256(lineage).hexdigest(),
               'sha256': digest, 'size': binary.stat().st_size, 'ldd': linkage,
               'command': 'cargo build --locked --release --manifest-path elastos/Cargo.toml -p localhost-provider',
               'run': os.environ['GITHUB_RUN_ID'], 'workflow_commit': os.environ['GITHUB_SHA']}, indent=2) + '\n')
@@ -270,7 +313,7 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+          CARGO_TARGET_DIR="$HOLDER_PROVIDER_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_PROVIDER_TARGET" cargo test --locked \
             --manifest-path "$GITHUB_WORKSPACE/provider-source/capsules/ipfs-provider/Cargo.toml"
       - name: seed the checksum-pinned isolated Kubo prerequisite
         run: |
@@ -706,16 +749,16 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as environment:
               environment.write('CI_GATEWAY_HELPER_ROOT=' + str(root) + '\n')
           PY_CANDIDATE_SOURCE
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo build --locked --release \
+          CARGO_TARGET_DIR="$HOLDER_GATEWAY_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_GATEWAY_TARGET" cargo build --locked --release \
             --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --bin elastos
-          install -m 700 "$RUNNER_TEMP/holder-provider-target/release/elastos" "$ACCEPTED_INPUT/gateway-elastos"
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+          install -m 700 "$HOLDER_GATEWAY_TARGET/release/elastos" "$ACCEPTED_INPUT/gateway-elastos"
+          CARGO_TARGET_DIR="$HOLDER_GATEWAY_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_GATEWAY_TARGET" cargo test --locked \
             --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib runtime_host_role_init
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+          CARGO_TARGET_DIR="$HOLDER_GATEWAY_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_GATEWAY_TARGET" cargo test --locked \
             --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib browser_home_public_mode_refuses_before_provider_setup
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+          CARGO_TARGET_DIR="$HOLDER_GATEWAY_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_GATEWAY_TARGET" cargo test --locked \
             --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-server --lib public_gateway_ipfs_refresh
-          CARGO_TARGET_DIR="$RUNNER_TEMP/holder-provider-target" cargo test --locked \
+          CARGO_TARGET_DIR="$HOLDER_GATEWAY_TARGET" CARGO_BUILD_BUILD_DIR="$HOLDER_GATEWAY_TARGET" cargo test --locked \
             --manifest-path "$CI_GATEWAY_HELPER_ROOT/elastos/Cargo.toml" -p elastos-runtime private_ipfs_generic_and_remote_dispatch_rejected_before_transmission
           python3 - <<'PY'
           import hashlib, json, os, subprocess
@@ -728,8 +771,11 @@ jobs:
           assert str(helper_root / 'elastos/crates/elastos-server').encode() in runtime.read_bytes()
           with runtime.open('rb') as stream:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          lineage = (Path(os.environ['HOLDER_OUTPUT']) / 'source-build-lineage.json').read_bytes()
           record = {'purpose': 'CI-only gateway role proof; operator Runtime upgrade remains approval-gated',
               'seed_package': False, 'source_commit': os.environ['PROVIDER_COMMIT'], 'source_tree': os.environ['PROVIDER_TREE'],
+              'build_lineage': json.loads(lineage)['lineages']['gateway'],
+              'source_build_lineage_sha256': hashlib.sha256(lineage).hexdigest(),
               'sha256': digest, 'size': runtime.stat().st_size, 'helper_root': os.environ['CI_GATEWAY_HELPER_ROOT'],
               'helper_source_archive_sha256': hashlib.sha256((Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source.tar.gz').read_bytes()).hexdigest(),
               'helper_source_files_sha256': hashlib.sha256((Path(os.environ['HOLDER_OUTPUT']) / 'gateway-source-files.json').read_bytes()).hexdigest(),
