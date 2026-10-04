@@ -1456,13 +1456,13 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   grid-template-columns: minmax(7rem, 9rem) minmax(0, 1fr);
   gap: 6px 12px;
   margin: 12px 0 0;
-  color: color-mix(in srgb, var(--text) 78%, transparent);
+  color: color-mix(in srgb, var(--text) 82%, transparent);
   font-size: 12px;
 }
 
 .agent-model-selection-facts dt {
   margin: 0;
-  font-weight: 650;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
 }
 
 .agent-model-selection-facts dd {
@@ -3095,6 +3095,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   height: 32px;
 }
 
+/* When the row is tight the model name ellipsizes; the left tools keep their
+   size. */
+.agent-composer-tools-left {
+  flex-shrink: 0;
+}
+
 .agent-composer-attachments {
   display: flex;
   flex-wrap: wrap;
@@ -3561,11 +3567,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   min-width: 0;
   font-size: 13px;
   line-height: 1;
+  white-space: nowrap;
 }
 
 .agent-model-name {
   display: inline-block;
-  min-width: 0;
+  min-width: 1.2em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
