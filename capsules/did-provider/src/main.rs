@@ -450,10 +450,7 @@ impl DidProvider {
             Ok(did) => did,
             Err(e) => return Response::error("invalid_did", &e),
         };
-        let owner_did = match self.signing_key.as_ref() {
-            Some(signing_key) => Some(encode_signing_key_did(signing_key)),
-            None => None,
-        };
+        let owner_did = self.signing_key.as_ref().map(encode_signing_key_did);
 
         Response::ok(serde_json::json!({
             "did": persona_did,
