@@ -100,59 +100,6 @@ jobs:
         with:
           path: ${{ runner.temp }}/kubo-cache
           key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/components.json') }}
-      - name: seed recipe-verified licensed Kubo into isolated Home
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          umask 077
-          python3 -I -S - <<'PYCODE'
-          import hashlib, json, os, re, subprocess, tempfile
-          from pathlib import Path
-          from urllib.parse import urlsplit
-          platform = "darwin-arm64"
-          recipes = json.loads(Path("scripts/release-upstream-recipes.json").read_bytes())["recipes"]
-          selected = [item for item in recipes if item["component"] == "kubo" and item["platform"] == platform]
-          if len(selected) != 1:
-              raise RuntimeError("Candidate requires exactly one native Kubo recipe")
-          recipe = selected[0]
-          info = recipe["source"]
-          declared = urlsplit(info["url"])
-          if (declared.scheme, declared.netloc) != ("https", "github.com") or declared.query or declared.fragment:
-              raise RuntimeError("Kubo build input must use its pinned official GitHub archive")
-          expected_path = "/ipfs/kubo/releases/download/v" + recipe["version"] + "/kubo_v" + recipe["version"] + "_darwin-arm64.tar.gz"
-          if declared.path != expected_path or not re.fullmatch(r"sha512:[0-9a-f]{128}", info["checksum"]):
-              raise RuntimeError("Candidate Kubo archive pin differs")
-          algorithm, expected = info["checksum"].split(":", 1)
-          filename = algorithm + "-" + expected
-          with tempfile.TemporaryDirectory(prefix="kubo-refused-", dir=os.environ["RUNNER_TEMP"]) as tmp:
-              cache, data = Path(tmp) / "cache", Path(tmp) / "data"
-              cache.mkdir(mode=0o700)
-              (cache / filename).write_bytes(b"tampered archive")
-              refused = subprocess.run(["scripts/seed-kubo-cache.sh", str(cache), str(data), platform],
-                                       capture_output=True, text=True)
-              if refused.returncode == 0 or "cached upstream input failed its recorded checksum or bound" not in refused.stderr:
-                  raise RuntimeError("Candidate accepted the tampered Kubo cache input")
-              if (data / "bin/kubo").exists():
-                  raise RuntimeError("Tampered input installed a Kubo executable")
-          (Path(os.environ["PROOF_EVIDENCE"]) / "kubo-input-refusal.json").write_text(
-              json.dumps({"tampered_archive": "refused", "installed_binary": "absent", "candidate_checksum": info["checksum"],
-                          "recipe_sha256": hashlib.sha256(Path("scripts/release-upstream-recipes.json").read_bytes()).hexdigest()}, indent=2) + "\n")
-          cache = Path(os.environ["RUNNER_TEMP"]) / "kubo-cache"
-          cache.mkdir(mode=0o700, exist_ok=True)
-          archive = cache / filename
-          if not archive.exists():
-              partial = archive.with_suffix(".partial")
-              subprocess.run(["curl", "-fLsS", "--retry", "3", "--retry-delay", "5", "--retry-all-errors",
-                              "--connect-timeout", "20", "--max-time", "180", "--max-filesize", str(info["max_bytes"]),
-                              "-o", str(partial), info["url"]], check=True)
-              if hashlib.sha512(partial.read_bytes()).hexdigest() != expected:
-                  raise RuntimeError("Downloaded Kubo archive differs from the candidate checksum")
-              partial.replace(archive)
-          PYCODE
-          scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
-            "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64
-          scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
-            "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64 --verify-installed
       - name: reclaim unused stock Xcode and require build headroom
         run: |
           set -euo pipefail
@@ -221,6 +168,59 @@ jobs:
           if usage.free < required:
               raise SystemExit("stock Xcode reclaim did not provide build headroom")
           PYCODE
+      - name: seed recipe-verified licensed Kubo into isolated Home
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -S - <<'PYCODE'
+          import hashlib, json, os, re, subprocess, tempfile
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          platform = "darwin-arm64"
+          recipes = json.loads(Path("scripts/release-upstream-recipes.json").read_bytes())["recipes"]
+          selected = [item for item in recipes if item["component"] == "kubo" and item["platform"] == platform]
+          if len(selected) != 1:
+              raise RuntimeError("Candidate requires exactly one native Kubo recipe")
+          recipe = selected[0]
+          info = recipe["source"]
+          declared = urlsplit(info["url"])
+          if (declared.scheme, declared.netloc) != ("https", "github.com") or declared.query or declared.fragment:
+              raise RuntimeError("Kubo build input must use its pinned official GitHub archive")
+          expected_path = "/ipfs/kubo/releases/download/v" + recipe["version"] + "/kubo_v" + recipe["version"] + "_darwin-arm64.tar.gz"
+          if declared.path != expected_path or not re.fullmatch(r"sha512:[0-9a-f]{128}", info["checksum"]):
+              raise RuntimeError("Candidate Kubo archive pin differs")
+          algorithm, expected = info["checksum"].split(":", 1)
+          filename = algorithm + "-" + expected
+          with tempfile.TemporaryDirectory(prefix="kubo-refused-", dir=os.environ["RUNNER_TEMP"]) as tmp:
+              cache, data = Path(tmp) / "cache", Path(tmp) / "data"
+              cache.mkdir(mode=0o700)
+              (cache / filename).write_bytes(b"tampered archive")
+              refused = subprocess.run(["scripts/seed-kubo-cache.sh", str(cache), str(data), platform],
+                                       capture_output=True, text=True)
+              if refused.returncode == 0 or "cached upstream input failed its recorded checksum or bound" not in refused.stderr:
+                  raise RuntimeError("Candidate accepted the tampered Kubo cache input")
+              if (data / "bin/kubo").exists():
+                  raise RuntimeError("Tampered input installed a Kubo executable")
+          (Path(os.environ["PROOF_EVIDENCE"]) / "kubo-input-refusal.json").write_text(
+              json.dumps({"tampered_archive": "refused", "installed_binary": "absent", "candidate_checksum": info["checksum"],
+                          "recipe_sha256": hashlib.sha256(Path("scripts/release-upstream-recipes.json").read_bytes()).hexdigest()}, indent=2) + "\n")
+          cache = Path(os.environ["RUNNER_TEMP"]) / "kubo-cache"
+          cache.mkdir(mode=0o700, exist_ok=True)
+          archive = cache / filename
+          if not archive.exists():
+              partial = archive.with_suffix(".partial")
+              subprocess.run(["curl", "-fLsS", "--retry", "3", "--retry-delay", "5", "--retry-all-errors",
+                              "--connect-timeout", "20", "--max-time", "180", "--max-filesize", str(info["max_bytes"]),
+                              "-o", str(partial), info["url"]], check=True)
+              if hashlib.sha512(partial.read_bytes()).hexdigest() != expected:
+                  raise RuntimeError("Downloaded Kubo archive differs from the candidate checksum")
+              partial.replace(archive)
+          PYCODE
+          scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
+            "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64
+          scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
+            "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64 --verify-installed
       - name: install host prerequisites
         timeout-minutes: 15
         run: brew install e2fsprogs coturn ffmpeg
