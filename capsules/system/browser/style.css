@@ -1803,7 +1803,7 @@ code {
 
 /* ---- Freeze additions kept over the original sheet ----
    Post-split features (detail view / lock screen / sidebar icons)
-   that the original sheet predates. Pinned by home-entropy-check. ---- */
+   that the original sheet predates. ---- */
 
 .system-locked {
   display: grid;

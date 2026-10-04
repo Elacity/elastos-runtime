@@ -221,8 +221,7 @@ function commandPlan({
       `node scripts/remote-carrier-exit-artifact-readiness.mjs --gateway-bin ${shellQuote(candidateGatewayBin)} --exit-provider-bin ${shellQuote(candidateExitProviderBin)}`,
       "scripts/carrier-only-authority-check.sh",
       "git diff --check",
-      "node scripts/home-entropy-check.mjs",
-      "node scripts/browser-entropy-check.mjs",
+      "node scripts/check-product-data.mjs",
       "(cd elastos && cargo fmt --all -- --check)",
     ],
     public_live_backup: [

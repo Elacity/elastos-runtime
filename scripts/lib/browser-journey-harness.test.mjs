@@ -26,6 +26,8 @@ function harnessFunction(name, globals = {}) {
     CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false,
     CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
     CHECK_BROWSER_RELOAD_CENSUS: false, BROWSER_RELOAD_OBSERVE_MS: 0,
+    BROWSER_DEFER_SCROLL: false,
+    CHECK_BROWSER_AUDIO_ENGINE_DIAGNOSTICS: false,
     BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null,
     BROWSER_JOURNEY_TARGET: browserJourneyTargetConfig(), browserJourneyEngineChoice, browserJourneyEngineRoute,
     browserJourneyFixtureUrl, browserJourneyProfileStorage, browserJourneyProfileBinding,
@@ -749,7 +751,7 @@ test("UI close requires exact ownership, terminal Engine effects and Runtime bas
     const actions = surface.actions;
     const opaqueGui = surface.gui;
     let reads = 0;
-    const response = { ok: () => true, status: () => 200, json: async () => receipt,
+    const response = { ok: () => true, status: () => 200, text: async () => JSON.stringify(receipt),
       url: () => `http://${variant === "wrong-response-origin" ? "foreign" : "localhost"}/api/apps/browser/pages/page-one/close`,
       request: () => ({ method: () => "POST", frame: () => variant === "wrong-response-frame" ? {} : surface.frame,
         headers: () => ({ "x-elastos-home-token": variant === "wrong-response-token" ? "foreign-token" : "browser-token" }),
@@ -900,10 +902,10 @@ test("startup close accepts already_absent only with the exact UI handle and Run
         request: () => ({ frame: () => variant === "wrong-source" ? {} : surface.frame,
           method: () => "POST", postDataJSON: () => body,
           headers: () => ({ "x-elastos-home-token": variant === "wrong-token" ? "foreign-token" : "browser-token" }) }),
-        json: async () => receipt,
+        text: async () => JSON.stringify(receipt),
       };
       if (variant === "retry-after-503") await surface.emit("response", { ...response, ok: () => false, status: () => 503,
-        json: async () => ({ error: "cleanup pending", logs: "private-log-secret" }) });
+        text: async () => JSON.stringify({ error: "cleanup pending", logs: "private-log-secret" }) });
       if (variant !== "message-only") await surface.emit("response", response);
       surface.message({ terminalKind: "already_absent", pageId: "page:prior", cleanupId: "cleanup-prior",
         requestId: variant === "wrong-request-id" ? "other-request" : "close-one", generation: variant === "wrong-generation" ? 3 : 2 });
@@ -1050,6 +1052,12 @@ for (const observation of ["ready", "document-transition", "unexpected-viewer-er
       observeControlledBrowserRequests: async (actualPage, actualFrame, token, record, options) => {
         assert.equal(actualPage, page); assert.equal(actualFrame, frame); assert.equal(token, "token-one");
         assert.equal(options.recordNavigation, true); return () => {};
+      },
+      extendControlledBrowserInput: async (actualPage, actualFrame, readReceipt, suffix, budget) => {
+        assert.equal(actualPage, page); assert.equal(actualFrame, frame);
+        assert.equal(typeof readReceipt, "function");
+        await frame.locator("#browser-keyboard-capture").pressSequentially(suffix, { timeout: budget.timeoutMs });
+        return { clicked: true, typed: true };
       },
       diagnoseBrowserViewerReload: async callbacks => {
         const state = await callbacks.readState({ signal });

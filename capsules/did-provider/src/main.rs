@@ -450,10 +450,7 @@ impl DidProvider {
             Ok(did) => did,
             Err(e) => return Response::error("invalid_did", &e),
         };
-        let owner_did = match self.signing_key.as_ref() {
-            Some(signing_key) => Some(encode_signing_key_did(signing_key)),
-            None => None,
-        };
+        let owner_did = self.signing_key.as_ref().map(encode_signing_key_did);
 
         Response::ok(serde_json::json!({
             "did": persona_did,
@@ -577,8 +574,7 @@ fn validate_did_recovery_request(
     recovery: &DidRecoveryPayload<'_>,
     now: u64,
 ) -> Result<(), String> {
-    decode_did_key(recovery.did)
-        .map_err(|e| format!("invalid DID recovery subject: {e}"))?;
+    decode_did_key(recovery.did).map_err(|e| format!("invalid DID recovery subject: {e}"))?;
     validate_token_like_id(recovery.principal_id, "principal_id")?;
     validate_principal_localhost_root(recovery.principal_id, recovery.localhost_root)?;
     validate_token_like_id(recovery.protector_id, "protector_id")?;
@@ -807,9 +803,7 @@ mod tests {
     fn test_resolve_rejects_overlong_did_via_shared_codec() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let provider = DidProvider::new();
-        assert_invalid_did(provider.resolve(&overlong_did(&encode_signing_key_did(
-            &signing_key,
-        ))));
+        assert_invalid_did(provider.resolve(&overlong_did(&encode_signing_key_did(&signing_key))));
     }
 
     #[test]
