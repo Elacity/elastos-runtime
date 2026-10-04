@@ -88,13 +88,20 @@ fixtures with `just test-ci-local-prepush`; the source CI gate also runs them.
 Each fixture clears Git's repository-local environment variables before it
 creates its owned repository. A disposable sentinel regression verifies that
 running a fixture from a hook preserves the caller's HEAD, tree, index and status.
+The gate retains hook Git variables for its own repository checks and clears
+Git's full repository-local variable list from product child environments.
+Ambient `ELASTOS_TEST_*_BIN` paths carry no candidate receipt, so the gate clears
+them before checks. Its provider preparation supplies candidate test paths;
+other explicit binary inputs need a source receipt and the owning test contract.
 
 Each worktree and each local heavy operator shares the persistent lock file
 `local-ai-heavy-build.lock` in `git rev-parse --path-format=absolute
 --git-common-dir`. Acquire its exclusive `fcntl.flock` lease before a heavy
 command and keep the file after releasing the lease. A busy lease stops the
 gate. It runs Cargo commands in sequence and settles its child command on
-interruption. Continue light source work and reviews while another operator
+interruption. The gate owns the lease descriptor and closes it after settling
+the command group; child commands receive no lease descriptor. Operators keep
+heavy tools in that group rather than detaching them. Continue light source work and reviews while another operator
 owns the lease. The default shared intermediate directory is `target-build`
 beside the common Git directory. An explicit `CARGO_BUILD_BUILD_DIR` selects
 another shared directory; each workspace keeps its own final target directory.

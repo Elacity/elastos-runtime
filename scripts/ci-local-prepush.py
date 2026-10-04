@@ -17,6 +17,7 @@ class GateError(Exception):
 
 
 INTERRUPTS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+GIT_LOCAL_ENV_VARS = ()
 
 
 def run(args, cwd, capture=False, lease=None):
@@ -25,6 +26,10 @@ def run(args, cwd, capture=False, lease=None):
         build = Path(os.environ["CARGO_BUILD_BUILD_DIR"])
         disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
     print("+ " + shlex.join(str(arg) for arg in args), flush=True)
+    environment = os.environ.copy()
+    if args[0] != "git":
+        for name in GIT_LOCAL_ENV_VARS:
+            environment.pop(name, None)
     # Own the child before a pending signal can raise in the parent. This gate
     # is single-threaded; the child restores the caller's mask before exec.
     prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
@@ -33,7 +38,7 @@ def run(args, cwd, capture=False, lease=None):
     try:
         process = subprocess.Popen(
             args, cwd=cwd, text=True, stdout=subprocess.PIPE if capture else None,
-            pass_fds=(lease.fileno(),) if lease else (), start_new_session=True,
+            env=environment, close_fds=True, start_new_session=True,
             preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
@@ -152,7 +157,7 @@ def referenced_inputs(root, source, folder, files, directories):
         literals = [match.group(1) for match in re.finditer(character + "|" + quoted, text)
                     if match.group(1) is not None]
     else:
-        single = r"'((?:\\.|[^'\\])*)'"
+        single = r"'((?:\\[^\r\n]|[^'\\\r\n])*)'"
         literals = [double or single for double, single in re.findall(quoted + "|" + single, text)]
     literals += re.findall(r"\bscripts/[\w./-]+", text)
     if source.suffix == ".sh":
@@ -462,9 +467,16 @@ def interrupted(signum, frame):
 
 
 def main():
+    global GIT_LOCAL_ENV_VARS
     if len(sys.argv) not in {1, 3}:
         raise GateError("use this gate directly, or pass Git's remote name and URL")
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+    GIT_LOCAL_ENV_VARS = tuple(git(root, "rev-parse", "--local-env-vars").splitlines())
+    # The gate prepares candidate provider paths itself; inherited binaries
+    # have no source receipt and cannot qualify a test input.
+    for name in tuple(os.environ):
+        if name.startswith("ELASTOS_TEST_") and name.endswith("_BIN"):
+            os.environ.pop(name)
     candidate = snapshot(root)
     if len(sys.argv) == 3:
         push_candidate(sys.stdin, candidate)

@@ -81,6 +81,7 @@ class PrepushTests(unittest.TestCase):
             with open(os.environ["PREPUSH_LOG"], "a") as log:
                 log.write(json.dumps({"tool": pathlib.Path(sys.argv[0]).name, "args": args,
                                       "cwd": os.getcwd(), "build_dir": os.environ.get("CARGO_BUILD_BUILD_DIR"),
+                                      "git_env": [k for k in os.environ if k.startswith("GIT_")],
                                       "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
             if pathlib.Path(sys.argv[0]).name == "node":
                 sys.exit(0)
@@ -90,6 +91,10 @@ class PrepushTests(unittest.TestCase):
                     pathlib.Path(os.environ["PREPUSH_IGNORE_TERM"]).write_text(str(os.getpid()))
                 if os.environ.get("PREPUSH_CHILD"):
                     subprocess.Popen([sys.executable, "-c", "import os, pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(os.environ['PREPUSH_CHILD']).write_text(str(os.getpid())); time.sleep(30)"])
+                if os.environ.get("PREPUSH_DETACHED"):
+                    subprocess.Popen([sys.executable, "-c", "import os, pathlib, time; pathlib.Path(os.environ['PREPUSH_DETACHED']).write_text(str(os.getpid())); time.sleep(30)"],
+                                     start_new_session=True, close_fds=False,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if os.environ.get("PREPUSH_SLEEP"):
                     time.sleep(30)
                 manifest = pathlib.Path(args[args.index("--manifest-path") + 1])
@@ -114,6 +119,9 @@ class PrepushTests(unittest.TestCase):
                 print(json.dumps({"workspace_root": str(workspace), "workspace_members": [p["id"] for p in packages],
                                   "packages": packages}))
             elif args[0] == "check":
+                if os.environ.get("PREPUSH_PRODUCT_SENTINEL"):
+                    subprocess.run(["git", "-C", os.environ["PREPUSH_PRODUCT_SENTINEL"],
+                                    "commit", "--allow-empty", "-qm", "owned product-child fixture"], check=True)
                 if os.environ.get("PREPUSH_DIRTY"):
                     (root / "README.md").write_text("changed during check\\n")
                 if os.environ.get("PREPUSH_HEAD"):
@@ -460,6 +468,26 @@ class PrepushTests(unittest.TestCase):
         self.commit()
         self.assert_server_input_units()
 
+    def test_python_comment_apostrophe_preserves_double_quoted_helper(self):
+        tool, helper = "scripts/media-tools-build.py", "scripts/build-media-tools.sh"
+        self.external_baseline('fn launch() { Command::new("python3")\n'
+                               '.arg(repo.join("scripts/media-tools-build.py")).spawn(); }\n',
+                               {tool: '# Match the server\'s archive bytes.\nhelper = "build-media-tools.sh"\n# The operator\'s helper.\n',
+                                helper: '# input\n'})
+        self.write(helper, '# changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
+    def test_node_comment_apostrophe_preserves_double_quoted_helper(self):
+        tool, helper = "scripts/runtime-owned.mjs", "scripts/node-helper.mjs"
+        self.external_baseline('fn launch() { Command::new("node")\n'
+                               '.arg(repo.join("scripts/runtime-owned.mjs")).spawn(); }\n',
+                               {tool: '// The caller\'s helper.\nnew URL("./node-helper.mjs", import.meta.url);\n// The operator\'s input.\n',
+                                helper: '// input\n'})
+        self.write(helper, '// changed input\n')
+        self.commit()
+        self.assert_server_input_units()
+
     def test_deleted_transitive_runtime_script_selects_runtime_units(self):
         wrapper = "scripts/browser-vm-remote-vz-launcher.integration.mjs"
         launcher = "scripts/browser-vm-remote-vz-launcher.mjs"
@@ -606,7 +634,9 @@ class PrepushTests(unittest.TestCase):
         self.write("elastos/crates/server/src/lib.rs", "// changed crate root\n")
         self.commit()
         result = self.invoke(extra={"PREPUSH_PACKAGE": "elastos-server",
-                                    "PREPUSH_TESTS": "protected_content_runtime::tests::process: test"})
+                                    "PREPUSH_TESTS": "protected_content_runtime::tests::process: test",
+                                    "ELASTOS_TEST_PROTECT_PROVIDER_BIN": str(self.tmp / "stale"),
+                                    "ELASTOS_TEST_UNRELATED_BIN": str(self.tmp / "ambient")})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         builds = [c for c in commands if c["args"][0] == "build"]
@@ -615,6 +645,36 @@ class PrepushTests(unittest.TestCase):
         tests = [c for c in commands if c["args"][0] == "test" and "--list" not in c["args"]]
         self.assertTrue(all(len(c["provider_env"]) == 3 for c in tests))
         self.assertTrue(all(str(self.root / "capsules") in path for c in tests for path in c["provider_env"].values()))
+
+    def test_ambient_test_binary_paths_are_removed_before_product_checks(self):
+        result = self.invoke(extra={"ELASTOS_TEST_PROTECT_PROVIDER_BIN": str(self.tmp / "stale"),
+                                    "ELASTOS_TEST_MEDIA_BIN": str(self.tmp / "ambient")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(all(not c["provider_env"] for c in self.commands()))
+
+    def test_product_child_git_operations_preserve_owned_caller_sentinel(self):
+        nested = self.tmp / "nested-git"
+        nested.mkdir()
+        def nested_git(*args):
+            return subprocess.check_output(["git", *args], cwd=nested, env=self.env, text=True).strip()
+        nested_git("init", "-q", "-b", "owned-product-fixture")
+        (nested / "owned.txt").write_text("owned disposable child repository\n")
+        nested_git("add", "owned.txt")
+        nested_git("commit", "-qm", "owned sentinel")
+        old_nested = nested_git("rev-parse", "HEAD")
+        def caller_state():
+            return (self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}"),
+                    (self.root / ".git/index").read_bytes(),
+                    self.git("status", "--porcelain=v1", "-z", "--untracked-files=all"))
+        before = caller_state()
+        local_names = set(self.git("rev-parse", "--local-env-vars").splitlines())
+        result = self.invoke(extra={"GIT_DIR": str(self.root / ".git"), "GIT_WORK_TREE": str(self.root),
+                                    "GIT_INDEX_FILE": str(self.root / ".git/index"), "GIT_COMMON_DIR": str(self.root / ".git"),
+                                    "PREPUSH_PRODUCT_SENTINEL": str(nested)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(before, caller_state(), "product child Git selected the caller repository")
+        self.assertNotEqual(old_nested, nested_git("rev-parse", "HEAD"))
+        self.assertTrue(all(not local_names.intersection(c["git_env"]) for c in self.commands()))
 
     def test_module_names_use_exact_filters_with_overlapping_names(self):
         self.write("elastos/crates/server/src/runtime.rs", "// changed runtime module\n")
@@ -735,6 +795,37 @@ class PrepushTests(unittest.TestCase):
                         pass
                 process.kill()
                 process.communicate()
+
+    def test_detached_descendant_keeps_no_stable_lease_after_gate_interrupt(self):
+        child_file = self.tmp / "detached.pid"
+        process = subprocess.Popen([str(SCRIPT)], cwd=self.root,
+                                   env={**self.env, "PREPUSH_SLEEP": "1", "PREPUSH_DETACHED": str(child_file)},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not child_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(child_file.exists(), "detached fixture did not start")
+            with (self.root / ".git/local-ai-heavy-build.lock").open("a+") as lease:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            process.send_signal(signal.SIGTERM)
+            _, error = process.communicate(timeout=7)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("received signal", error)
+            child = int(child_file.read_text())
+            os.kill(child, 0)  # The deliberately detached fixture still runs.
+            with (self.root / ".git/local-ai-heavy-build.lock").open("a+") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if child_file.exists():
+                try:
+                    os.killpg(int(child_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=7)
 
 
 def shutil_usage(total, used, free):
