@@ -100,48 +100,59 @@ jobs:
         with:
           path: ${{ runner.temp }}/kubo-cache
           key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/components.json') }}
-      - name: seed archive-verified Kubo into isolated Home
+      - name: seed recipe-verified licensed Kubo into isolated Home
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          # Dispatch branches cannot restore develop/PR caches. The official
-          # GitHub archive has the same candidate-pinned checksum as dist.ipfs.tech.
-          python3 - <<'PYCODE'
-          import json, os, re, subprocess, tempfile
+          umask 077
+          python3 -I -S - <<'PYCODE'
+          import hashlib, json, os, re, subprocess, tempfile
           from pathlib import Path
           from urllib.parse import urlsplit
           platform = "darwin-arm64"
-          info = json.loads(Path("components.json").read_text())["external"]["kubo"]["platforms"][platform]
+          recipes = json.loads(Path("scripts/release-upstream-recipes.json").read_bytes())["recipes"]
+          selected = [item for item in recipes if item["component"] == "kubo" and item["platform"] == platform]
+          if len(selected) != 1:
+              raise RuntimeError("Candidate requires exactly one native Kubo recipe")
+          recipe = selected[0]
+          info = recipe["source"]
           declared = urlsplit(info["url"])
-          assert declared.scheme == "https" and declared.netloc == "dist.ipfs.tech"
-          assert not declared.query and not declared.fragment
-          match = re.fullmatch(r"/kubo/(v[0-9]+\.[0-9]+\.[0-9]+)/kubo_\1_darwin-arm64\.tar\.gz", declared.path)
-          assert match and re.fullmatch(r"sha512:[0-9a-f]{128}", info["checksum"])
-          assert info["extract_path"] == "kubo/ipfs" and info["install_path"] == "bin/kubo"
-          # Exercise the candidate verifier before using the downloaded input.
+          if (declared.scheme, declared.netloc) != ("https", "github.com") or declared.query or declared.fragment:
+              raise RuntimeError("Kubo build input must use its pinned official GitHub archive")
+          expected_path = "/ipfs/kubo/releases/download/v" + recipe["version"] + "/kubo_v" + recipe["version"] + "_darwin-arm64.tar.gz"
+          if declared.path != expected_path or not re.fullmatch(r"sha512:[0-9a-f]{128}", info["checksum"]):
+              raise RuntimeError("Candidate Kubo archive pin differs")
+          algorithm, expected = info["checksum"].split(":", 1)
+          filename = algorithm + "-" + expected
           with tempfile.TemporaryDirectory(prefix="kubo-refused-", dir=os.environ["RUNNER_TEMP"]) as tmp:
               cache, data = Path(tmp) / "cache", Path(tmp) / "data"
               cache.mkdir(mode=0o700)
-              (cache / "kubo-darwin-arm64.tar.gz").write_bytes(b"tampered archive")
+              (cache / filename).write_bytes(b"tampered archive")
               refused = subprocess.run(["scripts/seed-kubo-cache.sh", str(cache), str(data), platform],
                                        capture_output=True, text=True)
-              assert refused.returncode != 0 and "kubo tarball checksum mismatch" in refused.stderr
-              assert not (data / "bin/kubo").exists()
+              if refused.returncode == 0 or "cached upstream input failed its recorded checksum or bound" not in refused.stderr:
+                  raise RuntimeError("Candidate accepted the tampered Kubo cache input")
+              if (data / "bin/kubo").exists():
+                  raise RuntimeError("Tampered input installed a Kubo executable")
           (Path(os.environ["PROOF_EVIDENCE"]) / "kubo-input-refusal.json").write_text(
-              json.dumps({"tampered_archive": "refused", "installed_binary": "absent", "candidate_checksum": info["checksum"]}, indent=2) + "\n")
+              json.dumps({"tampered_archive": "refused", "installed_binary": "absent", "candidate_checksum": info["checksum"],
+                          "recipe_sha256": hashlib.sha256(Path("scripts/release-upstream-recipes.json").read_bytes()).hexdigest()}, indent=2) + "\n")
           cache = Path(os.environ["RUNNER_TEMP"]) / "kubo-cache"
           cache.mkdir(mode=0o700, exist_ok=True)
-          archive = cache / "kubo-darwin-arm64.tar.gz"
+          archive = cache / filename
           if not archive.exists():
-              mirror = "https://github.com/ipfs/kubo/releases/download/" + match[1] + "/" + Path(declared.path).name
-              partial = archive.with_suffix(archive.suffix + ".partial")
+              partial = archive.with_suffix(".partial")
               subprocess.run(["curl", "-fLsS", "--retry", "3", "--retry-delay", "5", "--retry-all-errors",
-                              "--connect-timeout", "20", "--max-time", "180", "--max-filesize", "134217728",
-                              "-o", str(partial), mirror], check=True)
+                              "--connect-timeout", "20", "--max-time", "180", "--max-filesize", str(info["max_bytes"]),
+                              "-o", str(partial), info["url"]], check=True)
+              if hashlib.sha512(partial.read_bytes()).hexdigest() != expected:
+                  raise RuntimeError("Downloaded Kubo archive differs from the candidate checksum")
               partial.replace(archive)
           PYCODE
           scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
             "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64
+          scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" \
+            "${CI_SOURCE_HOME}/Library/Application Support/elastos" darwin-arm64 --verify-installed
       - name: reclaim unused stock Xcode and require build headroom
         run: |
           set -euo pipefail
@@ -301,9 +312,40 @@ jobs:
               original = checkout / "scripts" / name
               destination = source / "scripts" / name
               assert not destination.exists(), "candidate already owns harness path"
+              original_bytes = original.read_bytes()
               shutil.copy2(original, destination)
+              adaptation = None
+              if name == "ci-model-package.mjs":
+                  previous = 'for (const field of ["url", "checksum", "extract_path"]) assert.equal(info[field], sourceInfo[field], `Kubo ${field} matches the archive-verifying seed contract`);'
+                  replacement = """// Proof adapter: source-home stamps the executable hash; the licensed
+          // capsule archive and candidate recipe retain separate provenance.
+          execFileSync("scripts/seed-kubo-cache.sh", [join(process.env.RUNNER_TEMP, "kubo-cache"), data, host, "--verify-installed"], { stdio: "pipe" });
+          const kuboBuildBytes = readFileSync(join(data, "receipts/kubo-build.json"));
+          const kuboBuild = JSON.parse(kuboBuildBytes);
+          const recipeBytes = readFileSync("scripts/release-upstream-recipes.json");
+          const kuboRecipes = JSON.parse(recipeBytes).recipes.filter(row => row.component === "kubo" && row.platform === host);
+          assert.equal(kuboRecipes.length, 1, "candidate supplies one native Kubo recipe");
+          const kuboRecipe = kuboRecipes[0];
+          assert.equal(kuboBuild.component, "kubo");
+          assert.equal(kuboBuild.platform, host);
+          assert.equal(kuboBuild.capsule_manifest.version, kuboRecipe.version);
+          assert.equal(sourceInfo.strategy, "source-build");
+          for (const field of ["release_path", "extract_path", "install_path"]) assert.equal(kuboBuild[field], sourceInfo[field], `Kubo ${field} matches the candidate template`);
+          assert.deepEqual(component.capsule_metadata.platforms[host], kuboBuild.capsule_metadata, "installed licensed Kubo capsule matches its receipt");
+          const installedKuboBytes = readFileSync(join(data, "bin/kubo"));
+          assert.equal(info.checksum, `sha256:${sha(installedKuboBytes)}`, "installed Kubo executable matches its stamped checksum");
+          assert.equal(info.size, installedKuboBytes.length, "installed Kubo executable matches its stamped size");"""
+                  text = original_bytes.decode()
+                  if text.count(previous) != 1:
+                      raise RuntimeError("Pinned Kubo harness adaptation point differs")
+                  text = text.replace(previous, replacement)
+                  text = text.replace('archive_checksum: info.checksum,', 'archive_checksum: kuboBuild.checksum, recipe_sha256: sha(recipeBytes), build_receipt_sha256: sha(kuboBuildBytes),')
+                  destination.write_text(text)
+                  adaptation = "Kubo proof uses candidate licensed recipe/capsule receipt, offline installed verification, and stamped executable identity"
               rows.append({"path": "scripts/" + name, "source_commit": actual,
-                           "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()})
+                           "original_sha256": hashlib.sha256(original_bytes).hexdigest(),
+                           "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                           "adaptation": adaptation})
           provenance = {"files": rows, "scope": "single installed Home core journey; historical wrapper without timing-series requirement; current eight-token request"}
           (Path(os.environ["PROOF_EVIDENCE"]) / "harness-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
           PYCODE
