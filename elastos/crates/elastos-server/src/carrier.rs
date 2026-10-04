@@ -10456,7 +10456,13 @@ pub(crate) mod tests {
         let good_checksum = format!("sha256:{:x}", Sha256::digest(b"fixture"));
         let manifest: crate::setup::ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
-                "good-fixture": {"install_path": "good-fixture", "platforms": {
+                "good-fixture": {"install_path": "good-fixture",
+                    "provider_runtime": {
+                        "role": "provider", "substrate": "native",
+                        "runtime_abi": "elastos.provider-stdio/v1",
+                        "execution": "native-provider", "provides": "elastos://fixture/*"
+                    },
+                    "platforms": {
                     "*": {"release_path": "artifact", "checksum": good_checksum}
                 }},
                 "bad-fixture": {"install_path": "bad-fixture", "platforms": {
