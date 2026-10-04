@@ -201,10 +201,34 @@ fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
+        return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if completed_group_after_signal_denial(&error, || observe_exit(pid), || group_descendants(pid))?
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn completed_group_after_signal_denial(
+    error: &io::Error,
+    mut observe: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    descendants: impl FnOnce() -> io::Result<Vec<u32>>,
+) -> io::Result<bool> {
+    if error.raw_os_error() != Some(libc::EPERM) {
+        return Ok(false);
+    }
+    let Some(exited) = observe()? else {
+        return Ok(false);
+    };
+    if !descendants()?.is_empty() {
+        return Ok(false);
+    }
+    // Darwin denies signals to a group containing only its exited leader. WNOWAIT
+    // keeps our direct child's PID reserved through both observations and the scan.
+    Ok(observe()?.is_some_and(|current| current == exited))
 }
 
 /// Read process birth from the kernel without starting a helper process.
@@ -668,6 +692,110 @@ mod tests {
             observe_exit(pid).unwrap_err().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    #[tokio::test]
+    async fn stop_reaps_exited_and_term_exiting_groups_and_preserves_another_group() {
+        for already_exited in [true, false] {
+            let mut command = if already_exited {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "exit 0"]);
+                command
+            } else {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("60");
+                command
+            };
+            let mut child = OwnedChild::spawn(&mut command).unwrap();
+            let pid = child.pid();
+            let mut other_command = Command::new("/bin/sleep");
+            other_command.arg("60");
+            let mut other = OwnedChild::spawn(&mut other_command).unwrap();
+            if already_exited {
+                assert!(wait_for_exit(&child).await.success());
+                assert!(group_descendants(pid).unwrap().is_empty());
+                #[cfg(target_os = "macos")]
+                for signal in [libc::SIGTERM, libc::SIGKILL] {
+                    assert_eq!(unsafe { libc::kill(-(pid as libc::pid_t), signal) }, -1);
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+                    assert!(observe_exit(pid).unwrap().is_some());
+                }
+            } else {
+                assert!(child.observed_exit().unwrap().is_none());
+            }
+            tokio::time::timeout(Duration::from_secs(2), child.stop())
+                .await
+                .unwrap()
+                .unwrap();
+            let status = child.observed_exit().unwrap().unwrap();
+            if already_exited {
+                assert!(status.success());
+            } else {
+                assert_eq!(status.signal(), Some(libc::SIGTERM));
+            }
+            assert_eq!(
+                observe_exit(pid).unwrap_err().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(group_descendants(pid).unwrap().is_empty());
+            assert!(other.observed_exit().unwrap().is_none());
+            tokio::time::timeout(Duration::from_secs(2), other.stop())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn signal_denial_requires_stable_exited_direct_child_and_empty_proved_group() {
+        for case in [
+            "complete",
+            "other errno",
+            "live child",
+            "not direct child",
+            "uncertain exit",
+            "remaining descendant",
+            "uncertain group",
+            "anchor disappeared",
+            "anchor reaped",
+            "changed exit event",
+        ] {
+            let error = io::Error::from_raw_os_error(if case == "other errno" {
+                libc::EACCES
+            } else {
+                libc::EPERM
+            });
+            let before = match case {
+                "live child" => Ok(None),
+                "not direct child" => Err(io::Error::from_raw_os_error(libc::ECHILD)),
+                "uncertain exit" => Err(io::Error::from_raw_os_error(libc::EPERM)),
+                _ => Ok(Some(ExitStatus::from_raw(0))),
+            };
+            let after = match case {
+                "anchor disappeared" => Ok(None),
+                "anchor reaped" => Err(io::Error::from_raw_os_error(libc::ECHILD)),
+                "changed exit event" => Ok(Some(ExitStatus::from_raw(7 << 8))),
+                _ => Ok(Some(ExitStatus::from_raw(0))),
+            };
+            let mut observations = vec![after, before];
+            let result = completed_group_after_signal_denial(
+                &error,
+                || observations.pop().unwrap(),
+                || match case {
+                    "remaining descendant" => Ok(vec![42]),
+                    "uncertain group" => Err(io::Error::from_raw_os_error(libc::EPERM)),
+                    _ => Ok(Vec::new()),
+                },
+            );
+            if matches!(
+                case,
+                "not direct child" | "uncertain exit" | "uncertain group" | "anchor reaped"
+            ) {
+                assert!(result.is_err(), "{case}");
+            } else {
+                assert_eq!(result.unwrap(), case == "complete", "{case}");
+            }
+        }
     }
 
     #[tokio::test]
