@@ -1966,6 +1966,12 @@ pub(crate) async fn ensure_local_model_engine(
                 "llama-server must come from the signed release; URL-only engines are refused"
             )
         })?;
+    // Source-checkout Homes build the engine during setup; only signed releases
+    // carry a prebuilt bundle that Assistant can fetch on demand.
+    anyhow::ensure!(
+        !matches!(info.strategy.as_deref(), Some("source-build") | Some("local-copy")),
+        "This source-checkout Home has no local AI engine. Rerun scripts/setup-source-home.sh with SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 to build it."
+    );
     anyhow::ensure!(
         matches!(info.strategy.as_deref(), None | Some("prebuilt")) && info.extract_path.is_some(),
         "on-demand llama-server requires a signed prebuilt bundle"
