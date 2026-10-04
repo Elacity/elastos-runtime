@@ -24,6 +24,11 @@ pub struct RuntimeCoords {
     pub policy_sha256: String,
     #[serde(default)]
     pub dependency_sha256: String,
+    #[serde(default)]
+    pub generation: String,
+    /// Gateway Home URL published after its listener and router are ready.
+    #[serde(default)]
+    pub home_url: String,
 }
 
 pub const RUNTIME_KIND_OPERATOR: &str = "operator";
@@ -1415,8 +1420,7 @@ async fn ensure_managed_runtime(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child
-            .child
-            .try_wait()
+            .observed_exit()
             .map_err(|e| anyhow::anyhow!("Failed to check runtime status: {}", e))?
         {
             anyhow::bail!(
@@ -1500,7 +1504,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(sha256_bytes(&bytes))
 }

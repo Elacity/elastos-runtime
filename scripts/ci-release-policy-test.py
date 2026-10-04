@@ -215,6 +215,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "engine-llama-arm64": ("engine-llama-arm64", "ubuntu-24.04-arm"),
             "lint": ("lint", "ubuntu-24.04"),
             "test-elastos": ("test-elastos", "ubuntu-24.04"),
+            "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
             "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
@@ -232,7 +233,7 @@ class ReleasePolicyTests(unittest.TestCase):
                       JOBS["source-home-linux"])
         needs = JOBS["release"].split("    needs:\n", 1)[1].split("    permissions:\n", 1)[0]
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
-                         ["lint", "test-elastos", "test-capsules", "source-home-linux", "source-home-macos"])
+                         ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
 
     def test_cli_fixture_job_requires_an_explicit_dispatch_and_pinned_manifest(self):

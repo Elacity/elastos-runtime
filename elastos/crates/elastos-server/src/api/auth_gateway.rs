@@ -1068,6 +1068,19 @@ pub fn migrate_configured_principal_roots_offline(
     })
 }
 
+pub(crate) fn migrate_configured_principal_roots_for_update(
+    data_dir: &std::path::Path,
+    backup_dir: &std::path::Path,
+    activation: &crate::install_transaction::SupportActivation<'_>,
+) -> anyhow::Result<crate::auth::PrincipalRootUpgradeReceiptV1> {
+    crate::auth::migrate_declared_principal_roots_for_update(
+        data_dir,
+        backup_dir,
+        || configured_principal_root_upgrade_declarations(data_dir),
+        activation,
+    )
+}
+
 fn configured_principal_root_upgrade_declarations(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<crate::auth::PrincipalRootUpgradeDeclarationV1>> {

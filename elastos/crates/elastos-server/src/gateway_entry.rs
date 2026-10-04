@@ -9,12 +9,13 @@ pub async fn run_gateway(
         public,
         cache_dir,
         publish,
-        setup_control_plane,
+        setup_gateway_control_plane,
     )
     .await
 }
 
 pub async fn run_browser_home() -> anyhow::Result<()> {
+    elastos_server::update_controller::enter_browser_home()?;
     elastos_server::gateway_cmd::run_gateway_direct_with_ready(
         "localhost:8090".to_string(),
         false,
@@ -27,6 +28,9 @@ pub async fn run_browser_home() -> anyhow::Result<()> {
 }
 
 fn browser_home_ready(url: &str) {
+    if std::env::var("ELASTOS_UPDATE_RESTART").as_deref() == Ok("1") {
+        return;
+    }
     eprintln!("Home: {url}");
     eprintln!("Keep this terminal open. Press Ctrl+C to stop Home.");
     crate::open_browser(url);
@@ -34,11 +38,23 @@ fn browser_home_ready(url: &str) {
 
 async fn setup_control_plane() -> anyhow::Result<elastos_server::gateway_cmd::GatewayControlPlane> {
     let infra = crate::server_infra::setup_control_plane_infrastructure().await?;
-    Ok(elastos_server::gateway_cmd::GatewayControlPlane {
+    Ok(control_plane(infra))
+}
+
+async fn setup_gateway_control_plane(
+) -> anyhow::Result<elastos_server::gateway_cmd::GatewayControlPlane> {
+    let infra = crate::server_infra::setup_gateway_infrastructure().await?;
+    Ok(control_plane(infra))
+}
+
+fn control_plane(
+    infra: crate::server_infra::ServerInfrastructure,
+) -> elastos_server::gateway_cmd::GatewayControlPlane {
+    elastos_server::gateway_cmd::GatewayControlPlane {
         provider_registry: infra.provider_registry,
         host_helpers: infra.host_helpers,
         carrier_service: infra.carrier_service,
         collaboration_context: infra.collaboration_context,
         collaboration_service: infra.collaboration_service,
-    })
+    }
 }

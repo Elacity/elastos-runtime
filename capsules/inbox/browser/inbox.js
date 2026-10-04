@@ -585,14 +585,42 @@
         time.textContent = formatInboxTime(entry.created_at);
       }
 
-      const body = document.createElement("p");
-      body.className = "entry-body";
-      body.textContent = inboxEntryText(entry, "body", "This request needs your review.");
+      const bodyText = inboxEntryText(entry, "body", "This request needs your review.");
+      const body = entry.kind === "hosted_route_decision" || entry.kind === "hosted_route_history"
+        ? createFactList(bodyText) : document.createElement("p");
+      body.classList.add("entry-body");
+      if (body.tagName === "P") body.textContent = bodyText;
 
       const actions = document.createElement("div");
       actions.className = "entry-actions";
       fillEntryActions(actions, entry);
       elements.entryDetail.append(titleRow, time, body, actions);
+    }
+
+    function createFactList(text) {
+      const list = document.createElement("div");
+      list.className = "entry-facts";
+      for (const line of text.split("\n")) {
+        const fact = /^([A-Z][A-Za-z0-9 -]{0,32}): (.*)$/.exec(line);
+        if (!fact) {
+          const note = document.createElement("p");
+          note.className = "entry-fact-note";
+          note.textContent = line;
+          list.append(note);
+          continue;
+        }
+        const row = document.createElement("div");
+        row.className = "entry-fact";
+        const label = document.createElement("span");
+        label.className = "entry-fact-label";
+        label.textContent = `${fact[1]}: `;
+        const value = document.createElement("span");
+        value.className = "entry-fact-value";
+        value.textContent = fact[2];
+        row.append(label, value);
+        list.append(row);
+      }
+      return list;
     }
 
     function createButton(label, onClick, className) {

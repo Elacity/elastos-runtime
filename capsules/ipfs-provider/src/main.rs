@@ -347,6 +347,37 @@ enum KuboState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HostRole {
+    #[default]
+    User,
+    Gateway,
+}
+
+impl HostRole {
+    fn from_init(config: &serde_json::Value) -> Result<Self, ()> {
+        // The role belongs to Runtime's private Init envelope, not arbitrary
+        // top-level provider options or the process environment.
+        if config.get("runtime_host_role").is_some() {
+            return Err(());
+        }
+        match config
+            .get("extra")
+            .and_then(|extra| extra.get("runtime_host_role"))
+        {
+            None => Ok(Self::User),
+            Some(serde_json::Value::String(role)) if role == "user" => Ok(Self::User),
+            Some(serde_json::Value::String(role)) if role == "gateway" => Ok(Self::Gateway),
+            Some(_) => Err(()),
+        }
+    }
+
+    fn idle_stop_due(self, last_used: u64, now: u64) -> bool {
+        self == Self::User && now.saturating_sub(last_used) > IDLE_TIMEOUT_SECS
+    }
+}
+
 // ── Coord file ──────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -361,6 +392,8 @@ struct CoordFile {
 // ── Provider ────────────────────────────────────────────────────────
 
 struct IpfsProvider {
+    host_role: HostRole,
+    initialized: bool,
     state: KuboState,
     api_port: u16,
     gateway_port: u16,
@@ -375,6 +408,8 @@ impl IpfsProvider {
         let data_dir = data_dir();
         let repo_dir = data_dir.join("ipfs-repo");
         Self {
+            host_role: HostRole::User,
+            initialized: false,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -602,9 +637,11 @@ impl IpfsProvider {
     // ── Init ────────────────────────────────────────────────────────
 
     fn init(&mut self, config: serde_json::Value) -> Response {
+        let Ok(host_role) = HostRole::from_init(&config) else {
+            return Response::error("invalid_config", "Invalid Runtime IPFS host role");
+        };
         let extra = config.get("extra").unwrap_or(&config);
-
-        if let Some(base_path) = config
+        let selected_root = if let Some(base_path) = config
             .get("base_path")
             .and_then(serde_json::Value::as_str)
             .or_else(|| extra.get("data_dir").and_then(serde_json::Value::as_str))
@@ -618,9 +655,25 @@ impl IpfsProvider {
                     "ipfs-provider data_dir must be absolute",
                 );
             }
-            self.data_dir = path;
-            self.repo_dir = self.data_dir.join("ipfs-repo");
+            path
+        } else {
+            self.data_dir.clone()
+        };
+        if self.initialized && (self.host_role != host_role || self.data_dir != selected_root) {
+            return Response::error(
+                "invalid_config",
+                "Runtime IPFS role and data root are fixed at Init",
+            );
         }
+        if self.initialized {
+            return Response::ok(
+                serde_json::json!({"provider":"ipfs-provider", "state":self.state,
+                "runtime_host_role":self.host_role}),
+            );
+        }
+        self.host_role = host_role;
+        self.data_dir = selected_root;
+        self.repo_dir = self.data_dir.join("ipfs-repo");
 
         if extra.get("gateways").is_some() || std::env::var("ELASTOS_IPFS_GATEWAYS").is_ok() {
             eprintln!("ipfs-provider: ignoring gateway override; provider is local-IPFS only");
@@ -657,9 +710,20 @@ impl IpfsProvider {
             }
         }
 
+        self.initialized = true;
+        eprintln!(
+            "ipfs-provider: Runtime host role {:?}; idle stop {}",
+            self.host_role,
+            if self.host_role == HostRole::Gateway {
+                "disabled"
+            } else {
+                "600s"
+            }
+        );
         Response::ok(serde_json::json!({
             "provider": "ipfs-provider",
             "state": self.state,
+            "runtime_host_role": self.host_role,
         }))
     }
 
@@ -2060,7 +2124,7 @@ fn collect_ls_files_recursive(
 
 // ── Idle timeout (background thread) ────────────────────────────────
 
-fn spawn_idle_watcher(data_dir: PathBuf, activity: Arc<Mutex<()>>) {
+fn spawn_idle_watcher(data_dir: PathBuf, activity: Arc<Mutex<()>>, role: HostRole) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(IDLE_CHECK_INTERVAL);
@@ -2068,7 +2132,7 @@ fn spawn_idle_watcher(data_dir: PathBuf, activity: Arc<Mutex<()>>) {
             let _activity = activity.lock().unwrap();
             if let Some(coord) = read_coord_file(&data_dir) {
                 let idle_secs = now_unix_secs().saturating_sub(coord.last_used);
-                if idle_secs > IDLE_TIMEOUT_SECS {
+                if role.idle_stop_due(coord.last_used, now_unix_secs()) {
                     eprintln!(
                         "ipfs-provider: Kubo idle for {}s (threshold {}s), stopping",
                         idle_secs, IDLE_TIMEOUT_SECS
@@ -2129,9 +2193,16 @@ fn main() {
         let is_shutdown = matches!(request, Request::Shutdown);
         let _activity = activity.lock().unwrap();
         let response = provider.handle(request);
-        if !idle_watcher_started && provider.state == KuboState::Ready {
+        if !idle_watcher_started
+            && provider.state == KuboState::Ready
+            && provider.host_role == HostRole::User
+        {
             // Init has selected the data root before this daemon becomes ready.
-            spawn_idle_watcher(provider.data_dir.clone(), Arc::clone(&activity));
+            spawn_idle_watcher(
+                provider.data_dir.clone(),
+                Arc::clone(&activity),
+                provider.host_role,
+            );
             idle_watcher_started = true;
         }
 
@@ -2361,6 +2432,8 @@ mod tests {
         );
         let root = tempfile::tempdir().unwrap();
         let mut provider = IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -2515,6 +2588,8 @@ mod tests {
             },
         );
         IpfsProvider {
+            host_role: HostRole::User,
+            initialized: true,
             state: KuboState::Ready,
             api_port: port,
             gateway_port: port,
@@ -3286,6 +3361,154 @@ mod tests {
         assert_eq!(provider.data_dir, tmp.path());
         assert_eq!(provider.repo_dir, tmp.path().join("ipfs-repo"));
         assert_eq!(provider.kubo_binary, Some(tmp.path().join("bin/kubo")));
+    }
+
+    #[test]
+    fn runtime_role_init_preserves_native_environment_roots() {
+        // Child test processes isolate native environment selection from other
+        // tests. Init must preserve that selected root for both Runtime roles.
+        if let Some(expected) = std::env::var_os("ISSUE89_INIT_EXPECTED_ROOT") {
+            let expected = PathBuf::from(expected);
+            for role in ["user", "gateway"] {
+                let mut provider = IpfsProvider::new();
+                assert_eq!(provider.data_dir, expected);
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "op":"init", "config":{"base_path":"", "allowed_paths":[],
+                    "read_only":false, "encryption_key":"",
+                    "extra":{"runtime_host_role":role}}
+                }))
+                .unwrap();
+                assert!(matches!(provider.handle(request), Response::Ok { .. }));
+                assert_eq!(provider.data_dir, expected);
+                assert_eq!(provider.repo_dir, expected.join("ipfs-repo"));
+                assert_eq!(provider.kubo_binary, Some(expected.join("bin/kubo")));
+                assert_eq!(
+                    provider.host_role,
+                    if role == "user" {
+                        HostRole::User
+                    } else {
+                        HostRole::Gateway
+                    }
+                );
+                assert!(provider.initialized);
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let explicit = root.path().join("explicit");
+        let xdg = root.path().join("child-xdg");
+        let home = root.path().join("child-home");
+        for selected in [&parent, &explicit, &xdg.join("elastos")] {
+            fs::create_dir_all(selected.join("bin")).unwrap();
+            fs::create_dir_all(selected.join("ipfs-repo")).unwrap();
+            fs::write(
+                selected.join("bin/kubo"),
+                b"fixture; Init does not execute Kubo",
+            )
+            .unwrap();
+            fs::write(selected.join("ipfs-repo/config"), b"{}\n").unwrap();
+        }
+        for (case, expected, managed_parent) in [
+            ("managed-parent", parent.clone(), parent.clone()),
+            ("explicit", explicit.clone(), parent.clone()),
+            (
+                "xdg",
+                xdg.join("elastos"),
+                root.path().join("absent-parent"),
+            ),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::runtime_role_init_preserves_native_environment_roots",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", &xdg)
+                .env("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR", &managed_parent)
+                .env("ISSUE89_INIT_EXPECTED_ROOT", &expected);
+            if case == "explicit" {
+                child.env("ELASTOS_DATA_DIR", &explicit);
+            }
+            let result = child.output().unwrap();
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_host_role_defaults_to_user_and_only_gateway_keeps_kubo() {
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"extra":null}),
+            serde_json::json!({"extra":{"runtime_host_role":"user", "keep_alive":true}}),
+        ] {
+            assert_eq!(HostRole::from_init(&config), Ok(HostRole::User));
+        }
+        assert_eq!(
+            HostRole::from_init(&serde_json::json!({"extra":{"runtime_host_role":"gateway"}})),
+            Ok(HostRole::Gateway)
+        );
+        assert!(!HostRole::User.idle_stop_due(100, 700));
+        assert!(HostRole::User.idle_stop_due(100, 701));
+        assert!(!HostRole::User.idle_stop_due(700, 100));
+        assert!(!HostRole::Gateway.idle_stop_due(0, u64::MAX));
+        for role in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(600),
+            serde_json::json!("Gateway"),
+            serde_json::json!("publisher"),
+            serde_json::json!("gateway "),
+        ] {
+            assert!(
+                HostRole::from_init(&serde_json::json!({"extra":{"runtime_host_role":role}}))
+                    .is_err()
+            );
+        }
+        assert!(HostRole::from_init(&serde_json::json!({"runtime_host_role":"gateway"})).is_err());
+    }
+
+    #[test]
+    fn runtime_init_refuses_role_or_root_changes_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        for role in ["user", "gateway"] {
+            let mut provider = IpfsProvider::new();
+            let config =
+                serde_json::json!({"base_path":root.path(), "extra":{"runtime_host_role":role}});
+            assert!(matches!(provider.init(config.clone()), Response::Ok { .. }));
+            assert!(matches!(provider.init(config.clone()), Response::Ok { .. }));
+            let bound_role = provider.host_role;
+            for change in [
+                serde_json::json!({"base_path":other.path(), "extra":{"runtime_host_role":role}}),
+                serde_json::json!({"base_path":root.path(), "extra":{"runtime_host_role":if role=="user" {"gateway"} else {"user"}}}),
+            ] {
+                assert!(matches!(provider.init(change), Response::Error { .. }));
+                assert_eq!(provider.host_role, bound_role);
+                assert_eq!(provider.data_dir, root.path());
+                assert_eq!(provider.repo_dir, root.path().join("ipfs-repo"));
+                assert_eq!(provider.state, KuboState::Cold);
+            }
+        }
+        let mut provider = IpfsProvider::new();
+        let previous = provider.data_dir.clone();
+        assert!(matches!(
+            provider.init(serde_json::json!({"base_path":root.path(),
+            "extra":{"runtime_host_role":true}})),
+            Response::Error { .. }
+        ));
+        assert_eq!(provider.data_dir, previous);
+        assert!(!provider.initialized);
+        assert_eq!(provider.host_role, HostRole::User);
     }
 
     #[test]

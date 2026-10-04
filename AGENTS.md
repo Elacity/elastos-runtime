@@ -16,11 +16,10 @@ are the only place for work status, acceptance criteria and proof.
   reviews and is merged. Until then, keep verified work open in QA / Review.
   Take the next unblocked task in that lane; starting it does not complete its
   predecessor. Keep blocked work open with its blocker in the issue.
-- Follow CI and installed journeys that you start to completion in the same
-  turn. While they run, continue eligible work in the other lane and keep the
-  one-active-task limit. Inspect the completed result, repair failures, and
-  verify the new candidate before handing back. An external blocker belongs
-  in the owning issue.
+- At the first CI failure caused by your candidate, cancel its remaining jobs
+  and repair the cause before another push. Continue eligible work while CI
+  runs. If CI is the only remaining work, end the turn and check again in
+  15 minutes. Record an external blocker in the owning issue.
 - Run at most one heavy local build on this Mac at a time. Workers agree which
   issue owns that build before starting it. CI builds do not count toward this
   local limit. Continue reviews, source work or other light checks in parallel.
@@ -247,6 +246,17 @@ git diff --stat <upstream>...HEAD
 git rev-list --left-right --count <upstream>...HEAD
 ```
 
+Before each push, fetch and merge current `origin/develop`, then check the
+clean candidate with `just ci-local-prepush`. The committed pre-push hook
+checks the exact pushed HEAD and refuses a stale base. It runs formatting,
+workspace/all-targets checks, Clippy for touched crates, and their unit targets.
+Use the [local pre-push procedure](scripts/README.md#local-pre-push-gate) to
+activate the hook and share the local heavy-build lease across worktrees.
+Reproduce an unclear failed Mac install, update, or Home startup step locally
+under that lease before pushing. Review a large diff with Opus before long Mac
+CI. Record the command and result in the owning issue; source checks and an
+operator reminder alone do not prove that installed step.
+
 Before deploying public Home, show the exact commit being deployed, confirm that
 `live` either already points to that commit or will be moved only after
 successful verification, and preserve a rollback path for the installed binary,
@@ -300,7 +310,8 @@ basic gate before handing work back:
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
+node --test scripts/check-product-data.test.mjs
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 ```
@@ -313,7 +324,7 @@ for touched crates or scripts, for example:
 cargo test --manifest-path capsules/chain-provider/Cargo.toml -- --nocapture
 ```
 
-For Browser-facing changes, include the relevant Browser entropy/smoke gates and
+For Browser-facing changes, include the relevant Browser behaviour/smoke gates and
 do not claim product readiness unless `scripts/browser-objective-audit.mjs`
 passes with accepted product media plus matching manual UX evidence.
 
@@ -461,10 +472,8 @@ Rust target; do not re-document dependency installation here.
   use. `wasm32-unknown-unknown` is the capsule Component target; the release
   scripts also add it on demand via `ensure_rust_target_installed`.
 - Core gate has no JS/Python package deps: the `.mjs` checks in `just verify`
-  (`home-entropy-check.mjs`, `browser-entropy-check.mjs`,
-  `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
-  only stdlib/`node --test`. `playwright` appears only as a scanned string in
-  entropy checks and as an import in Browser/GUI headless smokes that are NOT
+  (`check-product-data.mjs`, `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
+  only stdlib/`node --test`. `playwright` appears as an import in Browser/GUI headless smokes that are NOT
   part of the core gate, so no `npm install` is needed for build/lint/test.
 - Build/lint/test run from the repo root (the recipes `cd elastos`
   themselves): `just build`, `just lint`, `just test`. A cold `just build` is
