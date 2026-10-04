@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Check the current worktree and the exact object supplied by Git pre-push."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+
+
+class GateError(Exception):
+    pass
+
+
+def run(args, cwd, capture=False, lease=None):
+    if lease and args[0] == "cargo":
+        disk_reserve(cwd)
+        build = Path(os.environ["CARGO_BUILD_BUILD_DIR"])
+        disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
+    print("+ " + shlex.join(str(arg) for arg in args), flush=True)
+    process = subprocess.Popen(
+        args, cwd=cwd, text=True, stdout=subprocess.PIPE if capture else None,
+        pass_fds=(lease.fileno(),) if lease else (), start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate()
+    except BaseException:
+        # Settle the owned command before releasing the heavy-build lease.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        # Cargo can exit before a rustc/helper descendant. Settle the whole
+        # owned group, including children which ignored the first signal.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        if process.stdout:
+            process.stdout.close()
+        raise
+    if process.returncode:
+        if capture and output:
+            print(output, end="", flush=True)
+        raise GateError("command failed: " + shlex.join(str(arg) for arg in args))
+    return output or ""
+
+
+def git(root, *args):
+    return run(["git", *args], root, capture=True).strip()
+
+
+def paths_from_git(root, *args):
+    return [path for path in run(["git", *args], root, capture=True).split("\0") if path]
+
+
+def snapshot(root):
+    flagged = [entry for entry in paths_from_git(root, "ls-files", "-v", "-z")
+               if entry[0] == "S" or entry[0].islower()]
+    if flagged:
+        raise GateError("clear assume-unchanged and skip-worktree index flags before this gate")
+    if git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+        raise GateError("commit or preserve the working tree changes before this gate")
+    branch = git(root, "symbolic-ref", "--quiet", "HEAD")
+    return branch, git(root, "rev-parse", "HEAD"), git(root, "rev-parse", "HEAD^{tree}")
+
+
+def push_candidate(lines, candidate):
+    updates = [line.split() for line in lines if line.strip()]
+    if len(updates) != 1 or len(updates[0]) != 4:
+        raise GateError("push one current branch at a time; deletions and tags need their own approval")
+    local_ref, local_oid, remote_ref, _ = updates[0]
+    branch, commit, _ = candidate
+    if local_ref != branch or local_oid != commit or not remote_ref.startswith("refs/heads/"):
+        raise GateError("the pushed branch and object must match this worktree's current HEAD")
+
+
+def current_develop(root, commit):
+    git(root, "fetch", "--no-tags", "origin", "+refs/heads/develop:refs/remotes/origin/develop")
+    develop = git(root, "rev-parse", "refs/remotes/origin/develop")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", develop, commit], cwd=root).returncode:
+        raise GateError("merge current origin/develop before checking and pushing; the hook keeps HEAD fixed")
+    return develop
+
+
+def disk_reserve(path):
+    disk = shutil.disk_usage(path)
+    if disk.free * 100 < disk.total * 15:
+        raise GateError("restore the 15% disk reserve before local Cargo checks")
+
+
+def acquire_lease(common, candidate):
+    # Keep one inode after release so every worktree/operator locks the same file.
+    lease = (common / "local-ai-heavy-build.lock").open("a+")
+    try:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lease.seek(0)
+        owner = lease.read().strip()
+        lease.close()
+        raise GateError("local heavy build lease is busy" + (": " + owner if owner else ""))
+    lease.seek(0)
+    lease.truncate()
+    json.dump({"pid": os.getpid(), "branch": candidate[0], "commit": candidate[1]}, lease)
+    lease.flush()
+    return lease
+
+
+def metadata(root, manifest, lease):
+    value = json.loads(run([
+        "cargo", "metadata", "--no-deps", "--offline", "--format-version", "1",
+        "--manifest-path", str(manifest),
+    ], root, capture=True, lease=lease))
+    members = set(value["workspace_members"])
+    return Path(value["workspace_root"]), [p for p in value["packages"] if p["id"] in members]
+
+
+def touched_workspaces(root, paths, lease):
+    workspaces = {}
+    workspace, packages = metadata(root, root / "elastos/Cargo.toml", lease)
+    workspaces[workspace] = packages
+    manifests = {root / path for path in paths_from_git(root, "ls-files", "-z", "*Cargo.toml")}
+    broad = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
+    # Resolve touched standalone workspaces, including tools and capsules.
+    candidates = set()
+    for path in paths:
+        if path.endswith("/Cargo.toml") and not (root / path).exists():
+            raise GateError("removed Rust package needs an explicit acceptance plan: " + path)
+        manifest = next((parent / "Cargo.toml" for parent in (root / path).parents
+                         if parent / "Cargo.toml" in manifests), None)
+        if manifest:
+            candidates.add(manifest)
+        elif path.endswith("/Cargo.toml") or path.endswith(".rs"):
+            raise GateError("changed Rust package was removed or has no manifest: " + path)
+    if broad:
+        candidates.update(manifest for manifest in manifests
+                          if "templates" not in manifest.parts and "fixtures" not in manifest.parts)
+    for manifest in sorted(candidates):
+        if not any(manifest == Path(p["manifest_path"])
+                   for ps in workspaces.values() for p in ps):
+            workspace, packages = metadata(root, manifest, lease)
+            workspaces[workspace] = packages
+    touched = {}
+    for workspace, packages in workspaces.items():
+        relative = workspace.relative_to(root).as_posix()
+        workspace_change = broad or any(path in {
+            relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",
+        } for path in paths)
+        selected = []
+        for package in packages:
+            prefix = Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
+            if workspace_change or any(path.startswith(prefix) for path in paths):
+                selected.append(package)
+        touched[workspace] = selected
+    return touched
+
+
+def unit_targets(package):
+    targets = []
+    for target in package["targets"]:
+        if not target.get("test", True):
+            continue
+        if any(kind in {"lib", "rlib", "proc-macro", "cdylib", "dylib", "staticlib"}
+               for kind in target["kind"]):
+            targets.append((target, ["--lib"]))
+        elif "bin" in target["kind"]:
+            targets.append((target, ["--bin", target["name"]]))
+    return targets
+
+
+def module_prefix(entry, changed):
+    """Prove a conventional file-module path; attributes/includes widen scope."""
+    if entry == changed:
+        return ""
+    try:
+        relative = changed.relative_to(entry.parent)
+    except ValueError:
+        return None
+    names = list(relative.parts[:-1])
+    if relative.name != "mod.rs":
+        names.append(relative.stem)
+    current = entry
+    for name in names:
+        if not current.is_file():
+            return None
+        source = current.read_text()
+        if re.search(r"#\s*\[\s*path\b|\binclude\s*!", source):
+            return None
+        declaration = r"(?m)^(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(name) + r"\s*;"
+        if not re.search(declaration, source):
+            return None
+        folder = current.parent if current.name in {"lib.rs", "main.rs", "mod.rs"} else current.with_suffix("")
+        plain, directory = folder / (name + ".rs"), folder / name / "mod.rs"
+        if plain.exists() == directory.exists():
+            return None
+        current = plain if plain.exists() else directory
+    return "::".join(names) + "::" if current == changed else None
+
+
+def unit_plan(root, package, paths):
+    targets = unit_targets(package)
+    folder = Path(package["manifest_path"]).parent
+    changed = [root / path for path in paths if (root / path).is_relative_to(folder)]
+    full = [(target, selectors, {""}) for target, selectors in targets]
+    if not changed or any(path.suffix != ".rs" or not path.exists() for path in changed):
+        return full
+    plan = {}
+    for path in changed:
+        matches = []
+        for index, (target, selectors) in enumerate(targets):
+            prefix = module_prefix(Path(target["src_path"]), path)
+            if prefix is not None:
+                matches.append((index, prefix))
+        if not matches:
+            return full
+        for index, prefix in matches:
+            plan.setdefault(index, set()).add(prefix)
+    return [(targets[index][0], targets[index][1], prefixes) for index, prefixes in sorted(plan.items())]
+
+
+def passed_tests(output):
+    return sum(int(count) for count in re.findall(r"(?m)^test result: ok\. (\d+) passed;", output))
+
+
+def prepare_process_providers(root, lease):
+    providers = {
+        "ELASTOS_TEST_PROTECT_PROVIDER_BIN": "protected-content-protect-provider",
+        "ELASTOS_TEST_DECRYPT_PROVIDER_BIN": "protected-content-decrypt-provider",
+        "ELASTOS_TEST_CUSTODY_PROVIDER_BIN": "custody-provider",
+    }
+    for variable, name in providers.items():
+        folder = root / "capsules" / name
+        run(["cargo", "build", "--release", "--target-dir", "target"], folder, lease=lease)
+        binary = folder / "target/release" / name
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise GateError("candidate process provider is unavailable: " + name)
+        os.environ[variable] = str(binary)
+
+
+def crate_units(root, workspace, package, paths, lease):
+    plan = unit_plan(root, package, paths)
+    if not plan:
+        raise GateError(package["name"] + " has no enabled unit test target")
+    prepared = False
+    executed = 0
+    for target, selectors, prefixes in plan:
+        args = ["cargo", "test", "-p", package["name"], *selectors]
+        listed = run([*args, "--", "--list"], workspace, capture=True, lease=lease)
+        tests = re.findall(r"(?m)^(.+): test$", listed)
+        if not tests:
+            raise GateError(package["name"] + " has zero unit tests on this host: " + " ".join(selectors))
+        # A source module can use tests in another module. Fall back to all
+        # tests in that target when a proven file path has no matching tests.
+        if any(not any(name.startswith(prefix) for name in tests) for prefix in prefixes):
+            prefixes = {""}
+        prefixes = {prefix for prefix in prefixes
+                    if not any(prefix != parent and prefix.startswith(parent) for parent in prefixes)}
+        selected = [name for name in tests if any(name.startswith(prefix) for prefix in prefixes)]
+        if package["name"] == "elastos-server" and not prepared and any(
+                name.startswith(("protected_content_runtime::", "server_infra::")) for name in selected):
+            prepare_process_providers(root, lease)
+            prepared = True
+        for prefix in sorted(prefixes):
+            # libtest accepts multiple full names after --. Exact names keep
+            # runtime:: from also selecting protected_content_runtime::.
+            filters = ["--exact", *[name for name in tests if name.startswith(prefix)]] if prefix else []
+            output = run([*args, "--", "--nocapture", *filters],
+                         workspace, capture=True, lease=lease)
+            print(output, end="", flush=True)
+            count = passed_tests(output)
+            if count == 0:
+                raise GateError(package["name"] + " executed zero passing unit tests")
+            executed += count
+    if executed == 0:
+        raise GateError(package["name"] + " has zero unit tests on this host")
+
+
+def gates(root, paths, lease):
+    run(["git", "diff", "--check", "origin/develop...HEAD"], root)
+    run(["node", "scripts/check-product-data.mjs"], root)
+    run(["node", "--test", "scripts/check-product-data.test.mjs"], root)
+    if any(path in {".githooks/pre-push", "scripts/ci-local-prepush.sh",
+                    "scripts/ci-local-prepush.py", "scripts/ci-local-prepush-test.py"}
+           for path in paths):
+        run(["python3", "scripts/ci-local-prepush-test.py"], root)
+    workspaces = touched_workspaces(root, paths, lease)
+    formats = {root / "elastos", root / "capsules/chain-provider", *workspaces}
+    for workspace in sorted(formats):
+        run(["cargo", "fmt", "--all", "--", "--check"], workspace, lease=lease)
+    for workspace, packages in sorted(workspaces.items()):
+        run(["cargo", "check", "--workspace", "--all-targets"], workspace, lease=lease)
+        if packages:
+            args = ["cargo", "clippy", "--all-targets"]
+            for package in packages:
+                args.extend(["-p", package["name"]])
+            run([*args, "--", "-D", "warnings"], workspace, lease=lease)
+        for package in packages:
+            crate_units(root, workspace, package, paths, lease)
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt("received signal " + str(signum))
+
+
+def main():
+    if len(sys.argv) not in {1, 3}:
+        raise GateError("use this gate directly, or pass Git's remote name and URL")
+    root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+    candidate = snapshot(root)
+    if len(sys.argv) == 3:
+        push_candidate(sys.stdin, candidate)
+    develop = current_develop(root, candidate[1])
+    if snapshot(root) != candidate:
+        raise GateError("source or HEAD changed while fetching develop")
+    print("source={} tree={} develop={}".format(candidate[1], candidate[2], develop), flush=True)
+    print("Operator gate: reproduce an unclear failed Mac install/update/Home step locally; "
+          "review a large diff with Opus before long Mac CI.", flush=True)
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    os.environ.setdefault("CARGO_BUILD_BUILD_DIR", str(common.parent / "target-build"))
+    build_dir = Path(os.environ["CARGO_BUILD_BUILD_DIR"]).expanduser().resolve()
+    os.environ["CARGO_BUILD_BUILD_DIR"] = str(build_dir)
+    disk_reserve(root)
+    disk_reserve(next(path for path in (build_dir, *build_dir.parents) if path.exists()))
+    with acquire_lease(common, candidate) as lease:
+        paths = paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", develop + "...HEAD")
+        gates(root, paths, lease)
+        if snapshot(root) != candidate:
+            raise GateError("source or HEAD changed during checks; check the new candidate")
+        if current_develop(root, candidate[1]) != develop:
+            raise GateError("develop changed during checks; check the new base before pushing")
+        if snapshot(root) != candidate:
+            raise GateError("source or HEAD changed during final fetch")
+    print("Local pre-push gate passed for " + candidate[1], flush=True)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        main()
+    except (GateError, OSError, ValueError, KeyboardInterrupt) as error:
+        print("pre-push stopped: " + str(error), file=sys.stderr)
+        sys.exit(1)

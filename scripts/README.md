@@ -42,6 +42,86 @@ tests, and the separate Browser local-exit checks. `just verify-release` adds
 browser-based UI source checks, local Carrier setup and Home front-door proofs.
 Publishing trust and signer verification are separate release gates.
 
+## Local pre-push gate
+
+Before each push, fetch and merge current `origin/develop` into the task branch,
+commit the candidate, then run `just ci-local-prepush`. Resolve the source and
+base before Git resolves the push object. The hook fetches develop and verifies
+its ancestry; it keeps the checked HEAD fixed. A moving base, a dirty source,
+hidden index flags, or a pushed object from another worktree stops the push.
+
+The gate runs the product-data checks, `cargo fmt --all -- --check` for Runtime,
+chain-provider and touched workspaces, then `cargo check --workspace
+--all-targets` for Runtime and touched standalone workspaces. It uses Cargo
+metadata to select touched crates for Clippy with warnings denied and their
+enabled lib/bin unit targets. It verifies conventional Rust module declarations
+and available test names before selecting exact test names for a module. Module names and
+unit-test names can differ, so uncertain mappings widen to a full unit target
+or touched crate. Test listing and a positive passed-test count protect against
+zero-test success. Selected server process tests first build their three
+candidate provider inputs and set their test paths under the same lease.
+Workspace manifests, lockfiles and Rust configuration widen the Rust scope;
+unrelated capsule suites and Linux/Browser journeys keep their own gates. A
+removed package needs an explicit acceptance plan. Run the small decision
+fixtures with `just test-ci-local-prepush`; the source CI gate also runs them.
+
+Each worktree and each local heavy operator shares the persistent lock file
+`local-ai-heavy-build.lock` in `git rev-parse --path-format=absolute
+--git-common-dir`. Acquire its exclusive `fcntl.flock` lease before a heavy
+command and keep the file after releasing the lease. A busy lease stops the
+gate. It runs Cargo commands in sequence and settles its child command on
+interruption. Continue light source work and reviews while another operator
+owns the lease. The default shared intermediate directory is `target-build`
+beside the common Git directory. An explicit `CARGO_BUILD_BUILD_DIR` selects
+another shared directory; each workspace keeps its own final target directory.
+The source and shared-build volumes each need at least 15% free space for this gate.
+
+If the cause of your last failed Mac install, update, or Home startup step is
+unclear, reproduce that exact step locally before the next push. Hold the same
+lease, use the task's approved isolated fixture, and record the candidate,
+command and result in its issue. Repair the failure, then repeat that step.
+The hook prints this operator requirement; it does not claim an installed
+journey passed. Review a large diff with Opus before starting long Mac CI. At
+the first CI failure caused by your candidate, cancel its remaining jobs. If CI is the only
+remaining work, end the turn and check again in 15 minutes.
+
+Activate the committed hook in each owned worktree after reviewing it. The
+following recipe requires worktree configuration and preserves existing hooks.
+When it stops for an existing hook configuration, keep that configuration and
+agree how its owner will chain both hooks before changing it. The recipe changes
+only the current worktree's hook path:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+
+def git(*args):
+    return subprocess.check_output(["git", *args], text=True).strip()
+
+root = Path(git("rev-parse", "--show-toplevel"))
+desired = root / ".githooks"
+enabled = subprocess.run(["git", "config", "--bool", "--get", "extensions.worktreeConfig"],
+                         text=True, stdout=subprocess.PIPE)
+if enabled.stdout.strip() != "true":
+    raise SystemExit("Enable worktree configuration through the repository owner first.")
+configured = subprocess.run(["git", "config", "--get", "core.hooksPath"],
+                            text=True, stdout=subprocess.PIPE)
+if configured.returncode == 0:
+    existing = Path(configured.stdout.strip()).expanduser()
+    existing = existing if existing.is_absolute() else root / existing
+    if existing.resolve() != desired.resolve():
+        raise SystemExit("Preserve the existing hook configuration and agree hook chaining first.")
+else:
+    default = Path(git("rev-parse", "--path-format=absolute", "--git-path", "hooks"))
+    if default.exists() and any(not p.name.endswith(".sample") for p in default.iterdir()):
+        raise SystemExit("Preserve the existing hooks and agree hook chaining first.")
+if not (desired / "pre-push").is_file():
+    raise SystemExit("The reviewed committed pre-push hook is required.")
+subprocess.run(["git", "config", "--worktree", "core.hooksPath", str(desired)], check=True)
+PY
+```
+
 ## Native platform inputs
 
 Run the preparation worker from one reviewed, clean checkout on each native

@@ -88,9 +88,13 @@ test-native-browser-isolation:
     cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
     sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
 
-# Collect local source, lint, and test results before a CI-fix push.
+# Check a clean candidate against current develop before each push.
 ci-local-prepush:
     scripts/ci-local-prepush.sh
+
+# Small Git/Cargo decision fixtures; Cargo is simulated.
+test-ci-local-prepush:
+    python3 scripts/ci-local-prepush-test.py
 
 # Cold Debian container check for test-elastos when Docker is available.
 # It copies the working tree and installs Node for integration tests.

@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Exercise pre-push decisions with local Git fixtures and fake Cargo/Node."""
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+from unittest import mock
+
+
+SCRIPT = Path(__file__).with_name("ci-local-prepush.sh")
+SPEC = importlib.util.spec_from_file_location("prepush", SCRIPT.with_suffix(".py"))
+GATE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(GATE)
+
+
+class PrepushTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.tmp = Path(self.scratch.name).resolve()
+        self.root = self.tmp / "source"
+        self.root.mkdir()
+        self.origin = self.tmp / "origin.git"
+        self.log = self.tmp / "commands.jsonl"
+        self.env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                    "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+                    "PREPUSH_ROOT": str(self.root), "PREPUSH_LOG": str(self.log)}
+        self.env.pop("CARGO_BUILD_BUILD_DIR", None)
+        self.git("init", "-q", "-b", "develop")
+        subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True, env=self.env)
+        self.write("elastos/Cargo.toml", "[workspace]\n")
+        self.write("elastos/crates/server/Cargo.toml", '[package]\nname = "server"\n')
+        self.write("elastos/crates/server/src/lib.rs", "mod runtime;\n")
+        self.write("elastos/crates/server/src/runtime.rs", "// fixture\n")
+        self.write("elastos/crates/server/src/main.rs", "mod release_cmd;\n")
+        self.write("elastos/crates/server/src/release_cmd.rs", "// fixture\n")
+        self.write("elastos/crates/other/Cargo.toml", '[package]\nname = "other"\n')
+        self.write("capsules/chain-provider/Cargo.toml", '[package]\nname = "chain-provider"\n')
+        self.write("capsules/chain-provider/src/main.rs", "// fixture\n")
+        self.write("capsules/wallet-provider/Cargo.toml", '[package]\nname = "wallet-provider"\n')
+        self.write("capsules/wallet-provider/src/approval.rs", "// fixture\n")
+        self.write("capsules/chat-room-ui/Cargo.toml", '[package]\nname = "chat-room-ui"\n')
+        self.write("capsules/chat-room-ui/src/lib.rs", "// fixture\n")
+        for name in ("protected-content-protect-provider", "protected-content-decrypt-provider", "custody-provider"):
+            self.write("capsules/" + name + "/Cargo.toml", '[package]\nname = "' + name + '"\n')
+        self.write("README.md", "Fixture\n")
+        self.write(".gitignore", "**/target/\n/target-build/\n")
+        self.commit()
+        self.git("remote", "add", "origin", str(self.origin))
+        self.git("push", "-q", "origin", "develop")
+        self.git("switch", "-q", "-c", "fix/fixture")
+        self.write("elastos/crates/server/src/release_cmd.rs", "// changed module\n")
+        self.commit()
+        binaries = self.tmp / "bin"
+        binaries.mkdir()
+        self.env["PATH"] = str(binaries) + os.pathsep + self.env["PATH"]
+        program = textwrap.dedent('''\
+            import json, os, pathlib, signal, subprocess, sys, time
+            root = pathlib.Path(os.environ["PREPUSH_ROOT"])
+            args = sys.argv[1:]
+            with open(os.environ["PREPUSH_LOG"], "a") as log:
+                log.write(json.dumps({"tool": pathlib.Path(sys.argv[0]).name, "args": args,
+                                      "cwd": os.getcwd(), "build_dir": os.environ.get("CARGO_BUILD_BUILD_DIR"),
+                                      "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
+            if pathlib.Path(sys.argv[0]).name == "node":
+                sys.exit(0)
+            if args[0] == "metadata":
+                if os.environ.get("PREPUSH_CHILD"):
+                    subprocess.Popen([sys.executable, "-c", "import os, pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(os.environ['PREPUSH_CHILD']).write_text(str(os.getpid())); time.sleep(30)"])
+                if os.environ.get("PREPUSH_SLEEP"):
+                    time.sleep(30)
+                manifest = pathlib.Path(args[args.index("--manifest-path") + 1])
+                workspace = manifest.parent
+                def package(name, folder, kinds):
+                    return {"id": name, "name": name, "manifest_path": str(folder / "Cargo.toml"),
+                            "targets": [{"kind": [kind], "name": name, "test": True,
+                                         "src_path": str(folder / "src" / ("main.rs" if kind == "bin" else "lib.rs"))} for kind in kinds]}
+                if workspace == root / "elastos":
+                    packages = [package(os.environ.get("PREPUSH_PACKAGE", "server"), workspace / "crates/server", ["lib", "bin"]),
+                                package("other", workspace / "crates/other", ["lib"])]
+                else:
+                    packages = [package(workspace.name, workspace, ["cdylib" if workspace.name == "chat-room-ui" else "bin"])]
+                print(json.dumps({"workspace_root": str(workspace), "workspace_members": [p["id"] for p in packages],
+                                  "packages": packages}))
+            elif args[0] == "check":
+                if os.environ.get("PREPUSH_DIRTY"):
+                    (root / "README.md").write_text("changed during check\\n")
+                if os.environ.get("PREPUSH_HEAD"):
+                    subprocess.run(["git", "commit", "--allow-empty", "-qm", "new candidate"], cwd=root, check=True)
+                if os.environ.get("PREPUSH_ADVANCE"):
+                    remote = os.environ["PREPUSH_ADVANCE"]
+                    old = subprocess.check_output(["git", "-C", remote, "rev-parse", "refs/heads/develop"], text=True).strip()
+                    tree = subprocess.check_output(["git", "-C", remote, "rev-parse", old + "^{tree}"], text=True).strip()
+                    commit = subprocess.check_output(["git", "-C", remote, "commit-tree", tree, "-p", old, "-m", "base advanced"], text=True).strip()
+                    subprocess.run(["git", "-C", remote, "update-ref", "refs/heads/develop", commit], check=True)
+                if os.environ.get("PREPUSH_FAIL"):
+                    sys.exit(1)
+            elif args[0] == "build":
+                binary = pathlib.Path(os.getcwd()) / "target/release" / pathlib.Path(os.getcwd()).name
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_text("fixture")
+                binary.chmod(0o755)
+            elif args[0] == "test":
+                if "--list" in args:
+                    empty = os.environ.get("PREPUSH_NO_TESTS") or (os.environ.get("PREPUSH_EMPTY_BIN") and "--bin" in args)
+                    listed = os.environ.get("PREPUSH_TESTS", "release_cmd::tests::updates: test")
+                    if "--lib" in args:
+                        listed = os.environ.get("PREPUSH_LIB_TESTS", listed)
+                    print(listed if not empty else "0 tests")
+                else:
+                    count = 0 if os.environ.get("PREPUSH_ZERO") else 1
+                    print(f"test result: ok. {count} passed; 0 failed; 1 ignored; 0 measured; 0 filtered out")
+            ''')
+        for tool in ("cargo", "node"):
+            path = binaries / tool
+            path.write_text("#!" + sys.executable + "\n" + program)
+            path.chmod(0o755)
+
+    def write(self, path, text):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def git(self, *args):
+        return subprocess.check_output(["git", *args], cwd=self.root, env=self.env, text=True).strip()
+
+    def commit(self):
+        self.git("add", "-A")
+        self.git("commit", "-qm", "fixture")
+
+    def invoke(self, input=None, extra=None):
+        args = [str(SCRIPT)] + (["origin", str(self.origin)] if input is not None else [])
+        return subprocess.run(args, cwd=self.root, env={**self.env, **(extra or {})},
+                              input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def commands(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def push_line(self, ref="refs/heads/fix/fixture", oid=None, remote="refs/heads/fix/fixture"):
+        return "{} {} {} {}\n".format(ref, oid or self.git("rev-parse", "HEAD"), remote, "0" * 40)
+
+    def assert_stopped(self, result, message):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+
+    def test_hook_candidate_and_caller_worktree_run_scoped_gates(self):
+        result = self.invoke(self.push_line())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cargo = [c for c in self.commands() if c["tool"] == "cargo"]
+        self.assertTrue(any(c["args"] == ["check", "--workspace", "--all-targets"] for c in cargo))
+        clippy, = [c for c in cargo if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "--", "-D", "warnings"])
+        tests = [c for c in cargo if c["args"][0] == "test"]
+        self.assertEqual(len(tests), 2)
+        self.assertNotIn("--lib", tests[0]["args"])
+        self.assertIn("--bin", tests[0]["args"])
+        self.assertIn("--exact", tests[1]["args"])
+        self.assertIn("release_cmd::tests::updates", tests[1]["args"])
+        self.assertTrue(all(c["cwd"].startswith(str(self.root)) for c in cargo))
+        self.assertTrue(all(c["build_dir"] == str(self.root / "target-build") for c in cargo))
+
+    def test_push_refusals_run_before_cargo(self):
+        for line in ("", "malformed\n", self.push_line() * 2,
+                     self.push_line(oid="f" * 40), self.push_line(ref="refs/heads/other"),
+                     self.push_line(remote="refs/tags/candidate"),
+                     self.push_line(ref="(delete)", oid="0" * 40)):
+            with self.subTest(line=line):
+                self.assertNotEqual(self.invoke(line).returncode, 0)
+                self.assertEqual(self.commands(), [])
+
+    def test_dirty_source_and_hidden_index_flags_are_refused(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            self.git("update-index", flag, "README.md")
+            self.assert_stopped(self.invoke(), "index flags")
+            self.git("update-index", "--no" + flag[1:], "README.md")
+        self.write("untracked.txt", "dirty\n")
+        self.assert_stopped(self.invoke(), "working tree changes")
+        self.assertEqual(self.commands(), [])
+
+    def test_detached_head_is_refused(self):
+        self.git("checkout", "-q", "--detach")
+        self.assert_stopped(self.invoke(), "symbolic-ref")
+        self.assertEqual(self.commands(), [])
+
+    def test_fetch_failure_and_stale_develop_are_refused(self):
+        self.git("remote", "set-url", "origin", str(self.tmp / "missing"))
+        self.assert_stopped(self.invoke(), "fetch")
+        self.git("remote", "set-url", "origin", str(self.origin))
+        self.git("reset", "--hard", "HEAD~1")
+        self.git("switch", "-q", "--orphan", "fix/stale")
+        self.write("README.md", "stale\n")
+        self.commit()
+        self.assert_stopped(self.invoke(), "merge current origin/develop")
+        self.assertEqual(self.commands(), [])
+
+    def test_changed_source_head_and_remote_base_fail_final_check(self):
+        for extra, message in (({"PREPUSH_DIRTY": "1"}, "working tree changes"),
+                               ({"PREPUSH_HEAD": "1"}, "HEAD changed during checks"),
+                               ({"PREPUSH_ADVANCE": str(self.origin)}, "merge current origin/develop")):
+            with self.subTest(extra=extra):
+                original = self.git("rev-parse", "HEAD")
+                self.assert_stopped(self.invoke(extra=extra), message)
+                self.git("reset", "--hard", original)
+
+    def test_zero_and_ignored_tests_fail_and_first_cargo_failure_stops(self):
+        for extra, message in (({"PREPUSH_NO_TESTS": "1"}, "zero unit tests"),
+                               ({"PREPUSH_ZERO": "1"}, "zero passing unit tests"),
+                               ({"PREPUSH_FAIL": "1"}, "cargo check")):
+            with self.subTest(extra=extra):
+                self.log.unlink(missing_ok=True)
+                self.assert_stopped(self.invoke(extra=extra), message)
+                if "PREPUSH_FAIL" in extra:
+                    self.assertFalse(any(c["args"][0] in {"clippy", "test"} for c in self.commands()))
+
+    def test_empty_touched_binary_cannot_use_library_tests_as_proof(self):
+        self.write("elastos/crates/server/src/lib.rs", "// changed library\n")
+        self.write("elastos/crates/server/src/main.rs", "mod release_cmd;\n// changed binary\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_EMPTY_BIN": "1"})
+        self.assert_stopped(result, "zero unit tests on this host: --bin server")
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "server", "--lib"] and
+                            "--nocapture" in c["args"] for c in self.commands()))
+
+    def test_standalone_binary_and_workspace_manifest_scope(self):
+        self.write("capsules/chain-provider/src/main.rs", "// changed binary\n")
+        self.write("elastos/Cargo.toml", "[workspace]\n# changed workspace\n")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and
+                            c["args"] == ["check", "--workspace", "--all-targets"] for c in commands))
+        self.assertTrue(any(c["args"][:5] == ["test", "-p", "chain-provider", "--bin", "chain-provider"] for c in commands))
+        self.assertTrue(any(c["args"][:3] == ["test", "-p", "other"] for c in commands))
+        self.assertFalse(any("wallet-provider" in str(c) for c in commands))
+
+    def test_rename_paths_with_newlines_and_removed_package_are_preserved(self):
+        self.git("mv", "elastos/crates/server/src/release_cmd.rs", "capsules/wallet-provider/src/renamed\nmodule.rs")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["args"][:3] == ["test", "-p", "wallet-provider"] for c in self.commands()))
+        (self.root / "capsules/wallet-provider/Cargo.toml").unlink()
+        self.commit()
+        self.assert_stopped(self.invoke(), "removed Rust package")
+
+    def test_busy_lease_refuses_and_retains_the_same_inode(self):
+        lock = self.root / ".git/local-ai-heavy-build.lock"
+        with lock.open("a+") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            inode = lock.stat().st_ino
+            self.assert_stopped(self.invoke(), "lease is busy")
+            self.assertEqual(self.commands(), [])
+        self.assertEqual(self.invoke().returncode, 0)
+        self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_explicit_shared_build_dir_is_preserved(self):
+        cache = str(self.tmp / "shared")
+        self.assertEqual(self.invoke(extra={"CARGO_BUILD_BUILD_DIR": cache}).returncode, 0)
+        self.assertTrue(all(c["build_dir"] == cache for c in self.commands()))
+
+    def test_relative_shared_build_dir_is_normalized_for_all_workspaces(self):
+        self.write("capsules/chain-provider/src/main.rs", "// changed\n")
+        self.commit()
+        self.assertEqual(self.invoke(extra={"CARGO_BUILD_BUILD_DIR": "../shared"}).returncode, 0)
+        self.assertTrue(all(c["build_dir"] == str(self.tmp / "shared") for c in self.commands()))
+
+    def test_cdylib_units_and_unknown_module_fallback(self):
+        self.write("capsules/chat-room-ui/src/lib.rs", "// changed\n")
+        self.write("elastos/crates/server/src/helpers.rs", "// ambiguous test owner\n")
+        self.commit()
+        self.assertEqual(self.invoke().returncode, 0)
+        tests = [c for c in self.commands() if c["args"][0] == "test"]
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "chat-room-ui", "--lib"] for c in tests))
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "server", "--lib"] for c in tests))
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "server", "--bin"] for c in tests))
+
+    def test_full_server_units_prepare_candidate_process_providers(self):
+        self.write("elastos/crates/server/src/lib.rs", "// changed crate root\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_PACKAGE": "elastos-server",
+                                    "PREPUSH_TESTS": "protected_content_runtime::tests::process: test"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        builds = [c for c in commands if c["args"][0] == "build"]
+        self.assertEqual(len(builds), 3)
+        self.assertTrue(all(c["args"] == ["build", "--release", "--target-dir", "target"] for c in builds))
+        tests = [c for c in commands if c["args"][0] == "test" and "--list" not in c["args"]]
+        self.assertTrue(all(len(c["provider_env"]) == 3 for c in tests))
+        self.assertTrue(all(str(self.root / "capsules") in path for c in tests for path in c["provider_env"].values()))
+
+    def test_module_names_use_exact_filters_with_overlapping_names(self):
+        self.write("elastos/crates/server/src/runtime.rs", "// changed runtime module\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_PACKAGE": "elastos-server",
+                                    "PREPUSH_LIB_TESTS": "runtime::tests::local: test\nprotected_content_runtime::tests::process: test"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tests = [c for c in self.commands() if c["args"][0] == "test" and "--list" not in c["args"]]
+        library, = [c for c in tests if "--lib" in c["args"]]
+        self.assertIn("--exact", library["args"])
+        self.assertIn("runtime::tests::local", library["args"])
+        self.assertNotIn("protected_content_runtime::tests::process", library["args"])
+        self.assertFalse(any(c["args"][0] == "build" for c in self.commands()))
+
+    def test_committed_hook_calls_reviewed_source_for_caller_candidate(self):
+        hook = SCRIPT.parent.parent / ".githooks/pre-push"
+        result = subprocess.run([str(hook), "origin", str(self.origin)], cwd=self.root, env=self.env,
+                                input=self.push_line(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_disk_reserve_refuses_before_builds(self):
+        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 86, 14)):
+            with self.assertRaisesRegex(GATE.GateError, "15% disk reserve"):
+                GATE.disk_reserve(self.root)
+        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 85, 15)):
+            GATE.disk_reserve(self.root)
+
+    def test_interrupt_settles_owned_cargo_and_releases_lease(self):
+        child_file = self.tmp / "child.pid"
+        process = subprocess.Popen([str(SCRIPT)], cwd=self.root,
+                                   env={**self.env, "PREPUSH_SLEEP": "1", "PREPUSH_CHILD": str(child_file)},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not child_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(child_file.exists(), "Cargo descendant fixture did not start")
+            child = int(child_file.read_text())
+            process.send_signal(signal.SIGTERM)
+            _, error = process.communicate(timeout=7)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("received signal", error)
+            status = subprocess.run(["ps", "-p", str(child), "-o", "stat="], text=True, stdout=subprocess.PIPE)
+            self.assertTrue(status.returncode != 0 or status.stdout.strip().startswith("Z"),
+                            "owned descendant survived interruption: " + status.stdout)
+            with (self.root / ".git/local-ai-heavy-build.lock").open("a+") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+
+def shutil_usage(total, used, free):
+    from collections import namedtuple
+    return namedtuple("Usage", "total used free")(total, used, free)
+
+
+if __name__ == "__main__":
+    unittest.main()

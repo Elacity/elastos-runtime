@@ -16,11 +16,10 @@ are the only place for work status, acceptance criteria and proof.
   reviews and is merged. Until then, keep verified work open in QA / Review.
   Take the next unblocked task in that lane; starting it does not complete its
   predecessor. Keep blocked work open with its blocker in the issue.
-- Follow CI and installed journeys that you start to completion in the same
-  turn. While they run, continue eligible work in the other lane and keep the
-  one-active-task limit. Inspect the completed result, repair failures, and
-  verify the new candidate before handing back. An external blocker belongs
-  in the owning issue.
+- At the first CI failure caused by your candidate, cancel its remaining jobs
+  and repair the cause before another push. Continue eligible work while CI
+  runs. If CI is the only remaining work, end the turn and check again in
+  15 minutes. Record an external blocker in the owning issue.
 - Run at most one heavy local build on this Mac at a time. Workers agree which
   issue owns that build before starting it. CI builds do not count toward this
   local limit. Continue reviews, source work or other light checks in parallel.
@@ -246,6 +245,17 @@ git log --oneline <upstream>..HEAD
 git diff --stat <upstream>...HEAD
 git rev-list --left-right --count <upstream>...HEAD
 ```
+
+Before each push, fetch and merge current `origin/develop`, then check the
+clean candidate with `just ci-local-prepush`. The committed pre-push hook
+checks the exact pushed HEAD and refuses a stale base. It runs formatting,
+workspace/all-targets checks, Clippy for touched crates, and their unit targets.
+Use the [local pre-push procedure](scripts/README.md#local-pre-push-gate) to
+activate the hook and share the local heavy-build lease across worktrees.
+Reproduce an unclear failed Mac install, update, or Home startup step locally
+under that lease before pushing. Review a large diff with Opus before long Mac
+CI. Record the command and result in the owning issue; source checks and an
+operator reminder alone do not prove that installed step.
 
 Before deploying public Home, show the exact commit being deployed, confirm that
 `live` either already points to that commit or will be moved only after

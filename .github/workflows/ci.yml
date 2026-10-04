@@ -65,6 +65,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: product data contracts
         run: node scripts/check-product-data.mjs
+      - name: local pre-push gate behavior
+        run: python3 scripts/ci-local-prepush-test.py
       - name: product UI source proofs
         run: |
           node --version
