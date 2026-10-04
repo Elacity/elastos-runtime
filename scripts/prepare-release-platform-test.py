@@ -5,6 +5,7 @@ import json
 import base64
 import hashlib
 import io
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -130,6 +131,7 @@ class PrepareWorkerTest(unittest.TestCase):
         for name in (
             "publish-release.sh", "prepare-release-platform.sh", "release-platform-input.py",
             "components-release-integrity-check.py", "check-versioning.sh", "build-media-tools.sh",
+            "release-upstream-assets.py", "release-upstream-input.py", "model-package-handoff.py",
         ):
             (scripts / name).write_bytes((SOURCE / "scripts" / name).read_bytes())
             (scripts / name).chmod(0o755)
@@ -201,6 +203,23 @@ class PrepareWorkerTest(unittest.TestCase):
             "extract_path": "llama-b10516",
             "install_path": "libexec/llama.cpp/b10516/linux-arm64",
             "binary_path": "llama-server"}}}
+        # Run the real upstream packaging helper with only tiny local pinned inputs.
+        license_path = scripts / "fixture-license.txt"
+        license_path.write_bytes(b"Synthetic upstream fixture licence\n")
+        recipe = {"schema": "elastos.release-upstream-input/v1", "component": "llama-server",
+                  "platform": "linux-arm64", "version": "0.0.10516", "format": "tar.gz",
+                  "root": "llama-b10516", "entrypoint": "llama-server", "extract_path": "llama-b10516",
+                  "install_path": "libexec/llama.cpp/b10516/linux-arm64", "binary_path": "llama-server",
+                  "max_unpacked_bytes": 4096,
+                  "source": {"path": "@llama-arm64-bundle", "checksum": "sha256:" + hashlib.sha256(self.arm64_engine.read_bytes()).hexdigest(),
+                             "max_bytes": self.arm64_engine.stat().st_size},
+                  "license": {"spdx_id": "MIT", "files": [{"name": "LICENSE", "source": {
+                      "path": "scripts/fixture-license.txt", "checksum": "sha256:" + hashlib.sha256(license_path.read_bytes()).hexdigest(),
+                      "max_bytes": license_path.stat().st_size}}]}}
+        (scripts / "release-upstream-recipes.json").write_text(json.dumps({
+            "schema": "elastos.release-upstream-recipes/v1", "recipes": [recipe]}))
+        external["llama-server"]["platforms"]["linux-arm64"].update(
+            strategy="source-build", cid="bafy-stale-fixture", url="https://example.invalid/stale-fixture")
         (self.repo / "components.json").write_text(json.dumps({
             "schema": "elastos.components/v1", "external": external,
             "profiles": {"home": {"components": ["home", "shell", "media-tools", "media-provider"]}}}))
@@ -248,7 +267,10 @@ class PrepareWorkerTest(unittest.TestCase):
         if init:
             commands.extend([("git", "init", "-b", "fixture"), ("git", "config", "user.name", "Fixture"),
                              ("git", "config", "user.email", "fixture@invalid"),
-                             ("git", "config", "commit.gpgsign", "false")])
+                             ("git", "config", "commit.gpgsign", "false"),
+                             ("git", "config", "gc.auto", "0"),
+                             ("git", "config", "maintenance.auto", "false"),
+                             ("git", "config", "gc.autoDetach", "false")])
         commands.extend([("git", "add", "."), ("git", "commit", "-m", message)])
         for command in commands:
             result = self.command(*command)
@@ -370,7 +392,7 @@ class PrepareWorkerTest(unittest.TestCase):
         m2, result = self.prepare("arm-m2", env=env, version="0.7.2", reuse_support=m1)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name in ("components.json", "components-template.json", "artifacts/model-catalog.json",
-                     "artifacts/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"):
+                     "artifacts/llama-server-linux-arm64.tar.gz"):
             self.assertEqual((m2 / name).read_bytes(), (m1 / name).read_bytes(), name)
         calls = [json.loads(line) for line in (self.root / "cargo.log").read_text().splitlines()]
         builds = [entry for entry in calls if entry["args"][0] == "build"]
@@ -433,7 +455,7 @@ class PrepareWorkerTest(unittest.TestCase):
                "ELASTOS_LLAMA_ARM64_BUNDLE": str(wrong)}
         output, result = self.prepare(env=env)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("wrong size", result.stderr)
+        self.assertIn("checksum differs", result.stderr)
         self.assertFalse(output.exists())
         self.assertFalse((self.root / "cargo.log").exists())
         content = bytearray(self.arm64_engine.read_bytes())
@@ -444,6 +466,118 @@ class PrepareWorkerTest(unittest.TestCase):
         self.assertIn("checksum differs", result.stderr)
         self.assertFalse(output.exists())
         self.assertFalse((self.root / "cargo.log").exists())
+
+    def model_preparation_env(self):
+        return {**self.env, 'ELASTOS_RELEASE_MODEL_KUBO_BIN': str(self.root / 'fixture-kubo'),
+                'ELASTOS_RELEASE_MODEL_KUBO_REPO': str(self.root / 'fixture-kubo-repo'),
+                'ELASTOS_RELEASE_MODEL_PUBLISHED_AT': '1800000000',
+                'ELASTOS_RELEASE_MODEL_PUBLISHER_DID': 'did:key:z6MkFixture',
+                'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(self.root / 'model-handoff')}
+
+    def test_model_preparation_refuses_partial_env_and_bad_handoff_before_build(self):
+        complete = self.model_preparation_env()
+        for name in [key for key in complete if key.startswith('ELASTOS_RELEASE_MODEL_')]:
+            with self.subTest(missing=name):
+                partial = dict(complete)
+                partial.pop(name)
+                output, result = self.prepare(env=partial)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Model preparation requires', result.stderr)
+                self.assertFalse(output.exists())
+                self.assertFalse((self.root / 'cargo.log').exists())
+        for handoff in (self.root / 'prepared', self.root / 'prepared/nested'):
+            with self.subTest(handoff=handoff):
+                output, result = self.prepare(env={**complete, 'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(handoff)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('new sibling', result.stderr)
+                self.assertFalse(output.exists())
+                self.assertFalse((self.root / 'cargo.log').exists())
+        (self.root / 'model-handoff').mkdir()
+        _, result = self.prepare(env=complete)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('new sibling', result.stderr)
+        _, result = self.prepare(env=complete, reuse_support=self.root / 'unused-support')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('fresh support', result.stderr)
+
+    def test_model_handoff_reuse_selects_one_input_and_refuses_mixed_export_mode(self):
+        env = {**self.env, 'ELASTOS_RELEASE_MODEL_PUBLISHED_AT': '1800000000',
+               'ELASTOS_RELEASE_MODEL_PUBLISHER_DID': 'did:key:z6MkFixture',
+               'ELASTOS_RELEASE_MODEL_HANDOFF_INPUT': str(self.root / 'shared-models'),
+               'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(self.root / 'native-models')}
+        command = ('/bin/bash', '-c', 'source scripts/publish-release.sh; release_model_preparation_enabled')
+        enabled = self.command(*command, env=env)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(enabled.stdout.strip(), 'true')
+        for variable in ('KUBO_BIN', 'KUBO_REPO'):
+            with self.subTest(variable=variable):
+                refused = self.command(*command, env={**env, 'ELASTOS_RELEASE_MODEL_' + variable: 'fixture'})
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn('without KUBO_BIN or KUBO_REPO', refused.stderr)
+
+    def test_optional_model_wiring_retains_unsigned_handoff_outside_native_artifacts(self):
+        # Exercise the native worker and real upstream capsule packaging. Only
+        # the expensive Kubo/model retention operation is a local inert stub.
+        driver = self.repo / 'scripts/release-upstream-assets.py'
+        driver.rename(driver.with_name('release-upstream-assets-real.py'))
+        driver.write_text(r'''#!/usr/bin/env python3
+import hashlib, json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+flags = ('--model-kubo-bin', '--model-kubo-repo', '--published-at', '--model-publisher-did', '--model-handoff-output')
+assert all(args.count(flag) == 1 for flag in flags)
+values = {flag: args[args.index(flag) + 1] for flag in flags}
+for flag, variable in zip(flags, ('KUBO_BIN', 'KUBO_REPO', 'PUBLISHED_AT', 'PUBLISHER_DID', 'HANDOFF_OUTPUT')):
+    assert values[flag] == os.environ['ELASTOS_RELEASE_MODEL_' + variable]
+baseline = [value for index, value in enumerate(args) if value not in flags and (index == 0 or args[index - 1] not in flags)]
+reply = subprocess.check_output([sys.executable, str(pathlib.Path(__file__).with_name('release-upstream-assets-real.py')), *baseline], text=True)
+result = json.loads(reply)
+output = pathlib.Path(args[args.index('--output') + 1])
+handoff = pathlib.Path(values['--model-handoff-output'])
+handoff.mkdir(mode=0o700)
+def write(name, content):
+    path = handoff / name
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return {'release_path': name, 'checksum': 'sha256:' + hashlib.sha256(content).hexdigest(), 'size': len(content)}
+retention = {}
+for index, name in enumerate(('model-qwen3.5-0.8b', 'model-qwen3.5-4b', 'model-qwen3.5-9b', 'model-bonsai-8b-q1')):
+    retention[name] = {'package_cid': 'bfixture' + str(index),
+                       'car': write(name + '.car', ('inert CAR ' + name).encode()),
+                       'receipt': write(name + '.car.receipt.json', b'{"fixture":true}\n')}
+catalogue = write('model-catalog.unsigned.json', json.dumps({'schema': 'elastos.model.catalog/v1',
+    'published_at': int(values['--published-at']), 'entries': []}).encode())
+catalogue['publisher_did'] = values['--model-publisher-did']
+result.update(model_retention=retention, model_catalog_unsigned=catalogue)
+receipt_path = output / 'upstream-input.json'
+receipt = json.loads(receipt_path.read_bytes())
+receipt.update(model_retention=retention, model_catalog_unsigned=catalogue)
+receipt_path.write_text(json.dumps(receipt) + '\n')
+print(json.dumps(result))
+''')
+        driver.chmod(0o755)
+        self.commit('inert model retention wiring fixture')
+        output, result = self.prepare(env=self.model_preparation_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        handoff = self.root / 'model-handoff'
+        self.assertEqual(len(list(handoff.iterdir())), 9)
+        provenance = json.loads((output / 'model-handoff.json').read_bytes())
+        self.assertEqual(provenance['schema'], 'elastos.release-model-handoff/v1')
+        self.assertEqual(provenance['handoff_directory'], '../model-handoff')
+        receipt = json.loads((output / 'platform-input.json').read_bytes())
+        self.assertEqual(provenance['source'], {key: receipt['source'][key] for key in ('commit', 'tree', 'clean')})
+        self.assertEqual(receipt['files']['model-handoff.json']['sha256'], hashlib.sha256((output / 'model-handoff.json').read_bytes()).hexdigest())
+        self.assertEqual(provenance['upstream_input_sha256'], hashlib.sha256((output / 'upstream-input.json').read_bytes()).hexdigest())
+        for name, info in provenance['files'].items():
+            self.assertEqual(info['checksum'], 'sha256:' + hashlib.sha256((handoff / name).read_bytes()).hexdigest())
+            self.assertEqual(info['size'], (handoff / name).stat().st_size)
+            self.assertEqual((handoff / name).stat().st_mode & 0o077, 0)
+            self.assertFalse((output / 'artifacts' / name).exists())
+        manifest = json.loads((output / 'components.json').read_bytes())
+        self.assertNotIn('model_retention', manifest)
+        self.assertNotIn('model_catalog_unsigned', manifest)
+        self.assertFalse(any('model_retention' in component for component in manifest['external'].values()))
+        checked = self.command('python3', 'scripts/release-platform-input.py', 'verify', str(output))
+        self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_success_uses_real_packaging_and_receipt(self):
         output, result = self.prepare()
@@ -489,6 +623,43 @@ class PrepareWorkerTest(unittest.TestCase):
         output, result = self.prepare(env={**self.env, "FAIL_BUILD": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(output.exists())
+
+    def test_symlink_parent_prepares_verified_input_at_canonical_path(self):
+        parent = self.root / "canonical-output"
+        parent.mkdir()
+        alias = self.root / "output-alias"
+        alias.symlink_to(parent, target_is_directory=True)
+        output, result = self.prepare("output-alias/prepared")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        canonical = parent / "prepared"
+        self.assertEqual(output.resolve(), canonical)
+        verified = self.command("python3", "scripts/release-platform-input.py", "verify", str(canonical))
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+        self.assertEqual(list(parent.glob(".release-platform.*")), [])
+
+    def test_symlink_parent_preserves_final_entry_and_checks_before_staging(self):
+        parent = self.root / "canonical-output"
+        parent.mkdir()
+        (self.root / "output-alias").symlink_to(parent, target_is_directory=True)
+        existing = parent / "existing"
+        existing.mkdir()
+        (existing / "owned.txt").write_text("preserve")
+        (parent / "dangling").symlink_to(parent / "absent-target")
+        for name in ("existing", "dangling"):
+            with self.subTest(name=name):
+                _, result = self.prepare("output-alias/" + name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Output already exists", result.stderr)
+                self.assertFalse((self.root / "cargo.log").exists())
+                self.assertEqual(list(parent.glob(".release-platform.*")), [])
+        self.assertEqual((existing / "owned.txt").read_text(), "preserve")
+        self.assertTrue((parent / "dangling").is_symlink())
+        (self.repo / "components.json").write_text("dirty")
+        _, result = self.prepare("output-alias/new-parent/prepared")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Source checkout must be clean", result.stderr)
+        self.assertFalse((parent / "new-parent").exists())
+        self.assertFalse((self.root / "cargo.log").exists())
 
     def test_media_build_failure_removes_stage_and_preserves_missing_output(self):
         output, result = self.prepare(env={**self.env, "FAIL_MEDIA_BUILD": "1"})
@@ -563,6 +734,7 @@ class PrepareWorkerTest(unittest.TestCase):
                 block = 'media_info = platform_info("media-tools")' + source.split(
                     'media_info = platform_info("media-tools")', 1)[1].split(
                     "\ndef write_capsule_archive", 1)[0].split(
+                    '\ncache = pathlib.Path', 1)[0].split(
                     '\nif platform == "linux-arm64":', 1)[0]
                 artifacts = self.root / script
                 artifacts.mkdir()
@@ -586,21 +758,50 @@ class PrepareWorkerTest(unittest.TestCase):
             'if platform == "linux-arm64":', 1)[1].split("\ndef write_capsule_archive", 1)[0]
         artifacts = self.root / "carrier-artifacts"
         artifacts.mkdir()
-        descriptor = json.loads((self.repo / "components.json").read_text())[
-            "external"]["llama-server"]["platforms"]["linux-arm64"]
+        manifest = json.loads((self.repo / "components.json").read_text())
+        descriptor = manifest["external"]["llama-server"]["platforms"]["linux-arm64"]
+        recipes_path = self.repo / "scripts/release-upstream-recipes.json"
+        recipes = json.loads(recipes_path.read_bytes())
+        for item in recipes['recipes'][0]['license']['files']:
+            item['source']['path'] = str(self.repo / item['source']['path'])
+        recipes_path.write_text(json.dumps(recipes))
+        spec = importlib.util.spec_from_file_location('carrier_fixture_upstream',
+                                                    self.repo / "scripts/release-upstream-input.py")
+        upstream = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(upstream)
         scope = {"platform": "linux-arm64", "artifacts_dir": artifacts,
                  "platform_info": lambda name: descriptor, "os": os, "pathlib": __import__("pathlib"),
-                 "shutil": shutil, "hashlib": hashlib}
+                 "shutil": shutil, "hashlib": hashlib, "json": json, "tempfile": tempfile,
+                 "root": self.repo, "cache": self.root / "upstream-cache", "upstream": upstream,
+                 "manifest": manifest}
         with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine)}):
             exec(compile(block, script, "exec"), scope)
         staged = artifacts / descriptor["release_path"]
-        self.assertEqual(staged.read_bytes(), self.arm64_engine.read_bytes())
+        self.assertEqual(descriptor['release_path'], 'llama-server-linux-arm64.tar.gz')
+        self.assertEqual(descriptor['checksum'], 'sha256:' + hashlib.sha256(staged.read_bytes()).hexdigest())
+        self.assertNotEqual(staged.read_bytes(), self.arm64_engine.read_bytes())
+        with tarfile.open(staged) as capsule, tarfile.open(self.arm64_engine) as original:
+            for name in ('llama-server', 'libllama.so'):
+                path = 'llama-b10516/' + name
+                self.assertEqual(capsule.extractfile(path).read(), original.extractfile(path).read())
+            self.assertEqual(capsule.extractfile('llama-b10516/LICENSE').read(),
+                             (self.repo / 'scripts/fixture-license.txt').read_bytes())
+            metadata = json.load(capsule.extractfile('llama-b10516/capsule.json'))
+            self.assertEqual((metadata['role'], metadata['type']), ('content', 'data'))
+            self.assertIsNotNone(capsule.getmember('llama-b10516/PROVENANCE.json'))
+        metadata = manifest['external']['llama-server']['capsule_metadata']['platforms']['linux-arm64']
+        self.assertEqual(metadata['checksum'], descriptor['checksum'])
+        self.assertEqual(metadata['size'], staged.stat().st_size)
+        self.assertNotIn('strategy', descriptor)
         wrong = self.root / "wrong-arm64-engine.tar.gz"
         data = bytearray(self.arm64_engine.read_bytes())
         data[-1] ^= 1
         wrong.write_bytes(data)
+        # A fresh cache exercises admission of the supplied bytes; a populated
+        # cache correctly reuses the already verified input with the same pin.
+        scope['cache'] = self.root / 'wrong-upstream-cache'
         with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(wrong)}):
-            with self.assertRaisesRegex(SystemExit, "differs from components.json"):
+            with self.assertRaisesRegex(ValueError, "upstream input checksum mismatch"):
                 exec(compile(block, script, "exec"), scope)
 
     def test_demo_rejects_old_input_and_overlays_selected_platform(self):
@@ -672,6 +873,17 @@ class PrepareWorkerTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((output / f"artifacts/elastos-{platform}").is_file())
             self.assert_media_archive(output, platform, setup_platform)
+            if platform == "aarch64-linux":
+                prepared = json.loads((output / "components.json").read_bytes())
+                descriptor = prepared["external"]["llama-server"]["platforms"]["linux-arm64"]
+                self.assertFalse(any(field in descriptor for field in ("strategy", "url", "cid")))
+                with tarfile.open(self.arm64_engine) as original, tarfile.open(output / "artifacts" / descriptor["release_path"]) as capsule:
+                    for name in ("llama-server", "libllama.so"):
+                        relative = "llama-b10516/" + name
+                        self.assertEqual(capsule.extractfile(relative).read(), original.extractfile(relative).read())
+                        self.assertEqual(capsule.getmember(relative).mode, original.getmember(relative).mode)
+                self.assertTrue((output / "upstream-recipes.json").is_file())
+                self.assertTrue((output / "upstream-input.json").is_file())
             inputs.extend(["--input", f"{platform}={output}"])
         media_calls = [json.loads(line) for line in (self.root / "media.log").read_text().splitlines()]
         self.assertEqual(media_calls, [

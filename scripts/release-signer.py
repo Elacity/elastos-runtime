@@ -41,6 +41,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPOSITORY = "Elacity/elastos-runtime"
@@ -51,6 +52,8 @@ BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MAX_JSON = 2 * 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 CHANNELS = {"stable", "canary", "jetson-test"}
+MODEL_CATALOG_DOMAIN = "elastos.model.catalog.v1"
+MODEL_COMPONENTS = {"model-qwen3.5-0.8b", "model-qwen3.5-4b", "model-qwen3.5-9b", "model-bonsai-8b-q1"}
 STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID", "IPNS_NAME"}
 
 
@@ -560,8 +563,147 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
 
 
 def signature_digest(domain, payload):
-    require(domain in ("elastos.release.v1", "elastos.release.head.v1"), "signing domain refused")
+    require(domain in ("elastos.release.v1", "elastos.release.head.v1", MODEL_CATALOG_DOMAIN), "signing domain refused")
     return hashlib.sha256(domain.encode() + b"\0" + payload).digest()
+
+
+@dataclass(frozen=True)
+class PreparedCatalog:
+    publisher_did: str
+    payload: bytes
+
+
+def model_path(value):
+    """Match the Runtime's portable model-package path admission."""
+    require(type(value) is str and 0 < len(value) <= 256
+            and all(re.fullmatch(r"[A-Za-z0-9._-]+", part) and part not in (".", "..")
+                    and not part.endswith(".") for part in value.split("/")),
+            "canonical model path required")
+    return value
+
+
+def catalogue_closure(capsule, index):
+    """Check the passive model closure without executing candidate helpers."""
+    require(set(capsule) == {"schema", "name", "version", "role", "type", "projections", "entrypoint", "model_content"}
+            and capsule["schema"] == "elastos.capsule/v1" and capsule["role"] == "content"
+            and capsule["type"] == "data" and capsule["projections"] == ["content"], "passive catalogue capsule required")
+    require(type(capsule["version"]) is str and 0 < len(capsule["version"]) <= 32, "model version refused")
+    entrypoint = capsule["entrypoint"]
+    model_path(entrypoint)
+    require(entrypoint.endswith(".gguf"), "GGUF model entrypoint required")
+    model = capsule["model_content"]
+    require(type(model) is dict and set(model) == {"format", "quantization", "engine", "consumer_interface",
+        "consumer_interface_version", "minimum_memory_mb", "license", "provenance"}, "model content fields refused")
+    require(model["format"] == "gguf" and model["quantization"] in ("Q4_K_M", "Q8_0", "Q1_0")
+            and model["engine"] == "llama.cpp" and model["consumer_interface"] == "elastos.provider.model"
+            and model["consumer_interface_version"] == "0.1.0" and type(model["minimum_memory_mb"]) is int
+            and 1 <= model["minimum_memory_mb"] <= 1048576, "model consumer contract refused")
+    provenance = model["provenance"]
+    require(type(provenance) is dict and set(provenance) == {"base_repository", "base_revision", "base_license",
+        "quantized_repository", "quantized_revision", "path"}, "model provenance fields refused")
+    for name in ("base_repository", "quantized_repository"):
+        model_path(provenance[name])
+        require(len(provenance[name].split("/")) == 2, "model owner/repository required")
+    for name in ("base_revision", "quantized_revision"):
+        oid(provenance[name])
+    notices = [provenance["path"]]
+    for license in (model["license"], provenance["base_license"]):
+        require(type(license) is dict and set(license) == {"spdx_id", "path"}
+                and license["spdx_id"] == "Apache-2.0", "model licence facts refused")
+        notices.append(license["path"])
+    for path in notices:
+        model_path(path)
+        require(path not in (entrypoint, "capsule.json"), "model notice requires a distinct closure file")
+    require(set(index) == {"schema", "kind", "files", "content_digest"}
+            and index["schema"] == "elastos.content.object.manifest/v1" and index["kind"] == "capsule",
+            "self-contained model closure required")
+    files = index["files"]
+    require(type(files) is list and 1 <= len(files) <= 32, "model closure file count refused")
+    previous, paths, total, digest = "", {}, 0, hashlib.sha256()
+    for item in files:
+        require(type(item) is dict and set(item) == {"path", "sha256", "size"}, "model closure file fields refused")
+        path = item["path"]
+        model_path(path)
+        checked_hash(item["sha256"])
+        require(path > previous and path.lower() not in paths and path.lower() != "_elastos_object.json"
+                and type(item["size"]) is int and 0 < item["size"] <= 16 * 1024**3
+                and (path == entrypoint or item["size"] <= 1024**2), "model closure path or size refused")
+        paths[path.lower()] = item
+        total += item["size"]
+        previous = path
+        for value in (path, item["sha256"], str(item["size"])):
+            digest.update(value.encode() + b"\0")
+    require(total <= 16 * 1024**3 and index["content_digest"] == "sha256:" + digest.hexdigest(),
+            "model closure digest or size differs")
+    require(all(path.lower() in paths and paths[path.lower()]["path"] == path
+                for path in (entrypoint, "capsule.json", *notices)), "model closure reference absent")
+    capsule_bytes = json_bytes(capsule)
+    record = paths["capsule.json"]
+    require(record["size"] == len(capsule_bytes) and record["sha256"] == sha256(capsule_bytes),
+            "model capsule closure bytes differ")
+
+
+def prepare_catalog(policy, root, manifest_name, fetch, now=None):
+    """Admit an exact operator-approved public catalogue before key access."""
+    require(policy.get("purpose") == "elastos.model.catalog/v1", "catalogue signing purpose required")
+    verify_source(policy, fetch)
+    check_did(policy.get("publisher_did"))
+    root = Path(root)
+    relative_path(manifest_name)
+    held = directory_fd(root)
+    try:
+        data = regular_bytes(manifest_name, 128 * 1024, root_fd=held)
+    finally:
+        os.close(held)
+    require(sha256(data) == checked_hash(policy.get("manifest_sha256")), "approved catalogue hash differs")
+    payload = parse_json(data)
+    require(type(payload) is dict and set(payload) == {"schema", "published_at", "expires_at", "entries"}
+            and payload["schema"] == "elastos.model.catalog/v1", "catalogue payload fields refused")
+    now = int(time.time()) if now is None else now
+    published, expiry = payload["published_at"], payload["expires_at"]
+    require(type(published) is int and type(policy.get("published_at")) is int and 0 <= published <= now
+            and published == policy.get("published_at"), "approved catalogue publication time differs")
+    require(expiry is None or type(expiry) is int and expiry > now and expiry > published,
+            "catalogue expiry refused")
+    approved = policy.get("catalog_entries")
+    require(type(approved) is dict and set(approved) == MODEL_COMPONENTS, "four approved catalogue bindings required")
+    entries = payload["entries"]
+    require(type(entries) is list and len(entries) == 4, "four catalogue entries required")
+    seen, roots = set(), set()
+    for entry in entries:
+        require(type(entry) is dict and set(entry) == {"cid", "capsule_manifest", "object_manifest"},
+                "catalogue entry fields refused")
+        cid = entry["cid"]
+        codec, _ = cid_info(cid)
+        require(cid.startswith("b") and codec == 0x70 and cid not in roots, "distinct catalogue directory CIDs required")
+        capsule, index = entry["capsule_manifest"], entry["object_manifest"]
+        require(type(capsule) is dict and type(index) is dict, "catalogue capsule and object manifest required")
+        name = capsule.get("name")
+        require(type(name) is str and name in approved and name not in seen, "catalogue component inventory differs")
+        binding = approved[name]
+        require(type(binding) is dict and set(binding) == {"package_cid", "content_digest"}
+                and binding["package_cid"] == cid and binding["content_digest"] == index.get("content_digest")
+                and type(binding["content_digest"]) is str and binding["content_digest"].startswith("sha256:"),
+                "approved catalogue content binding differs")
+        checked_hash(binding["content_digest"][7:])
+        require(capsule.get("schema") == "elastos.capsule/v1" and capsule.get("role") == "content"
+                and capsule.get("type") == "data" and type(capsule.get("model_content")) is dict
+                and index.get("schema") == "elastos.content.object.manifest/v1" and index.get("kind") == "capsule",
+                "catalogue model contract refused")
+        catalogue_closure(capsule, index)
+        seen.add(name)
+        roots.add(cid)
+    return PreparedCatalog(policy["publisher_did"], json_bytes(payload))
+
+
+def sign_catalog(prepared, backend):
+    require(public_did(backend.public_key()) == prepared.publisher_did, "custodian public DID differs")
+    digest = signature_digest(MODEL_CATALOG_DOMAIN, prepared.payload)
+    signature = backend.sign(digest)
+    require(type(signature) is bytes and len(signature) == 64, "Ed25519 signature length differs")
+    require(backend.verify(digest, signature) is True, "signature public verification failed")
+    return (("model-catalog.json", json_bytes({"payload": parse_json(prepared.payload),
+        "signature": signature.hex(), "signer_did": prepared.publisher_did})),)
 
 
 def sign_publication(prepared, backend):
@@ -642,7 +784,8 @@ class OpenSSLBackend:
 
 
 def confirmed(prepared, input_stream, output_stream):
-    output_stream.write(f"Sign approved release as {prepared.publisher_did}.\nType this complete DID to confirm, or press Enter to cancel: ")
+    subject = "model catalogue" if isinstance(prepared, PreparedCatalog) else "release"
+    output_stream.write(f"Sign approved {subject} as {prepared.publisher_did}.\nType this complete DID to confirm, or press Enter to cancel: ")
     output_stream.flush()
     return input_stream.readline().strip() == prepared.publisher_did
 
@@ -652,6 +795,7 @@ def main():
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--input-root", required=True, type=Path)
     parser.add_argument("--manifest", default="signing-input.json")
+    parser.add_argument("--catalog", action="store_true", help="sign only an exact approved four-model catalogue payload")
     parser.add_argument("--output-root", required=True, type=Path)
     args = parser.parse_args()
     require(sys.flags.isolated == 1 and sys.flags.no_site == 1, "run the pinned interpreter with -I -S")
@@ -667,13 +811,17 @@ def main():
         require(info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022,
                 "output parent protection refused")
     with tempfile.TemporaryDirectory(prefix=".elastos-signing-", dir=args.output_root.parent) as scratch:
-        prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
+        if args.catalog:
+            prepared = prepare_catalog(policy, args.input_root, args.manifest, github_json)
+        else:
+            require(policy.get("purpose") != "elastos.model.catalog/v1", "catalogue policy requires catalogue mode")
+            prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
         require(confirmed(prepared, sys.stdin, sys.stderr), "signing cancelled")
         # Recheck canonical source authority after confirmation, before backend use.
         verify_source(policy, github_json)
         backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
         try:
-            publication = sign_publication(prepared, backend)
+            publication = sign_catalog(prepared, backend) if args.catalog else sign_publication(prepared, backend)
         finally:
             backend.close()
         args.output_root.mkdir(mode=0o700)
@@ -690,7 +838,7 @@ def main():
         except Exception:
             shutil.rmtree(args.output_root)
             raise
-    print("Signed approved publication snapshot.")
+    print("Signed approved model catalogue." if args.catalog else "Signed approved publication snapshot.")
 
 
 if __name__ == "__main__":

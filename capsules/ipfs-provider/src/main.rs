@@ -27,10 +27,77 @@ const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const CAT_TO_PATH_CHUNK: usize = 64 * 1024;
+const ADD_PATH_CHUNK: usize = 1024 * 1024;
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
 const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+// The upload borrows one opened file. A short read or changed file cannot
+// silently replace missing payload bytes with the multipart footer.
+struct AddPathReader<'a> {
+    file: &'a mut fs::File,
+    length: u64,
+    remaining: u64,
+    modified: SystemTime,
+}
+
+impl<'a> AddPathReader<'a> {
+    fn new(file: &'a mut fs::File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Upload source must be a regular file",
+            ));
+        }
+        Ok(Self {
+            file,
+            length: metadata.len(),
+            remaining: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+
+    fn unchanged(&self) -> io::Result<()> {
+        let metadata = self.file.metadata()?;
+        if metadata.len() != self.length || metadata.modified()? != self.modified {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Upload source changed during read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for AddPathReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            self.unchanged()?;
+            return Ok(0);
+        }
+        let limit = buffer
+            .len()
+            .min(ADD_PATH_CHUNK)
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let count = self.file.read(&mut buffer[..limit])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Upload source ended before its recorded length",
+            ));
+        }
+        self.remaining -= count as u64;
+        if self.remaining == 0 {
+            self.unchanged()?;
+        }
+        Ok(count)
+    }
+}
 
 fn deserialize_metadata_max<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -1415,9 +1482,50 @@ impl IpfsProvider {
     }
 
     fn kubo_add_path(&self, path: &Path, pin: bool) -> Result<String, String> {
-        let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+        if !fs::metadata(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?
+            .is_file()
+        {
+            return Err("Upload source must be a regular file".into());
+        }
+        let mut file = fs::File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader =
+            AddPathReader::new(&mut file).map_err(|e| format!("Failed to read file: {}", e))?;
+        let length = reader.length;
+        let modified = reader.modified;
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        self.kubo_add_bytes(&bytes, filename, pin)
+        let boundary = format!("----elastos{}", now_unix_secs());
+        let prefix = format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, filename).into_bytes();
+        let footer = format!("\r\n--{}--\r\n", boundary).into_bytes();
+        let content_length = length
+            .checked_add(prefix.len() as u64)
+            .and_then(|n| n.checked_add(footer.len() as u64))
+            .ok_or("Upload content length exceeds its bound")?;
+        let body = io::Cursor::new(prefix)
+            .chain(reader)
+            .chain(io::Cursor::new(footer));
+        let resp = ureq::post(&format!("{}/api/v0/add?pin={}", self.api_url(), pin))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={}", boundary),
+            )
+            .set("Content-Length", &content_length.to_string())
+            .timeout(LARGE_HTTP_TIMEOUT)
+            .send(body)
+            .map_err(|e| format!("IPFS add failed: {}", e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        if metadata.len() != length || metadata.modified().map_err(|e| e.to_string())? != modified {
+            return Err("Upload source changed during read".into());
+        }
+        if resp.status() != 200 {
+            return Err(format!("IPFS add failed: HTTP {}", resp.status()));
+        }
+        let body_str = resp
+            .into_string()
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        parse_add_response(&body_str)
     }
 
     fn kubo_add_directory(&self, files: Vec<DirFile>, pin: bool) -> Result<String, String> {
@@ -2115,6 +2223,140 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn add_path_http_fixture(status: u16) -> (u16, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(length < 4 * ADD_PATH_CHUNK);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let response =
+                b"{\"Name\":\"release.tar.gz\",\"Hash\":\"QmStreamedFixture\",\"Size\":\"17\"}\n";
+            write!(
+                socket,
+                "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                response.len()
+            )
+            .unwrap();
+            socket.write_all(response).unwrap();
+            (headers, body)
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn add_path_streams_exact_multipart_and_keeps_single_file_pin_options() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("release.tar.gz");
+        let payload: Vec<u8> = (0..2 * ADD_PATH_CHUNK + 17)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        fs::write(&path, &payload).unwrap();
+        for pin in [true, false] {
+            let (port, server) = add_path_http_fixture(200);
+            let provider = bounded_cat_fixture_provider(root.path(), port);
+            assert_eq!(
+                provider.kubo_add_path(&path, pin).unwrap(),
+                "QmStreamedFixture"
+            );
+            let (headers, body) = server.join().unwrap();
+            assert!(headers.starts_with(&format!("POST /api/v0/add?pin={} HTTP/1.1\r\n", pin)));
+            assert!(!headers.to_ascii_lowercase().contains("transfer-encoding:"));
+            let content_type = headers
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+                .unwrap();
+            let boundary = content_type.split("boundary=").nth(1).unwrap();
+            assert!(content_type.contains("multipart/form-data; boundary=----elastos"));
+            let prefix = format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"release.tar.gz\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary).into_bytes();
+            let footer = format!("\r\n--{}--\r\n", boundary).into_bytes();
+            assert!(body.starts_with(&prefix) && body.ends_with(&footer));
+            assert_eq!(body.len(), prefix.len() + payload.len() + footer.len());
+            assert_eq!(
+                &body[prefix.len()..body.len() - footer.len()],
+                payload.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_stream_reader_bounds_reads_and_refuses_short_or_changed_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("payload");
+        let payload = vec![b'x'; 2 * ADD_PATH_CHUNK + 17];
+        fs::write(&path, &payload).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let mut reader = AddPathReader::new(&mut file).unwrap();
+        let mut buffer = vec![0; 3 * ADD_PATH_CHUNK];
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut total = 0;
+        loop {
+            let count = reader.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(count <= ADD_PATH_CHUNK);
+            assert_eq!(&buffer[..count], &payload[total..total + count]);
+            total += count;
+        }
+        assert_eq!(total, payload.len());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(payload.len() as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(&path, &payload).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let mut reader = AddPathReader::new(&mut file).unwrap();
+        assert_eq!(reader.read(&mut buffer).unwrap(), ADD_PATH_CHUNK);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn add_path_stream_request_failure_and_nonregular_source_are_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("release.tar.gz");
+        fs::write(&path, b"fixture payload").unwrap();
+        let (port, server) = add_path_http_fixture(500);
+        let provider = bounded_cat_fixture_provider(root.path(), port);
+        let error = provider.kubo_add_path(&path, true).unwrap_err();
+        assert!(error.contains("IPFS add failed") && error.contains("500"));
+        let (_, body) = server.join().unwrap();
+        assert!(body
+            .windows(b"fixture payload".len())
+            .any(|part| part == b"fixture payload"));
+        assert!(provider
+            .kubo_add_path(root.path(), true)
+            .unwrap_err()
+            .contains("regular file"));
+    }
 
     fn private_hash_fixture_request() -> serde_json::Value {
         serde_json::json!({"op":"runtime_hash_staged_directory","directory":{

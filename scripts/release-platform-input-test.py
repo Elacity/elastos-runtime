@@ -337,18 +337,6 @@ class PlatformInputTest(unittest.TestCase):
         self.assertEqual(set(inputs.validate_inputs(self.values())), set(inputs.PLATFORMS))
 
     def test_input_staging_and_cid_attachment_preserve_three_platforms(self):
-        pinned = {"platforms": {"*": {"url": "https://example.invalid/kubo-v1.tar.gz",
-                   "checksum": "sha256:" + "d" * 64, "size": 100, "install_path": "bin/ipfs"}}}
-        self.template["external"]["kubo"] = pinned
-        self.template["profiles"]["home"]["components"].append("kubo")
-        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
-        for root in self.bundles.values():
-            manifest = json.loads((root / "components.json").read_text())
-            manifest["external"]["kubo"] = copy.deepcopy(pinned)
-            manifest["profiles"] = copy.deepcopy(self.template["profiles"])
-            self.write_json(root / "components.json", manifest)
-            self.write_json(root / "components-template.json", self.template)
-            self.refresh(root)
         stage = self.root / "publication"
         record = inputs.stage_inputs(self.values(), "0.7.1", stage)
         self.assertEqual(len(record["files"]), 8)
@@ -365,7 +353,6 @@ class PlatformInputTest(unittest.TestCase):
                    for platform in inputs.PLATFORMS]
         self.assertEqual(len(set(outputs)), 1)
         final = json.loads(outputs[0])
-        self.assertEqual(final["external"]["kubo"], pinned)
         for setup, _, _ in inputs.PLATFORMS.values():
             descriptor = final["external"]["shell"]["platforms"][setup]
             self.assertTrue(descriptor["cid"].startswith("bafy"))
@@ -990,7 +977,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         descriptor["url"] = "https://example.invalid/home.tar.gz"
         self.write_json(root / "components.json", manifest)
         self.refresh(root)
-        with self.assertRaisesRegex(ValueError, "needs a local artifact"):
+        with self.assertRaisesRegex(ValueError, "requires a release artifact"):
             inputs.verify(root)
 
     def test_wrong_extract_root_and_missing_provider_contract_reject(self):
@@ -1402,6 +1389,456 @@ class SourceRecordTest(unittest.TestCase):
                     inputs.source_identity("e" * 40, tree)
 
 
+
+class UpstreamCapsuleAdmissionTest(unittest.TestCase):
+    write_json = PlatformInputTest.write_json
+    refresh = PlatformInputTest.refresh
+    make_bundle = PlatformInputTest.make_bundle
+    reuse_fixture = PlatformInputTest.reuse_fixture
+    record_reuse = PlatformInputTest.record_reuse
+
+    def setUp(self):
+        PlatformInputTest.setUp(self)
+        self.root = self.root.resolve()
+        self.bundles = {name: path.resolve() for name, path in self.bundles.items()}
+
+    def upstream_fixture(self, payload=None, model=False):
+        root = self.bundles["aarch64-darwin"]
+        script = Path(__file__).with_name("release-upstream-input.py")
+        spec = importlib.util.spec_from_file_location("upstream_admission_fixture", script)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        source = self.root / "source"
+        (source / "scripts").mkdir(exist_ok=True)
+        (source / "scripts/payload").write_bytes(payload or (b"GGUF inert weights" if model else binary("aarch64-darwin")))
+        (source / "scripts/license").write_bytes(b"fixture upstream licence\n")
+        recipe = {"schema": helper.SCHEMA, "component": "kubo", "platform": "darwin-arm64",
+            "version": "1.0.0", "source": {"path": "scripts/payload", "checksum": "sha256:" + inputs.digest(source / "scripts/payload"), "max_bytes": 4096},
+            "format": "raw", "root": "kubo", "entrypoint": "ipfs", "extract_path": "kubo/ipfs",
+            "install_path": "bin/kubo", "max_unpacked_bytes": 4096,
+            "license": {"spdx_id": "MIT", "files": [{"name": "LICENSE", "source": {
+                "path": "scripts/license", "checksum": "sha256:" + inputs.digest(source / "scripts/license"), "max_bytes": 4096}}]}}
+        if model:
+            recipe.update(component="model-fixture", root="model-fixture", entrypoint="fixture.gguf",
+                          extract_path="model-fixture/fixture.gguf", install_path="models/fixture.gguf")
+            recipe["license"]["spdx_id"] = "Apache-2.0"
+            notice = source / "scripts/provenance-notice"
+            notice.write_bytes(b"Synthetic model provenance notice\n")
+            recipe["notices"] = [{"name": "PROVENANCE.md", "source": {"path": "scripts/provenance-notice",
+                "checksum": "sha256:" + inputs.digest(notice), "max_bytes": 4096}}]
+            recipe["model_content"] = {"format": "gguf", "quantization": "Q1_0", "engine": "llama.cpp",
+                "consumer_interface": "elastos.provider.model", "consumer_interface_version": "0.1.0",
+                "minimum_memory_mb": 4096, "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                "provenance": {"base_repository": "example/base", "base_revision": "1" * 40,
+                    "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                    "quantized_repository": "example/quantized", "quantized_revision": "2" * 40, "path": "PROVENANCE.md"}}
+        name = recipe["component"]
+        inventory = {"schema": "elastos.release-upstream-recipes/v1", "recipes": [recipe]}
+        self.write_json(source / "scripts/release-upstream-recipes.json", inventory)
+        (root / "upstream-recipes.json").write_bytes((source / "scripts/release-upstream-recipes.json").read_bytes())
+        resolved = copy.deepcopy(recipe)
+        resolved["source"]["path"] = str(source / resolved["source"]["path"])
+        resolved["license"]["files"][0]["source"]["path"] = str(source / "scripts/license")
+        for item in resolved.get("notices", []):
+            item["source"]["path"] = str(source / item["source"]["path"])
+        receipt = helper.package(resolved, self.root / "upstream-cache", root / "artifacts")
+        receipt["recipe_sha256"] = hashlib.sha256(inputs.canonical(recipe)).hexdigest()
+        self.write_json(root / "upstream-input.json", {"schema": "elastos.release-upstream-assets/v1", "platform": "darwin-arm64",
+            "recipes_sha256": inputs.digest(root / "upstream-recipes.json"), "capsules": [receipt]})
+        template = json.loads((root / "components-template.json").read_bytes())
+        template["external"][name] = {"platforms": {"darwin-arm64": {"strategy": "source-build",
+            "release_path": receipt["release_path"], "install_path": recipe["install_path"], "extract_path": recipe["extract_path"]}}}
+        self.write_json(root / "components-template.json", template)
+        self.write_json(source / "components.json", template)
+        manifest = json.loads((root / "components.json").read_bytes())
+        manifest["external"][name] = {"platforms": {"darwin-arm64": {key: receipt[key] for key in
+            ("release_path", "checksum", "size", "extract_path", "install_path")}}, "capsule_metadata": {
+            "role": "content", "type": "data", "install_path": "capsules/" + name, "platforms": {"darwin-arm64": receipt["capsule_metadata"]}}}
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        return root, recipe, receipt
+
+    def test_upstream_native_archive_checks_extracted_payload_and_passive_metadata(self):
+        root, _, _ = self.upstream_fixture()
+        self.assertEqual(inputs.verify(root)["platform"], "aarch64-darwin")
+        manifest = json.loads((root / "components.json").read_bytes())
+        self.assertEqual(inputs.integrity.audit_provider_capsule_metadata(manifest, ["darwin-arm64"], selected_components={"kubo"}, source_root=self.root / "source"), [])
+
+    def test_passive_model_content_keeps_contract_without_provider_icons(self):
+        root, _, _ = self.upstream_fixture(model=True)
+        self.assertEqual(inputs.verify(root)["platform"], "aarch64-darwin")
+        manifest = json.loads((root / "components.json").read_bytes())
+        self.assertEqual(inputs.integrity.audit_provider_capsule_metadata(manifest, ["darwin-arm64"],
+            selected_components={"model-fixture"}, source_root=self.root / "source"), [])
+
+    def test_upstream_missing_receipt_is_refused(self):
+        root, _, _ = self.upstream_fixture()
+        (root / "upstream-recipes.json").unlink()
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "retained recipe"):
+            inputs.verify(root)
+
+    def test_upstream_rejects_wrong_architecture(self):
+        root, _, _ = self.upstream_fixture(binary("x86_64-linux"))
+        with self.assertRaisesRegex(ValueError, "expected executable"):
+            inputs.verify(root)
+
+    def test_upstream_rehashes_payload_closure_and_pinned_licence(self):
+        root, recipe, receipt = self.upstream_fixture()
+        archive_path = root / "artifacts" / receipt["release_path"]
+        with tarfile.open(archive_path) as archive:
+            members = [(member, archive.extractfile(member).read()) for member in archive]
+        for target, message in (("ipfs", "source checksum"), ("LICENSE", "licence"), ("PROVENANCE.json", "provenance"), ("_elastos_object.json", "closure")):
+            with self.subTest(target=target):
+                with tarfile.open(archive_path, "w:gz") as archive:
+                    for original, payload in members:
+                        member = copy.copy(original)
+                        if member.name == "kubo/" + target:
+                            payload = b"{}" if target.endswith(".json") else payload + b"tamper"
+                        member.size = len(payload)
+                        archive.addfile(member, io.BytesIO(payload))
+                with self.assertRaisesRegex(ValueError, message):
+                    inputs.check_upstream_archive(archive_path, recipe, receipt, "aarch64-darwin")
+
+    def test_upstream_root_and_original_recipe_receipt_pins_are_checked(self):
+        root, _, receipt = self.upstream_fixture()
+        document = json.loads((root / "upstream-input.json").read_bytes())
+        for field, value in (("extract_path", "kubo"), ("recipe_sha256", "0" * 64)):
+            with self.subTest(field=field):
+                bad = copy.deepcopy(document)
+                bad["capsules"][0][field] = value
+                self.write_json(root / "upstream-input.json", bad)
+                self.refresh(root)
+                with self.assertRaises(ValueError):
+                    inputs.verify(root)
+        self.write_json(root / "upstream-input.json", document)
+        self.refresh(root)
+        args = self.reuse_fixture()
+        inputs.copy_support(args)
+        changed = json.loads((self.root / "source/scripts/release-upstream-recipes.json").read_bytes())
+        changed["recipes"][0]["source"]["checksum"] = "sha256:" + "f" * 64
+        self.write_json(self.root / "source/scripts/release-upstream-recipes.json", changed)
+        current = self.record_reuse(args)
+        self.assertEqual(current["files"]["upstream-recipes.json"], inputs.file_record(root / "upstream-recipes.json"))
+
+    def test_candidate_admission_rechecks_retained_recipes_against_original_git_source(self):
+        root, _, _ = self.upstream_fixture()
+        pins = (root / "upstream-recipes.json").read_bytes()
+        with patch.object(inputs.subprocess, "check_output", return_value=pins) as show:
+            inputs.validate_inputs(["aarch64-darwin=" + str(root)], "0.7.1", "aarch64-darwin")
+            self.assertEqual(show.call_args.args[0], ["git", "show", "a" * 40 + ":scripts/release-upstream-recipes.json"])
+        with patch.object(inputs.subprocess, "check_output", return_value=b"{}"), self.assertRaisesRegex(ValueError, "original reviewed source"):
+            inputs.validate_inputs(["aarch64-darwin=" + str(root)], "0.7.1", "aarch64-darwin")
+
+    def test_release_refuses_url_only_dependency_even_with_source_pin(self):
+        root = self.bundles["aarch64-darwin"]
+        manifest = json.loads((root / "components.json").read_bytes())
+        manifest["external"]["url-only"] = {"platforms": {"darwin-arm64": {
+            "url": "https://example.test/dependency", "checksum": "sha256:" + "a" * 64, "size": 64}}}
+        self.assertTrue(any("URL-only" in error for error in inputs.integrity.audit_release_artifacts(manifest, ["darwin-arm64"], root / "artifacts")))
+
+
+class ModelFinalizationTest(unittest.TestCase):
+    write_json = PlatformInputTest.write_json
+    refresh = PlatformInputTest.refresh
+    make_bundle = PlatformInputTest.make_bundle
+
+    def setUp(self):
+        PlatformInputTest.setUp(self)
+        self.root = self.root.resolve()
+        self.bundles = {name: path.resolve() for name, path in self.bundles.items()}
+        candidates = [shutil.which("openssl"), "/opt/homebrew/opt/openssl@3/bin/openssl"]
+        self.openssl = None
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                path = Path(candidate).resolve()
+                result = subprocess.run([str(path), "version"], capture_output=True)
+                if result.returncode == 0 and result.stdout.startswith(b"OpenSSL 3."):
+                    self.openssl = path
+                    break
+        if self.openssl is None:
+            self.skipTest("public Ed25519 fixture requires OpenSSL 3")
+        self.native, recipe, previous = UpstreamCapsuleAdmissionTest.upstream_fixture(self, model=True)
+        self.native.chmod(0o700)
+        (self.native / "artifacts" / previous["release_path"]).unlink()
+        script = Path(__file__).with_name("release-upstream-input.py")
+        spec = importlib.util.spec_from_file_location("model_finalization_upstream_fixture", script)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        source = self.root / "source"
+        recipes, capsules = [], []
+        template = json.loads((self.native / "components-template.json").read_bytes())
+        manifest = json.loads((self.native / "components.json").read_bytes())
+        del template["external"]["model-fixture"]
+        del manifest["external"]["model-fixture"]
+        for name in sorted(inputs.MODEL_COMPONENTS):
+            item = copy.deepcopy(recipe)
+            item.update(component=name, root=name, extract_path=name + "/fixture.gguf")
+            resolved = copy.deepcopy(item)
+            for record in [resolved["source"], *(notice["source"] for notice in resolved["license"]["files"]),
+                           *(notice["source"] for notice in resolved.get("notices", []))]:
+                record["path"] = str(source / record["path"])
+            receipt = helper.package(resolved, self.root / "upstream-cache", self.native / "artifacts")
+            receipt["recipe_sha256"] = hashlib.sha256(inputs.canonical(item)).hexdigest()
+            recipes.append(item)
+            capsules.append(receipt)
+            template["external"][name] = {"platforms": {"darwin-arm64": {"strategy": "source-build",
+                "release_path": receipt["release_path"], "install_path": item["install_path"], "extract_path": item["extract_path"]}}}
+            manifest["external"][name] = {"role": "content", "platforms": {"darwin-arm64": {
+                key: receipt[key] for key in ("release_path", "checksum", "size", "extract_path", "install_path")}},
+                "capsule_metadata": {"role": "content", "type": "data", "install_path": "capsules/" + name,
+                    "platforms": {"darwin-arm64": receipt["capsule_metadata"]}}}
+            template["external"][name]["role"] = "content"
+        inventory = {"schema": "elastos.release-upstream-recipes/v1", "recipes": recipes}
+        self.write_json(source / "scripts/release-upstream-recipes.json", inventory)
+        self.write_json(self.native / "upstream-recipes.json", inventory)
+        self.write_json(source / "components.json", template)
+        self.write_json(self.native / "components-template.json", template)
+        self.write_json(self.native / "components.json", manifest)
+        self.upstream = {"schema": "elastos.release-upstream-assets/v1", "platform": "darwin-arm64",
+            "recipes_sha256": inputs.digest(self.native / "upstream-recipes.json"), "capsules": capsules}
+        self.model_root = self.native.parent / "model-handoff"
+        self.model_root.mkdir(mode=0o700)
+        # Disposable signing material belongs only to this test's private,
+        # automatically cleaned directory. Tool output never enters test logs.
+        self.key = self.root / "fixture-key.pem"
+        self.crypto(["genpkey", "-algorithm", "ED25519", "-out", str(self.key)])
+        self.key.chmod(0o600)
+        public = self.crypto(["pkey", "-in", str(self.key), "-pubout", "-outform", "DER"])
+        self.did = signer.public_did(public[12:])
+        self.payload = {"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None, "entries": []}
+        retention = {}
+        _, handoff = inputs.model_tools()
+        for capsule in capsules:
+            name = capsule["component"]
+            cid = "b" + base64.b32encode(b"\x01\x70\x12\x20" + hashlib.sha256(name.encode()).digest()).decode().lower().rstrip("=")
+            self.payload["entries"].append({"cid": cid, "capsule_manifest": copy.deepcopy(capsule["capsule_manifest"]),
+                                           "object_manifest": copy.deepcopy(capsule["object_manifest"])})
+            car = self.model_root / (name + ".car")
+            car.write_bytes(b"inert CAR byte-binding fixture " + name.encode())
+            receipt = self.model_root / (name + ".car.receipt.json")
+            receipt.write_bytes(signer.json_bytes({"schema": handoff.RECEIPT_SCHEMA, "package_cid": cid,
+                "car_sha256": inputs.digest(car), "car_bytes": car.stat().st_size, "kubo_version": handoff.KUBO_VERSION,
+                "exported_at": 1}))
+            retention[name] = {"package_cid": cid, **{kind: self.descriptor(path) for kind, path in (("car", car), ("receipt", receipt))}}
+        draft = self.model_root / "model-catalog.unsigned.json"
+        draft.write_bytes(signer.json_bytes(self.payload))
+        self.record = {"schema": "elastos.release-model-handoff/v1",
+            "scope": "key-free model preparation; signed catalogue finalization follows",
+            "source": {"commit": "a" * 40, "tree": "b" * 40, "clean": True}, "platform": "aarch64-darwin", "version": "0.7.1",
+            "handoff_directory": "../model-handoff", "model_catalog_unsigned": {**self.descriptor(draft), "publisher_did": self.did},
+            "model_retention": retention}
+        self.bind_handoff()
+        self.catalogue = self.root / "public-catalogue.json"
+        self.sign()
+        self.args = SimpleNamespace(input=self.native, handoff=self.model_root, catalogue=self.catalogue,
+                                    publisher_did=self.did, openssl=self.openssl, output=self.root / "finalized")
+
+    def crypto(self, arguments):
+        result = subprocess.run([str(self.openssl), *arguments], capture_output=True,
+                                env={"OPENSSL_CONF": "/dev/null", "LANG": "C"}, timeout=20)
+        if result.returncode:
+            self.fail("disposable public signature fixture operation failed")
+        return result.stdout
+
+    def descriptor(self, path):
+        return {"release_path": path.name, "checksum": "sha256:" + inputs.digest(path), "size": path.stat().st_size}
+
+    def bind_handoff(self):
+        self.upstream.update({key: self.record[key] for key in ("model_catalog_unsigned", "model_retention")})
+        self.write_json(self.native / "upstream-input.json", self.upstream)
+        self.record["upstream_input_sha256"] = inputs.digest(self.native / "upstream-input.json")
+        descriptors = [self.record["model_catalog_unsigned"], *(item[kind] for item in self.record["model_retention"].values()
+                                                               for kind in ("car", "receipt"))]
+        self.record["files"] = {info["release_path"]: {key: info[key] for key in ("checksum", "size")} for info in descriptors}
+        self.write_json(self.native / "model-handoff.json", self.record)
+        for path in self.model_root.iterdir():
+            path.chmod(0o600)
+        self.refresh(self.native)
+
+    def sign(self, domain=b"elastos.model.catalog.v1"):
+        message = self.root / "fixture-digest"
+        signature = self.root / "fixture-signature"
+        message.write_bytes(hashlib.sha256(domain + b"\0" + signer.json_bytes(self.payload)).digest())
+        self.crypto(["pkeyutl", "-sign", "-rawin", "-inkey", str(self.key), "-in", str(message), "-out", str(signature)])
+        self.catalogue.write_bytes(signer.json_bytes({"payload": self.payload, "signature": signature.read_bytes().hex(), "signer_did": self.did}))
+        self.catalogue.chmod(0o600)
+
+    def refused(self, pattern):
+        with self.assertRaisesRegex((ValueError, OSError), pattern):
+            inputs.finalize_models(self.args)
+        self.assertFalse(self.args.output.exists())
+        self.assertFalse(list(self.root.glob(".finalize-models-*")))
+        self.assertFalse(list(self.root.glob(".model-public-verify-*")))
+
+    def test_public_signature_and_retention_finalize_preserves_native_source(self):
+        before = (self.native / "platform-input.json").read_bytes()
+        with patch.object(inputs, "source_identity", side_effect=AssertionError("finalization must not rebuild")):
+            receipt = inputs.finalize_models(self.args)
+        self.assertEqual((self.native / "platform-input.json").read_bytes(), before)
+        self.assertEqual((self.args.output / "model-native-input.json").read_bytes(), before)
+        self.assertEqual(inputs.verify(self.args.output), receipt)
+        manifest = json.loads((self.args.output / "components.json").read_bytes())
+        self.assertEqual(manifest["model_catalog"], {"head_cid": inputs.catalog_head_cid(self.catalogue.read_bytes()), "publisher_dids": [self.did]})
+        self.assertEqual(manifest["model_retention"], self.record["model_retention"])
+        self.assertTrue(all("cid" not in item[kind] for item in manifest["model_retention"].values() for kind in ("car", "receipt")))
+        self.assertEqual(len(list((self.args.output / "artifacts").glob("*.car*"))), 8)
+
+    def test_domain_and_signature_failure_clean_public_scratch(self):
+        self.sign(b"elastos.release.v1")
+        self.refused("verification failed")
+
+    def test_exact_public_publisher_required(self):
+        self.args.publisher_did = signer.public_did(bytes(32))
+        self.refused("public publisher differs")
+
+    def test_signed_payload_must_equal_worker_proposal(self):
+        self.payload["published_at"] = 2
+        self.sign()
+        self.refused("payload differs")
+
+    def test_payload_identity_preserves_json_types(self):
+        unsigned = copy.deepcopy(self.payload)
+        unsigned["published_at"] = True
+        draft = self.model_root / "model-catalog.unsigned.json"
+        draft.write_bytes(signer.json_bytes(unsigned))
+        self.record["model_catalog_unsigned"].update(self.descriptor(draft))
+        self.bind_handoff()
+        self.refused("payload differs")
+
+    def test_public_catalogue_closure_refuses_execution_and_noncanonical_roots(self):
+        self.payload["entries"][0]["capsule_manifest"]["network"] = True
+        self.sign()
+        self.refused("passive catalogue")
+
+    def test_distinct_four_directory_roots_required(self):
+        self.payload["entries"][1]["cid"] = self.payload["entries"][0]["cid"]
+        self.sign()
+        self.refused("distinct canonical directory")
+
+    def test_signed_native_closure_cannot_change_under_a_valid_signature(self):
+        # The two closures are each valid passive objects; the reviewed native
+        # receipt owns which object belongs in this public catalogue.
+        self.payload["entries"][0]["capsule_manifest"]["model_content"]["minimum_memory_mb"] += 1
+        capsule = self.payload["entries"][0]["capsule_manifest"]
+        index = self.payload["entries"][0]["object_manifest"]
+        encoded = signer.json_bytes(capsule)
+        for item in index["files"]:
+            if item["path"] == "capsule.json":
+                item.update(sha256=hashlib.sha256(encoded).hexdigest(), size=len(encoded))
+        content = hashlib.sha256()
+        for item in index["files"]:
+            for field in (item["path"], item["sha256"], str(item["size"])):
+                content.update(field.encode() + b"\0")
+        index["content_digest"] = "sha256:" + content.hexdigest()
+        draft = self.model_root / "model-catalog.unsigned.json"
+        draft.write_bytes(signer.json_bytes(self.payload))
+        self.record["model_catalog_unsigned"].update(self.descriptor(draft))
+        self.bind_handoff()
+        self.sign()
+        self.refused("closure differs from native")
+
+    def test_car_corruption_is_refused_before_copy(self):
+        path = next(self.model_root.glob("*.car"))
+        path.write_bytes(path.read_bytes() + b"changed")
+        self.refused("protection or bytes differ")
+
+    def test_car_receipt_root_must_equal_catalogue(self):
+        item = next(iter(self.record["model_retention"].values()))
+        path = self.model_root / item["receipt"]["release_path"]
+        value = json.loads(path.read_bytes())
+        value["package_cid"] = self.payload["entries"][1]["cid"]
+        path.write_bytes(signer.json_bytes(value))
+        item["receipt"] = self.descriptor(path)
+        self.bind_handoff()
+        self.refused("does not match")
+
+    def test_protected_handoff_and_exact_inventory_required(self):
+        self.model_root.chmod(0o755)
+        self.refused("protected owned directory")
+
+    def test_public_native_directory_keeps_private_handoff_and_scratch(self):
+        self.native.chmod(0o755)
+        self.root.chmod(0o755)
+        inputs.finalize_models(self.args)
+        self.assertEqual(self.args.output.stat().st_mode & 0o777, 0o700)
+        inputs.verify(self.args.output)
+
+    def test_extra_handoff_file_is_refused(self):
+        (self.model_root / "unapproved.bin").write_bytes(b"extra")
+        self.refused("file inventory differs")
+
+    def test_output_collision_preserves_existing_directory(self):
+        self.args.output.mkdir()
+        with self.assertRaisesRegex(ValueError, "new output outside"):
+            inputs.finalize_models(self.args)
+        self.assertTrue(self.args.output.is_dir())
+        self.assertEqual(list(self.args.output.iterdir()), [])
+
+    def test_copy_failure_cleans_owned_output_scratch(self):
+        with patch.object(inputs.shutil, "copyfile", side_effect=OSError("fixture copy failure")):
+            self.refused("fixture copy failure")
+        inputs.verify(self.native)
+
+    def test_repeated_finalization_refuses_to_rewrite_build_provenance(self):
+        inputs.finalize_models(self.args)
+        self.args.input = self.args.output
+        self.args.output = self.root / "second-finalization"
+        self.refused("original native build input")
+
+    def test_handoff_source_binding_and_original_build_required(self):
+        self.record["source"]["tree"] = "d" * 40
+        self.bind_handoff()
+        self.refused("source binding differs")
+
+    def test_whole_copy_budget_precedes_any_scratch(self):
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100, free=16)), \
+                patch.object(inputs.tempfile, "TemporaryDirectory", side_effect=AssertionError("scratch before disk gate")):
+            self.refused("15 percent")
+
+    def test_approved_budget_checks_largest_package_charge(self):
+        budget = {"max_cache_bytes": 1, "max_model_memory_bytes": 8 * 1024**3}
+        for name in ("components.json", "components-template.json"):
+            value = json.loads((self.native / name).read_bytes())
+            value["model_catalog"] = {"head_cid": inputs.catalog_head_cid(b"old catalog"), "publisher_dids": [self.did], "local_use": budget}
+            self.write_json(self.native / name, value)
+        (self.native / "artifacts/model-catalog.json").write_bytes(b"old catalog")
+        self.refresh(self.native)
+        self.refused("approved local-use budget")
+
+    def test_source_budget_and_previous_catalogue_bytes_are_preserved(self):
+        budget = {"max_cache_bytes": 64 * 1024**2, "max_model_memory_bytes": 8 * 1024**3}
+        for name in ("components.json", "components-template.json"):
+            value = json.loads((self.native / name).read_bytes())
+            value["model_catalog"] = {"head_cid": inputs.catalog_head_cid(b"old catalog"), "publisher_dids": [self.did], "local_use": budget}
+            self.write_json(self.native / name, value)
+        (self.native / "artifacts/model-catalog.json").write_bytes(b"old catalog")
+        self.refresh(self.native)
+        inputs.finalize_models(self.args)
+        self.assertEqual((self.args.output / "model-native-catalog.json").read_bytes(), b"old catalog")
+        manifest = json.loads((self.args.output / "components.json").read_bytes())
+        self.assertEqual(manifest["model_catalog"]["local_use"], budget)
+        inputs.verify(self.args.output)
+
+    def test_valid_reused_support_input_requires_original_build(self):
+        reused = self.root / "reused-native"
+        reused.mkdir(mode=0o700)
+        args = SimpleNamespace(input=self.native, root=reused, platform="aarch64-darwin", version="0.7.2")
+        inputs.copy_support(args)
+        PlatformInputTest.record_reuse(self, args)
+        self.args.input = reused
+        self.refused("original native build input")
+
+    def test_finalized_receipt_preserves_prior_native_provenance(self):
+        inputs.finalize_models(self.args)
+        path = self.args.output / "platform-input.json"
+        value = json.loads(path.read_bytes())
+        value["source"]["tree"] = "d" * 40
+        self.write_json(path, value)
+        with self.assertRaisesRegex(ValueError, "rewrote native build provenance"):
+            inputs.verify(self.args.output)
+
+
 class ReleaseSignerInputTest(unittest.TestCase):
     def test_custodian_refuses_hostile_inputs_without_running_candidates(self):
         # CI's existing release-input gate runs these public-data/fake-backend
@@ -1425,6 +1862,19 @@ class InstallerAdmissionTest(unittest.TestCase):
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def load_tests(loader, tests, pattern):
+    # Load each inert wrapper case into CI's existing entry point. The same
+    # loader keeps unittest -k filters; explicit class/method selections retain
+    # unittest's normal behavior and do not enter this module hook.
+    for name in ("release-upstream-input-test.py", "release-upstream-assets-test.py", "release-source-upstream-test.py"):
+        sibling_spec = importlib.util.spec_from_file_location(
+            name.replace("-", "_").removesuffix(".py"), Path(__file__).with_name(name))
+        sibling = importlib.util.module_from_spec(sibling_spec)
+        sibling_spec.loader.exec_module(sibling)
+        tests.addTests(loader.loadTestsFromModule(sibling, pattern=pattern))
+    return tests
 
 
 if __name__ == "__main__":

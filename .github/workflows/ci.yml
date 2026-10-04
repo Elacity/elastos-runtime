@@ -618,6 +618,17 @@ jobs:
       - name: reserve hosted Mac build and fixture capacity
         timeout-minutes: 10
         run: python3 scripts/update-hop-compare.py prepare-ci-disk
+      - name: require fresh Mac build intermediates
+        run: |
+          set -euo pipefail
+          # Cargo 1.91 stores fingerprints here. Start outside the restored
+          # cache, then share intermediates across this source tree's N/N+1.
+          directory="$RUNNER_TEMP/source-home-macos-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          echo "CI_MAC_BUILD_DIR_FRESH=true" >> "$GITHUB_ENV"
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -675,6 +686,18 @@ jobs:
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
             --runtime "$PWD/elastos/target/release/elastos"
+          python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
+          import json, os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          build = json.loads(path.read_text())
+          directory = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
+          assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'
+          assert directory.is_dir() and not directory.is_symlink()
+          assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'
+          build['intermediates'] = {'directory': str(directory), 'initially_absent': True,
+                                    'source': build['source']}
+          path.write_text(json.dumps(build, indent=2) + '\n')
+          PY
       - name: generate disposable signed install and update fixture
         timeout-minutes: 5
         run: |
