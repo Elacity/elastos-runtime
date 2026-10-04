@@ -418,6 +418,36 @@ code {
   line-height: 1.35;
 }
 
+.runtime-update-fields {
+  margin: 12px 0 0;
+}
+
+.runtime-update-fields > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  margin-top: 5px;
+}
+
+.runtime-update-fields dt {
+  color: var(--el-muted);
+  font-size: 11px;
+}
+
+.runtime-update-fields dd {
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.runtime-update-changes {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .shell-picker {
   display: flex;
   align-items: center;

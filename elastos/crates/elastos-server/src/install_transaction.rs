@@ -1,4 +1,4 @@
-//! Offline release-file transaction. Destinations retain their installed paths.
+//! Installed release-file transaction. Journal schemas bind their fixed destinations.
 //! Installer adoption of this lock is a separate release-owner integration.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,7 +9,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use elastos_common::localhost::{publisher_release_head_path, publisher_release_manifest_path};
+use elastos_common::localhost::{
+    installation_release_head_path, installation_release_manifest_path,
+    publisher_release_head_path, publisher_release_manifest_path,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -20,6 +23,17 @@ const STAGE: &str = ".elastos.update-stage";
 const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
 const RESERVE_PERCENT: u128 = 15;
+
+#[derive(Debug)]
+pub(crate) struct DiskReserveError;
+
+impl std::fmt::Display for DiskReserveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("update would cross the 15% disk reserve; previous release preserved")
+    }
+}
+
+impl std::error::Error for DiskReserveError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,13 +94,53 @@ struct Journal {
     binary_basename: String,
     phase: Phase,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<RestartRecord>,
+}
+
+/// A restart controller keeps this record and the verified rollback until Home is ready.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartPlan {
+    pub request_id: String,
+    pub controller_sha256: String,
+    pub launch_plan_sha256: String,
+    pub support_sha256: String,
+    pub previous_version: String,
+    pub candidate_version: String,
+    pub previous_binary_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestartPhase {
+    CandidatePending,
+    CandidateStartClaimed,
+    CandidateRunning,
+    CandidateReady,
+    Restoring,
+    Restored,
+    PreviousStartClaimed,
+    PreviousRunning,
+    PreviousReady,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartRecord {
+    pub plan: RestartPlan,
+    pub phase: RestartPhase,
+    pub generation: String,
+    pub pid: Option<u32>,
+    pub process_start: Option<String>,
 }
 
 /// Serializes installation writers at an absolute, resolved binary parent.
 /// Writers resolve the parent once and use the same path for their destinations.
-/// The lock path stays in place after the guard closes its file and releases the flock.
+/// The lock path stays in place after the guard releases the flock and closes its file.
 pub(crate) struct InstallationGuard {
     _lock: File,
+    binary_parent: PathBuf,
 }
 
 impl InstallationGuard {
@@ -115,8 +169,121 @@ impl InstallationGuard {
             return Err(std::io::Error::last_os_error())
                 .context("another writer owns the installation lock");
         }
-        Ok(Self { _lock: lock })
+        Ok(Self {
+            _lock: lock,
+            binary_parent: binary_parent.to_path_buf(),
+        })
     }
+
+    pub(crate) fn require_binary(&self, binary: &Path) -> anyhow::Result<()> {
+        if !binary.is_absolute()
+            || binary.parent().context("installed binary parent missing")?
+                != self.binary_parent.as_path()
+        {
+            bail!("installed release writer owns a different binary parent");
+        }
+        check_directory(&self.binary_parent)?;
+        let path = self.binary_parent.join(INSTALL_LOCK);
+        check_file(&self._lock, &path, true)?;
+        let held = self._lock.metadata()?;
+        let current = fs::symlink_metadata(path)?;
+        if !current.is_file() || held.dev() != current.dev() || held.ino() != current.ino() {
+            bail!("installed release writer lock identity changed");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        // A forked command can retain this description until its CLOEXEC fd closes.
+        // The guard's scope owns the lock, so release it before closing our fd.
+        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._lock), libc::LOCK_UN) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseLayout {
+    LegacyPublisher,
+    Consumed,
+}
+
+fn journal_layout(journal: &Journal) -> anyhow::Result<ReleaseLayout> {
+    match (journal.schema.as_str(), journal.restart.is_some()) {
+        ("elastos.install-transaction/v1", false) | ("elastos.install-transaction/v2", true) => {
+            Ok(ReleaseLayout::LegacyPublisher)
+        }
+        ("elastos.install-transaction/v3", false) | ("elastos.install-transaction/v4", true) => {
+            Ok(ReleaseLayout::Consumed)
+        }
+        _ => bail!("installation journal schema is incompatible with this writer"),
+    }
+}
+
+fn read_journal_file(path: &Path) -> anyhow::Result<Option<Journal>> {
+    let file = match open_read(path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file, path, true)?;
+    if file.metadata()?.len() > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_JOURNAL + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_JOURNAL {
+        bail!("installation journal exceeds size limit");
+    }
+    let journal: Journal = serde_json::from_slice(&bytes)?;
+    journal_layout(&journal)?;
+    Ok(Some(journal))
+}
+
+/// Ordinary installed writers use the persisted binary location, so replacing source
+/// settings cannot redirect them away from a retained transaction or its lock.
+/// A fresh source has no installation yet; installer/bootstrap ownership covers that path.
+pub(crate) fn acquire_installed_writer(
+    data_dir: &Path,
+) -> anyhow::Result<Option<InstallationGuard>> {
+    let retained = crate::update_controller::installed_writer_binary(data_dir)?;
+    let binary = match retained {
+        Some(binary) => binary,
+        None => {
+            let sources = crate::sources::load_trusted_sources(data_dir)?;
+            let Some(source) = sources
+                .default_source()
+                .filter(|source| !source.install_path.is_empty())
+            else {
+                return Ok(None);
+            };
+            PathBuf::from(&source.install_path)
+        }
+    };
+    if !binary.is_absolute() {
+        bail!("installed writer binary path must be absolute");
+    }
+    let parent = binary.parent().context("installed writer parent missing")?;
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let guard = InstallationGuard::acquire(&parent)?;
+    match fs::symlink_metadata(parent.join(JOURNAL)) {
+        Ok(_) => {
+            bail!("A signed update requires recovery; preserve its release files and support.")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(guard))
 }
 
 pub(crate) struct InstallTransaction {
@@ -124,13 +291,17 @@ pub(crate) struct InstallTransaction {
     data_dir: PathBuf,
     binary: PathBuf,
     destinations: BTreeMap<ReleaseFile, PathBuf>,
+    layout: ReleaseLayout,
 }
 
 impl InstallTransaction {
     pub(crate) fn has_pending_recovery(binary: &Path) -> bool {
         binary
             .parent()
-            .is_some_and(|parent| fs::symlink_metadata(parent.join(JOURNAL)).is_ok())
+            .is_some_and(|parent| match fs::symlink_metadata(parent.join(JOURNAL)) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
     }
     pub(crate) fn acquire(data_dir: &Path, binary: &Path) -> anyhow::Result<Self> {
         if !data_dir.is_absolute() || !binary.is_absolute() {
@@ -150,17 +321,28 @@ impl InstallTransaction {
         let binary = bin_parent.join(basename);
         file_state(&binary)?;
         let guard = InstallationGuard::acquire(&bin_parent)?;
+        let layout = read_journal_file(&bin_parent.join(JOURNAL))?
+            .as_ref()
+            .map(journal_layout)
+            .transpose()?
+            .unwrap_or(ReleaseLayout::Consumed);
         let destinations = BTreeMap::from([
             (ReleaseFile::RuntimeBinary, binary.clone()),
             (ReleaseFile::Components, data_dir.join("components.json")),
             (ReleaseFile::Sources, data_dir.join("sources.json")),
             (
                 ReleaseFile::ReleaseHead,
-                publisher_release_head_path(&data_dir),
+                match layout {
+                    ReleaseLayout::LegacyPublisher => publisher_release_head_path(&data_dir),
+                    ReleaseLayout::Consumed => installation_release_head_path(&data_dir),
+                },
             ),
             (
                 ReleaseFile::ReleaseManifest,
-                publisher_release_manifest_path(&data_dir),
+                match layout {
+                    ReleaseLayout::LegacyPublisher => publisher_release_manifest_path(&data_dir),
+                    ReleaseLayout::Consumed => installation_release_manifest_path(&data_dir),
+                },
             ),
         ]);
         if destinations.values().collect::<BTreeSet<_>>().len() != ReleaseFile::ALL.len() {
@@ -171,13 +353,46 @@ impl InstallTransaction {
             data_dir,
             binary,
             destinations,
+            layout,
         };
         // Check every destination and parent before the journal can authorize writes.
-        for destination in tx.destinations.values() {
+        for (&id, destination) in &tx.destinations {
             tx.check_parent(destination.parent().unwrap(), false)?;
+            tx.check_metadata_custody(id)?;
             file_state(destination)?;
         }
         Ok(tx)
+    }
+
+    fn check_metadata_custody(&self, id: ReleaseFile) -> anyhow::Result<()> {
+        if self.uses_consumed_layout()
+            && matches!(id, ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest)
+        {
+            let destination = &self.destinations[&id];
+            match fs::symlink_metadata(destination.parent().unwrap()) {
+                Ok(metadata) if metadata.mode() & 0o7777 != 0o700 => {
+                    bail!("Consumed release inputs require an owner-only directory.")
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
+            }
+            match open_read(destination) {
+                Ok(file) if file.metadata()?.mode() & 0o7777 != 0o600 => {
+                    bail!("Consumed release inputs require owner-only files.")
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_none_or(|error| error.kind() != std::io::ErrorKind::NotFound) =>
+                {
+                    return Err(error)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn binary_path(&self) -> &Path {
@@ -188,6 +403,24 @@ impl InstallTransaction {
         &self.data_dir
     }
 
+    /// Recovery reads the same metadata namespace selected by the journal schema.
+    pub(crate) fn release_manifest_path(&self) -> &Path {
+        &self.destinations[&ReleaseFile::ReleaseManifest]
+    }
+
+    pub(crate) fn release_head_path(&self) -> &Path {
+        &self.destinations[&ReleaseFile::ReleaseHead]
+    }
+
+    pub(crate) fn writer_guard(&self) -> &InstallationGuard {
+        &self._guard
+    }
+
+    pub(crate) fn uses_consumed_layout(&self) -> bool {
+        self.layout == ReleaseLayout::Consumed
+    }
+
+    #[cfg(test)]
     pub(crate) fn staged_binary(&self) -> PathBuf {
         self.scratch(ReleaseFile::RuntimeBinary, STAGE)
     }
@@ -266,6 +499,9 @@ impl InstallTransaction {
             self.require_empty_scratch()?;
             return Ok(());
         };
+        if journal.restart.is_some() && !rollback_committed {
+            bail!("Home restart is pending; use the installed restart controller to recover");
+        }
         // Every finalized scratch file is hash/mode bound before any release
         // restoration. Partial writes have distinct names and only staging owns them.
         self.validate_scratch(&journal)?;
@@ -283,6 +519,7 @@ impl InstallTransaction {
             // Commit already verified the installed set. Cleanup owns only the
             // journal and scratch; later safe owner changes belong to the live set.
             for entry in &journal.entries {
+                self.check_metadata_custody(entry.id)?;
                 if file_state(&self.destinations[&entry.id])?.is_none() {
                     bail!(
                         "release file {} is missing; retain journal for recovery",
@@ -321,6 +558,12 @@ impl InstallTransaction {
                 }
             }
             journal.phase = Phase::Recovering;
+            if let Some(restart) = &mut journal.restart {
+                restart.phase = RestartPhase::Restoring;
+                restart.generation.clear();
+                restart.pid = None;
+                restart.process_start = None;
+            }
             self.write_journal(&journal)?;
             for entry in &journal.entries {
                 let current = file_state(&self.destinations[&entry.id])?;
@@ -353,10 +596,55 @@ impl InstallTransaction {
                 )?;
             }
         }
+        if let Some(restart) = &mut journal.restart {
+            restart.phase = RestartPhase::Restored;
+            restart.generation.clear();
+            restart.pid = None;
+            restart.process_start = None;
+            return self.write_journal(&journal);
+        }
         self.cleanup(&journal)
     }
 
+    /// Check all refusal-only preparation gates before publishing migrated custody.
+    pub(crate) fn preflight_prepare(
+        &self,
+        files: &[(ReleaseFile, &[u8])],
+        previous_head: &[u8],
+        previous_release: &[u8],
+    ) -> anyhow::Result<()> {
+        if !self.uses_consumed_layout() {
+            bail!("Legacy recovery must finish before preparing a new installed release.");
+        }
+        self.require_empty_scratch()?;
+        if files.len() != ReleaseFile::ALL.len()
+            || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
+                != ReleaseFile::ALL.into_iter().collect()
+        {
+            bail!("release transaction requires exactly five release files");
+        }
+        let mut allocations = BTreeMap::new();
+        for &(id, bytes) in files {
+            self.check_parent(self.destinations[&id].parent().unwrap(), false)?;
+            self.check_metadata_custody(id)?;
+            let state = file_state(&self.destinations[&id])?;
+            let old_metadata = match id {
+                ReleaseFile::ReleaseHead => previous_head.len() as u64,
+                ReleaseFile::ReleaseManifest => previous_release.len() as u64,
+                _ => 0,
+            };
+            let original = state.as_ref().map(|state| state.2).unwrap_or(old_metadata);
+            // An absent pair first needs its migration copy as well as rollback.
+            let migration = if state.is_none() { old_metadata } else { 0 };
+            allocations.insert(id, bytes.len() as u64 + original + migration);
+        }
+        self.check_disk(&allocations)
+    }
+
     pub(crate) fn prepare(&self, files: &[(ReleaseFile, &[u8])]) -> anyhow::Result<()> {
+        if self.layout == ReleaseLayout::LegacyPublisher {
+            bail!("Legacy recovery must finish before preparing a new installed release.");
+        }
         self.require_empty_scratch()?;
         if files.len() != ReleaseFile::ALL.len()
             || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
@@ -367,6 +655,7 @@ impl InstallTransaction {
         let mut entries = Vec::new();
         let mut allocations = BTreeMap::new();
         for &(id, bytes) in files {
+            self.check_metadata_custody(id)?;
             let state = file_state(&self.destinations[&id])?;
             let original_mode = state.as_ref().map(|item| item.1);
             let staged_mode = if id == ReleaseFile::RuntimeBinary {
@@ -389,7 +678,7 @@ impl InstallTransaction {
             self.check_parent(&parent, true)?;
         }
         let mut journal = Journal {
-            schema: "elastos.install-transaction/v1".to_string(),
+            schema: "elastos.install-transaction/v3".to_string(),
             transaction_id: hex::encode(rand::random::<[u8; 16]>()),
             data_dir: self.data_dir.clone(),
             binary_basename: self
@@ -401,6 +690,7 @@ impl InstallTransaction {
                 .to_string(),
             phase: Phase::Staging,
             entries,
+            restart: None,
         };
         self.write_journal(&journal)?;
         let result = (|| {
@@ -469,6 +759,206 @@ impl InstallTransaction {
         self.commit_with(|_| Ok(()), check)
     }
 
+    pub(crate) fn prepare_restart(&self, plan: RestartPlan) -> anyhow::Result<()> {
+        if self.layout == ReleaseLayout::LegacyPublisher {
+            bail!("Legacy recovery must finish before preparing a new Home restart.");
+        }
+        validate_restart_plan(&plan)?;
+        let mut journal = self
+            .read_journal()?
+            .context("prepared release journal missing")?;
+        if journal.phase != Phase::Prepared || journal.restart.is_some() {
+            bail!("release is not prepared for a new restart");
+        }
+        if journal
+            .entries
+            .iter()
+            .any(|entry| entry.original_sha256.is_none())
+            || journal
+                .entries
+                .iter()
+                .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+                .and_then(|entry| entry.original_sha256.as_deref())
+                != Some(&plan.previous_binary_sha256)
+        {
+            bail!("automatic recovery requires a verified previous complete release");
+        }
+        journal.schema = "elastos.install-transaction/v4".into();
+        journal.restart = Some(RestartRecord {
+            plan,
+            phase: RestartPhase::CandidatePending,
+            generation: String::new(),
+            pid: None,
+            process_start: None,
+        });
+        self.write_journal(&journal)
+    }
+
+    pub(crate) fn restart_record(&self) -> anyhow::Result<RestartRecord> {
+        self.restart_record_if_any()?
+            .context("restart journal missing")
+    }
+
+    pub(crate) fn restart_record_if_any(&self) -> anyhow::Result<Option<RestartRecord>> {
+        Ok(self.read_journal()?.and_then(|journal| journal.restart))
+    }
+
+    /// Controller loss before restart planning can leave an unchanged CLI staging journal.
+    /// Recover only pre-activation state in its schema-bound namespace.
+    pub(crate) fn recover_before_restart(&self) -> anyhow::Result<bool> {
+        let Some(journal) = self.read_journal()? else {
+            return Ok(false);
+        };
+        if journal.restart.is_some() {
+            return Ok(false);
+        }
+        if !matches!(journal.phase, Phase::Staging | Phase::Prepared) {
+            bail!("Pending release has no controller restart receipt; use its original recovery owner.");
+        }
+        self.recover()?;
+        Ok(true)
+    }
+
+    pub(crate) fn claim_start(&self, previous: bool) -> anyhow::Result<RestartRecord> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        let expected = if previous {
+            RestartPhase::Restored
+        } else {
+            RestartPhase::CandidatePending
+        };
+        if restart.phase != expected || (!previous && journal.phase != Phase::Committed) {
+            bail!("restart start claim already consumed or release is not activated");
+        }
+        restart.phase = if previous {
+            RestartPhase::PreviousStartClaimed
+        } else {
+            RestartPhase::CandidateStartClaimed
+        };
+        restart.generation = hex::encode(rand::random::<[u8; 16]>());
+        restart.pid = None;
+        restart.process_start = None;
+        let record = restart.clone();
+        self.write_journal(&journal)?;
+        Ok(record)
+    }
+
+    pub(crate) fn record_started(
+        &self,
+        generation: &str,
+        pid: u32,
+        process_start: String,
+    ) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        if restart.generation != generation
+            || pid == 0
+            || process_start.is_empty()
+            || process_start.len() > 128
+        {
+            bail!("restart process identity is invalid");
+        }
+        restart.phase = match restart.phase {
+            RestartPhase::CandidateStartClaimed => RestartPhase::CandidateRunning,
+            RestartPhase::PreviousStartClaimed => RestartPhase::PreviousRunning,
+            _ => bail!("restart start claim is not available"),
+        };
+        restart.pid = Some(pid);
+        restart.process_start = Some(process_start);
+        self.write_journal(&journal)
+    }
+
+    pub(crate) fn record_ready(&self, generation: &str, pid: u32) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_mut().context("restart record missing")?;
+        if restart.generation != generation || restart.pid != Some(pid) {
+            bail!("ready Home differs from the claimed generation");
+        }
+        restart.phase = match restart.phase {
+            RestartPhase::CandidateRunning => RestartPhase::CandidateReady,
+            RestartPhase::PreviousRunning => RestartPhase::PreviousReady,
+            _ => bail!("restart process is not awaiting readiness"),
+        };
+        self.write_journal(&journal)
+    }
+
+    /// Caller first stops and reaps its exact candidate generation and acquires the host lock.
+    pub(crate) fn restore_for_restart(&self) -> anyhow::Result<()> {
+        let record = self.restart_record()?;
+        if matches!(
+            record.phase,
+            RestartPhase::CandidateReady
+                | RestartPhase::PreviousStartClaimed
+                | RestartPhase::PreviousRunning
+                | RestartPhase::PreviousReady
+        ) {
+            bail!(
+                "restart restoration is unavailable after readiness or a previous-host start claim"
+            );
+        }
+        self.recover_inner(true)
+    }
+
+    pub(crate) fn finish_restart(&self) -> anyhow::Result<()> {
+        let journal = self.read_journal()?.context("restart journal missing")?;
+        let restart = journal.restart.as_ref().context("restart record missing")?;
+        let previous = match restart.phase {
+            RestartPhase::CandidateReady => false,
+            RestartPhase::PreviousReady => true,
+            _ => bail!("retain rollback until the claimed Home is ready"),
+        };
+        for entry in &journal.entries {
+            self.require_state(
+                entry.id,
+                if previous {
+                    entry.original_sha256.as_deref()
+                } else {
+                    Some(&entry.staged_sha256)
+                },
+                if previous {
+                    entry.original_mode
+                } else {
+                    Some(entry.staged_mode)
+                },
+            )?;
+        }
+        self.cleanup(&journal)
+    }
+
+    /// Normal setup needs the admitted candidate components while it refreshes support.
+    /// Keep original backups and the committing journal until the final metadata save.
+    pub(crate) fn activate_artifacts_for_support(&self) -> anyhow::Result<()> {
+        let mut journal = self
+            .read_journal()?
+            .context("prepared release journal missing")?;
+        if !self.uses_consumed_layout()
+            || journal.phase != Phase::Prepared
+            || journal.restart.is_some()
+        {
+            bail!("support activation requires a prepared consumed CLI release");
+        }
+        self.validate_scratch(&journal)?;
+        for entry in &journal.entries {
+            self.require_state(
+                entry.id,
+                entry.original_sha256.as_deref(),
+                entry.original_mode,
+            )?;
+        }
+        journal.phase = Phase::Committing;
+        self.write_journal(&journal)?;
+        let result = (|| {
+            for id in [ReleaseFile::RuntimeBinary, ReleaseFile::Components] {
+                let entry = journal.entries.iter().find(|entry| entry.id == id).unwrap();
+                fs::rename(self.scratch(id, STAGE), &self.destinations[&id])?;
+                sync_directory(self.destinations[&id].parent().unwrap())?;
+                self.require_state(id, Some(&entry.staged_sha256), Some(entry.staged_mode))?;
+            }
+            Ok(())
+        })();
+        self.restore_on_error(result)
+    }
+
     fn commit_with(
         &self,
         mut after_rename: impl FnMut(ReleaseFile) -> anyhow::Result<()>,
@@ -477,19 +967,32 @@ impl InstallTransaction {
         let mut journal = self
             .read_journal()?
             .context("prepared release journal missing")?;
-        if journal.phase != Phase::Prepared {
+        if !matches!(journal.phase, Phase::Prepared | Phase::Committing) {
             bail!("release transaction is not prepared");
         }
         self.validate_scratch(&journal)?;
+        // A resumed writer can finish only a contiguous, admitted activation prefix.
+        let mut original_suffix = false;
         for entry in &journal.entries {
             check_private_directory(self.scratch(entry.id, STAGE).parent().unwrap())?;
             check_private_directory(self.scratch(entry.id, ROLLBACK).parent().unwrap())?;
-            self.require_state(
-                entry.id,
+            let state = file_state(&self.destinations[&entry.id])?;
+            let original = state_matches(
+                &state,
                 entry.original_sha256.as_deref(),
                 entry.original_mode,
-            )?;
-            require_hash(&self.scratch(entry.id, STAGE), &entry.staged_sha256)?;
+            );
+            let candidate =
+                state_matches(&state, Some(&entry.staged_sha256), Some(entry.staged_mode));
+            if !(original || journal.phase == Phase::Committing && candidate && !original_suffix) {
+                bail!("release activation prefix changed; retain journal for recovery");
+            }
+            if original && !candidate {
+                original_suffix = true;
+            }
+            if !candidate {
+                require_hash(&self.scratch(entry.id, STAGE), &entry.staged_sha256)?;
+            }
             if let Some(original) = &entry.original_sha256 {
                 require_hash(&self.scratch(entry.id, ROLLBACK), original)?;
             }
@@ -499,6 +1002,13 @@ impl InstallTransaction {
             self.write_journal(&journal)?;
             for entry in &journal.entries {
                 self.check_parent(self.destinations[&entry.id].parent().unwrap(), false)?;
+                if state_matches(
+                    &file_state(&self.destinations[&entry.id])?,
+                    Some(&entry.staged_sha256),
+                    Some(entry.staged_mode),
+                ) {
+                    continue;
+                }
                 self.require_state(
                     entry.id,
                     entry.original_sha256.as_deref(),
@@ -518,7 +1028,11 @@ impl InstallTransaction {
             self.write_journal(&journal)
         })();
         self.restore_on_error(result)?;
-        self.cleanup(&journal)
+        if journal.restart.is_some() {
+            Ok(())
+        } else {
+            self.cleanup(&journal)
+        }
     }
 
     fn restore_on_error(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
@@ -563,26 +1077,13 @@ impl InstallTransaction {
     }
 
     fn read_journal(&self) -> anyhow::Result<Option<Journal>> {
-        let mut file = match open_read(&self.journal_path()) {
-            Ok(file) => file,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Ok(None)
-            }
-            Err(error) => return Err(error),
+        let Some(journal) = read_journal_file(&self.journal_path())? else {
+            return Ok(None);
         };
-        check_file(&file, &self.journal_path(), true)?;
-        if file.metadata()?.len() > MAX_JOURNAL {
-            bail!("installation journal exceeds size limit");
+        if journal_layout(&journal)? != self.layout {
+            bail!("installation journal layout changed during recovery");
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let journal: Journal = serde_json::from_slice(&bytes)?;
-        if journal.schema != "elastos.install-transaction/v1"
-            || journal.data_dir != self.data_dir
+        if journal.data_dir != self.data_dir
             || journal.binary_basename != self.binary.file_name().unwrap().to_str().unwrap()
             || journal.transaction_id.len() != 32
             || !journal
@@ -599,6 +1100,7 @@ impl InstallTransaction {
         {
             bail!("installation journal identity is incompatible with this writer");
         }
+        validate_restart_record(&journal)?;
         for entry in &journal.entries {
             if !valid_hash(&entry.staged_sha256)
                 || entry
@@ -611,6 +1113,13 @@ impl InstallTransaction {
                     .is_some_and(|mode| mode & !0o777 != 0 || mode & 0o022 != 0)
                 || entry.staged_mode & !0o777 != 0
                 || entry.staged_mode & 0o022 != 0
+                || (self.uses_consumed_layout()
+                    && matches!(
+                        entry.id,
+                        ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest
+                    )
+                    && (entry.staged_mode != 0o600
+                        || entry.original_mode.is_some_and(|mode| mode != 0o600)))
             {
                 bail!("installation journal entry is invalid");
             }
@@ -864,6 +1373,218 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+pub(crate) fn validate_restart_plan(plan: &RestartPlan) -> anyhow::Result<()> {
+    if plan.request_id.len() != 32
+        || !plan.request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || [
+            &plan.controller_sha256,
+            &plan.launch_plan_sha256,
+            &plan.support_sha256,
+            &plan.previous_binary_sha256,
+        ]
+        .iter()
+        .any(|hash| !valid_hash(hash))
+        || semver::Version::parse(&plan.previous_version).is_err()
+        || semver::Version::parse(&plan.candidate_version).is_err()
+    {
+        bail!("restart plan is invalid");
+    }
+    Ok(())
+}
+
+fn validate_restart_record(journal: &Journal) -> anyhow::Result<()> {
+    let Some(restart) = &journal.restart else {
+        return Ok(());
+    };
+    if !matches!(
+        journal.schema.as_str(),
+        "elastos.install-transaction/v2" | "elastos.install-transaction/v4"
+    ) || journal.transaction_id.len() != 32
+        || !journal
+            .transaction_id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || journal.entries.len() != ReleaseFile::ALL.len()
+        || journal
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>()
+            != ReleaseFile::ALL.into_iter().collect()
+        || journal.entries.iter().any(|entry| {
+            !valid_hash(&entry.staged_sha256)
+                || entry
+                    .original_sha256
+                    .as_ref()
+                    .is_none_or(|hash| !valid_hash(hash))
+                || entry
+                    .original_mode
+                    .is_none_or(|mode| mode & !0o777 != 0 || mode & 0o022 != 0)
+                || entry.staged_mode & !0o777 != 0
+                || entry.staged_mode & 0o022 != 0
+        })
+    {
+        bail!("restart journal release entries are invalid");
+    }
+    validate_restart_plan(&restart.plan)?;
+    let (claimed, running, outer_valid) = match restart.phase {
+        RestartPhase::CandidatePending => (
+            false,
+            false,
+            matches!(
+                journal.phase,
+                Phase::Prepared | Phase::Committing | Phase::Committed
+            ),
+        ),
+        RestartPhase::CandidateStartClaimed => (true, false, journal.phase == Phase::Committed),
+        RestartPhase::CandidateRunning | RestartPhase::CandidateReady => {
+            (true, true, journal.phase == Phase::Committed)
+        }
+        RestartPhase::Restoring | RestartPhase::Restored => {
+            (false, false, journal.phase == Phase::Recovering)
+        }
+        RestartPhase::PreviousStartClaimed => (true, false, journal.phase == Phase::Recovering),
+        RestartPhase::PreviousRunning | RestartPhase::PreviousReady => {
+            (true, true, journal.phase == Phase::Recovering)
+        }
+    };
+    let generation_valid = if claimed {
+        restart.generation.len() == 32 && restart.generation.bytes().all(|b| b.is_ascii_hexdigit())
+    } else {
+        restart.generation.is_empty()
+    };
+    if !outer_valid
+        || !generation_valid
+        || running != restart.pid.is_some()
+        || running != restart.process_start.is_some()
+        || restart.pid == Some(0)
+        || restart
+            .process_start
+            .as_ref()
+            .is_some_and(|start| start.is_empty() || start.len() > 128)
+        || journal
+            .entries
+            .iter()
+            .any(|entry| entry.original_sha256.is_none())
+        || journal
+            .entries
+            .iter()
+            .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+            .and_then(|entry| entry.original_sha256.as_deref())
+            != Some(&restart.plan.previous_binary_sha256)
+    {
+        bail!("restart journal identity or phase is invalid");
+    }
+    Ok(())
+}
+
+/// A pending transaction admits only its controller's claimed host generation.
+/// This read precedes host startup side effects; the controller retains the writer lock.
+pub(crate) fn authorize_host_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    authorize_host_start_with_generation(
+        data_dir,
+        binary,
+        std::env::var("ELASTOS_UPDATE_GENERATION").ok().as_deref(),
+        std::process::id(),
+    )
+}
+
+pub(crate) fn authorize_host_start_with_generation(
+    data_dir: &Path,
+    binary: &Path,
+    generation: Option<&str>,
+    process_id: u32,
+) -> anyhow::Result<()> {
+    let Some(journal) = read_host_start_journal(data_dir, binary)? else {
+        return Ok(());
+    };
+    if journal.restart.is_none() {
+        bail!("{}", pending_home_recovery_hint(&journal));
+    }
+    let restart = journal.restart.context(
+        "Home restart recovery is pending. Start the retained update controller with its receipt.",
+    )?;
+    validate_restart_plan(&restart.plan)?;
+    let generation = generation.unwrap_or_default();
+    if generation.len() != 32
+        || generation != restart.generation
+        || restart.pid.is_some_and(|pid| pid != process_id)
+    {
+        bail!("Home start differs from the controller's claimed generation. Start the retained update controller with its receipt.");
+    }
+    let previous = match restart.phase {
+        RestartPhase::CandidateStartClaimed | RestartPhase::CandidateRunning => false,
+        RestartPhase::PreviousStartClaimed | RestartPhase::PreviousRunning => true,
+        _ => bail!("installation is not ready for a claimed Home start"),
+    };
+    let entry = journal
+        .entries
+        .iter()
+        .find(|entry| entry.id == ReleaseFile::RuntimeBinary)
+        .context("restart Runtime entry missing")?;
+    let expected = if previous {
+        entry.original_sha256.as_deref()
+    } else {
+        Some(entry.staged_sha256.as_str())
+    };
+    if !state_matches(
+        &file_state(binary)?,
+        expected,
+        if previous {
+            entry.original_mode
+        } else {
+            Some(entry.staged_mode)
+        },
+    ) {
+        bail!("claimed Runtime binary changed before startup");
+    }
+    Ok(())
+}
+
+pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    if let Some(journal) = read_host_start_journal(data_dir, binary)? {
+        bail!("{}", pending_home_recovery_hint(&journal));
+    }
+    Ok(())
+}
+
+fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
+    if journal.restart.is_none() {
+        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
+    } else {
+        "Home restart recovery is pending. Start the retained update controller with its receipt."
+    }
+}
+
+fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
+    let parent = binary.parent().context("host binary parent missing")?;
+    let path = parent.join(JOURNAL);
+    let Some(journal) = read_journal_file(&path)? else {
+        return Ok(None);
+    };
+    validate_restart_record(&journal)?;
+    if journal.data_dir != fs::canonicalize(data_dir)?
+        || journal.binary_basename
+            != binary
+                .file_name()
+                .context("host binary basename missing")?
+                .to_string_lossy()
+    {
+        bail!("Installation recovery belongs to a different Home. Retain its files for operator repair.");
+    }
+    anyhow::ensure!(
+        matches!(
+            journal.schema.as_str(),
+            "elastos.install-transaction/v1"
+                | "elastos.install-transaction/v2"
+                | "elastos.install-transaction/v3"
+                | "elastos.install-transaction/v4"
+        ),
+        "Installation recovery format is unknown. Retain its files for operator repair."
+    );
+    Ok(Some(journal))
+}
+
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -886,10 +1607,19 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
 fn require_disk_reserve(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
     let reserve = (total * RESERVE_PERCENT).div_ceil(100);
     if total == 0 || available < reserve || needed > available.saturating_sub(reserve) {
-        bail!("update would cross the 15% disk reserve; previous release preserved");
+        return Err(DiskReserveError.into());
     }
     Ok(())
 }
+
+pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyhow::Result<()> {
+    let (total, available) = disk_space(path)?;
+    require_disk_reserve(total, available, u128::from(needed))
+}
+
+#[cfg(test)]
+#[path = "install_transaction/restart_tests.rs"]
+mod restart_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1016,6 +1746,47 @@ mod tests {
     }
 
     #[test]
+    fn installation_guard_releases_ownership_with_a_retained_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let guard = InstallationGuard::acquire(&parent).unwrap();
+        let retained = guard._lock.try_clone().unwrap();
+        let inode = retained.metadata().unwrap().ino();
+        let flags = unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(parent.join(INSTALL_LOCK))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+        );
+        assert!(matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ));
+
+        drop(guard);
+        let next_guard = InstallationGuard::acquire(&parent).unwrap();
+        assert_eq!(retained.metadata().unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(parent.join(INSTALL_LOCK)).unwrap().ino(),
+            inode
+        );
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        drop(retained);
+        assert!(InstallationGuard::acquire(&parent).is_err());
+        drop(next_guard);
+        let _guard = InstallationGuard::acquire(&parent).unwrap();
+    }
+
+    #[test]
     fn installation_guard_uses_resolved_aliases_and_keeps_distinct_parents_independent() {
         let fixture = Fixture::new();
         let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
@@ -1069,6 +1840,31 @@ mod tests {
         assert_eq!(snapshot(&moved), moved_before);
         assert_eq!(snapshot(&other), other_before);
         assert!(!moved.join(INSTALL_LOCK).exists());
+        assert!(!other.join(INSTALL_LOCK).exists());
+    }
+
+    #[test]
+    fn installation_guard_requires_its_resolved_parent_for_binary_admission() {
+        let fixture = Fixture::new();
+        let parent = fs::canonicalize(fixture.binary.parent().unwrap()).unwrap();
+        let alias = parent.with_file_name("bin-alias");
+        let other = parent.with_file_name("other-bin");
+        fs::create_dir(&other).unwrap();
+        symlink(&parent, &alias).unwrap();
+        let guard = InstallationGuard::acquire(&parent).unwrap();
+        guard.require_binary(&parent.join("elastos")).unwrap();
+        assert!(guard.require_binary(&alias.join("elastos")).is_err());
+        assert!(guard.require_binary(&other.join("elastos")).is_err());
+        fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        guard.require_binary(&parent.join("elastos")).unwrap();
+        assert!(guard.require_binary(&alias.join("elastos")).is_err());
+
+        let moved = parent.with_file_name("moved-bin");
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&other, &parent).unwrap();
+        assert!(guard.require_binary(&parent.join("elastos")).is_err());
+        assert!(moved.join(INSTALL_LOCK).is_file());
         assert!(!other.join(INSTALL_LOCK).exists());
     }
 
@@ -1531,43 +2327,153 @@ mod tests {
 
     #[test]
     fn committed_cleanup_preserves_later_owner_bytes_and_modes() {
+        assert_committed_cleanup_preserves_owner_edits(ReleaseLayout::Consumed);
+    }
+
+    #[test]
+    fn legacy_committed_cleanup_preserves_publisher_owner_bytes_and_modes() {
+        assert_committed_cleanup_preserves_owner_edits(ReleaseLayout::LegacyPublisher);
+    }
+
+    fn assert_committed_cleanup_preserves_owner_edits(layout: ReleaseLayout) {
         let fixture = Fixture::new();
         let writer = fixture.writer();
         fixture.old_files(&writer, false);
         fixture.commit_before_cleanup(&writer);
+        if layout == ReleaseLayout::LegacyPublisher {
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            let publisher = publisher_release_head_path(&fixture.data)
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            writer
+                .check_parent(publisher.parent().unwrap(), true)
+                .unwrap();
+            fs::rename(
+                writer.destinations[&ReleaseFile::ReleaseHead]
+                    .parent()
+                    .unwrap(),
+                publisher,
+            )
+            .unwrap();
+            journal.schema = "elastos.install-transaction/v1".into();
+            writer.write_journal(&journal).unwrap();
+        }
+        drop(writer);
+        let writer = fixture.writer();
+        assert_eq!(writer.layout, layout);
+        let independent_metadata = if layout == ReleaseLayout::Consumed {
+            [
+                publisher_release_head_path(&fixture.data),
+                publisher_release_manifest_path(&fixture.data),
+            ]
+        } else {
+            [
+                installation_release_head_path(&fixture.data),
+                installation_release_manifest_path(&fixture.data),
+            ]
+        };
+        for path in &independent_metadata {
+            writer.check_parent(path.parent().unwrap(), true).unwrap();
+            write_new(path, b"independent signed input", 0o600).unwrap();
+        }
         fs::remove_file(writer.scratch(ReleaseFile::RuntimeBinary, ROLLBACK)).unwrap();
+        let modes: BTreeMap<_, _> = ReleaseFile::ALL
+            .map(|id| {
+                let mode = match (id, layout) {
+                    (ReleaseFile::RuntimeBinary, _) => 0o750,
+                    (
+                        ReleaseFile::ReleaseHead | ReleaseFile::ReleaseManifest,
+                        ReleaseLayout::Consumed,
+                    ) => 0o600,
+                    _ => 0o640,
+                };
+                (id, mode)
+            })
+            .into_iter()
+            .collect();
         for id in ReleaseFile::ALL {
             let destination = &writer.destinations[&id];
             fs::write(destination, format!("later owner {}", id.name())).unwrap();
-            let mode = if id == ReleaseFile::RuntimeBinary {
-                0o750
-            } else {
-                0o640
-            };
-            fs::set_permissions(destination, fs::Permissions::from_mode(mode)).unwrap();
+            fs::set_permissions(destination, fs::Permissions::from_mode(modes[&id])).unwrap();
         }
         drop(writer);
         let resumed = fixture.writer();
         resumed.recover().unwrap();
         resumed.require_empty_scratch().unwrap();
         resumed.recover().unwrap();
+        for metadata in [
+            publisher_release_head_path(&fixture.data),
+            installation_release_head_path(&fixture.data),
+        ] {
+            for directory in [STAGE, ROLLBACK] {
+                assert_eq!(
+                    fs::symlink_metadata(metadata.parent().unwrap().join(directory))
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::NotFound,
+                );
+            }
+        }
+        assert!(!resumed.journal_path().exists());
         for id in ReleaseFile::ALL {
             let destination = &resumed.destinations[&id];
             assert_eq!(
                 fs::read(destination).unwrap(),
                 format!("later owner {}", id.name()).as_bytes()
             );
-            let mode = if id == ReleaseFile::RuntimeBinary {
-                0o750
-            } else {
-                0o640
-            };
-            assert_eq!(fs::metadata(destination).unwrap().mode() & 0o777, mode);
+            assert_eq!(
+                fs::metadata(destination).unwrap().mode() & 0o777,
+                modes[&id]
+            );
+        }
+        for path in independent_metadata {
+            assert_eq!(fs::read(&path).unwrap(), b"independent signed input");
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
         }
         assert_eq!(
             fs::read(fixture.data.join("owner-data")).unwrap(),
             b"data written by owner"
         );
+    }
+
+    #[test]
+    fn committed_cleanup_refuses_nonprivate_consumed_metadata_and_preserves_custody() {
+        for (id, mode) in [ReleaseFile::ReleaseHead, ReleaseFile::ReleaseManifest]
+            .into_iter()
+            .flat_map(|id| [0o640, 0o644].into_iter().map(move |mode| (id, mode)))
+        {
+            let fixture = Fixture::new();
+            let writer = fixture.writer();
+            fixture.old_files(&writer, false);
+            fixture.commit_before_cleanup(&writer);
+            let destination = &writer.destinations[&id];
+            fs::write(destination, b"preserve later owner input").unwrap();
+            fs::set_permissions(destination, fs::Permissions::from_mode(mode)).unwrap();
+            let paths: Vec<_> = writer
+                .destinations
+                .values()
+                .cloned()
+                .chain(ReleaseFile::ALL.map(|id| writer.scratch(id, ROLLBACK)))
+                .chain(std::iter::once(writer.journal_path()))
+                .collect();
+            let before: Vec<_> = paths
+                .iter()
+                .map(|path| (fs::read(path).unwrap(), fs::metadata(path).unwrap().mode()))
+                .collect();
+            let error = writer.recover().unwrap_err();
+            assert!(error.to_string().contains("owner-only files"));
+            drop(writer);
+            assert!(InstallTransaction::acquire(&fixture.data, &fixture.binary).is_err());
+            for (path, (bytes, mode)) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert_eq!(fs::metadata(path).unwrap().mode(), mode);
+            }
+            assert_eq!(
+                fs::read(fixture.data.join("owner-data")).unwrap(),
+                b"data written by owner"
+            );
+        }
     }
 
     #[test]
