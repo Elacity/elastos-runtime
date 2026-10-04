@@ -889,6 +889,10 @@ async function openFailureState(page, frame) {
       innerWidth,
       innerHeight,
       scale: window.visualViewport?.scale ?? null,
+      scroll: [scrollX, scrollY],
+      visualViewport: window.visualViewport
+        ? [visualViewport.offsetLeft, visualViewport.offsetTop, visualViewport.width, visualViewport.height]
+        : null,
       scrollWidth: document.documentElement.scrollWidth,
       shellFrame: shell ? [Math.round(shell.x), Math.round(shell.y), Math.round(shell.width), Math.round(shell.height)] : null,
     };
@@ -907,6 +911,12 @@ async function openFailureState(page, frame) {
       innerHeight,
       formFactor: document.body.dataset.formFactor || null,
       bodyClasses: [...document.body.classList],
+      scroll: [scrollX, scrollY],
+      visualViewport: window.visualViewport
+        ? [visualViewport.offsetLeft, visualViewport.offsetTop, visualViewport.width, visualViewport.height]
+        : null,
+      activeElement: document.activeElement ? `${document.activeElement.tagName}#${document.activeElement.id}` : null,
+      pointerEvents: window.phoneSmokePointerEvents || [],
       bar: bar ? box(bar) : null,
       barScrollWidth: bar?.scrollWidth ?? null,
       items: bar
@@ -918,7 +928,23 @@ async function openFailureState(page, frame) {
       brandImage: brandImage ? { box: box(brandImage), natural: [brandImage.naturalWidth, brandImage.naturalHeight], complete: brandImage.complete } : null,
     };
   }).catch((error) => String(error));
-  return { host, shell };
+  const playwrightSearchBox = await frame.locator("#toolbar-spotlight").boundingBox().catch((error) => String(error));
+  return { host, shell, playwrightSearchBox };
+}
+
+// Registered before Playwright's own hit-target listeners, so it sees the
+// pointer events Playwright rejects as intercepted.
+async function recordPointerEvents(frame) {
+  await frame.evaluate(() => {
+    window.phoneSmokePointerEvents = [];
+    for (const type of ["pointerdown", "mousedown", "click"]) {
+      window.addEventListener(type, (event) => {
+        const target = event.target;
+        window.phoneSmokePointerEvents.push(`${type}@${Math.round(event.clientX)},${Math.round(event.clientY)}:${target?.id || target?.tagName}`);
+        window.phoneSmokePointerEvents.splice(0, window.phoneSmokePointerEvents.length - 8);
+      }, true);
+    }
+  });
 }
 
 async function runProfile(browser, engineId, profile, origin) {
@@ -960,6 +986,7 @@ async function runProfile(browser, engineId, profile, origin) {
       booted = await bootHome(context, origin);
     }
     const { page, frame } = booted;
+    await recordPointerEvents(frame);
     for (const surface of SHELL_SURFACES) {
       if (surface.phone === false && profile.id.startsWith("phone")) {
         continue;
