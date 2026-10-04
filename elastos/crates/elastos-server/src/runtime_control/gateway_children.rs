@@ -164,6 +164,11 @@ impl StartingChild {
     pub(crate) fn ready(&mut self) {
         self.ready = true;
     }
+
+    /// Keep the unreaped leader available for failed-start group cleanup.
+    pub(crate) fn observed_exit(&self) -> std::io::Result<Option<ExitStatus>> {
+        process_ownership::observe_exit(self.child.id())
+    }
 }
 
 impl Drop for StartingChild {
@@ -916,6 +921,103 @@ mod tests {
         assert!(!absent.exists());
         assert!(live.exists());
         assert!(refuse_unreconciled_groups(temp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn early_start_exit_keeps_cleanup_ownership_until_the_group_is_empty() {
+        for retained in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (_published, owner) = fixture_owner(temp.path(), "gateway-fixture");
+            let leader = Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut leader =
+                StartingChild::new(leader, Some(&owner), &temp.path().join("child-coords.json"))
+                    .unwrap();
+            let pid = leader.child.id();
+            let birth = process_start(pid).unwrap();
+            let record = leader.record.clone().unwrap();
+            let record_bytes = std::fs::read(&record).unwrap();
+            let mut helper = crate::api::server::HostHelperProcess {
+                name: "failed-start group helper",
+                child: Command::new("sleep")
+                    .arg("60")
+                    .process_group(pid as i32)
+                    .spawn()
+                    .unwrap(),
+            };
+            let helper_pid = helper.child.id();
+            let mut unrelated = crate::api::server::HostHelperProcess {
+                name: "unrelated failed-start fixture",
+                child: Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            };
+            leader.child.kill().unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let status = loop {
+                if let Some(status) = leader.observed_exit().unwrap() {
+                    break status;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert!(helper.child.try_wait().unwrap().is_none());
+            assert_eq!(leader.observed_exit().unwrap(), Some(status));
+            assert_eq!(leader.observed_exit().unwrap(), Some(status));
+            if retained {
+                // Reap our direct helper concurrently so cleanup can prove an
+                // empty group while its exited leader still reserves the PID.
+                let (started, running) = std::sync::mpsc::channel();
+                let reaper = std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                    while std::time::Instant::now() < deadline {
+                        if let Some(status) = helper.child.try_wait().unwrap() {
+                            return Some(status);
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // The helper's guard owns fixture cleanup if group drain fails.
+                    None
+                });
+                running.recv().unwrap();
+                drop(leader);
+                assert_eq!(
+                    reaper.join().unwrap().unwrap().signal(),
+                    Some(libc::SIGKILL)
+                );
+                assert!(!record.exists());
+                assert!(process_ownership::generation_gone(pid, &birth).unwrap());
+                assert!(process_ownership::group_descendants(pid)
+                    .unwrap()
+                    .is_empty());
+            } else {
+                // Loss of the direct-child anchor retains the ownership record.
+                assert_eq!(leader.child.try_wait().unwrap(), Some(status));
+                assert_eq!(
+                    leader.observed_exit().unwrap_err().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                drop(leader);
+                assert!(helper.child.try_wait().unwrap().is_none());
+                assert_eq!(std::fs::read(&record).unwrap(), record_bytes);
+                assert!(refuse_unreconciled_groups(temp.path()).is_err());
+                drop(helper);
+                shutdown(Some(owner)).await.unwrap();
+                assert!(!record.exists());
+            }
+            assert_eq!(unsafe { libc::kill(helper_pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            assert!(unrelated.child.try_wait().unwrap().is_none());
+        }
     }
 
     #[tokio::test]
