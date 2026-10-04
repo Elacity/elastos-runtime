@@ -2323,7 +2323,6 @@ mod tests {
             reader.read(&mut buffer).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        drop(reader);
         fs::write(&path, &payload).unwrap();
         let mut file = fs::File::open(&path).unwrap();
         let mut reader = AddPathReader::new(&mut file).unwrap();
