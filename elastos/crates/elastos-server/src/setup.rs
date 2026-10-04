@@ -379,7 +379,7 @@ async fn run_with_data_dir(
         let binary_install_state =
             component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info);
         let metadata_install_state =
-            provider_capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform);
+            capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform);
         match effective_component_install_state_for_name(
             &manifest,
             &data_dir,
@@ -512,7 +512,7 @@ async fn run_with_data_dir(
             metadata_install_state,
             Some(InstallState::Missing | InstallState::Stale(_))
         ) {
-            ensure_provider_capsule_metadata_component(
+            ensure_component_capsule_metadata(
                 &data_dir,
                 name,
                 comp,
@@ -975,7 +975,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     })
 }
 
-async fn ensure_provider_capsule_metadata_component(
+async fn ensure_component_capsule_metadata(
     data_dir: &Path,
     name: &str,
     component: &Component,
@@ -1022,8 +1022,9 @@ async fn ensure_provider_capsule_metadata_component(
     )
     .await?;
     write_platform_cache_metadata(platform_info, &dest)?;
-    if let Some(reason) = installed_provider_capsule_metadata_stale_reason(name, &dest) {
-        anyhow::bail!("installed provider capsule metadata '{name}' failed validation: {reason}");
+    if let Some(reason) = installed_component_capsule_metadata_stale_reason(name, component, &dest)
+    {
+        anyhow::bail!("installed capsule metadata '{name}' failed validation: {reason}");
     }
     Ok(())
 }
@@ -1159,7 +1160,7 @@ fn effective_component_install_state_for_name(
     if !matches!(state, InstallState::Installed) {
         return state;
     }
-    match provider_capsule_metadata_install_state_for_name(data_dir, name, component, platform) {
+    match capsule_metadata_install_state_for_name(data_dir, name, component, platform) {
         Some(InstallState::Installed) | None => InstallState::Installed,
         Some(InstallState::Missing) => InstallState::Stale(
             "provider capsule metadata missing from installed bundle".to_string(),
@@ -1268,7 +1269,7 @@ fn component_install_state_for_name(
     base
 }
 
-fn provider_capsule_metadata_install_state_for_name(
+fn capsule_metadata_install_state_for_name(
     data_dir: &Path,
     name: &str,
     component: &Component,
@@ -1304,8 +1305,10 @@ fn provider_capsule_metadata_install_state_for_name(
             "provider capsule metadata install path is not a directory".to_string(),
         ));
     }
-    if let Some(reason) = extracted_bundle_cache_stale_reason(&install_root, platform_info)
-        .or_else(|| installed_provider_capsule_metadata_stale_reason(name, &install_root))
+    if let Some(reason) =
+        extracted_bundle_cache_stale_reason(&install_root, platform_info).or_else(|| {
+            installed_component_capsule_metadata_stale_reason(name, component, &install_root)
+        })
     {
         return Some(InstallState::Stale(reason));
     }
@@ -1340,8 +1343,9 @@ fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Opt
     None
 }
 
-fn installed_provider_capsule_metadata_stale_reason(
+fn installed_component_capsule_metadata_stale_reason(
     name: &str,
+    component: &Component,
     install_root: &Path,
 ) -> Option<String> {
     let manifest_bytes = match fs::read(install_root.join("capsule.json")) {
@@ -1360,6 +1364,45 @@ fn installed_provider_capsule_metadata_stale_reason(
             "capsule metadata name mismatch: expected '{}', found '{}'",
             name, manifest.name
         ));
+    }
+    if component.provider_runtime.is_none() {
+        // Content metadata describes bytes, not a provider or an execution grant.
+        if manifest.role != elastos_common::CapsuleRole::Content
+            || manifest.capsule_type != elastos_common::CapsuleType::Data
+            || manifest.runtime_abi.is_some()
+            || manifest.execution.is_some()
+            || manifest.bus_contract.is_some()
+            || manifest.wit_world_sha256.is_some()
+            || manifest.viewer.is_some()
+            || manifest.microvm.is_some()
+            || manifest.providers.is_some()
+            || manifest.authority.is_some()
+            || manifest.provides.is_some()
+            || !manifest.requires.is_empty()
+            || !manifest.capabilities.is_empty()
+            || !manifest.interfaces.is_empty()
+            || manifest.permissions.host_process
+            || manifest.permissions.guest_network
+            || !manifest.permissions.storage.is_empty()
+            || !manifest.permissions.messaging.is_empty()
+        {
+            return Some("capsule metadata must be passive content/data".to_string());
+        }
+        if let Err(err) = elastos_common::validate_model_content_path(&manifest.entrypoint) {
+            return Some(format!("passive capsule entrypoint is invalid: {err}"));
+        }
+        let mut entrypoint = install_root.to_path_buf();
+        for part in Path::new(&manifest.entrypoint).components() {
+            entrypoint.push(part);
+            match fs::symlink_metadata(&entrypoint) {
+                Ok(metadata) if !metadata.file_type().is_symlink() => {}
+                _ => return Some("passive capsule entrypoint is missing or aliased".to_string()),
+            }
+        }
+        if !entrypoint.is_file() {
+            return Some("passive capsule entrypoint is not a regular file".to_string());
+        }
+        return None;
     }
     if manifest.role != elastos_common::CapsuleRole::Provider {
         return Some("capsule metadata role must be provider".to_string());
@@ -2678,7 +2721,7 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
         {
             continue;
         }
-        ensure_provider_capsule_metadata_component(
+        ensure_component_capsule_metadata(
             data_dir,
             name,
             new_component,
@@ -2864,11 +2907,13 @@ async fn download_component(
 
     // Release artifacts come from the trusted source over Carrier.
     // A failed Carrier fetch stays a failure, even when a URL is present.
-    if let Some(release_path) = platform_info
-        .release_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-    {
+    if let Some(release_path) = platform_info.release_path.as_deref() {
+        if release_path.trim().is_empty() {
+            anyhow::bail!(
+                "component '{}' must come from the signed release: present release_path is blank",
+                name
+            );
+        }
         required_release_artifact_checksum(name, platform_info)?;
         let elastos_url = platform_info
             .cid
@@ -3872,10 +3917,11 @@ mod tests {
         let version = engine.version.as_deref().unwrap();
         let mut prebuilt = 0;
         for (platform, info) in &engine.platforms {
-            if info.url.is_none() {
+            if info.release_path.is_none() {
                 continue;
             }
             prebuilt += 1;
+            assert!(info.url.is_none(), "{platform} must use the signed release");
             assert_eq!(
                 info.binary_path.as_deref(),
                 Some("llama-server"),
@@ -3918,24 +3964,29 @@ mod tests {
             .components
             .iter()
             .any(|component| component == "archive-manager"));
-        for name in ["model-provider", "llama-server"] {
-            for profile_name in ["home", "demo"] {
-                assert!(
-                    manifest.profiles[profile_name]
-                        .components
-                        .iter()
-                        .any(|component| component == name),
-                    "{profile_name} profile must install {name}"
-                );
-            }
+        for profile_name in ["home", "demo"] {
+            let selected = resolve_components(&manifest, Some(profile_name), &[], &[]).unwrap();
+            assert!(selected.iter().any(|name| name == "model-provider"));
+            assert!(
+                !selected.iter().any(|name| name == "llama-server"
+                    || manifest
+                        .external
+                        .get(name)
+                        .is_some_and(|component| component
+                            .install_path
+                            .as_deref()
+                            .is_some_and(|path| path.ends_with(".gguf")))),
+                "{profile_name} installs the engine and models only on demand"
+            );
         }
-        assert!(
-            !manifest.profiles["home"]
-                .components
-                .iter()
-                .any(|component| component.starts_with("model-qwen")),
-            "home profile must not install huggingface GGUF components"
-        );
+        let on_demand = resolve_components(
+            &manifest,
+            None,
+            &["llama-server".to_string(), "model-bonsai-8b-q1".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(on_demand, ["llama-server", "model-bonsai-8b-q1"]);
         let catalog = manifest
             .model_catalog
             .as_ref()
@@ -5141,6 +5192,116 @@ mod tests {
     }
 
     #[test]
+    fn passive_capsule_metadata_admits_content_without_provider_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut component = provider_component_with_capsule_metadata();
+        component.provider_runtime = None;
+        let manifest = serde_json::json!({
+            "schema": "elastos.capsule/v1", "name": "kubo", "version": "0.40.1",
+            "role": "content", "type": "data", "projections": ["content"],
+            "entrypoint": "ipfs"
+        });
+        fs::write(tmp.path().join("ipfs"), b"packaged kubo").unwrap();
+        fs::write(
+            tmp.path().join("capsule.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_component_capsule_metadata_stale_reason("kubo", &component, tmp.path()),
+            None
+        );
+
+        for (field, value) in [
+            ("name", serde_json::json!("another-component")),
+            ("role", serde_json::json!("provider")),
+            ("type", serde_json::json!("wasm")),
+            (
+                "runtime_abi",
+                serde_json::json!("elastos.provider-stdio/v1"),
+            ),
+            ("execution", serde_json::json!("native-provider")),
+            ("capabilities", serde_json::json!(["elastos://object/*"])),
+            ("permissions", serde_json::json!({"storage": ["shared"]})),
+            ("entrypoint", serde_json::json!("../outside")),
+            ("entrypoint", serde_json::json!("missing")),
+        ] {
+            let mut refused = manifest.clone();
+            refused[field] = value;
+            fs::write(
+                tmp.path().join("capsule.json"),
+                serde_json::to_vec(&refused).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                installed_component_capsule_metadata_stale_reason("kubo", &component, tmp.path())
+                    .is_some(),
+                "{field}"
+            );
+        }
+        fs::write(
+            tmp.path().join("capsule.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join("ipfs")).unwrap();
+        std::os::unix::fs::symlink("capsule.json", tmp.path().join("ipfs")).unwrap();
+        assert!(
+            installed_component_capsule_metadata_stale_reason("kubo", &component, tmp.path())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn provider_capsule_metadata_keeps_role_and_icon_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let component = provider_component_with_capsule_metadata();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../capsules/object-provider/capsule.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        fs::write(
+            tmp.path().join("capsule.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(installed_component_capsule_metadata_stale_reason(
+            "object-provider",
+            &component,
+            tmp.path()
+        )
+        .is_some());
+        fs::create_dir(tmp.path().join("icons")).unwrap();
+        for size in PROVIDER_ICON_SIZES {
+            fs::write(tmp.path().join(format!("icons/icon-{size}.png")), b"icon").unwrap();
+        }
+        assert_eq!(
+            installed_component_capsule_metadata_stale_reason(
+                "object-provider",
+                &component,
+                tmp.path()
+            ),
+            None
+        );
+        manifest = serde_json::json!({
+            "schema": "elastos.capsule/v1", "name": "object-provider", "version": "0.2.0",
+            "role": "content", "type": "data", "entrypoint": "payload"
+        });
+        fs::write(tmp.path().join("payload"), b"passive downgrade").unwrap();
+        fs::write(
+            tmp.path().join("capsule.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(installed_component_capsule_metadata_stale_reason(
+            "object-provider",
+            &component,
+            tmp.path()
+        )
+        .is_some());
+    }
+
+    #[test]
     fn installed_provider_binary_still_refreshes_missing_capsule_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let component = provider_component_with_capsule_metadata();
@@ -5196,7 +5357,7 @@ mod tests {
         )
         .unwrap();
 
-        match provider_capsule_metadata_install_state_for_name(
+        match capsule_metadata_install_state_for_name(
             tmp.path(),
             "object-provider",
             &component,
@@ -6032,7 +6193,10 @@ mod tests {
 
             let error = result.unwrap_err().to_string();
             assert!(error.contains("kubo"), "{error}");
-            assert!(error.contains("must come from the signed release"), "{error}");
+            assert!(
+                error.contains("must come from the signed release"),
+                "{error}"
+            );
             assert_eq!(requests.load(Ordering::SeqCst), 0);
             assert!(!dest.parent().unwrap().exists());
         }
@@ -6154,6 +6318,160 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("Checksum mismatch for kubo"), "{error}");
         assert_eq!(fs::read(dest).unwrap(), b"installed fixture");
+    }
+
+    #[tokio::test]
+    async fn download_component_requires_explicit_cid_gateway_and_verifies_checksum() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let bytes = b"gateway fixture";
+        let digest = sha2::Sha256::digest(bytes);
+        let cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{gateway}/unused");
+        let app = axum::Router::new().route(
+            &format!("/ipfs/{cid}"),
+            axum::routing::get(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { "gateway fixture" }
+            }),
+        );
+        let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut info: PlatformInfo = serde_json::from_value(serde_json::json!({
+            "url": url,
+            "cid": cid.to_string(),
+            "checksum": format!("sha256:{digest:x}")
+        }))
+        .unwrap();
+        let dest = tmp.path().join("bin/operator-tool");
+        let error = download_component(
+            tmp.path(),
+            "operator-tool",
+            &url,
+            &info,
+            &dest,
+            &build_gateway_list(tmp.path()),
+            FirstPartyCarrierContext::Setup,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("No configured fetch path"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!dest.parent().unwrap().exists());
+
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture",
+            "publisher_dids": [elastos_identity::derive_did(&[217; 32]).1],
+            "gateways": [gateway]
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(tmp.path(), &sources).unwrap();
+        let gateways = build_gateway_list(tmp.path());
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"installed fixture").unwrap();
+        info.checksum = Some(format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(b"different component")
+        ));
+        let error = download_component(
+            tmp.path(),
+            "operator-tool",
+            &url,
+            &info,
+            &dest,
+            &gateways,
+            FirstPartyCarrierContext::Setup,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Checksum mismatch for operator-tool"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"installed fixture");
+
+        info.checksum = Some(format!("sha256:{digest:x}"));
+        let result = download_component(
+            tmp.path(),
+            "operator-tool",
+            &url,
+            &info,
+            &dest,
+            &gateways,
+            FirstPartyCarrierContext::Setup,
+        )
+        .await;
+        serving.abort();
+        let _ = serving.await;
+
+        result.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read(dest).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn download_component_rejects_blank_release_path_with_cid_before_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { "gateway fixture" }
+        });
+        let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [elastos_identity::derive_did(&[217; 32]).1],
+            "gateways": [gateway]
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(tmp.path(), &sources).unwrap();
+        let dest = tmp.path().join("bin/kubo");
+        for blank in ["", " ", "\t\n"] {
+            let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+                "release_path": blank,
+                "cid": catalog_head_cid(b"gateway fixture").unwrap(),
+                "checksum": format!("sha256:{:x}", sha2::Sha256::digest(b"gateway fixture"))
+            }))
+            .unwrap();
+            let error = download_component(
+                tmp.path(),
+                "kubo",
+                "unused",
+                &info,
+                &dest,
+                &build_gateway_list(tmp.path()),
+                FirstPartyCarrierContext::Setup,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("release_path is blank"),
+                "{error}"
+            );
+            assert!(!dest.parent().unwrap().exists());
+        }
+        serving.abort();
+        let _ = serving.await;
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
