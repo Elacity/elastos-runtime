@@ -1514,7 +1514,8 @@ class CliFixtureTests(unittest.TestCase):
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
-                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None):
+                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None,
+                 apply_exit=0):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
@@ -1599,6 +1600,9 @@ class CliFixtureTests(unittest.TestCase):
                         lock.chmod(0o600)
                     elif args[-1] == "--check":
                         stdout = "Discovery: Carrier"
+                    elif apply_exit:
+                        self.returncode = apply_exit
+                        stdout, stderr = "Discovery: Carrier", apply_stderr
                     else:
                         current = observer.read(self.home / observer.CLI_DATA / "sources.json")["sources"][0]["installed_version"]
                         if current == manifest["new"]["version"]:
@@ -1730,6 +1734,9 @@ class CliFixtureTests(unittest.TestCase):
         code, _, result = self.fake_run(user_data_drift=True)
         self.assertEqual(code, 1)
         self.assertIn("config/data/support preservation differs", result["failure"])
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 0))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(b"").hexdigest())
         self.assertTrue(result["cleanup"]["passed"])
 
     def test_runner_rejects_substituted_legacy_metadata_before_update(self):
@@ -1822,6 +1829,63 @@ class CliFixtureTests(unittest.TestCase):
         code, _, result = self.fake_run(apply_stderr="ERROR ungraceful endpoint drop")
         self.assertEqual(code, 1)
         self.assertIn("Carrier apply failed", result["failure"])
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 0))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(b"ERROR ungraceful endpoint drop").hexdigest())
+
+    def test_failed_apply_retains_exact_reply_and_bounded_ci_diagnostic(self):
+        stderr = "discarded prefix\n" + "x" * 5000 + "\n\x1b[31mError: fixture apply refusal\x1b[0m\n"
+        code, calls, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
+        self.assertEqual(code, 1)
+        checks = result["paths"]["m2-discovery"]["checks"]
+        self.assertEqual(set(checks), {"check", "apply"})
+        self.assertEqual(checks["check"]["status"], "passed")
+        apply = checks["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 1))
+        owned = next(row for row in result["cleanup"]["owned_processes"] if row["pid"] == apply["pid"])
+        self.assertEqual(owned["exit"], 1)
+        self.assertGreaterEqual(apply["elapsed_ms"], 0)
+        self.assertEqual(apply["stdout_sha256"], hashlib.sha256(b"Discovery: Carrier").hexdigest())
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+        self.assertTrue(result["failure"].startswith("plain Carrier apply failed; command exit 1; CI m2-apply stderr: "))
+        self.assertTrue(result["failure"].endswith("Error: fixture apply refusal"))
+        self.assertNotIn("discarded prefix", result["failure"])
+        self.assertNotIn("\x1b", result["failure"])
+        self.assertLessEqual(len(result["failure"].split("; CI m2-apply stderr: ", 1)[1]), 1024)
+        self.assertEqual([argv[1:] for argv, _ in calls if argv[1] == "update"], [["update", "--check"], ["update"]])
+        self.assertEqual(observer.digest(self.root / "results/homes/cli/.local/bin/elastos"),
+                         self.manifest["files"][self.manifest["publications"]["old"]["binary"]]["sha256"])
+        self.assertTrue(result["cleanup"]["passed"])
+        self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+
+    def test_failed_operator_apply_keeps_diagnostic_private_and_reply_available(self):
+        self.positive()
+        stderr = "private operator apply diagnostic\n"
+        code, _, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failure"], "plain Carrier apply failed; command exit 1")
+        self.assertNotIn("private operator", json.dumps(result))
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 1))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_apply_reply_survives_coordination_inspection_refusal(self):
+        inspect = observer.cli_coordination
+        def coordination(home_path, required=True):
+            if home_path.name == "cli" and (self.root / "results/m2-apply.stderr").exists():
+                raise ValueError("injected apply coordination refusal")
+            return inspect(home_path, required)
+        with patch.object(observer, "cli_coordination", side_effect=coordination):
+            code, _, result = self.fake_run()
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failure"], "injected apply coordination refusal")
+        checks = result["paths"]["m2-discovery"]["checks"]
+        self.assertEqual(checks["check"]["status"], "passed")
+        self.assertEqual((checks["apply"]["status"], checks["apply"]["exit"]), ("failed", 0))
+        self.assertEqual(checks["apply"]["stdout_sha256"], hashlib.sha256(b"Discovery: Carrier").hexdigest())
+        self.assertNotIn("m2-apply", result["coordination"])
+        self.assertTrue(result["cleanup"]["passed"])
 
     def test_cleanup_census_failure_keeps_result_failed(self):
         code, _, result = self.fake_run(cleanup_error=True)

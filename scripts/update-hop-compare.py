@@ -1487,6 +1487,21 @@ def cli_success(processes, label, command):
     return command["exit"] == 0 and cli_clean_output(processes, label)
 
 
+def cli_ci_stderr_detail(processes, manifest, label, description):
+    # The immutable CI fixture uses disposable keys. Operator Runtime logs stay private.
+    if manifest.get("proof_scope") != "ci-rehearsal" or not hasattr(processes, "output"):
+        return ""
+    stderr = processes.output / (label + ".stderr")
+    try:
+        with stderr.open("rb") as stream:
+            stream.seek(max(0, stderr.stat().st_size - 4096))
+            tail = stream.read(4096).decode(errors="replace")
+        tail = re.sub(r"\x1b\[[0-9;]*m", "", tail).strip()
+        return "; CI " + description + " stderr: " + tail[-1024:] if tail else ""
+    except OSError:
+        return "; CI " + description + " diagnostic is unavailable"
+
+
 class CliBootstrap:
     """Serve admitted installer bytes; record and refuse every M2 HTTP fallback."""
     def __init__(self, root, manifest):
@@ -1947,18 +1962,7 @@ def cli_initial_home(processes, manifest, home_path, evidence=None):
         detail += "; controller exit " + str(exit_code)
         if cleanup_failure is not None:
             detail += "; cleanup: " + str(cleanup_failure)
-        # The immutable CI fixture uses disposable keys. Operator Runtime logs stay private.
-        if manifest.get("proof_scope") == "ci-rehearsal" and hasattr(processes, "output"):
-            stderr = processes.output / "initial-home-start.stderr"
-            try:
-                with stderr.open("rb") as stream:
-                    stream.seek(max(0, stderr.stat().st_size - 4096))
-                    tail = stream.read(4096).decode(errors="replace")
-                tail = re.sub(r"\x1b\[[0-9;]*m", "", tail).strip()
-                if tail:
-                    detail += "; CI controller stderr: " + tail[-1024:]
-            except OSError:
-                detail += "; CI controller diagnostic is unavailable"
+        detail += cli_ci_stderr_detail(processes, manifest, "initial-home-start", "controller")
         raise ValueError(detail) from failure
     need(proof is not None, "initial Home readiness proof is absent")
     for identity in (proof["controller"], proof["host"]):
@@ -2005,9 +2009,11 @@ def cli_run(config, output):
     holder_config = holder_data / "config.toml"
     holder_labels, holder_config_text = [], None
 
-    def command(home_path, args, label):
+    def command(home_path, args, label, evidence=None):
         reply = processes.command([str(home_path / ".local/bin/elastos"), *args],
                                   cli_environment(home_path), home_path, label)
+        if evidence is not None:
+            evidence.update(reply)
         if home_path != holder:
             result["coordination"][label] = cli_coordination(home_path)
         return reply
@@ -2161,15 +2167,19 @@ def cli_run(config, output):
             need(cli_success(processes, "m2-check", reply) and "Discovery: Carrier" in processes.text("m2-check")
                  and cli_state(manifest, consumer) == before, "plain Carrier check failed or changed files")
             result["paths"]["m2-discovery"]["checks"]["check"] = {"status": "passed", **reply}
-            reply = command(consumer, ["update"], "m2-apply")
-            need(cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply"), "plain Carrier apply failed")
+            apply = {"status": "failed"}
+            result["paths"]["m2-discovery"]["checks"]["apply"] = apply
+            reply = command(consumer, ["update"], "m2-apply", apply)
+            if not (cli_success(processes, "m2-apply", reply) and "Discovery: Carrier" in processes.text("m2-apply")):
+                raise ValueError("plain Carrier apply failed; command exit " + str(reply["exit"])
+                                 + cli_ci_stderr_detail(processes, manifest, "m2-apply", "m2-apply"))
             need(result["coordination"]["m2-apply"]["pid"] == reply["pid"], "apply coordination PID differs from its owned command")
             after = verify(consumer, "new", "m2-version")
             need(after["coordination"] == result["coordination"]["m2-apply"], "version command changed Runtime coordination metadata")
             expected_sources = json.loads(json.dumps(before["sources"]))
             expected_sources["sources"][0].update(installed_version=manifest["new"]["version"], head_cid=manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
             need(after["sources"] == expected_sources and after["preserved"] == before["preserved"] and after["data"] == before["data"], "config/data/support preservation differs")
-            result["paths"]["m2-discovery"]["checks"]["apply"] = {"status": "passed", **reply}
+            apply["status"] = "passed"
             reply = command(consumer, ["update"], "m2-repeat")
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
