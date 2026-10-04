@@ -26,8 +26,8 @@ fn private_ipfs_unavailable() -> ProviderError {
     ProviderError::Provider("local content preparation unavailable".into())
 }
 
-fn private_model_configuration(target: &str, op: &str) -> bool {
-    target.eq_ignore_ascii_case("model") && op == "init"
+fn private_provider_configuration(target: &str, op: &str) -> bool {
+    (target.eq_ignore_ascii_case("model") || target.eq_ignore_ascii_case("ipfs")) && op == "init"
 }
 
 fn model_index_stream(invocation: &ProviderInvocation) -> bool {
@@ -1524,9 +1524,9 @@ impl ProviderRegistry {
         target: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(target, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(target, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1566,9 +1566,9 @@ impl ProviderRegistry {
         request: &serde_json::Value,
         include_runtime_only: bool,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1627,14 +1627,14 @@ impl ProviderRegistry {
         &self,
         invocation: ProviderInvocation,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(&invocation.target, &invocation.op)
-            || private_model_configuration(
+        if private_provider_configuration(&invocation.target, &invocation.op)
+            || private_provider_configuration(
                 &invocation.target,
                 invocation.request["op"].as_str().unwrap_or_default(),
             )
         {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if private_ipfs_operation(&invocation.op)
@@ -3210,11 +3210,12 @@ mod tests {
         let carrier = Arc::new(MockCarrierInvoker::default());
         registry.set_carrier_invoker(carrier.clone()).await;
         for op in [
+            "init",
             "runtime_prepare_backend",
             "runtime_hash_staged_directory",
             "runtime_check_capacity",
         ] {
-            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}});
+            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}, "config":{"base_path":"/private/fixture", "extra":{"runtime_host_role":"gateway"}}});
             assert!(registry.send_raw("ipfs", &request).await.is_err());
             assert!(registry
                 .send_runtime_provider_target_raw("ipfs", &request)

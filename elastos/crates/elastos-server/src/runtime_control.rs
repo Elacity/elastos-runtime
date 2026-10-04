@@ -1420,8 +1420,7 @@ async fn ensure_managed_runtime(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child
-            .child
-            .try_wait()
+            .observed_exit()
             .map_err(|e| anyhow::anyhow!("Failed to check runtime status: {}", e))?
         {
             anyhow::bail!(

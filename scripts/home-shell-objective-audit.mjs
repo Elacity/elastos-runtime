@@ -146,9 +146,7 @@ function audit(args) {
   const state = read("state.md");
   const tasks = read("TASKS.md");
   const contractDoc = read("docs/HOME_SHELL_HOST_CONTRACT.md");
-  const capsuleContractDoc = read("docs/CAPSULE_INTERFACE_CONTRACT.md");
   const espDoc = read("docs/ESP_V0.md");
-  const entropy = read("scripts/home-entropy-check.mjs");
   const bridgeSmoke = read("scripts/home-shell-bridge-smoke.mjs");
   const authGateSmoke = read("scripts/home-shell-auth-gate-smoke.mjs");
   const staleHintSmoke = read("scripts/home-shell-stale-hint-boot-smoke.mjs");
@@ -161,7 +159,6 @@ function audit(args) {
   const virtualAuthSmoke = read("scripts/home-passkey-virtual-auth-smoke.mjs");
   const gatewayHomeTerminal = read("elastos/crates/elastos-server/src/api/gateway_home_terminal.rs");
   const gatewayHomeTests = read("elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs");
-  const gatewayCapsuleCatalog = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs");
   const catalogReadModel = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs");
   const shellPicker = read("elastos/esp/shell_picker.ts");
   const manual = manualUxResult(args.manualUx);
@@ -223,7 +220,7 @@ function audit(args) {
         !shellCore.includes("export async function ensureHomeGuiDom()") &&
         !shellCore.includes("function desktopLayoutBounds()") &&
         !shellCore.includes("desktopIconsVisible: true") &&
-        entropy.includes("Home must keep a host-only DOM") &&
+        manual.ok &&
         homeGuiManifest.includes('"execution": "web-projection"') &&
         homeIndex.includes('id="active-shell-frame"') &&
         homeGuiIndex.includes('<div class="home-gui-shell"></div>') &&
@@ -238,9 +235,9 @@ function audit(args) {
         "capsules/home/browser/shell-core.js",
         "capsules/home/browser/home-shell-host.js",
         "docs/HOME_SHELL_HOST_CONTRACT.md",
-        "scripts/home-entropy-check.mjs",
+        ...(args.manualUx ? [args.manualUx] : []),
       ],
-      "Keep GUI projection inside the isolated home-gui capsule and keep the Home host free of GUI DOM or behavior.",
+      "Keep GUI projection inside home-gui and provide a current-candidate operator report that confirms host ownership and GUI isolation.",
     ),
     criterion(
       "minimal_host_recovery",
@@ -345,17 +342,13 @@ function audit(args) {
     criterion(
       "capsule_interface_projection",
       "Capsules expose web, CLI, facts, affordances, gate metadata, audit/mirror, and Carrier/service readiness through Runtime-derived projections.",
-      includesNormalized(capsuleContractDoc, "web, CLI, facts, affordances, gates, audit/mirror, and Carrier/service") &&
-        entropy.includes("first_party_capsules_have_complete_projection_contract") &&
-        gatewayCapsuleCatalog.includes("first_party_capsules_have_complete_projection_contract") &&
-        state.includes("first_party_capsules_have_complete_projection_contract"),
+      // Manifest data and test declarations do not prove Runtime-derived or installed projections.
+      false,
       [
-        "docs/HOME_SHELL_HOST_CONTRACT.md",
-        "scripts/home-entropy-check.mjs",
+        "docs/CAPSULE_INTERFACE_CONTRACT.md",
         "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
-        "state.md",
       ],
-      "Keep Runtime projection contract and first-party coverage in sync.",
+      "Provide passing first_party_capsules_have_complete_projection_contract results for this candidate and its installed /api/capsules/contracts/audit evidence. This audit has no input for that evidence, so this criterion remains open.",
     ),
     criterion(
       "runtime_carrier_alignment",

@@ -366,81 +366,90 @@ mod trusted_gateway_tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = OwnedChild::spawn(&mut command).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        let pids_path = temp.path().join("owned-pids.json");
-        while !pids_path.exists() {
-            assert!(
-                child.observed_exit().unwrap().is_none(),
-                "gateway fixture exited before readiness"
-            );
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "gateway fixture did not become ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let pids: Vec<u32> = serde_json::from_slice(&std::fs::read(pids_path).unwrap()).unwrap();
-        let home = std::fs::read_to_string(temp.path().join("home-url")).unwrap();
-        let coords_path = crate::runtime_control::gateway_runtime_coord_path(temp.path());
-        let coords: crate::runtime_control::RuntimeCoords =
-            serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
-        assert_eq!(coords.pid, child.pid());
-        assert_eq!(coords.home_url, home);
-        let home = url::Url::parse(&home).unwrap();
-        let public_authority = home.authority();
-        let control_authority = coords.api_url.strip_prefix("http://").unwrap();
-        let public = tokio::net::TcpStream::connect(public_authority)
-            .await
-            .unwrap();
-        let control = tokio::net::TcpStream::connect(control_authority)
-            .await
-            .unwrap();
-        let mut streams = [public, control];
-        let requests = [
-            format!("POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {public_authority}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n", home.origin().ascii_serialization()),
-            format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_authority}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"),
-        ];
-        let mut buffer = [0; 128];
-        for (stream, request) in streams.iter_mut().zip(requests) {
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(String::from_utf8_lossy(&buffer[..count]).starts_with("HTTP/1.1 100 Continue"));
-            stream.write_all(b"{").await.unwrap();
-        }
-        assert_eq!(
-            unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGTERM) },
-            0
-        );
-        let status = loop {
-            if let Some(status) = child.observed_exit().unwrap() {
-                break status;
+        let pid = child.pid();
+        let root = temp.path().to_path_buf();
+        let journey = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let pids_path = root.join("owned-pids.json");
+            while !pids_path.exists() {
+                assert!(
+                    crate::update_controller::child::observe_exit(pid)
+                        .unwrap()
+                        .is_none(),
+                    "gateway fixture exited before readiness"
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "gateway fixture did not become ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "TERM did not finish gateway drain"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        assert!(status.success(), "gateway TERM fixture failed: {status}");
-        assert!(!coords_path.exists());
-        for pid in pids {
-            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
-        }
-        for stream in &mut streams {
-            let closed = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer))
+            let pids: Vec<u32> =
+                serde_json::from_slice(&std::fs::read(pids_path).unwrap()).unwrap();
+            let home = std::fs::read_to_string(root.join("home-url")).unwrap();
+            let coords_path = crate::runtime_control::gateway_runtime_coord_path(&root);
+            let coords: crate::runtime_control::RuntimeCoords =
+                serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
+            assert_eq!(coords.pid, pid);
+            assert_eq!(coords.home_url, home);
+            let home = url::Url::parse(&home).unwrap();
+            let public_authority = home.authority();
+            let control_authority = coords.api_url.strip_prefix("http://").unwrap();
+            let public = tokio::net::TcpStream::connect(public_authority)
                 .await
                 .unwrap();
-            assert!(matches!(closed, Ok(0)) || closed.is_err());
-        }
-        // The direct child remains unreaped until the final same-group cleanup.
+            let control = tokio::net::TcpStream::connect(control_authority)
+                .await
+                .unwrap();
+            let mut streams = [public, control];
+            let requests = [
+                format!("POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {public_authority}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n", home.origin().ascii_serialization()),
+                format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_authority}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"),
+            ];
+            let mut buffer = [0; 128];
+            for (stream, request) in streams.iter_mut().zip(requests) {
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&buffer[..count]).starts_with("HTTP/1.1 100 Continue")
+                );
+                stream.write_all(b"{").await.unwrap();
+            }
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+            let status = loop {
+                if let Some(status) = crate::update_controller::child::observe_exit(pid).unwrap() {
+                    break status;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "TERM did not finish gateway drain"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(status.success(), "gateway TERM fixture failed: {status}");
+            assert!(!coords_path.exists());
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            for stream in &mut streams {
+                let closed =
+                    tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer))
+                        .await
+                        .unwrap();
+                assert!(matches!(closed, Ok(0)) || closed.is_err());
+            }
+        });
+        let result = journey.await;
+        // Keep the child and test Home alive through cleanup, including assertion panic.
         child.stop().await.unwrap();
+        result.unwrap();
     }
 
     #[cfg(unix)]
@@ -481,11 +490,14 @@ mod trusted_gateway_tests {
             let pid = child.child.id();
             child.ready();
             drop(child);
+            let pids_pending = child_root.join("owned-pids.pending");
             std::fs::write(
-                child_root.join("owned-pids.json"),
+                &pids_pending,
                 serde_json::to_vec(&[helper_pid, pid, descendant_pid]).unwrap(),
             )
             .unwrap();
+            // The parent treats this path as readiness; publish only complete JSON.
+            std::fs::rename(pids_pending, child_root.join("owned-pids.json")).unwrap();
         });
         start_gateway_server_with_shutdown(
             "127.0.0.1:0",

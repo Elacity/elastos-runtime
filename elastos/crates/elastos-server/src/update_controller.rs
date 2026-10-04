@@ -1419,6 +1419,42 @@ pub(crate) fn installed_writer_binary(data_dir: &Path) -> Result<Option<PathBuf>
     Ok(Some(receipt.binary))
 }
 
+/// Host preflight keeps the prior receipt's installation while a signed controller repair is pending.
+/// Controller execution and ordinary writers retain their full receipt admission gates.
+pub(crate) fn installed_host_binary(data_dir: &Path) -> Result<Option<PathBuf>> {
+    let path = data_dir.join(DIRECTORY).join(RECEIPT);
+    if !path_present(&path)? {
+        return Ok(None);
+    }
+    check_controller_directory(path.parent().context("controller receipt parent missing")?)?;
+    let receipt: Receipt = read_private_json(&path)?;
+    anyhow::ensure!(
+        receipt.data_dir == fs::canonicalize(data_dir)?,
+        "Controller host receipt belongs to another data root."
+    );
+    validate_retained_receipt_record(&receipt)?;
+    anyhow::ensure!(
+        Path::new(&receipt.trusted_source.install_path).is_absolute()
+            && fs::canonicalize(&receipt.trusted_source.install_path)? == receipt.binary,
+        "Controller host receipt belongs to another installed binary."
+    );
+    let existing = controller_file_digest(&receipt.controller)?
+        .context("Retained controller binary is missing. Preserve its files for repair.")?;
+    if existing != receipt.controller_sha256 {
+        let sources = load_trusted_sources(data_dir)?;
+        let source = sources
+            .default_source()
+            .context("Installed trusted source missing")?;
+        let installed =
+            crate::installed_release::read_without_migration(data_dir, &receipt.binary, source)?;
+        anyhow::ensure!(
+            existing == installed.binary_sha256,
+            "Controller binary differs from its signed receipt and current installed release."
+        );
+    }
+    Ok(Some(receipt.binary))
+}
+
 fn controller_directory(data_dir: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
         data_dir.is_absolute() && fs::canonicalize(data_dir)? == data_dir,

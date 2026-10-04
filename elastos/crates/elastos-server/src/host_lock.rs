@@ -36,6 +36,22 @@ pub fn acquire_host_process_lock(
     if !matches!(role, "update" | "update-recovery") {
         authorize_host_process_start(data_dir)?;
     }
+    acquire_host_process_lock_inner(data_dir, role, addr)
+}
+
+pub(crate) fn acquire_principal_root_update_lock(
+    data_dir: &Path,
+    activation: &crate::install_transaction::SupportActivation<'_>,
+) -> anyhow::Result<HostProcessGuard> {
+    activation.authorize_principal_root_migration(data_dir)?;
+    acquire_host_process_lock_inner(data_dir, "principal-root-upgrade", "offline")
+}
+
+fn acquire_host_process_lock_inner(
+    data_dir: &Path,
+    role: &str,
+    addr: &str,
+) -> anyhow::Result<HostProcessGuard> {
     fs::create_dir_all(data_dir)?;
     let lock_path = host_lock_path(data_dir);
     let mut file = OpenOptions::new()
