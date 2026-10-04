@@ -21,6 +21,7 @@ import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
 } from "./home-gui-authority.js?v=home-20260813a";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -366,6 +367,10 @@ window.addEventListener("message", (event) => {
   }
   if (message.type === "home:shell-response") {
     settleRequest(message);
+    return;
+  }
+  if (message.type === "home:link-status") {
+    applyHomeLinkStatus(message);
     return;
   }
   if (message.type === "home:shell-summary") {

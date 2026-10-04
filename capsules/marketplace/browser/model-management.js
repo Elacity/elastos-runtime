@@ -323,7 +323,7 @@
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
         }
         const controls = element("div", "", "model-controls");
-        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Use", () => void act("use"), active(p) || reconcileRequired);
+        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download", () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
