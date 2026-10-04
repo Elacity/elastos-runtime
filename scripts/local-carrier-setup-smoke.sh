@@ -527,10 +527,13 @@ install -m 700 "${REPO_ROOT}/elastos/target/release/localhost-provider" \
     "${DATA_DIR}/bin/localhost-provider"
 [[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]
 
+# This fixture has an unsigned local publisher, so it is a source-checkout
+# setup, not an installed signed release: it sets no install_path. Setup then
+# reads ELASTOS_COMPONENTS_MANIFEST and still fetches every part over Carrier.
+# Installed releases admit their private signed pair first (setup.rs tests).
 SOURCES_PATH="${DATA_DIR}/sources.json"
 CONNECT_TICKET="${CONNECT_TICKET}" \
 NODE_ID="${NODE_ID}" \
-ELASTOS_BIN_PATH="${ELASTOS_BIN}" \
 SOURCES_PATH="${SOURCES_PATH}" \
 python3 - <<'PY'
 import json
@@ -549,7 +552,7 @@ sources = {
             "publisher_node_id": os.environ["NODE_ID"],
             "ipns_name": "",
             "gateways": [],
-            "install_path": os.environ["ELASTOS_BIN_PATH"],
+            "install_path": "",
             "installed_version": "",
             "head_cid": "",
         }
