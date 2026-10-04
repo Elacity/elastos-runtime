@@ -261,6 +261,50 @@ async function checkFrontdoor(browser, context, page) {
     await popup.close();
   }
 
+  // Home -> sandboxed Home GUI shell -> app, as the installed Home mounts windows.
+  await page.goto(`${origin}/healthz`);
+  await page.evaluate(() => {
+    const shell = document.createElement('iframe');
+    shell.id = 'shell-fixture';
+    shell.src = '/apps/home-gui/';
+    document.body.append(shell);
+  });
+  const shellFrame = await (await page.waitForSelector('#shell-fixture')).contentFrame();
+  assert.ok(shellFrame, 'the Home GUI shell frame exists');
+  assert.equal(await shellFrame.evaluate(() => window.origin), 'null', 'the shell runs in an opaque origin');
+  for (const app of ['assistant', 'marketplace']) {
+    const appFrame = await (await shellFrame.waitForSelector(`#${app}`)).contentFrame();
+    await appFrame.waitForFunction(() => window.appProbe?.ready);
+    assert.equal(appFrame.url(), `${origin}/apps/${app}/`, `${app}: opens inside the sandboxed shell`);
+    const probe = await appFrame.evaluate(() => window.appProbe);
+    assert.equal(probe.reads.cookie.denied, true, `${app}: Home cookie stays private inside the shell`);
+    assert.equal(probe.reads.storage.denied, true, `${app}: Home storage stays private inside the shell`);
+  }
+
+  // A foreign site may frame an app document, but it gets no Home cookie, token or API authority.
+  await context.grantPermissions(['local-network-access'], { origin: 'https://hostile.example' });
+  const foreign = await context.newPage();
+  try {
+    await foreign.route('https://hostile.example/**', route => route.fulfill({
+      contentType: 'text/html',
+      body: `<!doctype html><title>Foreign framer</title><iframe id="app" src="${origin}/apps/assistant/"></iframe>`,
+    }));
+    const framedRequest = foreign.waitForRequest(`${origin}/apps/assistant/`);
+    await foreign.goto('https://hostile.example/');
+    const framedHeaders = await (await framedRequest).allHeaders();
+    assert.equal(framedHeaders.cookie, undefined, 'a foreign frame request carries no Home cookie');
+    const foreignApp = await (await foreign.waitForSelector('#app')).contentFrame();
+    await foreignApp.waitForFunction(() => window.appProbe?.ready);
+    const foreignProbe = await foreignApp.evaluate(() => window.appProbe);
+    assert.equal(foreignProbe.reads.cookie.denied, true, 'a foreign-framed app cannot read the Home cookie');
+    assert.equal(foreignProbe.reads.storage.denied, true, 'a foreign-framed app cannot read Home storage');
+    const foreignRequests = await foreignApp.evaluate(() => window.runAppRequests(''));
+    assert.ok(foreignRequests.every(result => result.status === 403 || result.failed === 'TypeError'),
+      'a foreign-framed app has no API authority');
+  } finally {
+    await foreign.close();
+  }
+
   // A separate browser context starts with the real Home assets and no grant.
   const anonymous = await browser.newContext();
   try {
@@ -374,7 +418,7 @@ async function checkFrontdoor(browser, context, page) {
     await attacker.close();
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
-  console.log('PASS: gateway app document/popup isolation, signed app fetch, anonymous Home entry, bootstrap Origin and Host admission');
+  console.log('PASS: gateway app document/popup isolation, apps inside the sandboxed shell, foreign app frames without authority, signed app fetch, anonymous Home entry, bootstrap Origin and Host admission');
 }
 
 async function observeWireResponses(context, page) {

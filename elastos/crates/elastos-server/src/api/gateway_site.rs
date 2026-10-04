@@ -1,4 +1,292 @@
 use super::*;
+use crate::release_publication::Publication;
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
+
+#[derive(Deserialize)]
+struct PublicationReceipt {
+    publisher_did: String,
+    last_release_cid: String,
+    last_head_cid: String,
+    last_version: String,
+}
+
+// A receipt and final head admit one verified snapshot. Later reads check identities
+// and hash only the requested artifact. Concurrent requests wait their turn.
+#[derive(Clone)]
+pub(super) struct ReleaseReadGate {
+    pub(super) permit: Arc<tokio::sync::Semaphore>,
+    cache: Arc<std::sync::Mutex<Option<CachedPublication>>>,
+    #[cfg(test)]
+    pub(super) admissions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReleaseReadGate {
+    pub(super) fn new() -> Self {
+        Self {
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            cache: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            admissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+type ReceiptStamp = (u64, u64, u64, i64, i64, i64, i64, u32, u64);
+
+fn receipt_stamp(metadata: &std::fs::Metadata) -> ReceiptStamp {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.mode(),
+        metadata.nlink(),
+    )
+}
+
+#[derive(PartialEq, Eq)]
+struct PublicationKey {
+    root_path: std::path::PathBuf,
+    receipt_stamp: ReceiptStamp,
+    head_stamp: ReceiptStamp,
+}
+
+struct PublicationContext {
+    key: PublicationKey,
+    receipt: PublicationReceipt,
+    receipt_file: File,
+    head_file: File,
+}
+
+struct CachedPublication {
+    key: PublicationKey,
+    // Retaining the receipt descriptor prevents inode reuse for this cache key.
+    _receipt_file: File,
+    _head_file: File,
+    // A changed snapshot stays refused until the receipt or final head changes.
+    publication: Option<Publication>,
+}
+
+fn publication_open_at(parent: &File, name: &str, directory: bool) -> std::io::Result<File> {
+    let name = CString::new(name)?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn publication_directory(path: &std::path::Path) -> std::io::Result<File> {
+    use std::path::Component;
+    let mut directory = File::open("/")?;
+    if !path.is_absolute() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = name.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
+                directory = publication_open_at(&directory, name, true)?;
+            }
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        }
+    }
+    Ok(directory)
+}
+
+fn read_publication_receipt(
+    root: &File,
+) -> anyhow::Result<(PublicationReceipt, File, ReceiptStamp)> {
+    let file = publication_open_at(root, "publish-state.json", false)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file()
+            && before.nlink() == 1
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.mode() & 0o022 == 0
+            && before.len() > 0
+            && before.len() <= 64 * 1024,
+        "unsafe publisher receipt"
+    );
+    let mut bytes = vec![0; before.len() as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    let stamp = receipt_stamp(&before);
+    anyhow::ensure!(
+        stamp == receipt_stamp(&file.metadata()?),
+        "publisher receipt changed"
+    );
+    Ok((serde_json::from_slice(&bytes)?, file, stamp))
+}
+
+fn publication_context(data_dir: &std::path::Path) -> Result<PublicationContext, StatusCode> {
+    // Runtime owns data_dir. Normalize its OS alias (e.g. macOS /var) before
+    // the no-follow walk of the publication and its saved policy receipt.
+    let base = data_dir.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    })?;
+    let root_path = elastos_common::localhost::publisher_root_path(&base);
+    let root = publication_directory(&root_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    })?;
+    let validated = (|| -> anyhow::Result<PublicationContext> {
+        let metadata = root.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
+            "unsafe publisher root"
+        );
+        let (receipt, receipt_file, stamp) = read_publication_receipt(&root)?;
+        // Receipt promotion precedes the head. Its final identity activates the
+        // new set even when a request refused the intermediate mixed snapshot.
+        let head_file = publication_open_at(&root, "release-head.json", false)?;
+        let head = head_file.metadata()?;
+        anyhow::ensure!(
+            head.is_file() && head.nlink() == 1 && head.len() > 0 && head.len() <= 256 * 1024,
+            "unsafe publication head"
+        );
+        Ok(PublicationContext {
+            key: PublicationKey {
+                root_path,
+                receipt_stamp: stamp,
+                head_stamp: receipt_stamp(&head),
+            },
+            receipt,
+            receipt_file,
+            head_file,
+        })
+    })();
+    validated.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn load_release_publication(context: &PublicationContext) -> anyhow::Result<Publication> {
+    // The operator's committed receipt owns the pin, rather than the envelope.
+    let receipt = &context.receipt;
+    let publication = Publication::open_published(&context.key.root_path, &receipt.publisher_did)?;
+    anyhow::ensure!(
+        receipt.last_release_cid == publication.release_cid()
+            && receipt.last_version == publication.version(),
+        "publisher receipt differs from signed set"
+    );
+    crate::update::verify_release_metadata_cid(&receipt.last_head_cid, publication.head_bytes())?;
+    Ok(publication)
+}
+
+enum ReleaseFile {
+    Head,
+    Release,
+    Installer,
+    Artifact(String),
+}
+
+async fn signed_release_response(
+    state: GatewayState,
+    gate: ReleaseReadGate,
+    file: ReleaseFile,
+    media_type: &'static str,
+) -> Response {
+    let Ok(permit) = gate.permit.clone().acquire_owned().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release publication unavailable",
+        )
+            .into_response();
+    };
+    let data_dir = state.data_dir;
+    let result = tokio::task::spawn_blocking(move || {
+        // Cancellation keeps the worker's permit until it finishes its checks.
+        let _permit = permit;
+        let context = publication_context(&data_dir)?;
+        let mut cache = gate
+            .cache
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if cache.as_ref().is_none_or(|saved| saved.key != context.key) {
+            #[cfg(test)]
+            gate.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let publication = load_release_publication(&context).ok();
+            *cache = Some(CachedPublication {
+                key: context.key,
+                _receipt_file: context.receipt_file,
+                _head_file: context.head_file,
+                publication,
+            });
+        }
+        let saved = cache.as_mut().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let checked = (|| {
+            let publication = saved
+                .publication
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            publication
+                .unchanged_published()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let response = match file {
+                ReleaseFile::Head => Ok(publication.head_bytes().to_vec()),
+                ReleaseFile::Release => Ok(publication.release_bytes().to_vec()),
+                ReleaseFile::Installer => Ok(publication.installer_bytes().to_vec()),
+                ReleaseFile::Artifact(name) => {
+                    if publication
+                        .artifacts()
+                        .iter()
+                        .any(|record| record.name == name)
+                    {
+                        publication
+                            .read_verified_artifact(&name)
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+                    } else {
+                        Err(StatusCode::NOT_FOUND)
+                    }
+                }
+            };
+            publication
+                .unchanged_published()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let after =
+                publication_context(&data_dir).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if after.key != saved.key {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            response
+        })();
+        if matches!(checked, Err(StatusCode::SERVICE_UNAVAILABLE)) {
+            saved.publication = None;
+        }
+        checked
+    })
+    .await
+    .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE));
+    match result {
+        Ok(bytes) => (StatusCode::OK, [("content-type", media_type)], bytes).into_response(),
+        Err(StatusCode::NOT_FOUND) => {
+            (StatusCode::NOT_FOUND, "Release file not found").into_response()
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release publication unavailable",
+        )
+            .into_response(),
+    }
+}
 
 pub(super) async fn sandbox_content_response(mut response: Response) -> Response {
     // User content has an opaque origin and keeps its scripts and form controls.
@@ -134,93 +422,45 @@ pub(super) async fn healthz() -> &'static str {
     "OK"
 }
 
-pub(super) async fn serve_release_manifest(State(state): State<GatewayState>) -> Response {
-    let path = publisher_release_manifest_path(&state.data_dir);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "release.json not found").into_response(),
-    }
+pub(super) async fn serve_release_manifest(
+    State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
+) -> Response {
+    signed_release_response(state, gate, ReleaseFile::Release, "application/json").await
 }
 
-pub(super) async fn serve_release_head(State(state): State<GatewayState>) -> Response {
-    let path = publisher_release_head_path(&state.data_dir);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "release-head.json not found").into_response(),
-    }
+pub(super) async fn serve_release_head(
+    State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
+) -> Response {
+    signed_release_response(state, gate, ReleaseFile::Head, "application/json").await
 }
 
 pub(super) async fn serve_artifact_file(
     State(state): State<GatewayState>,
+    Extension(gate): Extension<ReleaseReadGate>,
     Path(path): Path<String>,
 ) -> Response {
-    if let Err(msg) = validate_file_path(&path) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+    if path.is_empty()
+        || path.len() > 240
+        || path.starts_with('.')
+        || validate_file_path(&path).is_err()
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid artifact name").into_response();
     }
-
-    let artifacts_root = publisher_artifacts_path(&state.data_dir);
-    let requested = artifacts_root.join(&path);
-    let Ok(root_canonical) = tokio::fs::canonicalize(&artifacts_root).await else {
-        return (StatusCode::NOT_FOUND, "artifacts not found").into_response();
-    };
-    let Ok(requested_canonical) = tokio::fs::canonicalize(&requested).await else {
-        return (StatusCode::NOT_FOUND, "artifact not found").into_response();
-    };
-    if !requested_canonical.starts_with(&root_canonical) {
-        return (StatusCode::BAD_REQUEST, "Path traversal not allowed").into_response();
-    }
-
-    match tokio::fs::read(&requested_canonical).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", content_type(&path))],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "artifact not found").into_response(),
-    }
+    let media_type = content_type(&path);
+    signed_release_response(state, gate, ReleaseFile::Artifact(path), media_type).await
 }
 
 pub(super) async fn serve_install_script(
     State(state): State<GatewayState>,
-    headers: axum::http::HeaderMap,
+    Extension(gate): Extension<ReleaseReadGate>,
+    _headers: axum::http::HeaderMap,
 ) -> Response {
-    let path = publisher_install_script_path(&state.data_dir);
-    if let Ok(bytes) = tokio::fs::read(&path).await {
-        // Dynamically stamp the publisher gateway URL so `curl <gw>/install.sh | bash`
-        // automatically embeds this gateway for future `elastos update`.
-        let script = String::from_utf8_lossy(&bytes);
-        let stamped = if script.contains("__PUBLISHER_GATEWAY__") {
-            match effective_gateway_origin(&headers) {
-                Ok(origin) => script
-                    .replace("__PUBLISHER_GATEWAY__", origin.origin())
-                    .into_bytes(),
-                Err(_) if headers.get("host").is_none() => bytes,
-                Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response();
-                }
-            }
-        } else {
-            bytes
-        };
-        return (
-            StatusCode::OK,
-            [("content-type", "text/x-shellscript")],
-            stamped,
-        )
-            .into_response();
-    }
-    (StatusCode::NOT_FOUND, "install.sh not found").into_response()
+    signed_release_response(state, gate, ReleaseFile::Installer, "text/x-shellscript").await
 }
 
 pub(super) async fn serve_site_head_document(

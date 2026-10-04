@@ -33,7 +33,7 @@ exec(compile(PYTHON, str(INSTALLER) + ":embedded-verifier", "exec"), CRYPTO)
 PROCESS_SOURCE = SOURCE.split("<<'PY_RUNTIME_CONTROL'\n", 1)[1].split("\nPY_RUNTIME_CONTROL", 1)[0]
 PROCESSES = {"__name__": "installer_test"}
 exec(compile(PROCESS_SOURCE, str(INSTALLER) + ":runtime-control", "exec"), PROCESSES)
-PUBLISHER_DID = "did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj"
+PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
 
 
 def binding_fixture():
@@ -239,7 +239,7 @@ class SignatureTests(unittest.TestCase):
     def test_pinned_publisher_did_conversion(self):
         self.assertEqual(
             CRYPTO["decode_did_key"](PUBLISHER_DID).hex(),
-            "af41628c49d1321500bb1ff54af3f7563e1090b6235ddd38802339cc23608404",
+            "24e56b3e6c9cc967cb298171fe106d5ba8892ee4be5624bb69b0d0042032ac41",
         )
         for did in ["did:key:z", PUBLISHER_DID + "0", "did:key:z" + "1" * 34,
                     PUBLISHER_DID.replace("did:key:z", "did:key:m"), None,
@@ -426,6 +426,8 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
                                    else ["--gateway", "https://test.invalid", "--head-cid", self.head_cid])
         result = shell('''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
+# Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
+export PYTHONDONTWRITEBYTECODE=1
 export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="" ELASTOS_IPFS_GATEWAYS=""
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
@@ -602,25 +604,29 @@ validate_release_identity "$1" "$2"
         self.assertIn("No release available for platform: aarch64-darwin", result.stderr)
         self.assertEqual(len(requests), 2)
 
-    def test_publisher_hashes_the_final_envelope_bytes_into_head_payload(self):
-        source = INSTALLER.with_name("publish-release.sh").read_text()
-        sha_helper = source[source.index("sha256() {"):source.index("\nfile_size() {")]
-        envelope_write = source[source.index('echo "$RELEASE_JSON" > "${TMPDIR}/release.json"'):source.index('info "Publishing release.json to IPFS..."')]
-        head_payload = source[source.index("HEAD_PAYLOAD=$(jq"):source.index('info "Signing release head..."')]
-        with tempfile.TemporaryDirectory(prefix="publisher-binding-") as directory:
-            result = shell(sha_helper + '''
-TMPDIR="$1"
-RELEASE_JSON='{"payload":{"note":"café"},"signature":"test"}'
-CHANNEL=stable VERSION=0.7.1 RELEASE_CID=release-a RELEASE_OBJECT_CID=object-a
-SIGNER_DID=test PREV_HEAD_CID=null
-now_unix() { echo 1; }
-''' + envelope_write + head_payload + '\nprintf "%s\\n" "$HEAD_PAYLOAD"\n', directory)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            written = Path(directory, "release.json").read_bytes()
-            payload = json.loads(result.stdout)
-            self.assertTrue(written.endswith(b"\n"))
-            self.assertEqual(payload["release_sha256"], hashlib.sha256(written).hexdigest())
-            self.assertEqual(payload["latest_release_cid"], "release-a")
+    def test_custodian_hashes_final_envelope_bytes_into_head_payload(self):
+        import importlib.util
+        import sys
+        from types import SimpleNamespace
+        path = INSTALLER.with_name("release-signer.py")
+        spec = importlib.util.spec_from_file_location("installer_custodian", path)
+        signer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = signer
+        spec.loader.exec_module(signer)
+        payload = {"schema": "elastos.release/v1", "channel": "stable", "version": "0.7.1", "note": "café"}
+        backend = mock.Mock()
+        backend.public_key.return_value = CRYPTO["decode_did_key"](PUBLISHER_DID)
+        backend.sign.return_value = bytes(64)
+        backend.verify.return_value = True
+        prepared = SimpleNamespace(publisher_did=PUBLISHER_DID, files=(), release=signer.json_bytes(payload),
+                                   updated_at=1, prev_head_cid=None)
+        publication = dict(signer.sign_publication(prepared, backend))
+        release = publication["release.json"]
+        head = json.loads(publication["release-head.json"])["payload"]
+        self.assertEqual(release, signer.json_bytes(json.loads(release)))
+        self.assertEqual(head["release_sha256"], hashlib.sha256(release).hexdigest())
+        self.assertEqual(head["latest_release_cid"], signer.unixfs_metadata_cid(release))
+        self.assertNotEqual(head["release_sha256"], hashlib.sha256(release + b"\n").hexdigest())
 
 
 class InstallationTests(unittest.TestCase):
@@ -771,7 +777,7 @@ class InstallationTests(unittest.TestCase):
                 with self.subTest(transport=transport, case="clean rerun"):
                     self.assert_clean_install(sandbox, transport, did, head, release, before)
 
-    def assert_clean_install(self, sandbox, transport, did, head, release, before):
+    def assert_clean_install(self, sandbox, transport, did, head, release, before, runtime=RUNTIME_STUB):
         """A valid --install-only run in a sandbox that already holds an installation."""
         sandbox.calls.unlink(missing_ok=True)
         result, requests = sandbox.run("--install-only", transport=transport)
@@ -781,7 +787,7 @@ class InstallationTests(unittest.TestCase):
         self.assertNotIn("Setting up Home", result.stdout)
         advertised = json.loads(release)["payload"]["platforms"]["x86_64-linux"]
         installed = sandbox.binary.read_bytes()
-        self.assertEqual(installed, RUNTIME_STUB)
+        self.assertEqual(installed, runtime)
         self.assertEqual(hashlib.sha256(installed).hexdigest(), advertised["binary"]["sha256"])
         self.assertTrue(sandbox.binary.stat().st_mode & 0o100)
         self.assertTrue(os.access(sandbox.binary, os.X_OK))
@@ -798,7 +804,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(sources["schema"], "elastos.trusted-sources/v1")
         source = sources["sources"][0]
         self.assertEqual((source["publisher_dids"], source["channel"], source["installed_version"], source["install_path"]),
-                         ([did], "stable", "0.7.1", str(sandbox.binary)))
+                         ([did], "stable", json.loads(release)["payload"]["version"], str(sandbox.binary)))
         self.assertEqual(source["discovery_uri"],
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
@@ -815,18 +821,80 @@ class InstallationTests(unittest.TestCase):
             "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
+    def test_staged_executable_accepts_exact_signed_version(self):
+        for version in ["0.7.1", "0.7.10", "0.7.1-rc.1", "0.7.1+build.1", "0.7.1-rc.1+build.1"]:
+            binary = RUNTIME_STUB.replace(b"elastos 0.7.1", ("elastos " + version).encode())
+            did, head, release = installable_fixture(runtime=binary, version=version)
+            for transport in ["publisher", "cid"]:
+                with self.subTest(version=version, transport=transport):
+                    with InstallerSandbox(head, release, did) as sandbox:
+                        self.existing_installation(sandbox)
+                        sandbox.respond("binary", binary)
+                        sandbox.respond("components", COMPONENTS)
+                        sandbox.respond("bootstrap", BOOTSTRAP)
+                        self.assert_clean_install(sandbox, transport, did, head, release,
+                                                  sandbox.home_state(), runtime=binary)
+
+    def test_fresh_install_saves_publisher_metadata(self):
+        did, head, release = installable_fixture()
+        for transport in ["publisher", "cid"]:
+            with self.subTest(transport=transport):
+                with InstallerSandbox(head, release, did) as sandbox:
+                    sandbox.respond("binary", RUNTIME_STUB)
+                    sandbox.respond("components", COMPONENTS)
+                    sandbox.respond("bootstrap", BOOTSTRAP)
+                    result, requests = sandbox.run("--install-only", transport=transport)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(requests, self.REQUESTS[transport])
+                    self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
+                    publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
+                    self.assertEqual((publisher / "release-head.json").read_bytes(), head)
+                    self.assertEqual((publisher / "release.json").read_bytes(), release)
+                    self.assertFalse((sandbox.data / "updates/consumed").exists())
+                    self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
     def test_staged_executable_refusal_preserves_installation_then_valid_retry_installs(self):
         # These binaries carry the signed, advertised hash; only the staged
         # executable's own behavior can reject them, and that must happen
         # before the current binary is replaced.
         cases = [
-            ("wrong version", RUNTIME_STUB.replace(b"elastos 0.7.1", b"elastos 0.6.0"),
+            ("wrong version", "0.7.1", RUNTIME_STUB.replace(b"elastos 0.7.1", b"elastos 0.6.0"),
              "version mismatch", ["--version"]),
-            ("nonzero exit with expected version in output",
+            ("nonzero exit with expected version in output", "0.7.1",
              RUNTIME_STUB.replace(b'echo "elastos 0.7.1" ;;', b'echo "elastos 0.7.1"; exit 3 ;;'),
              "failed its version check (exit 3)", ["--version"]),
-            ("invalid executable", b"\x00\x01\x02 not an executable\n", "failed its version check", []),
+            ("empty output", "0.7.1", RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b":"),
+             "version mismatch", ["--version"]),
+            ("exact version only on stderr", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1" >&2'),
+             "version mismatch", ["--version"]),
+            ("version split between stdout and stderr", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'printf "elastos "; printf "0.7.1" >&2'),
+             "version mismatch", ["--version"]),
+            ("exact stdout with stderr warning", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1"; echo "warning" >&2'),
+             "version mismatch", ["--version"]),
+            ("exact stdout with blank stderr line", "0.7.1",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1"', b'echo "elastos 0.7.1"; echo >&2'),
+             "version mismatch", ["--version"]),
+            ("invalid executable", "0.7.1", b"\x00\x01\x02 not an executable\n", "failed its version check", []),
         ]
+        for name, version, output in [
+            ("patch prefix overlap", "0.7.1", "elastos 0.7.10"),
+            ("unexpected prerelease", "0.7.1", "elastos 0.7.1-rc.1"),
+            ("unexpected build metadata", "0.7.1", "elastos 0.7.1+build.1"),
+            ("prerelease prefix overlap", "0.7.1-rc.1", "elastos 0.7.1-rc.10"),
+            ("build prefix overlap", "0.7.1+build.1", "elastos 0.7.1+build.10"),
+            ("missing prerelease", "0.7.1-rc.1", "elastos 0.7.1"),
+            ("missing build metadata", "0.7.1+build.1", "elastos 0.7.1"),
+            ("bare version", "0.7.1", "0.7.1"),
+            ("wrong executable name", "0.7.1", "other 0.7.1"),
+            ("extra version text", "0.7.1", "elastos 0.6.0 (expected 0.7.1)"),
+            ("multiple version lines", "0.7.1", "elastos 0.7.1\nelastos 0.7.10"),
+            ("extra text after version", "0.7.1", "elastos 0.7.1 additional text"),
+        ]:
+            binary = RUNTIME_STUB.replace(b"elastos 0.7.1", output.encode())
+            cases.append((name, version, binary, "version mismatch", ["--version"]))
         did, head, release = installable_fixture()
         for transport in ["publisher", "cid"]:
             with InstallerSandbox(head, release, did) as sandbox:
@@ -834,8 +902,8 @@ class InstallationTests(unittest.TestCase):
                 sandbox.respond("components", COMPONENTS)
                 sandbox.respond("bootstrap", BOOTSTRAP)
                 before = sandbox.home_state()
-                for name, binary, message, expected_calls in cases:
-                    _, served_head, served_release = installable_fixture(runtime=binary)
+                for name, version, binary, message, expected_calls in cases:
+                    _, served_head, served_release = installable_fixture(runtime=binary, version=version)
                     sandbox.respond("release-head.json", served_head)
                     sandbox.respond("release.json", served_release)
                     sandbox.respond("binary", binary)

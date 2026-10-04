@@ -1018,17 +1018,19 @@ TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
 cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
 chmod +x "${TMP_INSTALL_BIN}"
 
-# The staged executable must run and report the release version before it
-# replaces the current binary. A refusal removes only this staged copy.
+# The staged executable must report the exact release version on stdout with
+# empty stderr before it replaces the current binary. Refusals remove this copy.
 STAGED_VERSION_STATUS=0
-STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>&1)" || STAGED_VERSION_STATUS=$?
+STAGED_VERSION_STDERR_PATH="${TMPDIR}/elastos-version.stderr"
+STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
+STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
 if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
     rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}"
+    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
-if ! printf '%s' "${STAGED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; then
+if [[ "${STAGED_VERSION_OUTPUT}" != "elastos ${RELEASE_VERSION}" || -s "${STAGED_VERSION_STDERR_PATH}" ]]; then
     rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}"
+    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
 mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 

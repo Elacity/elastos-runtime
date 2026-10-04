@@ -462,8 +462,10 @@ pub(super) async fn install_via_carrier(
     info: &PlatformInfo,
     dest: &Path,
     platform: &str,
+    context: super::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     validate_request(data, info, dest, platform)?;
+    let bind_addr = super::first_party_carrier_bind_addr(data, context)?;
     let source = crate::sources::load_trusted_sources(data)?
         .default_source()
         .cloned()
@@ -500,12 +502,13 @@ pub(super) async fn install_via_carrier(
     // read/write still has a 30-second idle limit, with one hour for all routes.
     tokio::time::timeout(
         std::time::Duration::from_secs(60 * 60),
-        crate::carrier::fetch_file_from_trusted_source_to(
+        crate::carrier::fetch_file_from_trusted_source_to_bound(
             &source,
             info.release_path.as_deref().unwrap(),
             &mut download,
             size,
             &mut progress,
+            bind_addr,
         ),
     )
     .await
@@ -935,55 +938,119 @@ mod tests {
     #[tokio::test]
     async fn browser_image_first_party_stream_installs_verified_file_and_preserves_set_on_bad_hash()
     {
-        use iroh::Watcher;
+        use tokio::io::{AsyncBufReadExt, BufReader};
         let platform = super::super::detect_platform();
         let Ok(guest) = guest_platform(&platform) else {
             return;
         };
-        let publisher = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         let mut files = fixture(b"working-image");
         let mut receipt: Value = serde_json::from_slice(&files[0].1).unwrap();
         receipt["target_platform"] = json!(guest);
         files[0].1 = serde_json::to_vec(&receipt).unwrap();
         let (bytes, info) = archive(&files);
-        let artifact = elastos_common::localhost::publisher_artifacts_path(publisher.path())
-            .join(info.release_path.as_ref().unwrap());
-        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        fs::write(&artifact, &bytes).unwrap();
-        let (key, did) = elastos_identity::derive_did(&[141; 32]);
-        let node = crate::carrier::start_isolated_carrier_node_with_registry(
-            &key,
-            &did,
-            publisher.path().to_owned(),
-            None,
+        let publisher = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![b"elastos/carrier/1".to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let runtime = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let bind_addr = runtime.bound_sockets()[0];
+        fs::write(
+            target.path().join("config.toml"),
+            format!("carrier_bind_addr = \"{bind_addr}\"\n"),
         )
-        .await
         .unwrap();
-        let address = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let address = node.endpoint.watch_addr().get();
-                if !address.addrs.is_empty() {
-                    break address;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let address = crate::carrier::tests::wait_for_direct_endpoint_addr(&publisher).await;
         let ticket = data_encoding::BASE32_NOPAD
             .encode(&serde_json::to_vec(&json!({"endpoints":[address]})).unwrap())
             .to_ascii_lowercase();
         let sources = serde_json::from_value(json!({
             "schema":"elastos.trusted-sources/v1", "default_source":"test",
-            "sources":[{"name":"test","publisher_node_id":node.endpoint.id().to_string(),"connect_ticket":ticket}]
+            "sources":[{"name":"test","publisher_node_id":publisher.id().to_string(),"connect_ticket":ticket}]
         })).unwrap();
         crate::sources::save_trusted_sources(target.path(), &sources).unwrap();
         let dest = target.path().join(INSTALL_PATH);
-        super::super::install_first_party_component_via_carrier(target.path(), NAME, &info, &dest)
-            .await
-            .unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::install_first_party_component_via_carrier(
+                target.path(),
+                NAME,
+                &info,
+                &dest,
+                super::super::FirstPartyCarrierContext::Setup,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains(&bind_addr.to_string()));
+        assert!(!dest.exists());
+        let server = publisher.clone();
+        let release_path = info.release_path.clone().unwrap();
+        let serving = tokio::spawn(async move {
+            for _ in 0..2 {
+                let incoming = server.accept().await.unwrap();
+                let iroh::endpoint::IncomingAddr::Ip(client_addr) = incoming.remote_addr() else {
+                    panic!("image download must use the configured loopback IP");
+                };
+                assert_eq!(client_addr.ip(), bind_addr.ip());
+                assert_ne!(client_addr.port(), bind_addr.port());
+                let connection = incoming.await.unwrap();
+                let (mut send, recv) = connection.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&request).unwrap()["path"],
+                    release_path
+                );
+                send.write_all(&(bytes.len() as u64).to_be_bytes())
+                    .await
+                    .unwrap();
+                send.write_all(&bytes).await.unwrap();
+                send.finish().unwrap();
+                assert!(matches!(
+                    connection.closed().await,
+                    iroh::endpoint::ConnectionError::ApplicationClosed(_)
+                ));
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        match std::net::UdpSocket::bind(client_addr) {
+                            Ok(socket) => break drop(socket),
+                            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("image download port cleanup failed: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("image download must close its temporary listener");
+            }
+        });
+        super::super::install_first_party_component_via_carrier(
+            target.path(),
+            NAME,
+            &info,
+            &dest,
+            super::super::FirstPartyCarrierContext::Runtime,
+        )
+        .await
+        .unwrap();
         verify_installed(target.path(), &info, &platform).unwrap();
+        assert!(!runtime.is_closed());
+        assert!(std::net::UdpSocket::bind(bind_addr).is_err());
         let mut corrupt = info.clone();
         corrupt.checksum = Some(format!("sha256:{}", "0".repeat(64)));
         let error = super::super::install_first_party_component_via_carrier(
@@ -991,11 +1058,15 @@ mod tests {
             NAME,
             &corrupt,
             &dest,
+            super::super::FirstPartyCarrierContext::Runtime,
         )
         .await
         .unwrap_err();
         assert!(format!("{error:#}").contains("checksum mismatch"));
         verify_installed(target.path(), &info, &platform).unwrap();
+        assert!(!runtime.is_closed());
+        assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
+        assert!(std::net::UdpSocket::bind(bind_addr).is_err());
         let expected_entries = if platform == "darwin-arm64" { 4 } else { 5 };
         assert_eq!(
             fs::read_dir(target.path().join("browser-vm"))
@@ -1004,10 +1075,12 @@ mod tests {
             expected_entries,
             "download and failed stages leave only the installed set, aliases and lock"
         );
-        crate::carrier::CarrierRuntimeService::new(node)
-            .shutdown()
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving)
             .await
+            .unwrap()
             .unwrap();
+        runtime.close().await;
+        publisher.close().await;
     }
 
     #[test]
@@ -1270,7 +1343,8 @@ mod tests {
             temp.path(),
             NAME,
             &new_info,
-            &temp.path().join(INSTALL_PATH)
+            &temp.path().join(INSTALL_PATH),
+            super::super::FirstPartyCarrierContext::Setup,
         )
         .await
         .is_err());

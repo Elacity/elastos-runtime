@@ -527,7 +527,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         Box::pin(async move { try_operator_p2p_discovery(&source, &publisher_did).await })
     });
 
-    crate::update::run_update_for_data_dir(
+    crate::update::run_update_for_data_dir_in_context(
         data_dir,
         &fetch_fn,
         Some(&try_p2p),
@@ -538,6 +538,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         env!("ELASTOS_VERSION"),
         true,
         false,
+        crate::setup::FirstPartyCarrierContext::Runtime,
     )
     .await?;
 
