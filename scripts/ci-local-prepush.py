@@ -16,43 +16,56 @@ class GateError(Exception):
     pass
 
 
+INTERRUPTS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+
+
 def run(args, cwd, capture=False, lease=None):
     if lease and args[0] == "cargo":
         disk_reserve(cwd)
         build = Path(os.environ["CARGO_BUILD_BUILD_DIR"])
         disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
     print("+ " + shlex.join(str(arg) for arg in args), flush=True)
-    process = subprocess.Popen(
-        args, cwd=cwd, text=True, stdout=subprocess.PIPE if capture else None,
-        pass_fds=(lease.fileno(),) if lease else (), start_new_session=True,
-    )
+    # Own the child before a pending signal can raise in the parent. This gate
+    # is single-threaded; the child restores the caller's mask before exec.
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
+    process = None
+    completed = False
     try:
+        process = subprocess.Popen(
+            args, cwd=cwd, text=True, stdout=subprocess.PIPE if capture else None,
+            pass_fds=(lease.fileno(),) if lease else (), start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask),
+        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         output, _ = process.communicate()
+        completed = True
     except BaseException:
-        # A second interrupt stays pending until the owned group is settled.
-        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+        signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
         try:
-            try:
+            if process is not None and not completed:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-            finally:
-                # Cargo can exit before a rustc/helper descendant.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-                if process.stdout:
-                    process.stdout.close()
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                finally:
+                    # Cargo can exit before a rustc/helper descendant.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    if process.stdout:
+                        process.stdout.close()
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-        raise
     if process.returncode:
         if capture and output:
             print(output, end="", flush=True)
@@ -129,6 +142,35 @@ def metadata(root, manifest, lease):
     return Path(value["workspace_root"]), [p for p in value["packages"] if p["id"] in members]
 
 
+def external_input_owners(root, packages, paths):
+    external = {root / path for path in paths
+                if "templates" in Path(path).parts or "fixtures" in Path(path).parts}
+    if not external:
+        return set()
+    owners = set()
+    matched = set()
+    rust = paths_from_git(root, "ls-files", "-z", "*.rs")
+    for package in packages:
+        folder = Path(package["manifest_path"]).parent
+        for path in rust:
+            source = root / path
+            if not source.is_relative_to(folder) or not source.is_file():
+                continue
+            includes = re.findall(r'\binclude_(?:str|bytes)\s*!\s*\(\s*"([^"]+)"', source.read_text())
+            for literal in includes:
+                included = (source.parent / literal).resolve()
+                for changed in external:
+                    parts = changed.relative_to(root).parts
+                    template = root.joinpath(*parts[:3]) if parts[:2] == ("templates", "capsules") else None
+                    if included == changed.resolve() or (template and included.is_relative_to(template)):
+                        owners.add(folder.resolve())
+                        matched.add(changed)
+    # Dynamic fixture reads and unrecognised template inputs widen to Runtime.
+    if external - matched:
+        owners.update(Path(package["manifest_path"]).parent.resolve() for package in packages)
+    return owners
+
+
 def touched_workspaces(root, paths, lease):
     workspaces = {}
     runtime, runtime_packages = metadata(root, root / "elastos/Cargo.toml", lease)
@@ -138,8 +180,9 @@ def touched_workspaces(root, paths, lease):
                     if not {"templates", "fixtures"}.intersection(manifest.relative_to(root).parts)}
     broad = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
     runtime_input = broad or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
-                                 or path.startswith(("elastos/.cargo/", "elastos/wit/")) for path in paths)
-    seeds = set()
+                                 or path.startswith(("elastos/.cargo/", "elastos/wit/", "elastos/config/")) for path in paths)
+    input_owners = external_input_owners(root, runtime_packages, paths)
+    seeds = set(input_owners)
     for package in runtime_packages:
         folder = Path(package["manifest_path"]).parent
         local_input = any((root / path).is_relative_to(folder) and
@@ -149,12 +192,15 @@ def touched_workspaces(root, paths, lease):
     # Resolve touched standalone workspaces, including tools and capsules.
     candidates = set()
     for path in paths:
+        if path.endswith("/Cargo.toml") and {"templates", "fixtures"}.intersection(Path(path).parts):
+            continue
         if path.endswith("/Cargo.toml") and not (root / path).exists():
             raise GateError("removed Rust package needs an explicit acceptance plan: " + path)
         manifest = next((parent / "Cargo.toml" for parent in (root / path).parents
                          if parent / "Cargo.toml" in manifests), None)
         if manifest:
-            candidates.add(manifest)
+            if manifest in discoverable:
+                candidates.add(manifest)
         elif path.endswith("/Cargo.toml") or path.endswith(".rs"):
             raise GateError("changed Rust package was removed or has no manifest: " + path)
     if broad:
@@ -196,13 +242,14 @@ def touched_workspaces(root, paths, lease):
         if workspace not in checked:
             continue
         relative = workspace.relative_to(root).as_posix()
-        workspace_change = broad or any(path in {
+        workspace_change = broad or (workspace == runtime and runtime_input) or any(path in {
             relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",
         } for path in paths)
         selected = []
         for package in packages:
             prefix = Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
-            if workspace_change or any(path.startswith(prefix) for path in paths):
+            if workspace_change or Path(package["manifest_path"]).parent.resolve() in input_owners or any(
+                    path.startswith(prefix) for path in paths):
                 selected.append(package)
         touched[workspace] = selected
     return touched
@@ -237,7 +284,7 @@ def module_prefix(entry, changed):
         if not current.is_file():
             return None
         source = current.read_text()
-        if re.search(r"#\s*\[\s*path\b|\binclude\s*!", source):
+        if "/*" in source or re.search(r"#\s*\[\s*path\b|\binclude\s*!", source):
             return None
         declaration = r"(?m)^(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(name) + r"\s*;"
         if not re.search(declaration, source):
@@ -352,6 +399,8 @@ def gates(root, paths, lease):
 
 
 def interrupted(signum, frame):
+    # Block repeats before raising, including the transition into run cleanup.
+    signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPTS)
     raise KeyboardInterrupt("received signal " + str(signum))
 
 
@@ -387,6 +436,7 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGHUP, interrupted)
     try:

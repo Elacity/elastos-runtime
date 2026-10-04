@@ -57,7 +57,14 @@ A Runtime Rust source or input change triggers metadata discovery of tracked
 standalone workspaces. Declared path dependencies identify direct and transitive
 consumers, including dependencies through other Runtime members. These consumers
 receive workspace/all-targets checks. Clippy and unit tests cover directly
-touched crates; dependent consumers retain their own behavior acceptance gates.
+touched crates and Runtime consumers of changed template or fixture data;
+dependent consumers retain their own behavior acceptance gates. Shared Runtime
+WIT, configuration, manifest and lockfile inputs select every Runtime package
+for Clippy and unit tests. Literal embedded data identifies its consuming
+Runtime package. A changed data file with an uncertain consumer widens that
+selection to all Runtime packages. Capsule template manifests are input data;
+the gate checks their Runtime consumers and keeps them outside product crate
+discovery.
 The gate uses Cargo metadata to select touched crates for Clippy with warnings
 denied and their enabled lib/bin unit targets. It verifies conventional Rust module declarations
 and available test names before selecting exact test names for a module. Module names and
@@ -71,6 +78,9 @@ retain the Runtime check and skip standalone dependency discovery. Capsule
 suites and Linux/Browser journeys keep their own gates. A
 removed package needs an explicit acceptance plan. Run the small decision
 fixtures with `just test-ci-local-prepush`; the source CI gate also runs them.
+Each fixture clears Git's repository-local environment variables before it
+creates its owned repository. A disposable sentinel regression verifies that
+running a fixture from a hook preserves the caller's HEAD, tree, index and status.
 
 Each worktree and each local heavy operator shares the persistent lock file
 `local-ai-heavy-build.lock` in `git rev-parse --path-format=absolute

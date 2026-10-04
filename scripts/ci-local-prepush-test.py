@@ -21,6 +21,17 @@ GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
 
 
+def fixture_environment(cwd):
+    # Hooks export repository-local Git variables. Clear the complete Git-owned
+    # list before init/add/commit can select an owned disposable repository.
+    names = subprocess.check_output(["git", "rev-parse", "--local-env-vars"], cwd=cwd, text=True).splitlines()
+    environment = {key: value for key, value in os.environ.items() if key not in names}
+    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                        "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
+    return environment
+
+
 class PrepushTests(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory()
@@ -30,9 +41,7 @@ class PrepushTests(unittest.TestCase):
         self.root.mkdir()
         self.origin = self.tmp / "origin.git"
         self.log = self.tmp / "commands.jsonl"
-        self.env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                    "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-                    "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        self.env = {**fixture_environment(self.tmp),
                     "PREPUSH_ROOT": str(self.root), "PREPUSH_LOG": str(self.log)}
         self.env.pop("CARGO_BUILD_BUILD_DIR", None)
         self.git("init", "-q", "-b", "develop")
@@ -298,6 +307,102 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "check"
                             for c in self.commands()))
+        clippy, = [c for c in self.commands() if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "other",
+                                        "-p", "common", "--", "-D", "warnings"])
+        self.assertEqual({c["args"][2] for c in self.commands() if c["args"][0] == "test"},
+                         {"server", "other", "common"})
+
+    def test_template_data_and_source_select_runtime_consumer_units(self):
+        self.git("reset", "--hard", "HEAD~1")
+        template = "templates/capsules/component-app/"
+        self.write(template + "Cargo.toml", '[package]\nname = "template"\n')
+        self.write(template + "capsule.json", '{}\n')
+        self.write("elastos/crates/common/src/lib.rs",
+                   'const TEMPLATE: &str = include_str!("../../../../templates/capsules/component-app/capsule.json");\n')
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write(template + "capsule.json", '{"changed":true}\n')
+        self.write(template + "src/lib.rs", "// changed capsule template source\n")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        self.assertFalse(any(template in str(c) for c in commands))
+        clippy, = [c for c in commands if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "common", "--", "-D", "warnings"])
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "common", "--lib"] and "--nocapture" in c["args"]
+                            for c in commands))
+
+    def test_external_fixture_data_selects_runtime_consumer_units(self):
+        self.git("reset", "--hard", "HEAD~1")
+        fixture = "elastos/tests/fixtures/probe/input.json"
+        self.write(fixture, '{}\n')
+        self.write("elastos/crates/common/src/lib.rs",
+                   'const PROBE: &str = include_str!("../../../tests/fixtures/probe/input.json");\n')
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write(fixture, '{"changed":true}\n')
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clippy, = [c for c in self.commands() if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "common", "--", "-D", "warnings"])
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "common", "--lib"] and "--nocapture" in c["args"]
+                            for c in self.commands()))
+
+    def test_mixed_known_template_and_unknown_fixture_widen_runtime_units(self):
+        self.git("reset", "--hard", "HEAD~1")
+        template = "templates/capsules/component-app/capsule.json"
+        self.write(template, '{}\n')
+        self.write("elastos/crates/common/src/lib.rs",
+                   'const TEMPLATE: &str = include_str!("../../../../templates/capsules/component-app/capsule.json");\n')
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write(template, '{"changed":true}\n')
+        self.write("elastos/tests/fixtures/dynamic/input.json", '{"changed":true}\n')
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clippy, = [c for c in self.commands() if c["args"][0] == "clippy"]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "other",
+                                        "-p", "common", "--", "-D", "warnings"])
+        self.assertEqual({c["args"][2] for c in self.commands() if c["args"][0] == "test"},
+                         {"server", "other", "common"})
+
+    def test_hook_git_environment_cannot_mutate_owned_sentinel_repository(self):
+        sentinel = self.tmp / "sentinel"
+        sentinel.mkdir()
+        def sentinel_git(*args):
+            return subprocess.check_output(["git", *args], cwd=sentinel,
+                                           env={**self.env, "GIT_OPTIONAL_LOCKS": "0"}, text=True)
+        sentinel_git("init", "-q", "-b", "sentinel")
+        (sentinel / "keep.txt").write_text("sentinel content\n")
+        sentinel_git("add", "keep.txt")
+        sentinel_git("commit", "-qm", "owned sentinel")
+        (sentinel / "keep.txt").write_text("sentinel dirty content\n")
+        (sentinel / "staged.txt").write_text("sentinel staged content\n")
+        sentinel_git("add", "staged.txt")
+        (sentinel / "untracked.txt").write_text("sentinel untracked content\n")
+        def state():
+            return (sentinel_git("rev-parse", "HEAD"), sentinel_git("rev-parse", "HEAD^{tree}"),
+                    (sentinel / ".git/index").read_bytes(),
+                    sentinel_git("status", "--porcelain=v1", "-z", "--untracked-files=all"))
+        before = state()
+        hostile = {**self.env, "GIT_DIR": str(sentinel / ".git"), "GIT_WORK_TREE": str(sentinel),
+                   "GIT_INDEX_FILE": str(sentinel / ".git/index"), "GIT_COMMON_DIR": str(sentinel / ".git"),
+                   "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null"}
+        child = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "PrepushTests.test_docs_only_change_keeps_standalone_metadata_discovery_outside_gate"],
+                               cwd=sentinel, env=hostile, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+        self.assertEqual(before, state(), "foreign fixture Git operations changed the owned sentinel")
+
+    def test_block_comment_module_declarations_widen_unit_scope(self):
+        entry = self.root / "elastos/crates/server/src/lib.rs"
+        entry.write_text("/*\nmod runtime;\n*/\n")
+        changed = self.root / "elastos/crates/server/src/runtime.rs"
+        self.assertIsNone(GATE.module_prefix(entry, changed))
 
     def test_discovery_exclusions_use_only_paths_inside_the_repository(self):
         self.git("reset", "--hard", "HEAD~1")
@@ -426,6 +531,41 @@ class PrepushTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+    def test_signal_at_child_launch_settles_owned_group_before_lease_release(self):
+        child_file = self.tmp / "launch.pid"
+        lease_file = self.root / ".git/local-ai-heavy-build.lock"
+        program = textwrap.dedent('''\
+            import fcntl, importlib.util, os, pathlib, signal, subprocess, sys
+            spec = importlib.util.spec_from_file_location("gate", sys.argv[1])
+            gate = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(gate)
+            for signum in gate.INTERRUPTS:
+                signal.signal(signum, gate.interrupted)
+            original = subprocess.Popen
+            def at_launch(*args, **kwargs):
+                process = original(*args, **kwargs)
+                pathlib.Path(sys.argv[2]).write_text(str(process.pid))
+                os.kill(os.getpid(), signal.SIGTERM)
+                return process
+            gate.subprocess.Popen = at_launch
+            with pathlib.Path(sys.argv[3]).open("a+") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                gate.run([sys.executable, "-c", "import time; time.sleep(30)"],
+                         pathlib.Path.cwd(), lease=lease)
+            ''')
+        result = subprocess.run([sys.executable, "-c", program, str(SCRIPT.with_suffix(".py")),
+                                 str(child_file), str(lease_file)], cwd=self.root, env=self.env,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("received signal", result.stderr)
+        self.assertTrue(child_file.exists(), "owned child was never launched")
+        status = subprocess.run(["ps", "-p", child_file.read_text(), "-o", "stat="],
+                                text=True, stdout=subprocess.PIPE)
+        self.assertTrue(status.returncode != 0 or status.stdout.strip().startswith("Z"),
+                        "child survived a signal at launch: " + status.stdout)
+        with lease_file.open("a+") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_second_interrupt_waits_until_term_resistant_group_is_settled(self):
         child_file, cargo_file = self.tmp / "child.pid", self.tmp / "cargo.pid"
