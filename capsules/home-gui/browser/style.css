@@ -1726,6 +1726,82 @@ img {
   font-weight: 600;
 }
 
+/* Home link status (shell-link-status.js): while the host reports that this
+   Home's gateway is not answering, the bar shows a pulsing dot and
+   "Reconnecting…", and Notification Centre opens with the explanation. The
+   bar status stays rendered (empty) so its live region is announced. */
+.toolbar-link-status {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-link-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar-link-status-dot,
+.notification-center-link {
+  display: none;
+}
+
+.toolbar-link-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f5a524;
+  animation: toolbar-link-status-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes toolbar-link-status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-link-status-dot {
+    animation: none;
+  }
+}
+
+body[data-home-link="reconnecting"] .toolbar-link-status {
+  margin-right: 8px;
+}
+
+body[data-home-link="reconnecting"] .toolbar-link-status-dot,
+body[data-home-link="reconnecting"] .notification-center-link {
+  display: block;
+}
+
+.notification-center-link {
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--lift);
+}
+
+.notification-center-link-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-center-link-detail {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .notification-center-clear {
   padding: 3px 8px;
   border: 0;

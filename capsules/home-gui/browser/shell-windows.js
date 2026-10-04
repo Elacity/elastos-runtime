@@ -19,6 +19,8 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
+  WINDOW_TOP_INSET,
+  WINDOW_BOTTOM_INSET,
 } from "./shell-core.js?v=home-20260813a";
 import {
   fitWindowBounds,
@@ -2101,34 +2103,27 @@ function browserWindowSpec(launched, offset) {
     return walletConnectorWindowSpec();
   }
   if (launched.target === SYSTEM_APP_ID) {
-    return {
-      x: 36,
-      y: 44,
-      width: 980,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 980, height: 620 }, 0, 0);
   }
   if (launched.target === "gba-emulator") {
-    return {
-      x: 88 + offset * 24,
-      y: 62 + offset * 20,
-      width: 900,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 900, height: 620 }, offset * 24, offset * 20);
   }
   if (launched.target === "browser") {
-    return {
-      x: 48 + offset * 18,
-      y: 54 + offset * 18,
-      width: 1280,
-      height: 804,
-    };
+    return centredWindowSpec({ width: 1280, height: 804 }, offset * 18, offset * 18);
   }
+  return centredWindowSpec({ width: 1040, height: 720 }, offset * 26, offset * 22);
+}
+
+function centredWindowSpec({ width, height }, cascadeX, cascadeY) {
+  const fitted = fitWindowBounds({ x: 0, y: 0, width, height });
+  const workspaceRect = desktop.getBoundingClientRect();
+  const roomWidth = window.innerWidth - workspaceRect.left;
+  const roomHeight = window.innerHeight - workspaceRect.top - WINDOW_TOP_INSET - WINDOW_BOTTOM_INSET;
   return {
-    x: 104 + offset * 26,
-    y: 78 + offset * 22,
-    width: 1040,
-    height: 720,
+    x: Math.round((roomWidth - fitted.width) / 2) + cascadeX,
+    y: WINDOW_TOP_INSET + Math.round((roomHeight - fitted.height) / 2) + cascadeY,
+    width,
+    height,
   };
 }
 

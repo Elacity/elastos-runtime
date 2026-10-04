@@ -252,23 +252,13 @@ fn read_journal_file(path: &Path) -> anyhow::Result<Option<Journal>> {
 pub(crate) fn acquire_installed_writer(
     data_dir: &Path,
 ) -> anyhow::Result<Option<InstallationGuard>> {
-    let retained = crate::update_controller::installed_writer_binary(data_dir)?;
-    let binary = match retained {
-        Some(binary) => binary,
-        None => {
-            let sources = crate::sources::load_trusted_sources(data_dir)?;
-            let Some(source) = sources
-                .default_source()
-                .filter(|source| !source.install_path.is_empty())
-            else {
-                return Ok(None);
-            };
-            PathBuf::from(&source.install_path)
-        }
+    let Some(binary) = installed_binary(
+        data_dir,
+        crate::update_controller::installed_writer_binary(data_dir)?,
+    )?
+    else {
+        return Ok(None);
     };
-    if !binary.is_absolute() {
-        bail!("installed writer binary path must be absolute");
-    }
     let parent = binary.parent().context("installed writer parent missing")?;
     let parent = match fs::canonicalize(parent) {
         Ok(parent) => parent,
@@ -286,12 +276,104 @@ pub(crate) fn acquire_installed_writer(
     Ok(Some(guard))
 }
 
+fn installed_binary(data_dir: &Path, retained: Option<PathBuf>) -> anyhow::Result<Option<PathBuf>> {
+    let binary = match retained {
+        Some(binary) => binary,
+        None => {
+            let sources = crate::sources::load_trusted_sources(data_dir)?;
+            let Some(source) = sources
+                .default_source()
+                .filter(|source| !source.install_path.is_empty())
+            else {
+                return Ok(None);
+            };
+            PathBuf::from(&source.install_path)
+        }
+    };
+    if !binary.is_absolute() {
+        bail!("installed writer binary path must be absolute");
+    }
+    Ok(Some(binary))
+}
+
 pub(crate) struct InstallTransaction {
     _guard: InstallationGuard,
     data_dir: PathBuf,
     binary: PathBuf,
     destinations: BTreeMap<ReleaseFile, PathBuf>,
     layout: ReleaseLayout,
+}
+
+/// Borrows the writer that activated this CLI release while migration is pending.
+/// Its private identity admits only the principal-root migration host lock.
+pub(crate) struct SupportActivation<'a> {
+    transaction: &'a InstallTransaction,
+    journal_sha256: String,
+}
+
+impl SupportActivation<'_> {
+    pub(crate) fn authorize_principal_root_migration(&self, data_dir: &Path) -> anyhow::Result<()> {
+        let transaction = self.transaction;
+        transaction._guard.require_binary(&transaction.binary)?;
+        if fs::canonicalize(data_dir)? != transaction.data_dir {
+            bail!("principal-root migration belongs to a different update Home");
+        }
+        let journal = transaction
+            .read_journal()?
+            .context("principal-root migration activation journal missing")?;
+        if journal.schema != "elastos.install-transaction/v3"
+            || journal.phase != Phase::Committing
+            || journal.restart.is_some()
+            || sha256(&serde_json::to_vec(&journal)?) != self.journal_sha256
+        {
+            bail!("principal-root migration requires its own pending CLI activation");
+        }
+        transaction.validate_scratch(&journal)?;
+        for entry in &journal.entries {
+            transaction.check_metadata_custody(entry.id)?;
+            let activated = matches!(
+                entry.id,
+                ReleaseFile::RuntimeBinary | ReleaseFile::Components
+            );
+            transaction.require_state(
+                entry.id,
+                if activated {
+                    Some(&entry.staged_sha256)
+                } else {
+                    entry.original_sha256.as_deref()
+                },
+                if activated {
+                    Some(entry.staged_mode)
+                } else {
+                    entry.original_mode
+                },
+            )?;
+            let stage = transaction.scratch(entry.id, STAGE);
+            let rollback = transaction.scratch(entry.id, ROLLBACK);
+            check_private_directory(stage.parent().unwrap())?;
+            check_private_directory(rollback.parent().unwrap())?;
+            if !state_matches(
+                &file_state(&stage)?,
+                if activated {
+                    None
+                } else {
+                    Some(&entry.staged_sha256)
+                },
+                if activated {
+                    None
+                } else {
+                    Some(entry.staged_mode)
+                },
+            ) || !state_matches(
+                &file_state(&rollback)?,
+                entry.original_sha256.as_deref(),
+                entry.original_mode,
+            ) {
+                bail!("principal-root migration activation custody changed; retain recovery files");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl InstallTransaction {
@@ -927,7 +1009,7 @@ impl InstallTransaction {
 
     /// Normal setup needs the admitted candidate components while it refreshes support.
     /// Keep original backups and the committing journal until the final metadata save.
-    pub(crate) fn activate_artifacts_for_support(&self) -> anyhow::Result<()> {
+    pub(crate) fn activate_artifacts_for_support(&self) -> anyhow::Result<SupportActivation<'_>> {
         let mut journal = self
             .read_journal()?
             .context("prepared release journal missing")?;
@@ -956,7 +1038,11 @@ impl InstallTransaction {
             }
             Ok(())
         })();
-        self.restore_on_error(result)
+        self.restore_on_error(result)?;
+        Ok(SupportActivation {
+            transaction: self,
+            journal_sha256: sha256(&serde_json::to_vec(&journal)?),
+        })
     }
 
     fn commit_with(
@@ -1542,7 +1628,8 @@ pub(crate) fn authorize_host_start_with_generation(
 }
 
 pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
-    if let Some(journal) = read_host_start_journal(data_dir, binary)? {
+    // Controller preflight already selects its installed binary and can repair a prior receipt.
+    if let Some(journal) = read_host_start_journal_at(data_dir, binary)? {
         bail!("{}", pending_home_recovery_hint(&journal));
     }
     Ok(())
@@ -1557,6 +1644,35 @@ fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
 }
 
 fn read_host_start_journal(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
+    let installed = installed_binary(
+        data_dir,
+        crate::update_controller::installed_host_binary(data_dir)?,
+    )?;
+    // Installation ownership precedes the invoking binary's own recovery fence.
+    for journal_binary in installed
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(binary))
+    {
+        let Some(journal) = read_host_start_journal_at(data_dir, journal_binary)? else {
+            continue;
+        };
+        let owner = installed.as_deref().unwrap_or(binary);
+        if fs::canonicalize(binary.parent().context("host binary parent missing")?)?
+            != fs::canonicalize(owner.parent().context("installed binary parent missing")?)?
+            || binary.file_name() != owner.file_name()
+        {
+            bail!(
+                "Home start differs from the installation retained for recovery. {}",
+                pending_home_recovery_hint(&journal)
+            );
+        }
+        return Ok(Some(journal));
+    }
+    Ok(None)
+}
+
+fn read_host_start_journal_at(data_dir: &Path, binary: &Path) -> anyhow::Result<Option<Journal>> {
     let parent = binary.parent().context("host binary parent missing")?;
     let path = parent.join(JOURNAL);
     let Some(journal) = read_journal_file(&path)? else {
@@ -1629,6 +1745,8 @@ mod tests {
     fn previous(id: ReleaseFile) -> Vec<u8> {
         if id == ReleaseFile::RuntimeBinary {
             b"#!/bin/sh\nprintf 'elastos 0.7.0\\n'\n".to_vec()
+        } else if id == ReleaseFile::Sources {
+            br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.0"}]}"#.to_vec()
         } else {
             format!("previous {}", id.name()).into_bytes()
         }
@@ -1643,8 +1761,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let data = root.path().join("data");
-            let binary = root.path().join("bin/elastos");
+            let root_path = fs::canonicalize(root.path()).unwrap();
+            let data = root_path.join("data");
+            let binary = root_path.join("bin/elastos");
             fs::create_dir(&data).unwrap();
             fs::create_dir(binary.parent().unwrap()).unwrap();
             fs::write(data.join("owner-data"), b"data written by owner").unwrap();
@@ -1719,10 +1838,241 @@ mod tests {
             journal.phase = Phase::Committed;
             writer.write_journal(&journal).unwrap();
         }
+
+        fn snapshot(&self) -> BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
+            fn collect(path: &Path, out: &mut BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>) {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                let bytes = metadata.is_file().then(|| fs::read(path).unwrap());
+                out.insert(path.to_path_buf(), (metadata.mode(), bytes));
+                if metadata.is_dir() {
+                    for entry in fs::read_dir(path).unwrap() {
+                        collect(&entry.unwrap().path(), out);
+                    }
+                }
+            }
+            let mut snapshot = BTreeMap::new();
+            collect(self._root.path(), &mut snapshot);
+            snapshot
+        }
     }
 
     fn candidate() -> [(ReleaseFile, &'static [u8]); 5] {
-        ReleaseFile::ALL.map(|id| (id, b"candidate bytes".as_slice()))
+        ReleaseFile::ALL.map(|id| (id, candidate_bytes(id)))
+    }
+
+    fn candidate_bytes(id: ReleaseFile) -> &'static [u8] {
+        if id == ReleaseFile::Sources {
+            br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.1"}]}"#
+        } else {
+            b"candidate bytes"
+        }
+    }
+
+    #[test]
+    fn cli_activation_admits_only_its_migration_before_release_commit() {
+        let fixture = Fixture::new();
+        let writer = fixture.writer();
+        fixture.old_files(&writer, false);
+        writer.prepare(&candidate()).unwrap();
+        let activation = writer.activate_artifacts_for_support().unwrap();
+
+        // Use the actual installed path, unlike a test runner outside this installation.
+        let error = authorize_host_start_with_generation(
+            writer.data_dir(),
+            writer.binary_path(),
+            None,
+            std::process::id(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("interrupted command-line update"));
+        assert!(InstallationGuard::acquire(writer.binary.parent().unwrap()).is_err());
+
+        let host =
+            crate::host_lock::acquire_principal_root_update_lock(writer.data_dir(), &activation)
+                .unwrap();
+        assert_eq!(
+            crate::host_lock::active_host_process(writer.data_dir())
+                .unwrap()
+                .unwrap()
+                .role,
+            "principal-root-upgrade"
+        );
+        assert!(crate::host_lock::acquire_principal_root_update_lock(
+            writer.data_dir(),
+            &activation,
+        )
+        .is_err());
+        drop(host);
+
+        let receipt = crate::api::auth_gateway::migrate_configured_principal_roots_for_update(
+            writer.data_dir(),
+            &writer.data_dir.join("backups/update-migration"),
+            &activation,
+        )
+        .unwrap();
+        assert_eq!(receipt.status, "already_ready");
+        activation
+            .authorize_principal_root_migration(writer.data_dir())
+            .unwrap();
+        writer
+            .commit_checked(|| {
+                assert!(activation
+                    .authorize_principal_root_migration(writer.data_dir())
+                    .is_err());
+                Ok(())
+            })
+            .unwrap();
+        assert!(activation
+            .authorize_principal_root_migration(writer.data_dir())
+            .is_err());
+        authorize_host_start_with_generation(
+            writer.data_dir(),
+            writer.binary_path(),
+            None,
+            std::process::id(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_migration_refuses_changed_or_missing_activation_files_without_writes() {
+        for id in ReleaseFile::ALL {
+            for directory in [None, Some(STAGE), Some(ROLLBACK)] {
+                if directory == Some(STAGE)
+                    && matches!(id, ReleaseFile::RuntimeBinary | ReleaseFile::Components)
+                {
+                    continue;
+                }
+                for change in ["bytes", "mode", "missing"] {
+                    let fixture = Fixture::new();
+                    let writer = fixture.writer();
+                    fixture.old_files(&writer, false);
+                    writer.prepare(&candidate()).unwrap();
+                    let activation = writer.activate_artifacts_for_support().unwrap();
+                    let path = match directory {
+                        Some(directory) => writer.scratch(id, directory),
+                        None => writer.destinations[&id].clone(),
+                    };
+                    match change {
+                        "bytes" => fs::write(&path, b"foreign bytes").unwrap(),
+                        "mode" => {
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap()
+                        }
+                        "missing" => fs::remove_file(&path).unwrap(),
+                        _ => unreachable!(),
+                    }
+                    let before = fixture.snapshot();
+                    assert!(
+                        crate::host_lock::acquire_principal_root_update_lock(
+                            writer.data_dir(),
+                            &activation,
+                        )
+                        .is_err(),
+                        "{id:?} {directory:?} {change}"
+                    );
+                    assert_eq!(fixture.snapshot(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cli_migration_refuses_foreign_identity_phase_and_custody_without_writes() {
+        for change in [
+            "staging",
+            "prepared",
+            "committed",
+            "recovering",
+            "schema",
+            "transaction",
+            "journal-home",
+            "binary-name",
+            "migration-home",
+            "lock",
+            "early-source",
+            "retained-binary-stage",
+            "foreign-scratch",
+            "missing-journal",
+            "rebound-stage",
+            "rebound-prefix",
+        ] {
+            let fixture = Fixture::new();
+            let writer = fixture.writer();
+            fixture.old_files(&writer, false);
+            writer.prepare(&candidate()).unwrap();
+            let activation = writer.activate_artifacts_for_support().unwrap();
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            let mut data_dir = writer.data_dir.clone();
+            match change {
+                "staging" => journal.phase = Phase::Staging,
+                "prepared" => journal.phase = Phase::Prepared,
+                "committed" => journal.phase = Phase::Committed,
+                "recovering" => journal.phase = Phase::Recovering,
+                "schema" => journal.schema = "elastos.install-transaction/v1".into(),
+                "transaction" => journal.transaction_id = "f".repeat(32),
+                "journal-home" => journal.data_dir = writer.data_dir.join("foreign"),
+                "binary-name" => journal.binary_basename = "foreign-runtime".into(),
+                "migration-home" => {
+                    data_dir = writer.data_dir.join("foreign");
+                    fs::create_dir(&data_dir).unwrap();
+                }
+                "lock" => {
+                    let lock = writer.binary.parent().unwrap().join(INSTALL_LOCK);
+                    fs::remove_file(&lock).unwrap();
+                    write_new(&lock, b"replaced lock", 0o600).unwrap();
+                }
+                "early-source" => fs::rename(
+                    writer.scratch(ReleaseFile::Sources, STAGE),
+                    &writer.destinations[&ReleaseFile::Sources],
+                )
+                .unwrap(),
+                "retained-binary-stage" => write_new(
+                    &writer.scratch(ReleaseFile::RuntimeBinary, STAGE),
+                    b"candidate bytes",
+                    0o755,
+                )
+                .unwrap(),
+                "foreign-scratch" => write_new(
+                    &writer.binary.parent().unwrap().join(STAGE).join("foreign"),
+                    b"owner file",
+                    0o600,
+                )
+                .unwrap(),
+                "missing-journal" => fs::remove_file(writer.journal_path()).unwrap(),
+                "rebound-stage" | "rebound-prefix" => {
+                    let id = if change == "rebound-stage" {
+                        ReleaseFile::Sources
+                    } else {
+                        ReleaseFile::RuntimeBinary
+                    };
+                    let entry = journal
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.id == id)
+                        .unwrap();
+                    entry.staged_sha256 = sha256(b"foreign admitted bytes");
+                    let path = if change == "rebound-stage" {
+                        writer.scratch(id, STAGE)
+                    } else {
+                        writer.destinations[&id].clone()
+                    };
+                    fs::write(path, b"foreign admitted bytes").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if change != "missing-journal" {
+                writer.write_journal(&journal).unwrap();
+            }
+            let before = fixture.snapshot();
+            assert!(
+                crate::host_lock::acquire_principal_root_update_lock(&data_dir, &activation)
+                    .is_err(),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), before);
+        }
     }
 
     #[test]
@@ -2124,8 +2474,8 @@ mod tests {
                 // The corrected retry uses the real paths and leaves one complete candidate.
                 writer.prepare(&candidate()).unwrap();
                 writer.commit().unwrap();
-                for path in writer.destinations.values() {
-                    assert_eq!(fs::read(path).unwrap(), b"candidate bytes");
+                for (id, path) in &writer.destinations {
+                    assert_eq!(fs::read(path).unwrap(), candidate_bytes(*id));
                 }
             }
         }
@@ -2319,8 +2669,8 @@ mod tests {
         drop(writer);
         let resumed = fixture.writer();
         resumed.recover().unwrap();
-        for destination in resumed.destinations.values() {
-            assert_eq!(fs::read(destination).unwrap(), b"candidate bytes");
+        for (id, destination) in &resumed.destinations {
+            assert_eq!(fs::read(destination).unwrap(), candidate_bytes(*id));
         }
         resumed.require_empty_scratch().unwrap();
     }

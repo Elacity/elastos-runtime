@@ -52,7 +52,7 @@ or one installed interaction. Then run the changed surface through its consumer.
 
 ```sh
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 node scripts/website-truth-check.mjs
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check

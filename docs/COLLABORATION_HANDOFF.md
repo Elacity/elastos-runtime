@@ -145,8 +145,7 @@ current candidate to implement them during acceptance.
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
-bash scripts/check-wci-alignment.sh
+node scripts/check-product-data.mjs
 cargo test --manifest-path capsules/chat-room-ui/Cargo.toml
 cargo clippy --manifest-path capsules/chat-room-ui/Cargo.toml --all-targets -- -D warnings
 (cd elastos && cargo fmt --all -- --check)

@@ -217,6 +217,340 @@ fn publish_retained_receipt(fixture: &PrivateFixture) {
     validate_retained_receipt(&receipt).unwrap();
 }
 
+fn prepare_host_fence_release(
+    fixture: &PrivateFixture,
+    source_binary: &Path,
+    restarting: bool,
+) -> InstallTransaction {
+    use crate::install_transaction::ReleaseFile;
+
+    let writer = InstallTransaction::acquire(&fixture.data, &fixture.binary).unwrap();
+    let sources = serde_json::to_vec(&source_config(source_binary)).unwrap();
+    writer
+        .prepare(&[
+            (ReleaseFile::RuntimeBinary, b"candidate fixture Runtime"),
+            (ReleaseFile::Components, b"candidate components"),
+            (ReleaseFile::Sources, &sources),
+            (ReleaseFile::ReleaseHead, b"candidate release head"),
+            (ReleaseFile::ReleaseManifest, b"candidate release manifest"),
+        ])
+        .unwrap();
+    if restarting {
+        writer
+            .prepare_restart(RestartPlan {
+                request_id: "c".repeat(32),
+                controller_sha256: digest(b"signed fixture Runtime"),
+                launch_plan_sha256: digest(b"fixture launch"),
+                support_sha256: digest(b"fixture support"),
+                previous_version: "0.7.0".into(),
+                candidate_version: "0.7.1".into(),
+                previous_binary_sha256: digest(b"signed fixture Runtime"),
+            })
+            .unwrap();
+    }
+    writer
+}
+
+fn host_fence_migration_target(fixture: &PrivateFixture) -> (PathBuf, PathBuf, PathBuf) {
+    let principal_id = "person:local:host-fence";
+    let protection = crate::auth::store_test_principal_root_protection(&fixture.data, principal_id);
+    let object_uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/save.sav",
+        protection.localhost_root
+    );
+    let target =
+        elastos_common::localhost::rooted_localhost_fs_path(&fixture.data, &object_uri).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fixture.file(&target, b"owner plaintext save", 0o600);
+    let plan = crate::auth::PrincipalRootMigrationPlanV1 {
+        schema: crate::auth::PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.into(),
+        principal_id: principal_id.into(),
+        localhost_root: protection.localhost_root,
+        objects: vec![crate::auth::PrincipalRootMigrationSelectionV1 {
+            object_uri,
+            plaintext_sha256: format!("sha256:{}", digest(b"owner plaintext save")),
+        }],
+    };
+    let plan_path = fixture.data.join("migration-plan.json");
+    fixture.file(&plan_path, &serde_json::to_vec(&plan).unwrap(), 0o600);
+    (target, plan_path, fixture.data.join("backups/host-fence"))
+}
+
+#[test]
+fn alternate_binary_refuses_installed_recovery_before_start_or_offline_migration() {
+    for retained in [false, true] {
+        for restarting in [false, true] {
+            let fixture = PrivateFixture::new();
+            fixture.publish_installed_release();
+            if retained {
+                publish_retained_receipt(&fixture);
+            }
+            let alternate = fixture.data.join("alternate-bin/installed-runtime");
+            fs::create_dir(alternate.parent().unwrap()).unwrap();
+            fixture.file(&alternate, b"candidate fixture Runtime", 0o755);
+            assert_ne!(alternate.parent(), fixture.binary.parent());
+            assert_ne!(
+                std::env::current_exe().unwrap().parent(),
+                fixture.binary.parent()
+            );
+            // A retained receipt owns recovery even when source settings point elsewhere.
+            let source_binary = if retained {
+                &alternate
+            } else {
+                &fixture.binary
+            };
+            let writer = prepare_host_fence_release(&fixture, source_binary, restarting);
+            if restarting {
+                writer.commit_checked(|| Ok(())).unwrap();
+            }
+            let claim = restarting.then(|| writer.claim_start(false).unwrap());
+            let (target, plan, backup) = host_fence_migration_target(&fixture);
+            let before = fixture.snapshot();
+            let expected = if restarting {
+                "retained update controller"
+            } else {
+                "Run `elastos update` again"
+            };
+            for result in [
+                crate::install_transaction::authorize_host_start_with_generation(
+                    &fixture.data,
+                    &alternate,
+                    claim.as_ref().map(|claim| claim.generation.as_str()),
+                    std::process::id(),
+                ),
+                crate::host_lock::acquire_host_process_lock(&fixture.data, "gateway", "offline")
+                    .map(|_| ()),
+                crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan, &backup)
+                    .map(|_| ()),
+                crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+                    &fixture.data,
+                    &backup,
+                )
+                .map(|_| ()),
+            ] {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains(expected), "{message}, retained={retained}");
+                assert_eq!(fixture.snapshot(), before);
+            }
+            assert_eq!(fs::read(target).unwrap(), b"owner plaintext save");
+            assert!(!backup.exists());
+            if let Some(claim) = claim {
+                fixture.file(
+                    &alternate
+                        .parent()
+                        .unwrap()
+                        .join(".elastos.update-journal.json"),
+                    b"{uncertain invoking journal",
+                    0o600,
+                );
+                let before = fixture.snapshot();
+                assert!(
+                    crate::install_transaction::authorize_host_start_with_generation(
+                        &fixture.data,
+                        &alternate,
+                        Some(&claim.generation),
+                        std::process::id(),
+                    )
+                    .is_err()
+                );
+                assert_eq!(fixture.snapshot(), before);
+                crate::install_transaction::authorize_host_start_with_generation(
+                    &fixture.data,
+                    &fixture.binary,
+                    Some(&claim.generation),
+                    std::process::id(),
+                )
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_start_and_offline_migration_keep_fresh_or_installed_homes_available() {
+    for installed in [false, true] {
+        let fixture = PrivateFixture::new();
+        if installed {
+            fixture.publish_installed_release();
+            publish_retained_receipt(&fixture);
+        }
+        let (target, plan, backup) = host_fence_migration_target(&fixture);
+        let host = crate::host_lock::acquire_host_process_lock(&fixture.data, "gateway", "offline")
+            .unwrap();
+        drop(host);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(backup.parent().unwrap())
+            .unwrap();
+        let receipt =
+            crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan, &backup)
+                .unwrap();
+        assert_eq!(receipt.object_count, 1);
+        assert_ne!(fs::read(target).unwrap(), b"owner plaintext save");
+        assert!(backup.exists());
+    }
+}
+
+#[test]
+fn alternate_binary_refuses_foreign_or_uncertain_installed_journals_without_writes() {
+    for retained in [false, true] {
+        for state in [
+            "foreign home",
+            "foreign binary",
+            "malformed",
+            "unsafe",
+            "symlink",
+            "directory",
+            "absent sources",
+        ] {
+            if state == "absent sources" && !retained {
+                continue;
+            }
+            let fixture = PrivateFixture::new();
+            fixture.publish_installed_release();
+            if retained {
+                publish_retained_receipt(&fixture);
+            }
+            let writer = prepare_host_fence_release(&fixture, &fixture.binary, false);
+            let journal = fixture
+                .binary
+                .parent()
+                .unwrap()
+                .join(".elastos.update-journal.json");
+            match state {
+                "foreign home" | "foreign binary" => {
+                    let mut value: Value =
+                        serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                    if state == "foreign home" {
+                        value["data_dir"] = json!(fixture.data.join("another-home"));
+                    } else {
+                        value["binary_basename"] = json!("foreign-runtime");
+                    }
+                    fs::write(&journal, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "malformed" => fs::write(&journal, b"{malformed").unwrap(),
+                "unsafe" => {
+                    fs::set_permissions(&journal, fs::Permissions::from_mode(0o666)).unwrap()
+                }
+                "symlink" => {
+                    fs::remove_file(&journal).unwrap();
+                    symlink(&fixture.binary, &journal).unwrap();
+                }
+                "directory" => {
+                    fs::remove_file(&journal).unwrap();
+                    fs::create_dir(&journal).unwrap();
+                }
+                "absent sources" => fs::remove_file(fixture.data.join("sources.json")).unwrap(),
+                _ => unreachable!(),
+            }
+            let (target, plan, backup) = host_fence_migration_target(&fixture);
+            let before = fixture.snapshot();
+            for result in [
+                crate::host_lock::acquire_host_process_lock(&fixture.data, "gateway", "offline")
+                    .map(|_| ()),
+                crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan, &backup)
+                    .map(|_| ()),
+                crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+                    &fixture.data,
+                    &backup,
+                )
+                .map(|_| ()),
+            ] {
+                assert!(result.is_err(), "{state}, retained={retained}");
+                assert_eq!(fixture.snapshot(), before, "{state}, retained={retained}");
+            }
+            assert_eq!(fs::read(target).unwrap(), b"owner plaintext save");
+            assert!(!backup.exists());
+            drop(writer);
+        }
+    }
+}
+
+#[test]
+fn invoking_journal_refuses_when_the_trusted_installation_parent_is_clean() {
+    for malformed in [false, true] {
+        let fixture = PrivateFixture::new();
+        fixture.publish_installed_release();
+        let alternate = fixture.data.join("alternate-bin/installed-runtime");
+        fs::create_dir(alternate.parent().unwrap()).unwrap();
+        fixture.file(&alternate, b"signed fixture Runtime", 0o755);
+        let writer = prepare_host_fence_release(&fixture, &fixture.binary, false);
+        let installed_journal = fixture
+            .binary
+            .parent()
+            .unwrap()
+            .join(".elastos.update-journal.json");
+        let bytes = fs::read(&installed_journal).unwrap();
+        writer.recover().unwrap();
+        assert!(!installed_journal.exists());
+        fixture.file(
+            &alternate
+                .parent()
+                .unwrap()
+                .join(".elastos.update-journal.json"),
+            if malformed {
+                b"{uncertain invoking journal"
+            } else {
+                &bytes
+            },
+            0o600,
+        );
+        let before = fixture.snapshot();
+        assert!(
+            crate::install_transaction::authorize_host_start_with_generation(
+                &fixture.data,
+                &alternate,
+                None,
+                std::process::id(),
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn ordinary_admission_refuses_invalid_installation_authority_without_writes() {
+    for state in [
+        "source json",
+        "relative source",
+        "receipt json",
+        "missing controller",
+    ] {
+        let fixture = PrivateFixture::new();
+        fixture.publish_installed_release();
+        if matches!(state, "receipt json" | "missing controller") {
+            publish_retained_receipt(&fixture);
+        }
+        let (_, plan, backup) = host_fence_migration_target(&fixture);
+        match state {
+            "source json" => {
+                fs::write(fixture.data.join("sources.json"), b"{invalid source").unwrap()
+            }
+            "relative source" => fs::write(
+                fixture.data.join("sources.json"),
+                serde_json::to_vec(&source_config(Path::new("relative/runtime"))).unwrap(),
+            )
+            .unwrap(),
+            "receipt json" => {
+                fs::write(fixture.directory.join(RECEIPT), b"{invalid receipt").unwrap()
+            }
+            "missing controller" => fs::remove_file(fixture.controller()).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fixture.snapshot();
+        for result in [
+            crate::host_lock::acquire_host_process_lock(&fixture.data, "gateway", "offline")
+                .map(|_| ()),
+            crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan, &backup)
+                .map(|_| ()),
+        ] {
+            assert!(result.is_err(), "{state}");
+            assert_eq!(fixture.snapshot(), before, "{state}");
+        }
+    }
+}
+
 #[test]
 fn retained_signed_receipt_keeps_writer_ownership_when_sources_are_absent() {
     let fixture = PrivateFixture::new();
@@ -480,6 +814,8 @@ fn receipt_round_trip_keeps_non_utf8_launch_args_environment_and_working_directo
     let cwd = fixture
         .data
         .join(OsString::from_vec(b"working-\xff".to_vec()));
+    // APFS rejects this non-UTF8 name; command construction does not access cwd.
+    #[cfg(not(target_os = "macos"))]
     fs::create_dir(&cwd).unwrap();
     let encode = |value: &OsStr| BASE64.encode(value.as_bytes());
     let argument = OsString::from_vec(b"argument-\xfe".to_vec());
@@ -1151,8 +1487,18 @@ fn low_space_cannot_hide_unsafe_controller_state_or_foreign_errors() {
 
 #[test]
 fn signed_current_controller_repairs_only_an_admitted_prior_receipt() {
-    for tamper in ["none", "signature", "launch", "binary path"] {
+    for tamper in [
+        "none",
+        "signature",
+        "launch",
+        "binary path",
+        "pending journal",
+        "current release",
+        "current components",
+        "controller bytes",
+    ] {
         let fixture = PrivateFixture::new();
+        fixture.publish_installed_release();
         publish_retained_receipt(&fixture);
         let _lease = acquire_lease(&fixture.directory).unwrap();
         let _writer = crate::install_transaction::InstallationGuard::acquire(
@@ -1165,15 +1511,35 @@ fn signed_current_controller_repairs_only_an_admitted_prior_receipt() {
         source.installed_version = "0.7.1".into();
         let current_bytes = b"next signed Runtime";
         let expected = digest(current_bytes);
+        let components = fs::read(fixture.data.join("components.json")).unwrap();
+        let descriptor = |bytes: &[u8]| json!({"cid": raw_cid(bytes), "sha256": digest(bytes), "size": bytes.len()});
         let mut payload = json!({"schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable", "platforms":{}});
-        payload["platforms"][crate::update::detect_release_platform()] =
-            json!({"binary":{"sha256":expected}});
-        let signed = signed(payload, "elastos.release.v1");
+        payload["platforms"][crate::update::detect_release_platform()] = json!({
+            "binary": descriptor(current_bytes), "components": descriptor(&components)
+        });
+        let release = signed(payload, "elastos.release.v1");
+        let head = signed(
+            json!({
+                "schema":"elastos.release.head/v1", "version":"0.7.1", "channel":"stable",
+                "latest_release_cid":raw_cid(&release), "release_sha256":digest(&release)
+            }),
+            "elastos.release.head.v1",
+        );
+        source.head_cid = raw_cid(&head);
+        let mut config = source_config(&fixture.binary);
+        config.sources[0] = source.clone();
+        fs::write(
+            fixture.data.join("sources.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(installation_release_head_path(&fixture.data), head).unwrap();
+        fs::write(installation_release_manifest_path(&fixture.data), &release).unwrap();
         fs::write(&fixture.binary, current_bytes).unwrap();
         // Simulate a crash after the new controller rename and before the receipt rename.
         fs::write(fixture.controller(), current_bytes).unwrap();
         assert_eq!(
-            admit_installed_release(&signed, &source, &fixture.binary).unwrap(),
+            admit_installed_release(&release, &source, &fixture.binary).unwrap(),
             expected
         );
         match tamper {
@@ -1182,22 +1548,67 @@ fn signed_current_controller_repairs_only_an_admitted_prior_receipt() {
             }
             "launch" => receipt.launch.cwd = BASE64.encode(b"changed prior launch"),
             "binary path" => receipt.binary = fixture.data.join("foreign-runtime"),
+            "pending journal" => fixture.file(
+                &fixture
+                    .binary
+                    .parent()
+                    .unwrap()
+                    .join(".elastos.update-journal.json"),
+                b"{uncertain pending journal",
+                0o600,
+            ),
+            "current release" => fs::write(
+                installation_release_manifest_path(&fixture.data),
+                b"changed current signed release",
+            )
+            .unwrap(),
+            "current components" => fs::write(
+                fixture.data.join("components.json"),
+                b"changed current components",
+            )
+            .unwrap(),
+            "controller bytes" => fs::write(fixture.controller(), b"foreign controller").unwrap(),
             _ => {}
         }
         write_private(&path, &receipt).unwrap();
         let before = fixture.snapshot();
+        let host = crate::install_transaction::authorize_host_start_with_generation(
+            &fixture.data,
+            &fixture.binary,
+            None,
+            std::process::id(),
+        );
+        if matches!(
+            tamper,
+            "pending journal" | "current release" | "current components" | "controller bytes"
+        ) {
+            assert!(host.is_err(), "current repair admission: {tamper}");
+            if tamper == "pending journal" {
+                assert!(prepare_controller(
+                    &fixture.directory,
+                    &fixture.binary,
+                    &expected,
+                    |_, _| panic!("pending journal requested a controller copy"),
+                )
+                .is_err());
+            }
+            assert_eq!(fixture.snapshot(), before, "{tamper}");
+            continue;
+        }
         let result = prepare_controller(&fixture.directory, &fixture.binary, &expected, |_, _| {
             panic!("current signed bytes need no copy")
         });
         if tamper == "none" {
+            host.unwrap();
             assert!(result.unwrap());
             assert_eq!(fixture.snapshot(), before);
             receipt.controller_sha256 = expected;
-            receipt.signed_controller_release = BASE64.encode(signed);
+            receipt.signed_controller_release = BASE64.encode(release);
             receipt.trusted_source = source;
             write_private(&path, &receipt).unwrap();
             validate_retained_receipt(&read_private_json::<Receipt>(&path).unwrap()).unwrap();
         } else {
+            assert!(host.is_err(), "host admission: {tamper}");
             assert!(result.is_err(), "{tamper}");
             assert_eq!(fixture.snapshot(), before, "{tamper}");
         }
@@ -1729,7 +2140,8 @@ async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
     publish_retained_receipt(&fixture);
     crate::sources::save_trusted_sources(&fixture.data, &source_config(&fixture.binary)).unwrap();
     let (_, request, _) = choice_fixture();
-    let mut command = tokio::process::Command::new("/bin/true");
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "exit 0"]);
     let child = child::OwnedChild::spawn(&mut command).unwrap();
     let mut controller = Controller {
         receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),

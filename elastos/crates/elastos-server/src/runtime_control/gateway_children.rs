@@ -1,6 +1,7 @@
 //! The gateway owns subordinate process groups, including launches from its PTY.
 use super::*;
 use crate::update_controller::child as process_ownership;
+use anyhow::Context;
 use std::process::{Child, Command};
 
 const OWNER_ENV: &str = "ELASTOS_MANAGED_GATEWAY_OWNER";
@@ -163,6 +164,11 @@ impl StartingChild {
     pub(crate) fn ready(&mut self) {
         self.ready = true;
     }
+
+    /// Keep the unreaped leader available for failed-start group cleanup.
+    pub(crate) fn observed_exit(&self) -> std::io::Result<Option<ExitStatus>> {
+        process_ownership::observe_exit(self.child.id())
+    }
 }
 
 impl Drop for StartingChild {
@@ -246,10 +252,13 @@ async fn shutdown_with_limits(
                 record.coords_path.starts_with(&owner.data_dir),
                 "managed runtime coordinates are outside their owner data root"
             );
-            validate_record_birth(&record)?;
-            let anchored = direct_child_anchor(&record)?;
+            validate_record_birth(&record)
+                .context("validate managed runtime birth before capture")?;
+            let anchored = direct_child_anchor(&record)
+                .context("capture managed runtime direct child and group")?;
             if anchored {
-                checked_signal(&record, libc::SIGTERM)?;
+                checked_signal(&record, libc::SIGTERM)
+                    .context("send managed runtime group TERM")?;
             }
             Ok(Pending {
                 path,
@@ -260,7 +269,7 @@ async fn shutdown_with_limits(
         })();
         match result {
             Ok(record) => pending.push(record),
-            Err(error) => failures.push(error.to_string()),
+            Err(error) => failures.push(format!("{error:#}")),
         }
     }
     while !pending.is_empty() {
@@ -273,11 +282,11 @@ async fn shutdown_with_limits(
             match settle_record(&mut entry, tokio::time::Instant::now() >= kill_deadline) {
                 Ok(true) => {
                     if let Err(error) = retire_record(entry) {
-                        failures.push(error.to_string());
+                        failures.push(format!("{error:#}"));
                     }
                 }
                 Ok(false) => retained.push(entry),
-                Err(error) => failures.push(error.to_string()),
+                Err(error) => failures.push(format!("{error:#}")),
             }
         }
         pending = retained;
@@ -372,35 +381,112 @@ fn direct_child_anchor(record: &Record) -> anyhow::Result<bool> {
 }
 
 fn checked_signal(record: &Record, signal: i32) -> anyhow::Result<()> {
-    validate_record_birth(record)?;
-    let exited = process_ownership::observe_exit(record.pid)?;
-    // A previously validated direct child reserves its group ID after exit.
-    // macOS getpgid stops exposing that leader once it becomes a zombie.
-    if exited.is_none() {
-        anyhow::ensure!(
-            process_ownership::process_group(record.pid)? == Some(record.pid),
-            "managed runtime group differs from its ownership record"
-        );
-    }
-    let result = unsafe { libc::kill(-(record.pid as libc::pid_t), signal) };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error.into());
-        }
-    }
+    // The caller already proved this direct child's birth and process group.
+    // Its unreaped PID keeps that anchor when macOS hides its exited birth.
+    observe_anchored_exit(
+        || {
+            process_ownership::observe_exit(record.pid)
+                .context("observe managed runtime exit before group signal")
+        },
+        || {
+            validate_record_birth(record)
+                .context("validate live managed runtime birth before signal")?;
+            let group = process_ownership::process_group(record.pid)
+                .context("read live managed runtime group before signal")?;
+            let Some(group) = group else {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                    .context("live managed runtime group became unavailable before signal");
+            };
+            anyhow::ensure!(
+                group == record.pid,
+                "managed runtime group differs from its ownership record"
+            );
+            Ok(())
+        },
+    )?
+    .require_observed()?;
+    process_ownership::signal_group(record.pid, signal).context("signal managed runtime group")?;
     Ok(())
 }
 
+#[derive(Debug)]
+enum AnchoredExit {
+    Observed(Option<ExitStatus>),
+    AwaitingExit(anyhow::Error),
+}
+
+impl AnchoredExit {
+    fn require_observed(self) -> anyhow::Result<Option<ExitStatus>> {
+        match self {
+            Self::Observed(exited) => Ok(exited),
+            Self::AwaitingExit(error) => Err(error),
+        }
+    }
+}
+
+/// The caller retains a direct child with a previously proved birth and group.
+fn observe_anchored_exit(
+    mut observe: impl FnMut() -> anyhow::Result<Option<ExitStatus>>,
+    inspect_live: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<AnchoredExit> {
+    let exited = observe()?;
+    if exited.is_some() {
+        return Ok(AnchoredExit::Observed(exited));
+    }
+    if let Err(error) = inspect_live() {
+        if cfg!(any(target_os = "macos", test))
+            && error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+        {
+            // Darwin can hide the birth/group after the preceding live event.
+            return match observe()
+                .context("reobserve retained managed runtime child after ESRCH")?
+            {
+                Some(exited) => Ok(AnchoredExit::Observed(Some(exited))),
+                None => Ok(AnchoredExit::AwaitingExit(error)),
+            };
+        }
+        return Err(error);
+    }
+    Ok(AnchoredExit::Observed(None))
+}
+
 fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
-    validate_record_birth(&entry.record)?;
+    settle_record_with_observer(entry, force, |record| {
+        observe_anchored_exit(
+            || {
+                process_ownership::observe_exit(record.pid)
+                    .context("observe managed runtime exit during settlement")
+            },
+            || {
+                validate_record_birth(record)
+                    .context("validate live managed runtime birth during settlement")
+            },
+        )
+    })
+}
+
+fn settle_record_with_observer(
+    entry: &mut Pending,
+    force: bool,
+    observe: impl FnOnce(&Record) -> anyhow::Result<AnchoredExit>,
+) -> anyhow::Result<bool> {
     if entry.anchored {
-        let exited = process_ownership::observe_exit(entry.record.pid)?;
+        let exited = match observe(&entry.record)? {
+            AnchoredExit::Observed(exited) => exited,
+            AnchoredExit::AwaitingExit(_) => return Ok(false),
+        };
         if force && !entry.killed {
-            checked_signal(&entry.record, libc::SIGKILL)?;
+            checked_signal(&entry.record, libc::SIGKILL)
+                .context("send managed runtime group KILL during settlement")?;
             entry.killed = true;
         }
-        if exited.is_some() && process_ownership::group_descendants(entry.record.pid)?.is_empty() {
+        if exited.is_some()
+            && process_ownership::group_descendants(entry.record.pid)
+                .context("inspect managed runtime descendants during settlement")?
+                .is_empty()
+        {
             let result = unsafe {
                 libc::waitpid(
                     entry.record.pid as libc::pid_t,
@@ -409,16 +495,19 @@ fn settle_record(entry: &mut Pending, force: bool) -> anyhow::Result<bool> {
                 )
             };
             if result < 0 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(std::io::Error::last_os_error())
+                    .context("reap managed runtime during settlement");
             }
             if result == 0 {
                 return Ok(false);
             }
+            entry.anchored = false;
         } else {
             return Ok(false);
         }
     }
     process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)
+        .context("confirm managed runtime generation disappearance after settlement")
 }
 
 fn retire_record(entry: Pending) -> anyhow::Result<()> {
@@ -431,7 +520,8 @@ fn retire_record(entry: Pending) -> anyhow::Result<()> {
         "managed runtime ownership record changed during cleanup"
     );
     anyhow::ensure!(
-        process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)?,
+        process_ownership::generation_gone(entry.record.pid, &entry.record.process_start)
+            .context("confirm managed runtime generation disappearance during retirement")?,
         "managed runtime generation remains during record retirement"
     );
     if read_private_runtime_coords(&entry.record.coords_path)
@@ -489,7 +579,7 @@ pub(crate) async fn test_child(owner: &Owner, coords_path: &Path) -> (StartingCh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     fn fixture_owner(data: &Path, generation: &str) -> (GatewayRuntimeCoordsGuard, Owner) {
         let coords = RuntimeCoords {
@@ -533,6 +623,220 @@ mod tests {
         assert!(Owner::read_for_generation(temp.path(), owner.pid, "gateway-fixture").is_err());
     }
 
+    #[test]
+    fn retained_anchor_retries_only_lost_darwin_visibility_with_an_exited_child() {
+        let io_error = |errno| anyhow::Error::from(std::io::Error::from_raw_os_error(errno));
+        for case in [
+            "already exited",
+            "valid live child",
+            "birth vanished during exit",
+            "group vanished during exit",
+            "birth mismatch",
+            "group mismatch",
+            "permission denied",
+            "other lookup failure",
+            "lookup lost child ownership",
+            "still live after ESRCH",
+            "reaped after ESRCH",
+            "uncertain after ESRCH",
+            "initial child ownership lost",
+            "initial exit uncertain",
+            "initial ESRCH",
+        ] {
+            let status = ExitStatus::from_raw(15);
+            let before = match case {
+                "already exited" => Ok(Some(status)),
+                "initial child ownership lost" => Err(io_error(libc::ECHILD)),
+                "initial exit uncertain" => Err(io_error(libc::EPERM)),
+                "initial ESRCH" => Err(io_error(libc::ESRCH)),
+                _ => Ok(None),
+            };
+            let after = match case {
+                "still live after ESRCH" => Ok(None),
+                "reaped after ESRCH" => Err(io_error(libc::ECHILD)),
+                "uncertain after ESRCH" => Err(io_error(libc::EPERM)),
+                _ => Ok(Some(status)),
+            };
+            let inspection = match case {
+                "valid live child" => Ok(()),
+                "birth mismatch" => Err(anyhow::anyhow!("managed runtime birth differs")),
+                "group mismatch" => Err(anyhow::anyhow!("managed runtime group differs")),
+                "permission denied" => Err(io_error(libc::EPERM)),
+                "other lookup failure" => Err(io_error(libc::EACCES)),
+                "lookup lost child ownership" => Err(io_error(libc::ECHILD)),
+                _ => Err(io_error(libc::ESRCH)),
+            };
+            let mut observations = vec![after, before];
+            let mut observed = 0;
+            let mut inspected = false;
+            let result = observe_anchored_exit(
+                || {
+                    observed += 1;
+                    observations.pop().unwrap()
+                },
+                || {
+                    inspected = true;
+                    inspection.context("inspect retained live child")
+                },
+            )
+            .and_then(AnchoredExit::require_observed);
+            match case {
+                "already exited" | "birth vanished during exit" | "group vanished during exit" => {
+                    assert_eq!(result.unwrap(), Some(status), "{case}");
+                }
+                "valid live child" => assert!(result.unwrap().is_none(), "{case}"),
+                _ => assert!(result.is_err(), "{case}"),
+            }
+            let retry = matches!(
+                case,
+                "birth vanished during exit"
+                    | "group vanished during exit"
+                    | "still live after ESRCH"
+                    | "reaped after ESRCH"
+                    | "uncertain after ESRCH"
+            );
+            assert_eq!(observed, if retry { 2 } else { 1 }, "{case}");
+            assert_eq!(
+                inspected,
+                !matches!(
+                    case,
+                    "already exited"
+                        | "initial child ownership lost"
+                        | "initial exit uncertain"
+                        | "initial ESRCH"
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_exit_preserves_the_signal_error_until_an_exit_is_observed() {
+        let status = ExitStatus::from_raw(15);
+        let mut events = [None, None, None, Some(status)].into_iter();
+        let mut sample = || {
+            observe_anchored_exit(
+                || Ok(events.next().unwrap()),
+                || {
+                    Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                        .context("inspect retained live child birth")
+                },
+            )
+            .unwrap()
+        };
+        let awaiting = sample();
+        assert!(matches!(&awaiting, AnchoredExit::AwaitingExit(_)));
+        let error = awaiting.require_observed().unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(format!("{error:#}").starts_with("inspect retained live child birth:"));
+        assert_eq!(sample().require_observed().unwrap(), Some(status));
+    }
+
+    #[test]
+    fn awaiting_exit_retains_the_record_and_anchor_across_forced_settlement_retries() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        // A synthetic absent PID makes any accidental signal path refuse.
+        let pid = libc::pid_t::MAX as u32;
+        let path = temp.path().join(format!("{pid}.json"));
+        let record = Record {
+            pid,
+            process_start: "macos:fixture:retained-anchor".into(),
+            coords_path: temp.path().join("child-coords.json"),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(file, &record).unwrap();
+        let mut entry = Pending {
+            path: path.clone(),
+            record,
+            anchored: true,
+            killed: false,
+        };
+        for force in [false, true, true] {
+            assert!(!settle_record_with_observer(&mut entry, force, |_| {
+                observe_anchored_exit(
+                    || Ok(None),
+                    || {
+                        Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                            .context("inspect retained live child birth")
+                    },
+                )
+            })
+            .unwrap());
+            assert!(entry.anchored);
+            assert!(!entry.killed);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                read_record(&path).unwrap().process_start,
+                entry.record.process_start
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anchored_exited_group_retires_after_kernel_hides_birth() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_published, owner) = fixture_owner(temp.path(), "gateway-fixture");
+        let child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut child =
+            StartingChild::new(child, Some(&owner), &temp.path().join("child-coords.json"))
+                .unwrap();
+        let path = child.record.clone().unwrap();
+        let record = read_record(&path).unwrap();
+        validate_record_birth(&record).unwrap();
+        assert!(direct_child_anchor(&record).unwrap());
+        let mut entry = Pending {
+            path: path.clone(),
+            record,
+            anchored: true,
+            killed: false,
+        };
+        let unrelated = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut unrelated =
+            StartingChild::new(unrelated, None, &temp.path().join("unrelated.json")).unwrap();
+        checked_signal(&entry.record, libc::SIGTERM).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_ownership::observe_exit(entry.record.pid)
+            .unwrap()
+            .is_none()
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // A new cleanup scan still refuses the now hidden birth identity.
+            assert!(shutdown(Some(owner)).await.is_err());
+            assert!(path.exists());
+        }
+        assert!(settle_record(&mut entry, true).unwrap());
+        assert!(!entry.anchored);
+        retire_record(entry).unwrap();
+        child.ready();
+        assert!(!path.exists());
+        assert!(unrelated.child.try_wait().unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn failed_identity_preserves_its_record_while_other_groups_are_drained() {
         let temp = tempfile::tempdir().unwrap();
@@ -563,18 +867,21 @@ mod tests {
         let valid_pid = valid.child.id();
         let valid_birth = process_start(valid_pid).unwrap();
         let valid_path = valid.record.clone().unwrap();
-        valid.ready();
-        assert!(shutdown_with_limits(
+        let shutdown_error = shutdown_with_limits(
             Some(owner.clone()),
             Duration::from_millis(20),
-            Duration::from_millis(500)
+            Duration::from_millis(500),
         )
         .await
-        .is_err());
+        .unwrap_err();
         assert!(foreign.child.try_wait().unwrap().is_none());
         assert!(foreign_path.exists());
-        assert!(!valid_path.exists());
+        assert!(
+            !valid_path.exists(),
+            "valid ownership record remains after cleanup: {shutdown_error:#}"
+        );
         assert!(process_ownership::generation_gone(valid_pid, &valid_birth).unwrap());
+        valid.ready();
         assert!(refuse_unreconciled_groups(temp.path()).is_err());
         foreign.child.kill().unwrap();
         foreign.child.wait().unwrap();
@@ -614,6 +921,103 @@ mod tests {
         assert!(!absent.exists());
         assert!(live.exists());
         assert!(refuse_unreconciled_groups(temp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn early_start_exit_keeps_cleanup_ownership_until_the_group_is_empty() {
+        for retained in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (_published, owner) = fixture_owner(temp.path(), "gateway-fixture");
+            let leader = Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut leader =
+                StartingChild::new(leader, Some(&owner), &temp.path().join("child-coords.json"))
+                    .unwrap();
+            let pid = leader.child.id();
+            let birth = process_start(pid).unwrap();
+            let record = leader.record.clone().unwrap();
+            let record_bytes = std::fs::read(&record).unwrap();
+            let mut helper = crate::api::server::HostHelperProcess {
+                name: "failed-start group helper",
+                child: Command::new("sleep")
+                    .arg("60")
+                    .process_group(pid as i32)
+                    .spawn()
+                    .unwrap(),
+            };
+            let helper_pid = helper.child.id();
+            let mut unrelated = crate::api::server::HostHelperProcess {
+                name: "unrelated failed-start fixture",
+                child: Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            };
+            leader.child.kill().unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let status = loop {
+                if let Some(status) = leader.observed_exit().unwrap() {
+                    break status;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert!(helper.child.try_wait().unwrap().is_none());
+            assert_eq!(leader.observed_exit().unwrap(), Some(status));
+            assert_eq!(leader.observed_exit().unwrap(), Some(status));
+            if retained {
+                // Reap our direct helper concurrently so cleanup can prove an
+                // empty group while its exited leader still reserves the PID.
+                let (started, running) = std::sync::mpsc::channel();
+                let reaper = std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                    while std::time::Instant::now() < deadline {
+                        if let Some(status) = helper.child.try_wait().unwrap() {
+                            return Some(status);
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // The helper's guard owns fixture cleanup if group drain fails.
+                    None
+                });
+                running.recv().unwrap();
+                drop(leader);
+                assert_eq!(
+                    reaper.join().unwrap().unwrap().signal(),
+                    Some(libc::SIGKILL)
+                );
+                assert!(!record.exists());
+                assert!(process_ownership::generation_gone(pid, &birth).unwrap());
+                assert!(process_ownership::group_descendants(pid)
+                    .unwrap()
+                    .is_empty());
+            } else {
+                // Loss of the direct-child anchor retains the ownership record.
+                assert_eq!(leader.child.try_wait().unwrap(), Some(status));
+                assert_eq!(
+                    leader.observed_exit().unwrap_err().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                drop(leader);
+                assert!(helper.child.try_wait().unwrap().is_none());
+                assert_eq!(std::fs::read(&record).unwrap(), record_bytes);
+                assert!(refuse_unreconciled_groups(temp.path()).is_err());
+                drop(helper);
+                shutdown(Some(owner)).await.unwrap();
+                assert!(!record.exists());
+            }
+            assert_eq!(unsafe { libc::kill(helper_pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            assert!(unrelated.child.try_wait().unwrap().is_none());
+        }
     }
 
     #[tokio::test]

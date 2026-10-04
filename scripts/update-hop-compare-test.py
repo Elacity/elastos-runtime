@@ -724,11 +724,127 @@ class CliFixtureTests(unittest.TestCase):
         with patch.object(Path, "lstat", foreign_owner), self.assertRaisesRegex(ValueError, "owned regular file"):
             observer.cli_state(self.manifest, home)
 
-    def admit(self):
+    def admit(self, local_rehearsal=None):
         with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature") as signatures:
-            admitted = observer.cli_admit(self.config)
+            admitted = observer.cli_admit(self.config, local_rehearsal)
             self.assertEqual(signatures.call_count, 3 * len(self.manifest["publications"]))
             return admitted
+
+    def local_fixture(self):
+        reference = "local-rehearsal:" + self.manifest["source"]["commit"] + ":UP-03-test"
+        self.manifest.update(proof_scope="local-rehearsal", reference=reference)
+        self.config["immutable"]["reference"] = reference
+        build = observer.cli_json(self.root / self.manifest["build"])
+        build.update(proof_scope="local-rehearsal", reference=reference)
+        for name in ("old", "new"):
+            self.manifest[name]["source"] = dict(self.manifest["source"])
+            build[name]["source"] = dict(self.manifest["source"])
+        self.manifest["build"] = self.add("local-build.json", build, cid=False)
+        self.freeze()
+        return reference
+
+    @contextlib.contextmanager
+    def local_environment(self):
+        source = dict(self.manifest["source"])
+        def git(argv, **kwargs):
+            if argv[1] == "status":
+                return ""
+            return source["commit" if argv[-1] == "HEAD" else "tree"] + "\n"
+        with patch.dict(observer.os.environ, {"CI": "", "GITHUB_ACTIONS": "", "ELASTOS_CI_FIXTURE_REFERENCE": "", "ELASTOS_CI_FIXTURE_SCOPE": ""}), \
+             patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
+             patch.object(observer.subprocess, "check_output", side_effect=git):
+            yield
+
+    def test_local_scope_requires_its_explicit_selector_and_preserves_all_refusals(self):
+        reference = self.local_fixture()
+        with self.local_environment():
+            with self.assertRaisesRegex(ValueError, "proof scope differs"):
+                self.admit()
+            self.assertEqual(self.admit(reference)["proof_scope"], "local-rehearsal")
+            with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature"):
+                receipt = observer.cli_inspect(self.config, reference)
+            self.assertEqual(receipt["reference"], reference)
+            self.assertEqual(receipt["retrieval_reference"], "")
+            for selector in receipt["selectors"].values():
+                self.assertEqual(selector["refusals"], list(observer.CLI_REFUSALS))
+            with self.assertRaisesRegex(ValueError, "scope or reference differs"):
+                self.admit(reference.replace("UP-03-test", "other-test"))
+
+    def test_local_selector_refuses_hosted_authority_dirty_source_and_candidate_substitution(self):
+        reference = self.local_fixture()
+        for variable, value, expected in (
+            ("CI", "true", "hosted CI authority"),
+            ("GITHUB_ACTIONS", "true", "hosted CI authority"),
+            ("ELASTOS_CI_FIXTURE_REFERENCE", "github-actions:test/repo:123", "artifact retrieval"),
+            ("ELASTOS_CI_FIXTURE_SCOPE", "production-positive", "proof scope differs"),
+            ("ELASTOS_CI_FIXTURE_SCOPE", "ci-rehearsal", "proof scope differs"),
+        ):
+            with self.subTest(variable=variable, value=value), self.local_environment(), patch.dict(observer.os.environ, {variable: value}), \
+                 self.assertRaisesRegex(ValueError, expected):
+                observer.cli_local_rehearsal(reference)
+        with self.local_environment():
+            with patch.object(observer.subprocess, "check_output", return_value=" M scripts/update-hop-compare.py\n"), \
+                 self.assertRaisesRegex(ValueError, "clean admitted source"):
+                observer.cli_local_rehearsal(reference)
+            with self.assertRaisesRegex(ValueError, "source commit differs"):
+                observer.cli_local_rehearsal(reference.replace("a" * 40, "c" * 40))
+            with patch.object(observer.sys, "platform", "linux"), self.assertRaisesRegex(ValueError, "native Mac"):
+                observer.cli_local_rehearsal(reference)
+            with self.assertRaisesRegex(ValueError, "exact source commit"):
+                observer.cli_local_rehearsal("local-rehearsal:short:fixture")
+
+    def test_local_fixture_refuses_scope_source_and_build_receipt_substitution(self):
+        reference = self.local_fixture()
+        with self.local_environment():
+            for scope in ("production-positive", "ci-rehearsal"):
+                self.manifest["proof_scope"] = scope
+                self.freeze()
+                with self.assertRaisesRegex(ValueError, "scope or reference differs"):
+                    self.admit(reference)
+            self.manifest["proof_scope"] = "local-rehearsal"
+            self.manifest["source"]["tree"] = "c" * 40
+            self.freeze()
+            with self.assertRaisesRegex(ValueError, "source tree differs"):
+                self.admit(reference)
+            self.manifest["source"]["tree"] = "b" * 40
+            self.manifest["old"]["source"]["commit"] = "c" * 40
+            self.freeze()
+            with self.assertRaisesRegex(ValueError, "compiled Runtime source differs"):
+                self.admit(reference)
+            self.manifest["old"]["source"] = dict(self.manifest["source"])
+            original = observer.cli_json(self.root / self.manifest["build"])
+            for field, value, expected in (
+                ("proof_scope", "ci-rehearsal", "hop proof scope"),
+                ("reference", reference + "-other", "local hop reference"),
+            ):
+                build = {**original, field: value}
+                self.manifest["build"] = self.add("substituted-build-" + field + ".json", build, cid=False)
+                self.freeze()
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.admit(reference)
+
+    def test_local_manifest_reference_cannot_be_relabelled_as_ci_proof(self):
+        self.local_fixture()
+        self.manifest["proof_scope"] = "ci-rehearsal"
+        self.freeze()
+        with patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_SCOPE": "ci-rehearsal"}), \
+             self.assertRaisesRegex(ValueError, "local fixture requires its explicit selector"):
+            self.admit()
+        self.positive()
+        self.manifest["reference"] = self.config["immutable"]["reference"] = "fixture:relabelled"
+        self.freeze()
+        with self.assertRaisesRegex(ValueError, "local build requires its explicit selector"):
+            self.admit()
+
+    def test_local_option_refuses_capacity_compare_and_non_cli_fixtures(self):
+        reference = "local-rehearsal:" + "a" * 40 + ":UP-03-test"
+        for operation, fixture in (("prepare-ci-disk", {}), ("compare", {}), ("inspect", {"mode": "comparison"}), ("run", {"mode": "comparison"})):
+            argv = ["observer", operation, str(self.root / "fixture.json"), "--local-rehearsal", reference]
+            with self.subTest(operation=operation), patch.object(observer.sys, "argv", argv), \
+                 patch.object(observer, "read", return_value=fixture), patch.object(observer.os, "umask"), patch.object(observer.signal, "signal"), \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(observer.main(), 2)
+            self.assertIn("local rehearsal applies only", stderr.getvalue())
 
     def positive(self):
         self.manifest["proof_scope"] = "production-positive"
@@ -1223,7 +1339,7 @@ class CliFixtureTests(unittest.TestCase):
         coords = observer.read(coords_path)
         sentinel = directory / "state/value"
         original = sentinel.read_bytes()
-        for refusal in ("readiness", "readiness nonzero CI", "readiness nonzero operator", "readiness missing CI log",
+        for refusal in ("readiness", "readiness nonzero CI", "readiness nonzero operator", "readiness nonzero local", "readiness missing CI log",
                         "owned group", "held lock", "listener", "user data", "live metadata", "shutdown metadata", "publisher"):
             with self.subTest(refusal=refusal):
                 running = True
@@ -1265,7 +1381,7 @@ class CliFixtureTests(unittest.TestCase):
                     manager.output = self.root
                     (self.root / "initial-home-start.stdout").write_bytes(b"fixture Home output")
                     (self.root / "initial-home-start.stderr").write_text("x" * 5000 + "\nprivate controller cause")
-                    manifest["proof_scope"] = "ci-rehearsal" if refusal.endswith("CI") else "production-positive"
+                    manifest["proof_scope"] = "ci-rehearsal" if refusal.endswith("CI") else "local-rehearsal" if refusal.endswith("local") else "production-positive"
                 if "missing" in refusal:
                     manager.output = self.root
                     for stream in ("stdout", "stderr"):
@@ -1318,6 +1434,15 @@ class CliFixtureTests(unittest.TestCase):
                 observer.cli_home_base(value, public=True)
 
     def test_generator_uses_explicit_disposable_keys_and_real_signature_admission(self):
+        self.assert_generated_signed_fixture()
+
+    def test_local_generator_binds_reference_and_keeps_key_support_and_signature_gates(self):
+        self.assert_generated_signed_fixture("local-rehearsal:" + "a" * 40 + ":UP-03-test")
+
+    def test_local_build_receipt_is_refused_by_ci_generation_and_keys_are_removed(self):
+        self.assert_generated_signed_fixture(foreign_build=True)
+
+    def assert_generated_signed_fixture(self, local_rehearsal=None, foreign_build=False):
         # Fake command delivery exercises generation; existing RFC 8032 test
         # signing supplies valid signatures to the actual installer verifier.
         # This proves observer admission only, and reports harness-self-test.
@@ -1331,6 +1456,10 @@ class CliFixtureTests(unittest.TestCase):
             "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
             "status": "passed", "cleanup": {"passed": True}, **{name: {"source": source, "version": version,
             "sha256": observer.digest(path), "version_environment": version} for name, path, version in (("old", native, "0.7.1"), ("new", next_runtime, "0.7.2"))}})
+        if local_rehearsal is not None or foreign_build:
+            build = observer.cli_json(build_receipt)
+            build.update(proof_scope="local-rehearsal", reference=local_rehearsal or "local-rehearsal:" + "a" * 40 + ":UP-03-test")
+            observer.write(build_receipt, build)
         support = self.qualified_home_support()
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
@@ -1364,10 +1493,25 @@ class CliFixtureTests(unittest.TestCase):
                 (repo / "blocks" / cid).write_bytes(block)
                 return subprocess.CompletedProcess(argv, 0, (cid + "\n").encode(), b"")
             return real_run(argv, **kwargs)
-        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+        environment = {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+        if local_rehearsal is not None:
+            environment.update(CI="", GITHUB_ACTIONS="", ELASTOS_CI_FIXTURE_REFERENCE="", ELASTOS_CI_FIXTURE_SCOPE="")
+        def git(argv, **kwargs):
+            return "" if argv[1] == "status" else "a" * 40 + "\n"
+        with patch.dict(observer.os.environ, environment), \
              patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
-             patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"):
-            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support)
+             patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", side_effect=git):
+            if foreign_build:
+                with self.assertRaisesRegex(ValueError, "hop build proof scope differs"):
+                    observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support)
+                self.assertTrue(key_paths)
+                self.assertTrue(all(not path.exists() for path in key_paths))
+                self.assertFalse((generated / "generator").exists())
+                return
+            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, local_rehearsal)
+        self.assertEqual(receipt["proof_scope"], "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal")
+        if local_rehearsal is not None:
+            self.assertEqual(receipt["reference"], local_rehearsal)
         self.assertTrue(receipt["keys_removed"])
         self.assertTrue(key_paths)
         self.assertTrue(all(not path.exists() for path in key_paths))
@@ -1375,6 +1519,10 @@ class CliFixtureTests(unittest.TestCase):
         generated_manifest = observer.cli_json(generated / "manifest.json")
         observer.cli_admit_model_fixture(generated, generated_manifest)
         model_fixture = generated_manifest["model_fixture"]
+        if local_rehearsal is not None:
+            self.assertTrue((generated / model_fixture["files"]["PROVENANCE.md"]).read_text().startswith("Owned local rehearsal fixture"))
+            config_path = generated / generated_manifest["consumer"]["files"]["config/fixture.json"]
+            self.assertEqual(observer.cli_json(config_path)["owner"], "isolated local rehearsal")
         catalogue_path = generated / generated_manifest["publications"]["old"]["catalogue"]
         original_catalogue = catalogue_path.read_bytes()
         for refusal in ("empty entries", "missing publication time", "closure digest", "missing package file", "holder CID"):
@@ -1434,14 +1582,24 @@ class CliFixtureTests(unittest.TestCase):
         observer.write(generated / "manifest.json", generated_manifest)
         config = observer.cli_json(generated / "fixture.json")
         config["immutable"]["sha256"] = observer.digest(generated / "manifest.json")
-        with patch.dict(observer.os.environ, {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": config["immutable"]["sha256"], "ELASTOS_CI_FIXTURE_REFERENCE": ""}):
-            self.assertEqual(observer.cli_admit(config)["proof_kind"], "harness-self-test")
+        admission_environment = {"ELASTOS_CI_FIXTURE_MANIFEST_SHA256": config["immutable"]["sha256"], "ELASTOS_CI_FIXTURE_REFERENCE": ""}
+        if local_rehearsal is not None:
+            admission_environment.update(CI="", GITHUB_ACTIONS="", ELASTOS_CI_FIXTURE_SCOPE="")
+        with patch.dict(observer.os.environ, admission_environment), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.subprocess, "check_output", side_effect=git):
+            self.assertEqual(observer.cli_admit(config, local_rehearsal)["proof_kind"], "harness-self-test")
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
             observer.cli_generate_hop(self.root / "generated", self.root / "missing", self.root / "missing", self.root / "missing", self.root)
 
     def test_hop_builder_preserves_n_and_compiles_n_plus_one_with_version_input(self):
+        self.assert_hop_builder()
+
+    def test_local_hop_builder_binds_clean_source_reference_and_native_versions(self):
+        self.assert_hop_builder("local-rehearsal:" + "a" * 40 + ":UP-03-test")
+
+    def assert_hop_builder(self, local_rehearsal=None):
         runtime = self.root / "built-runtime"
         header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         runtime.write_bytes(header + b"N")
@@ -1463,16 +1621,21 @@ class CliFixtureTests(unittest.TestCase):
             return {"exit": 0}
         def git(argv, **kwargs):
             return "" if argv[1] == "status" else "a" * 40 + "\n"
-        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+        environment = {"CI": "true", "GITHUB_ACTIONS": "true"}
+        if local_rehearsal is not None:
+            environment.update(CI="", GITHUB_ACTIONS="", ELASTOS_CI_FIXTURE_REFERENCE="", ELASTOS_CI_FIXTURE_SCOPE="")
+        with patch.dict(observer.os.environ, environment), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}):
-            receipt = observer.cli_build_hop(destination, runtime)
+            receipt = observer.cli_build_hop(destination, runtime, local_rehearsal)
         self.assertEqual(receipt["status"], "passed")
         self.assertEqual((destination / "elastos-old").read_bytes(), header + b"N")
         self.assertEqual((destination / "elastos-new").read_bytes(), header + b"N+1")
         self.assertEqual(receipt["new"]["version_environment"], "0.7.2")
         self.assertEqual(receipt["new"]["sha256"], observer.digest(destination / "elastos-new"))
         self.assertEqual(calls[1][0], receipt["command"])
+        if local_rehearsal is not None:
+            self.assertEqual((receipt["proof_scope"], receipt["reference"]), ("local-rehearsal", local_rehearsal))
 
     def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
         runtime = self.root / "built-runtime"
@@ -1514,7 +1677,8 @@ class CliFixtureTests(unittest.TestCase):
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
                  cleanup_error=False, holder_stderr="", holder_shutdown_stderr="", http_fallback=False,
-                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None):
+                 config_drift=False, user_data_drift=False, coordination_pid_drift=False, metadata_drift=None,
+                 apply_exit=0, local_rehearsal=None):
         manifest, root, calls, processes = self.manifest, self.root, [], []
         holder_data = root / "results/homes/holder" / observer.CLI_DATA
         bootstrap_calls = 0
@@ -1599,6 +1763,9 @@ class CliFixtureTests(unittest.TestCase):
                         lock.chmod(0o600)
                     elif args[-1] == "--check":
                         stdout = "Discovery: Carrier"
+                    elif apply_exit:
+                        self.returncode = apply_exit
+                        stdout, stderr = "Discovery: Carrier", apply_stderr
                     else:
                         current = observer.read(self.home / observer.CLI_DATA / "sources.json")["sources"][0]["installed_version"]
                         if current == manifest["new"]["version"]:
@@ -1658,8 +1825,49 @@ class CliFixtureTests(unittest.TestCase):
             opener = stack.enter_context(patch.object(observer.urllib.request, "build_opener"))
             opener.return_value.open.side_effect = bootstrap_response
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            code = observer.cli_run(self.config, self.root / "results")
+            code = observer.cli_run(self.config, self.root / "results", local_rehearsal)
         return code, calls, observer.read(self.root / "results/result.json")
+
+    def test_local_runner_keeps_full_hop_twelve_refusals_and_owned_cleanup(self):
+        reference = self.local_fixture()
+        self.manifest["initial_home"] = {"files": []}
+        self.freeze()
+        with self.local_environment(), patch.object(observer, "cli_initial_home", return_value={"status": "passed"}) as initial_home:
+            code, calls, result = self.fake_run(local_rehearsal=reference)
+        initial_home.assert_called_once()
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["paths"]["m1-install"]["checks"]["initial-home"]["status"], "passed")
+        self.assertEqual((result["proof_scope"], result["reference"], result["retrieval_reference"]), ("local-rehearsal", reference, ""))
+        self.assertEqual(len([argv for argv, _ in calls if argv[1:] == ["update", "--check"]]), 3)
+        for path in result["paths"].values():
+            for refusal in observer.CLI_REFUSALS:
+                self.assertEqual(path["checks"][refusal]["status"], "passed")
+        for refusal in ("wrong-signer-head-check", "wrong-signer-release-check"):
+            self.assertEqual(result["paths"]["m2-discovery"]["checks"][refusal]["status"], "passed")
+        self.assertTrue(result["cleanup"]["passed"])
+        self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+
+    def test_local_runner_keeps_failed_apply_detail_private(self):
+        reference = self.local_fixture()
+        stderr = "private local fixture error detail\n"
+        with self.local_environment():
+            code, _, result = self.fake_run(apply_exit=1, apply_stderr=stderr, local_rehearsal=reference)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failure"], "plain Carrier apply failed; command exit 1")
+        self.assertNotIn("private local", json.dumps(result))
+        self.assertEqual((self.root / "results/m2-apply.stderr").read_text(), stderr)
+        self.assertEqual((self.root / "results").stat().st_mode & 0o777, 0o700)
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_local_runner_source_change_fails_receipt_after_owned_cleanup(self):
+        reference = self.local_fixture()
+        with self.local_environment(), patch.object(observer, "cli_local_rehearsal", side_effect=ValueError("local rehearsal requires a clean admitted source")):
+            code, _, result = self.fake_run(local_rehearsal=reference)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("local rehearsal requires a clean admitted source", result["cleanup"]["errors"])
+        self.assertFalse(result["cleanup"]["passed"])
+        self.assertEqual(result["cleanup"]["remaining_pids"], [])
 
     def test_runner_registers_copied_native_support_before_initial_home_and_cleans_orphans(self):
         for name in ("ipfs-provider", "kubo"):
@@ -1730,6 +1938,9 @@ class CliFixtureTests(unittest.TestCase):
         code, _, result = self.fake_run(user_data_drift=True)
         self.assertEqual(code, 1)
         self.assertIn("config/data/support preservation differs", result["failure"])
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 0))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(b"").hexdigest())
         self.assertTrue(result["cleanup"]["passed"])
 
     def test_runner_rejects_substituted_legacy_metadata_before_update(self):
@@ -1822,6 +2033,63 @@ class CliFixtureTests(unittest.TestCase):
         code, _, result = self.fake_run(apply_stderr="ERROR ungraceful endpoint drop")
         self.assertEqual(code, 1)
         self.assertIn("Carrier apply failed", result["failure"])
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 0))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(b"ERROR ungraceful endpoint drop").hexdigest())
+
+    def test_failed_apply_retains_exact_reply_and_bounded_ci_diagnostic(self):
+        stderr = "discarded prefix\n" + "x" * 5000 + "\n\x1b[31mError: fixture apply refusal\x1b[0m\n"
+        code, calls, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
+        self.assertEqual(code, 1)
+        checks = result["paths"]["m2-discovery"]["checks"]
+        self.assertEqual(set(checks), {"check", "apply"})
+        self.assertEqual(checks["check"]["status"], "passed")
+        apply = checks["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 1))
+        owned = next(row for row in result["cleanup"]["owned_processes"] if row["pid"] == apply["pid"])
+        self.assertEqual(owned["exit"], 1)
+        self.assertGreaterEqual(apply["elapsed_ms"], 0)
+        self.assertEqual(apply["stdout_sha256"], hashlib.sha256(b"Discovery: Carrier").hexdigest())
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+        self.assertTrue(result["failure"].startswith("plain Carrier apply failed; command exit 1; CI m2-apply stderr: "))
+        self.assertTrue(result["failure"].endswith("Error: fixture apply refusal"))
+        self.assertNotIn("discarded prefix", result["failure"])
+        self.assertNotIn("\x1b", result["failure"])
+        self.assertLessEqual(len(result["failure"].split("; CI m2-apply stderr: ", 1)[1]), 1024)
+        self.assertEqual([argv[1:] for argv, _ in calls if argv[1] == "update"], [["update", "--check"], ["update"]])
+        self.assertEqual(observer.digest(self.root / "results/homes/cli/.local/bin/elastos"),
+                         self.manifest["files"][self.manifest["publications"]["old"]["binary"]]["sha256"])
+        self.assertTrue(result["cleanup"]["passed"])
+        self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
+
+    def test_failed_operator_apply_keeps_diagnostic_private_and_reply_available(self):
+        self.positive()
+        stderr = "private operator apply diagnostic\n"
+        code, _, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failure"], "plain Carrier apply failed; command exit 1")
+        self.assertNotIn("private operator", json.dumps(result))
+        apply = result["paths"]["m2-discovery"]["checks"]["apply"]
+        self.assertEqual((apply["status"], apply["exit"]), ("failed", 1))
+        self.assertEqual(apply["stderr_sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+        self.assertTrue(result["cleanup"]["passed"])
+
+    def test_apply_reply_survives_coordination_inspection_refusal(self):
+        inspect = observer.cli_coordination
+        def coordination(home_path, required=True):
+            if home_path.name == "cli" and (self.root / "results/m2-apply.stderr").exists():
+                raise ValueError("injected apply coordination refusal")
+            return inspect(home_path, required)
+        with patch.object(observer, "cli_coordination", side_effect=coordination):
+            code, _, result = self.fake_run()
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failure"], "injected apply coordination refusal")
+        checks = result["paths"]["m2-discovery"]["checks"]
+        self.assertEqual(checks["check"]["status"], "passed")
+        self.assertEqual((checks["apply"]["status"], checks["apply"]["exit"]), ("failed", 0))
+        self.assertEqual(checks["apply"]["stdout_sha256"], hashlib.sha256(b"Discovery: Carrier").hexdigest())
+        self.assertNotIn("m2-apply", result["coordination"])
+        self.assertTrue(result["cleanup"]["passed"])
 
     def test_cleanup_census_failure_keeps_result_failed(self):
         code, _, result = self.fake_run(cleanup_error=True)

@@ -111,10 +111,16 @@ impl RestartFixture {
 }
 
 fn old_bytes(id: ReleaseFile) -> Vec<u8> {
+    if id == ReleaseFile::Sources {
+        return br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.0"}]}"#.to_vec();
+    }
     format!("previous release {}", id.name()).into_bytes()
 }
 
 fn new_bytes(id: ReleaseFile) -> Vec<u8> {
+    if id == ReleaseFile::Sources {
+        return br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"fixture","installed_version":"0.7.1"}]}"#.to_vec();
+    }
     format!("candidate release {}", id.name()).into_bytes()
 }
 

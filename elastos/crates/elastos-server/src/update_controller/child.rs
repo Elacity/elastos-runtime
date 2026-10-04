@@ -195,7 +195,7 @@ pub(crate) fn observe_exit(pid: u32) -> io::Result<Option<ExitStatus>> {
     }
 }
 
-fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     if unsafe { libc::kill(-(pid as libc::pid_t), signal) } == 0 {
         return Ok(());
     }
@@ -399,7 +399,8 @@ pub(crate) fn group_descendants(leader: u32) -> io::Result<Vec<u32>> {
     if bytes < 0 || (bytes == 0 && io::Error::last_os_error().raw_os_error() != Some(0)) {
         return Err(io::Error::last_os_error());
     }
-    if bytes >= buffer_size || bytes as usize % std::mem::size_of::<libc::pid_t>() != 0 {
+    if bytes >= buffer_size || !(bytes as usize).is_multiple_of(std::mem::size_of::<libc::pid_t>())
+    {
         return Err(io::Error::other(
             "owned process group listing exceeded its bound",
         ));

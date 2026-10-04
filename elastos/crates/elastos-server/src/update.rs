@@ -1360,7 +1360,7 @@ async fn run_upgrade_with_restart(
             transaction.writer_guard(),
         )?;
         transaction.prepare(&files)?;
-        transaction.activate_artifacts_for_support()?;
+        let activation = transaction.activate_artifacts_for_support()?;
         println!("  Installed binary: {}", bin_path.display());
         println!("  Installed binary verified (version ✓)");
         println!(
@@ -1410,9 +1410,10 @@ async fn run_upgrade_with_restart(
                 std::process::id()
             ));
             let principal_root_receipt =
-                crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+                crate::api::auth_gateway::migrate_configured_principal_roots_for_update(
                     data_dir,
                     &principal_root_backup,
+                    &activation,
                 )?;
             println!(
                 "  Principal-root readiness: {} ({} object(s))",
