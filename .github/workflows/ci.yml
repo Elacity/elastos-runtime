@@ -178,6 +178,14 @@ jobs:
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
+      - name: require fresh lint build intermediates
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/lint-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
@@ -202,9 +210,8 @@ jobs:
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
-      # The three provider workspaces are release-built from cold on every
-      # run otherwise; with the cache restored, cargo only re-fingerprints
-      # the workspace members and reuses every dependency artifact.
+      # Provider outputs keep the paths used by the process tests. Fresh
+      # intermediates below bind their builds to this job's source tree.
       - name: restore provider build artifacts
         id: providers-cache
         if: env.CI_USE_CACHE == 'true'
@@ -217,6 +224,14 @@ jobs:
           key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             providers-bd-target-${{ runner.os }}-
+      - name: require fresh Runtime test build intermediates
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/test-elastos-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -391,6 +406,18 @@ jobs:
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
         uses: docker/setup-buildx-action@v3
+      - name: require fresh custody build intermediates
+        if: steps.should-run.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/custody-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+      - name: build current custody host Runtime
+        if: steps.should-run.outputs.run == 'true'
+        run: cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
       # Pre-warms the custody-host image's BuildKit layer cache via the GHA
       # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
       # own `docker compose up -d --build` expects it -- that later build
@@ -459,6 +486,14 @@ jobs:
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
+      - name: require fresh Linux source-home build intermediates
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/source-home-linux-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
@@ -569,6 +604,17 @@ jobs:
       - name: reserve hosted Mac build and fixture capacity
         timeout-minutes: 10
         run: python3 scripts/update-hop-compare.py prepare-ci-disk
+      - name: require fresh Mac build intermediates
+        run: |
+          set -euo pipefail
+          # Cargo 1.91 stores fingerprints here. Start outside the restored
+          # cache, then share intermediates across this source tree's N/N+1.
+          directory="$RUNNER_TEMP/source-home-macos-build"
+          test ! -e "$directory"
+          test ! -L "$directory"
+          mkdir -m 700 "$directory"
+          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          echo "CI_MAC_BUILD_DIR_FRESH=true" >> "$GITHUB_ENV"
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup
@@ -626,6 +672,18 @@ jobs:
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
             --runtime "$PWD/elastos/target/release/elastos"
+          python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
+          import json, os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          build = json.loads(path.read_text())
+          directory = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
+          assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'
+          assert directory.is_dir() and not directory.is_symlink()
+          assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'
+          build['intermediates'] = {'directory': str(directory), 'initially_absent': True,
+                                    'source': build['source']}
+          path.write_text(json.dumps(build, indent=2) + '\n')
+          PY
       - name: generate disposable signed install and update fixture
         timeout-minutes: 5
         run: |
