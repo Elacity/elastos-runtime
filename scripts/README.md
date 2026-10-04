@@ -114,9 +114,11 @@ repository package or crate names in that profile, including matches from other
 resolved graphs. Artifacts with distinct package names and distinct normalized
 crate names, plus registry source/download caches, stay preserved. Prepared
 process providers receive the same package-scoped clean in the release profile
-before their builds. A package or crate-name collision with an external
-dependency in the current resolved graph
-stops the gate before cleaning that scope.
+before their builds. An external dependency package-name collision, or a
+normalized crate-name collision with its library or proc-macro target, stops
+the gate before cleaning that scope. This check uses the current resolved
+graph. Declared foreign tests, examples, benches and ordinary binaries are
+outside the dependency compile graph and its target-name collision check.
 
 Full metadata resolution keeps committed workspace locks fixed with `--locked`.
 Ignored generated locks follow normal online Cargo resolution and can update

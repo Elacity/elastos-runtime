@@ -132,6 +132,7 @@ class PrepushTests(unittest.TestCase):
                     packages = [package(os.environ.get("PREPUSH_PACKAGE", "server"), workspace / "crates/server", ["lib", "bin"]),
                                 package("other", workspace / "crates/other", ["lib"]),
                                 package("common", workspace / "crates/common", ["lib"])]
+                    packages[0]["targets"].extend(json.loads(os.environ.get("PREPUSH_LOCAL_TARGETS", "[]")))
                 else:
                     packages = [package(workspace.name, workspace, ["cdylib" if workspace.name == "chat-room-ui" else "bin"])]
                 members = [p["id"] for p in packages]
@@ -216,6 +217,11 @@ class PrepushTests(unittest.TestCase):
                 "manifest_path": str(folder / "Cargo.toml"), "dependencies": [],
                 "targets": [{"name": target or name, "kind": [kind], "test": True,
                              "src_path": str(folder / "src/lib.rs")}]}
+
+    def local_test_targets(self):
+        return [{"name": name, "kind": ["test"], "crate_types": ["bin"], "test": True,
+                 "src_path": str(self.root / "elastos/crates/server/tests" / (name + ".rs"))}
+                for name in ("integration", "smoke")]
 
     def push_line(self, ref="refs/heads/fix/fixture", oid=None, remote="refs/heads/fix/fixture"):
         return "{} {} {} {}\n".format(ref, oid or self.git("rev-parse", "HEAD"), remote, "0" * 40)
@@ -694,10 +700,11 @@ class PrepushTests(unittest.TestCase):
         self.assertTrue(all(c["args"][-1] == str(Path(c["cwd"]) / "Cargo.toml") for c in resolved))
 
     def test_registry_and_git_package_name_collisions_refuse_before_clean(self):
-        for source in ("registry+fixture", "git+fixture"):
-            with self.subTest(source=source):
+        for source, kind in (("registry+fixture", "lib"), ("git+fixture", "lib"),
+                             ("registry+fixture", "custom-build")):
+            with self.subTest(source=source, kind=kind):
                 self.log.unlink(missing_ok=True)
-                foreign = self.dependency_package("server", source, target="foreign_target")
+                foreign = self.dependency_package("server", source, target="foreign_target", kind=kind)
                 result = self.invoke(extra={"PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
                 self.assert_stopped(result, "clean collides with external artifact names: server")
                 self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
@@ -711,6 +718,37 @@ class PrepushTests(unittest.TestCase):
                 result = self.invoke(extra={"PREPUSH_PACKAGE": "server-probe",
                                             "PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
                 self.assert_stopped(result, "clean collides with external artifact names: server_probe")
+                self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                                     for c in self.commands()))
+
+    def test_inactive_foreign_targets_do_not_collide_with_local_test_names(self):
+        # Registry metadata includes a distinct dependency library as well as
+        # integration/smoke test executables with crate_types=[bin]. The target
+        # kind, not crate_types, distinguishes those inactive package targets.
+        foreign = []
+        for kind in ("test", "example", "bench", "bin"):
+            package = self.dependency_package("foreign-" + kind, "registry+fixture")
+            package["targets"].extend(
+                {"name": name, "kind": [kind], "crate_types": ["bin"], "test": True,
+                 "src_path": str(self.tmp / "dependencies" / ("foreign-" + kind) / (name + ".rs"))}
+                for name in ("integration", "smoke"))
+            foreign.append(package)
+        result = self.invoke(extra={"PREPUSH_LOCAL_TARGETS": json.dumps(self.local_test_targets()),
+                                    "PREPUSH_DEPENDENCY_PACKAGES": json.dumps(foreign)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clean, = [c for c in self.commands() if c["args"][0] == "clean"]
+        self.assertEqual(clean["args"], ["clean", "--locked", "--offline", "-p", "common", "-p", "other", "-p", "server"])
+        self.assertTrue(any(c["args"][0] == "check" for c in self.commands()))
+
+    def test_active_foreign_library_collides_with_local_test_names(self):
+        for kind, name in (("lib", "integration"), ("proc-macro", "smoke")):
+            with self.subTest(kind=kind, name=name):
+                self.log.unlink(missing_ok=True)
+                foreign = self.dependency_package("foreign-library", "registry+fixture", target=name, kind=kind)
+                foreign["targets"][0]["crate_types"] = [kind]
+                result = self.invoke(extra={"PREPUSH_LOCAL_TARGETS": json.dumps(self.local_test_targets()),
+                                            "PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
+                self.assert_stopped(result, "clean collides with external artifact names: " + name)
                 self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
                                      for c in self.commands()))
 

@@ -179,11 +179,15 @@ def clean_repository_packages(root, workspace, lease, release=False):
         raise GateError("repository package clean has an empty scope: " + str(workspace))
     # Cargo clean removes artifacts by package and crate-name globs, including
     # all hashes. A qualified package ID cannot narrow those removal patterns.
-    def target_names(packages):
+    def target_names(packages, kinds=None):
         return {target["name"].replace("-", "_") for package in packages
-                for target in package["targets"] if "custom-build" not in target["kind"]}
+                for target in package["targets"] if "custom-build" not in target["kind"] and
+                (kinds is None or kinds.intersection(target["kind"]))}
     collisions = names.intersection(package["name"] for package in foreign)
-    collisions.update(target_names(local).intersection(target_names(foreign)))
+    # Ordinary dependencies build library/proc-macro targets. Their declared
+    # tests, examples, benches and binaries are outside this dependency graph.
+    dependency_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+    collisions.update(target_names(local).intersection(target_names(foreign, dependency_kinds)))
     if collisions:
         raise GateError("repository package clean collides with external artifact names: " +
                         ", ".join(sorted(collisions)))
