@@ -932,6 +932,8 @@ class CliFixtureTests(unittest.TestCase):
         for name, provides in (("ipfs-provider", "elastos://ipfs/*"), ("localhost-provider", "localhost://*")):
             registry["external"][name]["provider_runtime"] = {"role": "provider", "substrate": "native",
                 "runtime_abi": "elastos.provider-stdio/v1", "execution": "native-provider", "provides": provides}
+        registry["external"]["home"] = {"install_path": "capsules/home", "description": "Qualified source Home",
+            "platforms": {"*": {"release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home"}}}
         observer.write(support / "components.json", registry)
         return support
 
@@ -952,6 +954,7 @@ class CliFixtureTests(unittest.TestCase):
         components = observer.cli_json(components_path)
         components["capsules"]["home"] = entry
         qualified = observer.cli_json(support / "components.json")
+        components["external"]["home"] = qualified["external"]["home"]
         for name in ("ipfs-provider", "kubo", "localhost-provider"):
             native = self.manifest["files"][mapping["bin/" + name]]
             selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/" + name}
@@ -1048,6 +1051,57 @@ class CliFixtureTests(unittest.TestCase):
                         changed["preserve"]["support"].remove(target)
                     with self.assertRaisesRegex(ValueError, "support.*incomplete|signed native Home support"):
                         observer.cli_admit_home_support(self.root, changed)
+
+    def test_home_qualification_and_admission_match_activation_resolution_and_refusals(self):
+        self.initial_home_fixture()
+        for scope, path in (("qualified", self.root / "support/components.json"),
+                            ("signed", self.root / self.manifest["publications"]["old"]["components"])):
+            original = path.read_bytes()
+            for case, accepted in (("missing", False), ("substituted", False), ("wrong component path", False),
+                                   ("wrong selected path", False), ("missing platform", False),
+                                   ("alias conflicts with wildcard", False), ("alias precedes wildcard", True),
+                                   ("direct precedes alias", True), ("direct refusal precedes alias", False),
+                                   ("null path uses component", True), ("empty path", False)):
+                with self.subTest(scope=scope, case=case):
+                    registry = json.loads(original)
+                    if case == "missing":
+                        del registry["external"]["home"]
+                    elif case == "substituted":
+                        registry["external"]["home"] = registry["external"]["localhost-provider"]
+                    elif case == "wrong component path":
+                        registry["external"]["home"]["install_path"] = "capsules/sibling"
+                        del registry["external"]["home"]["platforms"]["*"]["install_path"]
+                    elif case == "wrong selected path":
+                        registry["external"]["home"]["platforms"]["*"]["install_path"] = "capsules/sibling"
+                    elif case == "missing platform":
+                        registry["external"]["home"]["platforms"] = {}
+                    else:
+                        platforms = registry["external"]["home"]["platforms"]
+                        if case == "alias conflicts with wildcard":
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/sibling"}
+                        elif case == "alias precedes wildcard":
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/home"}
+                            platforms["*"]["install_path"] = "capsules/sibling"
+                        elif case == "direct precedes alias":
+                            platforms["darwin-arm64"] = {"install_path": "capsules/home"}
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/sibling"}
+                        elif case == "direct refusal precedes alias":
+                            platforms["darwin-arm64"] = {"install_path": "capsules/sibling"}
+                            platforms["aarch64-darwin"] = {"install_path": "capsules/home"}
+                        else:
+                            platforms["*"]["install_path"] = None if case == "null path uses component" else ""
+                    observer.write(path, registry)
+                    def admit():
+                        if scope == "qualified":
+                            return observer.cli_qualified_home(self.root / "support", "darwin-arm64")
+                        return observer.cli_admit_home_support(self.root, self.manifest)
+                    if accepted:
+                        admit()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Home activation binding"):
+                            admit()
+            path.write_bytes(original)
+        observer.cli_admit_home_support(self.root, self.manifest)
 
     def test_initial_home_snapshot_preserves_ipfs_provider_and_kubo_bytes(self):
         home, directory, _, _, _, _, _ = self.initial_home_fixture()
@@ -1347,6 +1401,14 @@ class CliFixtureTests(unittest.TestCase):
         qualified = observer.cli_json(support / "components.json")
         consumer_data = generated / "copied-consumer" / observer.CLI_DATA
         observer.cli_copy(generated, generated_manifest, generated_manifest["consumer"]["files"], consumer_data)
+        self.assertEqual(components["external"]["home"], qualified["external"]["home"])
+        home_activation = observer.cli_home_activation_descriptor(components, "darwin-arm64")
+        active_home = consumer_data / home_activation["platforms"]["*"]["install_path"]
+        self.assertTrue(active_home.is_dir())
+        copied_home = observer.cli_json(active_home / "capsule.json")
+        self.assertEqual(copied_home["name"], "home")
+        self.assertEqual(observer.digest(active_home / copied_home["entrypoint"]),
+                         components["capsules"]["home"]["entrypoint_sha256"].removeprefix("sha256:"))
         for name in ("ipfs-provider", "kubo", "localhost-provider"):
             target = "bin/" + name
             relative = generated_manifest["consumer"]["files"][target]
