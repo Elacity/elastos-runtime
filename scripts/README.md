@@ -105,6 +105,17 @@ heavy tools in that group rather than detaching them. Continue light source work
 owns the lease. The default shared intermediate directory is `target-build`
 beside the common Git directory. An explicit `CARGO_BUILD_BUILD_DIR` selects
 another shared directory; each workspace keeps its own final target directory.
+The gate sets both Cargo target-directory environment variables to that
+workspace's `target` directory. Before compile checks, it cleans the complete
+resolved repository path-package scope with `cargo clean -p`, retaining the
+shared directory. The caller-selected directory is the repository's rebuildable
+intermediate cache. Each clean removes all compiled artifacts with the selected
+repository package or crate names in that profile, including matches from other
+resolved graphs. Artifacts with distinct names and registry source/download
+caches stay preserved. Prepared process providers receive the same
+package-scoped clean in the release profile before their builds. A package or
+crate-name collision with an external dependency in the current resolved graph
+stops the gate before cleaning that scope.
 The source and shared-build volumes each need at least 15% free space for this gate.
 
 If the cause of your last failed Mac install, update, or Home startup step is

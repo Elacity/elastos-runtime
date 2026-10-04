@@ -27,6 +27,10 @@ def run(args, cwd, capture=False, lease=None):
         disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
     print("+ " + shlex.join(str(arg) for arg in args), flush=True)
     environment = os.environ.copy()
+    if args[0] == "cargo":
+        target = str(Path(cwd).resolve() / "target")
+        environment["CARGO_TARGET_DIR"] = target
+        environment["CARGO_BUILD_TARGET_DIR"] = target
     if args[0] != "git":
         for name in GIT_LOCAL_ENV_VARS:
             environment.pop(name, None)
@@ -142,9 +146,41 @@ def metadata(root, manifest, lease):
     value = json.loads(run([
         "cargo", "metadata", "--no-deps", "--offline", "--format-version", "1",
         "--manifest-path", str(manifest),
-    ], root, capture=True, lease=lease))
+    ], manifest.parent, capture=True, lease=lease))
     members = set(value["workspace_members"])
     return Path(value["workspace_root"]), [p for p in value["packages"] if p["id"] in members]
+
+
+def clean_repository_packages(root, workspace, lease, release=False):
+    # A shared build dir can treat older worktree sources as fresh. Refresh
+    # every resolved repository package while retaining external dependencies.
+    value = json.loads(run([
+        "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+        "--manifest-path", str(workspace / "Cargo.toml"),
+    ], workspace, capture=True, lease=lease))
+    local = [package for package in value["packages"]
+             if package.get("source") is None and
+             Path(package["manifest_path"]).resolve().is_relative_to(root.resolve())]
+    foreign = [package for package in value["packages"] if package not in local]
+    names = {package["name"] for package in local}
+    if not names:
+        raise GateError("repository package clean has an empty scope: " + str(workspace))
+    # Cargo clean removes artifacts by package and crate-name globs, including
+    # all hashes. A qualified package ID cannot narrow those removal patterns.
+    def target_names(packages):
+        return {target["name"].replace("-", "_") for package in packages
+                for target in package["targets"] if "custom-build" not in target["kind"]}
+    collisions = names.intersection(package["name"] for package in foreign)
+    collisions.update(target_names(local).intersection(target_names(foreign)))
+    if collisions:
+        raise GateError("repository package clean collides with external artifact names: " +
+                        ", ".join(sorted(collisions)))
+    args = ["cargo", "clean", "--locked", "--offline"]
+    if release:
+        args.append("--release")
+    for name in sorted(names):
+        args.extend(["-p", name])
+    run(args, workspace, lease=lease)
 
 
 def referenced_inputs(root, source, folder, files, directories):
@@ -390,6 +426,8 @@ def prepare_process_providers(root, lease):
         "ELASTOS_TEST_DECRYPT_PROVIDER_BIN": "protected-content-decrypt-provider",
         "ELASTOS_TEST_CUSTODY_PROVIDER_BIN": "custody-provider",
     }
+    for name in providers.values():
+        clean_repository_packages(root, root / "capsules" / name, lease, release=True)
     for variable, name in providers.items():
         folder = root / "capsules" / name
         run(["cargo", "build", "--release", "--target-dir", "target"], folder, lease=lease)
@@ -449,6 +487,8 @@ def gates(root, paths, lease):
     formats = {root / "elastos", root / "capsules/chain-provider", *workspaces}
     for workspace in sorted(formats):
         run(["cargo", "fmt", "--all", "--", "--check"], workspace, lease=lease)
+    for workspace in sorted(workspaces):
+        clean_repository_packages(root, workspace, lease)
     for workspace, packages in sorted(workspaces.items()):
         run(["cargo", "check", "--workspace", "--all-targets"], workspace, lease=lease)
         if packages:

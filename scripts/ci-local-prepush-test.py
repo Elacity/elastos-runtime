@@ -81,6 +81,8 @@ class PrepushTests(unittest.TestCase):
             with open(os.environ["PREPUSH_LOG"], "a") as log:
                 log.write(json.dumps({"tool": pathlib.Path(sys.argv[0]).name, "args": args,
                                       "cwd": os.getcwd(), "build_dir": os.environ.get("CARGO_BUILD_BUILD_DIR"),
+                                      "target_dir": os.environ.get("CARGO_TARGET_DIR"),
+                                      "build_target_dir": os.environ.get("CARGO_BUILD_TARGET_DIR"),
                                       "git_env": [k for k in os.environ if k.startswith("GIT_")],
                                       "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
             if pathlib.Path(sys.argv[0]).name == "node":
@@ -106,7 +108,8 @@ class PrepushTests(unittest.TestCase):
                         dependency = {"path": dependency} if isinstance(dependency, str) else dependency.copy()
                         dependency["path"] = str(root / dependency["path"])
                         dependencies.append(dependency)
-                    return {"id": name, "name": name, "manifest_path": str(folder / "Cargo.toml"),
+                    return {"id": name, "name": name, "source": None,
+                            "manifest_path": str(folder / "Cargo.toml"),
                             "dependencies": dependencies,
                             "targets": [{"kind": [kind], "name": name, "test": True,
                                          "src_path": str(folder / "src" / ("main.rs" if kind == "bin" else "lib.rs"))} for kind in kinds]}
@@ -116,7 +119,22 @@ class PrepushTests(unittest.TestCase):
                                 package("common", workspace / "crates/common", ["lib"])]
                 else:
                     packages = [package(workspace.name, workspace, ["cdylib" if workspace.name == "chat-room-ui" else "bin"])]
-                print(json.dumps({"workspace_root": str(workspace), "workspace_members": [p["id"] for p in packages],
+                members = [p["id"] for p in packages]
+                if "--no-deps" not in args:
+                    seen = {pathlib.Path(p["manifest_path"]).parent for p in packages}
+                    pending = list(packages)
+                    while pending:
+                        for dependency in pending.pop()["dependencies"]:
+                            folder = pathlib.Path(dependency["path"])
+                            if folder in seen or not folder.is_relative_to(root):
+                                continue
+                            seen.add(folder)
+                            name = os.environ.get("PREPUSH_PACKAGE", "server") if folder == root / "elastos/crates/server" else folder.name
+                            value = package(name, folder, ["lib"] if folder.is_relative_to(root / "elastos/crates") else ["bin"])
+                            packages.append(value)
+                            pending.append(value)
+                    packages.extend(json.loads(os.environ.get("PREPUSH_DEPENDENCY_PACKAGES", "[]")))
+                print(json.dumps({"workspace_root": str(workspace), "workspace_members": members,
                                   "packages": packages}))
             elif args[0] == "check":
                 if os.environ.get("PREPUSH_PRODUCT_SENTINEL"):
@@ -176,6 +194,13 @@ class PrepushTests(unittest.TestCase):
 
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def dependency_package(self, name, source, folder=None, target=None, kind="lib"):
+        folder = folder or self.tmp / "dependencies" / name
+        return {"id": (source or "path") + "#" + name, "name": name, "source": source,
+                "manifest_path": str(folder / "Cargo.toml"), "dependencies": [],
+                "targets": [{"name": target or name, "kind": [kind], "test": True,
+                             "src_path": str(folder / "src/lib.rs")}]}
 
     def push_line(self, ref="refs/heads/fix/fixture", oid=None, remote="refs/heads/fix/fixture"):
         return "{} {} {} {}\n".format(ref, oid or self.git("rev-parse", "HEAD"), remote, "0" * 40)
@@ -305,8 +330,9 @@ class PrepushTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         metadata = [c for c in self.commands() if c["args"][0] == "metadata"]
-        self.assertEqual(len(metadata), 1)
-        self.assertEqual(metadata[0]["args"][-1], str(self.root / "elastos/Cargo.toml"))
+        self.assertEqual(len(metadata), 2)
+        self.assertTrue(all(c["args"][-1] == str(self.root / "elastos/Cargo.toml") for c in metadata))
+        self.assertEqual(sum("--no-deps" in c["args"] for c in metadata), 1)
 
     def test_shared_runtime_input_seeds_all_members(self):
         self.git("reset", "--hard", "HEAD~1")
@@ -620,6 +646,87 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(self.invoke(extra={"CARGO_BUILD_BUILD_DIR": "../shared"}).returncode, 0)
         self.assertTrue(all(c["build_dir"] == str(self.tmp / "shared") for c in self.commands()))
 
+    def test_repository_clean_covers_all_members_and_forward_path_dependencies(self):
+        self.write("capsules/chain-provider/src/main.rs", "// changed\n")
+        self.commit()
+        graph = {"elastos/crates/server": ["capsules/custody-provider"],
+                 "capsules/custody-provider": ["capsules/chain-provider"],
+                 "capsules/chain-provider": ["elastos/crates/common"]}
+        foreign = [self.dependency_package("server-extension", "registry+fixture"),
+                   self.dependency_package("git-library", "git+fixture"),
+                   self.dependency_package("external-library", None),
+                   self.dependency_package("registry-library", "registry+fixture", self.root / "vendor/registry-library")]
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph),
+                                    "PREPUSH_DEPENDENCY_PACKAGES": json.dumps(foreign)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands()
+        cleans = [c for c in commands if c["args"][0] == "clean"]
+        self.assertEqual(len(cleans), 2)
+        by_workspace = {c["cwd"]: c["args"] for c in cleans}
+        self.assertEqual(by_workspace[str(self.root / "elastos")],
+                         ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common",
+                          "-p", "custody-provider", "-p", "other", "-p", "server"])
+        self.assertEqual(by_workspace[str(self.root / "capsules/chain-provider")],
+                         ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common"])
+        first_build = next(index for index, c in enumerate(commands)
+                           if c["args"][0] in {"check", "clippy", "test", "build"})
+        self.assertTrue(all(commands.index(c) < first_build for c in cleans))
+        resolved = [c for c in commands if c["args"][0] == "metadata" and "--no-deps" not in c["args"]]
+        self.assertEqual(len(resolved), 2)
+        self.assertTrue(all("--locked" in c["args"] and "--offline" in c["args"] for c in resolved))
+        self.assertTrue(all(c["args"][-1] == str(Path(c["cwd"]) / "Cargo.toml") for c in resolved))
+
+    def test_registry_and_git_package_name_collisions_refuse_before_clean(self):
+        for source in ("registry+fixture", "git+fixture"):
+            with self.subTest(source=source):
+                self.log.unlink(missing_ok=True)
+                foreign = self.dependency_package("server", source, target="foreign_target")
+                result = self.invoke(extra={"PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
+                self.assert_stopped(result, "clean collides with external artifact names: server")
+                self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                                     for c in self.commands()))
+
+    def test_foreign_normalized_target_collisions_refuse_before_clean(self):
+        for source in ("registry+fixture", None):
+            with self.subTest(source=source):
+                self.log.unlink(missing_ok=True)
+                foreign = self.dependency_package("foreign-library", source, target="server_probe")
+                result = self.invoke(extra={"PREPUSH_PACKAGE": "server-probe",
+                                            "PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
+                self.assert_stopped(result, "clean collides with external artifact names: server_probe")
+                self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                                     for c in self.commands()))
+
+    def test_foreign_custom_build_target_does_not_collide_with_local_target(self):
+        foreign = self.dependency_package("foreign-library", "registry+fixture", target="server", kind="custom-build")
+        result = self.invoke(extra={"PREPUSH_DEPENDENCY_PACKAGES": json.dumps([foreign])})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clean, = [c for c in self.commands() if c["args"][0] == "clean"]
+        self.assertEqual(clean["args"], ["clean", "--locked", "--offline", "-p", "common", "-p", "other", "-p", "server"])
+
+    def test_empty_repository_clean_scope_refuses_before_clean_command(self):
+        foreign = self.dependency_package("external-library", None)
+        with mock.patch.object(GATE, "run", return_value=json.dumps({"packages": [foreign]})) as run:
+            with self.assertRaisesRegex(GATE.GateError, "empty scope"):
+                GATE.clean_repository_packages(self.root, self.root / "elastos", None)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][1], "metadata")
+
+    def test_inherited_output_directories_are_overridden_for_each_workspace(self):
+        self.write("capsules/chain-provider/src/main.rs", "// changed\n")
+        self.commit()
+        shared = str(self.tmp / "shared-intermediates")
+        result = self.invoke(extra={"CARGO_BUILD_BUILD_DIR": shared,
+                                    "CARGO_TARGET_DIR": str(self.tmp / "global-output"),
+                                    "CARGO_BUILD_TARGET_DIR": str(self.tmp / "other-global-output")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cargo = [c for c in self.commands() if c["tool"] == "cargo"]
+        self.assertGreaterEqual(len({c["cwd"] for c in cargo}), 2)
+        for command in cargo:
+            self.assertEqual(command["target_dir"], str(Path(command["cwd"]) / "target"))
+            self.assertEqual(command["build_target_dir"], command["target_dir"])
+            self.assertEqual(command["build_dir"], shared)
+
     def test_cdylib_units_and_unknown_module_fallback(self):
         self.write("capsules/chat-room-ui/src/lib.rs", "// changed\n")
         self.write("elastos/crates/server/src/helpers.rs", "// ambiguous test owner\n")
@@ -633,7 +740,11 @@ class PrepushTests(unittest.TestCase):
     def test_full_server_units_prepare_candidate_process_providers(self):
         self.write("elastos/crates/server/src/lib.rs", "// changed crate root\n")
         self.commit()
+        providers = ("protected-content-protect-provider", "protected-content-decrypt-provider", "custody-provider")
+        graph = {"capsules/" + name: ["elastos/crates/common"] for name in providers}
+        graph["elastos/crates/common"] = ["elastos/crates/other"]
         result = self.invoke(extra={"PREPUSH_PACKAGE": "elastos-server",
+                                    "PREPUSH_GRAPH": json.dumps(graph),
                                     "PREPUSH_TESTS": "protected_content_runtime::tests::process: test",
                                     "ELASTOS_TEST_PROTECT_PROVIDER_BIN": str(self.tmp / "stale"),
                                     "ELASTOS_TEST_UNRELATED_BIN": str(self.tmp / "ambient")})
@@ -642,6 +753,15 @@ class PrepushTests(unittest.TestCase):
         builds = [c for c in commands if c["args"][0] == "build"]
         self.assertEqual(len(builds), 3)
         self.assertTrue(all(c["args"] == ["build", "--release", "--target-dir", "target"] for c in builds))
+        cleans = [c for c in commands if c["args"][0] == "clean" and "--release" in c["args"]]
+        self.assertEqual({c["cwd"] for c in cleans}, {str(self.root / "capsules" / name) for name in providers})
+        self.assertEqual(len(cleans), 3)
+        self.assertTrue(all(commands.index(c) < commands.index(builds[0]) for c in cleans))
+        for clean in cleans:
+            expected = ["clean", "--locked", "--offline", "--release"]
+            for name in sorted({Path(clean["cwd"]).name, "common", "other"}):
+                expected.extend(["-p", name])
+            self.assertEqual(clean["args"], expected)
         tests = [c for c in commands if c["args"][0] == "test" and "--list" not in c["args"]]
         self.assertTrue(all(len(c["provider_env"]) == 3 for c in tests))
         self.assertTrue(all(str(self.root / "capsules") in path for c in tests for path in c["provider_env"].values()))
