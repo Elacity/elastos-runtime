@@ -12,6 +12,12 @@ separate artifact identities and verification records.
 
 The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
 
+The staged release root DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Before a staged
+install, compare this DID with the `MAINTAINER_DID` value in the frozen installer.
+Promotion to the live installer requires staged install and update acceptance
+and operator approval.
+
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```

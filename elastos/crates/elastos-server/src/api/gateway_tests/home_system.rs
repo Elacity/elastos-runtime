@@ -656,9 +656,263 @@ async fn test_home_entry_rejects_path_traversal() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn test_home_cli_terminal_delayed_body_policy_switch_refuses_spawn() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("terminal-started");
+    let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
+    let _args = EnvRestore::set(
+        "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+        serde_json::json!([
+            "-c",
+            "printf started > \"$1\"; exec sleep 30",
+            "terminal-policy-fixture",
+            marker.to_str().unwrap()
+        ])
+        .to_string(),
+    );
+    for enable_registration in [false, true] {
+        for route in [
+            "sessions",
+            "sessions/missing/resize",
+            "sessions/missing/intent",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = passkey_authority(dir.path());
+            std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+            let app = gateway_router(test_state(dir.path()));
+            let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+            let (reading_tx, reading_rx) = tokio::sync::oneshot::channel();
+            let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(futures_lite::stream::unfold(
+                Some((reading_tx, body_rx)),
+                |state| async move {
+                    let (reading_tx, body_rx) = state?;
+                    reading_tx.send(()).unwrap();
+                    let body = body_rx.await.unwrap();
+                    Some((Ok::<Bytes, Infallible>(body), None))
+                },
+            ));
+            let pending = tokio::spawn(
+                app.oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri(format!("/api/apps/home-cli/terminal/{route}"))
+                        .header("x-elastos-home-token", &token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                ),
+            );
+            // Body polling proves the request passed the outer policy middleware.
+            reading_rx.await.unwrap();
+            if enable_registration {
+                crate::auth::set_guest_registration_enabled(
+                    dir.path(),
+                    true,
+                    crate::auth::now_ts(),
+                )
+                .unwrap();
+            } else {
+                std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+            }
+            body_tx.send(Bytes::from_static(b"{}")).unwrap();
+            let response = pending.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !marker.exists(),
+                "a delayed refused request started a process"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_home_cli_terminal_developer_mode_policy_matrix() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("terminal-started");
+    let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
+    let _args = EnvRestore::set(
+        "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+        serde_json::json!([
+            "-c",
+            "printf started > \"$1\"; exec sleep 30",
+            "terminal-policy-fixture",
+            marker.to_str().unwrap()
+        ])
+        .to_string(),
+    );
+
+    for developer_mode in [false, true] {
+        for registration_enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = passkey_authority(dir.path());
+            let guest = passkey_authority_with_name_role(
+                dir.path(),
+                Some("terminal policy guest"),
+                crate::auth::RuntimePrincipalRole::Guest,
+            );
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("developer_mode = {developer_mode}\n"),
+            )
+            .unwrap();
+            crate::auth::set_guest_registration_enabled(
+                dir.path(),
+                registration_enabled,
+                crate::auth::now_ts(),
+            )
+            .unwrap();
+            let app = gateway_router(test_state(dir.path()));
+            for authority in [&owner, &guest] {
+                let token =
+                    app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, authority);
+                if developer_mode && !registration_enabled {
+                    let contract = app
+                        .clone()
+                        .oneshot(
+                            test_browser_request("localhost:61180", "null")
+                                .uri("/api/apps/home-cli/terminal/contract")
+                                .header("x-elastos-home-token", &token)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(contract.status(), StatusCode::OK);
+                    continue;
+                }
+                assert_terminal_routes_refused(&app, &token).await;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists(), "a refused request started a host process");
+
+    // The same command fixture must start when the policy permits the owner.
+    // Then each policy switch must close the existing process as well.
+    for enable_registration in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = passkey_authority(dir.path());
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+        let app = gateway_router(test_state(dir.path()));
+        let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+        let started = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/home-cli/terminal/sessions")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(started.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = started["session_id"].as_str().unwrap();
+        let pid = gateway_home_terminal::home_terminal_process_id(session_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if enable_registration {
+            crate::auth::set_guest_registration_enabled(dir.path(), true, crate::auth::now_ts())
+                .unwrap();
+        } else {
+            std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+        }
+        assert_terminal_routes_refused(&app, &token).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if gateway_home_terminal::home_terminal_process_id(session_id)
+                    .await
+                    .is_none()
+                    && unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy switch must retire the owned terminal process");
+        std::fs::remove_file(&marker).unwrap();
+    }
+}
+
+async fn assert_terminal_routes_refused(app: &axum::Router, token: &str) {
+    for (method, route) in [
+        ("GET", "contract"),
+        ("POST", "sessions"),
+        ("GET", "sessions/missing/events?ticket=fixture"),
+        ("GET", "sessions/missing/input?ticket=fixture"),
+        ("POST", "sessions/missing/resize"),
+        ("POST", "sessions/missing/intent"),
+        ("POST", "sessions/missing/close"),
+        ("OPTIONS", "sessions"),
+    ] {
+        for body in ["{}", "invalid JSON"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method(method)
+                        .uri(format!("/api/apps/home-cli/terminal/{route}"))
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("access-control-request-method", "POST")
+                        .header("access-control-request-headers", "x-elastos-home-token")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {route}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_home_cli_terminal_defaults_off_and_malformed_settings_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+    let app = gateway_router(test_state(dir.path()));
+    assert_terminal_routes_refused(&app, &token).await;
+    for contents in [
+        "dev_mode = true\n",
+        "developer_mode = false\n",
+        "developer_mode = 'true'\n",
+        "developer_mode = 1\n",
+        "developer_mode = true\nbroken = [",
+    ] {
+        std::fs::write(dir.path().join("config.toml"), contents).unwrap();
+        assert_terminal_routes_refused(&app, &token).await;
+    }
+    std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+    std::fs::create_dir(dir.path().join("config.toml")).unwrap();
+    assert_terminal_routes_refused(&app, &token).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
     let _args = EnvRestore::set(
         "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",

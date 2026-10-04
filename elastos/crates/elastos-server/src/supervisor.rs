@@ -1489,6 +1489,7 @@ impl Supervisor {
                 name,
                 platform_info,
                 &dest,
+                crate::setup::FirstPartyCarrierContext::Runtime,
             )
             .await?;
             return Ok(dest);
