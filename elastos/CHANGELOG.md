@@ -6,6 +6,11 @@ All notable changes to the public ElastOS Runtime repository.
 
 ### Fixed
 
+- Setup accepts passive content capsules from the signed release while retaining
+  provider role and icon checks. It refuses URL-only downloads and blank release
+  paths, including entries that also contain a CID. Explicit CID-only operator
+  gateways still verify checksums before replacing installed bytes.
+
 - CLI updates check the candidate executable before installation with a bounded
   version probe. Failed launches, timeouts, excess output, and unexpected version
   output preserve the previous installation.
