@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -18,6 +19,22 @@ spec.loader.exec_module(controller)
 
 
 class CapacityTests(unittest.TestCase):
+    def test_query_reads_stderr_only_help_and_preserves_stdout_only_json(self):
+        help_command = ['/usr/bin/xcrun', 'simctl', 'help', 'runtime']
+        list_command = ['/usr/bin/xcrun', 'simctl', 'runtime', 'list', '-j']
+        help_text = "delete: use alias 'all'; list"
+        replies = [subprocess.CompletedProcess(help_command, 0, stdout='', stderr=help_text),
+                   subprocess.CompletedProcess(list_command, 0, stdout='{}\n', stderr='simctl warning\n')]
+        with patch.object(controller.subprocess, 'run', side_effect=replies) as run:
+            self.assertEqual(controller.query(help_command, timeout=15), help_text)
+            self.assertEqual(json.loads(controller.query(list_command)), {})
+        self.assertEqual(run.call_args_list[0].args, (help_command,))
+        self.assertEqual(run.call_args_list[0].kwargs,
+                         {'capture_output': True, 'text': True, 'check': True, 'timeout': 15})
+        self.assertEqual(run.call_args_list[1].args, (list_command,))
+        self.assertEqual(run.call_args_list[1].kwargs,
+                         {'capture_output': True, 'text': True, 'check': True, 'timeout': 30})
+
     def setUp(self):
         self.record = {}
         self.growth = 100

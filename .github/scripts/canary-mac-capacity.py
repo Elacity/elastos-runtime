@@ -21,8 +21,10 @@ def need(condition, message):
 
 
 def query(argv, timeout=30):
-    return subprocess.run(argv, capture_output=True, text=True, check=True,
-                          timeout=timeout).stdout.strip()
+    result = subprocess.run(argv, capture_output=True, text=True, check=True, timeout=timeout)
+    if argv == ['/usr/bin/xcrun', 'simctl', 'help', 'runtime']:
+        return (result.stdout + result.stderr).strip()
+    return result.stdout.strip()
 
 
 def native_bindings(query=query):
