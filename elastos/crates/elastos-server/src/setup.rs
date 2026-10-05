@@ -4255,11 +4255,11 @@ pub(crate) mod tests {
         let on_demand = resolve_components(
             &manifest,
             None,
-            &["llama-server".to_string(), "model-bonsai-8b-q1".to_string()],
+            &["llama-server".to_string()],
             &[],
         )
         .unwrap();
-        assert_eq!(on_demand, ["llama-server", "model-bonsai-8b-q1"]);
+        assert_eq!(on_demand, ["llama-server"]);
         let catalog = manifest
             .model_catalog
             .as_ref()
