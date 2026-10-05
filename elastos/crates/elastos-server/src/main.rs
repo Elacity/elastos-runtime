@@ -579,6 +579,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Allow reinstall, downgrade, or repair of an invalid installed version
+        #[arg(long)]
+        force: bool,
     },
 
     /// Check for and install runtime updates
@@ -606,6 +610,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Allow reinstall, downgrade, or repair of an invalid installed version
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1631,6 +1639,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         }
         | Commands::Upgrade {
             check,
@@ -1639,6 +1648,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         } => {
             release_cmd::run_update_command(
                 check,
@@ -1647,6 +1657,7 @@ async fn main() -> anyhow::Result<()> {
                 gateways,
                 yes,
                 rollback_to,
+                force,
                 ELASTOS_VERSION,
             )
             .await?;
@@ -2309,6 +2320,39 @@ mod tests {
     use clap::Parser;
     use sha2::Digest;
     use std::fs;
+
+    #[test]
+    fn update_cli_accepts_force_only_when_requested() {
+        for command in ["update", "upgrade"] {
+            for requested in [false, true] {
+                let mut args = vec!["elastos", command];
+                if requested {
+                    args.push("--force");
+                }
+                let cli = super::Cli::try_parse_from(args).unwrap();
+                let Some(
+                    super::Commands::Update { force, .. } | super::Commands::Upgrade { force, .. },
+                ) = cli.command
+                else {
+                    panic!("expected update command");
+                };
+                assert_eq!(force, requested);
+            }
+        }
+        let error = super::Cli::try_parse_from([
+            "elastos",
+            "node",
+            "update",
+            "--peer",
+            "did:key:fixture",
+            "--apply",
+            "--yes",
+            "--force",
+        ])
+        .err()
+        .expect("operator update accepted --force");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 
     #[test]
     fn source_add_cli_keeps_omitted_channel_distinct_from_explicit_stable() {

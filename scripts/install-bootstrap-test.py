@@ -316,16 +316,19 @@ class ShellTests(unittest.TestCase):
         installer_core = re.search(r'    core = r"([^"]+)"', SOURCE).group(1)
         installer_tail = re.search(r'if not re.fullmatch\(core \+ r"([^"]+)"', SOURCE).group(1)
         self.assertEqual("^" + installer_core + installer_tail + "$", expected_pattern)
-        versions = [
+        accepted_versions = [
             "0.7.1", "1.2.3-alpha.0", "1.2.3-beta.2", "1.2.3-rc.10+build.1",
-            "1.2.3+build-1", "1.2.3+build..1", "1.2.3+.",
+            "1.2.3+build-1", "1.2.3+build.01", "1.2.3+0.a-b",
+        ]
+        rejected_versions = [
+            "1.2.3+build..1", "1.2.3+.", "1.2.3+.build", "1.2.3+build.",
             "", "v0.7.1", "01.2.3", "1.02.3", "1.2.03", "1.2",
             "1.2.3-rc1", "1.2.3-rc.01", "1.2.3-preview.1", "1.2.3+",
             "1.2.3\n", " 1.2.3", "1.2.3 ",
         ]
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory, name) for name in ("head.json", "release.json")]
-            for version in versions:
+            for version in accepted_versions + rejected_versions:
                 release = {"payload": {"schema": "elastos.release/v1",
                                        "version": version, "channel": "stable"}}
                 paths[1].write_text(json.dumps(release))
@@ -336,7 +339,9 @@ class ShellTests(unittest.TestCase):
                 expected = subprocess.run([OPTIONS.bash, str(policy), version], capture_output=True)
                 actual = shell('validate_release_identity "$1" "$2"\n', *paths)
                 with self.subTest(version=version):
-                    self.assertEqual(actual.returncode == 0, expected.returncode == 0,
+                    self.assertEqual(expected.returncode == 0, version in accepted_versions,
+                                     expected.stdout + expected.stderr)
+                    self.assertEqual(actual.returncode == 0, version in accepted_versions,
                                      actual.stdout + actual.stderr)
 
     def test_release_identity_requires_matching_nonempty_strings(self):

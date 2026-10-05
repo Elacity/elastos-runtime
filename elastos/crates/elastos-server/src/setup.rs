@@ -6569,6 +6569,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn checkout_manifest_prepared_for_release_admits_every_platform() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let mut manifest = load_manifest_from_path(&path).unwrap();
+        // Release preparation stamps built assets and replaces source-build recipes.
+        // Keep other strategies and existing checksums to check the real inventory.
+        for component in manifest.external.values_mut() {
+            for info in component.platforms.values_mut().chain(
+                component
+                    .capsule_metadata
+                    .iter_mut()
+                    .flat_map(|metadata| metadata.platforms.values_mut()),
+            ) {
+                if info.strategy.as_deref() == Some("source-build") {
+                    info.strategy = None;
+                }
+                if info.checksum.as_deref().is_none_or(str::is_empty) {
+                    info.checksum = Some(format!("sha256:{}", "a".repeat(64)));
+                }
+            }
+        }
+        for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
+            admit_release_components(&manifest, platform)
+                .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
+        }
+        for profile in ["minimal", "full"] {
+            let selected = resolve_components(&manifest, Some(profile), &[], &[]).unwrap();
+            assert!(selected.iter().any(|name| name == "vmlinux"));
+        }
+        let kernel = &manifest.external["vmlinux"];
+        assert!(resolve_platform_info(kernel, "linux-arm64").is_none());
+        assert!(resolve_platform_info(kernel, "aarch64-linux").is_none());
+        assert!(resolve_platform_info(kernel, "linux-amd64").is_some());
+    }
+
+    #[test]
     fn verify_checksum_requires_release_artifact_checksum() {
         let info = PlatformInfo {
             url: None,

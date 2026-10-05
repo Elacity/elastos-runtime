@@ -679,7 +679,7 @@ try:
     if hashlib.sha256(release_bytes).hexdigest() != expected:
         raise ValueError("Release envelope differs from the signed head")
     core = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    if not re.fullmatch(core + r"(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?(\+[0-9A-Za-z.-]+)?", str(head.get("version", ""))):
+    if not re.fullmatch(core + r"(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?", str(head.get("version", ""))):
         raise ValueError("Invalid signed release version; expected X.Y.Z or X.Y.Z-{alpha|beta|rc}.N")
     for field in ("version", "channel"):
         value = head.get(field)
