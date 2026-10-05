@@ -1068,7 +1068,7 @@ def installer_source_blob(source):
 
 
 def changelog_changes(version):
-    """Use this release's bullets, or Unreleased until its heading is cut."""
+    """Use bounded change bullets from this release, or Unreleased until cut."""
     sections = {}
     text = (SOURCE_ROOT / "elastos/CHANGELOG.md").read_text(encoding="utf-8")
     for section in re.split(r"(?m)^## ", text)[1:]:
@@ -1077,16 +1077,35 @@ def changelog_changes(version):
         if name:
             sections[name[1]] = body
     changes = []
+    bullet_numbers = []
+    number = 0
     continuing = False
-    for line in sections.get(version, sections.get("Unreleased", "")).split("\n"):
+    include = True
+    section_name = version if version in sections else "Unreleased"
+    for line in sections.get(section_name, "").split("\n"):
+        subsection = re.match(r"^###\s+(\S+)", line)
+        if subsection:
+            include = subsection[1].casefold() in {"added", "changed", "fixed", "removed", "security"}
+            continuing = False
+            continue
         bullet = re.match(r"^[-*] (.*)$", line)
         if bullet:
+            number += 1
+        if not include:
+            continue
+        if bullet:
             changes.append(bullet[1].strip())
+            bullet_numbers.append(number)
             continuing = True
         elif continuing and line.startswith((" ", "\t")) and line.strip():
             changes[-1] += " " + line.strip()
         else:
             continuing = False
+    for number, change in zip(bullet_numbers, changes):
+        size = len(change.encode("utf-8"))
+        if size > 500:
+            raise ValueError(f"elastos/CHANGELOG.md [{section_name}] bullet {number}: "
+                             f"release changes exceed the 500-byte bound ({size} bytes)")
     return changes
 
 

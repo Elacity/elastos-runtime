@@ -17,14 +17,15 @@ All notable changes to the public ElastOS Runtime repository.
 - Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
   refuses a larger declared size before reading the body.
 
-- Setup accepts passive content capsules from the signed release while retaining
-  provider role and icon checks. It refuses URL-only downloads and blank release
-  paths, including entries that also contain a CID. Explicit CID-only operator
-  gateways still verify checksums before replacing installed bytes. Fresh installed
-  setup admits the private signed release pair and binary under the installation
-  writer, then fetches components and the model catalogue over Carrier. Both are
-  verified before any metadata or component write; signed manifest bytes remain
-  unchanged.
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths, including
+  entries with a CID. Explicit CID-only operator gateways verify checksums before
+  replacing installed bytes.
+
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer. It then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed manifest
+  bytes stay unchanged.
 
 - CLI updates check the candidate executable before installation with a bounded
   version probe. Failed launches, timeouts, excess output, and unexpected version

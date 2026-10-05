@@ -1070,6 +1070,40 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         manifest = self.prepare_signing_fixture(fixture)
         self.assertEqual(manifest["release"]["changes"], ["This release."])
 
+    def test_unsigned_handoff_excludes_non_change_subsections(self):
+        fixture = self.signing_fixture()
+        notes = "## [0.7.1]\n- Direct change.\n"
+        for heading in ("Known limits", "Notes", "Known limitations", "Deferred"):
+            notes += f"\n### {heading}\n- " + "x" * 501 + "\n  continued limit.\n"
+        headings = ("Added", "Changed", "Fixed", "Removed", "Security", "Added (release tooling)")
+        for heading in headings:
+            notes += f"\n### {heading}\n- {heading} change.\n  Continued.\n"
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(notes)
+        self.assertEqual(self.prepare_signing_fixture(fixture)["release"]["changes"],
+                         ["Direct change."] + [f"{heading} change. Continued." for heading in headings])
+
+    def test_changelog_refuses_long_bullet_with_location(self):
+        fixture = self.signing_fixture()
+        for section in ("Unreleased", "0.7.1"):
+            for bullet in ("x" * 501, "é" * 249 + "\n  éé"):
+                with self.subTest(section=section, bullet=bullet):
+                    (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+                        f"## [{section}]\n### Known limits\n- Ignored limit.\n"
+                        "### Fixed\n- " + "é" * 250 + "\n- " + bullet + "\n")
+                    message = (r"elastos/CHANGELOG\.md \[" + section
+                               + r"\] bullet 3: release changes exceed the 500-byte bound")
+                    with self.assertRaisesRegex(ValueError, message):
+                        inputs.changelog_changes("0.7.1")
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.prepare_signing_fixture(fixture)
+                    self.assertFalse(fixture.output.exists())
+
+    def test_real_unreleased_changelog_fits_release_bounds(self):
+        with patch.object(inputs, "SOURCE_ROOT", Path(__file__).resolve().parent.parent):
+            changes = inputs.changelog_changes("Unreleased")
+        self.assertTrue(changes)
+        signer.check_release_changes(changes)
+
     def test_unsigned_handoff_omits_changes_without_matching_notes(self):
         fixture = self.signing_fixture()
         (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text("## [0.7.0]\n- Older change.\n")
