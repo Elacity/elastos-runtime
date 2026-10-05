@@ -467,7 +467,7 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/home/events" && req.method === "GET") {
-    json(res, 200, { events: [], cursor: "" });
+    json(res, 200, { schema: "elastos.home.events/v1", events: [], cursor: "" });
     return true;
   }
   if (url.pathname === "/api/apps/home/launch" && req.method === "POST") {
