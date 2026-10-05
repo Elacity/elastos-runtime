@@ -102,10 +102,10 @@ case "${1:-}" in
     --version) echo "elastos 0.7.1" ;;
     install-release)
         if [[ -e "$FIXTURES/writer-refuses" ]]; then echo "Error: fixture writer refusal" >&2; exit 1; fi
-        [[ "${*: -1}" == --check ]] && exit 0
+        if [[ "${*: -1}" == --check ]]; then echo "  fixture writer admitted"; exit 0; fi
         candidate="$FIXTURES/candidate"; mkdir -p "$candidate"
         cp "${@: -4:1}" "$candidate/runtime"; cp "${@: -3}" "$candidate/"; cp "${@: -4:1}" "$5"
-        exit 0 ;;
+        echo "  fixture writer installed"; exit 0 ;;
     setup)
         printf '%s\\n' "Runtime setup handoff; Carrier transport is outside this fixture" > "${ELASTOS_TEST_SETUP_MARKER:?fixture marker}"
         exit 0 ;;
@@ -186,7 +186,7 @@ VECTORS = [
 def shell(script, *args):
     return subprocess.run(
         [OPTIONS.bash, "--noprofile", "--norc", "-s", "--", *map(str, args)],
-        input=HELPERS + "\nALLOW_UNSIGNED=false\n" + script,
+        input=HELPERS + "\n" + script,
         text=True, capture_output=True, timeout=15,
     )
 
@@ -737,6 +737,9 @@ class InstallationTests(unittest.TestCase):
         # Admission runs before this installer stops Runtime; the second call installs.
         self.assertRegex(calls[1], writer + " --check$")
         self.assertRegex(calls[2], writer + "$")
+        steps = ["fixture writer admitted", "Stopping verified Runtime processes",
+                 "Installing binary to", "fixture writer installed", "Verifying and upgrading configured protected roots"]
+        self.assertEqual(sorted(steps, key=result.stdout.index), steps)
         self.assertRegex(calls[3], "^principal-root-upgrade --data-dir %s --backup-dir %s/backups/principal-root-upgrade-[0-9]+-[0-9]+$"
                          % (re.escape(str(sandbox.data)), re.escape(str(sandbox.data))))
         self.assertEqual(len(calls), 4, "setup and Home launch stay out of --install-only")

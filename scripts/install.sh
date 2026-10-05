@@ -10,13 +10,11 @@
 #
 #   ./scripts/install.sh --head-cid QmXyz...
 #   ./scripts/install.sh --head-cid QmXyz... --maintainer-did did:key:z6Mk...
-#   ./scripts/install.sh --head-cid QmXyz... --allow-unsigned
 #   ./scripts/install.sh --help
 #
 # Required (one of):
 #   ELASTOS_HEAD_CID env var   or   --head-cid <CID>
 #   ELASTOS_MAINTAINER_DID env var   or   --maintainer-did <did:key:...>
-#   (or --allow-unsigned to skip sig check)
 #
 # Trust anchors can be provided via env vars or CLI flags. In the canonical
 # bootstrap flow, they should already be stamped into install.sh.
@@ -33,11 +31,11 @@
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
 #   5. Download the Runtime binary and verify SHA-256
-#   6. Install the Runtime and save the verified envelopes and stamped Carrier source
+#   6. Runtime's installation writer admits and installs the Runtime, the verified
+#      envelopes and the stamped Carrier source in one journaled transaction
 #   7. Runtime setup fetches signed metadata and installs Home over Carrier
 #
-# Fails closed if trust anchors or signature verification fail, unless the
-# operator explicitly selects --allow-unsigned.
+# Fails closed if trust anchors or signature verification fail.
 #
 # Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
@@ -131,7 +129,6 @@ show_help() {
     echo "  --gateway URL        IPFS gateway base URL (repeatable, operator/debug bootstrap)"
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
     echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
-    echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
     echo "  --help                Show this help"
@@ -515,11 +512,6 @@ verify_signature() {
     local domain="$2"
     local expected_did="$3"
 
-    if [[ "$ALLOW_UNSIGNED" = true ]]; then
-        warn "Skipping signature verification (--allow-unsigned)"
-        return 0
-    fi
-
     if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
 # RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
 # https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1
@@ -726,7 +718,6 @@ if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
     return 0
 fi
 
-ALLOW_UNSIGNED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
@@ -751,7 +742,6 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
-        --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
             INSTALL_DIR="$2"; shift 2 ;;
@@ -796,8 +786,8 @@ if [[ -z "$HEAD_CID" && -z "$PUBLISHER_GATEWAY" ]]; then
     die "No bootstrap publisher URL and no HEAD_CID. Either:\n  1. Set ELASTOS_PUBLISHER_GATEWAY env var, or\n  2. Set ELASTOS_HEAD_CID env var, or\n  3. Pass --head-cid <CID>."
 fi
 
-if [[ "$ALLOW_UNSIGNED" != true && -z "$MAINTAINER_DID" ]]; then
-    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>.\n  For unsigned install: pass --allow-unsigned"
+if [[ -z "$MAINTAINER_DID" ]]; then
+    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
 fi
 
 # ── Preflight ─────────────────────────────────────────────────────────

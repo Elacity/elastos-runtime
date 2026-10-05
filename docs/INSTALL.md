@@ -178,9 +178,10 @@ original recovery before that migration. If the saved pair requires repair,
 keep the files in place and follow Runtime's operator repair step.
 
 Running `install.sh` again uses the same installation lock and journal. Before it
-stops Runtime, it refuses an older release, another channel, a pending Home
-update and a second writer. An interrupted run restores the previous
-installation.
+stops Runtime, it restores an interrupted install and refuses an older release,
+another channel, a pending Home update, a second writer and an installed Runtime
+without a readable `sources.json`. Until an interrupted install is restored,
+Home does not start and asks you to run `install.sh` again.
 
 ### Recover an interrupted update
 

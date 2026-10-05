@@ -601,8 +601,8 @@ fn new_publisher_key_hint(error: anyhow::Error) -> anyhow::Error {
 }
 
 /// install.sh hands its verified candidate to the shared installation writer.
-/// `check` admits it without changes before the installer stops this Home.
-/// The installer leaves components.json to Runtime setup.
+/// `check` restores an interrupted install and admits the release before the
+/// installer stops this Home. The installer leaves components.json to setup.
 pub fn install_release(
     data_dir: &Path,
     binary: &Path,
@@ -616,28 +616,29 @@ pub fn install_release(
         .default_source()
         .context("installer trusted source is missing")?;
     crate::installed_release::admit_candidate(binary, source, &executable, &head, &release)?;
-    let transaction = InstallTransaction::acquire(data_dir, binary)?;
+    let mut transaction = InstallTransaction::acquire(data_dir, binary)?;
     if transaction.restart_record_if_any()?.is_some()
         || crate::update_controller::has_queued_update(transaction.data_dir())?
     {
         anyhow::bail!("A Home update is still in progress. Open Home to let it finish, then run the installer again; this installation was not changed.");
     }
-    let offline =
-        || crate::host_lock::acquire_host_process_lock(transaction.data_dir(), "update", "offline");
-    let mut held = None;
     if InstallTransaction::has_pending_recovery(transaction.binary_path()) {
-        // An interrupted install or update is restored before the new release is admitted.
-        if check {
-            return Ok(());
-        }
-        held = Some(offline()?);
+        // Restore an interrupted install or update before this release is admitted.
+        let offline = crate::host_lock::acquire_host_process_lock(
+            transaction.data_dir(),
+            "update",
+            "offline",
+        )?;
         transaction.recover()?;
-        anyhow::ensure!(
-            transaction.uses_consumed_layout(),
-            "An earlier update was restored. Run the installer again."
-        );
+        drop((offline, transaction));
+        // Recovery keeps its journal's layout; the next writer selects the current one.
+        transaction = InstallTransaction::acquire(data_dir, binary)?;
     }
-    if let Some(current) = load_trusted_sources(transaction.data_dir())?.default_source() {
+    let current = load_trusted_sources(transaction.data_dir())
+        .ok()
+        .and_then(|config| config.default_source().cloned())
+        .filter(|current| !current.installed_version.is_empty());
+    if let Some(current) = current {
         let installed = Path::new(&current.install_path);
         if let (Some(Ok(parent)), Some(name)) = (
             installed.parent().map(std::fs::canonicalize),
@@ -657,15 +658,20 @@ pub fn install_release(
             source.installed_version,
             current.installed_version
         );
-        verify_source_channel(current, &source.channel)?;
+        verify_source_channel(&current, &source.channel)?;
+    } else {
+        // Without a release record an existing Runtime could be newer than this one.
+        anyhow::ensure!(
+            std::fs::symlink_metadata(transaction.binary_path()).is_err(),
+            "{} is installed, but this Home's release record (sources.json) is missing or unreadable, so the installer cannot tell whether this release is older. Move that Runtime aside, then run the installer again; this installation was not changed.",
+            binary.display()
+        );
     }
     if check {
         return Ok(());
     }
-    let _offline = match held {
-        Some(held) => held,
-        None => offline()?,
-    };
+    let _offline =
+        crate::host_lock::acquire_host_process_lock(transaction.data_dir(), "update", "offline")?;
     transaction.prepare(&[
         (ReleaseFile::RuntimeBinary, executable.as_slice()),
         (ReleaseFile::Sources, sources.as_slice()),
@@ -3711,6 +3717,40 @@ mod tests {
             install_release(data, binary, paths, false)
         }
 
+        /// Stops the writer after staging, or after it activated every file.
+        fn interrupt(data: &Path, binary: &Path, candidate: &[PathBuf; 4], activated: bool) {
+            let bytes = candidate
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap());
+            let transaction = InstallTransaction::acquire(data, binary).unwrap();
+            transaction
+                .prepare(&[
+                    (ReleaseFile::RuntimeBinary, &bytes[0][..]),
+                    (ReleaseFile::Sources, &bytes[1][..]),
+                    (ReleaseFile::ReleaseHead, &bytes[2][..]),
+                    (ReleaseFile::ReleaseManifest, &bytes[3][..]),
+                ])
+                .unwrap();
+            if activated {
+                // Unwinding skips the writer's own restore, as a killed process would.
+                let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    transaction.commit_checked(|| panic!("installer stopped"))
+                }));
+                assert!(stopped.is_err());
+                assert_eq!(std::fs::read(binary).unwrap(), bytes[0]);
+            }
+            assert!(InstallTransaction::has_pending_recovery(binary));
+        }
+
+        fn empty() -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let fixture = tempfile::tempdir().unwrap();
+            let data = fixture.path().join("data");
+            let binary = fixture.path().join("bin/elastos");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            (fixture, data, binary)
+        }
+
         /// Every file's mode and bytes; unchanged means identical.
         fn files(root: &Path, skip_locks: bool) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
             let mut files = BTreeMap::new();
@@ -3836,11 +3876,7 @@ mod tests {
 
         #[tokio::test]
         async fn fresh_install_then_concurrent_writer_is_refused() {
-            let fixture = tempfile::tempdir().unwrap();
-            let data = fixture.path().join("data");
-            let binary = fixture.path().join("bin/elastos");
-            std::fs::create_dir_all(&data).unwrap();
-            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            let (fixture, data, binary) = empty();
             let candidates = tempfile::tempdir().unwrap();
             let first = candidate(candidates.path(), &binary, "0.7.1", 7);
             install(&data, &binary, &first).unwrap();
@@ -3968,27 +4004,8 @@ mod tests {
             assert!(error.contains("Run the publisher's install.sh"), "{error}");
             assert_eq!(files(fixture.path(), false), old_install);
 
-            // The installer stops after staging; recovery leaves the old Home working.
-            let transaction = InstallTransaction::acquire(&data, &binary).unwrap();
-            transaction
-                .prepare(&[
-                    (ReleaseFile::RuntimeBinary, &runtime("0.7.1")[..]),
-                    (
-                        ReleaseFile::Sources,
-                        &std::fs::read(&new_key[1]).unwrap()[..],
-                    ),
-                    (
-                        ReleaseFile::ReleaseHead,
-                        &std::fs::read(&new_key[2]).unwrap()[..],
-                    ),
-                    (
-                        ReleaseFile::ReleaseManifest,
-                        &std::fs::read(&new_key[3]).unwrap()[..],
-                    ),
-                ])
-                .unwrap();
-            drop(transaction);
-            assert!(InstallTransaction::has_pending_recovery(&binary));
+            // The installer stops after activating; recovery leaves the old Home working.
+            interrupt(&data, &binary, &new_key, true);
             recover_pending_installation(&data).unwrap();
             assert_eq!(files(fixture.path(), true), old_install);
             let version = std::process::Command::new(&binary)
@@ -4025,6 +4042,82 @@ mod tests {
                 .map(PathBuf::from)
                 .collect()
             );
+        }
+
+        #[test]
+        fn interrupted_fresh_install_blocks_home_and_installer_rerun_completes() {
+            for activated in [false, true] {
+                let (_fixture, data, binary) = empty();
+                let candidates = tempfile::tempdir().unwrap();
+                let first = candidate(candidates.path(), &binary, "0.7.1", 7);
+                interrupt(&data, &binary, &first, activated);
+                let error = crate::install_transaction::authorize_host_start(&data, &binary)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("Run install.sh again"), "{error}");
+                install(&data, &binary, &first).unwrap();
+                assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.1"));
+                assert!(!InstallTransaction::has_pending_recovery(&binary));
+                crate::install_transaction::authorize_host_start(&data, &binary).unwrap();
+            }
+        }
+
+        #[test]
+        fn existing_runtime_without_a_release_record_is_refused() {
+            for record in [
+                None,
+                Some(b"not json".as_slice()),
+                Some(br#"{"schema":"elastos.trusted-sources/v1","sources":[{"name":"default"}]}"#),
+            ] {
+                let (fixture, data, binary) = empty();
+                std::fs::write(&binary, runtime("0.7.2")).unwrap();
+                if let Some(record) = record {
+                    std::fs::write(data.join("sources.json"), record).unwrap();
+                }
+                let candidates = tempfile::tempdir().unwrap();
+                let older = candidate(candidates.path(), &binary, "0.7.1", 7);
+                let before = files(fixture.path(), true);
+                for check in [true, false] {
+                    let paths = older.each_ref().map(PathBuf::as_path);
+                    let error = install_release(&data, &binary, paths, check).unwrap_err();
+                    assert!(error.to_string().contains("release record"), "{error:#}");
+                    assert_eq!(files(fixture.path(), true), before);
+                }
+            }
+        }
+
+        #[test]
+        fn tampered_or_foreign_signed_candidates_are_refused_without_changes() {
+            let (fixture, data, binary) = empty();
+            let candidates = tempfile::tempdir().unwrap();
+            install(
+                &data,
+                &binary,
+                &candidate(candidates.path(), &binary, "0.7.1", 7),
+            )
+            .unwrap();
+            for (case, expected) in [
+                ("tampered binary", "differs from its signed checksum"),
+                ("foreign release signer", "Signer DID mismatch"),
+                ("foreign head signer", "Signer DID mismatch"),
+            ] {
+                let next = candidate(candidates.path(), &binary, "0.7.2", 7);
+                let foreign = candidate(candidates.path(), &binary, "0.7.2", 9);
+                match case {
+                    "tampered binary" => std::fs::write(&next[0], runtime("0.7.3")).unwrap(),
+                    "foreign release signer" => {
+                        std::fs::copy(&foreign[3], &next[3]).map(drop).unwrap()
+                    }
+                    _ => std::fs::copy(&foreign[2], &next[2]).map(drop).unwrap(),
+                }
+                let before = files(fixture.path(), false);
+                for check in [true, false] {
+                    let paths = next.each_ref().map(PathBuf::as_path);
+                    let error = install_release(&data, &binary, paths, check).unwrap_err();
+                    assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+                    assert_eq!(files(fixture.path(), false), before, "{case}");
+                }
+            }
         }
     }
 }

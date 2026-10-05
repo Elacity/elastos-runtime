@@ -1640,10 +1640,16 @@ pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyho
 }
 
 fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
-    if journal.restart.is_none() {
-        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
-    } else {
+    if journal.restart.is_some() {
         "Home restart recovery is pending. Start the retained update controller with its receipt."
+    } else if journal
+        .entries
+        .iter()
+        .all(|entry| entry.id != ReleaseFile::Components)
+    {
+        "An interrupted installation requires recovery. Run install.sh again before starting Home."
+    } else {
+        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
     }
 }
 
