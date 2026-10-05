@@ -120,6 +120,9 @@ pub(crate) struct RestartPlan {
     pub controller_sha256: String,
     pub launch_plan_sha256: String,
     pub support_sha256: String,
+    // An older installed controller writes plans without this field; the
+    // candidate it starts must still read that journal.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub support_paths: BTreeSet<PathBuf>,
     pub previous_version: String,
     pub candidate_version: String,

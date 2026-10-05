@@ -147,6 +147,15 @@ fn restart_plan() -> RestartPlan {
     }
 }
 
+#[test]
+fn plan_from_an_older_controller_without_support_paths_still_parses() {
+    let mut value = serde_json::to_value(restart_plan()).unwrap();
+    assert!(value.get("support_paths").is_none(), "empty set is omitted");
+    value.as_object_mut().unwrap().remove("support_paths");
+    let plan: RestartPlan = serde_json::from_value(value).unwrap();
+    assert!(plan.support_paths.is_empty());
+}
+
 fn prepare_release(writer: &InstallTransaction) {
     let files = ReleaseFile::ALL.map(|id| (id, new_bytes(id)));
     let borrowed = files.each_ref().map(|(id, bytes)| (*id, bytes.as_slice()));
