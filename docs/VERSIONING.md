@@ -155,10 +155,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    with the source commit, the install version N and the update version N+1.
    The source is a commit on `develop`, or the head of an open pull request into
    `develop` that already contains `develop`. The run builds the Apple silicon
-   pair (N+1 reuses N's support bytes) in fresh Cargo directories, checks
-   versions, source and support parity, and builds the matching Linux seed
-   package (Runtime N, `ipfs-provider` and the exact source). Each job summary
-   records its artifact ID and digest.
+   pair (N+1 reuses N's support bytes) in fresh Cargo directories and checks
+   versions, source and support parity. Each job summary records its artifact
+   ID and digest.
 2. **Prepare.** On the operator Mac, from a clone of this repository, run
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It downloads and checks
    the Mac artifact, verifies the inputs, checks out the exact source as a
@@ -171,19 +170,26 @@ the version by the contract change (see Meaning) and update the changelog first;
    the `release-signer.py` command. The operator runs it and types the DID.
    The signer refuses a commit that is not on `develop`.
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
-   seed sequence: copy the four small signed files, rebuild the rest from the
-   CI artifact, verify every hash, stop the service, run the preflight, import,
-   and start the service. Import run with the service stopped ends with the
-   known gossip error `No running runtime found` after the commit; the sequence
-   accepts only that error.
+   seed sequence for the seed's installed Runtime: copy the four small signed
+   files, rebuild the rest from the CI artifact, verify every hash, stop the
+   service, run the preflight, import, and start the service. An import run
+   while the service is stopped ends with the known gossip error
+   `No running runtime found` after the commit, and the sequence accepts only
+   that error.
 
-The seed host, data directory, service unit and staging directory come from
-`RELEASE_SEED`, `RELEASE_SEED_DATA`, `RELEASE_SEED_UNIT` and
-`RELEASE_SEED_STAGE`. The seed Runtime runs its release helpers from the source
-path it was built in, so the seed keeps that source at
-`/opt/elastos/release-source` (the service user owns `/opt/elastos`). The seed
-needs glibc 2.39 or newer. Publish N first; after N is accepted on a real
-install, prepare N+1 from the same run before its artifacts expire (14 days).
+Upgrading the seed Runtime itself is rare. Run the workflow with
+`seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints
+the steps: create `/opt/elastos` for the service user, check and install the
+exact source at `/opt/elastos/release-source` (the seed Runtime runs its
+release helpers from the path it was built in), install the Runtime and IPFS
+provider, update the provider's pin in the installed `components.json`, verify
+the provider and start the service. The seed needs glibc 2.39 or newer.
+
+Seed details come from `RELEASE_SEED`, `RELEASE_SEED_DATA`,
+`RELEASE_SEED_UNIT`, `RELEASE_SEED_STAGE`, `RELEASE_SEED_RUNTIME` and
+`RELEASE_SEED_USER`, not from this repository. Publish N first; after N is
+accepted on a real install, prepare N+1 from the same run before its artifacts
+expire (14 days).
 
 ## Tagging Recommendation
 

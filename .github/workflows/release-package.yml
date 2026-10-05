@@ -1,6 +1,7 @@
 # Key-free release inputs: the Apple silicon pair (install N, update N+1 that
-# reuses N's support) and the matching Linux seed package, all from one exact
-# source. Signing and seed import are operator steps; see docs/VERSIONING.md.
+# reuses N's support) and, when asked, the matching Linux seed package, all from
+# one exact source. Signing and seed import are operator steps; see
+# docs/VERSIONING.md.
 name: Release package
 
 on:
@@ -11,13 +12,17 @@ on:
         required: true
         type: string
       install_version:
-        description: Install version N (also the seed Runtime version)
+        description: Install version N
         required: true
         type: string
       update_version:
         description: Update version N+1, built with N's support
         required: true
         type: string
+      seed_package:
+        description: Also build the Linux seed package (only to upgrade the seed Runtime)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -169,6 +174,7 @@ jobs:
   seed:
     name: matching Linux seed package
     needs: admit
+    if: inputs.seed_package
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:

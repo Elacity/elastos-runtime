@@ -8,13 +8,18 @@
 #       Write the exact signer policy for that unsigned input and print the
 #       signing command. SIGNER is the installed release-signer.py copy.
 #   scripts/release-publish.sh seed VERSION SIGNED_DIR
-#       Print the seed import sequence for that signed set.
+#       Print the seed import sequence for that signed set. It uses the seed's
+#       installed Runtime and provider.
+#   scripts/release-publish.sh seed-upgrade RUN_ID
+#       Rarely: print the sequence that installs the run's Linux seed package
+#       (Runtime, IPFS provider and its source) on the seed.
 #
 # Environment: RELEASE_SEED (ssh host) and RELEASE_SEED_DATA (seed service data
-# dir) for prepare and seed; RELEASE_SEED_UNIT (service unit) and
-# RELEASE_SEED_STAGE (seed staging dir) for seed. RELEASE_WORK defaults to
-# ~/.local/share/elastos-release. RELEASE_ORIGIN defaults to the public origin.
-# See docs/VERSIONING.md "Publishing a release".
+# dir) for prepare; seed also needs RELEASE_SEED_UNIT (service unit),
+# RELEASE_SEED_STAGE (seed staging dir) and RELEASE_SEED_RUNTIME (installed
+# Runtime path); seed-upgrade also needs RELEASE_SEED_USER (service user).
+# RELEASE_WORK defaults to ~/.local/share/elastos-release. RELEASE_ORIGIN
+# defaults to the public origin. See docs/VERSIONING.md "Publishing a release".
 set -euo pipefail
 umask 077
 
@@ -28,12 +33,22 @@ die() { echo "release-publish: $*" >&2; exit 1; }
 need_env() { local name; for name; do [[ -n "${!name:-}" ]] || die "set $name"; done; }
 sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
 
-# Prints "id digest" of the run's newest live PREFIX-<commit>-<attempt> artifact.
+# Prints "id digest name" of the run's newest live PREFIX-<commit>-<attempt> artifact.
 artifact() {
     local run="$1" prefix="$2"
     gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" --jq "[.artifacts[]
         | select((.name | test(\"^$prefix-[0-9a-f]{40}-[0-9]+\$\")) and (.expired | not))] | sort_by(.id)
-        | if length > 0 then \"\(last.id) \(last.digest | ltrimstr(\"sha256:\"))\" else error(\"no $prefix artifact\") end"
+        | if length > 0 then \"\(last.id) \(last.digest | ltrimstr(\"sha256:\")) \(last.name)\" else error(\"no $prefix artifact\") end"
+}
+
+# Prints the seed-side preamble and get NAME ID DIGEST: download, check, unpack.
+seed_preamble() {
+    cat <<EOF
+# On the seed as the service user, with GH_TOKEN allowed to read Actions artifacts:
+set -euo pipefail; umask 077; install -d -m 700 $1; cd $1
+get() { curl -fsSL -H "Authorization: Bearer \$GH_TOKEN" -o "\$1.zip" "https://api.github.com/repos/$REPO/actions/artifacts/\$2/zip"
+        echo "\$3  \$1.zip" | sha256sum -c --quiet; unzip -q "\$1.zip" -d "\$1"; (cd "\$1" && sha256sum -c --quiet SHA256SUMS); }
+EOF
 }
 
 # Work dir of a prepared version; holds run.json, inputs/, source/, unsigned/.
@@ -49,7 +64,7 @@ prepare() {
         == ".github/workflows/release-package.yml success" ]] || die "run $run is not a successful Release package run"
     mkdir -p "$work/state" "$work/data"
     id=$(artifact "$run" release-mac)
-    digest=${id#* } id=${id% *}
+    read -r id digest _ <<< "$id"
     gh api "repos/$REPO/actions/artifacts/$id/zip" > "$work/mac.zip"
     [[ "$(sha "$work/mac.zip")" == "$digest" ]] || die "Mac artifact digest differs"
     unzip -q "$work/mac.zip" -d "$work/parts"
@@ -111,14 +126,14 @@ policy() {
 
 seed() {
     [[ $# == 2 ]] || die "usage: seed VERSION SIGNED_DIR"
-    need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE
-    local version="$1" signed work run name did commit mac seed_pkg stage
+    need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
+    local version="$1" signed work run name did mac mac_digest stage
     signed=$(realpath "$2") work=$(work_dir "$version")
-    run=$(jq -r .run "$work/run.json") name=$(jq -r .input "$work/run.json")
+    run=$(jq -er .run "$work/run.json")
+    name=$(jq -er .input "$work/run.json")
     did=$(jq -er .signer_did "$signed/release-head.json")
-    commit=$(jq -r .source.commit "$work/inputs/$name/platform-input.json")
     mac=$(artifact "$run" release-mac)
-    seed_pkg=$(artifact "$run" release-seed)
+    read -r mac mac_digest _ <<< "$mac"
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
     cat <<EOF
@@ -127,25 +142,19 @@ ssh $RELEASE_SEED 'install -d -m 700 $stage/signed'
 scp $signed/{install.sh,release.json,release-head.json,components-aarch64-darwin.json} $RELEASE_SEED:$stage/signed/
 scp $work/signed.SHA256SUMS $RELEASE_SEED:$stage/
 
-# On the seed as the service user, with GH_TOKEN allowed to read Actions artifacts:
-set -euo pipefail; umask 077; cd $stage
-get() { curl -fsSL -H "Authorization: Bearer \$GH_TOKEN" -o "\$1.zip" "https://api.github.com/repos/$REPO/actions/artifacts/\$2/zip"
-        echo "\$3  \$1.zip" | sha256sum -c --quiet; unzip -q "\$1.zip" -d "\$1"; (cd "\$1" && sha256sum -c --quiet SHA256SUMS); }
-get mac ${mac% *} ${mac#* }
-get seed ${seed_pkg% *} ${seed_pkg#* }
+EOF
+    seed_preamble "$stage"
+    cat <<EOF
+get mac $mac $mac_digest
 cat mac/release-inputs.tar.gz.part* | tar -xzf -
 (cd inputs && sha256sum -c --quiet SHA256SUMS)
 cut -c67- signed.SHA256SUMS | while read -r f; do [ -e "signed/\$f" ] || cp "inputs/$name/artifacts/\$f" signed/; done
 (cd signed && sha256sum -c --quiet ../signed.SHA256SUMS)
 [ "\$(ls signed | wc -l)" = "\$(wc -l < signed.SHA256SUMS)" ]
-chmod 755 seed/elastos seed/ipfs-provider
-sudo systemctl stop $RELEASE_SEED_UNIT
-rm -rf $SOURCE_ROOT; mkdir -p $SOURCE_ROOT; tar -xzf seed/source.tar.gz -C $SOURCE_ROOT
-[ "\$(git -C $SOURCE_ROOT rev-parse HEAD)" = $commit ]
-[ -z "\$(git -C $SOURCE_ROOT status --porcelain)" ]
 export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
-publish() { seed/elastos publish-release --version $version --channel canary --signed-publication signed \\
-            --publisher-did $did --ipfs-provider-bin seed/ipfs-provider "\$@"; }
+publish() { $RELEASE_SEED_RUNTIME publish-release --version $version --channel canary --signed-publication signed \\
+            --publisher-did $did --ipfs-provider-bin $RELEASE_SEED_DATA/bin/ipfs-provider "\$@"; }
+sudo systemctl stop $RELEASE_SEED_UNIT
 publish --preflight-only
 # Import ends with a known gossip error after commit while the service is stopped.
 publish 2>&1 | tee import.log || grep -q 'committed; retry publication to announce its head: No running runtime found' import.log
@@ -153,8 +162,38 @@ sudo systemctl start $RELEASE_SEED_UNIT
 EOF
 }
 
+seed_upgrade() {
+    [[ $# == 1 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: seed-upgrade RUN_ID"
+    need_env RELEASE_SEED_USER RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
+    local pkg id digest name commit
+    pkg=$(artifact "$1" release-seed)
+    read -r id digest name <<< "$pkg"
+    commit=${name#release-seed-} commit=${commit%-*}
+    seed_preamble "$RELEASE_SEED_STAGE/seed-upgrade-$1"
+    cat <<EOF
+sudo install -d -o $RELEASE_SEED_USER /opt/elastos
+get seed $id $digest
+chmod 755 seed/elastos seed/ipfs-provider
+rm -rf $SOURCE_ROOT.new; mkdir $SOURCE_ROOT.new; tar -xzf seed/source.tar.gz -C $SOURCE_ROOT.new
+[ "\$(git -C $SOURCE_ROOT.new rev-parse HEAD)" = $commit ]
+[ -z "\$(git -C $SOURCE_ROOT.new status --porcelain)" ]
+export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
+sudo systemctl stop $RELEASE_SEED_UNIT
+rm -rf $SOURCE_ROOT; mv $SOURCE_ROOT.new $SOURCE_ROOT
+install -m 755 seed/elastos $RELEASE_SEED_RUNTIME
+install -m 755 seed/ipfs-provider $RELEASE_SEED_DATA/bin/ipfs-provider
+jq --arg c "sha256:\$(sha256sum seed/ipfs-provider | cut -d ' ' -f 1)" --argjson s "\$(stat -c %s seed/ipfs-provider)" \\
+   '.external["ipfs-provider"].platforms["linux-amd64"] += {checksum: \$c, size: \$s}' \\
+   $RELEASE_SEED_DATA/components.json > components.json
+install -m 600 components.json $RELEASE_SEED_DATA/components.json
+$SOURCE_ROOT/scripts/installed-provider-verify.sh --require-verified ipfs-provider
+sudo systemctl start $RELEASE_SEED_UNIT
+EOF
+}
+
 command="${1:-}"
 case "$command" in
     prepare|policy|seed) shift; "$command" "$@" ;;
-    *) sed -n '2,17p' "${BASH_SOURCE[0]}"; exit 2 ;;
+    seed-upgrade) shift; seed_upgrade "$@" ;;
+    *) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 2 ;;
 esac
