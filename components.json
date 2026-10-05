@@ -1469,54 +1469,6 @@
           "binary_path": "llama-server"
         }
       }
-    },
-    "model-qwen3.5-0.8b": {
-      "size_mb": 507,
-      "description": "Qwen3.5 0.8B Q4_K_M \u2014 small default for fast local startup",
-      "platforms": {
-        "*": {
-          "release_path": "model-qwen3.5-0.8b-any.tar.gz",
-          "extract_path": "model-qwen3.5-0.8b/Qwen3.5-0.8B-Q4_K_M.gguf",
-          "install_path": "models/Qwen3.5-0.8B-Q4_K_M.gguf",
-          "strategy": "source-build"
-        }
-      }
-    },
-    "model-qwen3.5-4b": {
-      "size_mb": 2740,
-      "description": "Qwen3.5 4B Q4_K_M \u2014 default for Orin Nano reliability",
-      "platforms": {
-        "*": {
-          "release_path": "model-qwen3.5-4b-any.tar.gz",
-          "extract_path": "model-qwen3.5-4b/Qwen3.5-4B-Q4_K_M.gguf",
-          "install_path": "models/Qwen3.5-4B-Q4_K_M.gguf",
-          "strategy": "source-build"
-        }
-      }
-    },
-    "model-qwen3.5-9b": {
-      "size_mb": 6170,
-      "description": "Qwen3.5 9B Q4_K_M \u2014 stable Mac evaluation candidate",
-      "platforms": {
-        "*": {
-          "release_path": "model-qwen3.5-9b-any.tar.gz",
-          "extract_path": "model-qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
-          "install_path": "models/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
-          "strategy": "source-build"
-        }
-      }
-    },
-    "model-bonsai-8b-q1": {
-      "size_mb": 1160,
-      "description": "PrismML Bonsai 8B Q1_0 \u2014 experimental low-memory Mac candidate",
-      "platforms": {
-        "*": {
-          "release_path": "model-bonsai-8b-q1-any.tar.gz",
-          "extract_path": "model-bonsai-8b-q1/Bonsai-8B-Q1_0.gguf",
-          "install_path": "models/Bonsai-8B-Q1_0.gguf",
-          "strategy": "source-build"
-        }
-      }
     }
   },
   "profiles": {
@@ -1695,8 +1647,7 @@
         "inbox",
         "assistant",
         "model-provider",
-        "llama-server",
-        "model-qwen3.5-0.8b"
+        "llama-server"
       ]
     },
     "public-gateway": {
@@ -1805,10 +1756,7 @@
         "vmlinux",
         "kubo",
         "cloudflared",
-        "llama-server",
-        "model-qwen3.5-0.8b",
-        "model-qwen3.5-4b",
-        "model-qwen3.5-9b"
+        "llama-server"
       ]
     }
   },
