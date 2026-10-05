@@ -134,8 +134,23 @@ class CapacityTests(unittest.TestCase):
         prepare = Mock(side_effect=self.refusal())
         with self.assertRaisesRegex(ValueError, 'timed out'):
             self.run_capacity(prepare, query=pending)
-        self.assertEqual(self.clock, 300)
+        self.assertEqual(self.clock, 900)
         prepare.assert_called_once()
+
+    def test_runtime_wait_ends_once_the_space_budget_is_met(self):
+        def pending(argv, timeout=30):
+            if argv[-2:] == ['help', 'runtime']:
+                return "delete alias 'all'; list"
+            if argv[-3:] == ['runtime', 'list', '-j']:
+                if self.clock >= 2:
+                    self.disk.free = 250
+                return json.dumps({'image': {'state': 'Deleting'}})
+            return ''
+        prepare = Mock(side_effect=[self.refusal(), {'status': 'ready'}])
+        self.run_capacity(prepare, query=pending)
+        self.assertEqual(self.record['status'], 'ready')
+        self.assertEqual(self.clock, 2)
+        self.assertEqual(prepare.call_count, 2)
 
     def test_asset_backed_runtime_deletion_can_settle_after_one_minute(self):
         def query(argv, timeout=30):

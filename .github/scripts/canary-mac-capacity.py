@@ -90,13 +90,14 @@ def run_capacity(record, growth, prepare_existing, measure, bindings=native_bind
         record['simulator_free_bytes_before'] = measure().free
         for operation in (['shutdown', 'all'], ['delete', 'all'], ['runtime', 'delete', 'all']):
             query(['/usr/bin/xcrun', 'simctl', *operation], timeout=60)
-        # Asset-backed runtime deletion continues after simctl returns.
-        deadline = monotonic() + 300
+        # Asset-backed runtime deletion continues after simctl returns. Stop waiting
+        # as soon as the space budget is met; the recheck below still enforces it.
+        deadline = monotonic() + 900
         while True:
             images = json.loads(query(['/usr/bin/xcrun', 'simctl', 'runtime', 'list', '-j']))
             need(isinstance(images, dict), 'Simulator image inventory differs')
             record['simulator_images_after'] = images
-            if not images:
+            if not images or enough(measure(), growth):
                 break
             need(monotonic() < deadline, 'Simulator runtime removal timed out')
             sleep(1)
