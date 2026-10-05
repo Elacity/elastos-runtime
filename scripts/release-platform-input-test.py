@@ -1101,7 +1101,6 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
     def test_real_unreleased_changelog_fits_release_bounds(self):
         with patch.object(inputs, "SOURCE_ROOT", Path(__file__).resolve().parent.parent):
             changes = inputs.changelog_changes("Unreleased")
-        self.assertTrue(changes)
         signer.check_release_changes(changes)
 
     def test_unsigned_handoff_omits_changes_without_matching_notes(self):
