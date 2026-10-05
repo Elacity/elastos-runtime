@@ -39,7 +39,9 @@ jobs:
         timeout-minutes: 40
         run: |
           set -euo pipefail
-          cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos -p localhost-provider
+          # `--bin elastos` filters every selected package, so build localhost-provider on its own.
+          cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
+          cargo build --locked --release --manifest-path elastos/Cargo.toml -p localhost-provider
           cargo build --locked --release --manifest-path capsules/ipfs-provider/Cargo.toml
           build="$RUNNER_TEMP/holder-build"
           install -d -m 700 "$build" "$RUNNER_TEMP/holder-output"
