@@ -206,6 +206,69 @@ class ReleasePolicyTests(unittest.TestCase):
                 cache = ["--cache-from", "type=gha", "--cache-to", "type=gha,mode=max"] if enabled else []
                 self.assertEqual(args, base + cache + ["--load", "."])
 
+    def test_github_runners_check_names_and_release_dependencies_stay_fixed(self):
+        expected = {
+            "source-gate": ("source-gate", "ubuntu-24.04"),
+            "engine-llama-arm64": ("engine-llama-arm64", "ubuntu-24.04-arm"),
+            "lint": ("lint", "ubuntu-24.04"),
+            "test-elastos": ("test-elastos", "ubuntu-24.04"),
+            "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
+            "test-capsules": ("test-capsules", "ubuntu-24.04"),
+            "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
+            "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
+            "source-home-macos": ("source-home-macos", "macos-14"),
+            "release": ("publish-github-release", "ubuntu-24.04"),
+        }
+        self.assertEqual(set(JOBS), set(expected))
+        for job, (name, runner) in expected.items():
+            self.assertEqual(field(JOBS[job], "name"), name)
+            self.assertEqual(field(JOBS[job], "runs-on"), runner)
+        self.assertEqual(field(JOBS["source-home-linux"], "os"),
+                         "[ubuntu-24.04, ubuntu-22.04-arm]")
+        self.assertIn("- os: ubuntu-22.04-arm\n            check_name: ubuntu-24.04-arm",
+                      JOBS["source-home-linux"])
+        needs = JOBS["release"].split("    needs:\n", 1)[1].split("    permissions:\n", 1)[0]
+        self.assertEqual(re.findall(r"- ([\w-]+)", needs),
+                         ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-macos"])
+        self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+    def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
+        mac_steps = steps("source-home-macos")
+        names = [step.splitlines()[0] for step in mac_steps]
+        generate = names.index("name: generate disposable signed install and update fixture")
+        prove = names.index("name: prove installed Home account and System update with Carrier hop and refusals")
+        build = names.index("name: build two actual Runtime versions")
+        capacity = names.index("name: reserve hosted Mac build and fixture capacity")
+        self.assertLess(capacity, names.index("name: source-home into isolated MAC_TEST_HOME"))
+        self.assertIn("prepare-ci-disk", mac_steps[capacity])
+        self.assertEqual(build + 1, generate)
+        self.assertIn("build-ci-hop", mac_steps[build])
+        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[build])
+        self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
+        self.assertEqual(prove, generate + 1)
+        self.assertNotIn("if:", mac_steps[generate])
+        self.assertNotIn("if:", mac_steps[prove])
+        self.assertIn("generate-ci-hop", mac_steps[generate])
+        self.assertIn('--runtime "$CI_HOP_ROOT/build-inputs/elastos-old"', mac_steps[generate])
+        self.assertIn('--next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new"', mac_steps[generate])
+        self.assertIn('--build-receipt "$CI_HOP_ROOT/build-inputs/build.json"', mac_steps[generate])
+        self.assertIn('--support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos"', mac_steps[generate])
+        self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal", mac_steps[prove])
+        self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', mac_steps[prove])
+        self.assertIn('python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json"', mac_steps[prove])
+        for step in mac_steps[generate:prove + 1]:
+            self.assertNotIn("FIXTURE_ARTIFACT_ID", step)
+            self.assertNotIn("GH_TOKEN", step)
+            self.assertNotIn("inputs.", step)
+        upload = mac_steps[names.index("name: retain the safe CI hop receipt")]
+        self.assertIn("${{ env.CI_HOP_ROOT }}/package/results/result.json", upload)
+        self.assertEqual(field(upload, "name"), "retain the safe CI hop receipt")
+        self.assertIn("name: macos-cli-update-hop-receipt", upload)
+        self.assertIn("if: always()", upload)
+        cleanup = mac_steps[names.index("name: remove stopped CI hop fixture files")]
+        self.assertIn("get('cleanup', {}).get('passed')", cleanup)
+        self.assertIn("shutil.rmtree(root)", cleanup)
+
     def test_engine_cache_has_exact_recipe_key_and_develop_only_writers(self):
         restore, = [step for step in steps("engine-llama-arm64") if "actions/cache/restore@" in step]
         save, = [step for step in steps("engine-llama-arm64") if "actions/cache/save@" in step]
