@@ -136,6 +136,12 @@ jobs:
             ${{ env.INPUT_ARTIFACT }}/receipts/disk-budget.json
           if-no-files-found: warn
           retention-days: 7
+      - name: preseed the four pinned model inputs through HTTPS redirects
+        timeout-minutes: 65
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -S ../workflow/.github/scripts/canary-model-preseed.py
       - name: start isolated build Kubo for the optional public model export
         if: inputs.prepare_models
         timeout-minutes: 15
@@ -216,7 +222,7 @@ jobs:
           unset ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
           scripts/prepare-release-platform.sh --version 0.8.0-alpha.3 --output "$INPUT_ARTIFACT/N3"
           python3 -I -S scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N3" > "$INPUT_ARTIFACT/receipts/N3-verify.json"
-          rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+          rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR" "$OWNED_ROOT/upstream-cache"
       - name: prepare V4 with fresh Cargo outputs and exact V3 support
         timeout-minutes: 100
         run: |
@@ -322,7 +328,7 @@ jobs:
                       while alive() and time.monotonic() < deadline: time.sleep(0.25)
                       if alive(): raise RuntimeError('Owned build Kubo remains alive after bounded cleanup')
               stopped = pid
-          for name in ('home', 'cargo-V3', 'cargo-V4', 'cargo-build-V3', 'cargo-build-V4', 'kubo-cache', 'model-kubo'):
+          for name in ('home', 'cargo-V3', 'cargo-V4', 'cargo-build-V3', 'cargo-build-V4', 'kubo-cache', 'model-kubo', 'upstream-cache'):
               path = root / name
               if path.is_symlink(): raise RuntimeError('Owned cleanup root is a symlink')
               if path.exists(): shutil.rmtree(path)
