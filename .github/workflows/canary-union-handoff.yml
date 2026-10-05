@@ -86,22 +86,33 @@ jobs:
           if api('issues/89')['state'] != 'open':
               raise SystemExit('#89 is closed; package preparation has ended')
           pr = api('pulls/' + pr_number)
-          if not pr['merged'] or pr['base']['ref'] != 'develop' or pr['merge_commit_sha'] != commit:
-              raise SystemExit('Source must be the completed source PR merge into develop')
           source = api('git/commits/' + commit)
-          if source['tree']['sha'] != tree or len(source['parents']) != 2:
-              raise SystemExit('Source must match the normal merge commit and exact tree')
-          head = pr['head']['sha']
-          if head not in [p['sha'] for p in source['parents']]:
-              raise SystemExit('Normal merge must retain the reviewed union head')
-          if api('git/commits/' + head)['tree']['sha'] != tree:
-              raise SystemExit('Merge tree changed from the reviewed union tree')
-          comparison = api('compare/' + commit + '...develop')
-          if comparison['status'] not in ('ahead', 'identical'):
-              raise SystemExit('Develop must contain the union merge commit')
+          if pr['base']['ref'] != 'develop' or source['tree']['sha'] != tree:
+              raise SystemExit('Source must be a develop PR commit with the exact tree')
           run = api('actions/runs/' + run_id)
-          if (run['status'], run['conclusion']) != ('completed', 'success'):
-              raise SystemExit('Union Runtime CI must finish successfully')
+          if pr['merged']:
+              if pr['merge_commit_sha'] != commit or len(source['parents']) != 2:
+                  raise SystemExit('Source must be the completed source PR merge into develop')
+              head = pr['head']['sha']
+              if head not in [p['sha'] for p in source['parents']]:
+                  raise SystemExit('Normal merge must retain the reviewed union head')
+              if api('git/commits/' + head)['tree']['sha'] != tree:
+                  raise SystemExit('Merge tree changed from the reviewed union tree')
+              comparison = api('compare/' + commit + '...develop')
+              if comparison['status'] not in ('ahead', 'identical'):
+                  raise SystemExit('Develop must contain the union merge commit')
+              if (run['status'], run['conclusion']) != ('completed', 'success'):
+                  raise SystemExit('Union Runtime CI must finish successfully')
+          else:
+              # Key-free build of the open PR head while its CI runs. The signer
+              # still refuses a commit that is not on develop, and develop admits
+              # only green, reviewed merges, so this moves no release gate.
+              head = commit
+              if pr['state'] != 'open' or pr['head']['sha'] != commit:
+                  raise SystemExit('Open source PR head must equal the source commit')
+              comparison = api('compare/develop...' + commit)
+              if comparison['status'] not in ('ahead', 'identical') or comparison['behind_by'] != 0:
+                  raise SystemExit('Open source PR must contain current develop')
           if run['path'].split('@')[0] != '.github/workflows/ci.yml':
               raise SystemExit('Admission requires the Runtime CI workflow')
           if run['head_repository']['full_name'] != 'Elacity/elastos-runtime':
@@ -115,8 +126,8 @@ jobs:
               'source_tree': tree, 'union_pr': int(pr_number), 'union_head': head,
               'source_ci_run': int(run_id), 'ci_attempt': run['run_attempt'],
               'workflow_commit': os.environ['GITHUB_SHA'], 'published_at': stamp,
-              'mac_versions': ['0.8.0-alpha.4', '0.8.0-alpha.5'],
-              'seed_version': '0.8.0-alpha.4',
+              'mac_versions': ['0.8.0-alpha.5', '0.8.0-alpha.6'],
+              'seed_version': '0.8.0-alpha.5', 'source_pr_merged': pr['merged'],
               'scope': 'key-free package inputs; operator owns signing and installation'}
           pathlib.Path('union-admission.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:

@@ -106,7 +106,7 @@ jobs:
               'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
               'source_ci_run': int(os.environ['SOURCE_CI_RUN']), 'workflow_commit': os.environ['GITHUB_SHA'],
               'published_at': os.environ['PUBLISHED_AT'],
-              'mac_versions': ['0.8.0-alpha.4', '0.8.0-alpha.5'], 'seed_version': '0.8.0-alpha.4'}
+              'mac_versions': ['0.8.0-alpha.5', '0.8.0-alpha.6'], 'seed_version': '0.8.0-alpha.5'}
           if any(admission.get(key) != value for key, value in expected.items()):
               raise RuntimeError('Shared union admission pins differ')
           receipts = Path(os.environ['RUNNER_TEMP']) / ('union-mac-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']) / 'inputs/receipts'
@@ -214,7 +214,7 @@ jobs:
             export ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT="$INPUT_ARTIFACT/N3-model-handoff"
           fi
           unset ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
-          scripts/prepare-release-platform.sh --version 0.8.0-alpha.4 --output "$INPUT_ARTIFACT/N3"
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.5 --output "$INPUT_ARTIFACT/N3"
           python3 -I -S scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N3" > "$INPUT_ARTIFACT/receipts/N3-verify.json"
           rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR" "$OWNED_ROOT/upstream-cache"
       - name: prepare V4 with fresh Cargo outputs and exact V3 support
@@ -244,7 +244,7 @@ jobs:
           unset ELASTOS_RELEASE_MODEL_KUBO_BIN ELASTOS_RELEASE_MODEL_KUBO_REPO \
             ELASTOS_RELEASE_MODEL_PUBLISHED_AT ELASTOS_RELEASE_MODEL_PUBLISHER_DID \
             ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT ELASTOS_RELEASE_MODEL_HANDOFF_INPUT
-          scripts/prepare-release-platform.sh --version 0.8.0-alpha.5 --output "$INPUT_ARTIFACT/N4" --reuse-support "$INPUT_ARTIFACT/N3"
+          scripts/prepare-release-platform.sh --version 0.8.0-alpha.6 --output "$INPUT_ARTIFACT/N4" --reuse-support "$INPUT_ARTIFACT/N3"
           python3 -I -S scripts/release-platform-input.py verify "$INPUT_ARTIFACT/N4" > "$INPUT_ARTIFACT/receipts/N4-verify.json"
           rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
       - name: verify native versions, source and support parity
@@ -257,7 +257,7 @@ jobs:
           if (root / 'N4/support-input.json').read_bytes() != (root / 'N3/platform-input.json').read_bytes():
               raise RuntimeError('V4 original support receipt differs from V3')
           records = []
-          for name, version in [('N3', '0.8.0-alpha.4'), ('N4', '0.8.0-alpha.5')]:
+          for name, version in [('N3', '0.8.0-alpha.5'), ('N4', '0.8.0-alpha.6')]:
               receipt = json.loads((root / name / 'platform-input.json').read_bytes())
               if receipt['source']['commit'] != os.environ['SOURCE_COMMIT'] or receipt['source']['tree'] != os.environ['SOURCE_TREE']:
                   raise RuntimeError('Native source binding differs')

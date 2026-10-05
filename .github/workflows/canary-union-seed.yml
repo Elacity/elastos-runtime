@@ -29,7 +29,7 @@ env:
   SOURCE_COMMIT: ${{ inputs.source_commit }}
   SOURCE_TREE: ${{ inputs.source_tree }}
   SOURCE_CI_RUN: ${{ inputs.source_ci_run }}
-  ELASTOS_RELEASE_VERSION: 0.8.0-alpha.4
+  ELASTOS_RELEASE_VERSION: 0.8.0-alpha.5
   HELPER_APPROVAL_COMMENT: '5969584669'
   HELPER_APPROVAL_SHA256: 635aa0a1cb223111ab430beb8cfe888887767e90da56ce7c6fb6dd3a6eba3d04
   CARGO_BUILD_JOBS: '4'
@@ -101,7 +101,7 @@ jobs:
           assert shared['source_ci_run'] == int(os.environ['SOURCE_CI_RUN'])
           assert shared['workflow_commit'] == os.environ['GITHUB_SHA']
           assert shared['seed_version'] == os.environ['ELASTOS_RELEASE_VERSION']
-          assert shared['mac_versions'] == ['0.8.0-alpha.4', '0.8.0-alpha.5']
+          assert shared['mac_versions'] == ['0.8.0-alpha.5', '0.8.0-alpha.6']
           decision = api(f"/repos/{repository}/issues/comments/{os.environ['HELPER_APPROVAL_COMMENT']}")
           assert decision['user']['login'] == 'andersalm'
           assert hashlib.sha256(decision['body'].encode()).hexdigest() == os.environ['HELPER_APPROVAL_SHA256']
