@@ -4252,13 +4252,8 @@ pub(crate) mod tests {
                         .is_some_and(|path| path.ends_with(".gguf")))),
             "Home installs the engine and models only on demand"
         );
-        let on_demand = resolve_components(
-            &manifest,
-            None,
-            &["llama-server".to_string()],
-            &[],
-        )
-        .unwrap();
+        let on_demand =
+            resolve_components(&manifest, None, &["llama-server".to_string()], &[]).unwrap();
         assert_eq!(on_demand, ["llama-server"]);
         let catalog = manifest
             .model_catalog
