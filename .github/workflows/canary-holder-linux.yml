@@ -362,9 +362,12 @@ jobs:
               ready(gateway_home, gateway, gateway_port)
               assert read(gateway_home, gateway_port, cids[0], warmup, 'gateway-before-idle')
               gateway_provider = provider_identity(gateway, gateway_data / 'bin/ipfs-provider')
-              before = idle_stop(gateway_data, gateway, gateway_provider, 'gateway-generic-file', 'gateway')
-              assert read(gateway_home, gateway_port, cids[2], generic, 'gateway-generic-file-after-idle')
-              restarted(gateway_data, before, 'gateway-generic-file')
+              # The gateway role keeps Kubo up (idle stop disabled); the next step
+              # proves that over real idle time. Here the uncached read must reuse it.
+              assert 'Runtime host role Gateway; idle stop disabled' in processes.text('gateway', 'stderr')
+              gateway_kubo = json.loads((gateway_data / 'ipfs-coords.json').read_bytes())['kubo_pid']
+              assert read(gateway_home, gateway_port, cids[2], generic, 'gateway-generic-file-uncached')
+              assert json.loads((gateway_data / 'ipfs-coords.json').read_bytes())['kubo_pid'] == gateway_kubo
               assert gateway.poll() is None and provider_identity(gateway, gateway_data / 'bin/ipfs-provider') == gateway_provider
               result['same_gateway_generation'] = child_identity(gateway.pid)
               result['same_gateway_provider_generation'] = gateway_provider
