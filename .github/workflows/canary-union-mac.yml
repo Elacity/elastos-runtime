@@ -136,12 +136,6 @@ jobs:
             ${{ env.INPUT_ARTIFACT }}/receipts/disk-budget.json
           if-no-files-found: warn
           retention-days: 7
-      - name: preseed the four pinned model inputs through HTTPS redirects
-        timeout-minutes: 65
-        run: |
-          set -euo pipefail
-          umask 077
-          python3 -I -S ../workflow/.github/scripts/canary-model-preseed.py
       - name: start isolated build Kubo for the optional public model export
         if: inputs.prepare_models
         timeout-minutes: 15
