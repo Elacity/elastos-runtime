@@ -1095,8 +1095,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     let fixture = PrivateFixture::new();
-    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
-    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let listener = tokio::net::TcpListener::bind("[::1]:8090").await.unwrap();
     let fetched = Arc::new(AtomicUsize::new(0));
     let observed = fetched.clone();
     let health_observed = fetched.clone();
@@ -1140,7 +1139,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let generation = "a".repeat(32);
     let binary_hash = digest(b"fixture owned gateway binary");
     let mut coords = json!({
-        "api_url":api_url, "home_url":format!("{api_url}/home/"),
+        "api_url":"http://[::1]:8090", "home_url":"http://[::1]:8090/home/",
         "attach_secret":"fixture-attach-secret", "runtime_kind":"gateway",
         "pid":pid, "generation":generation, "binary_sha256":binary_hash,
     });

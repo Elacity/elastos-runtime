@@ -1929,7 +1929,7 @@ fn support_paths_snapshot(
                 }
             }
         }
-        fingerprint_support_tree(&data_dir.join(&relative), excluded, &mut digest)?;
+        fingerprint_support_tree(&data_dir.join(relative), excluded, &mut digest)?;
     }
     Ok(hex::encode(digest.finalize()))
 }
