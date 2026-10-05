@@ -62,6 +62,13 @@ jobs:
           ref: ${{ inputs.source_commit }}
           path: source
           persist-credentials: false
+      - name: check out the pinned workflow capacity controller
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          sparse-checkout: .github/scripts
+          persist-credentials: false
       - name: read the shared admission from this dispatch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -116,28 +123,19 @@ jobs:
         run: |
           set -euo pipefail
           brew install e2fsprogs coturn pkg-config openssl@3
-          python3 -I -S - <<'PYCODE'
-          import importlib.util, json, os, shutil
-          from pathlib import Path
-          planned = (70 if os.environ['PREPARE_MODELS'] == 'true' else 50) * 1024**3
-          spec = importlib.util.spec_from_file_location('capacity', 'scripts/update-hop-compare.py')
-          capacity = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(capacity)
-          original = capacity.cli_reclaim_xcode
-          capacity.cli_reclaim_xcode = lambda apps, protected, growth, measure, remove: original(apps, protected, planned, measure, remove)
-          reclaimed = capacity.cli_prepare_ci_disk()
-          Path(os.environ['INPUT_ARTIFACT'], 'receipts/hosted-capacity.json').write_text(json.dumps(reclaimed, indent=2) + '\n')
-          usage = shutil.disk_usage(os.environ['OWNED_ROOT'])
-          # Both native inputs include four licensed model archives. Export also
-          # retains CARs and Kubo blocks. Each fresh Cargo domain is removed
-          # after output verification, before the next build and archive creation.
-          growth = planned
-          if (usage.free - growth) * 100 < usage.total * 15:
-              raise SystemExit(f'Hosted Mac needs {growth} planned bytes plus its 15% disk reserve; free={usage.free}, total={usage.total}')
-          Path(os.environ['INPUT_ARTIFACT'], 'receipts/disk-budget.json').write_text(json.dumps({
-              'free_bytes': usage.free, 'total_bytes': usage.total,
-              'planned_growth_bytes': growth, 'reserve_percent': 15}, indent=2) + '\n')
-          PYCODE
+          [[ "$(git -C ../workflow rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git -C ../workflow status --porcelain=v1 --untracked-files=all)" ]]
+          python3 -I -S ../workflow/.github/scripts/canary-mac-capacity.py
+      - name: retain bounded capacity diagnostics
+        if: always() && env.INPUT_ARTIFACT != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: union-mac-capacity-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.INPUT_ARTIFACT }}/receipts/hosted-capacity.json
+            ${{ env.INPUT_ARTIFACT }}/receipts/disk-budget.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: start isolated build Kubo for the optional public model export
         if: inputs.prepare_models
         timeout-minutes: 15
