@@ -1,6 +1,7 @@
 use super::super::gateway_home_update::{
     check_matches_source, choice_matches, system_runtime_update_summary_with_cache,
-    SystemUpdateApplyRequest, UpdateCheckCache, UpdateCheckKey, UpdateCheckSnapshot,
+    system_update_failure, SystemUpdateApplyRequest, UpdateCheckCache, UpdateCheckKey,
+    UpdateCheckSnapshot,
 };
 use super::home_system::{home_test_get_json, home_test_post_json};
 use super::*;
@@ -829,5 +830,32 @@ async fn system_update_exact_retry_recovers_both_queue_write_boundaries() {
         if dispatched == "completed" {
             assert!(!controller.join("request.json").exists());
         }
+    }
+}
+
+#[tokio::test]
+async fn system_update_failures_explain_the_cause_without_private_error_details() {
+    for (error, expected_status, expected_cause) in [
+        (
+            anyhow::Error::from(crate::update::UpdateSourceUnavailable)
+                .context("private source endpoint"),
+            StatusCode::FAILED_DEPENDENCY,
+            "Connect to the internet and select Update again.",
+        ),
+        (
+            anyhow::anyhow!("private verification detail"),
+            StatusCode::CONFLICT,
+            "release was refused or verification failed",
+        ),
+    ] {
+        let response = system_update_failure(&error);
+        assert_eq!(response.status(), expected_status);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = value["error"].as_str().unwrap();
+        assert!(message.contains(expected_cause));
+        assert!(!message.contains("private"));
     }
 }

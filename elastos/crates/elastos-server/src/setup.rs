@@ -2992,6 +2992,251 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
     Ok(refreshed)
 }
 
+/// Prepare installed support in an isolated tree. The release transaction owns
+/// publication and rollback; setup owns archive validation and cache metadata.
+pub(crate) async fn stage_update_support(
+    data_dir: &Path,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+    platform: &str,
+    fetch: &crate::update::FetchFn,
+    owner: &mut dyn crate::update::RestartOwner,
+) -> anyhow::Result<(tempfile::TempDir, Vec<(PathBuf, PathBuf)>)> {
+    for bytes in [old_bytes, new_bytes] {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(
+            value["schema"] == "elastos.components/v1",
+            "unsupported release components schema"
+        );
+    }
+    let old: ComponentsManifest = serde_json::from_slice(old_bytes)?;
+    let new: ComponentsManifest = serde_json::from_slice(new_bytes)?;
+    let stage = tempfile::tempdir_in(data_dir)?;
+    let mut paths = std::collections::BTreeMap::new();
+    for (name, component) in &new.external {
+        let info = resolve_platform_info(component, platform);
+        let old_component = old.external.get(name);
+        let required = new
+            .profiles
+            .get("home")
+            .is_some_and(|profile| profile.components.contains(name));
+        let installed = !matches!(
+            component_install_state_for_name(
+                &old,
+                data_dir,
+                name,
+                old_component.unwrap_or(component),
+                old_component.and_then(|old| resolve_platform_info(old, platform))
+            ),
+            InstallState::Missing
+        );
+        if !installed && !required {
+            continue;
+        }
+        let info =
+            info.ok_or_else(|| anyhow::anyhow!("required support unavailable for this platform"))?;
+        let changed = component_signature(old_component, platform)
+            != component_signature(Some(component), platform);
+        let mut assets = Vec::new();
+        if changed || !installed {
+            let path = resolve_install_path(component, Some(info))
+                .ok_or_else(|| anyhow::anyhow!("support install path missing"))?;
+            if let Some(old_path) = old_component
+                .and_then(|old| resolve_install_path(old, resolve_platform_info(old, platform)))
+            {
+                if path != old_path {
+                    paths.insert(PathBuf::from(old_path), PathBuf::new());
+                }
+            }
+            assets.push((PathBuf::from(path), info, false));
+        }
+        if component_capsule_metadata_changed(old_component, component, platform)
+            || changed
+            || !installed
+        {
+            if let Some(metadata) = &component.capsule_metadata {
+                let info = resolve_component_capsule_metadata_platform_info(metadata, platform)
+                    .ok_or_else(|| anyhow::anyhow!("support metadata unavailable"))?;
+                let path = resolve_component_capsule_metadata_install_path(metadata, Some(info))
+                    .ok_or_else(|| anyhow::anyhow!("support metadata path missing"))?;
+                validate_capsule_component_install_path(name, path)?;
+                assets.push((PathBuf::from(path), info, true));
+            }
+        }
+        for (relative, asset, metadata) in assets {
+            crate::install_transaction::validate_support_path(&relative)?;
+            anyhow::ensure!(
+                asset.strategy.is_none(),
+                "update support requires signed release artifacts"
+            );
+            required_release_artifact_checksum(name, asset)?
+                .ok_or_else(|| anyhow::anyhow!("signed support checksum missing"))?;
+            let key =
+                if let Some(path) = asset.release_path.as_ref().filter(|path| !path.is_empty()) {
+                    anyhow::ensure!(
+                        !Path::new(path).is_absolute()
+                            && Path::new(path)
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_))),
+                        "unsafe signed support release path"
+                    );
+                    format!("release-path:{path}")
+                } else {
+                    let cid = asset
+                        .cid
+                        .as_ref()
+                        .filter(|cid| !cid.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("signed support source missing"))?;
+                    cid::Cid::try_from(cid.as_str())?;
+                    cid.clone()
+                };
+            owner.progress("downloading", &crate::update::download_message(asset.size))?;
+            let bytes = fetch(key, Vec::new()).await?;
+            owner.progress(
+                "verifying",
+                "Verifying the update. Home restarts when the update is ready.",
+            )?;
+            verify_checksum(name, &bytes, asset)?;
+            if let Some(size) = asset.size {
+                anyhow::ensure!(bytes.len() as u64 == size, "support artifact size mismatch");
+            }
+            let dest = stage.path().join(&relative);
+            if asset.extract_path.is_some() {
+                extract_from_tarball(&bytes, &dest, asset)?;
+            } else {
+                atomic_write_file(&dest, &bytes)?;
+                fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+            }
+            if metadata {
+                write_platform_cache_metadata(asset, &dest)?;
+                anyhow::ensure!(
+                    installed_component_capsule_metadata_stale_reason(name, component, &dest)
+                        .is_none(),
+                    "support capsule metadata verification failed"
+                );
+            } else {
+                write_cache_metadata(&new, Some(asset), platform, name, &dest)?;
+            }
+            paths.insert(relative, dest.clone());
+            if !metadata && asset.binary_path.is_some() {
+                // Bundle aliases point to the final owned installation, not staging.
+                let relative = PathBuf::from("bin").join(name);
+                crate::install_transaction::validate_support_path(&relative)?;
+                let link = stage.path().join(&relative);
+                fs::create_dir_all(link.parent().unwrap())?;
+                let binary = Path::new(asset.binary_path.as_deref().unwrap());
+                anyhow::ensure!(
+                    !binary.is_absolute()
+                        && binary
+                            .components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_))),
+                    "unsafe support executable path"
+                );
+                anyhow::ensure!(dest.join(binary).is_file(), "support executable missing");
+                std::os::unix::fs::symlink(
+                    data_dir
+                        .join(
+                            asset
+                                .install_path
+                                .as_deref()
+                                .ok_or_else(|| anyhow::anyhow!("bundle install path missing"))?,
+                        )
+                        .join(binary),
+                    &link,
+                )?;
+                paths.insert(relative, link);
+            }
+        }
+    }
+    for (name, component) in &old.external {
+        if !new.external.contains_key(name) {
+            if let Some(path) =
+                resolve_install_path(component, resolve_platform_info(component, platform))
+            {
+                paths.insert(PathBuf::from(path), PathBuf::new());
+            }
+        }
+    }
+    for name in old.capsules.keys().chain(new.capsules.keys()) {
+        let relative = PathBuf::from("capsules").join(name);
+        crate::install_transaction::validate_support_path(&relative)?;
+        let changed = match (old.capsules.get(name), new.capsules.get(name)) {
+            (Some(old), Some(new)) => old.cid != new.cid || old.sha256 != new.sha256,
+            _ => true,
+        };
+        if !changed
+            || paths
+                .keys()
+                .any(|path| path.starts_with(&relative) || relative.starts_with(path))
+        {
+            continue;
+        }
+        let Some(entry) = new.capsules.get(name) else {
+            paths.insert(relative, PathBuf::new());
+            continue;
+        };
+        // Uninstalled optional apps remain on demand. A cached app must be ready
+        // before activation, with the same archive and cache contract as supervisor.
+        if !data_dir.join(&relative).exists() {
+            continue;
+        }
+        cid::Cid::try_from(entry.cid.as_str())?;
+        anyhow::ensure!(!entry.sha256.is_empty(), "signed capsule checksum missing");
+        owner.progress(
+            "downloading",
+            &crate::update::download_message(Some(entry.size)),
+        )?;
+        let bytes = fetch(entry.cid.clone(), Vec::new()).await?;
+        owner.progress(
+            "verifying",
+            "Verifying the update. Home restarts when the update is ready.",
+        )?;
+        anyhow::ensure!(
+            hex::encode(sha2::Sha256::digest(&bytes)) == entry.sha256
+                && bytes.len() as u64 == entry.size,
+            "capsule artifact verification failed"
+        );
+        let dest = stage.path().join(&relative);
+        fs::create_dir_all(&dest)?;
+        tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice())).unpack(&dest)?;
+        anyhow::ensure!(
+            dest.join("capsule.json").is_file(),
+            "capsule manifest missing"
+        );
+        fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", entry.cid))?;
+        fs::write(
+            dest.join(CACHED_ARTIFACT_SHA_FILE),
+            format!("{}\n", entry.sha256),
+        )?;
+        paths.insert(relative, dest);
+    }
+    // Journal the first absent parent as one tree. Recovery then removes a new
+    // bundle's directories as well as its files, preserving the old support set.
+    let mut complete = std::collections::BTreeMap::new();
+    for (relative, source) in &paths {
+        let mut root = relative.clone();
+        if !source.as_os_str().is_empty() {
+            while !data_dir.join(root.parent().unwrap()).exists() {
+                root = root.parent().unwrap().to_path_buf();
+                crate::install_transaction::validate_support_path(&root)?;
+            }
+        }
+        let source = if root == *relative {
+            source.clone()
+        } else {
+            stage.path().join(&root)
+        };
+        complete.insert(root, source);
+    }
+    let roots: Vec<_> = complete.keys().cloned().collect();
+    complete.retain(|path, _| {
+        !roots
+            .iter()
+            .any(|root| root != path && path.starts_with(root))
+    });
+    Ok((stage, complete.into_iter().collect()))
+}
+
 fn component_signature(component: Option<&Component>, platform: &str) -> Option<String> {
     let component = component?;
     let platform_info = resolve_platform_info(component, platform)?;

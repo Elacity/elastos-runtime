@@ -16,13 +16,13 @@ use elastos_common::localhost::{
 };
 
 use crate::crypto::{verify_release_envelope, verify_release_envelope_against_dids};
-use crate::install_transaction::{InstallTransaction, ReleaseFile};
+use crate::install_transaction::{InstallTransaction, ReleaseFile, RestartPhase};
 use crate::install_transaction::{RestartPlan, RestartRecord};
 use crate::sources::{
     default_data_dir, default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
 };
 
-/// Async callback for fetching content by CID from the trusted source.
+/// Async callback for fetching a CID or `release-path:<path>` from the trusted source.
 /// The caller decides whether any explicit transport override is allowed.
 pub type FetchFn = Box<
     dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send>>
@@ -54,12 +54,19 @@ pub async fn discover_carrier_release_head(
 ) -> anyhow::Result<DiscoveredHead> {
     let announcement = client
         .release_head()
-        .await?
+        .await
+        .context(UpdateSourceUnavailable)?
         .ok_or_else(|| anyhow::anyhow!("Trusted source returned no release head"))?;
     resolve_discovered_head(&announcement, source, |cid| async move {
         match cid {
-            Some(cid) => client.fetch_content(&cid, None).await,
-            None => client.fetch_file("release-head.json").await,
+            Some(cid) => client
+                .fetch_content(&cid, None)
+                .await
+                .context(UpdateSourceUnavailable),
+            None => client
+                .fetch_file("release-head.json")
+                .await
+                .context(UpdateSourceUnavailable),
         }
     })
     .await
@@ -811,7 +818,25 @@ enum ApplyMode {
     FrozenOffline,
 }
 
+#[derive(Debug)]
+pub(crate) struct UpdateSourceUnavailable;
+impl std::fmt::Display for UpdateSourceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("update source unavailable")
+    }
+}
+impl std::error::Error for UpdateSourceUnavailable {}
+
+pub(crate) fn download_message(size: Option<u64>) -> String {
+    let size = size
+        .map(|bytes| format!(" ({})", format_bytes(bytes as usize)))
+        .unwrap_or_default();
+    format!("Downloading the update{size}. Home restarts when the update is ready.")
+}
+
 pub(crate) trait RestartOwner: Send {
+    fn progress(&self, phase: &str, message: &str) -> anyhow::Result<()>;
+
     fn plan(
         &self,
         support_sha256: String,
@@ -1312,7 +1337,16 @@ async fn run_upgrade_with_restart(
             .map(|n| format!(" [{}]", format_bytes(n as usize)))
             .unwrap_or_default()
     );
+    if let Some(owner) = restart_owner.as_ref() {
+        owner.progress("downloading", &download_message(binary_size))?;
+    }
     let binary_data = fetch_fn(binary_cid.to_string(), ordered_gateways.to_vec()).await?;
+    if let Some(owner) = restart_owner.as_ref() {
+        owner.progress(
+            "verifying",
+            "Verifying the update. Home restarts when the update is ready.",
+        )?;
+    }
     println!("  Downloaded binary: {}", format_bytes(binary_data.len()));
 
     // Verify SHA-256
@@ -1346,7 +1380,16 @@ async fn run_upgrade_with_restart(
             .map(|n| format!(" [{}]", format_bytes(n as usize)))
             .unwrap_or_default()
     );
+    if let Some(owner) = restart_owner.as_ref() {
+        owner.progress("downloading", &download_message(comp_size))?;
+    }
     let comp_data = fetch_fn(comp_cid.to_string(), ordered_gateways.to_vec()).await?;
+    if let Some(owner) = restart_owner.as_ref() {
+        owner.progress(
+            "verifying",
+            "Verifying the update. Home restarts when the update is ready.",
+        )?;
+    }
     println!(
         "  Downloaded components.json: {}",
         format_bytes(comp_data.len())
@@ -1533,21 +1576,26 @@ async fn run_upgrade_with_restart(
         return Ok(());
     }
 
-    // This first recovery seam supports an offline hop with unchanged support assets.
-    // The installation lock coordinates writers; the host lock keeps the Home offline.
+    // The restart owner stages support while Home runs. Standalone frozen updates
+    // retain their offline fence and unchanged-support contract.
     let bin_path = if source.install_path.is_empty() {
         default_install_path()
     } else {
         PathBuf::from(&source.install_path)
     };
     let transaction = InstallTransaction::acquire(data_dir, &bin_path)?;
-    let _offline =
-        crate::host_lock::acquire_host_process_lock(transaction.data_dir(), "update", "offline")
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "offline update requires the restart owner to stop Runtime first: {error}"
-                )
-            })?;
+    let mut offline = if restart_owner.is_none() {
+        Some(
+            crate::host_lock::acquire_host_process_lock(
+                transaction.data_dir(),
+                "update",
+                "offline",
+            )
+            .context("offline update requires the restart owner to stop Runtime first")?,
+        )
+    } else {
+        None
+    };
     transaction.recover()?;
     anyhow::ensure!(
         transaction.uses_consumed_layout(),
@@ -1561,13 +1609,30 @@ async fn run_upgrade_with_restart(
     let data_dir = transaction.data_dir();
     crate::api::auth_gateway::verify_configured_principal_roots_ready(data_dir)?;
     let old_components = std::fs::read(data_dir.join("components.json"))?;
-    let support = frozen_support_snapshot(
-        data_dir,
-        &old_components,
-        &comp_data,
-        &component_platform,
-        &transaction.excluded_paths(),
-    )?;
+    let staged_support = if let Some(owner) = restart_owner.as_mut() {
+        Some(
+            crate::setup::stage_update_support(
+                data_dir,
+                &old_components,
+                &comp_data,
+                &component_platform,
+                fetch_fn,
+                *owner,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if restart_owner.is_none() {
+        frozen_support_snapshot(
+            data_dir,
+            &old_components,
+            &comp_data,
+            &component_platform,
+            &transaction.excluded_paths(),
+        )?;
+    }
     let bin_path = transaction.binary_path();
 
     // Build gateway list with working gateway first (if discovered via gateway)
@@ -1609,13 +1674,6 @@ async fn run_upgrade_with_restart(
         (ReleaseFile::ReleaseHead, head_bytes),
         (ReleaseFile::ReleaseManifest, release_bytes.as_slice()),
     ];
-    let restart_plan = restart_owner
-        .as_ref()
-        .map(|owner| owner.plan(support.clone(), current_version, version))
-        .transpose()?;
-    if let Some(plan) = &restart_plan {
-        crate::install_transaction::validate_restart_plan(plan)?;
-    }
     transaction.preflight_prepare(&files, &previous.head, &previous.release)?;
     verify_candidate_before_migration(&transaction, &binary_data, version).await?;
     crate::installed_release::load_or_migrate(
@@ -1625,37 +1683,54 @@ async fn run_upgrade_with_restart(
         transaction.writer_guard(),
     )?;
     transaction.prepare(&files)?;
-    let support_check = frozen_support_snapshot(
-        data_dir,
-        &old_components,
-        &comp_data,
-        &component_platform,
-        &transaction.excluded_paths(),
-    )
-    .and_then(|current| {
-        if current != support {
-            anyhow::bail!("installed support changed during staging; previous release preserved");
+    if let Some((_, paths)) = &staged_support {
+        if let Err(error) = transaction.prepare_support(paths) {
+            transaction.abort()?;
+            return Err(error);
         }
-        Ok(())
-    });
-    if let Err(error) = support_check {
-        return match transaction.abort() {
-            Ok(()) => Err(error),
-            Err(recovery) => Err(error.context(format!("release recovery required: {recovery:#}"))),
-        };
     }
-    if let Some(plan) = restart_plan {
-        if let Err(error) = transaction.prepare_restart(plan) {
-            return match transaction.abort() {
-                Ok(()) => Err(error),
-                Err(recovery) => {
-                    Err(error.context(format!("release recovery required: {recovery:#}")))
-                }
-            };
+    let prepared = (|| {
+        let support = support_snapshot(
+            data_dir,
+            &old_components,
+            &comp_data,
+            &component_platform,
+            &transaction.excluded_paths(),
+        )?;
+        let restart_plan = restart_owner
+            .as_ref()
+            .map(|owner| owner.plan(support.clone(), current_version, version))
+            .transpose()?;
+        if let Some(plan) = restart_plan {
+            transaction.prepare_restart(plan)?;
         }
+        Ok::<_, anyhow::Error>(support)
+    })();
+    let support = match prepared {
+        Ok(support) => support,
+        Err(error) => {
+            transaction.abort()?;
+            return Err(error);
+        }
+    };
+    // All downloads, executable checks and rollback preparation finish while the
+    // current Home owns its host lock. The offline fence starts at activation.
+    if let Some(owner) = restart_owner.as_mut() {
+        if let Err(error) =
+            owner.progress("restarting", "Installing the update and restarting Home.")
+        {
+            transaction.abort_pre_activation_restart()?;
+            return Err(error);
+        }
+        owner.stop().await?;
+    }
+    if restart_owner.is_some() {
+        offline = Some(crate::host_lock::acquire_host_process_lock(
+            data_dir, "update", "offline",
+        )?);
     }
     let activation = transaction.commit_checked(|| {
-        if frozen_support_snapshot(
+        if support_snapshot(
             data_dir,
             &old_components,
             &comp_data,
@@ -1668,7 +1743,7 @@ async fn run_upgrade_with_restart(
         Ok(())
     });
     if let Some(owner) = restart_owner.as_mut() {
-        drop(_offline);
+        drop(offline);
         let candidate = match activation {
             Ok(()) => {
                 let record = transaction.claim_start(false)?;
@@ -1724,9 +1799,18 @@ async fn run_upgrade_with_restart(
 pub(crate) fn verify_restart_support(transaction: &InstallTransaction) -> anyhow::Result<()> {
     let record = transaction.restart_record()?;
     let components = std::fs::read(transaction.data_dir().join("components.json"))?;
-    if frozen_support_snapshot(
+    let previous = matches!(
+        record.phase,
+        RestartPhase::Restored
+            | RestartPhase::PreviousStartClaimed
+            | RestartPhase::PreviousRunning
+            | RestartPhase::PreviousReady
+    );
+    transaction.verify_support(previous)?;
+    let old_components = transaction.original_components()?;
+    if support_snapshot(
         transaction.data_dir(),
-        &components,
+        &old_components,
         &components,
         &crate::setup::detect_platform(),
         &transaction.excluded_paths(),
@@ -1768,10 +1852,8 @@ pub(crate) fn frozen_support_snapshot(
     platform: &str,
     excluded: &std::collections::BTreeSet<PathBuf>,
 ) -> anyhow::Result<String> {
-    use sha2::Digest;
     let old_value: serde_json::Value = serde_json::from_slice(old)?;
     let new_value: serde_json::Value = serde_json::from_slice(new)?;
-    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(new)?;
     if old_value["schema"] != "elastos.components/v1"
         || new_value["schema"] != "elastos.components/v1"
     {
@@ -1784,13 +1866,31 @@ pub(crate) fn frozen_support_snapshot(
             );
         }
     }
+    support_snapshot(data_dir, old, new, platform, excluded)
+}
+
+fn support_snapshot(
+    data_dir: &Path,
+    old: &[u8],
+    new: &[u8],
+    platform: &str,
+    excluded: &std::collections::BTreeSet<PathBuf>,
+) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(new)?;
+    let old_manifest: crate::setup::ComponentsManifest = serde_json::from_slice(old)?;
     let mut paths = std::collections::BTreeSet::from([
         PathBuf::from("bin"),
         PathBuf::from("capsules"),
         PathBuf::from("libexec"),
+        PathBuf::from("tools"),
         PathBuf::from("model-catalog.json"),
     ]);
-    for component in manifest.external.values() {
+    for component in manifest
+        .external
+        .values()
+        .chain(old_manifest.external.values())
+    {
         let info = crate::setup::resolve_platform_info(component, platform);
         if let Some(path) = crate::setup::resolve_install_path(component, info) {
             paths.insert(PathBuf::from(path));
@@ -1829,7 +1929,7 @@ fn fingerprint_support_tree(
     use sha2::Digest;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    if excluded.contains(path) {
+    if excluded.iter().any(|excluded| path.starts_with(excluded)) {
         return Ok(());
     }
     let path_bytes = path.as_os_str().as_encoded_bytes();

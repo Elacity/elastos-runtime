@@ -1156,3 +1156,159 @@ fn normal_admitted_prefix_finishes_all_five_consumed_roles() {
     assert_no_transaction_scratch(&writer);
     assert_sentinels(&sentinels);
 }
+
+#[test]
+fn staged_support_recovers_interrupted_activation_and_preserves_owner_data() {
+    for interruption in [
+        "prepared",
+        "removed",
+        "activated",
+        "foreign",
+        "foreign metadata",
+    ] {
+        let fixture = RestartFixture::new();
+        let writer = fixture.writer();
+        fs::create_dir(fixture.data.join("capsules")).unwrap();
+        let destination = fixture.data.join("capsules/system");
+        fs::create_dir(&destination).unwrap();
+        write_new(&destination.join("system.js"), b"previous System", 0o644).unwrap();
+        std::os::unix::fs::symlink("system.js", destination.join("alias.js")).unwrap();
+        let candidate = fixture.root.path().join("candidate-system");
+        fs::create_dir(&candidate).unwrap();
+        write_new(&candidate.join("system.js"), b"candidate System", 0o644).unwrap();
+        std::os::unix::fs::symlink("system.js", candidate.join("alias.js")).unwrap();
+        prepare_release(&writer);
+        writer
+            .prepare_support(&[(PathBuf::from("capsules/system"), candidate)])
+            .unwrap();
+        writer.prepare_restart(restart_plan()).unwrap();
+        assert_eq!(
+            fs::read(destination.join("system.js")).unwrap(),
+            b"previous System"
+        );
+        if interruption != "prepared" {
+            let mut journal = writer.read_journal().unwrap().unwrap();
+            journal.phase = Phase::Committing;
+            writer.write_journal(&journal).unwrap();
+            if interruption == "removed" {
+                fs::remove_dir_all(&destination).unwrap();
+            } else {
+                support::activate(&writer, &journal.support).unwrap();
+                if interruption == "foreign metadata" {
+                    fs::write(
+                        &writer.destinations[&ReleaseFile::Components],
+                        b"foreign metadata",
+                    )
+                    .unwrap();
+                }
+                if interruption == "foreign" {
+                    fs::write(destination.join("system.js"), b"foreign change").unwrap();
+                }
+            }
+        }
+        fixture.write_new_owner_data();
+        drop(writer);
+        let writer = fixture.writer();
+        if interruption.starts_with("foreign") {
+            let before = fixture.snapshot();
+            assert!(writer.restore_for_restart().is_err());
+            assert_eq!(fixture.snapshot(), before);
+        } else {
+            writer.restore_for_restart().unwrap();
+            fixture.assert_release(&writer, true);
+            writer.verify_support(true).unwrap();
+            assert_eq!(
+                fs::read(destination.join("system.js")).unwrap(),
+                b"previous System"
+            );
+            assert_eq!(
+                fs::read_link(destination.join("alias.js")).unwrap(),
+                PathBuf::from("system.js")
+            );
+            let previous = started(&writer, true);
+            writer
+                .record_ready(&previous.generation, PREVIOUS_PID)
+                .unwrap();
+            writer.finish_restart().unwrap();
+            assert_no_transaction_scratch(&writer);
+            assert!(!fixture.data.join(support::SCRATCH).exists());
+        }
+        fixture.assert_new_owner_data();
+    }
+}
+
+#[test]
+fn staged_support_refuses_paths_outside_owned_assets_and_overlapping_runtime() {
+    for path in [
+        "../owner-data",
+        "owner-data",
+        "/tmp/fixture",
+        "bin",
+        "capsules/../owner-data",
+        "bin/.elastos.update-stage",
+        "tools",
+    ] {
+        let fixture = RestartFixture::new();
+        let writer = fixture.writer();
+        prepare_release(&writer);
+        let candidate = fixture.root.path().join("candidate-support");
+        write_new(&candidate, b"candidate support", 0o644).unwrap();
+        let before = fixture.snapshot();
+        assert!(
+            writer
+                .prepare_support(&[(PathBuf::from(path), candidate)])
+                .is_err(),
+            "{path}"
+        );
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn staged_support_ready_cleanup_can_resume_after_its_scratch_was_removed() {
+    let fixture = RestartFixture::new();
+    let writer = fixture.writer();
+    fs::create_dir(fixture.data.join("bin")).unwrap();
+    let candidate = fixture.root.path().join("candidate-provider");
+    write_new(&candidate, b"candidate provider", 0o755).unwrap();
+    prepare_release(&writer);
+    writer
+        .prepare_support(&[(PathBuf::from("bin/fixture-provider"), candidate)])
+        .unwrap();
+    writer.prepare_restart(restart_plan()).unwrap();
+    writer.commit_checked(|| Ok(())).unwrap();
+    let record = started(&writer, false);
+    writer
+        .record_ready(&record.generation, CANDIDATE_PID)
+        .unwrap();
+    fs::remove_dir_all(fixture.data.join(support::SCRATCH)).unwrap();
+    drop(writer);
+    let writer = fixture.writer();
+    writer.verify_support(false).unwrap();
+    writer.finish_restart().unwrap();
+    assert_no_transaction_scratch(&writer);
+    assert_eq!(
+        fs::read(fixture.data.join("bin/fixture-provider")).unwrap(),
+        b"candidate provider"
+    );
+}
+
+#[test]
+fn staged_support_removal_of_an_uninstalled_component_keeps_its_parents_absent() {
+    let fixture = RestartFixture::new();
+    let writer = fixture.writer();
+    prepare_release(&writer);
+    writer
+        .prepare_support(&[(PathBuf::from("tools/uninstalled-helper"), PathBuf::new())])
+        .unwrap();
+    writer.prepare_restart(restart_plan()).unwrap();
+    writer.commit_checked(|| Ok(())).unwrap();
+    assert!(!fixture.data.join("tools").exists());
+    writer.verify_support(false).unwrap();
+    let record = started(&writer, false);
+    writer
+        .record_ready(&record.generation, CANDIDATE_PID)
+        .unwrap();
+    writer.finish_restart().unwrap();
+    assert_no_transaction_scratch(&writer);
+}

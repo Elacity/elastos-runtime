@@ -16,6 +16,9 @@ use elastos_common::localhost::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod support;
+pub(crate) use support::validate_support_path;
+
 const INSTALL_LOCK: &str = ".elastos.install.lock";
 const JOURNAL: &str = ".elastos.update-journal.json";
 const JOURNAL_TMP: &str = ".elastos.update-journal.tmp";
@@ -105,6 +108,8 @@ struct Journal {
     entries: Vec<Entry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restart: Option<RestartRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    support: Vec<support::Entry>,
 }
 
 /// A restart controller keeps this record and the verified rollback until Home is ready.
@@ -539,6 +544,15 @@ impl InstallTransaction {
             paths.insert(parent.join(STAGE));
             paths.insert(parent.join(ROLLBACK));
         }
+        paths.insert(self.data_dir.join(support::SCRATCH));
+        if let Ok(Some(journal)) = self.read_journal() {
+            paths.extend(
+                journal
+                    .support
+                    .iter()
+                    .map(|entry| self.data_dir.join(&entry.path)),
+            );
+        }
         paths
     }
 
@@ -597,6 +611,7 @@ impl InstallTransaction {
         // restoration. Partial writes have distinct names and only staging owns them.
         self.validate_scratch(&journal)?;
         if journal.phase == Phase::Staging {
+            support::require_original(self, &journal.support)?;
             for entry in &journal.entries {
                 self.require_state(
                     entry.id,
@@ -648,6 +663,7 @@ impl InstallTransaction {
                     )?;
                 }
             }
+            support::validate_restore(self, &journal.support)?;
             journal.phase = Phase::Recovering;
             if let Some(restart) = &mut journal.restart {
                 restart.phase = RestartPhase::Restoring;
@@ -656,6 +672,7 @@ impl InstallTransaction {
                 restart.process_start = None;
             }
             self.write_journal(&journal)?;
+            support::restore(self, &journal.support)?;
             for entry in &journal.entries {
                 let current = file_state(&self.destinations[&entry.id])?;
                 if state_matches(
@@ -779,6 +796,7 @@ impl InstallTransaction {
             phase: Phase::Staging,
             entries,
             restart: None,
+            support: Vec::new(),
         };
         self.write_journal(&journal)?;
         let result = (|| {
@@ -829,6 +847,54 @@ impl InstallTransaction {
             self.write_journal(&journal)
         })();
         self.restore_on_error(result)
+    }
+
+    pub(crate) fn prepare_support(&self, paths: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+        support::prepare(self, paths)
+    }
+
+    pub(crate) fn original_components(&self) -> anyhow::Result<Vec<u8>> {
+        let journal = self.read_journal()?.context("release journal missing")?;
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.id == ReleaseFile::Components)
+            .unwrap();
+        let path = self.scratch(ReleaseFile::Components, ROLLBACK);
+        let path = if path.exists() {
+            path
+        } else {
+            self.destinations[&ReleaseFile::Components].clone()
+        };
+        require_hash(
+            &path,
+            entry
+                .original_sha256
+                .as_deref()
+                .context("previous components missing")?,
+        )?;
+        Ok(fs::read(path)?)
+    }
+
+    pub(crate) fn verify_support(&self, previous: bool) -> anyhow::Result<()> {
+        let journal = self.read_journal()?.context("release journal missing")?;
+        support::require_installed(self, &journal.support, previous)
+    }
+
+    pub(crate) fn abort_pre_activation_restart(&self) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("release journal missing")?;
+        anyhow::ensure!(
+            journal.phase == Phase::Prepared
+                && journal
+                    .restart
+                    .as_ref()
+                    .is_some_and(|restart| restart.phase == RestartPhase::CandidatePending),
+            "activation already has recovery ownership"
+        );
+        journal.restart = None;
+        journal.schema = "elastos.install-transaction/v3".into();
+        self.write_journal(&journal)?;
+        self.abort()
     }
 
     pub(crate) fn abort(&self) -> anyhow::Result<()> {
@@ -1010,6 +1076,7 @@ impl InstallTransaction {
                 },
             )?;
         }
+        support::require_installed(self, &journal.support, previous)?;
         self.cleanup(&journal)
     }
 
@@ -1119,6 +1186,7 @@ impl InstallTransaction {
                     Some(entry.staged_mode),
                 )?;
             }
+            support::activate(self, &journal.support)?;
             after_activation()?;
             journal.phase = Phase::Committed;
             self.write_journal(&journal)
@@ -1190,6 +1258,7 @@ impl InstallTransaction {
         {
             bail!("installation journal identity is incompatible with this writer");
         }
+        support::validate_entries(self, &journal.support)?;
         validate_restart_record(&journal)?;
         for entry in &journal.entries {
             if !valid_hash(&entry.staged_sha256)
@@ -1254,6 +1323,7 @@ impl InstallTransaction {
     }
 
     fn validate_scratch(&self, journal: &Journal) -> anyhow::Result<()> {
+        support::validate_scratch(self, journal)?;
         for parent in self.parents() {
             self.check_parent(&parent, false)?;
             for directory in [STAGE, ROLLBACK] {
@@ -1299,6 +1369,7 @@ impl InstallTransaction {
     fn cleanup(&self, journal: &Journal) -> anyhow::Result<()> {
         // Validate the whole scratch set before deleting even its first file.
         self.validate_scratch(journal)?;
+        support::cleanup(self, journal)?;
         for parent in self.parents() {
             for directory in [STAGE, ROLLBACK] {
                 let path = parent.join(directory);

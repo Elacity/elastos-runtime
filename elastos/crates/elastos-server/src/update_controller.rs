@@ -340,7 +340,13 @@ pub(crate) fn owner_update_is_queued(
                         || status.current_version == request.new_version)
                     && matches!(
                         status.phase.as_str(),
-                        "staging" | "restarting" | "updated" | "restored" | "failed"
+                        "staging"
+                            | "downloading"
+                            | "verifying"
+                            | "restarting"
+                            | "updated"
+                            | "restored"
+                            | "failed"
                     ),
                 "Retained update result differs from the approved intent."
             );
@@ -926,6 +932,25 @@ impl Controller {
     fn publish_apply_result(&self, result: &Result<()>) -> Result<()> {
         if result.is_ok() {
             self.publish("updated", "Home is up to date.")
+        } else if self.host_ready
+            && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
+            && status(&self.receipt.data_dir)?.is_some_and(|status| {
+                matches!(
+                    status.phase.as_str(),
+                    "staging" | "downloading" | "verifying"
+                )
+            })
+        {
+            let message = if result
+                .as_ref()
+                .unwrap_err()
+                .is::<crate::update::UpdateSourceUnavailable>()
+            {
+                "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+            } else {
+                "Update verification failed or the release was refused. Your current version is unchanged. Select Update again."
+            };
+            self.publish("failed", message)
         } else if self.host_ready && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
         {
             self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")
@@ -961,12 +986,14 @@ impl Controller {
                 self.publish("staging", "Checking the signed update.")?;
                 let result = self.apply().await;
                 self.publish_apply_result(&result)?;
-                if InstallTransaction::has_pending_recovery(&self.receipt.binary)
-                    || !self.host_ready
-                {
+                if !self.host_ready {
                     return result;
                 }
-                self.finish_request()?;
+                // A pre-activation refusal keeps the current Home and recovery owner
+                // alive. Only a settled transaction can retire its consumed request.
+                if !InstallTransaction::has_pending_recovery(&self.receipt.binary) {
+                    self.finish_request()?;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1001,8 +1028,11 @@ impl Controller {
         .binary_sha256;
         drop(writer);
         self.previous_version = source.installed_version.clone();
-        let client =
-            Arc::new(crate::carrier::CarrierClient::connect_trusted_source(&source, 15).await?);
+        let client = Arc::new(
+            crate::carrier::CarrierClient::connect_trusted_source(&source, 15)
+                .await
+                .context(crate::update::UpdateSourceUnavailable)?,
+        );
         self.carrier = Some(client.clone());
         let fetch_client = client.clone();
         let choice = request.clone();
@@ -1012,7 +1042,12 @@ impl Controller {
             let choice = choice.clone();
             let trusted = trusted.clone();
             Box::pin(async move {
-                let bytes = client.fetch_content(&cid, None).await?;
+                let bytes = if let Some(path) = cid.strip_prefix("release-path:") {
+                    client.fetch_file(path).await
+                } else {
+                    client.fetch_content(&cid, None).await
+                }
+                .context(crate::update::UpdateSourceUnavailable)?;
                 if cid == choice.head_cid {
                     verify_update_choice(&bytes, &choice, &trusted)?;
                 }
@@ -1020,8 +1055,6 @@ impl Controller {
             })
         });
         let result = async {
-            self.publish("restarting", "Installing the update and restarting Home.")?;
-            self.stop_child().await?;
             let data_dir = self.receipt.data_dir.clone();
             crate::update::run_restarting_update(&data_dir, &fetch, request.head_cid, self).await
         }
@@ -1141,6 +1174,10 @@ impl Controller {
 }
 
 impl crate::update::RestartOwner for Controller {
+    fn progress(&self, phase: &str, message: &str) -> Result<()> {
+        self.publish(phase, message)
+    }
+
     fn plan(
         &self,
         support_sha256: String,
