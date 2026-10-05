@@ -4386,7 +4386,8 @@ async function launchSystem(page, homeToken, passkey) {
 
 async function checkSystemUpdate(page, systemFrame) {
   assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW, "System update check needs the current and next version");
-  await systemFrame.locator('button[data-settings="about"]').click();
+  // Show the update row for the screenshots; the check reads the DOM either way.
+  await systemFrame.locator('button[data-settings="about"]').evaluate((button) => button.click());
   const read = () => systemFrame.evaluate(() => {
     const field = (name) => document.querySelector(`[data-field="${name}"]`);
     return {
