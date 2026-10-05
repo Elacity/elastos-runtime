@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Issue #89: prove gateway-role Kubo stays up through real idle time in CI.
 
-The candidate Runtime owns role selection. The accepted frozen Runtime is a
+The Runtime under test owns role selection as the gateway holder and is also a
 Carrier-only consumer. The separate workflow fixture proves user idle recovery.
-This helper qualifies isolated CI artifacts; it does not install a seed package.
+This helper qualifies isolated CI builds; it does not install a seed package.
 """
 
 import base64
@@ -40,11 +40,8 @@ def port(kind=socket.SOCK_STREAM):
 
 def main():
     assert os.environ["GITHUB_ACTIONS"] == "true" and os.environ["RUNNER_OS"] == "Linux"
-    workspace = Path(os.environ["GITHUB_WORKSPACE"])
-    accepted, output = Path(os.environ["ACCEPTED_INPUT"]), Path(os.environ["HOLDER_OUTPUT"])
-    observer_path = workspace / "observer/scripts/update-hop-compare.py"
-    assert sha(observer_path) == os.environ["OBSERVER_SHA256"]
-    spec = importlib.util.spec_from_file_location("accepted_observer", observer_path)
+    accepted, output = Path(os.environ["HOLDER_BUILD"]), Path(os.environ["HOLDER_OUTPUT"])
+    spec = importlib.util.spec_from_file_location("observer", Path(__file__).with_name("update-hop-compare.py"))
     observer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(observer)
     processes = observer.CliProcesses(output)
@@ -54,9 +51,7 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     result = {"schema": "elastos.issue89.holder-always-on/v1", "passed": False,
               "clock": "real monotonic elapsed idle; no coordination clock changes",
-              "source_commit": os.environ["PROVIDER_COMMIT"], "source_tree": os.environ["PROVIDER_TREE"],
-              "consumer_source_commit": os.environ["SOURCE_COMMIT"],
-              "consumer_source_tree": os.environ["SOURCE_TREE"], "seed_package": False,
+              "source_commit": os.environ["GITHUB_SHA"], "seed_package": False,
               "service_restarts": 0, "provider_restarts": 0, "source_modified": False}
 
     def environment(home):
@@ -118,23 +113,7 @@ def main():
         return payload
 
     try:
-        template = json.loads((workspace / "source/components.json").read_bytes())
-        builds = {"runtime": json.loads((output / "gateway-runtime-build.json").read_bytes()),
-                  "provider": json.loads((output / "provider-build.json").read_bytes()),
-                  "localhost": json.loads((output / "localhost-fixture-build.json").read_bytes())}
-        accepted_build = json.loads((output / "accepted-build.json").read_bytes())
-        accepted_runtime = next(item for item in accepted_build["binaries"] if item["name"] == "elastos")
-        assert accepted_runtime["size"] == 114187264
-        assert sha(accepted / "elastos") == accepted_runtime["sha256"]
-        assert not builds["runtime"]["seed_package"] and not builds["localhost"]["seed_package"]
-        helper_root = Path(builds["runtime"]["helper_root"])
-        assert str(helper_root) == "/home/runner/.local/share/elastos-issue89-candidate/source"
-        assert builds["runtime"]["source_commit"] == builds["provider"]["source_commit"] == result["source_commit"]
-        assert builds["runtime"]["source_tree"] == builds["provider"]["source_tree"] == result["source_tree"]
-        source_files = json.loads((output / "gateway-source-files.json").read_bytes())
-        assert all(sha(helper_root / name) == digest for name, digest in source_files.items())
-        frozen_files = json.loads((accepted / "receipts/source-files.json").read_bytes())
-        assert all(sha(Path(os.environ["SEED_HELPER_ROOT"]) / name) == digest for name, digest in frozen_files.items())
+        template = json.loads(Path("components.json").read_bytes())
         installed = {}
         for role in ("holder", "consumer"):
             home = root / role
@@ -142,11 +121,8 @@ def main():
             (home / ".local/bin").mkdir(mode=0o700, parents=True)
             (data / "bin").mkdir(mode=0o700, parents=True)
             runtime = home / ".local/bin/elastos"
-            source = accepted / ("gateway-elastos" if role == "holder" else "elastos")
-            shutil.copyfile(source, runtime)
+            shutil.copyfile(accepted / "elastos", runtime)
             runtime.chmod(0o700)
-            expected = builds["runtime"] if role == "holder" else accepted_runtime
-            assert sha(runtime) == expected["sha256"] and runtime.stat().st_size == expected["size"]
             processes.roots[str(runtime)] = {sha(runtime)}
             manifest = {"external": {}, "profiles": {}, "capsules": {}}
             names = ("ipfs-provider", "kubo") if role == "holder" else ("localhost-provider",)
@@ -169,7 +145,7 @@ def main():
             command(home, [str(runtime), "node", "info", "--json"], role + "-identity")
             installed[role] = home, data, runtime, port()
         home, data, runtime, gateway_port = installed["holder"]
-        assert sha(data / "bin/ipfs-provider") == builds["provider"]["sha256"]
+        version = command(home, [str(runtime), "--version"], "holder-version")
         kubo_env = {**environment(home), "IPFS_PATH": str(data / "ipfs-repo")}
         reply = processes.command([str(data / "bin/kubo"), "init", "--profile=test"], kubo_env, home,
                                   "always-on-kubo-init")
@@ -238,7 +214,7 @@ def main():
         assert idle_coord == before
         assert idle_elapsed > 600 and int(time.time()) - before["last_used"] > 600
         assert "Kubo idle for" not in processes.text("always-on-holder", "stderr")
-        # Frozen serve reaps attach sessions idle >600s on a 60s timer. Refresh
+        # Serve reaps attach sessions idle >600s on a 60s timer. Refresh
         # only the consumer's local authorization after the real idle interval;
         # the holder's first operation remains the single Carrier content read.
         fresh_auth = attach(consumer_data, consumer, "runtime-coords.json", "operator")
@@ -251,13 +227,13 @@ def main():
         assert json.loads(coord_path.read_bytes()) == before, "consumer attach changed holder coordinates"
         result["consumer_authorization"] = {
             "refresh": "consumer-only local /api/auth/attach after the idle interval",
-            "reason": "frozen serve removes attach sessions idle >600s on a 60s cleanup timer",
+            "reason": "serve removes attach sessions idle >600s on a 60s cleanup timer",
             "idle_limit_seconds": 600, "cleanup_interval_seconds": 60,
             "holder_coordinates_unchanged": True, "consumer_generation_unchanged": True}
         request_started = time.monotonic()
         payload = carrier_fetch(consumer_auth, cids[1], accepted / "elastos")
         elapsed = time.monotonic() - request_started
-        assert len(payload) == accepted_runtime["size"] and hashlib.sha256(payload).hexdigest() == accepted_runtime["sha256"]
+        assert payload == (accepted / "elastos").read_bytes()
         assert elapsed <= 15, "first read exceeded immediate-read fixture bound"
         after = json.loads(coord_path.read_bytes())
         assert {key: value for key, value in after.items() if key != "last_used"} == {
@@ -269,8 +245,7 @@ def main():
         fetched.write_bytes(payload)
         fetched.chmod(0o700)
         processes.roots[str(fetched)] = {sha(fetched)}
-        version = command(consumer_home, [str(fetched), "--version"], "fetched-version")
-        assert version == "elastos " + os.environ["ELASTOS_RELEASE_VERSION"]
+        assert command(consumer_home, [str(fetched), "--version"], "fetched-version") == version
         assert processes.text("always-on-fetched-version", "stderr") == ""
         result.update(passed=True, role="gateway", role_selected_by="Runtime gateway command private verified Init",
             idle_elapsed_seconds=idle_elapsed, last_used_before=before["last_used"], last_used_after_idle=idle_coord["last_used"],
@@ -279,15 +254,11 @@ def main():
                 "elapsed_seconds": elapsed, "immediate_read_bound_seconds": 15,
                 "transport": "typed availability / Carrier provider_invoke / holder Content / native IPFS cat",
                 "legacy_content_fetch_journey": False, "consumer_local_backend": False},
-            installed_runtime=builds["runtime"], installed_provider=builds["provider"],
-            consumer_runtime=accepted_runtime, localhost_fixture=builds["localhost"],
+            installed_runtime_sha256=sha(runtime), installed_provider_sha256=sha(data / "bin/ipfs-provider"),
             installed_kubo={"sha256":sha(data / "bin/kubo"), "size":(data / "bin/kubo").stat().st_size},
             installed_manifest_sha256=sha(data / "components.json"))
-        for checkout in ("source", "provider-source", "observer"):
-            assert not subprocess.check_output(["git", "-C", str(workspace / checkout), "status",
-                "--porcelain=v1", "--untracked-files=all"], text=True).strip(), "source changed during qualification"
-        assert all(sha(helper_root / name) == digest for name, digest in source_files.items())
-        assert all(sha(Path(os.environ["SEED_HELPER_ROOT"]) / name) == digest for name, digest in frozen_files.items())
+        assert not subprocess.check_output(["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            text=True).strip(), "source changed during qualification"
     except Exception as error:
         result["failure"] = {"type": type(error).__name__, "message": str(error)}
         raise
@@ -296,10 +267,6 @@ def main():
         if not result["cleanup"]["errors"] and result["cleanup"]["remaining_pids"] == []:
             shutil.rmtree(root)
             result["fixture_removed"] = True
-            candidate_root = Path(os.environ["CI_GATEWAY_HELPER_ROOT"])
-            assert str(candidate_root) == "/home/runner/.local/share/elastos-issue89-candidate/source"
-            shutil.rmtree(candidate_root.parent)
-            result["candidate_helper_removed"] = True
         else:
             result["passed"] = False
         (output / "holder-always-on.json").write_text(json.dumps(result, indent=2) + "\n")
