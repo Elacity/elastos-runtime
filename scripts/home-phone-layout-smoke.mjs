@@ -19,6 +19,8 @@ import { tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { LONG_PRESS_MS } from "../capsules/home-gui/browser/shell-touch.js";
+
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const outputRoot = process.env.HOME_PHONE_SMOKE_OUT
   ? resolve(process.env.HOME_PHONE_SMOKE_OUT)
@@ -125,6 +127,17 @@ const BASELINE = {
 };
 
 const state = { errors: [] };
+// The healthy fixture holds the event stream open. The closed-stream run ends
+// it at once and holds summary replies, so a reconnect's summary refresh can
+// land while a finger holds a Dock tile.
+const fixture = { closeEventStream: false, holdSummaries: false, heldSummaries: [], summaryReplies: 0 };
+
+function releaseHeldSummaries() {
+  fixture.holdSummaries = false;
+  for (const reply of fixture.heldSummaries.splice(0)) {
+    reply();
+  }
+}
 const pageErrors = [];
 const capsuleErrors = []; // capsule-side and engine-noise errors, reported not asserted
 const consoleErrors = [];
@@ -432,7 +445,15 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/home/summary" && req.method === "GET") {
-    json(res, 200, homeSummary());
+    const reply = () => {
+      fixture.summaryReplies += 1;
+      json(res, 200, homeSummary());
+    };
+    if (fixture.holdSummaries) {
+      fixture.heldSummaries.push(reply);
+    } else {
+      reply();
+    }
     return true;
   }
   if (url.pathname === "/api/apps/home/collaboration/presence" && req.method === "POST") {
@@ -456,14 +477,18 @@ async function handleApi(req, res, url) {
   }
   if (url.pathname === "/api/apps/home/events/stream" && req.method === "GET") {
     // A Home holds its event stream open. A stream that ends at once sends the
-    // host into its poll-and-reopen recovery several times a second, and every
-    // summary it posts rebuilds the Dock under a held finger.
+    // host into its poll-and-reopen recovery, and every summary it refreshes
+    // rebuilds the Dock under a held finger.
     res.writeHead(200, {
       "access-control-allow-origin": "*",
       "cache-control": "no-store",
       "content-type": "text/event-stream",
     });
-    res.write(": open\n\n");
+    if (fixture.closeEventStream) {
+      res.end();
+    } else {
+      res.write(": open\n\n");
+    }
     return true;
   }
   if (url.pathname === "/api/apps/home/events" && req.method === "GET") {
@@ -682,10 +707,13 @@ const SPOTLIGHT_PROBE_QUERY = "e";
 const LONG_PRESS_HOLD_MS = 700;
 
 // Playwright cannot hold a finger down, so this plays the browser: a touch
-// pointerdown on the first visible match, a hold, then the pointerup and the
-// click a release produces. Returns the app the icon opens.
-async function longPressApp(frame, selector) {
-  const target = await frame.evaluate((selector) => {
+// pointerdown on the first visible match, then (on release) the pointerup and
+// the click a release produces. A touch pointer is captured by the pressed
+// tile, so the release goes to that tile, or to the element under the finger
+// when a redraw removed it. Records when the pressed tile left the page.
+// Returns the app the icon opens.
+async function pressApp(frame, selector) {
+  return frame.evaluate((selector) => {
     const tile = Array.from(document.querySelectorAll(selector)).find((node) => {
       if (node.id === "launcher-toggle" || node.id === "assistant-toggle") return false;
       const box = node.getBoundingClientRect();
@@ -702,13 +730,27 @@ async function longPressApp(frame, selector) {
       clientX: box.x + box.width / 2,
       clientY: box.y + box.height / 2,
     };
+    const pressedAt = performance.now();
+    window.__smokeTileRemovedAfterMs = null;
+    const removal = new MutationObserver(() => {
+      if (!tile.isConnected && window.__smokeTileRemovedAfterMs === null) {
+        window.__smokeTileRemovedAfterMs = Math.round(performance.now() - pressedAt);
+      }
+    });
+    removal.observe(document.body, { childList: true, subtree: true });
     tile.dispatchEvent(new PointerEvent("pointerdown", init));
     window.__smokeReleaseLongPress = () => {
-      tile.dispatchEvent(new PointerEvent("pointerup", init));
-      tile.dispatchEvent(new MouseEvent("click", init));
+      removal.disconnect();
+      const releasedOn = tile.isConnected ? tile : document.elementFromPoint(init.clientX, init.clientY);
+      releasedOn?.dispatchEvent(new PointerEvent("pointerup", init));
+      releasedOn?.dispatchEvent(new MouseEvent("click", init));
     };
     return tile.dataset.target;
   }, selector);
+}
+
+async function longPressApp(frame, selector) {
+  const target = await pressApp(frame, selector);
   await sleep(LONG_PRESS_HOLD_MS);
   await frame.evaluate(() => window.__smokeReleaseLongPress());
   return target;
@@ -1561,6 +1603,77 @@ function phoneTouchMenuFailures(run) {
   return failures;
 }
 
+// Closed event stream on a portrait phone: the host keeps reconnecting and
+// refreshing its summary, and each refresh rebuilds the Dock. A finger holds a
+// Dock tile while the next refresh lands; the redraw must come before the
+// long-press fires, and the release must open that app's menu and launch
+// nothing.
+const CLOSED_STREAM_REFRESH_TIMEOUT_MS = 10_000;
+const CLOSED_STREAM_PROFILE = PROFILES.find((profile) => profile.id === "phone-portrait");
+
+async function runClosedStream(browser, engineId, origin) {
+  const dir = join(outputRoot, engineId, "phone-portrait-closed-stream");
+  mkdirSync(dir, { recursive: true });
+  const context = await browser.newContext({
+    viewport: CLOSED_STREAM_PROFILE.viewport,
+    deviceScaleFactor: CLOSED_STREAM_PROFILE.deviceScaleFactor,
+    isMobile: CLOSED_STREAM_PROFILE.isMobile,
+    hasTouch: CLOSED_STREAM_PROFILE.hasTouch,
+    reducedMotion: "reduce",
+  });
+  fixture.closeEventStream = true;
+  try {
+    const { page, frame } = await bootHome(context, origin);
+    const windowsBefore = await frame.locator(".window").count();
+    const repliesAtBoot = fixture.summaryReplies;
+    await waitFor(() => fixture.summaryReplies > repliesAtBoot, CLOSED_STREAM_REFRESH_TIMEOUT_MS,
+      "a summary refresh from the closed event stream's recovery");
+    fixture.holdSummaries = true;
+    await waitFor(() => fixture.heldSummaries.length > 0, CLOSED_STREAM_REFRESH_TIMEOUT_MS,
+      "the next reconnect's summary refresh");
+    const startedAt = Date.now();
+    const target = await pressApp(frame, ".taskbar-item[data-target]");
+    releaseHeldSummaries();
+    await sleep(Math.max(0, LONG_PRESS_HOLD_MS - (Date.now() - startedAt)));
+    const tileRemovedAfterMs = await frame.evaluate(() => window.__smokeTileRemovedAfterMs);
+    await frame.evaluate(() => window.__smokeReleaseLongPress());
+    await sleep(SURFACE_SETTLE_MS);
+    const menu = await frame.evaluate(() => {
+      const node = document.querySelector("#desktop-context-menu");
+      return {
+        open: !node.hidden,
+        sheet: node.classList.contains("context-menu-sheet"),
+        title: node.querySelector(".context-menu-title")?.textContent || "",
+        items: Array.from(node.querySelectorAll(".context-menu-item")).map((row) => row.textContent),
+      };
+    });
+    const expectedTitle = FIRST_PARTY_APPS.find(([id]) => id === target)?.[1] || "";
+    await screenshot(page, dir, "closed-stream-dock-hold");
+    const windowsAfter = await frame.locator(".window").count();
+    await pressEscape(frame);
+    return { engine: engineId, target, expectedTitle, tileRemovedAfterMs, menu, windowsBefore, windowsAfter };
+  } finally {
+    fixture.closeEventStream = false;
+    releaseHeldSummaries();
+    await context.close();
+  }
+}
+
+function closedStreamFailures(run) {
+  const label = `${run.engine}/phone-portrait/closed-stream`;
+  if (run.tileRemovedAfterMs === null || run.tileRemovedAfterMs >= LONG_PRESS_MS) {
+    return [`${label}: the reconnect's summary refresh must redraw the Dock under the held tile before the long-press fires (${LONG_PRESS_MS} ms). Got ${JSON.stringify(run)}`];
+  }
+  const failures = [];
+  if (!run.menu.open || !run.menu.sheet || run.menu.title !== run.expectedTitle) {
+    failures.push(`${label}: a long-press held through a Dock redraw must open the held app's menu. Got ${JSON.stringify(run)}`);
+  }
+  if (run.windowsAfter !== run.windowsBefore) {
+    failures.push(`${label}: the release after a long-press held through a Dock redraw must not launch the app. Got ${JSON.stringify(run)}`);
+  }
+  return failures;
+}
+
 // Sheet grab handles on a portrait phone: each bar sheet's handle is a 44 px
 // Close (a tap closes), a short drag snaps the sheet back, and a long drag
 // toward its origin (up) closes it.
@@ -1919,7 +2032,7 @@ const requestedEngines = (process.env.HOME_PHONE_SMOKE_ENGINES || "chromium,webk
 
 const origin = await listen();
 mkdirSync(outputRoot, { recursive: true });
-const report = { generatedAt: new Date().toISOString(), origin, source: sourceTruths(), runs: [] };
+const report = { generatedAt: new Date().toISOString(), origin, source: sourceTruths(), runs: [], closedStreamRuns: [] };
 const failures = [];
 const skippedEngines = [];
 try {
@@ -1939,6 +2052,10 @@ try {
         failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
+      const closedStream = await runClosedStream(browser, engineId, origin);
+      report.closedStreamRuns.push(closedStream);
+      failures.push(...closedStreamFailures(closedStream));
+      console.log(`[home-phone-layout] ${engineId}/phone-portrait/closed-stream tile_redrawn_after_ms=${closedStream.tileRemovedAfterMs} menu=${closedStream.menu.open ? closedStream.menu.title : "shut"} windows=${closedStream.windowsBefore}->${closedStream.windowsAfter}`);
     } finally {
       await browser.close().catch(() => {});
     }

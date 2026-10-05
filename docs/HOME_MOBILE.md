@@ -471,6 +471,19 @@ rows, no window may open, and a tap on the bar's Control Centre button
 beside it must only dismiss (screenshot `context-menu-sheet`). Playwright
 cannot hold a finger down, so the probe plays the browser's touch
 `pointerdown`, the hold, then the `pointerup` and click a release produces.
+A touch pointer stays with the pressed tile, so the release goes to that
+tile, or to the element under the finger when a redraw removed it.
+
+The healthy fixture holds the Home event stream open. A separate
+closed-stream run (portrait, both engines) ends the stream at once, so the
+host keeps reconnecting and refreshing its summary, and each refresh
+rebuilds the Dock. It holds the next summary reply until a finger is down on
+a Dock tile, then lets it land: the tile must leave the page before the
+long-press fires (the run fails when the redraw misses that window), the
+held app's menu must open, and the release must launch nothing (screenshot
+`phone-portrait-closed-stream/closed-stream-dock-hold`). The recovery repair
+itself (a valid poll resets stream retries; a summary refresh can bypass the
+retry delay) has its own owner.
 
 ## Real-device checks the smoke cannot do
 
