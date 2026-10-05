@@ -21,10 +21,8 @@
 # Trust anchors can be provided via env vars or CLI flags. In the canonical
 # bootstrap flow, they should already be stamped into install.sh.
 #
-# Downloads the signed Runtime, components.json, and the pinned model catalog:
-#   1. elastos binary → ~/.local/bin/elastos
-#   2. components.json → the platform's ElastOS application-data directory
-#   3. model-catalog.json → the same data directory, when components.json pins one
+# Downloads the signed release head, release envelope, and Runtime binary.
+# Runtime setup fetches component metadata and the pinned model catalog over Carrier.
 #
 # After bootstrap, setup installs the Home profile and opens browser Home.
 # Use --install-only for automated provisioning or other profiles.
@@ -34,10 +32,9 @@
 #   2. Verify Ed25519 signature against pinned MAINTAINER_DID
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
-#   5. Download binary + components.json, verify SHA-256
-#   6. Download the pinned model catalog when components.json names one, verify its head
-#   7. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
-#   8. Save trusted-source Carrier metadata for later `setup` and `update`
+#   5. Download the Runtime binary and verify SHA-256
+#   6. Install the Runtime and save the verified envelopes and stamped Carrier source
+#   7. Runtime setup fetches signed metadata and installs Home over Carrier
 #
 # Fails closed if trust anchors or signature verification fail, unless the
 # operator explicitly selects --allow-unsigned.
@@ -141,12 +138,11 @@ show_help() {
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/model-catalog.json  Signed model catalog, when pinned"
-    echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
+    echo "  Verified release metadata and the trusted Carrier source in the Runtime data directory"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
-    echo "  Setup installs the Home profile, then opens Home in your browser."
+    echo "  Runtime setup fetches signed metadata and Home components over Carrier."
+    echo "  Setup then opens Home in your browser."
     echo "  Keep the terminal open while using Home; Ctrl+C stops it."
     echo "  Without an interactive terminal, the installer prints the launch command."
     echo ""
@@ -211,53 +207,6 @@ validate_explicit_source_bootstrap_pair() {
     if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" != true ]] ||
        [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" != true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
         die "trusted-source Carrier bootstrap overrides are atomic; set both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID, or neither"
-    fi
-}
-
-refresh_source_bootstrap_from_publisher() {
-    [[ -n "$PUBLISHER_GATEWAY" ]] || return 0
-    if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
-        return 0
-    fi
-
-    local bootstrap_url parsed
-    bootstrap_url="${PUBLISHER_GATEWAY%/}/.well-known/elastos/carrier-bootstrap.json?role=publisher"
-    if ! parsed=$(curl -fsSL --max-time 10 "$bootstrap_url" | python3 -c '
-import json
-import sys
-
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-
-if data.get("schema") != "elastos.carrier.bootstrap/v1":
-    raise SystemExit(1)
-if data.get("role") != "publisher":
-    raise SystemExit(1)
-ticket = (data.get("ticket") or "").strip()
-node_id = (data.get("node_id") or "").strip()
-if not ticket or not node_id:
-    raise SystemExit(1)
-print(ticket)
-print(node_id)
-'); then
-        warn "Could not refresh trusted-source Carrier bootstrap from ${bootstrap_url}; using stamped source route"
-        return 0
-    fi
-
-    local refreshed=() line
-    while IFS= read -r line; do
-        refreshed+=("$line")
-    done <<<"$parsed"
-    if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
-        SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
-    fi
-    if [[ "${PUBLISHER_NODE_ID_EXPLICIT}" != true ]]; then
-        PUBLISHER_NODE_ID="${refreshed[1]:-}"
-    fi
-    if [[ -n "$SOURCE_CONNECT_TICKET" && -n "$PUBLISHER_NODE_ID" ]]; then
-        info "Refreshed trusted-source Carrier bootstrap from publisher gateway"
     fi
 }
 
@@ -923,8 +872,6 @@ validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
 
 BINARY_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
 BINARY_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
-COMPONENTS_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['cid']")
-COMPONENTS_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['sha256']")
 
 if [[ -z "$BINARY_CID" ]]; then
     AVAILABLE=$(json_get "${TMPDIR}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
@@ -959,52 +906,7 @@ fi
 info "Verifying binary SHA-256..."
 sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
-# ── Download + verify components.json ────────────────────────────────
-
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Downloading components.json from bootstrap publisher URL"
-    curl -fsSL --max-time 30 -o "${TMPDIR}/components.json" "${PG}/artifacts/components-${PLATFORM}.json" \
-        || die "Failed to download components from ${PG}/artifacts/components-${PLATFORM}.json"
-else
-    info "Downloading components.json by CID: ${COMPONENTS_CID} (bootstrap mode)"
-    ipfs_fetch "$COMPONENTS_CID" "${TMPDIR}/components.json"
-fi
-
-info "Verifying components.json SHA-256..."
-sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
-
-# ── Download + verify the pinned model catalog ───────────────────────
-# The verified components.json names the catalog head. Every advertised file
-# is staged and verified here; nothing running or installed changes before.
-
-CATALOG_HEAD=$(json_get "${TMPDIR}/components.json" '(d.get("model_catalog") or {}).get("head_cid")')
-if [[ -n "$CATALOG_HEAD" ]]; then
-    if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-        info "Downloading model catalog from bootstrap publisher URL"
-        curl -fsSL --max-time 30 -o "${TMPDIR}/model-catalog.json" "${PG}/artifacts/model-catalog.json" \
-            || die "Failed to download model catalog from ${PG}/artifacts/model-catalog.json; the current installation was preserved"
-    else
-        info "Downloading model catalog by CID: ${CATALOG_HEAD} (bootstrap mode)"
-        ipfs_fetch "$CATALOG_HEAD" "${TMPDIR}/model-catalog.json"
-    fi
-    info "Verifying model catalog head ${CATALOG_HEAD}..."
-    CATALOG_HEAD="$CATALOG_HEAD" python3 - "${TMPDIR}/model-catalog.json" <<'PY' \
-        || die "Downloaded model catalog does not match the pin in components.json; the current installation was preserved"
-import base64
-import hashlib
-import os
-import pathlib
-import sys
-
-data = pathlib.Path(sys.argv[1]).read_bytes()
-expected = os.environ["CATALOG_HEAD"]
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != expected:
-    raise SystemExit(f"model catalog head {head} does not match pin {expected}")
-PY
-fi
-
-# ── Install (2 files) ────────────────────────────────────────────────
+# ── Install the verified Runtime binary ─────────────────────────────
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
 info "Stopping verified Runtime processes for this installation before its protected-root check..."
@@ -1037,41 +939,6 @@ mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
 
-# Evict stale cached capsules when components.json changes (CID mismatch).
-# This forces the supervisor to re-download updated capsule binaries on demand.
-OLD_COMPONENTS="${DATA_DIR}/components.json"
-if [[ -f "$OLD_COMPONENTS" ]]; then
-    CHANGED_CAPSULES=$(python3 - "$OLD_COMPONENTS" "${TMPDIR}/components.json" <<'PY'
-import json, sys
-try:
-    old = json.load(open(sys.argv[1]))
-    new = json.load(open(sys.argv[2]))
-    for name, entry in new.get("capsules", {}).items():
-        old_entry = old.get("capsules", {}).get(name, {})
-        if old_entry.get("cid") != entry.get("cid"):
-            print(name)
-except Exception:
-    pass
-PY
-    )
-    CAPSULE_CACHE="${DATA_DIR}/capsules"
-    for cname in $CHANGED_CAPSULES; do
-        if [[ -d "${CAPSULE_CACHE}/${cname}" ]]; then
-            info "Evicting stale capsule cache: ${cname}"
-            rm -rf "${CAPSULE_CACHE}/${cname}"
-        fi
-    done
-fi
-
-info "Installing components.json to ${DATA_DIR}/..."
-cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
-
-if [[ -n "$CATALOG_HEAD" ]]; then
-    info "Installing signed model catalog ${CATALOG_HEAD} to ${DATA_DIR}/..."
-    (umask 077; cp "${TMPDIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json")
-    chmod 600 "${DATA_DIR}/model-catalog.json"
-fi
-
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."
 "${INSTALL_DIR}/elastos" principal-root-upgrade \
@@ -1079,8 +946,6 @@ info "Verifying and upgrading configured protected roots while Runtime is stoppe
     --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
 
 # ── Save Carrier contact + release metadata for `elastos upgrade` ────
-
-refresh_source_bootstrap_from_publisher
 
 SIGNER_DID=$(json_get "${TMPDIR}/release-head.json" 'd["signer_did"]')
 
@@ -1147,11 +1012,60 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
 PY
 info "Saved trusted source config to ${DATA_DIR}/sources.json"
 
-PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
-mkdir -p "${PUBLISHER_ROOT}"
-cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
-info "Saved publisher metadata for future upgrades"
+# Consumer custody is separate from this Runtime's publication output. Runtime
+# setup/update consume this verified pair under their installation guard.
+python3 - "$TMPDIR" "$DATA_DIR" <<'PY_CONSUMED_RELEASE'
+import os, stat, sys
+from pathlib import Path
+
+def save_consumed_release():
+    source, data = map(Path, sys.argv[1:])
+    root = data / 'installation'
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(directory)
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise ValueError('Consumed release directory must be private and owned')
+        for name in ('release.json', 'release-head.json'):
+            try:
+                previous = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(previous.st_mode) or previous.st_nlink != 1
+                    or previous.st_uid != os.geteuid() or previous.st_mode & 0o077):
+                raise ValueError('Consumed release files must be private owned regular files')
+        staged = []
+        try:
+            # Finish both exclusive writes before replacing either verified file.
+            for name in ('release.json', 'release-head.json'):
+                temporary = '.' + name + '.bootstrap'
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+                staged.append((temporary, name))
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write((source / name).read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            for temporary, name in staged:
+                os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            for temporary, _ in staged:
+                try: os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError: pass
+    finally:
+        os.close(directory)
+
+try:
+    save_consumed_release()
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Consumed release handoff failed: {exc}")
+PY_CONSUMED_RELEASE
+info "Saved verified release inputs for Runtime setup and updates"
 
 # ── Complete installation ─────────────────────────────────────────────
 

@@ -413,35 +413,68 @@ async fn run_signed_publication(
     // publication host executes its provider against this verified snapshot.
     std::fs::create_dir_all(&data_dir)?;
     let data_dir = data_dir.canonicalize()?;
-    let scratch = tempfile::Builder::new()
-        .prefix(".release-import-")
-        .tempdir_in(&data_dir)?;
-    let snapshot = scratch.path().join("snapshot");
-    publication.snapshot_into(&snapshot)?;
-    let frozen = Publication::open_published(&snapshot, signer)?;
-    for artifact in frozen.artifacts() {
-        let actual =
-            import_publication_file(&provider, &snapshot.join("artifacts").join(&artifact.name))
+    let budget = publication_storage_budget(&publication)?;
+    let mut preflight = PublicationProvider::start(&provider, &data_dir).await?;
+    let imported: anyhow::Result<_> = async {
+        preflight
+            .request(serde_json::json!({"op":"runtime_prepare_backend"}))
+            .await?;
+        preflight
+            .check_capacity(&data_dir, budget.repo_bytes, budget.local_bytes)
+            .await?;
+        let scratch = tempfile::Builder::new()
+            .prefix(".release-import-")
+            .tempdir_in(&data_dir)?;
+        let snapshot = scratch.path().join("snapshot");
+        publication.snapshot_into(&snapshot)?;
+        let frozen = Publication::open_published(&snapshot, signer)?;
+        for artifact in frozen.artifacts() {
+            let actual = preflight
+                .import_file(&snapshot.join("artifacts").join(&artifact.name))
                 .await?;
-        if actual != artifact.cid && cid::Cid::try_from(artifact.cid.as_str())?.codec() == 0x55 {
-            // The catalogue's signed pin is a raw block. The existing provider
-            // imports files as UnixFS; publish the bounded raw block through
-            // that provider's own local Kubo endpoint as well.
-            anyhow::ensure!(
-                artifact.size <= 2 * 1024 * 1024,
-                "Raw publication block exceeds its bounded import size"
-            );
-            let bytes = frozen.read_verified_artifact(&artifact.name)?;
-            let raw = import_publication_raw_block(&provider, &artifact.name, bytes).await?;
-            require_import_cid(&raw, &artifact.cid)?;
-        } else {
-            require_import_cid(&actual, &artifact.cid)?;
+            if actual != artifact.cid && cid::Cid::try_from(artifact.cid.as_str())?.codec() == 0x55
+            {
+                // The catalogue's signed pin is a raw block. The existing provider
+                // imports files as UnixFS; publish the bounded raw block through
+                // that provider's own local Kubo endpoint as well.
+                anyhow::ensure!(
+                    artifact.size <= 2 * 1024 * 1024,
+                    "Raw publication block exceeds its bounded import size"
+                );
+                let bytes = frozen.read_verified_artifact(&artifact.name)?;
+                let raw = preflight.import_raw_block(&artifact.name, bytes).await?;
+                require_import_cid(&raw, &artifact.cid)?;
+            } else {
+                require_import_cid(&actual, &artifact.cid)?;
+            }
         }
+        // Directory blocks, rather than just CAR file bytes, must be retained
+        // before this generation can become the advertised release head.
+        import_publication_models_with_session(
+            &mut preflight,
+            workspace_root,
+            &data_dir,
+            &snapshot.join("artifacts"),
+            frozen.model_retention(),
+        )
+        .await?;
+        let release_cid = preflight
+            .import_file(&snapshot.join("release.json"))
+            .await?;
+        require_import_cid(&release_cid, publication.release_cid())?;
+        let head_cid = preflight
+            .import_file(&snapshot.join("release-head.json"))
+            .await?;
+        elastos_server::update::verify_release_metadata_cid(&head_cid, publication.head_bytes())?;
+        Ok((scratch, snapshot, release_cid, head_cid))
     }
-    let release_cid = import_publication_file(&provider, &snapshot.join("release.json")).await?;
-    require_import_cid(&release_cid, publication.release_cid())?;
-    let head_cid = import_publication_file(&provider, &snapshot.join("release-head.json")).await?;
-    elastos_server::update::verify_release_metadata_cid(&head_cid, publication.head_bytes())?;
+    .await;
+    let finished = preflight.finish().await;
+    if finished.is_err() {
+        let _ = preflight.child.kill().await;
+    }
+    let (scratch, snapshot, release_cid, head_cid) = imported?;
+    finished?;
     let state = PublishState {
         publisher_did: Some(signer.to_owned()),
         last_release_cid: Some(release_cid.clone()),
@@ -563,6 +596,7 @@ fn require_import_cid(actual: &str, expected: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn import_publication_file(provider: &Path, file: &Path) -> anyhow::Result<String> {
     let response = publication_provider_request(
         provider,
@@ -576,6 +610,7 @@ async fn import_publication_file(provider: &Path, file: &Path) -> anyhow::Result
     Ok(cid.to_owned())
 }
 
+#[cfg(test)]
 async fn import_publication_raw_block(
     provider: &Path,
     name: &str,
@@ -586,16 +621,29 @@ async fn import_publication_raw_block(
         "Raw publication block exceeds its bounded import size"
     );
     let status = publication_provider_request(provider, serde_json::json!({"op":"status"})).await?;
+    publication_raw_block_put(status, name, bytes).await
+}
+
+async fn publication_raw_block_put(
+    status: serde_json::Value,
+    name: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        bytes.len() <= 2 * 1024 * 1024,
+        "Raw publication block exceeds its bounded import size"
+    );
     let endpoint = status["data"]["api_endpoint"]
         .as_str()
         .context("Qualified Kubo API endpoint missing")?;
     let base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(endpoint)?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_owned());
-    let response = client
+    let mut response = client
         .post(base.join("/api/v0/block/put")?)
         .query(&[
             ("cid-codec", "raw"),
@@ -606,19 +654,32 @@ async fn import_publication_raw_block(
         .send()
         .await?
         .error_for_status()?;
-    let receipt: serde_json::Value = response.json().await?;
+    let mut receipt_bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            receipt_bytes.len() + chunk.len() <= 64 * 1024,
+            "Raw block import receipt exceeds its bound"
+        );
+        receipt_bytes.extend_from_slice(&chunk);
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)?;
     Ok(receipt["Key"]
         .as_str()
         .context("Raw block import receipt lacks its CID")?
         .to_owned())
 }
 
+#[cfg(test)]
 async fn publication_provider_request(
     provider: &Path,
     operation: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new(provider)
+        .env(
+            "ELASTOS_DATA_DIR",
+            elastos_server::sources::default_data_dir(),
+        )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -649,6 +710,526 @@ async fn publication_provider_request(
         "IPFS provider refused import"
     );
     Ok(response)
+}
+
+struct PublicationProvider {
+    child: tokio::process::Child,
+    input: tokio::process::ChildStdin,
+    output: tokio::io::BufReader<tokio::process::ChildStdout>,
+}
+
+impl PublicationProvider {
+    async fn start(provider: &Path, data_dir: &Path) -> anyhow::Result<Self> {
+        let mut child = tokio::process::Command::new(provider)
+            .env("ELASTOS_DATA_DIR", data_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Cannot start the qualified model import provider")?;
+        let input = child.stdin.take().context("Model provider stdin missing")?;
+        let output = tokio::io::BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("Model provider stdout missing")?,
+        );
+        let mut session = Self {
+            child,
+            input,
+            output,
+        };
+        if let Err(error) = session
+            .request(serde_json::json!({"op":"init","config":{}}))
+            .await
+        {
+            let _ = session.child.kill().await;
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    async fn request(&mut self, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let operation = async {
+            let line = format!("{request}\n");
+            self.input.write_all(line.as_bytes()).await?;
+            let mut response = Vec::new();
+            (&mut self.output)
+                .take(64 * 1024 + 1)
+                .read_until(b'\n', &mut response)
+                .await?;
+            anyhow::ensure!(
+                !response.is_empty() && response.len() <= 64 * 1024 && response.ends_with(b"\n"),
+                "Model provider response exceeds its bound or ended early"
+            );
+            let value: serde_json::Value = serde_json::from_slice(&response)?;
+            anyhow::ensure!(
+                value["status"] == "ok",
+                "Qualified model provider refused readiness"
+            );
+            Ok(value)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(300), operation)
+            .await
+            .context("Model provider readiness exceeded five minutes")?
+    }
+
+    async fn import_file(&mut self, file: &Path) -> anyhow::Result<String> {
+        let response = self
+            .request(serde_json::json!({"op":"add_path", "path":file, "pin":true}))
+            .await?;
+        let cid = response["data"]["cid"]
+            .as_str()
+            .context("IPFS import receipt lacks a CID")?;
+        cid::Cid::try_from(cid).context("IPFS import receipt has an invalid CID")?;
+        Ok(cid.to_owned())
+    }
+
+    async fn import_raw_block(&mut self, name: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+        let status = self.request(serde_json::json!({"op":"status"})).await?;
+        publication_raw_block_put(status, name, bytes).await
+    }
+
+    async fn check_capacity(
+        &mut self,
+        data_dir: &Path,
+        repo_bytes: u64,
+        local_bytes: u64,
+    ) -> anyhow::Result<(u64, elastos_server::local_http::LoopbackHttpBaseUrl)> {
+        // The private provider probe validates the actual API repository, its
+        // pinned datastore layout and all datastore volumes. Bind that probe
+        // to the selected Runtime repository before using its free-space data.
+        let status = self.request(serde_json::json!({"op":"status"})).await?;
+        let endpoint = status["data"]["api_endpoint"]
+            .as_str()
+            .context("Model repository API endpoint missing")?;
+        let base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(endpoint)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut response = client
+            .post(base.join("/api/v0/repo/stat")?)
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= 64 * 1024,
+                "Model repository status exceeds its bound"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let repo_status: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let repo = data_dir.join("ipfs-repo");
+        require_selected_repository(&repo_status, &repo)?;
+        // The existing private probe admits up to 64 GiB per request. Larger
+        // publication reservations use the same observed volume and capacity;
+        // the publisher checks their entire budget below without truncation.
+        let probe_bytes = repo_bytes.clamp(1, 64 * 1024 * 1024 * 1024);
+        let observation = self
+            .request(
+                serde_json::json!({"op":"runtime_check_capacity","required_bytes":probe_bytes}),
+            )
+            .await?;
+        let local = storage_observation(data_dir)?;
+        let selected = storage_observation(&repo)?;
+        let floor = validate_publication_capacity(
+            &observation["data"],
+            probe_bytes,
+            selected,
+            local,
+            repo_bytes,
+            local_bytes,
+        )?;
+        Ok((floor, base))
+    }
+
+    async fn finish(&mut self) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.request(serde_json::json!({"op":"shutdown"})).await?;
+        self.input.shutdown().await?;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
+            .await
+            .context("Model import provider did not exit")??;
+        anyhow::ensure!(status.success(), "Model import provider exit failed");
+        Ok(())
+    }
+}
+
+struct PublicationStorageBudget {
+    local_bytes: u64,
+    repo_bytes: u64,
+}
+
+fn model_storage_bytes(
+    records: &[elastos_server::release_publication::ModelRetention],
+) -> anyhow::Result<u64> {
+    records.iter().try_fold(0_u64, |total, record| {
+        total
+            .checked_add(
+                record
+                    .car
+                    .size
+                    .checked_mul(2)
+                    .context("Model storage budget overflow")?,
+            )
+            .and_then(|n| n.checked_add(1024 * 1024))
+            .context("Model storage budget overflow")
+    })
+}
+
+fn publication_storage_budget(
+    publication: &elastos_server::release_publication::Publication,
+) -> anyhow::Result<PublicationStorageBudget> {
+    let metadata = (publication.head_bytes().len()
+        + publication.release_bytes().len()
+        + publication.installer_bytes().len()) as u64;
+    let files = publication
+        .artifacts()
+        .iter()
+        .try_fold(metadata, |total, artifact| {
+            total
+                .checked_add(artifact.size)
+                .context("Publication storage budget overflow")
+        })?;
+    storage_budget(
+        files,
+        publication.artifacts().len() + 3,
+        model_storage_bytes(publication.model_retention())?,
+    )
+}
+
+fn storage_budget(
+    files: u64,
+    count: usize,
+    models: u64,
+) -> anyhow::Result<PublicationStorageBudget> {
+    // Two full local copies (immutable snapshot and promotion stage), two
+    // payload budgets for UnixFS file blocks and filesystem overhead, then the
+    // retained model directory blocks. One MiB per file covers control files,
+    // allocation rounding and publication bookkeeping. Existing pins may make
+    // the real write smaller; preflight reserves a cold repository.
+    let overhead = u64::try_from(count)?
+        .checked_mul(1024 * 1024)
+        .context("Publication storage budget overflow")?;
+    let twice = files
+        .checked_mul(2)
+        .context("Publication storage budget overflow")?;
+    Ok(PublicationStorageBudget {
+        local_bytes: twice
+            .checked_add(overhead)
+            .context("Publication storage budget overflow")?,
+        repo_bytes: twice
+            .checked_add(overhead)
+            .and_then(|n| n.checked_add(models))
+            .context("Publication storage budget overflow")?,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StorageObservation {
+    volume: u64,
+    capacity: u64,
+    free: u64,
+}
+
+fn storage_observation(path: &Path) -> anyhow::Result<StorageObservation> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0,
+        "Publication storage directory must be owned and protected"
+    );
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    anyhow::ensure!(
+        unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } == 0,
+        "Publication storage observation failed"
+    );
+    let stats = unsafe { stats.assume_init() };
+    let capacity = u64::try_from(u128::from(stats.f_blocks) * u128::from(stats.f_frsize))?;
+    let free = u64::try_from(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))?;
+    anyhow::ensure!(
+        capacity > 0
+            && free <= capacity
+            && stats.f_frsize > 0
+            && stats.f_flag & libc::ST_RDONLY == 0,
+        "Publication storage observation refused"
+    );
+    Ok(StorageObservation {
+        volume: metadata.dev(),
+        capacity,
+        free,
+    })
+}
+
+fn require_selected_repository(value: &serde_json::Value, repo: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value["RepoPath"].as_str() == repo.to_str() && value["RepoSize"].as_u64().is_some(),
+        "Model API repository differs from the selected Runtime repository"
+    );
+    Ok(())
+}
+
+fn validate_publication_capacity(
+    value: &serde_json::Value,
+    probe_bytes: u64,
+    repo: StorageObservation,
+    local: StorageObservation,
+    repo_bytes: u64,
+    local_bytes: u64,
+) -> anyhow::Result<u64> {
+    let fields = value
+        .as_object()
+        .context("Publication capacity response required")?;
+    anyhow::ensure!(
+        fields.len() == 4
+            && fields.keys().all(|key| matches!(
+                key.as_str(),
+                "volume_id" | "capacity_bytes" | "available_bytes" | "required_bytes"
+            )),
+        "Publication capacity fields refused"
+    );
+    let free = value["available_bytes"]
+        .as_u64()
+        .context("Publication capacity free bytes required")?;
+    anyhow::ensure!(
+        repo.volume > 0
+            && value["volume_id"].as_u64() == Some(repo.volume)
+            && value["capacity_bytes"].as_u64() == Some(repo.capacity)
+            && value["required_bytes"].as_u64() == Some(probe_bytes)
+            && free <= repo.capacity,
+        "Publication capacity differs from the selected Runtime repository"
+    );
+    let repo_free = free.min(repo.free);
+    let floor = u64::try_from(u128::from(repo.capacity).saturating_mul(15).div_ceil(100))?;
+    let shared = repo.volume == local.volume;
+    anyhow::ensure!(
+        !shared || repo.capacity == local.capacity,
+        "Publication volume observations disagree"
+    );
+    let required = u128::from(repo_bytes) + if shared { u128::from(local_bytes) } else { 0 };
+    anyhow::ensure!(
+        u128::from(repo_free.min(if shared { local.free } else { repo_free }))
+            >= u128::from(floor) + required,
+        "Publication writes would cross the 15 percent free-space floor"
+    );
+    if !shared {
+        let local_floor = u128::from(local.capacity).saturating_mul(15).div_ceil(100);
+        anyhow::ensure!(
+            local.capacity > 0
+                && local.free <= local.capacity
+                && u128::from(local.free) >= local_floor + u128::from(local_bytes),
+            "Publication local copies would cross the 15 percent free-space floor"
+        );
+    }
+    Ok(floor)
+}
+
+fn model_import_space_guard(
+    repo: &Path,
+    records: &[elastos_server::release_publication::ModelRetention],
+) -> anyhow::Result<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(repo)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0,
+        "Model repository must be owned and protected"
+    );
+    let mut observation = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    anyhow::ensure!(
+        unsafe { libc::fstatvfs(directory.as_raw_fd(), observation.as_mut_ptr()) } == 0,
+        "Model repository capacity observation failed"
+    );
+    let observation = unsafe { observation.assume_init() };
+    let capacity = u128::from(observation.f_blocks) * u128::from(observation.f_frsize);
+    let free = u128::from(observation.f_bavail) * u128::from(observation.f_frsize);
+    let floor = capacity.saturating_mul(15).div_ceil(100);
+    let car_bytes: u128 = records
+        .iter()
+        .map(|record| u128::from(record.car.size))
+        .sum();
+    // Reserve all CAR payload bytes plus an equal filesystem-overhead budget.
+    // Observe real free space again after each import as well.
+    let required = car_bytes * 2 + records.len() as u128 * 1024 * 1024;
+    anyhow::ensure!(
+        capacity > 0 && free <= capacity && free >= floor + required,
+        "Model directory import would cross the 15 percent free-space floor"
+    );
+    u64::try_from(floor).context("Model repository floor exceeds its integer bound")
+}
+
+async fn bounded_model_import(
+    script: &Path,
+    api: &elastos_server::local_http::LoopbackHttpBaseUrl,
+    artifacts: &Path,
+    record: &elastos_server::release_publication::ModelRetention,
+    floor: u64,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncRead, AsyncReadExt};
+    async fn read_bounded(reader: impl AsyncRead + Unpin) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader.take(64 * 1024 + 1).read_to_end(&mut bytes).await?;
+        anyhow::ensure!(
+            bytes.len() <= 64 * 1024,
+            "Model import process output exceeded its bound"
+        );
+        Ok(bytes)
+    }
+    let mut child = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg("import")
+        .arg("--kubo-api")
+        .arg(api.as_str())
+        .arg("--cid")
+        .arg(&record.package_cid)
+        .arg("--car")
+        .arg(artifacts.join(&record.car.name))
+        .arg("--receipt")
+        .arg(artifacts.join(&record.receipt.name))
+        .arg("--free-space-floor-bytes")
+        .arg(floor.to_string())
+        .arg("--timeout-seconds")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Cannot run the model package import helper")?;
+    let stdout = child.stdout.take().context("Model import stdout missing")?;
+    let stderr = child.stderr.take().context("Model import stderr missing")?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let (stdout, _stderr, status) =
+            tokio::try_join!(read_bounded(stdout), read_bounded(stderr), async {
+                Ok::<_, anyhow::Error>(child.wait().await?)
+            })?;
+        anyhow::ensure!(
+            status.success(),
+            "Model CAR import failed before publication"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&stdout).context("Model import receipt is invalid")?;
+        let fields = value
+            .as_object()
+            .context("Model import receipt must be an object")?;
+        anyhow::ensure!(
+            fields.len() == 6
+                && fields.keys().all(|key| matches!(
+                    key.as_str(),
+                    "schema" | "package_cid" | "pinned" | "blocks" | "block_bytes" | "kubo_version"
+                )),
+            "Model import receipt fields refused"
+        );
+        anyhow::ensure!(
+            value["schema"] == "elastos.model.package-import/v1"
+                && value["package_cid"] == record.package_cid
+                && value["pinned"] == true
+                && value["kubo_version"] == "0.40.1"
+                && value["blocks"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0 && count <= record.car.size)
+                && value["block_bytes"]
+                    .as_u64()
+                    .is_some_and(|size| size > 0 && size <= record.car.size),
+            "Model import receipt differs from the signed retention root"
+        );
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("Model CAR import exceeded five minutes before publication")
+        }
+    }
+}
+
+#[cfg(test)]
+async fn import_publication_models(
+    provider: &Path,
+    workspace: &Path,
+    data_dir: &Path,
+    artifacts: &Path,
+    records: &[elastos_server::release_publication::ModelRetention],
+) -> anyhow::Result<()> {
+    let mut session = PublicationProvider::start(provider, data_dir).await?;
+    let result = import_publication_models_with_session(
+        &mut session,
+        workspace,
+        data_dir,
+        artifacts,
+        records,
+    )
+    .await;
+    let finished = session.finish().await;
+    if finished.is_err() {
+        let _ = session.child.kill().await;
+    }
+    result?;
+    finished
+}
+
+async fn import_publication_models_with_session(
+    session: &mut PublicationProvider,
+    workspace: &Path,
+    data_dir: &Path,
+    artifacts: &Path,
+    records: &[elastos_server::release_publication::ModelRetention],
+) -> anyhow::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let script = workspace.join("scripts/model-package-handoff.py");
+    anyhow::ensure!(script.is_file(), "Model package import helper is required");
+    async {
+        session
+            .request(serde_json::json!({"op":"runtime_prepare_backend"}))
+            .await?;
+        let repo = data_dir.join("ipfs-repo");
+        let required = model_storage_bytes(records)?;
+        let (floor, api) = session.check_capacity(data_dir, required, 0).await?;
+        model_import_space_guard(&repo, records)?;
+        for record in records {
+            session
+                .request(serde_json::json!({"op":"runtime_prepare_backend"}))
+                .await?;
+            // Use the held provider's admitted endpoint, rather than resolving
+            // the mutable coordinate file again in the external helper.
+            bounded_model_import(&script, &api, artifacts, record, floor).await?;
+            let (_, after) = session.check_capacity(data_dir, 1, 0).await?;
+            anyhow::ensure!(
+                after.as_str() == api.as_str(),
+                "Model provider API changed during CAR import"
+            );
+            model_import_space_guard(&repo, &[])?;
+        }
+        Ok(())
+    }
+    .await
 }
 
 fn workspace_root() -> PathBuf {
@@ -1796,7 +2377,7 @@ mod tests {
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
     };
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn platform_input_options() -> PublishReleaseOptions {
         PublishReleaseOptions {
@@ -2258,6 +2839,372 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn model_import_fixture(
+        root: &Path,
+        mode: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Vec<elastos_server::release_publication::ModelRetention>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let data = root.join("data");
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(data.join("ipfs-repo")).unwrap();
+        std::fs::create_dir(&artifacts).unwrap();
+        std::fs::create_dir(root.join("scripts")).unwrap();
+        let provider = root.join("model-provider-fixture");
+        let provider_program = r#"#!/usr/bin/env python3
+import base64, hashlib, http.server, json, os, pathlib, sys, threading
+cid = 'b' + base64.b32encode(b'\x01\x55\x12\x20' + hashlib.sha256(b'public model provider fixture').digest()).decode().lower().rstrip('=')
+with open(__file__ + '.starts', 'a') as sink: sink.write(str(os.getpid()) + '\n')
+repo = pathlib.Path(__file__).parent / 'data' / 'ipfs-repo'
+class API(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_POST(self):
+        path = str(repo) if __MODE__ != 'wrong-repo' else str(repo.parent / 'other-repo')
+        value = {'RepoPath':path, 'RepoSize':0} if self.path == '/api/v0/repo/stat' else {'Key':cid}
+        data = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+server = http.server.HTTPServer(('127.0.0.1', 0), API)
+endpoint = 'http://127.0.0.1:' + str(server.server_port)
+pathlib.Path(__file__ + '.api').write_text(endpoint + '/')
+worker = threading.Thread(target=server.serve_forever, daemon=True)
+worker.start()
+prepares = 0
+try:
+    for line in sys.stdin:
+        with open(__file__ + '.requests', 'a') as sink: sink.write(line)
+        request = json.loads(line)
+        data = {}
+        if request['op'] == 'runtime_prepare_backend':
+            prepares += 1
+            if __MODE__ == 'replaced-coords' and prepares > 1:
+                (repo.parent / 'ipfs-coords.json').write_text(json.dumps({'api_port':1}))
+        if request['op'] == 'add_path': data = {'cid':cid}
+        if request['op'] == 'status':
+            api = endpoint
+            if __MODE__ == 'changed-api' and (repo.parent.parent / 'scripts/model-package-handoff.requests').exists():
+                api = endpoint.replace('127.0.0.1', 'localhost')
+            data = {'api_endpoint':api}
+        if request['op'] == 'runtime_check_capacity':
+            stats = os.statvfs(repo)
+            data = {'volume_id':os.stat(repo).st_dev, 'capacity_bytes':stats.f_blocks * stats.f_frsize,
+                'available_bytes':stats.f_bavail * stats.f_frsize, 'required_bytes':request['required_bytes']}
+        print(json.dumps({'status':'ok','data':data}), flush=True)
+        if request['op'] == 'shutdown': break
+finally:
+    server.shutdown()
+    worker.join()
+    server.server_close()
+"#.replace("__MODE__", &serde_json::to_string(mode).unwrap());
+        std::fs::write(&provider, provider_program).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = root.join("scripts/model-package-handoff.py");
+        let program = format!(
+            r#"import json, pathlib, sys, urllib.request
+args = sys.argv[1:]
+with pathlib.Path(__file__).with_suffix('.requests').open('a') as sink:
+    sink.write(json.dumps(args) + '\n')
+if {mode:?} == 'replaced-coords':
+    root = pathlib.Path(__file__).parent.parent
+    assert json.loads((root / 'data/ipfs-coords.json').read_text())['api_port'] == 1
+    assert '--data-dir' not in args
+    api = args[args.index('--kubo-api') + 1]
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
+    with opener.open(urllib.request.Request(api.rstrip('/') + '/api/v0/repo/stat', data=b''), timeout=2) as response:
+        assert json.load(response)['RepoPath'] == str(root / 'data/ipfs-repo')
+if {mode:?} == 'failure':
+    sys.exit(7)
+if {mode:?} == 'oversized':
+    print('x' * 65537)
+    sys.exit(0)
+cid = args[args.index('--cid') + 1]
+print(json.dumps({{'schema':'elastos.model.package-import/v1','package_cid':cid,
+    'pinned':{pin},'blocks':1,'block_bytes':5,'kubo_version':'0.40.1'}}))
+"#,
+            pin = if mode == "unpinned" { "False" } else { "True" }
+        );
+        std::fs::write(script, program).unwrap();
+        let records = (0..4)
+            .map(|index| {
+                let bytes = format!("public model fixture {index}");
+                let cid = import_fixture_raw_cid(bytes.as_bytes());
+                let raw = cid::Cid::try_from(cid.as_str()).unwrap();
+                let package_cid = cid::Cid::new_v1(0x70, *raw.hash()).to_string();
+                let descriptor =
+                    |name: String| elastos_server::release_publication::ArtifactDescriptor {
+                        name,
+                        cid: cid.clone(),
+                        sha256: "a".repeat(64),
+                        size: 32,
+                    };
+                elastos_server::release_publication::ModelRetention {
+                    component: format!("model-fixture-{index}"),
+                    package_cid,
+                    car: descriptor(format!("model-fixture-{index}.car")),
+                    receipt: descriptor(format!("model-fixture-{index}.car.receipt.json")),
+                }
+            })
+            .collect();
+        (provider, data, artifacts, records)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_files_raw_blocks_and_model_imports_share_one_owned_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (provider, data, artifacts, records) = model_import_fixture(&root, "success");
+        let file = artifacts.join("public-file.tar");
+        std::fs::write(&file, b"public fixture").unwrap();
+        let mut session = super::PublicationProvider::start(&provider, &data)
+            .await
+            .unwrap();
+        let expected = import_fixture_raw_cid(b"public model provider fixture");
+        assert_eq!(session.import_file(&file).await.unwrap(), expected);
+        assert_eq!(
+            session
+                .import_raw_block("model-catalog.json", b"public fixture".to_vec())
+                .await
+                .unwrap(),
+            expected
+        );
+        super::import_publication_models_with_session(
+            &mut session,
+            &root,
+            &data,
+            &artifacts,
+            &records,
+        )
+        .await
+        .unwrap();
+        session.finish().await.unwrap();
+        let starts = std::fs::read_to_string(format!("{}.starts", provider.display())).unwrap();
+        assert_eq!(starts.lines().count(), 1);
+        let requests = import_fixture_requests(&provider);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["op"] == "init")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["op"] == "add_path")
+                .count(),
+            1
+        );
+        assert_eq!(requests.last().unwrap()["op"], "shutdown");
+        assert_eq!(
+            std::fs::read_to_string(root.join("scripts/model-package-handoff.requests"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_retention_batch_keeps_provider_ready_and_passes_exact_import_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (provider, data, artifacts, records) = model_import_fixture(&root, "success");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            super::import_publication_models(&provider, &root, &data, &artifacts, &records),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = import_fixture_requests(&provider);
+        assert_eq!(
+            requests.first().unwrap(),
+            &serde_json::json!({"op":"init","config":{}})
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["op"] == "runtime_prepare_backend")
+                .count(),
+            5
+        );
+        assert_eq!(
+            requests.last().unwrap(),
+            &serde_json::json!({"op":"shutdown"})
+        );
+        let arguments: Vec<Vec<String>> =
+            std::fs::read_to_string(root.join("scripts/model-package-handoff.requests"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(arguments.len(), 4);
+        let api = std::fs::read_to_string(format!("{}.api", provider.display())).unwrap();
+        for (args, record) in arguments.iter().zip(&records) {
+            assert_eq!(args[0], "import");
+            assert!(!args.iter().any(|arg| arg == "--data-dir"));
+            for (flag, expected) in [
+                ("--kubo-api", api.clone()),
+                ("--cid", record.package_cid.clone()),
+                (
+                    "--car",
+                    artifacts
+                        .join(&record.car.name)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "--receipt",
+                    artifacts
+                        .join(&record.receipt.name)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ("--timeout-seconds", "60".to_owned()),
+            ] {
+                assert_eq!(
+                    &args[args.iter().position(|arg| arg == flag).unwrap() + 1],
+                    &expected
+                );
+            }
+            assert!(
+                args[args
+                    .iter()
+                    .position(|arg| arg == "--free-space-floor-bytes")
+                    .unwrap()
+                    + 1]
+                .parse::<u64>()
+                .unwrap()
+                    > 0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_import_keeps_admitted_provider_api_when_coordinates_are_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (provider, data, artifacts, records) = model_import_fixture(&root, "replaced-coords");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            super::import_publication_models(&provider, &root, &data, &artifacts, &records),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let imports =
+            std::fs::read_to_string(root.join("scripts/model-package-handoff.requests")).unwrap();
+        assert_eq!(imports.lines().count(), 4);
+        let coordinates: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join("ipfs-coords.json")).unwrap()).unwrap();
+        assert_eq!(coordinates["api_port"], 1);
+        assert_eq!(
+            import_fixture_requests(&provider).last().unwrap()["op"],
+            "shutdown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_import_failure_refuses_the_batch_and_preserves_previous_public_files() {
+        for mode in ["failure", "unpinned", "oversized", "changed-api"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let (provider, data, artifacts, records) = model_import_fixture(&root, mode);
+            let previous = data.join("previous-public-head.json");
+            std::fs::write(&previous, b"accepted previous public generation").unwrap();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                super::import_publication_models(&provider, &root, &data, &artifacts, &records),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains("Model"), "{error}");
+            assert_eq!(
+                std::fs::read(&previous).unwrap(),
+                b"accepted previous public generation"
+            );
+            let requests = import_fixture_requests(&provider);
+            assert_eq!(
+                requests.last().unwrap(),
+                &serde_json::json!({"op":"shutdown"})
+            );
+            let imports =
+                std::fs::read_to_string(root.join("scripts/model-package-handoff.requests"))
+                    .unwrap();
+            assert_eq!(
+                imports.lines().count(),
+                1,
+                "failed import must stop the remaining batch"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_import_refuses_an_api_repository_outside_selected_runtime_before_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (provider, data, artifacts, records) = model_import_fixture(&root, "wrong-repo");
+        let error = super::import_publication_models(&provider, &root, &data, &artifacts, &records)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("repository differs"), "{error}");
+        assert!(!root.join("scripts/model-package-handoff.requests").exists());
+        assert_eq!(
+            import_fixture_requests(&provider).last().unwrap()["op"],
+            "shutdown"
+        );
+    }
+
+    #[test]
+    fn publication_budget_reserves_copies_file_blocks_and_directory_blocks_before_writes() {
+        let budget = super::storage_budget(100, 2, 60).unwrap();
+        assert_eq!(budget.local_bytes, 200 + 2 * 1024 * 1024);
+        assert_eq!(budget.repo_bytes, budget.local_bytes + 60);
+        assert!(super::storage_budget(u64::MAX, 1, 1).is_err());
+        let repo = super::StorageObservation {
+            volume: 7,
+            capacity: 1000,
+            free: 350,
+        };
+        let value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
+        // Each 150-byte write would fit on its own, but their combined peak
+        // would leave only 50 bytes on the same volume, below the 15% floor.
+        assert!(super::validate_publication_capacity(&value, 150, repo, repo, 150, 150).is_err());
+        let other = super::StorageObservation {
+            volume: 8,
+            capacity: 1000,
+            free: 350,
+        };
+        assert!(super::validate_publication_capacity(&value, 150, repo, other, 150, 150).is_ok());
+        let wrong = serde_json::json!({"volume_id":8,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
+        assert!(super::validate_publication_capacity(&wrong, 150, repo, other, 150, 150).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_storage_preflight_reserves_all_records_before_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (_provider, data, _artifacts, mut records) = model_import_fixture(&root, "success");
+        for record in &mut records {
+            record.car.size = u64::MAX;
+        }
+        assert!(super::model_import_space_guard(&data.join("ipfs-repo"), &records).is_err());
     }
 
     #[cfg(unix)]

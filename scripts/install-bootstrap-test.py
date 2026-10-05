@@ -98,14 +98,19 @@ RUNTIME_STUB = b'''#!/bin/bash
 printf '%s\\n' "$*" >> "${ELASTOS_TEST_CALLS:?fixture call log}"
 case "${1:-}" in
     --version) echo "elastos 0.7.1" ;;
-    principal-root-upgrade|setup|home) exit 0 ;;
+    setup)
+        data="${XDG_DATA_HOME:?fixture XDG root}/elastos"
+        for metadata in sources.json installation/release-head.json installation/release.json; do
+            [[ -f "$data/$metadata" ]] || exit 98
+        done
+        printf '%s\\n' "Runtime setup handoff; Carrier transport is outside this fixture" > "${ELASTOS_TEST_SETUP_MARKER:?fixture marker}"
+        exit 0 ;;
+    principal-root-upgrade|home) exit 0 ;;
     *) exit 97 ;;
 esac
 '''
 COMPONENTS = json.dumps({"schema": "elastos.components/v1", "capsules": {}, "external": {},
                          "profiles": {}}, sort_keys=True).encode() + b"\n"
-BOOTSTRAP = (b'{"schema":"elastos.carrier.bootstrap/v1","role":"publisher",'
-             b'"ticket":"fixture-ticket","node_id":"fixture-node"}\n')
 
 
 CATALOG = b'{"payload":{"schema":"elastos.model.catalog/v1","entries":[]},"note":"fixture catalog"}\n'
@@ -274,47 +279,14 @@ class SignatureTests(unittest.TestCase):
 
 
 class ShellTests(unittest.TestCase):
-    def test_bootstrap_refresh_is_bash32_compatible(self):
-        result = shell('''
-PUBLISHER_GATEWAY=https://test.invalid
-SOURCE_CONNECT_TICKET=old-ticket
-PUBLISHER_NODE_ID=old-node
-SOURCE_CONNECT_TICKET_EXPLICIT=false
-PUBLISHER_NODE_ID_EXPLICIT=false
-curl() { printf '%s\\n' '{"schema":"elastos.carrier.bootstrap/v1","role":"publisher","ticket":"fresh-ticket","node_id":"fresh-node"}'; }
-refresh_source_bootstrap_from_publisher
-[[ "$SOURCE_CONNECT_TICKET" == fresh-ticket && "$PUBLISHER_NODE_ID" == fresh-node ]]
-''')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_bootstrap_failure_preserves_atomic_stamped_pair(self):
-        for response in ["{}", '{"schema":"elastos.carrier.bootstrap/v1","role":"publisher","ticket":"partial"}',
-                         '{"schema":"elastos.carrier.bootstrap/v1","role":"runtime","ticket":"wrong","node_id":"wrong"}']:
-            result = shell('''
-PUBLISHER_GATEWAY=https://test.invalid
-SOURCE_CONNECT_TICKET=old-ticket
-PUBLISHER_NODE_ID=old-node
-SOURCE_CONNECT_TICKET_EXPLICIT=false
-PUBLISHER_NODE_ID_EXPLICIT=false
-curl() { printf '%s\\n' "$1"; }
-''' .replace('"$1"', shlex.quote(response)) + '''
-refresh_source_bootstrap_from_publisher
-[[ "$SOURCE_CONNECT_TICKET" == old-ticket && "$PUBLISHER_NODE_ID" == old-node ]]
-''')
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_explicit_bootstrap_pair_avoids_refresh(self):
-        result = shell('''
-PUBLISHER_GATEWAY=https://test.invalid
-SOURCE_CONNECT_TICKET=explicit-ticket
-PUBLISHER_NODE_ID=explicit-node
-SOURCE_CONNECT_TICKET_EXPLICIT=true
-PUBLISHER_NODE_ID_EXPLICIT=true
-curl() { echo unexpected-network-call >&2; exit 91; }
-refresh_source_bootstrap_from_publisher
-[[ "$SOURCE_CONNECT_TICKET" == explicit-ticket && "$PUBLISHER_NODE_ID" == explicit-node ]]
-''')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def test_explicit_carrier_source_overrides_require_a_complete_pair(self):
+        for ticket, node, accepted in [(True, True, True), (False, False, True),
+                                       (True, False, False), (False, True, False)]:
+            result = shell('SOURCE_CONNECT_TICKET_EXPLICIT="$1"\nPUBLISHER_NODE_ID_EXPLICIT="$2"\n'
+                           'validate_explicit_source_bootstrap_pair\n',
+                           str(ticket).lower(), str(node).lower())
+            with self.subTest(ticket=ticket, node=node):
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
     def test_empty_gateway_array_fails_with_installer_message(self):
         result = shell('GATEWAYS=()\nipfs_fetch test-cid /unused\n')
@@ -365,11 +337,14 @@ class InstallerSandbox:
     and any request for a response that is absent, fails and is logged.
     """
 
-    def __init__(self, head, release, did, system="Linux", machine="x86_64", catalog_cid=""):
+    def __init__(self, head, release, did, system="Linux", machine="x86_64"):
         self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-")
         self.root = Path(self.directory.name)
         self.did, self.system, self.machine = did, system, machine
-        self.catalog_cid = catalog_cid
+        self.installer = self.root / "install.sh"
+        # Release publication stamps the reviewed source route into install.sh.
+        self.installer.write_text(SOURCE.replace("__SOURCE_CONNECT_TICKET__", "fixture-ticket", 1)
+                                  .replace("__PUBLISHER_NODE_ID__", "fixture-node", 1))
         self.home = self.root / "home"
         self.data = self.home / "xdg-data/elastos"
         self.binary = self.home / ".local/bin/elastos"
@@ -382,7 +357,6 @@ class InstallerSandbox:
         self.release_cid = json.loads(head)["payload"]["latest_release_cid"]
         platform_entry = json.loads(release)["payload"].get("platforms", {}).get("x86_64-linux", {})
         self.binary_cid = platform_entry.get("binary", {}).get("cid", "")
-        self.components_cid = platform_entry.get("components", {}).get("cid", "")
         self.respond("release-head.json", head)
         self.respond("release.json", release)
         mocks = self.root / "mocks"
@@ -397,9 +371,6 @@ case "$url" in
   */release-head.json|*/ipfs/"$FIXTURE_HEAD_CID") response=release-head.json;;
   */release.json|*/ipfs/"$FIXTURE_RELEASE_CID") response=release.json;;
   */artifacts/elastos-*|*/ipfs/"$FIXTURE_BINARY_CID") response=binary;;
-  */artifacts/components-*.json|*/ipfs/"$FIXTURE_COMPONENTS_CID") response=components;;
-  */artifacts/model-catalog.json|*/ipfs/"$FIXTURE_CATALOG_CID") response=catalog;;
-  */.well-known/elastos/carrier-bootstrap.json*) response=bootstrap;;
   *) echo unexpected-request-blocked >&2; exit 93;;
 esac
 [ -f "$FIXTURES/responses/$response" ] || { echo artifact-request-blocked >&2; exit 93; }
@@ -430,12 +401,12 @@ export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES=
 export PYTHONDONTWRITEBYTECODE=1
 export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="" ELASTOS_IPFS_GATEWAYS=""
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
-export ELASTOS_TEST_CALLS="$1/calls" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
-export FIXTURE_HEAD_CID="$6" FIXTURE_RELEASE_CID="$7" FIXTURE_BINARY_CID="$8" FIXTURE_COMPONENTS_CID="$9"
-export FIXTURE_CATALOG_CID="${10}"
-exec "$2" --noprofile --norc "$3" "${@:11}"
-''', self.root, OPTIONS.bash, INSTALLER, self.system, self.machine, self.head_cid, self.release_cid,
-                       self.binary_cid, self.components_cid, self.catalog_cid, "--maintainer-did", self.did, *options)
+export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
+export FIXTURE_HEAD_CID="$6" FIXTURE_RELEASE_CID="$7" FIXTURE_BINARY_CID="$8"
+# Feed the complete stamped script through stdin, as curl | bash does.
+cat "$3" | "$2" --noprofile --norc -s -- "${@:9}"
+''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, self.head_cid, self.release_cid,
+                       self.binary_cid, "--maintainer-did", self.did, *options)
         return result, self.requests()[seen:]
 
     def runtime_calls(self):
@@ -634,11 +605,9 @@ class InstallationTests(unittest.TestCase):
 
     REQUESTS = {
         "publisher": ["https://test.invalid/release-head.json", "https://test.invalid/release.json",
-                      "https://test.invalid/artifacts/elastos-x86_64-linux",
-                      "https://test.invalid/artifacts/components-x86_64-linux.json",
-                      "https://test.invalid/.well-known/elastos/carrier-bootstrap.json?role=publisher"],
+                      "https://test.invalid/artifacts/elastos-x86_64-linux"],
         "cid": ["https://test.invalid/ipfs/head-a", "https://test.invalid/ipfs/release-a",
-                "https://test.invalid/ipfs/binary-a", "https://test.invalid/ipfs/components-a"],
+                "https://test.invalid/ipfs/binary-a"],
     }
 
     def test_test_signer_reproduces_fixed_fixture_vectors(self):
@@ -664,7 +633,8 @@ class InstallationTests(unittest.TestCase):
         sandbox.binary.write_bytes(b"#!/bin/sh\necho previous runtime\n")
         sandbox.binary.chmod(0o755)
         files = {
-            "components.json": b'{"schema":"elastos.components/v1","capsules":{},"note":"previous"}\n',
+            "components.json": b'{"schema":"elastos.components/v1","capsules":{"shell":{"cid":"previous"}},"note":"previous"}\n',
+            "model-catalog.json": b'{"note":"previous catalog"}\n',
             "sources.json": b'{"schema":"elastos.trusted-sources/v1","note":"previous"}\n',
             "Users/alice/notes.txt": b"user data stays\n",
             "capsules/shell/cache.bin": b"cached capsule stays\n",
@@ -682,98 +652,66 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(sandbox.home_state(), before)
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
-    def test_pinned_catalogue_is_verified_before_any_installation_change(self):
-        # A release whose components.json pins a signed model catalogue advertises
-        # three files. A missing or mismatched catalogue is refused like a bad
-        # binary: before Runtime processes are stopped and before the current
-        # binary, components.json or catalogue change.
-        components = pinned_components()
-        catalog_cid = catalog_head_cid(CATALOG)
-        did, head, release = installable_fixture(components=components)
-        previous_catalog = b'{"note":"previous catalog"}\n'
-        catalog_url = {"publisher": "https://test.invalid/artifacts/model-catalog.json",
-                       "cid": f"https://test.invalid/ipfs/{catalog_cid}"}
-        for transport in ["publisher", "cid"]:
-            with InstallerSandbox(head, release, did, catalog_cid=catalog_cid) as sandbox:
-                self.existing_installation(sandbox)
-                (sandbox.data / "model-catalog.json").write_bytes(previous_catalog)
-                (sandbox.data / "model-catalog.json").chmod(0o600)
-                sandbox.respond("components", components)
-                sandbox.respond("binary", RUNTIME_STUB)
-                sandbox.respond("bootstrap", BOOTSTRAP)
-                before = sandbox.home_state()
-                expected = self.REQUESTS[transport][:4] + [catalog_url[transport]]
-                for name, served in [("missing catalogue", None),
-                                     ("catalogue differs from pin", CATALOG.replace(b"fixture", b"altered"))]:
-                    (sandbox.responses / "catalog").unlink(missing_ok=True)
-                    if served is not None:
-                        sandbox.respond("catalog", served)
-                    result, requests = sandbox.run("--install-only", transport=transport)
-                    with self.subTest(transport=transport, case=name):
-                        self.assert_no_installation_effects(sandbox, before, result)
-                        self.assertEqual((sandbox.data / "model-catalog.json").read_bytes(), previous_catalog)
-                        self.assertIn("Verifying components.json SHA-256", result.stdout)
-                        self.assertNotIn("Installing binary to", result.stdout)
-                        if served is None:
-                            self.assertRegex(result.stderr, "Failed to (download model catalog|fetch CID)")
+    def test_runtime_owns_metadata_handoff_after_three_bootstrap_downloads(self):
+        # The shell keeps both existing metadata files and cached capsules. The
+        # Runtime stub proves setup receives verified envelopes and source config;
+        # it deliberately makes no Carrier claim and writes no component metadata.
+        for transport in ("publisher", "cid"):
+            for catalogue in (False, True):
+                components = pinned_components() if catalogue else COMPONENTS
+                manifest = json.loads(components)
+                manifest["capsules"] = {"shell": {"cid": "new-shell"}}
+                components = json.dumps(manifest).encode()
+                did, head, release = installable_fixture(components=components)
+                for install_only in (False, True):
+                    with self.subTest(transport=transport, catalogue=catalogue, install_only=install_only), \
+                            InstallerSandbox(head, release, did) as sandbox:
+                        self.existing_installation(sandbox)
+                        before = sandbox.home_state()
+                        sandbox.respond("binary", RUNTIME_STUB)
+                        # Components/catalog/bootstrap endpoints remain blocked.
+                        result, requests = sandbox.run(*(["--install-only"] if install_only else []), transport=transport)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(requests, self.REQUESTS[transport])
+                        for name in ("components.json", "model-catalog.json", "capsules/shell/cache.bin", "Users/alice/notes.txt"):
+                            self.assertEqual(sandbox.home_state()["xdg-data/elastos/" + name],
+                                             before["xdg-data/elastos/" + name])
+                        self.assertEqual((sandbox.data / "installation/release-head.json").read_bytes(), head)
+                        self.assertEqual((sandbox.data / "ElastOS/SystemServices/Publisher/release-head.json").read_bytes(), b"previous head\n")
+                        self.assertEqual((sandbox.data / "installation/release.json").read_bytes(), release)
+                        self.assertEqual((sandbox.data / "ElastOS/SystemServices/Publisher/release.json").read_bytes(), b"previous release\n")
+                        source = json.loads((sandbox.data / "sources.json").read_text())["sources"][0]
+                        self.assertEqual((source["connect_ticket"], source["publisher_node_id"]),
+                                         ("fixture-ticket", "fixture-node"))
+                        marker = sandbox.root / "setup-marker"
+                        if install_only:
+                            self.assertFalse(marker.exists())
+                            self.assertNotIn("setup", sandbox.runtime_calls())
                         else:
-                            self.assertIn("does not match pin", result.stderr)
-                            self.assertIn("the current installation was preserved", result.stderr)
-                        self.assertEqual(requests, expected)
-                sandbox.respond("catalog", CATALOG)
-                sandbox.calls.unlink(missing_ok=True)
-                result, requests = sandbox.run("--install-only", transport=transport)
-                with self.subTest(transport=transport, case="exact catalogue"):
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("Runtime installed:", result.stdout)
-                    bootstrap = self.REQUESTS[transport][4:]
-                    self.assertEqual(requests, expected + bootstrap)
-                    self.assertLess(result.stdout.index("Verifying model catalog"),
-                                    result.stdout.index("Stopping verified Runtime processes"))
-                    installed = sandbox.data / "model-catalog.json"
-                    self.assertEqual(installed.read_bytes(), CATALOG)
-                    self.assertEqual(installed.stat().st_mode & 0o777, 0o600)
-                    self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
-                    self.assertEqual((sandbox.data / "components.json").read_bytes(), components)
-                    self.assertEqual(sandbox.runtime_calls()[0], "--version")
-                    after = sandbox.home_state()
-                    changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
-                    self.assertEqual(changed, {
-                        ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/model-catalog.json",
-                        "xdg-data/elastos/sources.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
-                    self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                            self.assertIn("Carrier transport is outside this fixture", marker.read_text())
+                            self.assertEqual(sandbox.runtime_calls()[-1], "setup")
+                        self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
         did, head, release = installable_fixture()
         cases = [
-            ("truncated binary", RUNTIME_STUB[:-9], COMPONENTS, "binary"),
-            ("wrong binary bytes", RUNTIME_STUB.replace(b"0.7.1", b"0.7.2"), COMPONENTS, "binary"),
-            ("wrong components bytes", RUNTIME_STUB, COMPONENTS.replace(b"{}", b"{ }", 1), "components"),
+            ("truncated binary", RUNTIME_STUB[:-9]),
+            ("wrong binary bytes", RUNTIME_STUB.replace(b"0.7.1", b"0.7.2")),
         ]
         for transport in ["publisher", "cid"]:
             with InstallerSandbox(head, release, did) as sandbox:
                 self.existing_installation(sandbox)
-                sandbox.respond("bootstrap", BOOTSTRAP)
                 before = sandbox.home_state()
                 expected = self.REQUESTS[transport]
-                for name, binary, components, stage in cases:
+                for name, binary in cases:
                     sandbox.respond("binary", binary)
-                    sandbox.respond("components", components)
                     result, requests = sandbox.run("--install-only", transport=transport)
                     with self.subTest(transport=transport, case=name):
                         self.assertIn("SHA-256 mismatch", result.stderr)
-                        if stage == "binary":
-                            self.assertIn("Verifying binary SHA-256", result.stdout)
-                            self.assertNotIn("Downloading components.json", result.stdout)
-                            self.assertEqual(requests, expected[:3])
-                        else:
-                            self.assertIn("Verifying components.json SHA-256", result.stdout)
-                            self.assertEqual(requests, expected[:4])
+                        self.assertIn("Verifying binary SHA-256", result.stdout)
+                        self.assertEqual(requests, expected)
                         self.assert_no_installation_effects(sandbox, before, result)
                 sandbox.respond("binary", RUNTIME_STUB)
-                sandbox.respond("components", COMPONENTS)
                 with self.subTest(transport=transport, case="clean rerun"):
                     self.assert_clean_install(sandbox, transport, did, head, release, before)
 
@@ -792,9 +730,9 @@ class InstallationTests(unittest.TestCase):
         self.assertTrue(sandbox.binary.stat().st_mode & 0o100)
         self.assertTrue(os.access(sandbox.binary, os.X_OK))
         self.assertFalse((sandbox.binary.parent / ".elastos.install.tmp").exists())
-        manifest = (sandbox.data / "components.json").read_bytes()
-        self.assertEqual(manifest, COMPONENTS)
-        self.assertEqual(hashlib.sha256(manifest).hexdigest(), advertised["components"]["sha256"])
+        for name in ("components.json", "model-catalog.json", "capsules/shell/cache.bin"):
+            self.assertEqual(sandbox.home_state()["xdg-data/elastos/" + name],
+                             before["xdg-data/elastos/" + name])
         calls = sandbox.runtime_calls()
         self.assertEqual(calls[0], "--version")
         self.assertRegex(calls[1], "^principal-root-upgrade --data-dir %s --backup-dir %s/backups/principal-root-upgrade-[0-9]+-[0-9]+$"
@@ -809,16 +747,19 @@ class InstallationTests(unittest.TestCase):
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
         self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node")
-                         if transport == "publisher" else ([], "head-a", "", ""))
-        publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
-        self.assertEqual((publisher / "release-head.json").read_bytes(), head)
-        self.assertEqual((publisher / "release.json").read_bytes(), release)
+                         if transport == "publisher" else ([], "head-a", "fixture-ticket", "fixture-node"))
+        consumed = sandbox.data / "installation"
+        self.assertEqual((consumed / "release-head.json").read_bytes(), head)
+        self.assertEqual((consumed / "release.json").read_bytes(), release)
+        self.assertEqual(consumed.stat().st_mode & 0o777, 0o700)
+        for name in ("release.json", "release-head.json"):
+            self.assertEqual((consumed / name).stat().st_mode & 0o777, 0o600)
         after = sandbox.home_state()
         changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
         self.assertEqual(changed, {
-            ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/sources.json",
-            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
-            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
+            ".local/bin/elastos", "xdg-data/elastos/sources.json", "xdg-data/elastos/installation",
+            "xdg-data/elastos/installation/release-head.json",
+            "xdg-data/elastos/installation/release.json"})
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_staged_executable_accepts_exact_signed_version(self):
@@ -830,26 +771,28 @@ class InstallationTests(unittest.TestCase):
                     with InstallerSandbox(head, release, did) as sandbox:
                         self.existing_installation(sandbox)
                         sandbox.respond("binary", binary)
-                        sandbox.respond("components", COMPONENTS)
-                        sandbox.respond("bootstrap", BOOTSTRAP)
                         self.assert_clean_install(sandbox, transport, did, head, release,
                                                   sandbox.home_state(), runtime=binary)
 
-    def test_fresh_install_saves_publisher_metadata(self):
+    def test_fresh_install_saves_private_consumed_pair_and_keeps_publisher_custody(self):
         did, head, release = installable_fixture()
         for transport in ["publisher", "cid"]:
             with self.subTest(transport=transport):
                 with InstallerSandbox(head, release, did) as sandbox:
                     sandbox.respond("binary", RUNTIME_STUB)
-                    sandbox.respond("components", COMPONENTS)
-                    sandbox.respond("bootstrap", BOOTSTRAP)
                     result, requests = sandbox.run("--install-only", transport=transport)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(requests, self.REQUESTS[transport])
                     self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
-                    publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
-                    self.assertEqual((publisher / "release-head.json").read_bytes(), head)
-                    self.assertEqual((publisher / "release.json").read_bytes(), release)
+                    consumed = sandbox.data / "installation"
+                    self.assertEqual((consumed / "release-head.json").read_bytes(), head)
+                    self.assertEqual((consumed / "release.json").read_bytes(), release)
+                    self.assertFalse((sandbox.data / "ElastOS/SystemServices/Publisher").exists())
+                    self.assertEqual(consumed.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual((consumed / "release.json").stat().st_mode & 0o777, 0o600)
+                    self.assertEqual((consumed / "release-head.json").stat().st_mode & 0o777, 0o600)
+                    self.assertFalse((sandbox.data / "components.json").exists())
+                    self.assertFalse((sandbox.data / "model-catalog.json").exists())
                     self.assertFalse((sandbox.data / "updates/consumed").exists())
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
@@ -899,8 +842,6 @@ class InstallationTests(unittest.TestCase):
         for transport in ["publisher", "cid"]:
             with InstallerSandbox(head, release, did) as sandbox:
                 self.existing_installation(sandbox)
-                sandbox.respond("components", COMPONENTS)
-                sandbox.respond("bootstrap", BOOTSTRAP)
                 before = sandbox.home_state()
                 for name, version, binary, message, expected_calls in cases:
                     _, served_head, served_release = installable_fixture(runtime=binary, version=version)
@@ -913,7 +854,7 @@ class InstallationTests(unittest.TestCase):
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn(message, result.stderr)
                         self.assertIn("the current installation was preserved", result.stderr)
-                        self.assertEqual(requests, self.REQUESTS[transport][:4])
+                        self.assertEqual(requests, self.REQUESTS[transport])
                         self.assertIn("Installing binary to", result.stdout)
                         self.assertNotIn("Installing components.json", result.stdout)
                         self.assertEqual(sandbox.runtime_calls(), expected_calls)
@@ -942,13 +883,67 @@ class InstallationTests(unittest.TestCase):
                 with self.subTest(transport=transport, case=name), \
                         InstallerSandbox(served_head, served_release, anchor) as sandbox:
                     self.existing_installation(sandbox)
-                    for response, data in [("binary", RUNTIME_STUB), ("components", COMPONENTS), ("bootstrap", BOOTSTRAP)]:
-                        sandbox.respond(response, data)
+                    sandbox.respond("binary", RUNTIME_STUB)
                     before = sandbox.home_state()
                     result, requests = sandbox.run("--install-only", transport=transport)
                     self.assertIn(message, result.stderr)
                     self.assertEqual(requests, self.REQUESTS[transport][:request_count])
                     self.assert_no_installation_effects(sandbox, before, result)
+
+
+class ConsumedReleaseTests(unittest.TestCase):
+    def run_handoff(self, source, data):
+        block = SOURCE.split("<<'PY_CONSUMED_RELEASE'\n", 1)[1].split("\nPY_CONSUMED_RELEASE", 1)[0]
+        return subprocess.run(["python3", "-I", "-S", "-", str(source), str(data)],
+                              input=block, text=True, capture_output=True, timeout=10)
+
+    def test_consumed_pair_refuses_unsafe_paths_and_preserves_prior_custody(self):
+        for case in ("symlink directory", "shared directory", "symlink file", "hardlink file",
+                     "shared file", "exclusive scratch", "second exclusive scratch", "second source missing"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="consumed-release-") as temp:
+                root = Path(temp)
+                source, data, outside = (root / name for name in ("source", "data", "outside"))
+                for path in (source, data, outside):
+                    path.mkdir(mode=0o700)
+                for name in ("release.json", "release-head.json"):
+                    (source / name).write_bytes(b"new verified " + name.encode())
+                publisher = data / "publisher"
+                publisher.mkdir(mode=0o700)
+                (publisher / "release-head.json").write_bytes(b"publisher custody")
+                consumed = data / "installation"
+                if case == "symlink directory":
+                    consumed.symlink_to(outside, target_is_directory=True)
+                else:
+                    consumed.mkdir(mode=0o700)
+                for name in ("release.json", "release-head.json"):
+                    (consumed / name).write_bytes(b"previous " + name.encode())
+                    (consumed / name).chmod(0o600)
+                if case == "shared directory":
+                    consumed.chmod(0o750)
+                elif case == "symlink file":
+                    (outside / "prior").write_bytes(b"previous release-head.json")
+                    (consumed / "release-head.json").unlink()
+                    (consumed / "release-head.json").symlink_to(outside / "prior")
+                elif case == "hardlink file":
+                    os.link(consumed / "release-head.json", outside / "prior")
+                elif case == "shared file":
+                    (consumed / "release-head.json").chmod(0o640)
+                elif case in ("exclusive scratch", "second exclusive scratch"):
+                    scratch = ".release-head.json.bootstrap" if case.startswith("second") else ".release.json.bootstrap"
+                    (consumed / scratch).write_bytes(b"other writer")
+                elif case == "second source missing":
+                    (source / "release-head.json").unlink()
+                result = self.run_handoff(source, data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Consumed release handoff failed:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual((publisher / "release-head.json").read_bytes(), b"publisher custody")
+                for name in ("release.json", "release-head.json"):
+                    self.assertEqual((consumed / name).read_bytes(), b"previous " + name.encode())
+                if case in ("exclusive scratch", "second exclusive scratch"):
+                    self.assertEqual((consumed / scratch).read_bytes(), b"other writer")
+                else:
+                    self.assertEqual(list(consumed.glob(".*.bootstrap")), [])
 
 
 class DataPathTests(unittest.TestCase):
@@ -1114,7 +1109,7 @@ class NativeProcessTests(unittest.TestCase):
         self.assertTrue(PROCESSES["matches_command"](snapshot, str(self.binary)))
         # Execute the actual pre-install block. It must stop the selected child
         # even though the selected binary hash is unchanged, before file writes.
-        block = SOURCE.split("# ── Install (2 files)", 1)[1]
+        block = SOURCE.split("# ── Install the verified Runtime binary", 1)[1]
         block = block[block.index("\n"):block.index('info "Installing binary')]
         result = shell('HOME="$1"\nXDG_DATA_HOME="$1/xdg-data"\nINSTALL_DIR="$1/.local/bin"\nBINARY_SHA256="$2"\n' + block,
                        self.home, hashlib.sha256(self.binary.read_bytes()).hexdigest())

@@ -51,6 +51,142 @@ class FakeBackend:
         self.calls.append("close")
 
 
+class CatalogSignerTests(unittest.TestCase):
+    # Reuse the public Git fixture, without inheriting its release test cases.
+    def setUp(self):
+        self.catalog_setup()
+
+    def fetch(self, path):
+        return SignerTests.fetch(self, path)
+
+    def approve_manifest(self):
+        return SignerTests.approve_manifest(self)
+
+    def catalog_setup(self):
+        SignerTests.setUp(self)
+        self.payload = {"schema": "elastos.model.catalog/v1", "published_at": 1, "expires_at": None, "entries": []}
+        bindings = {}
+        for name in sorted(S.MODEL_COMPONENTS):
+            digest = hashlib.sha256(name.encode()).digest()
+            cid = "b" + base64.b32encode(b"\x01\x70\x12\x20" + digest).decode().lower().rstrip("=")
+            capsule = {"schema": "elastos.capsule/v1", "name": name, "version": "1", "role": "content", "type": "data",
+                "projections": ["content"], "entrypoint": "model.gguf", "model_content": {
+                    "format": "gguf", "quantization": "Q4_K_M", "engine": "llama.cpp", "consumer_interface": "elastos.provider.model",
+                    "consumer_interface_version": "0.1.0", "minimum_memory_mb": 2048,
+                    "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                    "provenance": {"base_repository": "fixture/base", "base_revision": COMMIT,
+                        "quantized_repository": "fixture/quantized", "quantized_revision": TREE,
+                        "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE.base"}, "path": "PROVENANCE.md"}}}
+            files = []
+            content = hashlib.sha256()
+            for path, data in sorted({"capsule.json": S.json_bytes(capsule), "model.gguf": b"GGUF fixture",
+                                      "LICENSE": b"fixture licence", "LICENSE.base": b"base licence", "PROVENANCE.md": b"pinned provenance"}.items()):
+                item = {"path": path, "sha256": S.sha256(data), "size": len(data)}
+                files.append(item)
+                for field in (path, item["sha256"], str(item["size"])):
+                    content.update(field.encode() + b"\0")
+            content_digest = "sha256:" + content.hexdigest()
+            self.payload["entries"].append({"cid": cid,
+                "capsule_manifest": capsule,
+                "object_manifest": {"schema": "elastos.content.object.manifest/v1", "kind": "capsule", "content_digest": content_digest, "files": files}})
+            bindings[name] = {"package_cid": cid, "content_digest": content_digest}
+        self.policy.update(purpose="elastos.model.catalog/v1", published_at=1, catalog_entries=bindings)
+        self.approve_catalog()
+
+    def approve_catalog(self):
+        data = S.json_bytes(self.payload)
+        (self.root / "model-catalog.unsigned.json").write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+
+    def prepare(self):
+        return S.prepare_catalog(self.policy, self.root, "model-catalog.unsigned.json", self.fetch, now=2)
+
+    def test_exact_catalogue_uses_only_its_approved_domain(self):
+        backend = FakeBackend()
+        publication = dict(S.sign_catalog(self.prepare(), backend))
+        self.assertEqual(set(publication), {"model-catalog.json"})
+        self.assertEqual(S.parse_json(publication["model-catalog.json"])["payload"], self.payload)
+        expected = hashlib.sha256(b"elastos.model.catalog.v1\0" + S.json_bytes(self.payload)).digest()
+        self.assertIn(("sign", expected), backend.calls)
+        self.assertFalse(self.marker.exists())
+
+    def test_catalogue_requires_an_exact_hash_and_content_binding(self):
+        self.payload["entries"][0]["object_manifest"]["content_digest"] = "sha256:" + "0" * 64
+        (self.root / "model-catalog.unsigned.json").write_bytes(S.json_bytes(self.payload))
+        with self.assertRaisesRegex(ValueError, "hash differs"):
+            self.prepare()
+        self.approve_catalog()
+        with self.assertRaisesRegex(ValueError, "content binding differs"):
+            self.prepare()
+
+    def test_catalogue_refuses_wrong_purpose_duplicate_missing_raw_and_future_entries(self):
+        original = copy.deepcopy(self.payload)
+        for change in ("duplicate", "missing", "raw", "future", "expired", "unknown"):
+            with self.subTest(change=change):
+                self.payload = copy.deepcopy(original)
+                if change == "duplicate": self.payload["entries"][1] = copy.deepcopy(self.payload["entries"][0])
+                if change == "missing": self.payload["entries"].pop()
+                if change == "raw": self.payload["entries"][0]["cid"] = S.raw_cid(b"file")
+                if change == "future": self.payload["published_at"] = 3
+                if change == "expired": self.payload["expires_at"] = 2
+                if change == "unknown": self.payload["authority"] = "candidate"
+                self.approve_catalog()
+                with self.assertRaises(ValueError): self.prepare()
+        self.payload = original
+        self.approve_catalog()
+        self.policy["purpose"] = "elastos.release/v1"
+        with self.assertRaisesRegex(ValueError, "purpose required"): self.prepare()
+
+    def test_catalogue_source_admission_precedes_signing(self):
+        prefix = f"/repos/{S.REPOSITORY}"
+        self.api[f"{prefix}/compare/{COMMIT}...{MAIN}?per_page=1"]["status"] = "diverged"
+        with self.assertRaisesRegex(ValueError, "outside main"): self.prepare()
+        self.assertFalse(self.marker.exists())
+
+    def test_catalogue_requires_matching_public_key_and_verified_signature(self):
+        prepared = self.prepare()
+        backend = FakeBackend()
+        backend.public = bytes(32)
+        with self.assertRaisesRegex(ValueError, "public DID differs"): S.sign_catalog(prepared, backend)
+        self.assertEqual(backend.calls, ["public"])
+        backend = FakeBackend()
+        backend.verified = False
+        with self.assertRaisesRegex(ValueError, "verification failed"): S.sign_catalog(prepared, backend)
+
+    def test_catalogue_refuses_execution_authority_missing_notice_and_changed_capsule_bytes(self):
+        original = copy.deepcopy(self.payload)
+        for change in ("authority", "notice", "capsule", "aliases", "digest"):
+            with self.subTest(change=change):
+                self.payload = copy.deepcopy(original)
+                entry = self.payload["entries"][0]
+                if change == "authority": entry["capsule_manifest"]["permissions"] = {"network": ["*"]}
+                if change == "notice": entry["capsule_manifest"]["model_content"]["license"]["path"] = "MISSING"
+                if change == "capsule": entry["capsule_manifest"]["version"] = "2"
+                if change == "aliases": entry["object_manifest"]["files"][1]["path"] = entry["object_manifest"]["files"][0]["path"].lower()
+                if change == "digest": entry["object_manifest"]["files"][0]["size"] += 1
+                self.approve_catalog()
+                with self.assertRaises(ValueError): self.prepare()
+
+    def test_catalogue_refuses_nonportable_model_paths(self):
+        original = copy.deepcopy(self.payload)
+        for field in ("entrypoint", "notice", "repository", "closure"):
+            with self.subTest(field=field):
+                self.payload = copy.deepcopy(original)
+                entry = self.payload["entries"][0]
+                capsule = entry["capsule_manifest"]
+                if field == "entrypoint": capsule["entrypoint"] = "model./model.gguf"
+                if field == "notice": capsule["model_content"]["license"]["path"] = "LICENSE."
+                if field == "repository": capsule["model_content"]["provenance"]["base_repository"] = "owner./repo"
+                if field == "closure": entry["object_manifest"]["files"][0]["path"] = "LICENSE."
+                self.approve_catalog()
+                with self.assertRaisesRegex(ValueError, "canonical model path"):
+                    self.prepare()
+        for value in ("model./model.gguf", "../model.gguf", "a//b", "a\\b", "é.gguf", "a" * 257):
+            with self.assertRaisesRegex(ValueError, "canonical model path"):
+                S.model_path(value)
+        self.assertEqual(S.model_path("_private/model-Q4_K_M.gguf"), "_private/model-Q4_K_M.gguf")
+
+
 class SignerTests(unittest.TestCase):
     def setUp(self):
         # These directories are removed by unittest cleanup, including refusals.

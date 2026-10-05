@@ -69,6 +69,9 @@ fn is_interactive_frontdoor_command(argv: &[String]) -> bool {
 
 #[cfg(unix)]
 fn should_isolate_process_group(argv: &[String]) -> bool {
+    if argv.first().is_some_and(|arg| arg == "__update-controller") {
+        return false;
+    }
     !is_interactive_frontdoor_command(argv)
 }
 
@@ -322,6 +325,12 @@ enum Commands {
         /// Emit the local Home-state probe as machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+
+    #[command(name = "__update-controller", hide = true)]
+    UpdateController {
+        #[arg(long)]
+        receipt: std::path::PathBuf,
     },
 
     /// Launch an AI agent that joins P2P chat and responds via LLM
@@ -1251,13 +1260,12 @@ async fn main() -> anyhow::Result<()> {
             let gateway_lifecycle = argv.first().is_some_and(|arg| arg == "gateway")
                 || (matches!(argv.first().map(String::as_str), None | Some("home"))
                     && argv.iter().any(|arg| arg == "--browser"));
+            // Register both streams before the parent watcher can send TERM.
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::spawn(async move {
-                let mut sigint =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .expect("SIGINT handler");
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("SIGTERM handler");
                 tokio::select! {
                     _ = sigint.recv() => {},
                     _ = sigterm.recv() => {},
@@ -1268,7 +1276,7 @@ async fn main() -> anyhow::Result<()> {
                     libc::kill(0, libc::SIGTERM);
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(if gateway_lifecycle {
-                    10
+                    15
                 } else {
                     2
                 }))
@@ -1280,6 +1288,8 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+
+    elastos_server::update_controller::watch_parent()?;
 
     // Install rustls crypto provider (ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1299,6 +1309,12 @@ async fn main() -> anyhow::Result<()> {
         status: false,
         json: false,
     });
+    if matches!(
+        &command,
+        Commands::Serve { .. } | Commands::Gateway { .. } | Commands::Home { browser: true, .. }
+    ) {
+        elastos_server::host_lock::authorize_host_process_start(&sources::default_data_dir())?;
+    }
 
     match command {
         Commands::Run {
@@ -1366,6 +1382,10 @@ async fn main() -> anyhow::Result<()> {
                 return gateway_entry::run_browser_home().await;
             }
             return home_cmd::run(status, json).await;
+        }
+
+        Commands::UpdateController { receipt } => {
+            return elastos_server::update_controller::run(receipt).await;
         }
 
         Commands::Agent {

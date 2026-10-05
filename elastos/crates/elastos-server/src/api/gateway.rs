@@ -71,6 +71,8 @@ mod gateway_home_system_ai_provider;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_update.rs"]
+mod gateway_home_update;
 #[path = "gateway_home_wallet_connector.rs"]
 mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
@@ -155,6 +157,7 @@ pub(super) use gateway_home_token::{
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+use gateway_home_update::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -730,7 +733,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                     gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
         )
-        .route("/api/apps/system/summary", get(system_summary))
+        .route(
+            "/api/apps/system/summary",
+            get(system_summary)
+                .post(system_update_apply)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/apps/system/appearance/preferences",
             post(system_appearance_preferences_update),

@@ -123,9 +123,10 @@ struct HomeRealtimeEvent {
     at: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HomeRealtimeSnapshot {
     principal_id: String,
+    runtime_signature: String,
     recovery_readiness: RecoveryReadinessSummary,
     profile_readiness: ProfileReadinessSummary,
     notification_signature: Vec<String>,
@@ -4871,7 +4872,7 @@ fn home_services_record_access_decision(
     })
 }
 
-fn require_admin_principal(
+pub(super) fn require_admin_principal(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<()> {
@@ -5224,6 +5225,7 @@ async fn home_realtime_snapshot(
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
+        runtime_signature: home_runtime_realtime_signature(&state.data_dir),
         recovery_readiness,
         profile_readiness: profile_readiness_for_principal(
             &state.data_dir,
@@ -5240,6 +5242,22 @@ async fn home_realtime_snapshot(
         services_signature,
         browser_sessions,
     }
+}
+
+fn home_runtime_realtime_signature(data_dir: &std::path::Path) -> String {
+    let controller = crate::update_controller::status(data_dir).ok().flatten();
+    stable_cursor_hash(&(
+        GATEWAY_VERSION,
+        std::env::var("ELASTOS_UPDATE_GENERATION").ok(),
+        controller.as_ref().map(|status| {
+            (
+                &status.id,
+                &status.phase,
+                &status.current_version,
+                &status.new_version,
+            )
+        }),
+    ))
 }
 
 fn home_realtime_cursor(snapshot: &HomeRealtimeSnapshot) -> String {
@@ -5272,6 +5290,7 @@ fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCu
     HomeRealtimeCursorParts {
         home: stable_cursor_hash(&(
             &snapshot.principal_id,
+            &snapshot.runtime_signature,
             &snapshot.recovery_readiness,
             &snapshot.profile_readiness,
         )),
@@ -6875,11 +6894,12 @@ pub(super) async fn system_summary(
         };
     let context = authority.home_launch_context();
 
-    let (runtime, wallet_accounts, wallet_approvals, runtime_log) = tokio::join!(
+    let (runtime, wallet_accounts, wallet_approvals, runtime_log, runtime_update) = tokio::join!(
         home_runtime_summary(&state.data_dir),
         system_wallet_accounts_summary(&state, &authority),
         system_wallet_approvals_summary(&state, &authority, false),
-        system_runtime_log(&state.data_dir)
+        system_runtime_log(&state.data_dir),
+        system_runtime_update_summary(&state.data_dir, &context)
     );
     Json(SystemSummaryResponse {
         identity: match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
@@ -6901,6 +6921,7 @@ pub(super) async fn system_summary(
             Err(err) => return system_error_response(err),
         },
         source: system_source_summary(&state.data_dir, &runtime),
+        runtime_update,
         runtime,
         wallet_accounts,
         wallet_approvals,
@@ -7889,6 +7910,7 @@ mod home_realtime_tests {
     fn scoped_realtime_change_does_not_emit_home_summary_event() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
@@ -7929,6 +7951,7 @@ mod home_realtime_tests {
     fn people_realtime_change_emits_people_scoped_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
@@ -7969,9 +7992,39 @@ mod home_realtime_tests {
     }
 
     #[test]
+    fn runtime_generation_and_update_phase_emit_home_summary_event_only() {
+        let snapshot = HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            runtime_signature: "version-previous:ready".to_string(),
+            recovery_readiness: RecoveryReadinessSummary::ready(),
+            profile_readiness: ProfileReadinessSummary::ready(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            capability_request_count: 0,
+            desktop_signature: Vec::new(),
+            room_signature: String::new(),
+            people_signature: Vec::new(),
+            services_signature: Vec::new(),
+            browser_sessions: serde_json::json!({}),
+        };
+        let cursor = home_realtime_cursor(&snapshot);
+        for runtime_signature in ["version-new:ready", "version-previous:restored"] {
+            let changed = HomeRealtimeSnapshot {
+                runtime_signature: runtime_signature.to_string(),
+                ..snapshot.clone()
+            };
+            let events = home_realtime_events(&cursor, &changed);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "home.summary.changed");
+            assert_eq!(events[0].scope, "home");
+        }
+    }
+
+    #[test]
     fn recovery_readiness_change_emits_home_summary_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
             recovery_readiness: RecoveryReadinessSummary::setup_required(),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),

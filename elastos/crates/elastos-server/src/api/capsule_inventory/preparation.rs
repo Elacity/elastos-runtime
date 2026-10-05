@@ -2856,7 +2856,7 @@ async fn append_admitted_model_offers_locked(
         let entry = current_entry(data_dir, record)?;
         require_cache_budget(data_dir, &snapshot)?;
         let settings = local_model_startup_profile(&crate::setup::detect_platform())?;
-        let engine = crate::setup::verified_local_model_engine(data_dir, &manifest)?;
+        let engine = crate::setup::ensure_local_model_engine(data_dir, &manifest_bytes).await?;
         let stage = Inventory::open(data_dir, false)?.admitted(&record.admission_id)?;
         let closure = crate::content::parse_content_object_manifest(
             &entry.cid,

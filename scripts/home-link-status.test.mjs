@@ -55,6 +55,13 @@ test("only a request that never reached the gateway, or a proxy saying it is gon
   }
   assert.equal(isGatewayUnreachable(new SyntaxError("bad json")), false);
   assert.equal(isGatewayUnreachable(null), false);
+  // A request that got no answer before its deadline counts; a cancelled one does not.
+  const timeout = new Error("Home event request timed out.");
+  timeout.name = "TimeoutError";
+  assert.equal(isGatewayUnreachable(timeout), true);
+  const cancelled = new Error("Home event request was cancelled.");
+  cancelled.name = "AbortError";
+  assert.equal(isGatewayUnreachable(cancelled), false);
 });
 
 test("the first unreachable failure tells the shell once and schedules a retry", () => {

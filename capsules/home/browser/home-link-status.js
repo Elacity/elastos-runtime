@@ -13,8 +13,10 @@ const GATEWAY_GONE_STATUSES = new Set([502, 503, 504]);
 
 // fetch rejects with a TypeError in every engine when the request never
 // reaches the gateway; an HTTP answer carries `status` (shell-core fetchJson).
+// A request that gets no answer before its deadline rejects with the
+// deadline's TimeoutError; a cancelled request (AbortError) is not an outage.
 export function isGatewayUnreachable(error) {
-  if (error instanceof TypeError) {
+  if (error instanceof TypeError || error?.name === "TimeoutError") {
     return true;
   }
   return GATEWAY_GONE_STATUSES.has(Number(error?.status));

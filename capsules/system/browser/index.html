@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-models-20260929d">
+<link rel="stylesheet" href="./style.css?v=system-update-20261005a">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -423,6 +423,21 @@
                   <div><dt>Device identity</dt><dd></dd></div>
                 </dl>
               </div>
+              <div id="runtime-update" class="pc2-group-row" hidden>
+                <div class="pc2-card-row pc2-card-row-stack">
+                  <div>
+                    <div class="pc2-card-label">Home update</div>
+                    <p id="runtime-update-status" class="pc2-card-sublabel" role="status" aria-live="polite"></p>
+                  </div>
+                  <button id="runtime-update-apply" class="pc2-btn pc2-btn-secondary" type="button" hidden disabled>Update and restart Home</button>
+                </div>
+                <dl class="system-fields runtime-update-fields" data-field="update-offer" hidden>
+                  <div><dt>Current version</dt><dd data-field="update-current-version"></dd></div>
+                  <div><dt>New version</dt><dd data-field="update-new-version"></dd></div>
+                  <div data-field="update-publisher-row"><dt>Publisher</dt><dd data-field="update-publisher"></dd></div>
+                </dl>
+                <p class="runtime-update-changes" data-field="update-changes"></p>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
@@ -473,6 +488,6 @@
     <p class="system-error" hidden></p>
   </main>
   <script src="./system-tabs.js"></script>
-  <script type="module" src="./system.js?v=system-models-20260929d"></script>
+  <script type="module" src="./system.js?v=system-update-20261005a"></script>
 </body>
 </html>
