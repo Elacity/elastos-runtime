@@ -36,6 +36,16 @@ pub(crate) fn load_or_migrate(
     source: &TrustedSource,
     guard: &InstallationGuard,
 ) -> Result<InstalledRelease> {
+    load_or_migrate_for_update(data, binary, source, guard, false)
+}
+
+pub(crate) fn load_or_migrate_for_update(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    guard: &InstallationGuard,
+    repair_version: bool,
+) -> Result<InstalledRelease> {
     guard.require_binary(binary)?;
     require_no_pending(binary)?;
     check_directory(data, false)?;
@@ -43,9 +53,15 @@ pub(crate) fn load_or_migrate(
     let root = data.join("installation");
     let stage = data.join(MIGRATION);
     if consumed_present(data)? {
-        let admitted = read_for_setup(data, binary, source, guard)?;
-        let release = serde_json::from_slice(&admitted.release).context(REPAIR)?;
-        admit_complete_support(data, binary, &release).context(REPAIR)?;
+        let admitted = read_pair(
+            data,
+            binary,
+            source,
+            &installation_release_head_path(data),
+            &installation_release_manifest_path(data),
+            true,
+            repair_version,
+        )?;
         if present(&stage)? {
             clean_partial_stage(&stage, &admitted)?;
         }
@@ -62,6 +78,7 @@ pub(crate) fn load_or_migrate(
                 &stage.join(HEAD),
                 &stage.join(RELEASE),
                 true,
+                repair_version,
             )?;
             publish_stage(data, binary, &stage, &root)?;
             return Ok(admitted);
@@ -73,6 +90,7 @@ pub(crate) fn load_or_migrate(
             &publisher_release_head_path(data),
             &publisher_release_manifest_path(data),
             false,
+            repair_version,
         )?;
         clean_partial_stage(&stage, &admitted)?;
         legacy = Some(admitted);
@@ -86,6 +104,7 @@ pub(crate) fn load_or_migrate(
             &publisher_release_head_path(data),
             &publisher_release_manifest_path(data),
             false,
+            repair_version,
         )?,
     };
     crate::install_transaction::require_controller_disk_reserve(
@@ -108,6 +127,15 @@ pub(crate) fn read_without_migration(
     binary: &Path,
     source: &TrustedSource,
 ) -> Result<InstalledRelease> {
+    read_without_migration_for_update(data, binary, source, false)
+}
+
+pub(crate) fn read_without_migration_for_update(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    repair_version: bool,
+) -> Result<InstalledRelease> {
     require_no_pending(binary)?;
     require_current_source(data, source)?;
     if consumed_present(data)? {
@@ -118,6 +146,7 @@ pub(crate) fn read_without_migration(
             &installation_release_head_path(data),
             &installation_release_manifest_path(data),
             true,
+            repair_version,
         )
     } else {
         read_pair(
@@ -127,6 +156,7 @@ pub(crate) fn read_without_migration(
             &publisher_release_head_path(data),
             &publisher_release_manifest_path(data),
             false,
+            repair_version,
         )
     }
 }
@@ -150,6 +180,7 @@ pub(crate) fn read_for_setup(
         &installation_release_head_path(data),
         &installation_release_manifest_path(data),
         true,
+        false,
     )
     .map(|(installed, _)| installed)
 }
@@ -169,6 +200,7 @@ pub(crate) fn read_for_transaction(
         transaction.release_head_path(),
         transaction.release_manifest_path(),
         transaction.uses_consumed_layout(),
+        false,
     )
 }
 
@@ -198,8 +230,10 @@ fn read_pair(
     head: &Path,
     release: &Path,
     private: bool,
+    repair_version: bool,
 ) -> Result<InstalledRelease> {
-    let (installed, release) = read_pair_and_binary(data, binary, source, head, release, private)?;
+    let (installed, release) =
+        read_pair_and_binary(data, binary, source, head, release, private, repair_version)?;
     admit_complete_support(data, binary, &release).context(REPAIR)?;
     Ok(installed)
 }
@@ -225,11 +259,13 @@ fn read_pair_and_binary(
     head: &Path,
     release: &Path,
     private: bool,
+    repair_version: bool,
 ) -> Result<(InstalledRelease, serde_json::Value)> {
     check_parents(data, head.parent().context(REPAIR)?, private)?;
     let head_bytes = read_regular(head, MAX_METADATA, private).context(REPAIR)?;
     let release_bytes = read_regular(release, MAX_METADATA, private).context(REPAIR)?;
-    admit_pair_and_binary(binary, source, &head_bytes, &release_bytes).context(REPAIR)
+    admit_pair_and_binary(binary, source, &head_bytes, &release_bytes, repair_version)
+        .context(REPAIR)
 }
 
 fn admit_pair_and_binary(
@@ -237,8 +273,9 @@ fn admit_pair_and_binary(
     source: &TrustedSource,
     head_bytes: &[u8],
     release_bytes: &[u8],
+    repair_version: bool,
 ) -> Result<(InstalledRelease, serde_json::Value)> {
-    let release = admit_pair(source, head_bytes, release_bytes)?;
+    let release = admit_pair(source, head_bytes, release_bytes, repair_version)?;
     anyhow::ensure!(
         fs::symlink_metadata(&source.install_path)?.is_file()
             && fs::canonicalize(&source.install_path)? == binary,
@@ -266,7 +303,7 @@ pub(crate) fn admit_candidate(
     head_bytes: &[u8],
     release_bytes: &[u8],
 ) -> Result<()> {
-    let release = admit_pair(source, head_bytes, release_bytes)?;
+    let release = admit_pair(source, head_bytes, release_bytes, false)?;
     anyhow::ensure!(
         Path::new(&source.install_path) == binary,
         "Installer source binary path differs from its writer"
@@ -283,6 +320,7 @@ fn admit_pair(
     source: &TrustedSource,
     head_bytes: &[u8],
     release_bytes: &[u8],
+    repair_version: bool,
 ) -> Result<serde_json::Value> {
     anyhow::ensure!(
         !source.publisher_dids.is_empty()
@@ -313,11 +351,20 @@ fn admit_pair(
         source,
         head["payload"]["channel"].as_str().unwrap_or(""),
     )?;
-    anyhow::ensure!(
-        head["payload"]["version"].as_str() == Some(source.installed_version.as_str()),
-        "Installed signed version differs from its source record"
-    );
-    semver::Version::parse(&source.installed_version)?;
+    let signed_version = head["payload"]["version"]
+        .as_str()
+        .context("Installed signed version missing")?;
+    semver::Version::parse(signed_version)?;
+    if !(repair_version
+        && !source.installed_version.is_empty()
+        && semver::Version::parse(&source.installed_version).is_err())
+    {
+        anyhow::ensure!(
+            signed_version == source.installed_version,
+            "Installed signed version differs from its source record"
+        );
+        semver::Version::parse(&source.installed_version)?;
+    }
     Ok(release)
 }
 

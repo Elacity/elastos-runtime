@@ -306,6 +306,39 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "0.7.1")
 
+    def test_signed_version_syntax_matches_release_policy(self):
+        policy = INSTALLER.with_name("check-versioning.sh")
+        policy_source = policy.read_text()
+        core = re.search(r"^core='([^']+)'", policy_source, re.M).group(1)
+        meta = re.search(r"^meta='([^']+)'", policy_source, re.M).group(1)
+        preferred = re.search(r'^preferred="([^"]+)"', policy_source, re.M).group(1)
+        expected_pattern = preferred.replace("${core}", core).replace("${meta}", meta)
+        installer_core = re.search(r'    core = r"([^"]+)"', SOURCE).group(1)
+        installer_tail = re.search(r'if not re.fullmatch\(core \+ r"([^"]+)"', SOURCE).group(1)
+        self.assertEqual("^" + installer_core + installer_tail + "$", expected_pattern)
+        versions = [
+            "0.7.1", "1.2.3-alpha.0", "1.2.3-beta.2", "1.2.3-rc.10+build.1",
+            "1.2.3+build-1", "1.2.3+build..1", "1.2.3+.",
+            "", "v0.7.1", "01.2.3", "1.02.3", "1.2.03", "1.2",
+            "1.2.3-rc1", "1.2.3-rc.01", "1.2.3-preview.1", "1.2.3+",
+            "1.2.3\n", " 1.2.3", "1.2.3 ",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory, name) for name in ("head.json", "release.json")]
+            for version in versions:
+                release = {"payload": {"schema": "elastos.release/v1",
+                                       "version": version, "channel": "stable"}}
+                paths[1].write_text(json.dumps(release))
+                head = {"payload": {"schema": "elastos.release.head/v1",
+                                    "version": version, "channel": "stable",
+                                    "release_sha256": hashlib.sha256(paths[1].read_bytes()).hexdigest()}}
+                paths[0].write_text(json.dumps(head))
+                expected = subprocess.run([OPTIONS.bash, str(policy), version], capture_output=True)
+                actual = shell('validate_release_identity "$1" "$2"\n', *paths)
+                with self.subTest(version=version):
+                    self.assertEqual(actual.returncode == 0, expected.returncode == 0,
+                                     actual.stdout + actual.stderr)
+
     def test_release_identity_requires_matching_nonempty_strings(self):
         head = {"payload": {"schema": "elastos.release.head/v1", "version": "0.7.1", "channel": "stable"}}
         release = {"payload": {"schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable"}}

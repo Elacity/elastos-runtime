@@ -2832,14 +2832,28 @@ fn required_release_artifact_checksum<'a>(
     if !requires_release_artifact_checksum(platform_info) {
         return Ok(checksum);
     }
-    let checksum = checksum.ok_or_else(|| {
+    valid_release_artifact_checksum(name, checksum).map(Some)
+}
+
+fn valid_release_artifact_checksum<'a>(
+    name: &str,
+    checksum: Option<&'a str>,
+) -> anyhow::Result<&'a str> {
+    let checksum = checksum.filter(|value| !value.is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
             "component '{}' release artifact is missing checksum; expected sha256:... or sha512:...",
             name
         )
     })?;
-    if checksum.starts_with("sha256:") || checksum.starts_with("sha512:") {
-        Ok(Some(checksum))
+    if checksum.split_once(':').is_some_and(|(algorithm, hash)| {
+        let length = match algorithm {
+            "sha256" => 64,
+            "sha512" => 128,
+            _ => return false,
+        };
+        hash.len() == length && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        Ok(checksum)
     } else {
         anyhow::bail!(
             "Unknown checksum format for {}: {}. Expected sha256:... or sha512:...",
@@ -2847,6 +2861,30 @@ fn required_release_artifact_checksum<'a>(
             checksum
         );
     }
+}
+
+/// Admit all applicable release components before downloads or installation.
+/// Setup retains its explicit development strategies outside release admission.
+pub(crate) fn admit_release_components(
+    manifest: &ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<()> {
+    for (name, component) in &manifest.external {
+        let assets = [
+            resolve_platform_info(component, platform),
+            component.capsule_metadata.as_ref().and_then(|metadata| {
+                resolve_component_capsule_metadata_platform_info(metadata, platform)
+            }),
+        ];
+        for info in assets.into_iter().flatten() {
+            anyhow::ensure!(
+                matches!(info.strategy.as_deref(), None | Some("prebuilt")),
+                "component '{name}' has a development or unsupported release strategy"
+            );
+            valid_release_artifact_checksum(name, info.checksum.as_deref())?;
+        }
+    }
+    Ok(())
 }
 
 /// Refresh support assets after the updater installs the verified manifest bytes.
@@ -3065,10 +3103,6 @@ pub(crate) async fn stage_update_support(
         }
         for (relative, asset, metadata) in assets {
             crate::install_transaction::validate_support_path(&relative)?;
-            anyhow::ensure!(
-                asset.strategy.is_none(),
-                "update support requires signed release artifacts"
-            );
             required_release_artifact_checksum(name, asset)?
                 .ok_or_else(|| anyhow::anyhow!("signed support checksum missing"))?;
             let key =
@@ -6497,6 +6531,41 @@ pub(crate) mod tests {
             resolve_component_download_url(&info).as_deref(),
             Some("elastos://QmCanonical")
         );
+    }
+
+    #[test]
+    fn release_component_admission_resolves_aliases_and_checks_complete_hash_syntax() {
+        for (info, accepted) in [
+            (
+                serde_json::json!({"checksum":format!("sha256:{}", "A".repeat(64))}),
+                true,
+            ),
+            (
+                serde_json::json!({"checksum":format!("sha512:{}", "b".repeat(128)), "strategy":"prebuilt"}),
+                true,
+            ),
+            (serde_json::json!({"checksum":"sha256:bad"}), false),
+            (
+                serde_json::json!({"checksum":format!("sha256:{}", "g".repeat(64))}),
+                false,
+            ),
+            (
+                serde_json::json!({"checksum":format!("sha256:{}\n", "a".repeat(64))}),
+                false,
+            ),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"strategy":"unknown"}), false),
+        ] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "external":{"fixture":{"platforms":{"aarch64-linux":info}}}, "profiles":{}
+            }))
+            .unwrap();
+            assert_eq!(
+                admit_release_components(&manifest, "linux-arm64").is_ok(),
+                accepted
+            );
+            assert!(admit_release_components(&manifest, "darwin-arm64").is_ok());
+        }
     }
 
     #[test]

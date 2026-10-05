@@ -487,6 +487,7 @@ pub async fn gather_local_node_status(data_dir: &Path) -> Result<OperatorNodeSta
 
 pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdateCheck> {
     let source = load_default_trusted_source(data_dir)?;
+    crate::update::installed_release_version(&source.installed_version)?;
     let client = tokio::time::timeout(
         Duration::from_secs(OPERATOR_CONNECT_TIMEOUT_SECS),
         crate::carrier::CarrierClient::connect_trusted_source(
@@ -707,6 +708,7 @@ fn bounded_release_text<'a>(
 
 pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> {
     let source = load_default_trusted_source(data_dir)?;
+    crate::update::installed_release_version(&source.installed_version)?;
     let source_name = source.name.clone();
     let channel = normalized_channel(&source);
     let previous_version = source.installed_version.clone();
@@ -2031,6 +2033,31 @@ mod tests {
             check.changes,
             vec!["Home can restart after a signed update."]
         );
+    }
+
+    #[tokio::test]
+    async fn operator_update_refuses_invalid_installed_version_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut source, _, _) = signed_check_fixture(|_| {}, |_| {});
+        source.installed_version = "broken".into();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let check = gather_local_update_check(dir.path()).await.unwrap_err();
+        let apply = apply_local_update(dir.path()).await.unwrap_err();
+        for error in [check, apply] {
+            assert!(error.is::<crate::update::InvalidInstalledVersion>());
+            assert!(error.to_string().contains("elastos update --force"));
+        }
+    }
+
+    #[test]
+    fn signed_update_check_refuses_invalid_installed_version_with_local_repair_hint() {
+        let (mut source, head, release) = signed_check_fixture(|_| {}, |_| {});
+        source.installed_version = "broken".into();
+        let error = verified_update_check(&source, &head, &release).unwrap_err();
+        assert!(error.is::<crate::update::InvalidInstalledVersion>());
+        assert!(error.to_string().contains("elastos update --force"));
     }
 
     #[test]
