@@ -115,8 +115,8 @@ jobs:
               'source_tree': tree, 'union_pr': int(pr_number), 'union_head': head,
               'source_ci_run': int(run_id), 'ci_attempt': run['run_attempt'],
               'workflow_commit': os.environ['GITHUB_SHA'], 'published_at': stamp,
-              'mac_versions': ['0.8.0-alpha.3', '0.8.0-alpha.4'],
-              'seed_version': '0.8.0-alpha.3',
+              'mac_versions': ['0.8.0-alpha.4', '0.8.0-alpha.5'],
+              'seed_version': '0.8.0-alpha.4',
               'scope': 'key-free package inputs; operator owns signing and installation'}
           pathlib.Path('union-admission.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
