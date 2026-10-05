@@ -455,7 +455,15 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/home/events/stream" && req.method === "GET") {
-    empty(res);
+    // A Home holds its event stream open. A stream that ends at once sends the
+    // host into its poll-and-reopen recovery several times a second, and every
+    // summary it posts rebuilds the Dock under a held finger.
+    res.writeHead(200, {
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+      "content-type": "text/event-stream",
+    });
+    res.write(": open\n\n");
     return true;
   }
   if (url.pathname === "/api/apps/home/events" && req.method === "GET") {
@@ -1947,5 +1955,6 @@ try {
       `${skippedEngines.length ? `skipped=${skippedEngines.join(",")} (not installed) ` : ""}report=${join(outputRoot, "report.json")}`,
   );
 } finally {
+  server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));
 }
