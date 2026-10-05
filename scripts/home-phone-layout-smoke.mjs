@@ -837,13 +837,18 @@ async function closeWindow(frame, target) {
 }
 
 async function screenshot(page, dir, name) {
-  await page.screenshot({ path: join(dir, `${name}.png`), fullPage: false });
-  // After capturing an open sheet, Chromium mobile emulation can deliver mouse
-  // input at the requested point divided by the device scale factor (Linux CI
-  // and macOS). Applying the same viewport again restores true input.
+  const path = join(dir, `${name}.png`);
   if (page.context().browser()?.browserType().name() === "chromium") {
-    await page.setViewportSize(page.viewportSize());
+    // Playwright captures beyond the viewport when an open sheet overflows it.
+    // Under mobile emulation Chromium then delivers mouse input at the requested
+    // point divided by the device scale factor, on Linux CI and macOS alike.
+    const session = await page.context().newCDPSession(page);
+    const { data } = await session.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+    await session.detach();
+    writeFileSync(path, Buffer.from(data, "base64"));
+    return;
   }
+  await page.screenshot({ path, fullPage: false });
 }
 
 async function bootHome(context, origin) {
