@@ -4,6 +4,7 @@
 //! Assistant acquires its signed engine on demand; model directories use the
 //! bounded preparation path, not this archive installer.
 
+use crate::api::capsule_inventory::MAX_MODEL_CATALOG_BYTES;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -648,7 +649,7 @@ async fn admit_installed_setup_metadata(
         let catalog = if let Some(trust) = &manifest.model_catalog {
             let bytes = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                client.fetch_file(MODEL_CATALOG_FILE),
+                client.fetch_file_bounded(MODEL_CATALOG_FILE, MAX_MODEL_CATALOG_BYTES),
             )
             .await
             .map_err(|_| anyhow::anyhow!("model catalogue Carrier fetch timed out"))??;
@@ -2452,7 +2453,6 @@ pub fn write_installed_manifest(
 }
 
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
-const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
 
 pub(crate) fn catalog_head_cid(bytes: &[u8]) -> anyhow::Result<String> {
     let hash = cid::multihash::Multihash::<64>::wrap(0x12, &sha2::Sha256::digest(bytes))
@@ -4255,12 +4255,6 @@ pub(crate) mod tests {
         let on_demand =
             resolve_components(&manifest, None, &["llama-server".to_string()], &[]).unwrap();
         assert_eq!(on_demand, ["llama-server"]);
-        let catalog = manifest
-            .model_catalog
-            .as_ref()
-            .expect("home matching install pins a signed model catalog");
-        assert!(!catalog.publisher_dids.is_empty());
-        assert!(catalog.local_use.is_some());
         for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
             let profile = manifest
                 .profiles
@@ -5270,60 +5264,6 @@ pub(crate) mod tests {
             InstallState::Stale(_)
         ));
         fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn runtime_setup_llama_bundle_is_reused_by_fetch() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let (manifest, data, bundle) = llama_bundle_fixture(tmp.path());
-        let component = &manifest.external["llama-server"];
-        write_cache_metadata(
-            &manifest,
-            resolve_platform_info(component, "darwin-arm64"),
-            "darwin-arm64",
-            "llama-server",
-            &bundle,
-        )
-        .unwrap();
-        let manifest_path = tmp.path().join("components.json");
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let tools = tmp.path().join("tools");
-        fs::create_dir(&tools).unwrap();
-        let uname = tools.join("uname");
-        fs::write(
-            &uname,
-            b"#!/bin/sh\n[ \"$1\" = \"-s\" ] && echo Darwin || echo arm64\n",
-        )
-        .unwrap();
-        fs::set_permissions(&uname, fs::Permissions::from_mode(0o700)).unwrap();
-        let output = Command::new("bash")
-            .arg(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../scripts/fetch/fetch-model.sh"),
-            )
-            .arg("stable")
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    tools.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env("ELASTOS_COMPONENTS_MANIFEST", manifest_path)
-            .env("ELASTOS_DATA_DIR", &data)
-            .output()
-            .unwrap();
-        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!bundle.join(CACHED_ARTIFACT_SHA_FILE).exists());
     }
 
     #[test]
@@ -6507,6 +6447,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn installed_setup_refuses_oversized_catalog_before_body_without_writes() {
+        for existing in [false, true] {
+            signed_setup_carrier_fixture("catalog size", existing).await;
+        }
+    }
+
+    #[tokio::test]
     async fn installed_setup_refuses_wrong_signers_without_writes() {
         for case in ["catalog signer", "head signer", "release signer"] {
             for existing in [false, true] {
@@ -6915,6 +6862,7 @@ pub(crate) mod tests {
         let observed = requests.clone();
         let endpoint = server.clone();
         let writer_parent = data.clone();
+        let oversized_catalog = case == "catalog size";
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -6936,6 +6884,14 @@ pub(crate) mod tests {
                         assert_eq!(signed_setup_snapshot(&writer_parent), before);
                     }
                     observed.fetch_add(1, Ordering::SeqCst);
+                    if oversized_catalog && request["path"] == MODEL_CATALOG_FILE {
+                        // Keep the body open and unsent: refusal must use the header alone.
+                        send.write_all(&((MAX_MODEL_CATALOG_BYTES as u64) + 1).to_be_bytes())
+                            .await
+                            .unwrap();
+                        let _ = send.stopped().await;
+                        continue;
+                    }
                     let bytes = &files[request["path"].as_str().unwrap()];
                     send.write_all(&(bytes.len() as u64).to_be_bytes())
                         .await
@@ -6963,9 +6919,16 @@ pub(crate) mod tests {
         } else {
             assert!(result.is_err(), "{case}");
             assert_eq!(signed_setup_snapshot(&data), before, "{case}");
+            if case == "catalog size" {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains(&format!("exceeds its {MAX_MODEL_CATALOG_BYTES}-byte bound")),
+                    "{error}"
+                );
+            }
             let expected_requests = match case {
                 "component hash" => 1,
-                "catalog hash" | "catalog signer" => 2,
+                "catalog hash" | "catalog signer" | "catalog size" => 2,
                 "head signer" | "release signer" | "pending journal" | "writer busy" => 0,
                 _ => panic!("unknown refusal case"),
             };

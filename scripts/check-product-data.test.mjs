@@ -5,7 +5,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkProductData, parsePublishData, validatePublishData, validateCapsule, validateCatalogBinding, validateComponents, validateContracts, validateModelCatalog } from "./check-product-data.mjs";
+import { checkProductData, parsePublishData, validatePublishData, validateCapsule, validateComponents, validateContracts } from "./check-product-data.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const json = (path) => JSON.parse(readFileSync(resolve(root, path), "utf8"));
@@ -25,7 +25,6 @@ for (const base of ["capsules", "elastos/capsules"]) {
   }
 }
 const components = json("components.json");
-const catalog = json("model-catalog.json");
 const clone = (value) => structuredClone(value);
 const shellPublish = readFileSync(resolve(root, "scripts/publish-release.sh"), "utf8");
 const rustPublish = readFileSync(resolve(root, "elastos/crates/elastos-server/src/publish.rs"), "utf8");
@@ -75,14 +74,6 @@ test("shipped capsule, profile, catalog and icon data pass together", () => {
   const result = checkProductData();
   assert.equal(result.capsules, paths.length);
   assert(result.capsules > 0 && result.profiles > 0 && result.method_contracts > 0);
-});
-
-test("catalog head binding refuses changed signed bytes and a substituted CID", () => {
-  const bytes = readFileSync(resolve(root, "model-catalog.json"));
-  assert.throws(() => validateCatalogBinding(components, Buffer.concat([bytes, Buffer.from(" ")])), /pinned head CID/);
-  const value = clone(components);
-  value.model_catalog.head_cid = "bafkreiother";
-  assert.throws(() => validateCatalogBinding(value, bytes), /pinned head CID/);
 });
 
 for (const [name, mutate, message] of [
@@ -177,22 +168,6 @@ for (const [name, mutate, message] of [
   });
 }
 
-for (const [name, mutate, message] of [
-  ["substituted signer", (value) => value.signer_did = "did:key:other", /trusted signer/],
-  ["missing model weights", (value) => value.payload.entries[0].object_manifest.files.pop(), /lacks weights/],
-  ["missing model provenance", (value) => value.payload.entries[0].capsule_manifest.model_content.provenance.path = "missing.md", /lacks missing/],
-  ["malformed file digest", (value) => value.payload.entries[0].object_manifest.files[0].sha256 = "00", /integrity metadata/],
-  ["model file traversal", (value) => value.payload.entries[0].object_manifest.files.push({ path: "../outside", sha256: "0".repeat(64), size: 1 }), /safe artifact path/],
-  ["absolute model file", (value) => value.payload.entries[0].object_manifest.files.push({ path: "/outside", sha256: "0".repeat(64), size: 1 }), /safe artifact path/],
-  ["negative minimum memory", (value) => value.payload.entries[0].capsule_manifest.model_content.minimum_memory_mb = -1, /positive integer/],
-]) {
-  test(`model data refuse ${name}`, () => {
-    const value = clone(catalog);
-    mutate(value);
-    assert.throws(() => validateModelCatalog(components, value), message);
-  });
-}
-
 function dataFixture() {
   const fixture = mkdtempSync(join(tmpdir(), "product-data-fixture-"));
   try {
@@ -211,7 +186,7 @@ function dataFixture() {
         for (const size of [32, 64, 128, 256]) copyFileSync(resolve(root, dirname(path), value.icon, `icon-${size}.png`), resolve(directory, value.icon, `icon-${size}.png`));
       }
     }
-    for (const path of ["components.json", "model-catalog.json", "capsules/home/browser/manifest.webmanifest", "capsules/home/browser/elastos-home-icon-192.png", "capsules/home/browser/elastos-home-icon-512.png", "scripts/publish-release.sh", "elastos/crates/elastos-server/src/publish.rs"]) {
+    for (const path of ["components.json", "capsules/home/browser/manifest.webmanifest", "capsules/home/browser/elastos-home-icon-192.png", "capsules/home/browser/elastos-home-icon-512.png", "scripts/publish-release.sh", "elastos/crates/elastos-server/src/publish.rs"]) {
       mkdirSync(dirname(resolve(fixture, path)), { recursive: true });
       copyFileSync(resolve(root, path), resolve(fixture, path));
     }

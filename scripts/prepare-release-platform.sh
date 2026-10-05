@@ -15,13 +15,6 @@ checkout. DIR must be absent. Use a directory outside the checkout, or one
 whose temporary sibling is ignored by Git. CARGO_TARGET_DIR selects the native
 build cache; otherwise Cargo resolves it. CARGO_BUILD_JOBS defaults to 4 (max 4).
 The output contains artifacts/, draft components.json and platform-input.json.
-Optional key-free model preparation uses ELASTOS_RELEASE_MODEL_* inputs:
-Fresh export uses KUBO_BIN, KUBO_REPO, PUBLISHED_AT, PUBLISHER_DID and HANDOFF_OUTPUT.
-Other native workers use HANDOFF_INPUT with PUBLISHED_AT, PUBLISHER_DID and
-HANDOFF_OUTPUT, reusing all nine public bytes from that first export. HANDOFF_OUTPUT
-must name a new protected sibling of DIR. Its CARs, receipts and unsigned catalogue
-remain outside artifacts/ and temporary cleanup; model-handoff.json binds them to
-this native input. The custodian finalizes and signs the catalogue separately.
 Generic provider microVM rootfs and Browser substrate acceptance are separate.
 Fresh Linux ARM64 support requires ELASTOS_LLAMA_ARM64_BUNDLE to name the reviewed b10516
 archive. The archive is verified against its build recipe before any build.
@@ -51,9 +44,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n "$VERSION" && -n "$OUTPUT" ]] || { usage >&2; exit 2; }
-MODEL_PREPARATION=$(release_model_preparation_enabled)
-[[ "$MODEL_PREPARATION" != true || -z "$REUSE_SUPPORT" ]] \
-    || die "Model preparation requires fresh support; --reuse-support preserves the qualified input"
 for tool in git python3 jq cargo rustc rustup tar; do
     command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
 done
@@ -67,26 +57,6 @@ path = Path(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
 print(path.parent.resolve() / path.name)
 PY
 )
-if [[ "$MODEL_PREPARATION" == true ]]; then
-    ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT=$(python3 - "$CALLER_DIR" "$ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT" "$OUTPUT" <<'PY'
-import os, sys
-from pathlib import Path
-path = Path(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
-output = Path(sys.argv[3])
-if path.parent != output.parent or path == output or path.exists() or path.is_symlink():
-    raise SystemExit('Model handoff must be a new sibling of the native output')
-if any(parent.is_symlink() for parent in path.parents):
-    raise SystemExit('Model handoff path must use its canonical parent')
-if not path.parent.is_dir():
-    raise SystemExit('Model handoff parent must already exist')
-metadata = path.parent.stat()
-if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
-    raise SystemExit('Model handoff parent must be owned and protected')
-print(path)
-PY
-)
-    export ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT
-fi
 if [[ -n "$REUSE_SUPPORT" ]]; then
     REUSE_SUPPORT=$(python3 - "$CALLER_DIR" "$REUSE_SUPPORT" <<'PY'
 import os, sys
@@ -278,58 +248,11 @@ for asset in "$TMPDIR/supported-assets-$PLATFORM"/* \
     [[ ! -L "$asset" ]] || die "Prepared artifact must be a regular owned file: $asset"
     destination="$STAGING/artifacts/$(basename "$asset")"
     [[ ! -e "$destination" && ! -L "$destination" ]] || die "Prepared artifact names must be distinct"
-    # Build output and stage share the owned WORK_DIR volume. Rename the files
-    # so staging does not allocate a second copy of the full model payloads.
+    # Build output and stage share a volume; avoid copying the payloads.
     mv "$asset" "$destination"
 done
 cp "$TMPDIR/supported-upstream-assets-$PLATFORM/upstream-input.json" "$STAGING/upstream-input.json"
 cp scripts/release-upstream-recipes.json "$STAGING/upstream-recipes.json"
-if [[ "$MODEL_PREPARATION" == true ]]; then
-    # Bind the retained proposal to clean source inputs. Consumer components
-    # remain unchanged until the separate signed catalogue finalization phase.
-    python3 - "$STAGING" "$ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT" "$SOURCE_COMMIT" "$SOURCE_TREE" "$PLATFORM" "$VERSION" <<'PY'
-import hashlib, json, os
-from pathlib import Path
-import stat, sys
-
-stage, handoff = Path(sys.argv[1]), Path(sys.argv[2])
-metadata = handoff.lstat()
-if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-    raise SystemExit('Model handoff directory must be protected and owned')
-document = json.loads((stage / 'upstream-input.json').read_bytes())
-catalogue, retention = document['model_catalog_unsigned'], document['model_retention']
-names = [catalogue['release_path'], *(record[kind]['release_path']
-         for record in retention.values() for kind in ('car', 'receipt'))]
-files = {}
-for name in names:
-    if not isinstance(name, str) or Path(name).name != name or name in files:
-        raise SystemExit('Model handoff file names must be distinct basenames')
-    path = handoff / name
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-        raise SystemExit('Model handoff files must be protected owned regular files')
-    with path.open('rb') as stream:
-        value = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            value.update(chunk)
-        checksum = 'sha256:' + value.hexdigest()
-    files[name] = {'checksum': checksum, 'size': metadata.st_size}
-expected = {catalogue['release_path']: catalogue, **{record[kind]['release_path']: record[kind]
-            for record in retention.values() for kind in ('car', 'receipt')}}
-if any(files[name] != {key: expected[name][key] for key in ('checksum', 'size')} for name in files):
-    raise SystemExit('Model handoff bytes differ from upstream preparation receipts')
-if {path.name for path in handoff.iterdir()} != set(files):
-    raise SystemExit('Model handoff inventory differs from preparation receipts')
-record = {'schema': 'elastos.release-model-handoff/v1',
-          'scope': 'key-free model preparation; signed catalogue finalization follows',
-          'source': {'commit': sys.argv[3], 'tree': sys.argv[4], 'clean': True},
-          'platform': sys.argv[5], 'version': sys.argv[6],
-          'handoff_directory': '../' + handoff.name,
-          'upstream_input_sha256': hashlib.sha256((stage / 'upstream-input.json').read_bytes()).hexdigest(),
-          'model_catalog_unsigned': catalogue, 'model_retention': retention, 'files': files}
-(stage / 'model-handoff.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
-PY
-fi
 if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
     cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
 fi

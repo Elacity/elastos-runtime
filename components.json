@@ -1759,15 +1759,5 @@
         "llama-server"
       ]
     }
-  },
-  "model_catalog": {
-    "head_cid": "bafkreigidvbvotnjdljhqmao3jmtgdh56h6wveso6lv7mnsyvmhcmhjpfq",
-    "publisher_dids": [
-      "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
-    ],
-    "local_use": {
-      "max_cache_bytes": 21474836480,
-      "max_model_memory_bytes": 8589934592
-    }
   }
 }
