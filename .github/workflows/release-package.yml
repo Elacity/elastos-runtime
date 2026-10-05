@@ -278,7 +278,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
       - name: download pinned ARM64 engine input
         if: matrix.platform == 'aarch64-linux'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: release-llama-arm64-${{ inputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/llama-arm64-bundle
