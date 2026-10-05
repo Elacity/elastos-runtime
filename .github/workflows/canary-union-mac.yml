@@ -105,7 +105,7 @@ jobs:
           expected = {'schema': 'elastos.canary-union-admission/v1',
               'source_commit': os.environ['SOURCE_COMMIT'], 'source_tree': os.environ['SOURCE_TREE'],
               'source_ci_run': int(os.environ['SOURCE_CI_RUN']), 'workflow_commit': os.environ['GITHUB_SHA'],
-              'union_pr': 230, 'published_at': os.environ['PUBLISHED_AT'],
+              'published_at': os.environ['PUBLISHED_AT'],
               'mac_versions': ['0.8.0-alpha.3', '0.8.0-alpha.4'], 'seed_version': '0.8.0-alpha.3'}
           if any(admission.get(key) != value for key, value in expected.items()):
               raise RuntimeError('Shared union admission pins differ')

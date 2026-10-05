@@ -99,7 +99,7 @@ jobs:
           assert shared['schema'] == 'elastos.canary-union-admission/v1'
           assert shared['source_commit'] == commit and shared['source_tree'] == tree
           assert shared['source_ci_run'] == int(os.environ['SOURCE_CI_RUN'])
-          assert shared['workflow_commit'] == os.environ['GITHUB_SHA'] and shared['union_pr'] == 230
+          assert shared['workflow_commit'] == os.environ['GITHUB_SHA']
           assert shared['seed_version'] == os.environ['ELASTOS_RELEASE_VERSION']
           assert shared['mac_versions'] == ['0.8.0-alpha.3', '0.8.0-alpha.4']
           decision = api(f"/repos/{repository}/issues/comments/{os.environ['HELPER_APPROVAL_COMMENT']}")

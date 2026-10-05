@@ -10,8 +10,12 @@ on:
       - .github/workflows/canary-union-seed.yml
   workflow_dispatch:
     inputs:
+      source_pr:
+        description: Pull request whose normal merge into develop is the source
+        required: true
+        type: string
       source_commit:
-        description: PR230 normal merge commit on develop
+        description: That PR's normal merge commit on develop
         required: true
         type: string
       source_tree:
@@ -19,7 +23,7 @@ on:
         required: true
         type: string
       source_ci_run:
-        description: Successful Runtime CI run for the merged PR230 tree
+        description: Successful Runtime CI run for that PR head or its merge
         required: true
         type: string
       published_at:
@@ -50,10 +54,11 @@ jobs:
       published_at: ${{ steps.admit.outputs.published_at }}
       admission_artifact_name: ${{ steps.admit.outputs.admission_artifact_name }}
     steps:
-      - name: admit exact PR230 merge and successful union CI
+      - name: admit exact PR merge and successful Runtime CI
         id: admit
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ inputs.source_pr }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           SOURCE_TREE: ${{ inputs.source_tree }}
           SOURCE_CI_RUN: ${{ inputs.source_ci_run }}
@@ -64,12 +69,12 @@ jobs:
           [[ "$GITHUB_REF" == refs/heads/fix/89-canary-inputs ]]
           python3 - <<'PY'
           import json, os, pathlib, re, urllib.request
-          commit, tree, run_id, stamp = (os.environ[k] for k in
-              ('SOURCE_COMMIT', 'SOURCE_TREE', 'SOURCE_CI_RUN', 'PUBLISHED_AT'))
+          commit, tree, run_id, stamp, pr_number = (os.environ[k] for k in
+              ('SOURCE_COMMIT', 'SOURCE_TREE', 'SOURCE_CI_RUN', 'PUBLISHED_AT', 'SOURCE_PR'))
           if not all(re.fullmatch(r'[0-9a-f]{40}', p) for p in (commit, tree)):
               raise SystemExit('Exact commit and tree SHAs are required')
-          if not re.fullmatch(r'[1-9][0-9]*', run_id):
-              raise SystemExit('A numeric Runtime CI run is required')
+          if not all(re.fullmatch(r'[1-9][0-9]*', p) for p in (run_id, pr_number)):
+              raise SystemExit('A numeric source PR and Runtime CI run are required')
           if not re.fullmatch(r'[1-9][0-9]{0,9}', stamp):
               raise SystemExit('Proposed catalogue time must use Unix seconds')
           def api(path):
@@ -80,9 +85,9 @@ jobs:
                   return json.load(response)
           if api('issues/89')['state'] != 'open':
               raise SystemExit('#89 is closed; package preparation has ended')
-          pr = api('pulls/230')
+          pr = api('pulls/' + pr_number)
           if not pr['merged'] or pr['base']['ref'] != 'develop' or pr['merge_commit_sha'] != commit:
-              raise SystemExit('Source must be the completed PR230 merge into develop')
+              raise SystemExit('Source must be the completed source PR merge into develop')
           source = api('git/commits/' + commit)
           if source['tree']['sha'] != tree or len(source['parents']) != 2:
               raise SystemExit('Source must match the normal merge commit and exact tree')
@@ -107,7 +112,7 @@ jobs:
               raise SystemExit('Successful CI tree differs from the package source')
           artifact_name = 'canary-union-admission-' + commit + '-' + os.environ['GITHUB_RUN_ATTEMPT']
           receipt = {'schema': 'elastos.canary-union-admission/v1', 'source_commit': commit,
-              'source_tree': tree, 'union_pr': 230, 'union_head': head,
+              'source_tree': tree, 'union_pr': int(pr_number), 'union_head': head,
               'source_ci_run': int(run_id), 'ci_attempt': run['run_attempt'],
               'workflow_commit': os.environ['GITHUB_SHA'], 'published_at': stamp,
               'mac_versions': ['0.8.0-alpha.3', '0.8.0-alpha.4'],
