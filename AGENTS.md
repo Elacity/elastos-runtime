@@ -7,7 +7,7 @@ are the only place for work status, acceptance criteria and proof.
 ## Work Tracking And Acceptance
 
 - GitHub issues own the work queue. In each lane, take the lowest-numbered open
-  task in the current milestone whose dependencies are satisfied and
+  task in the current weekly milestone whose dependencies are satisfied and
   which has no active blocker. Keep at most one task issue In progress per
   lane. Parent issues group the lane;
   they do not authorize a second active task. User messages approve, redirect
@@ -58,7 +58,7 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Branch Roles
 
-- `main` is the release line.
+- `main` is the release line. It changes only through the weekly release PR.
 - `develop` is the integration line. Task PRs merge into it when their checks
   and reviews pass (see Review And Commit Discipline).
 - Feature and fix branches remain unpublished working lines until they are
@@ -85,10 +85,29 @@ says so in its PR and merges after its parent. Name branches `feat/<slug>` or
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
-## Releases
+## Weekly Releases
 
-Releases are built by `.github/workflows/release-package.yml` and published with `scripts/release-publish.sh` as described in [Publishing a release](docs/VERSIONING.md#publishing-a-release).
-Changes to `main` and tags stay with Anders.
+- Each weekly release has a milestone `0.7.N`. Its scope is fixed on the
+  Wednesday before the release; work that misses it moves to the next milestone.
+- On Tuesday the candidate is cut from `develop` as `release/0.7.N` with the
+  version bump and changelog, and opened as a PR to `main`.
+- Three people confirm the candidate before the tag. Sasha reviews the visible
+  changes (CI screenshots and a short look) on his Wednesday. `irzhywau`
+  approves the release PR. Anders runs the ten-minute journey on his Mac: a
+  fresh install (an update from the previous weekly release once the signed
+  update tasks UP-01 to UP-03 are merged), sign in, one local AI reply, one chat
+  message and one Browser page. A failed journey or a visible regression holds
+  the tag for that week.
+- On Wednesday the PR merges, `v0.7.N` is tagged on the merge commit, and `main`
+  merges back into `develop`.
+- 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets
+  its Done means.
+
+## Canary releases
+
+Canary builds come from a `develop` commit through
+`.github/workflows/release-package.yml` and are published with
+`scripts/release-publish.sh` (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)).
 
 ## Branch Lifecycle
 
@@ -262,7 +281,7 @@ capsules, provider config, and `components.json`.
   `irzhywau` for security follow-up: he reviews merged security task PRs, and a
   finding goes into an existing issue or a revert when it reopens a hole.
   When he authors a security task PR, Anders conducts the follow-up review.
-  Release PRs still need his approval before merge and tag; when he is
+  Weekly release PRs still need his approval before merge and tag; when he is
   the author, Anders reviews. Also request the feature owner when required.
 - Use one development review round per coherent change. Resolve findings in
   that round and fix their cause before requesting the current verdict. Scope
@@ -328,7 +347,7 @@ and result.
 Prove installed behavior on the CI install jobs (GitHub-hosted Linux x86-64,
 Linux ARM64 and macOS machines) when they cover the journey, and link that CI
 run as the proof. Otherwise use the installed-proof steps above. The Jetson is
-checked on the release candidate. A PR that changes what users see links the CI
+checked on the weekly candidate. A PR that changes what users see links the CI
 screenshots at desktop and phone width.
 
 ## Journey Register Gate
