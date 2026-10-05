@@ -750,6 +750,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         env!("ELASTOS_VERSION"),
         true,
         false,
+        false,
         crate::setup::FirstPartyCarrierContext::Runtime,
     )
     .await;

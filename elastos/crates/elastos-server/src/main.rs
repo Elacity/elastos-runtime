@@ -580,7 +580,7 @@ enum Commands {
         #[arg(long)]
         rollback_to: Option<String>,
 
-        /// Allow reinstall, downgrade, or repair of an invalid installed version
+        /// Repair an invalid installed version with a verified same or newer release
         #[arg(long)]
         force: bool,
     },
@@ -611,7 +611,7 @@ enum Commands {
         #[arg(long)]
         rollback_to: Option<String>,
 
-        /// Allow reinstall, downgrade, or repair of an invalid installed version
+        /// Repair an invalid installed version with a verified same or newer release
         #[arg(long)]
         force: bool,
     },

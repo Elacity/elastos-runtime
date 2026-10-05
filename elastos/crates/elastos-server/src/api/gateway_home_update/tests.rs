@@ -757,6 +757,8 @@ fn system_update_post_rejects_hidden_authority_fields() {
         "admin",
         "owner",
         "auto_confirm",
+        "force",
+        "repair_invalid_version",
         "recovered",
         "effect_id",
         "request_sha256",
