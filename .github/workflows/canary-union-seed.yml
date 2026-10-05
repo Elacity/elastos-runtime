@@ -13,6 +13,9 @@ on:
       source_ci_run:
         required: true
         type: string
+      admission_artifact_name:
+        required: true
+        type: string
     outputs:
       artifact_name:
         description: Sealed Linux Runtime, provider and exact helper-source package
@@ -55,7 +58,7 @@ jobs:
       - name: read the shared source admission from this dispatch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          name: ${{ inputs.admission_artifact_name }}
           path: ${{ runner.temp }}/union-seed-admission
       - name: admit source and resolve the approved helper root
         working-directory: reviewed

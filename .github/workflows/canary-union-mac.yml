@@ -16,6 +16,9 @@ on:
       published_at:
         required: true
         type: string
+      admission_artifact_name:
+        required: true
+        type: string
       publisher_did:
         type: string
         default: did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
@@ -62,7 +65,7 @@ jobs:
       - name: read the shared admission from this dispatch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          name: ${{ inputs.admission_artifact_name }}
           path: ${{ runner.temp }}/union-mac-admission
       - name: bind source and allocate owned paths
         run: |

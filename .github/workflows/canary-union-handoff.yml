@@ -48,6 +48,7 @@ jobs:
       source_tree: ${{ steps.admit.outputs.source_tree }}
       source_ci_run: ${{ steps.admit.outputs.source_ci_run }}
       published_at: ${{ steps.admit.outputs.published_at }}
+      admission_artifact_name: ${{ steps.admit.outputs.admission_artifact_name }}
     steps:
       - name: admit exact PR230 merge and successful union CI
         id: admit
@@ -104,6 +105,7 @@ jobs:
               raise SystemExit('CI must bind the exact union head or its develop merge')
           if api('git/commits/' + run['head_sha'])['tree']['sha'] != tree:
               raise SystemExit('Successful CI tree differs from the package source')
+          artifact_name = 'canary-union-admission-' + commit + '-' + os.environ['GITHUB_RUN_ATTEMPT']
           receipt = {'schema': 'elastos.canary-union-admission/v1', 'source_commit': commit,
               'source_tree': tree, 'union_pr': 230, 'union_head': head,
               'source_ci_run': int(run_id), 'ci_attempt': run['run_attempt'],
@@ -114,13 +116,14 @@ jobs:
           pathlib.Path('union-admission.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               for key, value in [('source_commit', commit), ('source_tree', tree),
-                                 ('source_ci_run', run_id), ('published_at', stamp)]:
+                                 ('source_ci_run', run_id), ('published_at', stamp),
+                                 ('admission_artifact_name', artifact_name)]:
                   out.write(key + '=' + value + '\n')
           PY
       - name: retain shared source admission
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: canary-union-admission-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          name: ${{ steps.admit.outputs.admission_artifact_name }}
           path: union-admission.json
           if-no-files-found: error
           retention-days: 7
@@ -134,6 +137,7 @@ jobs:
       source_tree: ${{ needs.admit.outputs.source_tree }}
       source_ci_run: ${{ needs.admit.outputs.source_ci_run }}
       published_at: ${{ needs.admit.outputs.published_at }}
+      admission_artifact_name: ${{ needs.admit.outputs.admission_artifact_name }}
       prepare_models: true
 
   seed:
@@ -144,3 +148,4 @@ jobs:
       source_commit: ${{ needs.admit.outputs.source_commit }}
       source_tree: ${{ needs.admit.outputs.source_tree }}
       source_ci_run: ${{ needs.admit.outputs.source_ci_run }}
+      admission_artifact_name: ${{ needs.admit.outputs.admission_artifact_name }}
