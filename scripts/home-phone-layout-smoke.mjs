@@ -838,6 +838,12 @@ async function closeWindow(frame, target) {
 
 async function screenshot(page, dir, name) {
   await page.screenshot({ path: join(dir, `${name}.png`), fullPage: false });
+  // After capturing an open sheet, Chromium mobile emulation can deliver mouse
+  // input at the requested point divided by the device scale factor (Linux CI
+  // and macOS). Applying the same viewport again restores true input.
+  if (page.context().browser()?.browserType().name() === "chromium") {
+    await page.setViewportSize(page.viewportSize());
+  }
 }
 
 async function bootHome(context, origin) {
