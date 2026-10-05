@@ -73,12 +73,11 @@ use super::{
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
     CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, CUSTODY_PROVIDER_OPERATIONS,
-    CUSTODY_PROVIDER_VERSION, MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1,
-    MEDIA_PROVIDER_ID, MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
+    MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1, MEDIA_PROVIDER_ID,
+    MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
     PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
-    PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
-    PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
-    PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
+    PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT,
+    PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS, PROTECT_PROVIDER_PROCESS_ID,
     RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
@@ -4222,7 +4221,7 @@ impl ProtectedStartupProvider {
                 "status": "ok",
                 "data": {
                     "provider": PROTECT_PROVIDER_PROCESS_ID,
-                    "version": PROTECT_PROVIDER_VERSION,
+                    "version": "0.7.2-alpha.5",
                     "configured": true,
                     "supported_operations": PROTECT_PROVIDER_OPERATIONS,
                     "request_schema": PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
@@ -4233,7 +4232,7 @@ impl ProtectedStartupProvider {
                 "status": "ok",
                 "data": {
                     "provider": CUSTODY_PROVIDER_ID,
-                    "version": CUSTODY_PROVIDER_VERSION,
+                    "version": "0.7.2-alpha.5",
                     "configured": true,
                     "supported_operations": CUSTODY_PROVIDER_OPERATIONS,
                     "request_schema": CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
@@ -4432,13 +4431,108 @@ fn protected_content_decrypt_provider_status() -> Value {
         "status": "ok",
         "data": {
             "provider": PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
-            "version": PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
+            "version": "0.7.2-alpha.5",
             "configured": true,
             "supported_operations": PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
             "request_schema": DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
             "response_schema": DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
         }
     })
+}
+
+// These fixtures represent frozen support files from a different Runtime release.
+#[cfg(unix)]
+mod provider_status_compatibility {
+    use super::*;
+
+    type StatusCheck = fn(&Value) -> anyhow::Result<()>;
+
+    fn cases() -> [(Value, StatusCheck, &'static str); 4] {
+        [
+            (
+                ProtectedStartupProvider::Protect.status(),
+                super::super::require_protect_provider_status,
+                "protect provider",
+            ),
+            (
+                ProtectedStartupProvider::Custody.status(),
+                super::super::require_inactive_custody_provider_status,
+                "inactive custody provider",
+            ),
+            (
+                protected_content_decrypt_provider_status(),
+                super::super::require_protected_content_decrypt_provider_status,
+                "protected-content decrypt provider",
+            ),
+            (
+                json!({
+                    "status": "ok",
+                    "data": {
+                        "provider": "media-provider",
+                        "protocol_version": "elastos.media-provider/v1",
+                        "version": "0.7.2-alpha.5",
+                        "configured": true,
+                        "supported_operations": ["status", "prepare"],
+                    }
+                }),
+                super::super::require_media_provider_status,
+                "media-provider",
+            ),
+        ]
+    }
+
+    #[test]
+    fn accepts_another_release_with_the_same_protocol() {
+        for (mut status, check, label) in cases() {
+            for version in ["0.7.2-alpha.5", "0.7.2-alpha.6", "0.1.0-dev"] {
+                status["data"]["version"] = json!(version);
+                check(&status).unwrap_or_else(|error| panic!("{label}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_incompatible_protocol_with_a_plain_message() {
+        for (status, check, label) in cases() {
+            let fields: &[&str] = if label == "media-provider" {
+                &["protocol_version"]
+            } else {
+                &["request_schema", "response_schema"]
+            };
+            for field in fields {
+                let mut incompatible = status.clone();
+                incompatible["data"][field] = json!("incompatible/v2");
+                let message = check(&incompatible).unwrap_err().to_string();
+                let expected = if label == "media-provider" {
+                    format!("{label} status has an unsupported protocol version")
+                } else {
+                    format!("{label} status has unsupported protocol schemas")
+                };
+                assert_eq!(message, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_missing_or_garbled_status() {
+        for (status, check, label) in cases() {
+            for version in [Value::Null, json!(42), json!(""), json!("garbled")] {
+                let mut invalid = status.clone();
+                invalid["data"]["version"] = version;
+                assert!(check(&invalid).is_err(), "{label}");
+            }
+            for field in status["data"].as_object().unwrap().keys() {
+                let mut missing = status.clone();
+                missing["data"].as_object_mut().unwrap().remove(field);
+                assert!(check(&missing).is_err(), "{label}: {field}");
+            }
+            assert!(check(&json!({"status": "ok"})).is_err(), "{label}");
+            assert!(
+                check(&json!({"status": "error", "data": status["data"]})).is_err(),
+                "{label}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -5950,7 +6044,7 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
     .unwrap();
 
     assert_eq!(status["provider"], "custody");
-    assert_eq!(status["version"], CUSTODY_PROVIDER_VERSION);
+    assert!(semver::Version::parse(status["version"].as_str().unwrap()).is_ok());
     assert_eq!(status["configured"], Value::Bool(true));
     assert_eq!(
         status["supported_operations"],

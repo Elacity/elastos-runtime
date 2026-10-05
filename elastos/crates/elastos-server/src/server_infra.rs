@@ -65,11 +65,6 @@ const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
 #[cfg(test)]
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-#[cfg(test)]
-const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2221,7 +2216,7 @@ mod tests {
             "data": {
                 "provider": MEDIA_PROVIDER_ID,
                 "protocol_version": MEDIA_PROVIDER_PROTOCOL_VERSION,
-                "version": MEDIA_PROVIDER_VERSION,
+                "version": "0.7.2-alpha.5",
                 "configured": true,
                 "supported_operations": ["status", "prepare"],
             }
@@ -2810,7 +2805,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_provider_startup_registers_only_the_runtime_media_route() {
+    async fn media_provider_startup_accepts_another_release_and_registers_only_the_runtime_media_route(
+    ) {
         let registry = provider::ProviderRegistry::new();
         let (bridge, provider) = test_provider_bridge(media_provider_status(), Duration::ZERO);
 

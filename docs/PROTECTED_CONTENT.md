@@ -81,8 +81,9 @@ topology stays private.
 
 Capsule URI lookup, public provider proxying, interface projection, and route
 lists exclude all four targets. Runtime registers a target only after the
-provider returns the exact successful identity, version, configured state,
-schema, and ordered operation set. Rejected startup settles and reaps the child
+provider returns the exact successful identity, a valid release version (it may
+differ from the Runtime's after a Runtime-only update), configured state,
+schema or protocol version, and ordered operation set. Rejected startup settles and reaps the child
 before it returns an error.
 
 Protect, media, and decrypt run as local native provider processes. Custody can
