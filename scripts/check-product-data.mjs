@@ -2,7 +2,6 @@
 
 // Validate shipped data. Runtime and UI behaviour belongs in executable tests.
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -295,50 +294,6 @@ export function validateComponents(components, manifests) {
   }
 }
 
-export function validateModelCatalog(components, catalog) {
-  const policy = components.model_catalog;
-  assert(policy?.head_cid?.startsWith("bafkrei"), "Model catalog head CID");
-  assert(Array.isArray(policy.publisher_dids) && policy.publisher_dids.length === 1, "Model catalog publisher DID");
-  same(catalog.signer_did, policy.publisher_dids[0], "Model catalog trusted signer");
-  same(catalog.payload?.schema, "elastos.model.catalog/v1", "Model catalog schema");
-  assert(!Object.hasOwn(catalog.payload, "expires_at"), "Permanent model catalog expiry");
-  assert(policy.local_use?.max_cache_bytes >= 18516684377 && policy.local_use?.max_model_memory_bytes >= 8589934592, "Model local-use floors");
-  const entries = requireList(catalog.payload.entries, "Model catalog entries");
-  assert(entries.length > 0, "Model catalog is empty");
-  unique(entries.map((entry) => entry.cid), "Model catalog CIDs");
-  for (const entry of entries) {
-    const capsule = entry.capsule_manifest;
-    same(capsule?.role, "content", "Model content role");
-    same(capsule?.type, "data", "Model content type");
-    const model = capsule.model_content;
-    same(model?.format, "gguf", "Model format");
-    same(model?.engine, "llama.cpp", "Model engine");
-    const files = requireList(entry.object_manifest?.files, "Model object files");
-    unique(files.map((file) => file.path), "Model object file paths");
-    for (const path of [capsule.entrypoint, model.license?.path, model.provenance?.path, model.provenance?.base_license?.path]) assert(files.some((file) => file.path === path), `Model object lacks ${path}`);
-    for (const file of files) {
-      safePath(file.path, "Model object file");
-      assert(/^[a-f0-9]{64}$/.test(file.sha256) && Number.isSafeInteger(file.size) && file.size >= 0, `Model object ${file.path} integrity metadata`);
-    }
-    assert(Number.isSafeInteger(model.minimum_memory_mb) && model.minimum_memory_mb > 0, "Model minimum memory must be a positive integer");
-    assert(model.minimum_memory_mb * 1024 * 1024 <= policy.local_use.max_model_memory_bytes, "Catalog model exceeds local memory policy");
-  }
-}
-
-export function validateCatalogBinding(components, bytes) {
-  // CIDv1, raw codec, SHA-256 multihash, lower-case base32.
-  const content = Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), createHash("sha256").update(bytes).digest()]);
-  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-  let encoded = "b", bits = 0, value = 0;
-  for (const byte of content) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) { bits -= 5; encoded += alphabet[(value >>> bits) & 31]; }
-  }
-  if (bits) encoded += alphabet[(value << (5 - bits)) & 31];
-  same(components.model_catalog.head_cid, encoded, "Model catalog bytes must match the pinned head CID");
-}
-
 export function checkProductData(repoRoot = root) {
   const json = (path) => JSON.parse(readFileSync(resolve(repoRoot, path), "utf8"));
   const manifests = {};
@@ -376,8 +331,6 @@ export function checkProductData(repoRoot = root) {
     readFileSync(resolve(repoRoot, "scripts/publish-release.sh"), "utf8"),
     readFileSync(resolve(repoRoot, "elastos/crates/elastos-server/src/publish.rs"), "utf8"),
   ));
-  validateModelCatalog(components, json("model-catalog.json"));
-  validateCatalogBinding(components, readFileSync(resolve(repoRoot, "model-catalog.json")));
   const pwa = json("capsules/home/browser/manifest.webmanifest");
   same(pwa.display, "standalone", "Home PWA display");
   for (const size of [192, 512]) {

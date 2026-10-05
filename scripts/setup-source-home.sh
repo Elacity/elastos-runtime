@@ -1233,34 +1233,6 @@ components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 }
 
-install_signed_model_catalog() {
-    echo "[setup-source-home] install signed model catalog"
-    COMPONENTS_SRC="${ROOT}/model-catalog.json" \
-    COMPONENTS_DEST="${DATA_DIR}/model-catalog.json" \
-    COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-    python3 - <<'PY'
-import base64
-import hashlib
-import json
-import os
-import pathlib
-import stat
-
-src = pathlib.Path(os.environ["COMPONENTS_SRC"])
-dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
-manifest = json.loads(pathlib.Path(os.environ["COMPONENTS_MANIFEST"]).read_bytes())
-pin = manifest.get("model_catalog")
-if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
-    raise SystemExit("source-home components.json is missing model_catalog.head_cid")
-data = src.read_bytes()
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != pin["head_cid"]:
-    raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
-dest.write_bytes(data)
-dest.chmod(stat.S_IRUSR | stat.S_IWUSR)
-PY
-}
-
 install_local_model_engine() {
     local mode="${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-0}"
 
@@ -1541,7 +1513,6 @@ source_home_binary_names | while IFS= read -r provider; do
     install -m 755 "$(source_home_provider_bin "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
-install_signed_model_catalog
 
 echo "[setup-source-home] install content publish backend before final manifest stamp"
 install_content_publish_backend
