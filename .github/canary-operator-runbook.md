@@ -999,8 +999,8 @@ closes.
 ## V3 catalogue and release; V4 follows the public V3
 
 The operator signs `0.8.0-alpha.3` with the maintainer DID below, upgrades the
-seed, and publishes V3 after package verification. V4 `0.8.0-alpha.4` follows
-Anders's installed V3 acceptance. Use the accepted union artifact linked in
+seed, and publishes V3 after package verification. V4 `0.8.0-alpha.4` publication
+follows Anders's installed V3 acceptance. Use the accepted union artifact linked in
 #89 and the source recorded in its receipts. Keep the original N3/N4 receipts,
 Runtime bytes and `N3-model-handoff` intact. The existing transfer, custody and
 seed procedures above apply; the old V1/V2 finalization workflow admits its own
@@ -1132,8 +1132,9 @@ Runtime's owned provider. Retain the committed receipt and check served-byte
 parity, model roots and Carrier after restart. A failed import follows the
 existing recovery procedure; a gossip retry uses the identical signed set.
 
-After V3 is public and Anders installs it, the operator asks Release to finalize
-V4. Keep the actual committed V3 seed receipt as `ACTUAL_V3_RECEIPT`. The key-free
+After V3 is public, the operator can ask Release to finalize V4. V4 publication
+follows Anders's installed V3 acceptance. Keep the actual committed V3 seed
+receipt as `ACTUAL_V3_RECEIPT`. The key-free
 builder imports the unchanged N4 Runtime through its qualified provider and
 records its returned CID. Extract verified inputs below its selected private
 `BUILDER_DATA` root; the provider admits `add_path` there. Keep the builder's
