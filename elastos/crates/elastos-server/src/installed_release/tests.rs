@@ -466,6 +466,53 @@ fn signed_standalone_support_bytes_and_regular_file_are_required() {
 }
 
 #[test]
+fn native_provider_outside_home_profile_is_verified_when_present_and_never_required() {
+    for (case, admitted) in [
+        ("optional absent", true),
+        ("optional valid", true),
+        ("optional changed", false),
+        ("required absent", false),
+    ] {
+        let mut fixture = Fixture::new();
+        let bytes = b"installed signed custody provider";
+        let path = fixture.data.join("bin/custody-provider");
+        let home = if case == "required absent" {
+            json!(["custody-provider"])
+        } else {
+            json!([])
+        };
+        let components = json!({"schema":"elastos.components/v1", "external":{"custody-provider":{
+            "install_path":"bin/custody-provider",
+            "provider_runtime":{"role":"provider", "substrate":"native", "runtime_abi":"elastos.provider-stdio/v1",
+                "execution":"native-provider", "provides":"custody", "runtime_only":true},
+            "platforms":{(crate::setup::detect_platform()):{"release_path":"custody-provider-fixture",
+                "install_path":"bin/custody-provider", "cid":raw_cid(bytes), "size":bytes.len(),
+                "checksum":format!("sha256:{}", hex::encode(Sha256::digest(bytes)))}}
+        }}, "capsules":{}, "profiles":{"home":{"components":home}}});
+        fs::write(
+            fixture.data.join("components.json"),
+            serde_json::to_vec(&components).unwrap(),
+        )
+        .unwrap();
+        fixture.bind_components();
+        if case.starts_with("optional valid") || case == "optional changed" {
+            fs::create_dir(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                if case == "optional changed" {
+                    &b"substituted provider"[..]
+                } else {
+                    &bytes[..]
+                },
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(fixture.load().is_ok(), admitted, "{case}");
+    }
+}
+
+#[test]
 fn installed_catalogue_keeps_pinned_custody_after_offer_expiry() {
     for case in [
         "expired valid",
