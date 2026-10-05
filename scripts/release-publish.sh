@@ -33,12 +33,19 @@ die() { echo "release-publish: $*" >&2; exit 1; }
 need_env() { local name; for name; do [[ -n "${!name:-}" ]] || die "set $name"; done; }
 sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
 
-# Prints "id digest name" of the run's newest live PREFIX-<commit>-<attempt> artifact.
-artifact() {
-    local run="$1" prefix="$2"
-    gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" --jq "[.artifacts[]
+# Checks the run (Release package, success) and prints "id digest commit" of its
+# newest live PREFIX-<commit>-<attempt> artifact after checking commit is on develop.
+checked_artifact() {
+    local run="$1" prefix="$2" found commit
+    [[ "$(gh api "repos/$REPO/actions/runs/$run" --jq '[.path, .conclusion] | join(" ")')" \
+        == ".github/workflows/release-package.yml success" ]] || die "run $run is not a successful Release package run"
+    found=$(gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" --jq "[.artifacts[]
         | select((.name | test(\"^$prefix-[0-9a-f]{40}-[0-9]+\$\")) and (.expired | not))] | sort_by(.id)
-        | if length > 0 then \"\(last.id) \(last.digest | ltrimstr(\"sha256:\")) \(last.name)\" else error(\"no $prefix artifact\") end"
+        | if length > 0 then \"\(last.id) \(last.digest | ltrimstr(\"sha256:\")) \(last.name)\" else error(\"no $prefix artifact\") end")
+    commit=${found##* $prefix-} commit=${commit%-*}
+    [[ "$(gh api "repos/$REPO/compare/$commit...develop" --jq .status)" =~ ^(ahead|identical)$ ]] \
+        || die "source $commit is not on develop"
+    echo "${found% *} $commit"
 }
 
 # Prints the seed-side preamble and get NAME ID DIGEST: download, check, unpack.
@@ -60,10 +67,8 @@ prepare() {
     need_env RELEASE_SEED RELEASE_SEED_DATA
     work=$(work_dir "$version")
     [[ ! -e "$work" ]] || die "$work exists; remove it to prepare again"
-    [[ "$(gh api "repos/$REPO/actions/runs/$run" --jq '[.path, .conclusion] | join(" ")')" \
-        == ".github/workflows/release-package.yml success" ]] || die "run $run is not a successful Release package run"
     mkdir -p "$work/state" "$work/data"
-    id=$(artifact "$run" release-mac)
+    id=$(checked_artifact "$run" release-mac)
     read -r id digest _ <<< "$id"
     gh api "repos/$REPO/actions/artifacts/$id/zip" > "$work/mac.zip"
     [[ "$(sha "$work/mac.zip")" == "$digest" ]] || die "Mac artifact digest differs"
@@ -132,7 +137,7 @@ seed() {
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
     did=$(jq -er .signer_did "$signed/release-head.json")
-    mac=$(artifact "$run" release-mac)
+    mac=$(checked_artifact "$run" release-mac)
     read -r mac mac_digest _ <<< "$mac"
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
@@ -154,21 +159,22 @@ cut -c67- signed.SHA256SUMS | while read -r f; do [ -e "signed/\$f" ] || cp "inp
 export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
 publish() { $RELEASE_SEED_RUNTIME publish-release --version $version --channel canary --signed-publication signed \\
             --publisher-did $did --ipfs-provider-bin $RELEASE_SEED_DATA/bin/ipfs-provider "\$@"; }
+sudo -v; [ -x $RELEASE_SEED_RUNTIME ]; [ -x $RELEASE_SEED_DATA/bin/ipfs-provider ]; [ -w $RELEASE_SEED_DATA ]
 sudo systemctl stop $RELEASE_SEED_UNIT
+trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
 publish --preflight-only
 # Import ends with a known gossip error after commit while the service is stopped.
 publish 2>&1 | tee import.log || grep -q 'committed; retry publication to announce its head: No running runtime found' import.log
-sudo systemctl start $RELEASE_SEED_UNIT
+trap - EXIT; sudo systemctl start $RELEASE_SEED_UNIT
 EOF
 }
 
 seed_upgrade() {
     [[ $# == 1 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: seed-upgrade RUN_ID"
     need_env RELEASE_SEED_USER RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
-    local pkg id digest name commit
-    pkg=$(artifact "$1" release-seed)
-    read -r id digest name <<< "$pkg"
-    commit=${name#release-seed-} commit=${commit%-*}
+    local pkg id digest commit
+    pkg=$(checked_artifact "$1" release-seed)
+    read -r id digest commit <<< "$pkg"
     seed_preamble "$RELEASE_SEED_STAGE/seed-upgrade-$1"
     cat <<EOF
 sudo install -d -o $RELEASE_SEED_USER /opt/elastos
@@ -177,17 +183,19 @@ chmod 755 seed/elastos seed/ipfs-provider
 rm -rf $SOURCE_ROOT.new; mkdir $SOURCE_ROOT.new; tar -xzf seed/source.tar.gz -C $SOURCE_ROOT.new
 [ "\$(git -C $SOURCE_ROOT.new rev-parse HEAD)" = $commit ]
 [ -z "\$(git -C $SOURCE_ROOT.new status --porcelain)" ]
-export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
-sudo systemctl stop $RELEASE_SEED_UNIT
-rm -rf $SOURCE_ROOT; mv $SOURCE_ROOT.new $SOURCE_ROOT
-install -m 755 seed/elastos $RELEASE_SEED_RUNTIME
-install -m 755 seed/ipfs-provider $RELEASE_SEED_DATA/bin/ipfs-provider
 jq --arg c "sha256:\$(sha256sum seed/ipfs-provider | cut -d ' ' -f 1)" --argjson s "\$(stat -c %s seed/ipfs-provider)" \\
    '.external["ipfs-provider"].platforms["linux-amd64"] += {checksum: \$c, size: \$s}' \\
    $RELEASE_SEED_DATA/components.json > components.json
+sudo -v; [ -w /opt/elastos ]; [ -w \$(dirname $RELEASE_SEED_RUNTIME) ]; [ -w $RELEASE_SEED_DATA/bin ]; [ -w $RELEASE_SEED_DATA ]
+export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
+sudo systemctl stop $RELEASE_SEED_UNIT
+trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
+rm -rf $SOURCE_ROOT; mv $SOURCE_ROOT.new $SOURCE_ROOT
+install -m 755 seed/elastos $RELEASE_SEED_RUNTIME
+install -m 755 seed/ipfs-provider $RELEASE_SEED_DATA/bin/ipfs-provider
 install -m 600 components.json $RELEASE_SEED_DATA/components.json
 $SOURCE_ROOT/scripts/installed-provider-verify.sh --require-verified ipfs-provider
-sudo systemctl start $RELEASE_SEED_UNIT
+trap - EXIT; sudo systemctl start $RELEASE_SEED_UNIT
 EOF
 }
 

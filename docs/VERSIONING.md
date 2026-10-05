@@ -159,12 +159,13 @@ the version by the contract change (see Meaning) and update the changelog first;
    versions, source and support parity. Each job summary records its artifact
    ID and digest.
 2. **Prepare.** On the operator Mac, from a clone of this repository, run
-   `scripts/release-publish.sh prepare RUN_ID VERSION`. It downloads and checks
-   the Mac artifact, verifies the inputs, checks out the exact source as a
-   worktree, takes Kubo from the build, reads the publisher bootstrap and signer
-   DID from the public origin, copies the seed's current `publish-state.json`
-   and runs `scripts/publish-release.sh --prepare-only` in an isolated data
-   directory.
+   `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
+   succeeded and that its source is on `develop` (merge an open pull request
+   first), downloads and checks the Mac artifact, verifies the inputs, checks
+   out the exact source as a worktree, takes Kubo from the build, reads the
+   publisher bootstrap and signer DID from the public origin, copies the seed's
+   current `publish-state.json` and runs `scripts/publish-release.sh
+   --prepare-only` in an isolated data directory.
 3. **Sign.** `scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL`
    writes the exact signer policy (with the current `develop` head) and prints
    the `release-signer.py` command. The operator runs it and types the DID.
@@ -184,6 +185,11 @@ exact source at `/opt/elastos/release-source` (the seed Runtime runs its
 release helpers from the path it was built in), install the Runtime and IPFS
 provider, update the provider's pin in the installed `components.json`, verify
 the provider and start the service. The seed needs glibc 2.39 or newer.
+
+Both seed sequences check sudo and every path they write before stopping the
+service, and once it is stopped an `EXIT` trap starts it again if any later
+step fails, so the seed is never left down. `seed-upgrade` checks the run the
+same way `prepare` does.
 
 Seed details come from `RELEASE_SEED`, `RELEASE_SEED_DATA`,
 `RELEASE_SEED_UNIT`, `RELEASE_SEED_STAGE`, `RELEASE_SEED_RUNTIME` and
