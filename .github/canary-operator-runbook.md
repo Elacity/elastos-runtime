@@ -994,3 +994,203 @@ isolated consumer processes and retain their safe receipts under the approved
 custody. Record exact package source, artifact, installed parity and idle/read
 results in #89. Remove the rollback set when the installed acceptance gate
 closes.
+
+
+## V3 catalogue and release; V4 follows the public V3
+
+The operator signs `0.8.0-alpha.3` with the maintainer DID below, upgrades the
+seed, and publishes V3 after package verification. V4 `0.8.0-alpha.4` follows
+Anders's installed V3 acceptance. Use the accepted union artifact linked in
+#89 and the source recorded in its receipts. Keep the original N3/N4 receipts,
+Runtime bytes and `N3-model-handoff` intact. The existing transfer, custody and
+seed procedures above apply; the old V1/V2 finalization workflow admits its own
+historical inputs.
+
+Use the signer from the admitted source, including its catalogue support;
+qualify its source and tool pins under the custody procedure above. Its SHA-256
+is `478a665179df1498443d8f75e96973bb057f049cbb2f592a7d73f8182025ce74`.
+Approve a catalogue policy with purpose `elastos.model.catalog/v1`, this DID,
+the exact unsigned catalogue hash, and the four recorded package CIDs and
+content digests. Keep the real key in custody. All paths below are absolute,
+protected operator paths; run source helpers from the admitted clean checkout.
+
+The signing Mac needs only the unsigned catalogue JSON (at most 128 KiB), its
+policy and the qualified signer/tools/key for catalogue signing. The builder
+retains the model CARs. For release signing, the Mac needs every file declared
+in `unsigned-V3/signing-input.json`, including the CARs, and space for the
+signer's complete verified copy. Let R be the sum of those recorded file sizes:
+the input and signed output need 2R bytes plus control files. The signer reserves
+R + 6 MiB of additional space. Measure the actual receipt below; a numeric R
+becomes available when the successful package and unsigned input exist. Transfer
+archives, retained native inputs and builder state add their own measured space
+if held on that same Mac. Preserve 15% free after each copy and extraction.
+
+```bash
+set -euo pipefail
+umask 077
+DID=did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+install -d -m 700 "$CUSTODY/catalog-input"
+install -m 600 "$INPUTS/N3-model-handoff/model-catalog.unsigned.json" \
+  "$CUSTODY/catalog-input/model-catalog.unsigned.json"
+env -i "$PINNED_PYTHON" -I -S "$INSTALLED_SIGNER" --catalog \
+  --policy "$CUSTODY/V3-catalog-policy.json" \
+  --input-root "$CUSTODY/catalog-input" --manifest model-catalog.unsigned.json \
+  --output-root "$CUSTODY/signed-V3-catalog"
+```
+
+Transfer only the public `model-catalog.json` back to the isolated builder as
+`SIGNED_CATALOGUE`. The source helper verifies its signature, model closure,
+retained CARs and native receipt before creating the finalized N3 copy.
+
+```bash
+set -euo pipefail
+umask 077
+DID=did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+"$PINNED_PYTHON" -I -S scripts/release-platform-input.py finalize-models \
+  --input "$INPUTS/N3" --handoff "$INPUTS/N3-model-handoff" \
+  --catalogue "$SIGNED_CATALOGUE" --publisher-did "$DID" \
+  --openssl "$PINNED_OPENSSL" --output "$INPUTS/N3-finalized"
+"$PINNED_PYTHON" -I -S scripts/release-platform-input.py verify "$INPUTS/N3-finalized"
+# The isolated builder uses the actual committed V2 predecessor receipt in
+# ELASTOS_PUBLISH_STATE_DIR and the accepted seed Carrier bootstrap/stamps.
+scripts/publish-release.sh --version 0.8.0-alpha.3 --channel canary \
+  --prepare-only "$INPUTS/unsigned-V3" --publisher-did "$DID" \
+  --platform-input "aarch64-darwin=$INPUTS/N3-finalized" \
+  --preview-platform aarch64-darwin
+```
+
+Approve the exact final V3 input and policy, then measure and sign in custody.
+The signer checks every declared artifact before key access. It asks the
+operator to type the full maintainer DID for each signature.
+
+```bash
+set -euo pipefail
+umask 077
+"$PINNED_PYTHON" -I -S - "$INPUTS/unsigned-V3/signing-input.json" "$CUSTODY" <<'PYCODE'
+import json, shutil, sys
+from pathlib import Path
+r = sum(item['size'] for item in json.loads(Path(sys.argv[1]).read_bytes())['files'].values())
+u = shutil.disk_usage(sys.argv[2])
+print(f"Release input: {r} bytes ({r / 1024**3:.6f} GiB); input plus signed copy: {2*r} bytes")
+assert (u.free - r - 6*1024**2)*100 >= u.total*15
+PYCODE
+env -i "$PINNED_PYTHON" -I -S "$INSTALLED_SIGNER" \
+  --policy "$CUSTODY/V3-policy.json" --input-root "$INPUTS/unsigned-V3" \
+  --output-root "$CUSTODY/signed-V3"
+```
+
+Transfer the complete signed V3 set with the protected seed procedure above.
+Upgrade Runtime, provider, manifest and the full helper source tree from the
+matching verified Linux seed package using the preceding gateway procedure.
+That procedure prepares verified sibling files `STAGED_RUNTIME`,
+`STAGED_IPFS_PROVIDER`, `STAGED_COMPONENTS` and `STAGED_HELPERS` beside their
+stable destinations. `HELPER_ROLLBACK` is the unused, approved sibling path
+for the existing helper tree in the single rollback set. Check all installation
+paths and staged receipts before the service window.
+Set the existing service's recorded stop/start and process-exit checks as the
+Bash arrays `SEED_STOP`, `SEED_START` and `SEED_QUIESCENCE`. The last command
+succeeds only after the owned Runtime/provider/Kubo processes exit. Retain
+the service HOME/data environment, identities,
+IPFS repository and actual V2 predecessor receipt. Stop that service and wait
+for its owned Runtime/provider/Kubo processes to exit before replacement or
+CLI access to the shared repository. As the service owner:
+
+```bash
+set -euo pipefail
+umask 077
+DID=did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+for command in SEED_STOP SEED_START SEED_QUIESCENCE; do
+  [[ $(declare -p "$command") == "declare -a "* ]]
+done
+(( ${#SEED_STOP[@]} && ${#SEED_START[@]} && ${#SEED_QUIESCENCE[@]} ))
+[[ "$SEED_DATA" == /*/elastos ]]
+export XDG_DATA_HOME="${SEED_DATA%/*}"
+export ELASTOS_DATA_DIR="$SEED_DATA" ELASTOS_COMPONENTS_JSON="$SEED_COMPONENTS"
+"${SEED_STOP[@]}"
+"${SEED_QUIESCENCE[@]}"
+[[ ! -e "$HELPER_ROLLBACK" && ! -L "$HELPER_ROLLBACK" ]]
+mv -T -- "$SEED_HELPERS" "$HELPER_ROLLBACK"
+mv -T -- "$STAGED_HELPERS" "$SEED_HELPERS"
+mv -T -- "$STAGED_IPFS_PROVIDER" "$IPFS_PROVIDER"
+mv -T -- "$STAGED_COMPONENTS" "$SEED_COMPONENTS"
+mv -T -- "$STAGED_RUNTIME" "$SEED_RUNTIME"
+"$SEED_HELPERS/scripts/installed-provider-verify.sh" --require-verified ipfs-provider
+# Keep the service stopped through import; restart only at SEED_START below.
+"$SEED_RUNTIME" publish-release --version 0.8.0-alpha.3 --channel canary \
+  --signed-publication "$SIGNED_V3" --publisher-did "$DID" --dry-run
+"$SEED_RUNTIME" publish-release --version 0.8.0-alpha.3 --channel canary \
+  --signed-publication "$SIGNED_V3" --publisher-did "$DID" \
+  --ipfs-provider-bin "$IPFS_PROVIDER" --preflight-only
+"$SEED_RUNTIME" publish-release --version 0.8.0-alpha.3 --channel canary \
+  --signed-publication "$SIGNED_V3" --publisher-did "$DID" \
+  --ipfs-provider-bin "$IPFS_PROVIDER"
+"${SEED_START[@]}"
+```
+
+The signed import verifies, imports and pins all four model CARs through
+Runtime's owned provider. Retain the committed receipt and check served-byte
+parity, model roots and Carrier after restart. A failed import follows the
+existing recovery procedure; a gossip retry uses the identical signed set.
+
+After V3 is public and Anders installs it, the operator asks Release to finalize
+V4. Keep the actual committed V3 seed receipt as `ACTUAL_V3_RECEIPT`. The key-free
+builder imports the unchanged N4 Runtime through its qualified provider and
+records its returned CID. Extract verified inputs below its selected private
+`BUILDER_DATA` root; the provider admits `add_path` there. Keep the builder's
+existing isolated HOME/IPFS environment:
+
+```bash
+set -euo pipefail
+umask 077
+export ELASTOS_DATA_DIR="$BUILDER_DATA"
+"$PINNED_PYTHON" -I -S - "$INPUTS/N4/artifacts/elastos-aarch64-darwin" \
+  "$BUILDER_IPFS_PROVIDER" "$N4_RUNTIME_IMPORT" <<'PYCODE'
+import hashlib, json, os, subprocess, sys
+from pathlib import Path
+runtime, provider, receipt = map(Path, sys.argv[1:])
+data = Path(os.environ['ELASTOS_DATA_DIR']).resolve(strict=True)
+assert data.is_absolute() and runtime == runtime.resolve(strict=True) and runtime.is_relative_to(data)
+def pin():
+    h = hashlib.sha256()
+    with runtime.open('rb') as f:
+        for b in iter(lambda: f.read(1024**2), b''): h.update(b)
+    return {'sha256': h.hexdigest(), 'size': runtime.stat().st_size}
+before = pin()
+requests = [{'op': 'init', 'config': {}},
+            {'op': 'add_path', 'path': str(runtime), 'pin': True}]
+r = subprocess.run([str(provider)], input=''.join(json.dumps(x)+'\n' for x in requests),
+                   text=True, capture_output=True, check=True, timeout=300)
+replies = [json.loads(line) for line in r.stdout.splitlines()]
+assert len(replies) == 2 and all(x['status'] == 'ok' for x in replies)
+assert pin() == before
+with receipt.open('x') as f:
+    json.dump({**before, 'cid': replies[-1]['data']['cid']}, f)
+PYCODE
+"$PINNED_PYTHON" -I -S "$WORKFLOW_ROOT/.github/scripts/canary-v4-finalize.py" \
+  --source-root "$SOURCE_ROOT" --workflow-commit "$WORKFLOW_COMMIT" \
+  --n3 "$INPUTS/N3" --n4 "$INPUTS/N4" --finalized-n3 "$INPUTS/N3-finalized" \
+  --unsigned-v3 "$INPUTS/unsigned-V3" --publish-state "$ACTUAL_V3_RECEIPT" \
+  --runtime-import "$N4_RUNTIME_IMPORT" --openssl "$PINNED_OPENSSL" \
+  --output "$INPUTS/V4-finalized"
+```
+
+Use the reviewed workflow checkout for `WORKFLOW_ROOT`/`WORKFLOW_COMMIT` and the
+clean admitted product checkout for `SOURCE_ROOT`. The finalizer verifies public
+V3 signatures and predecessor, original native receipts, frozen support,
+maintainer catalogue and every output byte. It retains the N4 Runtime and V3
+support, then emits `V4-finalized/unsigned-V4` with a separate provenance receipt;
+it leaves the original native inputs intact. The Runtime CID receipt records
+importer evidence; the seed's signed import rechecks the actual CID and bytes.
+Stop the builder's owned provider/Kubo processes when preparation ends.
+
+The operator approves the final V4 policy, repeats the signing-space measurement
+for `V4-finalized/unsigned-V4`, and signs that complete set:
+
+```bash
+set -euo pipefail
+umask 077
+env -i "$PINNED_PYTHON" -I -S "$INSTALLED_SIGNER" \
+  --policy "$CUSTODY/V4-policy.json" \
+  --input-root "$INPUTS/V4-finalized/unsigned-V4" \
+  --output-root "$CUSTODY/signed-V4"
+```
