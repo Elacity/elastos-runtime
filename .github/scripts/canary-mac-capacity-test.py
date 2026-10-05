@@ -134,8 +134,26 @@ class CapacityTests(unittest.TestCase):
         prepare = Mock(side_effect=self.refusal())
         with self.assertRaisesRegex(ValueError, 'timed out'):
             self.run_capacity(prepare, query=pending)
-        self.assertEqual(self.clock, 60)
+        self.assertEqual(self.clock, 300)
         prepare.assert_called_once()
+
+    def test_asset_backed_runtime_deletion_can_settle_after_one_minute(self):
+        def query(argv, timeout=30):
+            if argv[-2:] == ['help', 'runtime']:
+                return "delete alias 'all'; list"
+            if argv[-3:] == ['runtime', 'list', '-j']:
+                if self.clock < 120:
+                    return json.dumps({'image': {'state': 'Deleting'}})
+                self.disk.free = 400
+                return '{}'
+            return ''
+        prepare = Mock(side_effect=[self.refusal(), {'status': 'ready'}])
+        self.run_capacity(prepare, query=query)
+        self.assertEqual(self.clock, 120)
+        self.assertEqual(self.record['status'], 'ready')
+        self.assertEqual(self.record['simulator_images_after'], {})
+        self.assertEqual(self.record['native_after'], self.record['native_before'])
+        self.assertEqual(prepare.call_count, 2)
 
     def test_simulator_failure_keeps_first_reclaim_receipt(self):
         error = self.refusal()
