@@ -349,11 +349,18 @@ fn admit_support(data: &Path, binary: &Path, components: &[u8]) -> Result<()> {
         let relative = crate::setup::resolve_install_path(component, info);
         if component.provider_runtime.is_some() {
             crate::setup::validate_provider_runtime(name, component)?;
-            let relative = relative.context("Installed native provider path is missing")?;
-            let path = data.join(relative);
-            check_parents(data, path.parent().context(REPAIR)?, false)?;
-            file_digest(&path)?;
-            crate::setup::verify_installed_component_binary(data, name, &path)?;
+            // A provider outside the Home profile (for example custody-provider)
+            // is optional: verify it when installed, never require it.
+            let path = relative.map(|relative| data.join(relative));
+            let present = path
+                .as_ref()
+                .is_some_and(|path| fs::symlink_metadata(path).is_ok());
+            if present || required.is_some_and(|names| names.contains(name)) {
+                let path = path.context("Installed native provider path is missing")?;
+                check_parents(data, path.parent().context(REPAIR)?, false)?;
+                file_digest(&path)?;
+                crate::setup::verify_installed_component_binary(data, name, &path)?;
+            }
         } else if let (Some(info), Some(relative)) = (info, relative) {
             if info.extract_path.is_none() && name != "home" {
                 let path = data.join(relative);
