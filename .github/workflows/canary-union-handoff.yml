@@ -138,7 +138,7 @@ jobs:
       source_ci_run: ${{ needs.admit.outputs.source_ci_run }}
       published_at: ${{ needs.admit.outputs.published_at }}
       admission_artifact_name: ${{ needs.admit.outputs.admission_artifact_name }}
-      prepare_models: true
+      prepare_models: false
 
   seed:
     name: matching Linux seed package
