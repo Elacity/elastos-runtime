@@ -1138,8 +1138,8 @@ def cli_home_activation_descriptor(registry, component_platform):
     return descriptor
 
 
-def cli_qualified_home(support_home, component_platform):
-    """Admit only the already built source Home and its native provider."""
+def cli_qualified_home(support_home, component_platform, name="home"):
+    """Admit an already built web capsule and the native Home provider."""
     support_home = support_home.resolve()
     registry = cli_json(cli_path(support_home, "components.json"))
     cli_home_activation_descriptor(registry, component_platform)
@@ -1152,10 +1152,10 @@ def cli_qualified_home(support_home, component_platform):
     need(selected["checksum"] == "sha256:" + digest(native)
          and selected.get("install_path", descriptor.get("install_path")) == "bin/localhost-provider",
          "qualified localhost provider binding differs")
-    entry = registry["capsules"]["home"]
-    need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
+    entry = registry["capsules"][name]
+    need(entry["install_path"] == "capsules/" + name and entry["entrypoint"] == "browser/index.html",
          "qualified Home entrypoint differs")
-    capsule_root = cli_path(support_home, "capsules/home")
+    capsule_root = cli_path(support_home, "capsules/" + name)
     paths = []
     for path in sorted(capsule_root.rglob("*")):
         relative = path.relative_to(support_home).as_posix()
@@ -1168,7 +1168,7 @@ def cli_qualified_home(support_home, component_platform):
                  "qualified Home tree contains private or build state")
             paths.append(path)
     installed = cli_json(capsule_root / "capsule.json")
-    need(installed["name"] == "home" and installed["entrypoint"] == entry["entrypoint"]
+    need(installed["name"] == name and installed["entrypoint"] == entry["entrypoint"]
          and installed["execution"] == "web-projection", "qualified Home manifest differs")
     document = capsule_root / entry["entrypoint"]
     need(entry["entrypoint_sha256"] == "sha256:" + digest(document)
@@ -1224,8 +1224,9 @@ def cli_admit_home_support(root, manifest):
              "initial Home support CID closure differs")
 
 
-CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider")
-CLI_SETUP_ARTIFACTS = ("home.tar.gz", "ipfs-provider", "kubo", "localhost-provider")
+CLI_WEB_CAPSULES = ("home", "home-gui", "system")
+CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider", "home-gui", "system")
+CLI_SETUP_ARTIFACTS = tuple(name + ".tar.gz" if name in CLI_WEB_CAPSULES else name for name in CLI_SETUP_COMPONENTS)
 CLI_HOME_CACHE = (".elastos-cid", ".elastos-artifact-sha256")
 CLI_LOCALHOST_METADATA = "localhost-provider-capsule-metadata.tar.gz"
 
@@ -1299,22 +1300,22 @@ def cli_localhost_metadata_files(raw, selected):
 
 def cli_setup_files(manifest):
     return {target: relative for target, relative in manifest["consumer"]["files"].items()
-            if target.startswith(("capsules/home/", "capsules/localhost-provider/")) or target in
+            if target.startswith(tuple("capsules/" + name + "/" for name in (*CLI_WEB_CAPSULES, "localhost-provider"))) or target in
             ("bin/ipfs-provider", "bin/kubo", "bin/localhost-provider")}
 
 
-def cli_home_archive(root, manifest, mapping):
+def cli_home_archive(root, manifest, mapping, name="home"):
     output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
             for target, relative in sorted(mapping.items()):
-                if not target.startswith("capsules/home/"):
+                if not target.startswith("capsules/" + name + "/"):
                     continue
                 raw = cli_path(root, relative).read_bytes()
                 binding = manifest["files"][relative]
                 need(len(raw) == binding["bytes"] and hashlib.sha256(raw).hexdigest() == binding["sha256"],
                      "Home archive input differs from inventory")
-                member = tarfile.TarInfo("home/" + target.removeprefix("capsules/home/"))
+                member = tarfile.TarInfo(target.removeprefix("capsules/"))
                 member.size, member.mode, member.mtime = len(raw), binding["mode"], 0
                 archive.addfile(member, io.BytesIO(raw))
     return output.getvalue()
@@ -1331,15 +1332,11 @@ def cli_admit_setup(root, manifest):
          and set(setup["artifacts"]) == set(CLI_SETUP_ARTIFACTS) | ({CLI_LOCALHOST_METADATA} if has_metadata else set()),
          "fixed setup artifact closure required")
     mapping = cli_setup_files(manifest)
-    need(all("bin/" + name in mapping for name in CLI_SETUP_COMPONENTS[1:])
-         and "capsules/home/capsule.json" in mapping and "capsules/home/browser/index.html" in mapping,
+    need(all("bin/" + name in mapping for name in CLI_SETUP_COMPONENTS if name not in CLI_WEB_CAPSULES)
+         and all("capsules/" + name + "/browser/index.html" in mapping for name in CLI_WEB_CAPSULES),
          "setup output inventory is incomplete")
     need(not any(Path(target).name in CLI_HOME_CACHE for target in mapping),
          "setup cache metadata belongs to installed setup")
-    archive_relative = setup["artifacts"]["home.tar.gz"]
-    need(archive_relative in manifest["files"], "Home setup archive missing from inventory")
-    need(cli_path(root, archive_relative).read_bytes() == cli_home_archive(root, manifest, mapping),
-         "Home setup archive differs from qualified bytes")
     platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
     for publication in manifest["publications"].values():
         components = cli_json(cli_path(root, publication["components"]))
@@ -1353,7 +1350,7 @@ def cli_admit_setup(root, manifest):
             need(name == "localhost-provider" or "capsule_metadata" not in component,
                  "setup component has unmodeled capsule metadata")
             selected = component["platforms"][platform_name]
-            target = "capsules/home" if name == "home" else "bin/" + name
+            target = "capsules/" + name if name in CLI_WEB_CAPSULES else "bin/" + name
             need(selected.get("release_path") == artifact and selected.get("install_path") == target
                  and not any(selected.get(key) for key in ("url", "source", "strategy"))
                  and selected.get("cid") == binding.get("cid")
@@ -1361,9 +1358,11 @@ def cli_admit_setup(root, manifest):
                  and selected.get("size") == binding["bytes"], "signed setup artifact binding differs")
             need(manifest["holder"]["content"].get(binding["cid"]) == relative,
                  "setup holder artifact is missing")
-            if name == "home":
-                entry = components["capsules"]["home"]
-                need(selected.get("extract_path") == "home"
+            if name in CLI_WEB_CAPSULES:
+                entry = components["capsules"][name]
+                need(cli_path(root, relative).read_bytes() == cli_home_archive(root, manifest, mapping, name),
+                     "Home setup archive differs from qualified bytes")
+                need(selected.get("extract_path") == name
                      and entry["cid"] == binding["cid"] and entry["sha256"] == "sha256:" + binding["sha256"]
                      and entry["size"] == binding["bytes"], "Home setup package identity differs")
             else:
@@ -1406,8 +1405,8 @@ def cli_verify_setup_support(root, manifest, home_path):
              and stat.S_IMODE(info.st_mode) == binding["mode"],
              "installed setup support differs: " + target)
     components = cli_json(directory / "components.json")
-    entry = components["capsules"]["home"]
-    caches = [("capsules/home", (entry["cid"], entry["sha256"]))]
+    caches = [("capsules/" + name, (components["capsules"][name]["cid"], components["capsules"][name]["sha256"]))
+              for name in CLI_WEB_CAPSULES]
     if "localhost_metadata" in manifest["setup"]:
         platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
         selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
@@ -1435,7 +1434,12 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable refusal root required")
     component_platform = "darwin-arm64" if platform.machine() == "arm64" else "darwin-amd64"
-    home_descriptor, home_paths, localhost_descriptor = cli_qualified_home(support_home, component_platform)
+    qualified = cli_json(support_home / "components.json")
+    capsules, home_paths = {}, []
+    for name in CLI_WEB_CAPSULES:
+        entry, paths, localhost_descriptor = cli_qualified_home(support_home, component_platform, name)
+        capsules[name] = entry
+        home_paths.extend(paths)
     metadata_info = cli_localhost_metadata_info(localhost_descriptor, component_platform)
     metadata_files = {}
     if metadata_info is not None:
@@ -1545,7 +1549,6 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
         manifest["signer_did"] = catalogue_envelope["signer_did"]
         catalogue = add("catalogue.json", catalogue_envelope)
         content(catalogue, raw=True)
-        qualified = cli_json(support_home / "components.json")
         opener = add("home-opener", Path("/usr/bin/true"), 0o700)
         home_mapping = {"bin/ipfs-provider": provider_relative, "bin/kubo": kubo_relative,
                         "bin/localhost-provider": localhost_relative, "fixture-tools/open": opener}
@@ -1555,20 +1558,22 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
         content(opener)
         for path in home_paths:
             target = path.relative_to(support_home).as_posix()
-            if path.parent == support_home / "capsules/home" and path.name in CLI_HOME_CACHE:
+            if path.name in CLI_HOME_CACHE:
                 continue
             relative = add("home-support/" + target, path)
             content(relative, raw=True)
             home_mapping[target] = relative
-        home_archive = add("home.tar.gz", cli_home_archive(root, manifest, home_mapping))
-        content(home_archive)
-        archive_binding = manifest["files"][home_archive]
-        home_descriptor = {**home_descriptor, "cid": archive_binding["cid"],
-                           "sha256": "sha256:" + archive_binding["sha256"], "size": archive_binding["bytes"]}
-        external = {"home": {"install_path": "capsules/home", "platforms": {component_platform: {
-            "release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home",
-            "cid": archive_binding["cid"], "checksum": "sha256:" + archive_binding["sha256"],
-            "size": archive_binding["bytes"]}}}}
+        archives, external = {}, {}
+        for name in CLI_WEB_CAPSULES:
+            archive = add(name + ".tar.gz", cli_home_archive(root, manifest, home_mapping, name))
+            content(archive)
+            archives[name + ".tar.gz"] = archive
+            binding = manifest["files"][archive]
+            capsules[name] = {**capsules[name], "cid": binding["cid"],
+                              "sha256": "sha256:" + binding["sha256"], "size": binding["bytes"]}
+            external[name] = {"install_path": "capsules/" + name, "platforms": {component_platform: {
+                "release_path": name + ".tar.gz", "extract_path": name, "install_path": "capsules/" + name,
+                "cid": binding["cid"], "checksum": "sha256:" + binding["sha256"], "size": binding["bytes"]}}}
         for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
             descriptor = qualified["external"][name]
             if name == "ipfs-provider":
@@ -1601,11 +1606,19 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
                 relative = add("localhost-metadata/" + target, raw, mode)
                 content(relative, raw=True)
                 home_mapping[target] = relative
-        components = add("components.json", {"schema": "elastos.components/v1", "capsules": {"home": home_descriptor}, "external": external,
+        # Like the release, list custody-provider outside the Home profile. Its
+        # bytes are pinned but never served or installed: Home must start without it (#238).
+        custody = support_home / "bin/custody-provider"
+        custody_cid = execute([str(root / kubo_relative), "add", "--offline", "-Q", "--only-hash",
+                               "--cid-version=1", str(custody)]).decode().strip()
+        external["custody-provider"] = {**qualified["external"]["custody-provider"], "platforms": {component_platform: {
+            "release_path": "custody-provider", "install_path": "bin/custody-provider", "cid": custody_cid,
+            "checksum": "sha256:" + digest(custody), "size": custody.stat().st_size}}}
+        components = add("components.json", {"schema": "elastos.components/v1", "capsules": capsules, "external": external,
                          "profiles": {"home": {"description": "Qualified fixture Home", "components": list(CLI_SETUP_COMPONENTS)}},
                          "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
-        manifest["setup"] = {"artifacts": dict(zip(CLI_SETUP_ARTIFACTS,
-            (home_archive, provider_relative, kubo_relative, localhost_relative)))}
+        manifest["setup"] = {"artifacts": {**archives, "ipfs-provider": provider_relative,
+                                         "kubo": kubo_relative, "localhost-provider": localhost_relative}}
         if metadata_relative is not None:
             manifest["setup"]["artifacts"][CLI_LOCALHOST_METADATA] = metadata_relative
             manifest["setup"]["localhost_metadata"] = {"artifact": CLI_LOCALHOST_METADATA, "files": sorted(metadata_files)}
@@ -2223,7 +2236,7 @@ def cli_port_released(value):
             need(probe.connect_ex(address) != 0, "initial Home listener survives shutdown")
 
 
-def cli_initial_home(processes, manifest, home_path, evidence=None):
+def cli_initial_home(processes, manifest, home_path, evidence=None, publish_next=None):
     """Run the installed entrypoint; Runtime alone admits and owns its child."""
     before = cli_home_snapshot(manifest, home_path)
     expected_metadata = cli_expected_installed_metadata(manifest, "old")
@@ -2259,6 +2272,8 @@ def cli_initial_home(processes, manifest, home_path, evidence=None):
             time.sleep(.2)
         need(proof is not None and process.poll() is None, "installed Home did not reach controller readiness")
         need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
+        if manifest["proof_kind"] == "real-runtime":
+            proof["system"] = cli_home_system_journey(processes, manifest, home_path, publish_next)
     except Exception as error:
         failure = error
     finally:
@@ -2303,6 +2318,31 @@ def cli_initial_home(processes, manifest, home_path, evidence=None):
     return proof
 
 
+def cli_home_system_journey(processes, manifest, home_path, publish_next):
+    """Create the first account and read System before and after the next publication."""
+    need(publish_next is not None, "installed System journey requires the next signed publication")
+    node = shutil.which("node")
+    need(node is not None and "PLAYWRIGHT_BROWSERS_PATH" in os.environ, "installed System journey requires Node and Playwright")
+    output = processes.output / "home-system"
+    output.mkdir(mode=0o700)
+    env = cli_environment(home_path)
+    env.update(PLAYWRIGHT_BROWSERS_PATH=os.environ["PLAYWRIGHT_BROWSERS_PATH"],
+               HOME_VIRTUAL_AUTH_PROFILE=str(output / "browser-profile"), HOME_VIRTUAL_AUTH_CLEANUP="0",
+               HOME_VIRTUAL_AUTH_SHELL_SWITCH="0", HOME_VIRTUAL_AUTH_UPDATE_DIR=str(output),
+               HOME_VIRTUAL_AUTH_UPDATE_VERSIONS=manifest["old"]["version"] + " " + manifest["new"]["version"])
+    browser = processes.spawn([node, str(Path(__file__).with_name("home-passkey-virtual-auth-smoke.mjs"))],
+                              env, home_path, "home-system")
+    deadline = time.monotonic() + 240
+    while browser.poll() is None and not (output / "up-to-date.json").exists() and time.monotonic() < deadline:
+        time.sleep(.2)
+    need((output / "up-to-date.json").exists() and browser.poll() is None,
+         "installed Home sign-up or up-to-date System state failed" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
+    publish_next()
+    need(browser.wait(timeout=180) == 0,
+         "System did not show the next signed version" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
+    return {name: cli_json(output / (name + ".json")) for name in ("up-to-date", "update-available")}
+
+
 def cli_run(config, output, local_rehearsal=None):
     manifest = cli_admit(config, local_rehearsal)
     root = Path(config["root"])
@@ -2324,7 +2364,7 @@ def cli_run(config, output, local_rehearsal=None):
     holder_data = holder / CLI_DATA
     holder_bin = holder / ".local/bin/elastos"
     installer = cli_path(root, manifest["installer"])
-    host, bootstrap, port, installer_bootstrap, carrier_port = None, None, None, None, None
+    host, bootstrap, port, installer_bootstrap, carrier_port, published = None, None, None, None, None, None
     holder_config = holder_data / "config.toml"
     holder_labels, holder_config_text = [], None
 
@@ -2345,7 +2385,9 @@ def cli_run(config, output, local_rehearsal=None):
                     processes.roots[str(cli_path(home_path, relative))] = {binding["sha256"]}
 
     def phase(name):
-        nonlocal host, bootstrap, port
+        nonlocal host, bootstrap, port, published
+        if name == published:
+            return
         cli_inventory(root, manifest)
         need(digest(root / "manifest.json") == config["immutable"]["sha256"], "manifest changed during run")
         if host is not None:
@@ -2380,7 +2422,7 @@ def cli_run(config, output, local_rehearsal=None):
         if bootstrap is not None:
             need(current["node_id"] == bootstrap["node_id"], "holder node changed between phases")
         bootstrap = current
-        installer_bootstrap.publication = publication
+        installer_bootstrap.publication, published = publication, name
 
     def install(home_path, label):
         env = cli_environment(home_path)
@@ -2498,7 +2540,7 @@ def cli_run(config, output, local_rehearsal=None):
             result["paths"]["m1-install"]["checks"]["initial-home"] = {
                 "status": "failed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home"}
             result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
-                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"])
+                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"], lambda: phase("new"))
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
         if result["proof_scope"] in ("production-positive", "ci-rehearsal", "local-rehearsal"):
             phase("new")

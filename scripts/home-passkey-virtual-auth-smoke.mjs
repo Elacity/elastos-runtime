@@ -41,6 +41,11 @@ const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
+// The installed-release CI journey: System must say "up to date", then show
+// the next signed version once the fixture publishes it (scripts/update-hop-compare.py).
+const SYSTEM_UPDATE_DIR = process.env.HOME_VIRTUAL_AUTH_UPDATE_DIR || "";
+const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = ""] =
+  (process.env.HOME_VIRTUAL_AUTH_UPDATE_VERSIONS || "").split(" ");
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
@@ -4375,7 +4380,44 @@ async function launchSystem(page, homeToken, passkey) {
   const recoveryExport = CHECK_RECOVERY_EXPORT
     ? await checkSystemRecoveryExport(page, systemFrame, passkey)
     : null;
-  return { ...system, recoveryExport };
+  const systemUpdate = SYSTEM_UPDATE_DIR ? await checkSystemUpdate(page, systemFrame) : null;
+  return { ...system, recoveryExport, systemUpdate };
+}
+
+async function checkSystemUpdate(page, systemFrame) {
+  assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW, "System update check needs the current and next version");
+  await systemFrame.locator('button[data-settings="about"]').click();
+  const read = () => systemFrame.evaluate(() => {
+    const field = (name) => document.querySelector(`[data-field="${name}"]`);
+    return {
+      shown: document.querySelector("#runtime-update")?.hidden === false,
+      status: document.querySelector("#runtime-update-status")?.textContent?.trim() || "",
+      offer: field("update-offer")?.hidden === false,
+      current_version: field("update-current-version")?.textContent?.trim() || "",
+      new_version: field("update-new-version")?.textContent?.trim() || "",
+    };
+  });
+  // System polls every 5 s and Runtime caches a Carrier check for 30 s.
+  const reach = async (name, predicate, message) => {
+    const deadline = Date.now() + 150_000;
+    let state = await read();
+    while (!predicate(state) && Date.now() < deadline) {
+      await delay(1_000);
+      state = await read();
+    }
+    assert(predicate(state), message, state);
+    await page.screenshot({ path: join(SYSTEM_UPDATE_DIR, `${name}.png`) });
+    writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    return state;
+  };
+  // The fixture publishes the next release only after up-to-date.json exists.
+  const upToDate = await reach("up-to-date", (state) => state.shown && !state.offer
+    && state.status === "Home is up to date.", "System did not report Home up to date");
+  const available = await reach("update-available", (state) => state.shown && state.offer
+    && state.status.startsWith("An update is available.")
+    && state.current_version === SYSTEM_UPDATE_CURRENT && state.new_version === SYSTEM_UPDATE_NEW,
+  "System did not report the next signed version");
+  return { up_to_date: upToDate, available };
 }
 
 async function readRecoveryExportDownload(download, expected) {
@@ -5469,6 +5511,7 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 }
 
 async function main() {
+  assert(!SYSTEM_UPDATE_DIR || CHECK_SYSTEM, "The System update check requires the System check");
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
   assert(!BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || BROWSER_CONTROLLED_TURN_TEST_HOME,
@@ -5630,6 +5673,7 @@ async function main() {
       recovery_export_checked: Boolean(system?.recoveryExport),
       recovery_export: system?.recoveryExport ?? null,
       system_fields: system?.fields || null,
+      system_update: system?.systemUpdate ?? null,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),

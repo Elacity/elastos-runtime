@@ -1027,29 +1027,33 @@ class CliFixtureTests(unittest.TestCase):
     def qualified_home_support(self):
         support = self.root / "support"
         (support / "bin").mkdir(parents=True, exist_ok=True)
-        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+        for name in ("ipfs-provider", "kubo", "localhost-provider", "custody-provider"):
             path = support / "bin" / name
             path.write_bytes(name.encode())
             path.chmod(0o755)
-        capsule = support / "capsules/home"
-        (capsule / "browser").mkdir(parents=True, exist_ok=True)
-        observer.write(capsule / "capsule.json", {"schema": "elastos.capsule/v1", "name": "home", "role": "app",
-                       "type": "wasm", "entrypoint": "browser/index.html", "execution": "web-projection"})
-        (capsule / "browser/index.html").write_bytes(b"<html>installed Home fixture</html>")
-        (capsule / "browser/shell.js").write_bytes(b"export const home = true;")
-        document = capsule / "browser/index.html"
-        entry = {"cid": "", "sha256": "", "size": 0, "install_path": "capsules/home", "entrypoint": "browser/index.html",
-                 "entrypoint_sha256": "sha256:" + observer.digest(document), "entrypoint_size": document.stat().st_size,
-                 "platforms": ["darwin-arm64"], "browser_assets": [{"path": path.relative_to(capsule).as_posix(),
-                 "sha256": "sha256:" + observer.digest(path), "size": path.stat().st_size} for path in sorted((capsule / "browser").rglob("*")) if path.is_file()]}
-        registry = {"capsules": {"home": entry}, "external": {name: {
+        registry = {"capsules": {}, "external": {name: {
             "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
             for name in ("ipfs-provider", "kubo", "localhost-provider")}}
+        for name in observer.CLI_WEB_CAPSULES:
+            capsule = support / "capsules" / name
+            (capsule / "browser").mkdir(parents=True, exist_ok=True)
+            observer.write(capsule / "capsule.json", {"schema": "elastos.capsule/v1", "name": name, "role": "app",
+                           "type": "wasm", "entrypoint": "browser/index.html", "execution": "web-projection"})
+            (capsule / "browser/index.html").write_bytes(b"<html>installed " + name.encode() + b" fixture</html>")
+            (capsule / "browser/shell.js").write_bytes(b"export const home = true;")
+            document = capsule / "browser/index.html"
+            registry["capsules"][name] = {"cid": "", "sha256": "", "size": 0, "install_path": "capsules/" + name,
+                "entrypoint": "browser/index.html", "entrypoint_sha256": "sha256:" + observer.digest(document),
+                "entrypoint_size": document.stat().st_size, "platforms": ["darwin-arm64"],
+                "browser_assets": [{"path": path.relative_to(capsule).as_posix(), "sha256": "sha256:" + observer.digest(path),
+                                    "size": path.stat().st_size} for path in sorted((capsule / "browser").rglob("*")) if path.is_file()]}
         for name, provides in (("ipfs-provider", "elastos://ipfs/*"), ("localhost-provider", "localhost://*")):
             registry["external"][name]["provider_runtime"] = {"role": "provider", "substrate": "native",
                 "runtime_abi": "elastos.provider-stdio/v1", "execution": "native-provider", "provides": provides}
         registry["external"]["home"] = {"install_path": "capsules/home", "description": "Qualified source Home",
             "platforms": {"*": {"release_path": "home.tar.gz", "extract_path": "home", "install_path": "capsules/home"}}}
+        registry["external"]["custody-provider"] = {"install_path": "bin/custody-provider", "platforms": {
+            "darwin-arm64": {"release_path": "custody-provider-darwin-arm64", "install_path": "bin/custody-provider"}}}
         observer.write(support / "components.json", registry)
         return support
 
@@ -1103,7 +1107,10 @@ class CliFixtureTests(unittest.TestCase):
     def setup_fixture(self, initial_home=False, support=None, metadata=False):
         support = support or self.qualified_home_support()
         metadata_path = self.qualified_localhost_metadata(support) if metadata else None
-        entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
+        entries, paths = {}, []
+        for name in observer.CLI_WEB_CAPSULES:
+            entries[name], capsule_paths, _ = observer.cli_qualified_home(support, "darwin-arm64", name)
+            paths.extend(capsule_paths)
         mapping = {}
         for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
             target = path.relative_to(support).as_posix()
@@ -1112,22 +1119,24 @@ class CliFixtureTests(unittest.TestCase):
         self.manifest["consumer"]["files"].update(mapping)
         for relative in mapping.values():
             self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
-        archive = self.add("setup/home.tar.gz", observer.cli_home_archive(self.root, self.manifest, mapping))
-        self.manifest["holder"]["content"][self.manifest["files"][archive]["cid"]] = archive
-        artifacts = dict(zip(observer.CLI_SETUP_ARTIFACTS,
-                             (archive, mapping["bin/ipfs-provider"], mapping["bin/kubo"], mapping["bin/localhost-provider"])))
+        artifacts = {}
+        for name in observer.CLI_WEB_CAPSULES:
+            archive = self.add("setup/" + name + ".tar.gz", observer.cli_home_archive(self.root, self.manifest, mapping, name))
+            self.manifest["holder"]["content"][self.manifest["files"][archive]["cid"]] = archive
+            artifacts[name + ".tar.gz"] = archive
+        artifacts.update({name: mapping["bin/" + name] for name in ("ipfs-provider", "kubo", "localhost-provider")})
         self.manifest["setup"] = {"artifacts": artifacts}
         components = observer.cli_json(self.root / self.manifest["publications"]["old"]["components"])
         components["schema"] = "elastos.components/v1"
         components["profiles"] = {"home": {"components": list(observer.CLI_SETUP_COMPONENTS)}}
         for name, artifact in zip(observer.CLI_SETUP_COMPONENTS, observer.CLI_SETUP_ARTIFACTS):
             binding = self.manifest["files"][artifacts[artifact]]
-            target = "capsules/home" if name == "home" else "bin/" + name
+            target = "capsules/" + name if name in observer.CLI_WEB_CAPSULES else "bin/" + name
             selected = {"release_path": artifact, "install_path": target, "cid": binding["cid"],
                         "checksum": "sha256:" + binding["sha256"], "size": binding["bytes"]}
-            if name == "home":
-                selected["extract_path"] = "home"
-                components["capsules"]["home"] = {**entry, "cid": binding["cid"],
+            if name in observer.CLI_WEB_CAPSULES:
+                selected["extract_path"] = name
+                components["capsules"][name] = {**entries[name], "cid": binding["cid"],
                     "sha256": "sha256:" + binding["sha256"], "size": binding["bytes"]}
             components["external"][name] = {"install_path": target, "platforms": {"darwin-arm64": selected}}
         if metadata_path is not None:
@@ -1344,7 +1353,7 @@ class CliFixtureTests(unittest.TestCase):
         self.assertIn("installed setup failed; command exit 7", result["failure"])
         self.assertEqual(result["setup"]["m1-setup"]["exit"], 7)
         self.assertTrue(all(str(self.root / "results/homes/cli" / observer.CLI_DATA / ("bin/" + name)) in roots_at_setup
-                            for name in observer.CLI_SETUP_COMPONENTS[1:]))
+                            for name in observer.CLI_SETUP_COMPONENTS if name not in observer.CLI_WEB_CAPSULES))
         self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
         self.assertTrue(result["cleanup"]["passed"])
 
@@ -1938,6 +1947,12 @@ class CliFixtureTests(unittest.TestCase):
                          {key: value for key, value in qualified["capsules"]["home"].items() if key not in package_fields})
         observer.cli_admit_setup(generated, generated_manifest)
         self.assertEqual(components["profiles"]["home"]["components"], list(observer.CLI_SETUP_COMPONENTS))
+        # A release lists custody outside the Home profile; Home must start without it (#238).
+        custody = components["external"]["custody-provider"]["platforms"]["darwin-arm64"]
+        self.assertNotIn("custody-provider", components["profiles"]["home"]["components"])
+        self.assertEqual(custody["checksum"], "sha256:" + observer.digest(support / "bin/custody-provider"))
+        self.assertNotIn(custody["cid"], generated_manifest["holder"]["content"])
+        self.assertNotIn("bin/custody-provider", generated_manifest["consumer"]["files"])
         self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
                             for target in generated_manifest["initial_home"]["files"]))
         native = generated_manifest["files"][generated_manifest["consumer"]["files"]["bin/localhost-provider"]]
@@ -2160,8 +2175,9 @@ class CliFixtureTests(unittest.TestCase):
                                     target.parent.mkdir(parents=True, exist_ok=True)
                                     target.write_bytes(source.read_bytes())
                                     target.chmod(0o755)
-                            entry = observer.cli_json(directory / "components.json")["capsules"]["home"]
-                            caches = [("capsules/home", (entry["cid"], entry["sha256"]))]
+                            capsules = observer.cli_json(directory / "components.json")["capsules"]
+                            caches = [("capsules/" + name, (capsules[name]["cid"], capsules[name]["sha256"]))
+                                      for name in observer.CLI_WEB_CAPSULES]
                             if "localhost_metadata" in manifest["setup"]:
                                 components = observer.cli_json(directory / "components.json")
                                 selected = observer.cli_localhost_metadata_info(components["external"]["localhost-provider"], "darwin-arm64")
@@ -2316,7 +2332,7 @@ class CliFixtureTests(unittest.TestCase):
         self.manifest["initial_home"] = {"files": []}
         self.freeze()
         owned_roots = {}
-        def initial_home(manager, manifest, home, evidence):
+        def initial_home(manager, manifest, home, evidence, publish_next):
             for name in ("ipfs-provider", "kubo"):
                 target = "bin/" + name
                 path = str(home / observer.CLI_DATA / target)
