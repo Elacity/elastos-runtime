@@ -675,36 +675,6 @@ async function pressEscape(frame) {
   await sleep(SURFACE_SETTLE_MS);
 }
 
-// Playwright's hit check reads elementsFromPoint()[0]; a tap lands on
-// elementFromPoint(). Prints the stack at the Search centre when they differ.
-async function logSearchHitStack(frame) {
-  const stack = await frame.evaluate(() => {
-    const search = document.getElementById("toolbar-spotlight")?.getBoundingClientRect();
-    if (!search) {
-      return null;
-    }
-    const x = search.left + search.width / 2;
-    const y = search.top + search.height / 2;
-    const name = (node) => `${node.tagName}#${node.id}.${String(node.className).slice(0, 30)}`;
-    const single = document.elementFromPoint(x, y);
-    const list = document.elementsFromPoint(x, y);
-    if (list[0] === single) {
-      return null;
-    }
-    return {
-      point: [Math.round(x), Math.round(y)],
-      elementFromPoint: single ? name(single) : null,
-      elementsFromPoint: list.slice(0, 6).map((node) => {
-        const rect = node.getBoundingClientRect();
-        return `${name(node)}:${[rect.left, rect.top, rect.width, rect.height].map(Math.round).join(",")}`;
-      }),
-    };
-  });
-  if (stack) {
-    console.warn(`[home-phone-layout] Search hit stack disagrees: ${JSON.stringify(stack)}`);
-  }
-}
-
 // One letter that fills Spotlight with result rows.
 const SPOTLIGHT_PROBE_QUERY = "e";
 
@@ -776,12 +746,8 @@ const SHELL_SURFACES = [
   },
   {
     id: "spotlight-results",
-    // The spotlight surface proves Search takes a hit-checked click. On Linux
-    // Chromium the reopen fails Playwright's hit check while the tap target is
-    // Search, so it skips the check; the input fill below still needs the sheet.
     open: async (frame) => {
-      await logSearchHitStack(frame);
-      await frame.locator("#toolbar-spotlight").click({ force: true });
+      await frame.locator("#toolbar-spotlight").click();
       await sleep(SHEET_SETTLE_MS);
       await frame.locator("#spotlight-input").fill(SPOTLIGHT_PROBE_QUERY);
     },
