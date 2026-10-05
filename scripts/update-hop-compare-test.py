@@ -1027,13 +1027,13 @@ class CliFixtureTests(unittest.TestCase):
     def qualified_home_support(self):
         support = self.root / "support"
         (support / "bin").mkdir(parents=True, exist_ok=True)
-        for name in ("ipfs-provider", "kubo", "localhost-provider", "custody-provider"):
+        for name in (*observer.CLI_NATIVE_SETUP, "custody-provider"):
             path = support / "bin" / name
             path.write_bytes(name.encode())
             path.chmod(0o755)
         registry = {"capsules": {}, "external": {name: {
             "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
-            for name in ("ipfs-provider", "kubo", "localhost-provider")}}
+            for name in observer.CLI_NATIVE_SETUP}}
         for name in observer.CLI_WEB_CAPSULES:
             capsule = support / "capsules" / name
             (capsule / "browser").mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1112,7 @@ class CliFixtureTests(unittest.TestCase):
             entries[name], capsule_paths, _ = observer.cli_qualified_home(support, "darwin-arm64", name)
             paths.extend(capsule_paths)
         mapping = {}
-        for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
+        for path in [*(support / "bin" / name for name in observer.CLI_NATIVE_SETUP), *paths]:
             target = path.relative_to(support).as_posix()
             mapping[target] = self.add("setup/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
         mapping["fixture-tools/open"] = self.add("setup/opener", b"fixture no-op utility", 0o700)
@@ -1124,7 +1124,7 @@ class CliFixtureTests(unittest.TestCase):
             archive = self.add("setup/" + name + ".tar.gz", observer.cli_home_archive(self.root, self.manifest, mapping, name))
             self.manifest["holder"]["content"][self.manifest["files"][archive]["cid"]] = archive
             artifacts[name + ".tar.gz"] = archive
-        artifacts.update({name: mapping["bin/" + name] for name in ("ipfs-provider", "kubo", "localhost-provider")})
+        artifacts.update({name: mapping["bin/" + name] for name in observer.CLI_NATIVE_SETUP})
         self.manifest["setup"] = {"artifacts": artifacts}
         components = observer.cli_json(self.root / self.manifest["publications"]["old"]["components"])
         components["schema"] = "elastos.components/v1"
@@ -1172,7 +1172,7 @@ class CliFixtureTests(unittest.TestCase):
                 "last_release_cid": self.manifest["files"][publication["release"]]["cid"]}, cid=False)
             for key in ("head", "release"):
                 self.manifest["holder"]["content"][self.manifest["files"][publication[key]]["cid"]] = publication[key]
-        self.manifest["preserve"]["support"] = ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]
+        self.manifest["preserve"]["support"] = ["capsules", *("bin/" + name for name in observer.CLI_NATIVE_SETUP), "fixture-tools"]
         if initial_home:
             self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
         self.manifest["holder"]["content"] = {cid: relative for cid, relative in self.manifest["holder"]["content"].items()
@@ -1413,7 +1413,7 @@ class CliFixtureTests(unittest.TestCase):
         support = self.qualified_home_support()
         entry, paths, _ = observer.cli_qualified_home(support, "darwin-arm64")
         mapping = {}
-        for path in [support / "bin/ipfs-provider", support / "bin/kubo", support / "bin/localhost-provider", *paths]:
+        for path in [*(support / "bin" / name for name in observer.CLI_NATIVE_SETUP), *paths]:
             target = path.relative_to(support).as_posix()
             mapping[target] = self.add("initial/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
         mapping["fixture-tools/open"] = self.add("initial/opener", b"fixture no-op utility", 0o700)
@@ -1421,13 +1421,13 @@ class CliFixtureTests(unittest.TestCase):
         for relative in mapping.values():
             self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
         self.manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(mapping)}
-        self.manifest["preserve"]["support"] = ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]
+        self.manifest["preserve"]["support"] = ["capsules", *("bin/" + name for name in observer.CLI_NATIVE_SETUP), "fixture-tools"]
         components_path = self.root / self.manifest["publications"]["old"]["components"]
         components = observer.cli_json(components_path)
         components["capsules"]["home"] = entry
         qualified = observer.cli_json(support / "components.json")
         components["external"]["home"] = qualified["external"]["home"]
-        for name in ("ipfs-provider", "kubo", "localhost-provider"):
+        for name in observer.CLI_NATIVE_SETUP:
             native = self.manifest["files"][mapping["bin/" + name]]
             selected = {"checksum": "sha256:" + native["sha256"], "cid": native["cid"], "size": native["bytes"], "install_path": "bin/" + name}
             components["external"][name] = {**qualified["external"][name], "platforms": {"darwin-arm64": selected}}

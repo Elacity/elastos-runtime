@@ -730,6 +730,19 @@ jobs:
           export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$CI_HOP_ROOT/generation.json")"
           python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
           python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
+      # Expected to fail until the protected-content provider fix lands (alpha.6:
+      # the updated Runtime refused the installed providers while System said
+      # "up to date"). Remove continue-on-error when that fix is merged.
+      - name: require no new provider warnings after the System update
+        continue-on-error: true
+        run: |
+          python3 -I - "$CI_HOP_ROOT/package/results/result.json" <<'PY'
+          import json, sys
+          result = json.load(open(sys.argv[1]))
+          new = result["paths"]["m1-install"]["checks"]["initial-home"]["system"]["provider_warnings"]["new"]
+          print("\n".join(new) or "no new provider warnings after the update")
+          sys.exit(1 if new else 0)
+          PY
       - name: retain the safe CI hop receipt
         if: always()
         uses: actions/upload-artifact@v5

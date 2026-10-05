@@ -1184,7 +1184,7 @@ def cli_admit_home_support(root, manifest):
     need(set(fixture) == {"entrypoint", "files"}
          and fixture["entrypoint"] == "capsules/home/browser/index.html", "initial Home fixture differs")
     mapping = manifest["consumer"]["files"]
-    native_paths = {"bin/ipfs-provider", "bin/kubo", "bin/localhost-provider"}
+    native_paths = {"bin/" + name for name in CLI_NATIVE_SETUP}
     expected = set(cli_setup_files(manifest)) | {"fixture-tools/open"}
     need(fixture["files"] == sorted(expected) and native_paths <= expected
          and "fixture-tools/open" in expected and "capsules/home/capsule.json" in expected and fixture["entrypoint"] in expected,
@@ -1225,7 +1225,11 @@ def cli_admit_home_support(root, manifest):
 
 
 CLI_WEB_CAPSULES = ("home", "home-gui", "system")
-CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider", "home-gui", "system")
+# Home-profile providers whose status must match the running Runtime; the update
+# journey compares their startup warnings before and after the update.
+CLI_PROTECTED_PROVIDERS = ("protected-content-protect-provider", "protected-content-decrypt-provider")
+CLI_NATIVE_SETUP = ("ipfs-provider", "kubo", "localhost-provider", *CLI_PROTECTED_PROVIDERS)
+CLI_SETUP_COMPONENTS = ("home", "ipfs-provider", "kubo", "localhost-provider", "home-gui", "system", *CLI_PROTECTED_PROVIDERS)
 CLI_SETUP_ARTIFACTS = tuple(name + ".tar.gz" if name in CLI_WEB_CAPSULES else name for name in CLI_SETUP_COMPONENTS)
 CLI_HOME_CACHE = (".elastos-cid", ".elastos-artifact-sha256")
 CLI_LOCALHOST_METADATA = "localhost-provider-capsule-metadata.tar.gz"
@@ -1301,7 +1305,7 @@ def cli_localhost_metadata_files(raw, selected):
 def cli_setup_files(manifest):
     return {target: relative for target, relative in manifest["consumer"]["files"].items()
             if target.startswith(tuple("capsules/" + name + "/" for name in (*CLI_WEB_CAPSULES, "localhost-provider"))) or target in
-            ("bin/ipfs-provider", "bin/kubo", "bin/localhost-provider")}
+            tuple("bin/" + name for name in CLI_NATIVE_SETUP)}
 
 
 def cli_home_archive(root, manifest, mapping, name="home"):
@@ -1454,13 +1458,13 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
             cli_metadata_cid(metadata_info["cid"], metadata_raw)
     else:
         need(localhost_metadata is None, "localhost metadata archive input has no source descriptor")
-    for path in (runtime, next_runtime, build_receipt, support_home / "bin/ipfs-provider", support_home / "bin/kubo"):
+    for path in (runtime, next_runtime, build_receipt, *(support_home / "bin" / name for name in CLI_NATIVE_SETUP)):
         need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
     disk = shutil.disk_usage(root.parent)
     # Two Runtime copies plus their CID blocks, native support, package copies
     # and eight isolated installed Homes fit within this conservative bound.
     growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
-                                                   for name in ("ipfs-provider", "kubo", "localhost-provider")) + sum(path.stat().st_size for path in home_paths)
+                                                   for name in CLI_NATIVE_SETUP) + sum(path.stat().st_size for path in home_paths)
                    + sum(len(raw) for raw, _ in metadata_files.values()) + (len(metadata_raw) if metadata_info else 0))
     need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
     root.mkdir(mode=0o700)
@@ -1498,6 +1502,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
     kubo_relative = add("kubo", support_home / "bin/kubo", 0o755)
     provider_relative = add("ipfs-provider", support_home / "bin/ipfs-provider", 0o755)
     localhost_relative = add("localhost-provider", support_home / "bin/localhost-provider", 0o755)
+    protected = {name: add(name, support_home / "bin" / name, 0o755) for name in CLI_PROTECTED_PROVIDERS}
     env = cli_environment(scratch)
     env["IPFS_PATH"] = str(scratch / "ipfs-repo")
 
@@ -1551,10 +1556,13 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
         content(catalogue, raw=True)
         opener = add("home-opener", Path("/usr/bin/true"), 0o700)
         home_mapping = {"bin/ipfs-provider": provider_relative, "bin/kubo": kubo_relative,
-                        "bin/localhost-provider": localhost_relative, "fixture-tools/open": opener}
+                        "bin/localhost-provider": localhost_relative, "fixture-tools/open": opener,
+                        **{"bin/" + name: relative for name, relative in protected.items()}}
         content(provider_relative)
         content(kubo_relative)
         content(localhost_relative)
+        for relative in protected.values():
+            content(relative)
         content(opener)
         for path in home_paths:
             target = path.relative_to(support_home).as_posix()
@@ -1574,9 +1582,9 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
             external[name] = {"install_path": "capsules/" + name, "platforms": {component_platform: {
                 "release_path": name + ".tar.gz", "extract_path": name, "install_path": "capsules/" + name,
                 "cid": binding["cid"], "checksum": "sha256:" + binding["sha256"], "size": binding["bytes"]}}}
-        for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative)):
+        for name, relative in (("ipfs-provider", provider_relative), ("kubo", kubo_relative), *protected.items()):
             descriptor = qualified["external"][name]
-            if name == "ipfs-provider":
+            if name != "kubo":
                 need(descriptor["platforms"][component_platform]["checksum"] == "sha256:" + manifest["files"][relative]["sha256"], "built support checksum differs")
             # Source-home verifies Kubo's archive pin. The disposable package pins
             # the installed executable bytes and exposes only local Carrier content.
@@ -1618,7 +1626,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
                          "profiles": {"home": {"description": "Qualified fixture Home", "components": list(CLI_SETUP_COMPONENTS)}},
                          "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
         manifest["setup"] = {"artifacts": {**archives, "ipfs-provider": provider_relative,
-                                         "kubo": kubo_relative, "localhost-provider": localhost_relative}}
+                                         "kubo": kubo_relative, "localhost-provider": localhost_relative, **protected}}
         if metadata_relative is not None:
             manifest["setup"]["artifacts"][CLI_LOCALHOST_METADATA] = metadata_relative
             manifest["setup"]["localhost_metadata"] = {"artifact": CLI_LOCALHOST_METADATA, "files": sorted(metadata_files)}
@@ -1692,7 +1700,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
                                            "capsules/sentinel/data": add("consumer/support", b"preserve support")}}
         manifest["consumer"]["files"].update(home_mapping)
         manifest["initial_home"] = {"entrypoint": "capsules/home/browser/index.html", "files": sorted(home_mapping)}
-        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", "bin/ipfs-provider", "bin/kubo", "bin/localhost-provider", "fixture-tools"]}
+        manifest["preserve"] = {"config": ["config"], "data": ["state"], "support": ["capsules", *("bin/" + name for name in CLI_NATIVE_SETUP), "fixture-tools"]}
         if local_rehearsal is not None:
             need(cli_local_rehearsal(local_rehearsal) == source, "local hop source changed during generation")
         write(root / "manifest.json", manifest)
@@ -2358,6 +2366,7 @@ def cli_home_system_journey(processes, manifest, home_path, publish):
              message + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
 
     reached("up-to-date", 240, "installed Home sign-up or up-to-date System state failed")
+    warnings_before = cli_provider_warnings(home_path)
     publish("tampered-binary")
     reached("refused", 330, "System did not refuse the tampered fixture plainly")
     need(digest(binary) == shas["old"] and source() == manifest["old"]["version"], "refused update changed the installed release")
@@ -2369,8 +2378,21 @@ def cli_home_system_journey(processes, manifest, home_path, publish):
     need(status["phase"] == "updated" and status["current_version"] == manifest["new"]["version"]
          and digest(binary) == shas["new"] and source() == manifest["new"]["version"] and host is not None
          and cli_process_executable(host["pid"]) == str(binary), "controller did not restart Home on the next version")
+    # alpha.6: the updated Runtime refused the installed protected-content providers
+    # while System said "up to date". CI requires `new` to be empty in its own step.
+    warnings_after = cli_provider_warnings(home_path)
     stages = ("up-to-date", "tampered-offer", "refused", "next-offer", "updated")
-    return {"stages": {name: cli_json(output / (name + ".json")) for name in stages}, "host": host}
+    return {"stages": {name: cli_json(output / (name + ".json")) for name in stages}, "host": host,
+            "provider_warnings": {"before": warnings_before, "after": warnings_after,
+                                  "new": sorted(set(warnings_after) - set(warnings_before))}}
+
+
+def cli_provider_warnings(home_path):
+    """Provider warnings and errors of the current Home start (the controller truncates the log per start)."""
+    text = (home_path / CLI_DATA / "update-controller/runtime.log").read_text(errors="replace")
+    lines = (re.sub(r"\x1b\[[0-9;]*m", "", line) for line in text.splitlines())
+    return sorted({match[1].strip() for line in lines
+                   if "provider" in line and (match := re.search(r"\b(?:WARN|ERROR)\b(.*)", line))})
 
 
 def cli_run(config, output, local_rehearsal=None):
