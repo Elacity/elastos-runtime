@@ -77,8 +77,10 @@ Every shell surface is graded on the same five things, in this order.
 3. **Reach.** Primary actions sit in the lower half of the screen; nothing
    the person must tap lives under the notch or the home indicator.
 4. **Grammar.** Every gesture has a button twin. Long-press opens the same
-   menu right-click opens. Swipe-down on a title bar dismisses; the leading
-   button does the same. No horizontal edge gestures anywhere in the shell.
+   menu right-click opens. Swipe-down on a title bar opens the app switcher
+   and keeps the app running; Control Centre → Overview is its button twin.
+   The trailing Minimise chevron sends the app Home, still running; the
+   leading Close closes it. No horizontal edge gestures anywhere in the shell.
 5. **Truth.** Safe areas are real (`viewport-fit=cover`), the soft keyboard
    never covers a focused input (host `visualViewport` → `--keyboard-inset`),
    `100dvh` not `100vh`, no rubber-band overscroll on the shell.
@@ -220,8 +222,9 @@ would be; no `image-set()` variant.
   (`shell-phone-stage.js`, `TITLE_SWIPE_DOWN_PX`, `TITLE_SWIPE_DRIFT_PX`).
   The head takes pointer capture so the moves keep arriving once the finger
   crosses into the capsule frame, and the click that ends the gesture is
-  swallowed — it would land on the card and undo the open. The Minimise
-  chevron is the button twin.
+  swallowed — it would land on the card and undo the open. Control Centre →
+  Overview opens the same switcher by button; the Minimise chevron sends the
+  window Home instead.
 - Cards carry the capsule icon and name (`.expose-caption`, counter-scaled by
   `--expose-card-scale` so they read at natural size) and, on coarse
   pointers, a 44 px Close (`.expose-close`) — the scaled title bar's own Close
@@ -496,8 +499,13 @@ the behaviour.
   flat scrim behind sheets.
 - Soft keyboard: focus Spotlight and the Assistant composer; the input must
   stay visible above the keyboard on iOS Safari and Android Chrome.
-- System back: Android back and the iOS edge swipe must close the top sheet
-  or return Home, and must leave Home from the bare desktop.
+- System back (Android): Back closes the top sheet or returns the window
+  Home, and leaves Home from the bare desktop.
+- Back on iOS: iOS has no system Back, and the shell keeps no history entry
+  on WebKit (the WebKit fallback above), so the edge swipe stays Safari's own
+  page back. Check the buttons instead: Close closes the window, Minimise
+  returns it Home with its state, and swipe-down on the title bar opens the
+  app switcher.
 - Rotation with a window open keeps the window and its state.
 - Long-press: holding a Dock app opens its menu sheet once on iOS Safari and
   Android Chrome, with no text selection, magnifier or link callout, and
