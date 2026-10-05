@@ -140,6 +140,7 @@ fn restart_plan() -> RestartPlan {
         controller_sha256: sha256(b"verified controller"),
         launch_plan_sha256: sha256(b"private launch plan"),
         support_sha256: sha256(b"frozen support"),
+        support_paths: Default::default(),
         previous_version: "0.7.0".into(),
         candidate_version: "0.7.1".into(),
         previous_binary_sha256: sha256(&old_bytes(ReleaseFile::RuntimeBinary)),
@@ -1155,6 +1156,46 @@ fn normal_admitted_prefix_finishes_all_five_consumed_roles() {
     fixture.assert_release(&writer, false);
     assert_no_transaction_scratch(&writer);
     assert_sentinels(&sentinels);
+}
+
+#[test]
+fn staged_support_change_refuses_activation_before_any_release_rename() {
+    let fixture = RestartFixture::new();
+    let writer = fixture.writer();
+    fs::create_dir(fixture.data.join("bin")).unwrap();
+    let destination = fixture.data.join("bin/fixture-provider");
+    write_new(&destination, b"previous support", 0o755).unwrap();
+    let candidate = fixture.root.path().join("candidate-provider");
+    write_new(&candidate, b"candidate support", 0o755).unwrap();
+    prepare_release(&writer);
+    writer
+        .prepare_support(&[(PathBuf::from("bin/fixture-provider"), candidate)])
+        .unwrap();
+    fs::write(&destination, b"changed support").unwrap();
+    let before = fixture.snapshot();
+    let mut renames = 0;
+    let error = writer
+        .commit_with(
+            |_| {
+                renames += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(renames, 0);
+    assert!(
+        error
+            .to_string()
+            .contains("installed release support changed"),
+        "{error:#}"
+    );
+    fixture.assert_release(&writer, true);
+    assert_eq!(
+        writer.read_journal().unwrap().unwrap().phase,
+        Phase::Prepared
+    );
+    assert_eq!(fixture.snapshot(), before);
 }
 
 #[test]

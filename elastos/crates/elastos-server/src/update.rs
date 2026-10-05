@@ -1701,7 +1701,8 @@ async fn run_upgrade_with_restart(
             .as_ref()
             .map(|owner| owner.plan(support.clone(), current_version, version))
             .transpose()?;
-        if let Some(plan) = restart_plan {
+        if let Some(mut plan) = restart_plan {
+            plan.support_paths = support_paths(&old_components, &comp_data, &component_platform)?;
             transaction.prepare_restart(plan)?;
         }
         Ok::<_, anyhow::Error>(support)
@@ -1798,7 +1799,6 @@ async fn run_upgrade_with_restart(
 /// A ready host is accepted only while the frozen support still matches its durable plan.
 pub(crate) fn verify_restart_support(transaction: &InstallTransaction) -> anyhow::Result<()> {
     let record = transaction.restart_record()?;
-    let components = std::fs::read(transaction.data_dir().join("components.json"))?;
     let previous = matches!(
         record.phase,
         RestartPhase::Restored
@@ -1807,12 +1807,9 @@ pub(crate) fn verify_restart_support(transaction: &InstallTransaction) -> anyhow
             | RestartPhase::PreviousReady
     );
     transaction.verify_support(previous)?;
-    let old_components = transaction.original_components()?;
-    if support_snapshot(
+    if support_paths_snapshot(
         transaction.data_dir(),
-        &old_components,
-        &components,
-        &crate::setup::detect_platform(),
+        &record.plan.support_paths,
         &transaction.excluded_paths(),
     )? != record.plan.support_sha256
     {
@@ -1876,7 +1873,14 @@ fn support_snapshot(
     platform: &str,
     excluded: &std::collections::BTreeSet<PathBuf>,
 ) -> anyhow::Result<String> {
-    use sha2::Digest;
+    support_paths_snapshot(data_dir, &support_paths(old, new, platform)?, excluded)
+}
+
+fn support_paths(
+    old: &[u8],
+    new: &[u8],
+    platform: &str,
+) -> anyhow::Result<std::collections::BTreeSet<PathBuf>> {
     let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(new)?;
     let old_manifest: crate::setup::ComponentsManifest = serde_json::from_slice(old)?;
     let mut paths = std::collections::BTreeSet::from([
@@ -1896,6 +1900,15 @@ fn support_snapshot(
             paths.insert(PathBuf::from(path));
         }
     }
+    Ok(paths)
+}
+
+fn support_paths_snapshot(
+    data_dir: &Path,
+    paths: &std::collections::BTreeSet<PathBuf>,
+    excluded: &std::collections::BTreeSet<PathBuf>,
+) -> anyhow::Result<String> {
+    use sha2::Digest;
     let mut digest = sha2::Sha256::new();
     for relative in paths {
         if relative.as_os_str().is_empty()

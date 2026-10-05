@@ -246,6 +246,7 @@ fn prepare_host_fence_release(
                 controller_sha256: digest(b"signed fixture Runtime"),
                 launch_plan_sha256: digest(b"fixture launch"),
                 support_sha256: digest(b"fixture support"),
+                support_paths: Default::default(),
                 previous_version: "0.7.0".into(),
                 candidate_version: "0.7.1".into(),
                 previous_binary_sha256: digest(b"signed fixture Runtime"),
@@ -1094,7 +1095,8 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     let fixture = PrivateFixture::new();
-    let listener = tokio::net::TcpListener::bind("[::1]:8090").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
     let fetched = Arc::new(AtomicUsize::new(0));
     let observed = fetched.clone();
     let health_observed = fetched.clone();
@@ -1138,7 +1140,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let generation = "a".repeat(32);
     let binary_hash = digest(b"fixture owned gateway binary");
     let mut coords = json!({
-        "api_url":"http://[::1]:8090", "home_url":"http://[::1]:8090/home/",
+        "api_url":api_url, "home_url":format!("{api_url}/home/"),
         "attach_secret":"fixture-attach-secret", "runtime_kind":"gateway",
         "pid":pid, "generation":generation, "binary_sha256":binary_hash,
     });
@@ -2952,6 +2954,46 @@ impl crate::update::RestartOwner for StagingRestartOwner {
 }
 
 #[tokio::test]
+async fn staged_support_skips_linux_only_home_component_on_darwin() {
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release();
+    publish_retained_receipt(&fixture);
+    let mut owner = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: None,
+        request: None,
+        previous_binary_sha256: digest(b"signed fixture Runtime"),
+        previous_version: "0.7.0".into(),
+        generation: String::new(),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+    };
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{},
+        "profiles":{"home":{"components":["browser-stream-bridge"]}},
+        "external":{"browser-stream-bridge":{
+            "install_path":"bin/browser-stream-bridge",
+            "platforms":{"linux-arm64":{"cid":raw_cid(b"linux support")}}
+        }}
+    }))
+    .unwrap();
+    let fetch: crate::update::FetchFn = Box::new(|_, _| panic!("unavailable support fetched"));
+    let (_, paths) = crate::setup::stage_update_support(
+        &fixture.data,
+        &fs::read(fixture.data.join("components.json")).unwrap(),
+        &components,
+        "darwin-arm64",
+        &fetch,
+        &mut owner,
+    )
+    .await
+    .unwrap();
+    assert!(paths.is_empty());
+}
+
+#[tokio::test]
 async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restarts_once() {
     for outcome in [
         "head fetch",
@@ -2975,6 +3017,8 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         "bundle",
         "bundle restored",
         "restored",
+        "optional restored",
+        "optional moved restored",
     ] {
         let fixture = PrivateFixture::new();
         fs::create_dir(fixture.data.join("bin")).unwrap();
@@ -3021,6 +3065,18 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             PathBuf::from("bin/fixture-provider")
         };
         let mut value: Value = serde_json::from_slice(&manifest(b"new support")).unwrap();
+        if outcome.starts_with("optional") {
+            let optional = json!({
+                "install_path":"libexec/optional/v2/runner",
+                "platforms":{(crate::setup::detect_platform()):{"cid":raw_cid(b"optional support")}}
+            });
+            if outcome == "optional moved restored" {
+                old_value["external"]["optional"] = optional.clone();
+                old_value["external"]["optional"]["install_path"] =
+                    json!("libexec/optional/v1/runner");
+            }
+            value["external"]["optional"] = optional;
+        }
         value["external"]["fixture-provider"]["install_path"] = json!(candidate_support);
         let support = if outcome.starts_with("bundle") {
             let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -3210,6 +3266,10 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             assert!(result.is_err());
             assert_eq!((owner.stops, owner.starts), (2, 2));
             assert_eq!(status.phase, "restored");
+            assert!(owner.controller.child.is_some(), "previous Home is running");
+            if outcome.starts_with("optional") {
+                assert!(!fixture.data.join("libexec").exists());
+            }
             assert_eq!(
                 fs::read(&fixture.binary).unwrap(),
                 b"signed fixture Runtime"

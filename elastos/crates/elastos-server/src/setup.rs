@@ -3014,7 +3014,9 @@ pub(crate) async fn stage_update_support(
     let stage = tempfile::tempdir_in(data_dir)?;
     let mut paths = std::collections::BTreeMap::new();
     for (name, component) in &new.external {
-        let info = resolve_platform_info(component, platform);
+        let Some(info) = resolve_platform_info(component, platform) else {
+            continue;
+        };
         let old_component = old.external.get(name);
         let required = new
             .profiles
@@ -3033,8 +3035,6 @@ pub(crate) async fn stage_update_support(
         if !installed && !required {
             continue;
         }
-        let info =
-            info.ok_or_else(|| anyhow::anyhow!("required support unavailable for this platform"))?;
         let changed = component_signature(old_component, platform)
             != component_signature(Some(component), platform);
         let mut assets = Vec::new();

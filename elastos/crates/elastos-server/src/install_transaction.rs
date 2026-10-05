@@ -120,6 +120,7 @@ pub(crate) struct RestartPlan {
     pub controller_sha256: String,
     pub launch_plan_sha256: String,
     pub support_sha256: String,
+    pub support_paths: BTreeSet<PathBuf>,
     pub previous_version: String,
     pub candidate_version: String,
     pub previous_binary_sha256: String,
@@ -853,29 +854,6 @@ impl InstallTransaction {
         support::prepare(self, paths)
     }
 
-    pub(crate) fn original_components(&self) -> anyhow::Result<Vec<u8>> {
-        let journal = self.read_journal()?.context("release journal missing")?;
-        let entry = journal
-            .entries
-            .iter()
-            .find(|entry| entry.id == ReleaseFile::Components)
-            .unwrap();
-        let path = self.scratch(ReleaseFile::Components, ROLLBACK);
-        let path = if path.exists() {
-            path
-        } else {
-            self.destinations[&ReleaseFile::Components].clone()
-        };
-        require_hash(
-            &path,
-            entry
-                .original_sha256
-                .as_deref()
-                .context("previous components missing")?,
-        )?;
-        Ok(fs::read(path)?)
-    }
-
     pub(crate) fn verify_support(&self, previous: bool) -> anyhow::Result<()> {
         let journal = self.read_journal()?.context("release journal missing")?;
         support::require_installed(self, &journal.support, previous)
@@ -1160,6 +1138,7 @@ impl InstallTransaction {
                 require_hash(&self.scratch(entry.id, ROLLBACK), original)?;
             }
         }
+        support::require_original(self, &journal.support)?;
         let result = (|| {
             journal.phase = Phase::Committing;
             self.write_journal(&journal)?;

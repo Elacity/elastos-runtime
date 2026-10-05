@@ -1194,6 +1194,7 @@ impl crate::update::RestartOwner for Controller {
             controller_sha256: self.receipt.controller_sha256.clone(),
             launch_plan_sha256: self.receipt.launch_sha256.clone(),
             support_sha256,
+            support_paths: Default::default(),
             previous_version: previous_version.into(),
             candidate_version: candidate_version.into(),
             previous_binary_sha256: self.previous_binary_sha256.clone(),
