@@ -72,8 +72,6 @@ Each top-level ledger has one job:
   topic membership, gossip operations, and trust limits
 - [Model provider](MODEL_PROVIDER.md): provider and model selection, streams,
   cancellation, recovery, and terminal outcomes
-- [Model package handoff](MODEL_PACKAGE_HANDOFF.md): signed model package inputs
-  and verification
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
