@@ -7,7 +7,7 @@ are the only place for work status, acceptance criteria and proof.
 ## Work Tracking And Acceptance
 
 - GitHub issues own the work queue. In each lane, take the lowest-numbered open
-  task in the current weekly milestone whose dependencies are satisfied and
+  task in the current milestone whose dependencies are satisfied and
   which has no active blocker. Keep at most one task issue In progress per
   lane. Parent issues group the lane;
   they do not authorize a second active task. User messages approve, redirect
@@ -23,14 +23,11 @@ are the only place for work status, acceptance criteria and proof.
 - Run at most one heavy local build on this Mac at a time. Workers agree which
   issue owns that build before starting it. CI builds do not count toward this
   local limit. Continue reviews, source work or other light checks in parallel.
-- Update the owning GitHub issue before reporting a state change. Routine
-  status notes and check-ins link the PR, CI run and review, then state the
-  result and remaining work. Keep exact source, tree and artifact identities
-  in installed-binary and release receipts, and in the private lifecycle
-  inventory. A routine status note uses those links instead of copied hashes.
+- Comment on GitHub only for a decision, a result with its link, a blocker or a review verdict.
+  Keep comments to at most 3 lines: no narration, hashes, receipts or agent-to-agent coordination.
+  Put status in the issue checklist.
 - Keep one work record. Do not create briefings, plans, gists or notes files.
-  Existing `state.md`, `TASKS.md` and dated audits are historical references;
-  move useful open work to its issue instead of maintaining a parallel queue.
+  Move useful open work from dated audits to its issue.
 - Keep seed security details, credentials and private operator data out of
   public issues, PRs and logs. Give the public issue only a safe summary and
   the approval or verification still needed. Retain sensitive raw evidence
@@ -61,7 +58,7 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Branch Roles
 
-- `main` is the release line. It changes only through the weekly release PR.
+- `main` is the release line.
 - `develop` is the integration line. Task PRs merge into it when their checks
   and reviews pass (see Review And Commit Discipline).
 - Feature and fix branches remain unpublished working lines until they are
@@ -74,7 +71,7 @@ are the only place for work status, acceptance criteria and proof.
   identities in the lifecycle inventory or the installed-artifact receipt;
   routine check-ins link the related PR, CI run and review.
 - Always report remote divergence. A local branch being green is not the same as
-  `elacity/<branch>` being up to date.
+  the remote branch being up to date.
 
 ## Creating Work Branches
 
@@ -88,23 +85,10 @@ says so in its PR and merges after its parent. Name branches `feat/<slug>` or
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
-## Weekly Releases
+## Releases
 
-- Each weekly release has a milestone `0.7.N`. Its scope is fixed on the
-  Wednesday before the release; work that misses it moves to the next milestone.
-- On Tuesday the candidate is cut from `develop` as `release/0.7.N` with the
-  version bump and changelog, and opened as a PR to `main`.
-- Three people confirm the candidate before the tag. Sasha reviews the visible
-  changes (CI screenshots and a short look) on his Wednesday. `irzhywau`
-  approves the release PR. Anders runs the ten-minute journey on his Mac: a
-  fresh install (an update from the previous weekly release once the signed
-  update tasks UP-01 to UP-03 are merged), sign in, one local AI reply, one chat
-  message and one Browser page. A failed journey or a visible regression holds
-  the tag for that week.
-- On Wednesday the PR merges, `v0.7.N` is tagged on the merge commit, and `main`
-  merges back into `develop`.
-- 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets
-  its Done means.
+Releases are built by `.github/workflows/release-package.yml` and published with `scripts/release-publish.sh` as described in [Publishing a release](docs/VERSIONING.md#publishing-a-release).
+Changes to `main` and tags stay with Anders.
 
 ## Branch Lifecycle
 
@@ -278,7 +262,7 @@ capsules, provider config, and `components.json`.
   `irzhywau` for security follow-up: he reviews merged security task PRs, and a
   finding goes into an existing issue or a revert when it reopens a hole.
   When he authors a security task PR, Anders conducts the follow-up review.
-  Weekly release PRs still need his approval before merge and tag; when he is
+  Release PRs still need his approval before merge and tag; when he is
   the author, Anders reviews. Also request the feature owner when required.
 - Use one development review round per coherent change. Resolve findings in
   that round and fix their cause before requesting the current verdict. Scope
@@ -292,8 +276,8 @@ capsules, provider config, and `components.json`.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
-- Put work status and proof in the owning GitHub issue. Keep release history in
-  `elastos/CHANGELOG.md` and product instructions in the relevant documentation.
+- Keep release history in `elastos/CHANGELOG.md` and product instructions in
+  the relevant documentation.
 - Keep product documentation release-neutral. Use version numbers only for
   exact release state, compatibility or migration, release notes or changelogs,
   manifests, and exact Git refs or evidence. Keep standing instructions,
@@ -344,7 +328,7 @@ and result.
 Prove installed behavior on the CI install jobs (GitHub-hosted Linux x86-64,
 Linux ARM64 and macOS machines) when they cover the journey, and link that CI
 run as the proof. Otherwise use the installed-proof steps above. The Jetson is
-checked on the weekly candidate. A PR that changes what users see links the CI
+checked on the release candidate. A PR that changes what users see links the CI
 screenshots at desktop and phone width.
 
 ## Journey Register Gate
@@ -389,7 +373,7 @@ scripts/setup-source-home.sh
 capsules, installs app capsule trees with their root WASM entrypoints, stamps
 `components.json`, and prepares source-home runtime helpers. Before restart:
 
-- back up the live binary, `components.json`, provider config, and capsule tree;
+- retain a rollback only when approved under Local Hygiene And Retention;
 - install the rebuilt `elastos/target/release/elastos`;
 - keep Browser supervisor scripts on a stable live-data path, not a temporary
   checkout path.
@@ -461,44 +445,3 @@ Cosmopolitan Libc may be researched for small C/C++ helper binaries, but it is
 not a drop-in answer for Rust workspace packaging, Chromium, WebView, GPU/audio,
 microVM isolation, or `.dmg` distribution.
 
-## Cursor Cloud specific instructions
-
-This section is durable guidance for Cloud Agents. The startup update script
-already installs `just` (`cargo install just`) and the `wasm32-unknown-unknown`
-Rust target; do not re-document dependency installation here.
-
-- Toolchain: Rust is pinned by [rust-toolchain.toml](rust-toolchain.toml)
-  (1.91.0 with `rustfmt`/`clippy`) and `rustup` auto-syncs it on first cargo
-  use. `wasm32-unknown-unknown` is the capsule Component target; the release
-  scripts also add it on demand via `ensure_rust_target_installed`.
-- Core gate has no JS/Python package deps: the `.mjs` checks in `just verify`
-  (`check-product-data.mjs`, `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
-  only stdlib/`node --test`. `playwright` appears as an import in Browser/GUI headless smokes that are NOT
-  part of the core gate, so no `npm install` is needed for build/lint/test.
-- Build/lint/test run from the repo root (the recipes `cd elastos`
-  themselves): `just build`, `just lint`, `just test`. A cold `just build` is
-  slow (runtime crate ~6 min). Each provider under `capsules/` is its own cargo
-  project; `build.sh --all` and `just home-frontdoor-smoke` build per-capsule
-  `target/` dirs, while `just test-capsules` shares one `target-capsules/` dir
-  so common dependencies compile once across the capsule suites.
-- Running the app from source: stage the built `localhost-provider` into
-  `$XDG_DATA_HOME/elastos/bin/` and write a `components.json` beside the data
-  dir whose `external.localhost-provider.platforms.<platform>.checksum` matches
-  that binary's `sha256:`, then `elastos serve --addr 127.0.0.1:<port>`. The
-  runtime verifies every staged component against that checksum (no dev bypass).
-  It then comes up healthy (`/api/health` → `{"status":"ok",...}`), Carrier P2P
-  online; authenticate via `POST /api/auth/attach` using `attach_secret` from
-  `$XDG_DATA_HOME/elastos/runtime-coords.json`. Self-contained commands
-  (`elastos identity show`, `elastos identity nickname set`, `elastos init`)
-  work directly against an isolated `HOME`/`XDG_DATA_HOME`.
-- Known release-gated gap (not an environment bug): `just home-frontdoor-smoke`
-  and the `public-install-*` smokes run `scripts/install.sh`, which downloads
-  the PUBLISHED release binary from `https://elastos.elacitylabs.com`. Whenever
-  the published binary trails this dev tree's `install.sh` contract (newer
-  subcommands, setup profiles), the installed-path proofs fail;
-  the owning GitHub issue records the accepted installed version and its
-  compatibility. Use the source `elastos serve` path above to
-  run the runtime locally instead.
-- No KVM: crosvm/microVM paths (Browser VM, full-screen chat microVM) warn and
-  fail closed here, so product Browser proof and microVM chat are not runnable
-  in this environment.

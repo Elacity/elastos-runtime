@@ -143,8 +143,6 @@ function audit(args) {
   ].map((file) => read(`capsules/home-cli/src/${file}`)).join("\n");
   const homeGuiManifest = read("capsules/home-gui/capsule.json");
   const commandContract = readJson("capsules/home-cli/browser/commands.json");
-  const state = read("state.md");
-  const tasks = read("TASKS.md");
   const contractDoc = read("docs/HOME_SHELL_HOST_CONTRACT.md");
   const espDoc = read("docs/ESP_V0.md");
   const bridgeSmoke = read("scripts/home-shell-bridge-smoke.mjs");
@@ -180,14 +178,10 @@ function audit(args) {
         shellCore.includes('export const HOME_GUI_SHELL_ID = "home-gui"') &&
         !shellCore.includes(retiredHomeGuiOldIdentifier) &&
         !host.includes(retiredHomeGuiOldIdentifier) &&
-        host.includes('"home-cli": "visible-target"') &&
-        state.includes("`home-shell-host` for host lifecycle") &&
-        state.includes("`home-gui` for the desktop projection") &&
-        state.includes("`home-cli` for the command projection"),
+        host.includes('"home-cli": "visible-target"'),
       [
         "capsules/home/browser/index.html",
         "capsules/home/browser/home-shell-host.js",
-        "state.md",
       ],
       "Keep the front-door route and internal shell names explicit.",
     ),
@@ -436,14 +430,12 @@ function audit(args) {
     criterion(
       "docs_and_stale_esp_cleanup",
       "ESP/Home docs explain the model plainly and stale esp-shell is not a selectable product shell.",
-      state.includes("replaces the obsolete `esp-shell` capsule") &&
-        contractDoc.includes("`home` is not a selectable shell") &&
+      contractDoc.includes("`home` is not a selectable shell") &&
         contractDoc.includes("`home-gui` and `home-cli` are sibling shell capsules") &&
         espDoc.includes("`home-cli` shell") &&
         !commandContract.commands.some((command) => command.name === "esp-shell") &&
         !homeIndex.includes("Esp Shell"),
       [
-        "state.md",
         "docs/HOME_SHELL_HOST_CONTRACT.md",
         "docs/ESP_V0.md",
         "capsules/home-cli/browser/commands.json",

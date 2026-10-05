@@ -259,8 +259,8 @@ The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [state.md](../state.md) records
-whether exact public-manifest parity evidence has been accepted.
+from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+owns exact public-manifest parity evidence.
 
 ## Capability policy
 

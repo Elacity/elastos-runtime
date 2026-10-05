@@ -54,7 +54,7 @@ fi
 DOCS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/elastos-docs-XXXXXX")
 trap 'rm -rf "$DOCS_DIR"' EXIT
 
-for f in docs/ARCHITECTURE.md docs/GETTING_STARTED.md docs/OVERVIEW.md README.md ROADMAP.md TASKS.md docs/NOTES.md elastos/CHANGELOG.md; do
+for f in docs/ARCHITECTURE.md docs/GETTING_STARTED.md docs/OVERVIEW.md README.md ROADMAP.md docs/NOTES.md elastos/CHANGELOG.md; do
     if [ -f "$f" ]; then
         cp "$f" "$DOCS_DIR/"
     fi

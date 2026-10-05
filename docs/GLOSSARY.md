@@ -3,9 +3,8 @@
 > Supplemental vocabulary note.
 >
 > This file is for term lookup, not for the primary repo narrative or current
-> behavior contract. Use [ARCHITECTURE.md](ARCHITECTURE.md) for the system
-> summary and [state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
-> [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for current truth.
+> behavior contract. Use [ARCHITECTURE.md](ARCHITECTURE.md) for the system summary,
+> [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for command expectations, and [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for status and proof.
 
 Key terms used in the ElastOS codebase and documentation.
 
