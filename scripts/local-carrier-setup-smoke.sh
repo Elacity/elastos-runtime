@@ -400,9 +400,6 @@ for name, capsule_dir in browser_capsules.items():
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
-catalog_dest = data_dir / "model-catalog.json"
-catalog_dest.write_bytes(components_src.with_name("model-catalog.json").read_bytes())
-catalog_dest.chmod(0o600)
 PY
 
 echo "[local-carrier-setup] staged local artifacts into ${ARTIFACTS_DIR}"
@@ -522,7 +519,6 @@ DATA_DIR="${XDG_DATA_HOME}/elastos"
 [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
 mkdir -p "${DATA_DIR}/bin"
 cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
-cp "${PUBLISHER_DATA_DIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json"
 install -m 700 "${REPO_ROOT}/elastos/target/release/localhost-provider" \
     "${DATA_DIR}/bin/localhost-provider"
 [[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]

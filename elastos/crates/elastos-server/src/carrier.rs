@@ -8275,14 +8275,22 @@ impl CarrierClient {
     }
 
     pub async fn fetch_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.fetch_file_bounded(path, 200 * 1024 * 1024).await
+    }
+
+    pub(crate) async fn fetch_file_bounded(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         let msg = serde_json::json!({"op":"file","path":path});
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, &format!("trusted source file fetch for {path}"))
-            .await
+        read_carrier_len_prefixed_bytes(
+            &mut recv,
+            &format!("trusted source file fetch for {path}"),
+            max_bytes,
+        )
+        .await
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
@@ -8298,7 +8306,7 @@ impl CarrierClient {
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, "content fetch").await
+        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", 200 * 1024 * 1024).await
     }
 
     pub async fn invoke_provider(
@@ -8427,11 +8435,12 @@ impl CarrierClient {
 async fn read_carrier_len_prefixed_bytes(
     recv: &mut iroh::endpoint::RecvStream,
     operation: &str,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 8];
     recv.read_exact(&mut len_buf).await?;
-    let len = u64::from_be_bytes(len_buf) as usize;
-    if len > 200 * 1024 * 1024 {
+    let len = u64::from_be_bytes(len_buf);
+    if len_buf[0] == b'{' {
         let mut error_bytes = len_buf.to_vec();
         let tail = recv.read_to_end(16 * 1024).await?;
         error_bytes.extend_from_slice(&tail);
@@ -8447,7 +8456,11 @@ async fn read_carrier_len_prefixed_bytes(
         }
         anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
     }
-    let mut content = vec![0u8; len];
+    anyhow::ensure!(
+        len <= max_bytes as u64,
+        "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
+    );
+    let mut content = vec![0u8; len as usize];
     recv.read_exact(&mut content).await?;
     Ok(content)
 }

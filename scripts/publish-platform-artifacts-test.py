@@ -575,45 +575,6 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                     artifacts = sorted(name for name in expected if name.startswith("artifacts/"))
                     self.assertEqual(order, artifacts + ["install.sh", "release.json", "publish-state.json", "release-head.json"])
 
-    def test_publication_export_retains_model_car_files_and_refuses_tampering(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepared, publisher = root / 'prepared', root / 'publisher'
-            publication_fixture(prepared)
-            retention = {}
-            for model in ('model-qwen3.5-0.8b', 'model-qwen3.5-4b', 'model-qwen3.5-9b', 'model-bonsai-8b-q1'):
-                entry = {'package_cid': 'fixture-model-root'}
-                for kind, suffix in (('car', '.car'), ('receipt', '.car.receipt.json')):
-                    name = model + suffix
-                    data = ('inert retention fixture ' + name).encode()
-                    (prepared / 'artifacts' / name).write_bytes(data)
-                    entry[kind] = {'release_path': name, 'cid': 'fixture-file-cid',
-                                   'checksum': 'sha256:' + sha256(data), 'size': len(data)}
-                retention[model] = entry
-            for platform in RELEASE_PLATFORMS:
-                path = prepared / 'artifacts' / f'components-{platform}.json'
-                manifest = json.loads(path.read_bytes())
-                manifest['model_retention'] = retention
-                data = json.dumps(manifest).encode()
-                path.write_bytes(data)
-                rewrite_release(prepared, lambda release, p=platform, b=data:
-                    release['payload']['platforms'][p]['components'].update(sha256=sha256(b), size=len(b)))
-            result = self.run_publication_export(prepared, publisher)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            before = snapshot(publisher)
-            for model in retention.values():
-                for kind in ('car', 'receipt'):
-                    name = model[kind]['release_path']
-                    self.assertEqual((publisher / 'artifacts' / name).read_bytes(),
-                                     (prepared / 'artifacts' / name).read_bytes())
-            first = prepared / 'artifacts' / retention['model-qwen3.5-0.8b']['car']['release_path']
-            original = first.read_bytes()
-            first.write_bytes(b'!' * len(original))
-            result = self.run_publication_export(prepared, publisher)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('prepared model retention bytes differ', result.stderr)
-            self.assertEqual(snapshot(publisher), before)
-
     def test_publication_export_rejects_incomplete_or_mismatched_sets_before_mutation(self):
         def replace(name, data):
             return lambda prepared: (prepared / name).write_bytes(data)

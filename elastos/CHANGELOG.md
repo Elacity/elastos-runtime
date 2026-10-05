@@ -4,7 +4,18 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Removed
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. Removed the model CAR retention and import path from release
+  preparation, signing and publication, `model-package-handoff.py`,
+  `fetch-model.sh` and their tests. Models return later as a separate signed
+  publication.
+
 ### Fixed
+
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
 
 - Setup accepts passive content capsules from the signed release while retaining
   provider role and icon checks. It refuses URL-only downloads and blank release

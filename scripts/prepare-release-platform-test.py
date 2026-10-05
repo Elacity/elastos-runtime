@@ -131,7 +131,7 @@ class PrepareWorkerTest(unittest.TestCase):
         for name in (
             "publish-release.sh", "prepare-release-platform.sh", "release-platform-input.py",
             "components-release-integrity-check.py", "check-versioning.sh", "build-media-tools.sh",
-            "release-upstream-assets.py", "release-upstream-input.py", "model-package-handoff.py",
+            "release-upstream-assets.py", "release-upstream-input.py",
         ):
             (scripts / name).write_bytes((SOURCE / "scripts" / name).read_bytes())
             (scripts / name).chmod(0o755)
@@ -466,118 +466,6 @@ class PrepareWorkerTest(unittest.TestCase):
         self.assertIn("checksum differs", result.stderr)
         self.assertFalse(output.exists())
         self.assertFalse((self.root / "cargo.log").exists())
-
-    def model_preparation_env(self):
-        return {**self.env, 'ELASTOS_RELEASE_MODEL_KUBO_BIN': str(self.root / 'fixture-kubo'),
-                'ELASTOS_RELEASE_MODEL_KUBO_REPO': str(self.root / 'fixture-kubo-repo'),
-                'ELASTOS_RELEASE_MODEL_PUBLISHED_AT': '1800000000',
-                'ELASTOS_RELEASE_MODEL_PUBLISHER_DID': 'did:key:z6MkFixture',
-                'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(self.root / 'model-handoff')}
-
-    def test_model_preparation_refuses_partial_env_and_bad_handoff_before_build(self):
-        complete = self.model_preparation_env()
-        for name in [key for key in complete if key.startswith('ELASTOS_RELEASE_MODEL_')]:
-            with self.subTest(missing=name):
-                partial = dict(complete)
-                partial.pop(name)
-                output, result = self.prepare(env=partial)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('Model preparation requires', result.stderr)
-                self.assertFalse(output.exists())
-                self.assertFalse((self.root / 'cargo.log').exists())
-        for handoff in (self.root / 'prepared', self.root / 'prepared/nested'):
-            with self.subTest(handoff=handoff):
-                output, result = self.prepare(env={**complete, 'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(handoff)})
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('new sibling', result.stderr)
-                self.assertFalse(output.exists())
-                self.assertFalse((self.root / 'cargo.log').exists())
-        (self.root / 'model-handoff').mkdir()
-        _, result = self.prepare(env=complete)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('new sibling', result.stderr)
-        _, result = self.prepare(env=complete, reuse_support=self.root / 'unused-support')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('fresh support', result.stderr)
-
-    def test_model_handoff_reuse_selects_one_input_and_refuses_mixed_export_mode(self):
-        env = {**self.env, 'ELASTOS_RELEASE_MODEL_PUBLISHED_AT': '1800000000',
-               'ELASTOS_RELEASE_MODEL_PUBLISHER_DID': 'did:key:z6MkFixture',
-               'ELASTOS_RELEASE_MODEL_HANDOFF_INPUT': str(self.root / 'shared-models'),
-               'ELASTOS_RELEASE_MODEL_HANDOFF_OUTPUT': str(self.root / 'native-models')}
-        command = ('/bin/bash', '-c', 'source scripts/publish-release.sh; release_model_preparation_enabled')
-        enabled = self.command(*command, env=env)
-        self.assertEqual(enabled.returncode, 0, enabled.stderr)
-        self.assertEqual(enabled.stdout.strip(), 'true')
-        for variable in ('KUBO_BIN', 'KUBO_REPO'):
-            with self.subTest(variable=variable):
-                refused = self.command(*command, env={**env, 'ELASTOS_RELEASE_MODEL_' + variable: 'fixture'})
-                self.assertNotEqual(refused.returncode, 0)
-                self.assertIn('without KUBO_BIN or KUBO_REPO', refused.stderr)
-
-    def test_optional_model_wiring_retains_unsigned_handoff_outside_native_artifacts(self):
-        # Exercise the native worker and real upstream capsule packaging. Only
-        # the expensive Kubo/model retention operation is a local inert stub.
-        driver = self.repo / 'scripts/release-upstream-assets.py'
-        driver.rename(driver.with_name('release-upstream-assets-real.py'))
-        driver.write_text(r'''#!/usr/bin/env python3
-import hashlib, json, os, pathlib, subprocess, sys
-args = sys.argv[1:]
-flags = ('--model-kubo-bin', '--model-kubo-repo', '--published-at', '--model-publisher-did', '--model-handoff-output')
-assert all(args.count(flag) == 1 for flag in flags)
-values = {flag: args[args.index(flag) + 1] for flag in flags}
-for flag, variable in zip(flags, ('KUBO_BIN', 'KUBO_REPO', 'PUBLISHED_AT', 'PUBLISHER_DID', 'HANDOFF_OUTPUT')):
-    assert values[flag] == os.environ['ELASTOS_RELEASE_MODEL_' + variable]
-baseline = [value for index, value in enumerate(args) if value not in flags and (index == 0 or args[index - 1] not in flags)]
-reply = subprocess.check_output([sys.executable, str(pathlib.Path(__file__).with_name('release-upstream-assets-real.py')), *baseline], text=True)
-result = json.loads(reply)
-output = pathlib.Path(args[args.index('--output') + 1])
-handoff = pathlib.Path(values['--model-handoff-output'])
-handoff.mkdir(mode=0o700)
-def write(name, content):
-    path = handoff / name
-    path.write_bytes(content)
-    path.chmod(0o600)
-    return {'release_path': name, 'checksum': 'sha256:' + hashlib.sha256(content).hexdigest(), 'size': len(content)}
-retention = {}
-for index, name in enumerate(('model-qwen3.5-0.8b', 'model-qwen3.5-4b', 'model-qwen3.5-9b', 'model-bonsai-8b-q1')):
-    retention[name] = {'package_cid': 'bfixture' + str(index),
-                       'car': write(name + '.car', ('inert CAR ' + name).encode()),
-                       'receipt': write(name + '.car.receipt.json', b'{"fixture":true}\n')}
-catalogue = write('model-catalog.unsigned.json', json.dumps({'schema': 'elastos.model.catalog/v1',
-    'published_at': int(values['--published-at']), 'entries': []}).encode())
-catalogue['publisher_did'] = values['--model-publisher-did']
-result.update(model_retention=retention, model_catalog_unsigned=catalogue)
-receipt_path = output / 'upstream-input.json'
-receipt = json.loads(receipt_path.read_bytes())
-receipt.update(model_retention=retention, model_catalog_unsigned=catalogue)
-receipt_path.write_text(json.dumps(receipt) + '\n')
-print(json.dumps(result))
-''')
-        driver.chmod(0o755)
-        self.commit('inert model retention wiring fixture')
-        output, result = self.prepare(env=self.model_preparation_env())
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        handoff = self.root / 'model-handoff'
-        self.assertEqual(len(list(handoff.iterdir())), 9)
-        provenance = json.loads((output / 'model-handoff.json').read_bytes())
-        self.assertEqual(provenance['schema'], 'elastos.release-model-handoff/v1')
-        self.assertEqual(provenance['handoff_directory'], '../model-handoff')
-        receipt = json.loads((output / 'platform-input.json').read_bytes())
-        self.assertEqual(provenance['source'], {key: receipt['source'][key] for key in ('commit', 'tree', 'clean')})
-        self.assertEqual(receipt['files']['model-handoff.json']['sha256'], hashlib.sha256((output / 'model-handoff.json').read_bytes()).hexdigest())
-        self.assertEqual(provenance['upstream_input_sha256'], hashlib.sha256((output / 'upstream-input.json').read_bytes()).hexdigest())
-        for name, info in provenance['files'].items():
-            self.assertEqual(info['checksum'], 'sha256:' + hashlib.sha256((handoff / name).read_bytes()).hexdigest())
-            self.assertEqual(info['size'], (handoff / name).stat().st_size)
-            self.assertEqual((handoff / name).stat().st_mode & 0o077, 0)
-            self.assertFalse((output / 'artifacts' / name).exists())
-        manifest = json.loads((output / 'components.json').read_bytes())
-        self.assertNotIn('model_retention', manifest)
-        self.assertNotIn('model_catalog_unsigned', manifest)
-        self.assertFalse(any('model_retention' in component for component in manifest['external'].values()))
-        checked = self.command('python3', 'scripts/release-platform-input.py', 'verify', str(output))
-        self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_success_uses_real_packaging_and_receipt(self):
         output, result = self.prepare()
