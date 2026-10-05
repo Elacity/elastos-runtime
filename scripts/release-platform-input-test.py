@@ -81,6 +81,8 @@ class PlatformInputTest(unittest.TestCase):
         source_root = self.root / "source"
         source_root.mkdir()
         self.write_json(source_root / "components.json", self.template)
+        (source_root / "elastos").mkdir()
+        (source_root / "elastos/CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         source = json.loads((next(iter(self.bundles.values())) / "platform-input.json").read_text())["source"]
         for context in (patch.object(inputs, "SOURCE_ROOT", source_root),
                         patch.object(inputs, "source_identity", return_value=source)):
@@ -1049,8 +1051,45 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         options.update(overrides)
         return inputs.signing_input(fixture.stage, fixture.cids_path, fixture.stamps_path, **options)
 
+    def test_unsigned_handoff_takes_wrapped_changes_from_unreleased_changelog(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Added\n\n"
+            "- Home shows signed\n  change notes.\n\n### Fixed\n"
+            "- Updates retain café text.\n\n## [0.7.0] - 2026-01-01\n- Older change.\n")
+        manifest = self.prepare_signing_fixture(fixture)
+        self.assertEqual(manifest["release"]["changes"],
+                         ["Home shows signed change notes.", "Updates retain café text."])
+
+    def test_unsigned_handoff_prefers_matching_version_changelog(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "## Unreleased\n- Future change.\n\n## [0.7.1] - 2026-01-01\n"
+            "Release introduction.\n\n### Fixed\n- This release.\n\n"
+            "## [0.7.0]\n- Older change.\n")
+        manifest = self.prepare_signing_fixture(fixture)
+        self.assertEqual(manifest["release"]["changes"], ["This release."])
+
+    def test_unsigned_handoff_omits_changes_without_matching_notes(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text("## [0.7.0]\n- Older change.\n")
+        self.assertNotIn("changes", self.prepare_signing_fixture(fixture)["release"])
+
+    def test_unsigned_handoff_refuses_changelog_outside_runtime_bounds(self):
+        fixture = self.signing_fixture()
+        for notes in (["é" * 251], ["change"] * 33, ["x" * 500] * 17,
+                      ["before\x7fafter"], [""]):
+            with self.subTest(notes=notes):
+                (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+                    "## [Unreleased]\n" + "\n".join("- " + note for note in notes) + "\n")
+                with self.assertRaisesRegex(ValueError, "changes"):
+                    self.prepare_signing_fixture(fixture)
+                self.assertFalse(fixture.output.exists())
+
     def test_unsigned_mac_canary_handoff_binds_exact_files_installer_and_source(self):
         fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "## [Unreleased]\n- System shows signed change notes.\n")
         manifest = self.prepare_signing_fixture(fixture)
         rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
         self.assertIn(b'HEAD_CID=""', rendered)
@@ -1058,6 +1097,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.assertEqual((manifest["version"], manifest["channel"]), ("0.7.1", "canary"))
         self.assertEqual(manifest["installer"], {"blob_oid": fixture.blob_oid, "stamps": fixture.stamps})
         self.assertEqual(manifest["release"]["source"], manifest["source"])
+        self.assertEqual(manifest["release"]["changes"], ["System shows signed change notes."])
         self.assertEqual(manifest["release"]["installer_sha256"], signer.sha256(rendered))
         self.assertEqual(manifest["release"]["released_at"], manifest["head"]["updated_at"])
         self.assertEqual(set(manifest["release"]["platforms"]), {fixture.platform})

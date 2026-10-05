@@ -63,6 +63,20 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def check_release_changes(changes):
+    """Match operator_control.rs text bounds, including UTF-8 byte lengths."""
+    require(type(changes) is list, "release changes must be a string array")
+    require(len(changes) <= 32, "release has too many changes")
+    total = 0
+    for change in changes:
+        require(type(change) is str, "release changes must be strings")
+        size = len(change.encode("utf-8"))
+        total += size
+        require(change.strip() and size <= 500 and total <= 8 * 1024
+                and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in change),
+                "release changes exceed their text bounds")
+
+
 def pairs(items):
     result = {}
     for name, value in items:
@@ -466,7 +480,9 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     require(type(installer) is dict and set(installer) == {"blob_oid", "stamps"}, "installer input refused")
     rendered = render_installer(installer_template(policy, installer["blob_oid"], fetch), installer["stamps"], policy["publisher_did"])
     release = manifest["release"]
-    require(type(release) is dict and set(release) == {"schema", "source", "version", "channel", "released_at", "prev_release_cid", "platforms", "installer_sha256"}, "release fields refused")
+    require(type(release) is dict and set(release) - {"changes"} == {"schema", "source", "version", "channel", "released_at", "prev_release_cid", "platforms", "installer_sha256"}, "release fields refused")
+    if "changes" in release:
+        check_release_changes(release["changes"])
     require(release["schema"] == "elastos.release/v1" and release["source"] == source
             and release["version"] == policy["version"] and release["channel"] == policy["channel"]
             and type(release["released_at"]) is int and release["released_at"] >= 0

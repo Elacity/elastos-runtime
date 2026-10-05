@@ -1067,6 +1067,29 @@ def installer_source_blob(source):
     return oid, data
 
 
+def changelog_changes(version):
+    """Use this release's bullets, or Unreleased until its heading is cut."""
+    sections = {}
+    text = (SOURCE_ROOT / "elastos/CHANGELOG.md").read_text(encoding="utf-8")
+    for section in re.split(r"(?m)^## ", text)[1:]:
+        heading, _, body = section.partition("\n")
+        name = re.match(r"\[?([^\]\s]+)", heading)
+        if name:
+            sections[name[1]] = body
+    changes = []
+    continuing = False
+    for line in sections.get(version, sections.get("Unreleased", "")).split("\n"):
+        bullet = re.match(r"^[-*] (.*)$", line)
+        if bullet:
+            changes.append(bullet[1].strip())
+            continuing = True
+        elif continuing and line.startswith((" ", "\t")) and line.strip():
+            changes[-1] += " " + line.strip()
+        else:
+            continuing = False
+    return changes
+
+
 def signing_input(stage, cids_path, stamps_path, channel, output,
                   preview_platform=None, prev_release_cid=None, prev_head_cid=None):
     """Prepare data for the separately installed custodian signer; no key input."""
@@ -1111,6 +1134,10 @@ def signing_input(stage, cids_path, stamps_path, channel, output,
                             "released_at": now, "prev_release_cid": prev_release_cid,
                             "platforms": platforms, "installer_sha256": signer.sha256(rendered)},
                 "head": {"updated_at": now, "prev_head_cid": prev_head_cid}}
+    changes = changelog_changes(record["version"])
+    signer.check_release_changes(changes)
+    if changes:
+        manifest["release"]["changes"] = changes
     manifest_bytes = signer.json_bytes(manifest)
     signer.require(len(manifest_bytes) <= signer.MAX_JSON, "signing input too large")
     if output.exists() or output.is_symlink():
