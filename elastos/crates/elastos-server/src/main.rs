@@ -534,6 +534,23 @@ enum Commands {
         backup_dir: PathBuf,
     },
 
+    /// Admit and install the installer's verified release through the shared writer
+    #[command(name = "install-release", hide = true)]
+    InstallRelease {
+        /// Runtime data root of this installation
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Installed Runtime binary path
+        #[arg(long)]
+        binary: PathBuf,
+        /// Verified candidate Runtime, trusted sources, release head and release
+        #[arg(long, num_args = 4, value_names = ["RUNTIME", "SOURCES", "HEAD", "RELEASE"])]
+        candidate: Vec<PathBuf>,
+        /// Admit only; change nothing
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Show runtime version
     Version,
 
@@ -1584,6 +1601,23 @@ async fn main() -> anyhow::Result<()> {
                 &backup_dir,
             )?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+
+        Commands::InstallRelease {
+            data_dir,
+            binary,
+            candidate,
+            check,
+        } => {
+            let [runtime, sources, head, release] = candidate.as_slice() else {
+                anyhow::bail!("install-release requires four candidate files");
+            };
+            elastos_server::update::install_release(
+                &data_dir,
+                &binary,
+                [runtime, sources, head, release].map(PathBuf::as_path),
+                check,
+            )?;
         }
 
         Commands::Version => {

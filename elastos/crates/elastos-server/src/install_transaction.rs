@@ -1,5 +1,5 @@
 //! Installed release-file transaction. Journal schemas bind their fixed destinations.
-//! Installer adoption of this lock is a separate release-owner integration.
+//! Updates stage all five release files; the installer leaves components to setup.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -62,6 +62,15 @@ impl ReleaseFile {
             Self::ReleaseHead => "release_head",
             Self::ReleaseManifest => "release_manifest",
         }
+    }
+
+    /// Installer transactions omit components, which Runtime setup installs.
+    fn complete_set(ids: impl Iterator<Item = Self>) -> bool {
+        let mut count = 0;
+        let ids = ids.inspect(|_| count += 1).collect::<BTreeSet<_>>();
+        ids.len() == count
+            && (ids.len() == Self::ALL.len()
+                || ids.len() == Self::ALL.len() - 1 && !ids.contains(&Self::Components))
     }
 }
 
@@ -728,11 +737,8 @@ impl InstallTransaction {
             bail!("Legacy recovery must finish before preparing a new installed release.");
         }
         self.require_empty_scratch()?;
-        if files.len() != ReleaseFile::ALL.len()
-            || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
-                != ReleaseFile::ALL.into_iter().collect()
-        {
-            bail!("release transaction requires exactly five release files");
+        if !ReleaseFile::complete_set(files.iter().map(|item| item.0)) {
+            bail!("release transaction requires the complete release file set");
         }
         let mut entries = Vec::new();
         let mut allocations = BTreeMap::new();
@@ -1031,7 +1037,11 @@ impl InstallTransaction {
         self.write_journal(&journal)?;
         let result = (|| {
             for id in [ReleaseFile::RuntimeBinary, ReleaseFile::Components] {
-                let entry = journal.entries.iter().find(|entry| entry.id == id).unwrap();
+                let entry = journal
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .context("support activation requires all five release files")?;
                 fs::rename(self.scratch(id, STAGE), &self.destinations[&id])?;
                 sync_directory(self.destinations[&id].parent().unwrap())?;
                 self.require_state(id, Some(&entry.staged_sha256), Some(entry.staged_mode))?;
@@ -1176,13 +1186,7 @@ impl InstallTransaction {
                 .transaction_id
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit())
-            || journal.entries.len() != ReleaseFile::ALL.len()
-            || journal
-                .entries
-                .iter()
-                .map(|entry| entry.id)
-                .collect::<BTreeSet<_>>()
-                != ReleaseFile::ALL.into_iter().collect()
+            || !ReleaseFile::complete_set(journal.entries.iter().map(|entry| entry.id))
         {
             bail!("installation journal identity is incompatible with this writer");
         }
@@ -1636,10 +1640,16 @@ pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyho
 }
 
 fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
-    if journal.restart.is_none() {
-        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
-    } else {
+    if journal.restart.is_some() {
         "Home restart recovery is pending. Start the retained update controller with its receipt."
+    } else if journal
+        .entries
+        .iter()
+        .all(|entry| entry.id != ReleaseFile::Components)
+    {
+        "An interrupted installation requires recovery. Run install.sh again before starting Home."
+    } else {
+        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
     }
 }
 

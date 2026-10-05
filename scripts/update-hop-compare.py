@@ -601,7 +601,7 @@ def cli_installer_metadata(installer, env):
 
 
 def cli_signature(installer, envelope, domain, signer, env):
-    command = 'source "$1"; ALLOW_UNSIGNED=false; verify_signature "$2" "$3" "$4"'
+    command = 'source "$1"; verify_signature "$2" "$3" "$4"'
     proc = subprocess.run(["/bin/bash", "-c", command, "fixture", str(installer),
                            str(envelope), domain, signer], env=env, capture_output=True,
                           timeout=15, check=False)

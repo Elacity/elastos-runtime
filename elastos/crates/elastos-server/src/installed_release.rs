@@ -238,6 +238,52 @@ fn admit_pair_and_binary(
     head_bytes: &[u8],
     release_bytes: &[u8],
 ) -> Result<(InstalledRelease, serde_json::Value)> {
+    let release = admit_pair(source, head_bytes, release_bytes)?;
+    anyhow::ensure!(
+        fs::symlink_metadata(&source.install_path)?.is_file()
+            && fs::canonicalize(&source.install_path)? == binary,
+        "Installed source binary path differs from its writer"
+    );
+    let platform = &release["payload"]["platforms"][crate::update::detect_release_platform()];
+    let (binary_sha256, binary_size) = file_digest(binary)?;
+    admit_descriptor(&platform["binary"], &binary_sha256, binary_size)?;
+    Ok((
+        InstalledRelease {
+            head: head_bytes.to_vec(),
+            release: release_bytes.to_vec(),
+            binary_sha256,
+        },
+        release,
+    ))
+}
+
+/// The installer admits its candidate set before the shared writer stages it.
+/// Its source is the explicit trust choice, so it may pin a new publisher key.
+pub(crate) fn admit_candidate(
+    binary: &Path,
+    source: &TrustedSource,
+    executable: &[u8],
+    head_bytes: &[u8],
+    release_bytes: &[u8],
+) -> Result<()> {
+    let release = admit_pair(source, head_bytes, release_bytes)?;
+    anyhow::ensure!(
+        Path::new(&source.install_path) == binary,
+        "Installer source binary path differs from its writer"
+    );
+    let platform = &release["payload"]["platforms"][crate::update::detect_release_platform()];
+    admit_descriptor(
+        &platform["binary"],
+        &hex::encode(Sha256::digest(executable)),
+        executable.len() as u64,
+    )
+}
+
+fn admit_pair(
+    source: &TrustedSource,
+    head_bytes: &[u8],
+    release_bytes: &[u8],
+) -> Result<serde_json::Value> {
     anyhow::ensure!(
         !source.publisher_dids.is_empty()
             && source.publisher_dids.iter().all(|did| !did.is_empty()),
@@ -272,22 +318,7 @@ fn admit_pair_and_binary(
         "Installed signed version differs from its source record"
     );
     semver::Version::parse(&source.installed_version)?;
-    anyhow::ensure!(
-        fs::symlink_metadata(&source.install_path)?.is_file()
-            && fs::canonicalize(&source.install_path)? == binary,
-        "Installed source binary path differs from its writer"
-    );
-    let platform = &release["payload"]["platforms"][crate::update::detect_release_platform()];
-    let (binary_sha256, binary_size) = file_digest(binary)?;
-    admit_descriptor(&platform["binary"], &binary_sha256, binary_size)?;
-    Ok((
-        InstalledRelease {
-            head: head_bytes.to_vec(),
-            release: release_bytes.to_vec(),
-            binary_sha256,
-        },
-        release,
-    ))
+    Ok(release)
 }
 
 pub(crate) fn admit_descriptor(
