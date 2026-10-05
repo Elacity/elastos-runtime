@@ -142,21 +142,60 @@ This repo keeps one coordinated release changelog:
 
 That matches the coordinated runtime release train better than per-crate changelogs. A publish is not complete unless the changelog and public status story are honest about what changed.
 
-## Ceremony Requirements
+## Publishing a release
 
-Before publish:
+A canary release moves through three places: GitHub builds it without keys, the
+operator Mac prepares and signs it, and the seed imports and serves it. Choose
+the version by the contract change (see Meaning) and update the changelog first;
+`scripts/publish-release.sh` checks the version format with
+[`scripts/check-versioning.sh`](../scripts/check-versioning.sh).
 
-1. version passes [`scripts/check-versioning.sh`](../scripts/check-versioning.sh)
-2. version choice matches the actual contract change (`MAJOR` / `MINOR` / `PATCH`)
-3. changelog and public docs are honest about the release
-4. checked publish ceremony passes
-5. remote proof passes before marking the published baseline
+1. **Build.** Run the `Release package` workflow
+   ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
+   with the source commit, the install version N and the update version N+1.
+   The source is a commit on `develop`, or the head of an open pull request into
+   `develop` that already contains `develop`. The run builds the Apple silicon
+   pair (N+1 reuses N's support bytes) in fresh Cargo directories and checks
+   versions, source and support parity. Each job summary records its artifact
+   ID and digest.
+2. **Prepare.** On the operator Mac, from a clone of this repository, run
+   `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
+   succeeded and that its source is on `develop` (merge an open pull request
+   first), downloads and checks the Mac artifact, verifies the inputs, checks
+   out the exact source as a worktree, takes Kubo from the build, reads the
+   publisher bootstrap and signer DID from the public origin, copies the seed's
+   current `publish-state.json` and runs `scripts/publish-release.sh
+   --prepare-only` in an isolated data directory.
+3. **Sign.** `scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL`
+   writes the exact signer policy (with the current `develop` head) and prints
+   the `release-signer.py` command. The operator runs it and types the DID.
+   The signer refuses a commit that is not on `develop`.
+4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
+   seed sequence for the seed's installed Runtime: copy the four small signed
+   files, rebuild the rest from the CI artifact, verify every hash, stop the
+   service, run the preflight, import, and start the service. An import run
+   while the service is stopped ends with the known gossip error
+   `No running runtime found` after the commit, and the sequence accepts only
+   that error.
 
-Current enforcement:
+Upgrading the seed Runtime itself is rare. Run the workflow with
+`seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints
+the steps: create `/opt/elastos` for the service user, check and install the
+exact source at `/opt/elastos/release-source` (the seed Runtime runs its
+release helpers from the path it was built in), install the Runtime and IPFS
+provider, update the provider's pin in the installed `components.json`, verify
+the provider and start the service. The seed needs glibc 2.39 or newer.
 
-- `elastos publish-release` is the preferred command surface for the checked publish flow
-- `scripts/publish-release.sh` is the low-level implementation and validates the version string before publish logic
-- the checked publish flow stamps `ELASTOS_RELEASE_VERSION` into published runtime/provider/capsule builds so installed artifacts report the coordinated release line instead of raw local package metadata
+Both seed sequences check sudo and every path they write before stopping the
+service, and once it is stopped an `EXIT` trap starts it again if any later
+step fails, so the seed is never left down. `seed-upgrade` checks the run the
+same way `prepare` does.
+
+Seed details come from `RELEASE_SEED`, `RELEASE_SEED_DATA`,
+`RELEASE_SEED_UNIT`, `RELEASE_SEED_STAGE`, `RELEASE_SEED_RUNTIME` and
+`RELEASE_SEED_USER`, not from this repository. Publish N first; after N is
+accepted on a real install, prepare N+1 from the same run before its artifacts
+expire (14 days).
 
 ## Tagging Recommendation
 

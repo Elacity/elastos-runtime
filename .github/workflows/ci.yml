@@ -83,6 +83,7 @@ jobs:
           python3 scripts/media-tools-build-test.py
           python3 scripts/verify-linux-arm64-package-test.py
           python3 scripts/update-hop-compare-test.py
+          python3 .github/scripts/release-mac-capacity-test.py
           python3 scripts/install-bootstrap-test.py
 
   test-behaviour:
