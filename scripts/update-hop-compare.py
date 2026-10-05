@@ -1664,7 +1664,10 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
             if phase == "wrong-platform":
                 release_platform = "x86_64-darwin" if release_platform == "aarch64-darwin" else "aarch64-darwin"
             version = old_version if phase == "old" else new_version
+            # Home's System check requires the signed source; the change note lets
+            # the installed journey tell each offered publication apart.
             release_payload = {"schema": "elastos.release/v1", "channel": "canary", "version": version,
+                               "source": source, "changes": ["Fixture " + phase],
                                "platforms": {release_platform: {"binary": binary_binding, "components": binding(components)}}}
             release = add(phase + "/release.json", sign(release_payload, "elastos.release.v1", keys[phase == "wrong-signer-release"]))
             content(release)
@@ -2236,7 +2239,7 @@ def cli_port_released(value):
             need(probe.connect_ex(address) != 0, "initial Home listener survives shutdown")
 
 
-def cli_initial_home(processes, manifest, home_path, evidence=None, publish_next=None):
+def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None):
     """Run the installed entrypoint; Runtime alone admits and owns its child."""
     before = cli_home_snapshot(manifest, home_path)
     expected_metadata = cli_expected_installed_metadata(manifest, "old")
@@ -2273,7 +2276,13 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish_next
         need(proof is not None and process.poll() is None, "installed Home did not reach controller readiness")
         need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
         if manifest["proof_kind"] == "real-runtime":
-            proof["system"] = cli_home_system_journey(processes, manifest, home_path, publish_next)
+            proof["system"] = cli_home_system_journey(processes, manifest, home_path, publish)
+            # The approved update replaced the installed release; shutdown must keep exactly that.
+            new = manifest["publications"]["new"]
+            before["binary"] = manifest["files"][new["binary"]]["sha256"]
+            before["installed_metadata"] = cli_expected_installed_metadata(manifest, "new")
+            before["sources"]["sources"][0].update(installed_version=manifest["new"]["version"],
+                                                   head_cid=manifest["files"][new["head"]]["cid"])
     except Exception as error:
         failure = error
     finally:
@@ -2299,9 +2308,10 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish_next
         detail += cli_ci_stderr_detail(processes, manifest, "initial-home-start", "controller")
         raise ValueError(detail) from failure
     need(proof is not None, "initial Home readiness proof is absent")
-    for identity in (proof["controller"], proof["host"]):
+    updated_host = proof.get("system", {}).get("host")
+    for identity in (proof["controller"], proof["host"], *([updated_host] if updated_host else [])):
         need(cli_process_identity(identity["pid"]) is None, "initial Home process survives shutdown")
-    groups = {proof["controller"]["group"], proof["host"]["group"]}
+    groups = {proof["controller"]["group"], proof["host"]["group"], *([updated_host["group"]] if updated_host else [])}
     need(not any(row["group"] in groups for row in cli_census()), "initial Home owned process group survives shutdown")
     need(not (directory / "gateway-runtime-coords.json").exists()
          and lock_state(directory / "host-process.lock") == "released"
@@ -2318,9 +2328,10 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish_next
     return proof
 
 
-def cli_home_system_journey(processes, manifest, home_path, publish_next):
-    """Create the first account and read System before and after the next publication."""
-    need(publish_next is not None, "installed System journey requires the next signed publication")
+def cli_home_system_journey(processes, manifest, home_path, publish):
+    """Through the real pages: create the first account, see Home up to date, refuse a
+    tampered offer, approve the next version and reconnect after the controller restart."""
+    need(publish is not None, "installed System journey requires the fixture publisher")
     node = shutil.which("node")
     need(node is not None and "PLAYWRIGHT_BROWSERS_PATH" in os.environ, "installed System journey requires Node and Playwright")
     output = processes.output / "home-system"
@@ -2332,15 +2343,34 @@ def cli_home_system_journey(processes, manifest, home_path, publish_next):
                HOME_VIRTUAL_AUTH_UPDATE_VERSIONS=manifest["old"]["version"] + " " + manifest["new"]["version"])
     browser = processes.spawn([node, str(Path(__file__).with_name("home-passkey-virtual-auth-smoke.mjs"))],
                               env, home_path, "home-system")
-    deadline = time.monotonic() + 240
-    while browser.poll() is None and not (output / "up-to-date.json").exists() and time.monotonic() < deadline:
-        time.sleep(.2)
-    need((output / "up-to-date.json").exists() and browser.poll() is None,
-         "installed Home sign-up or up-to-date System state failed" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
-    publish_next()
-    need(browser.wait(timeout=180) == 0,
-         "System did not show the next signed version" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
-    return {name: cli_json(output / (name + ".json")) for name in ("up-to-date", "update-available")}
+    binary = home_path / ".local/bin/elastos"
+    source = lambda: source_for_home(home_path)["installed_version"]  # noqa: E731
+    shas = {name: manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("old", "new")}
+    # The approved update replaces the installed executable while its processes are owned.
+    for path in (binary, home_path / CLI_DATA / "update-controller/runtime"):
+        processes.roots[str(path)] = set(shas.values())
+
+    def reached(stage, seconds, message):
+        deadline = time.monotonic() + seconds
+        while browser.poll() is None and not (output / (stage + ".json")).exists() and time.monotonic() < deadline:
+            time.sleep(.2)
+        need((output / (stage + ".json")).exists() and browser.poll() is None,
+             message + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
+
+    reached("up-to-date", 240, "installed Home sign-up or up-to-date System state failed")
+    publish("tampered-binary")
+    reached("refused", 330, "System did not refuse the tampered fixture plainly")
+    need(digest(binary) == shas["old"] and source() == manifest["old"]["version"], "refused update changed the installed release")
+    publish("new")
+    need(browser.wait(timeout=420) == 0,
+         "System did not update and reconnect on the next version" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
+    status = cli_private_json(home_path / CLI_DATA / "update-controller/status.json")
+    host = cli_process_identity(status["host_pid"]) if status.get("host_pid") else None
+    need(status["phase"] == "updated" and status["current_version"] == manifest["new"]["version"]
+         and digest(binary) == shas["new"] and source() == manifest["new"]["version"] and host is not None
+         and cli_process_executable(host["pid"]) == str(binary), "controller did not restart Home on the next version")
+    stages = ("up-to-date", "tampered-offer", "refused", "next-offer", "updated")
+    return {"stages": {name: cli_json(output / (name + ".json")) for name in stages}, "host": host}
 
 
 def cli_run(config, output, local_rehearsal=None):
@@ -2540,7 +2570,7 @@ def cli_run(config, output, local_rehearsal=None):
             result["paths"]["m1-install"]["checks"]["initial-home"] = {
                 "status": "failed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home"}
             result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
-                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"], lambda: phase("new"))
+                processes, manifest, initial, result["paths"]["m1-install"]["checks"]["initial-home"], phase)
         result["paths"]["m2-discovery"] = {"status": "failed", "checks": {}}
         if result["proof_scope"] in ("production-positive", "ci-rehearsal", "local-rehearsal"):
             phase("new")
