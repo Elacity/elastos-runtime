@@ -177,6 +177,11 @@ support under the installation lock. An interrupted transaction completes its
 original recovery before that migration. If the saved pair requires repair,
 keep the files in place and follow Runtime's operator repair step.
 
+Running `install.sh` again uses the same installation lock and journal. Before it
+stops Runtime, it refuses an older release, another channel, a pending Home
+update and a second writer. An interrupted run restores the previous
+installation.
+
 ### Recover an interrupted update
 
 If Runtime reports an interrupted command-line update, run `elastos update`
@@ -234,9 +239,10 @@ gateways. After confirmation, Runtime accepts release signatures from the new
 DID and refuses signatures from the former DID.
 
 An existing Home that keeps its old source pin refuses a release signed by the
-new maintainer with a signer-mismatch error. That Home continues to trust the
-old key and remains exposed if a copy of that key exists. The owner must compare
-the public DID and complete the explicit re-trust step before its next update.
+new maintainer. Its `elastos update` error names the signer mismatch and says to
+run the publisher's `install.sh`. That run is an explicit re-trust: it pins the
+new DID, installs the release and keeps identity, accounts and user files. Until
+then the Home trusts the old key and remains exposed if a copy of that key exists.
 
 ## Installed files
 

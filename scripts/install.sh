@@ -906,50 +906,38 @@ fi
 info "Verifying binary SHA-256..."
 sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
-# ── Install the verified Runtime binary ─────────────────────────────
+# ── Admit the verified release with the shared installation writer ──
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
-info "Stopping verified Runtime processes for this installation before its protected-root check..."
-installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
-    || die "Close this installation's Runtime and retry; its existing files were preserved"
-info "Open Home again after installation to reconnect."
-
-info "Installing binary to ${INSTALL_DIR}/elastos..."
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
 mkdir -p "$INSTALL_DIR"
-TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
+
+# New Runtime data is private; preserve the mode of an existing installation.
+(umask 077; mkdir -p "$DATA_DIR")
+
+TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
+trap 'rm -rf "$TMPDIR" "$TMP_INSTALL_BIN"' EXIT
 cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
 chmod +x "${TMP_INSTALL_BIN}"
 
 # The staged executable must report the exact release version on stdout with
-# empty stderr before it replaces the current binary. Refusals remove this copy.
+# empty stderr before it can write this installation.
 STAGED_VERSION_STATUS=0
 STAGED_VERSION_STDERR_PATH="${TMPDIR}/elastos-version.stderr"
 STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
 STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
 if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
-    rm -f "${TMP_INSTALL_BIN}"
     die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
 if [[ "${STAGED_VERSION_OUTPUT}" != "elastos ${RELEASE_VERSION}" || -s "${STAGED_VERSION_STDERR_PATH}" ]]; then
-    rm -f "${TMP_INSTALL_BIN}"
     die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
-mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 
-# New Runtime data is private; preserve the mode of an existing installation.
-(umask 077; mkdir -p "$DATA_DIR")
-
-PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
-info "Verifying and upgrading configured protected roots while Runtime is stopped..."
-"${INSTALL_DIR}/elastos" principal-root-upgrade \
-    --data-dir "${DATA_DIR}" \
-    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
-
-# ── Save Carrier contact + release metadata for `elastos upgrade` ────
+# ── Carrier contact + release metadata for `elastos upgrade` ─────────
 
 SIGNER_DID=$(json_get "${TMPDIR}/release-head.json" 'd["signer_did"]')
 
-SOURCES_PATH="${DATA_DIR}/sources.json"
+SOURCES_PATH="${TMPDIR}/sources.json"
 PUBLISHER_HASH=$(SIGNER_DID="${SIGNER_DID}" python3 - <<'PY'
 import hashlib
 import os
@@ -1010,61 +998,30 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
     json.dump(sources, f, indent=2)
     f.write("\n")
 PY
+
+# The writer refuses an older release, another channel, a pending Home
+# update and a concurrent writer before this installer stops Runtime.
+INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
+    --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
+    "${TMPDIR}/release-head.json" "${TMPDIR}/release.json")
+"${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
+
+info "Stopping verified Runtime processes for this installation before its protected-root check..."
+installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
+info "Open Home again after installation to reconnect."
+
+# One journaled transaction replaces the Runtime, trusted sources and the
+# verified release pair; an interrupted run restores the previous set.
+info "Installing binary to ${INSTALL_DIR}/elastos..."
+"${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+
+PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+info "Verifying and upgrading configured protected roots while Runtime is stopped..."
+"${INSTALL_DIR}/elastos" principal-root-upgrade \
+    --data-dir "${DATA_DIR}" \
+    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
 info "Saved trusted source config to ${DATA_DIR}/sources.json"
-
-# Consumer custody is separate from this Runtime's publication output. Runtime
-# setup/update consume this verified pair under their installation guard.
-python3 - "$TMPDIR" "$DATA_DIR" <<'PY_CONSUMED_RELEASE'
-import os, stat, sys
-from pathlib import Path
-
-def save_consumed_release():
-    source, data = map(Path, sys.argv[1:])
-    root = data / 'installation'
-    try:
-        root.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        metadata = os.fstat(directory)
-        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-            raise ValueError('Consumed release directory must be private and owned')
-        for name in ('release.json', 'release-head.json'):
-            try:
-                previous = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if (not stat.S_ISREG(previous.st_mode) or previous.st_nlink != 1
-                    or previous.st_uid != os.geteuid() or previous.st_mode & 0o077):
-                raise ValueError('Consumed release files must be private owned regular files')
-        staged = []
-        try:
-            # Finish both exclusive writes before replacing either verified file.
-            for name in ('release.json', 'release-head.json'):
-                temporary = '.' + name + '.bootstrap'
-                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=directory)
-                staged.append((temporary, name))
-                with os.fdopen(fd, 'wb') as stream:
-                    stream.write((source / name).read_bytes())
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            for temporary, name in staged:
-                os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
-            os.fsync(directory)
-        finally:
-            for temporary, _ in staged:
-                try: os.unlink(temporary, dir_fd=directory)
-                except FileNotFoundError: pass
-    finally:
-        os.close(directory)
-
-try:
-    save_consumed_release()
-except (OSError, ValueError) as exc:
-    raise SystemExit(f"Consumed release handoff failed: {exc}")
-PY_CONSUMED_RELEASE
 info "Saved verified release inputs for Runtime setup and updates"
 
 # ── Complete installation ─────────────────────────────────────────────
