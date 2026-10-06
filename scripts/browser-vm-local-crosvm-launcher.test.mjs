@@ -23,7 +23,7 @@ test("Runtime Browser helpers and adapter contain no escalation command", () => 
 
 function networkApi(result) {
   const calls = [];
-  const context = vm.createContext({ path, process: { getuid: () => 1001 },
+  const context = vm.createContext({ path, os: { userInfo: () => ({ username: "elastos-agent" }) }, process: { getuid: () => 1001 },
     runSync(command, args) { calls.push([command, args]); return result; },
   });
   const start = source.indexOf("function linuxNetworkCommand(");
@@ -33,11 +33,24 @@ function networkApi(result) {
 }
 
 test("missing Linux setup refuses launch with one root command", () => {
-  const api = networkApi({ status: 1, stderr: "Browser network setup is required. As root, run: python3 /fixture/scripts/browser-vm-linux-network.py setup --user elastos-agent\n" });
+  const api = networkApi({ status: 1, stderr: "Browser network setup is required. As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent\n" });
   assert.throws(() => api.requireLinuxNetwork("/fixture/bin/browser-vm-local-crosvm-launcher.mjs"),
     /As root, run: python3 .* setup --user elastos-agent/);
   assert.equal(api.calls.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(api.calls[0])), ["python3", ["/fixture/scripts/browser-vm-linux-network.py", "check"]]);
+});
+
+test("a failed helper command names the root-owned repair copy", () => {
+  const api = networkApi({ status: 1, stderr: "" });
+  assert.throws(() => api.requireLinuxNetwork("/fixture/bin/browser-vm-local-crosvm-launcher.mjs"),
+    /As root, run: python3 \/usr\/local\/lib\/elastos\/browser-vm-linux-network.py setup --user elastos-agent/);
+});
+
+test("existing Browser CI step runs the Linux network tests", () => {
+  const ci = fs.readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const step = ci.slice(ci.indexOf("- name: JavaScript behavior tests"), ci.indexOf("\n  # One input for every ARM consumer"));
+  assert.match(step, /python3 scripts\/browser-vm-linux-network\.test\.py/);
+  assert.match(step, /node --test/);
 });
 
 test("crosvm command consumes the prepared TAP and addresses", () => {
@@ -79,15 +92,20 @@ test("real launcher stops before VM commands when setup is absent", async t => {
   fs.writeFileSync(path.join(root, "scripts/browser-vm-linux-network.py"),
     helper.replace("RUN = Path('/run/elastos-browser')", `RUN = Path(${JSON.stringify(path.join(root, "absent-setup"))})`));
   for (const file of ["kernel", "rootfs", "initrd", "crosvm"]) fs.writeFileSync(path.join(root, file), "fixture");
+  const requestFile = path.join(root, "request.json");
+  fs.writeFileSync(requestFile, JSON.stringify({ schema: "elastos.browser.vm-engine.open/v1", launch_request: {
+    schema: "elastos.browser.engine.launch-request/v1", adapter: "fixture", stream_id: "fixture",
+    engine: "chromium_microvm", display_mode: "webrtc_remote_display", network_mode: "runtime_net_only",
+    direct_network: false, wallet_injection: false, relay_ipc: { kind: "unix_socket", path: socket },
+  } }));
+  // A regular stdin file avoids a nonblocking pipe read race in the fixture.
+  const requestFd = fs.openSync(requestFile, "r");
+  t.after(() => fs.closeSync(requestFd));
   const result = spawnSync(process.execPath, ["--import", preload, installed], {
     env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: root, ELASTOS_BROWSER_VM_ROOT: path.join(root, "sessions"),
       ELASTOS_BROWSER_VM_KERNEL: path.join(root, "kernel"), ELASTOS_BROWSER_VM_ROOTFS: path.join(root, "rootfs"),
       ELASTOS_BROWSER_VM_INITRD: path.join(root, "initrd"), ELASTOS_BROWSER_VM_CROSVM_BIN: path.join(root, "crosvm") },
-    input: JSON.stringify({ schema: "elastos.browser.vm-engine.open/v1", launch_request: {
-      schema: "elastos.browser.engine.launch-request/v1", adapter: "fixture", stream_id: "fixture",
-      engine: "chromium_microvm", display_mode: "webrtc_remote_display", network_mode: "runtime_net_only",
-      direct_network: false, wallet_injection: false, relay_ipc: { kind: "unix_socket", path: socket },
-    } }), encoding: "utf8", timeout: 5000,
+    stdio: [requestFd, "pipe", "pipe"], encoding: "utf8", timeout: 5000,
   });
   assert.equal(result.status, 1, result.stderr);
   // A root-run CI uses the explicit ordinary-user refusal instead.

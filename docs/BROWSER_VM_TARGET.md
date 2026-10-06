@@ -397,12 +397,14 @@ local TURN on TCP/UDP `41000` with relay ports `49152:49215`. Session ICE
 configuration uses `turn:{host_ip}:{turn_port}` with a username and credential.
 The launcher refuses a different local media port or relay range.
 
-After staging the reviewed helpers, run this command in a root shell. Replace
-`<data-dir>` and `<home-user>` with the stable Home data directory and its
-ordinary Linux account:
+After staging and reviewing the helpers, install the setup helper in its
+root-owned location. Run these commands in a root shell. Replace
+`<reviewed-checkout>` and `<home-user>` with the reviewed source directory and
+the ordinary Linux Home account:
 
 ```sh
-python3 <data-dir>/scripts/browser-vm-linux-network.py setup --user <home-user>
+install -D -o root -g root -m 755 <reviewed-checkout>/scripts/browser-vm-linux-network.py /usr/local/lib/elastos/browser-vm-linux-network.py
+python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user <home-user>
 ```
 
 The script lists the devices, addresses and policy, then asks for `y` before
@@ -416,13 +418,20 @@ This gives `elastos-agent` KVM access without changing its groups.
 Root stores ACL state in `/var/lib/elastos-browser/<uid>.json`, copies the
 setup helper to `/usr/local/lib/elastos/browser-vm-linux-network.py`, and
 enables `elastos-browser-network-<uid>.service`. This oneshot service restores
-the devices and rules after each boot, following host firewall services.
+the devices and rules after each boot, following host firewall services. The
+unit shares stop/restart and reload events with `nftables`, `firewalld`, `ufw`
+and `netfilter-persistent`. Before stopping or repairing the network, it
+removes the receipt and brings every TAP down, including active guests. A
+failed repair leaves the TAPs down and Browser unavailable. Active session
+locks can hold repair until the user closes those sessions.
 It writes a root-owned, boot-bound receipt under `/run/elastos-browser` only
 after all changes succeed. The Runtime does read-only checks of that receipt,
-its policy, TAP identity/owner/persistence/address, and device access on each
-readiness request and launch. Root owns firewall state: after a host firewall
-reload or manual rule change, close Browser sessions and rerun setup before
-using Browser. An ordinary process cannot inspect the privileged rule set.
+its policy, active unit state, TAP identity/owner/persistence/address, and
+device access on each readiness request and launch. Root owns firewall state:
+direct rule edits or flush commands outside these service events require the
+operator to close Browser sessions and rerun setup. An ordinary process cannot
+inspect the privileged rule set. Repair messages name the root-owned helper;
+if that copy is absent or unsafe, they first require a reviewed installation.
 
 The launcher leases a slot with an ordinary file lock. It releases that lock
 after the VM and media children stop. A TAP with an active carrier remains
@@ -450,7 +459,7 @@ forwarding, NAT and host default-route changes are unnecessary.
 For removal, use the same root shell and helper:
 
 ```sh
-python3 <data-dir>/scripts/browser-vm-linux-network.py remove --user <home-user>
+python3 /usr/local/lib/elastos/browser-vm-linux-network.py remove --user <home-user>
 ```
 
 After confirmation, removal deletes this account's TAPs, filter hooks/chains,
@@ -470,6 +479,9 @@ Use an isolated test Home on an unused port such as `18091`.
 1. Run the confirmed setup command as root. As the Home user, run
    `python3 <data-dir>/scripts/browser-vm-linux-network.py check`. Save the
    returned slot addresses. After reboot, repeat the check to prove restoration.
+   Restart and reload each installed firewall service. Prove restoration when
+   sessions are closed; with an active session, prove that failed repair keeps
+   the TAPs down and readiness unavailable. Close the session and rerun setup.
 2. Start the test Runtime as that user with a PATH directory containing only
    the needed ordinary tools (including `node`, `python3`, `ip`, `cp`, `ss`
    and `turnserver`) and its installed `bin` directory. Record

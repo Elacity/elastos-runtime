@@ -2,6 +2,7 @@
 """Root-owned Linux Browser TAP pool; check and lease run as the Home user."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -19,6 +21,7 @@ HELPER = Path('/usr/local/lib/elastos/browser-vm-linux-network.py')
 SYSFS = Path('/sys/class/net')
 IPV6 = Path('/proc/sys/net/ipv6/conf')
 SLOTS = 4
+FIREWALL_SERVICES = 'nftables.service firewalld.service ufw.service netfilter-persistent.service'
 
 
 class SlotsBusy(RuntimeError):
@@ -105,6 +108,7 @@ def check(uid):
     pool = networks(uid)
     if not isinstance(receipt, dict) or receipt.get('uid') != uid or receipt.get('boot_id') != boot_id() or receipt.get('networks') != pool or receipt.get('policy') != policy(pool):
         raise RuntimeError('setup receipt does not match this user, boot or network policy')
+    run('systemctl', 'is-active', '--quiet', f'elastos-browser-network-{uid}.service')
     for device in ['/dev/kvm', '/dev/net/tun']:
         if not stat.S_ISCHR(os.stat(device).st_mode) or not os.access(device, os.R_OK | os.W_OK):
             raise RuntimeError(f'{device} requires read/write access')
@@ -126,13 +130,26 @@ def check(uid):
     return pool
 
 
+def active_carrier(tap):
+    device = SYSFS / tap
+    if not device.exists() or not int((device / 'flags').read_text().strip(), 16) & 1:
+        return False
+    try:
+        return (device / 'carrier').read_text().strip() == '1'
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        # The link can go down between reading IFF_UP and carrier.
+        return False
+
+
 @contextlib.contextmanager
 def locks(uid, pool):
     with contextlib.ExitStack() as stack:
         for n in pool:
             file = stack.enter_context(open(RUN / f"{n['tapName']}.lock", 'a'))
             fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if (SYSFS / n['tapName'] / 'carrier').exists() and (SYSFS / n['tapName'] / 'carrier').read_text().strip() == '1':
+            if active_carrier(n['tapName']):
                 raise RuntimeError('Close Browser sessions before changing their network')
         yield
 
@@ -146,7 +163,7 @@ def lease(uid):
             except BlockingIOError:
                 continue
             # A VM which outlived its launcher still owns this device.
-            if (SYSFS / n['tapName'] / 'carrier').read_text().strip() == '1':
+            if active_carrier(n['tapName']):
                 continue
             print(json.dumps(n), flush=True)
             sys.stdin.buffer.read()  # Launcher holds the lease through child cleanup.
@@ -159,6 +176,16 @@ def write_json(file, value):
     temporary.write_text(json.dumps(value))
     temporary.chmod(0o644)
     temporary.replace(file)
+
+
+def invalidate(user):
+    if RUN.exists():
+        trusted_path(RUN)
+        (RUN / f'{user.pw_uid}.json').unlink(missing_ok=True)
+    # Cut off active guests as well as future launches during firewall changes.
+    for n in networks(user.pw_uid):
+        if (SYSFS / n['tapName']).exists():
+            run('ip', 'link', 'set', n['tapName'], 'down')
 
 
 def restore(user):
@@ -234,7 +261,7 @@ def configure(user, remove=False):
                 run('setfacl', '-x', f'u:{uid}', '/dev/kvm')
             else:
                 run('setfacl', '-m', previous, '/dev/kvm')
-            run('systemctl', 'disable', '--now', unit)
+            run('systemctl', 'disable', '--now', unit, optional=True)
             unit_path.unlink(missing_ok=True)
             udev.unlink(missing_ok=True)
             state.unlink()
@@ -260,18 +287,30 @@ def configure(user, remove=False):
             shutil.copyfile(__file__, HELPER)
         HELPER.chmod(0o755)
         udev.write_text(f'KERNEL=="kvm", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/kvm"\n')
-        unit_path.write_text(f'[Unit]\nDescription=ElastOS Browser network for UID {uid}\nAfter=network.target nftables.service firewalld.service ufw.service\n\n[Service]\nType=oneshot\nExecStart={sys.executable} {HELPER} restore --user {user.pw_name}\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n')
+        command = f'{sys.executable} {HELPER}'
+        unit_path.write_text(f'[Unit]\nDescription=ElastOS Browser network for UID {uid}\nAfter=network.target {FIREWALL_SERVICES}\nPartOf={FIREWALL_SERVICES}\nReloadPropagatedFrom={FIREWALL_SERVICES}\n\n[Service]\nType=oneshot\nExecStart={command} restore --user {user.pw_name}\nExecReload={command} restore --user {user.pw_name}\nExecStop={command} invalidate --user {user.pw_name}\nExecStopPost={command} invalidate --user {user.pw_name}\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n')
         run('systemctl', 'daemon-reload')
         run('systemctl', 'enable', unit)
     run('systemctl', 'daemon-reload')
     run('udevadm', 'control', '--reload-rules')
     if not remove:
-        restore(user)
+        run('systemctl', 'restart', unit)
+
+
+def repair_command(user):
+    prerequisite = ''
+    try:
+        trusted_path(HELPER)
+        if not stat.S_ISREG(HELPER.lstat().st_mode):
+            raise RuntimeError('helper is not a regular file')
+    except (OSError, RuntimeError):
+        prerequisite = f'Install the reviewed root-owned helper at {HELPER} first. '
+    return f'{prerequisite}As root, run: python3 {shlex.quote(str(HELPER))} setup --user {shlex.quote(user.pw_name)}'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['setup', 'remove', 'restore', 'check', 'lease'])
+    parser.add_argument('action', choices=['setup', 'remove', 'restore', 'invalidate', 'check', 'lease'])
     parser.add_argument('--user')
     args = parser.parse_args()
     user = pwd.getpwnam(args.user) if args.user else pwd.getpwuid(os.getuid())
@@ -286,13 +325,13 @@ def main():
         except SlotsBusy:
             raise
         except (OSError, ValueError, KeyError, IndexError, TypeError, RuntimeError) as error:
-            raise RuntimeError(f'Browser network is unavailable ({error}). As root, run: python3 {Path(__file__).resolve()} setup --user {user.pw_name}') from error
+            raise RuntimeError(f'Browser network is unavailable ({error}). {repair_command(user)}') from error
         return
     if os.getuid() != 0 or not args.user or user.pw_uid == 0:
         raise RuntimeError('Run setup/removal as root with --user naming the ordinary Home account')
     if sys.platform != 'linux':
         raise RuntimeError('Browser network setup requires a Linux host')
-    if args.action != 'restore':
+    if args.action in ['setup', 'remove']:
         verb = 'Remove' if args.action == 'remove' else 'Create/repair'
         print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, KVM user ACL, a KVM udev rule and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
         for n in networks(user.pw_uid):
@@ -301,7 +340,9 @@ def main():
             return
         configure(user, remove=args.action == 'remove')
     else:
-        restore(user)
+        invalidate(user)
+        if args.action == 'restore':
+            restore(user)
 
 
 if __name__ == '__main__':

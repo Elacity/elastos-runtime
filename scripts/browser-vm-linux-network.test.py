@@ -1,6 +1,7 @@
 """Root-free tests for the host setup, readiness and bounded lease contract."""
 import contextlib
 import copy
+import errno
 import importlib.util
 import io
 import json
@@ -35,7 +36,7 @@ class NetworkTest(unittest.TestCase):
         for n, index in zip(self.pool, self.receipt['ifindices']):
             device = network.SYSFS / n['tapName']
             device.mkdir()
-            for name, value in dict(owner=self.uid, tun_flags='0x1002', carrier=0, ifindex=index).items():
+            for name, value in dict(owner=self.uid, tun_flags='0x1002', flags='0x1', carrier=0, ifindex=index).items():
                 (device / name).write_text(str(value))
             ipv6 = network.IPV6 / n['tapName']
             ipv6.mkdir()
@@ -71,7 +72,17 @@ class NetworkTest(unittest.TestCase):
 
     def test_check_is_read_only(self):
         self.assertEqual(network.check(self.uid), self.pool)
-        self.assertTrue(all(c[:3] in [('ip', '-j', 'addr'), ('ip', 'tuntap', 'show')] for c in self.calls))
+        self.assertTrue(all(c[:3] in [('ip', '-j', 'addr'), ('ip', 'tuntap', 'show'), ('systemctl', 'is-active', '--quiet')] for c in self.calls))
+
+    def test_readiness_refuses_a_stopped_network_service(self):
+        command = self.run_command
+        def stopped(*args, **kwargs):
+            if args[0] == 'systemctl':
+                raise RuntimeError('network service is inactive')
+            return command(*args, **kwargs)
+        with patch.object(network, 'run', side_effect=stopped):
+            with self.assertRaisesRegex(RuntimeError, 'inactive'):
+                network.check(self.uid)
 
     def test_missing_or_wrong_setup_is_refused(self):
         original = copy.deepcopy(self.receipt)
@@ -110,8 +121,66 @@ class NetworkTest(unittest.TestCase):
         with patch.object(network.sys, 'argv', ['network', 'check']), patch.object(network.pwd, 'getpwuid', return_value=user), \
                 patch.object(network.os, 'getuid', return_value=self.uid), \
                 patch.object(network, 'check', side_effect=FileNotFoundError('missing TAP')):
-            with self.assertRaisesRegex(RuntimeError, r'As root, run: python3 .*browser-vm-linux-network.py setup --user elastos-agent'):
+            with self.assertRaisesRegex(RuntimeError, r'As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent'):
                 network.main()
+
+    def test_down_tap_allows_repair_locks_without_reading_carrier(self):
+        device = network.SYSFS / self.pool[0]['tapName']
+        (device / 'flags').write_text('0x0')
+        read_text = Path.read_text
+        def read(file, *args, **kwargs):
+            if file == device / 'carrier':
+                raise OSError(errno.EINVAL, 'down TAP has no carrier state')
+            return read_text(file, *args, **kwargs)
+        with patch.object(Path, 'read_text', read):
+            with network.locks(self.uid, self.pool):
+                pass
+            user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid)
+            with patch.object(network, 'trusted_path'), patch.object(network.os, 'chown'), patch.object(network, 'write_json'):
+                network.restore(user)
+        # The lock still blocks repair, even with the link down.
+        with open(network.RUN / f"{self.pool[0]['tapName']}.lock", 'r+') as held:
+            network.fcntl.flock(held, network.fcntl.LOCK_EX | network.fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                with network.locks(self.uid, self.pool):
+                    self.fail('a down link cannot bypass an active lease')
+
+    def test_carrier_down_race_allows_repair_but_other_errors_are_visible(self):
+        carrier = network.SYSFS / self.pool[0]['tapName'] / 'carrier'
+        read_text = Path.read_text
+        for code in [errno.EINVAL, errno.EACCES]:
+            def read(file, *args, **kwargs):
+                if file == carrier:
+                    raise OSError(code, 'carrier read failed')
+                return read_text(file, *args, **kwargs)
+            with patch.object(Path, 'read_text', read):
+                if code == errno.EINVAL:
+                    self.assertFalse(network.active_carrier(self.pool[0]['tapName']))
+                else:
+                    with self.assertRaises(PermissionError):
+                        network.active_carrier(self.pool[0]['tapName'])
+
+    def test_failed_service_restore_revokes_readiness_and_cuts_off_guests(self):
+        receipt = network.RUN / f'{self.uid}.json'
+        receipt.write_text(json.dumps(self.receipt))
+        user = SimpleNamespace(pw_uid=self.uid, pw_name='elastos-agent')
+        with patch.object(network.sys, 'argv', ['network', 'restore', '--user', user.pw_name]), \
+                patch.object(network.pwd, 'getpwnam', return_value=user), patch.object(network.os, 'getuid', return_value=0), \
+                patch.object(network.sys, 'platform', 'linux'), patch.object(network, 'trusted_path'), \
+                patch.object(network, 'restore', side_effect=RuntimeError('iptables failed')):
+            with self.assertRaisesRegex(RuntimeError, 'iptables failed'):
+                network.main()
+        self.assertFalse(receipt.exists())
+        for n in self.pool:
+            self.assertIn(('ip', 'link', 'set', n['tapName'], 'down'), self.calls)
+
+    def test_repair_uses_only_a_trusted_root_helper(self):
+        user = SimpleNamespace(pw_name='elastos-agent')
+        with patch.object(network, 'trusted_path', side_effect=RuntimeError('user-writable helper')):
+            message = network.repair_command(user)
+        self.assertIn('Install the reviewed root-owned helper', message)
+        self.assertIn(f'As root, run: python3 {network.HELPER} setup --user elastos-agent', message)
+        self.assertNotIn(str(Path(network.__file__).parent), message)
 
     def test_lease_skips_locked_and_orphaned_taps_then_releases(self):
         with open(network.RUN / f"{self.pool[0]['tapName']}.lock", 'r+') as held:
@@ -216,13 +285,33 @@ class NetworkTest(unittest.TestCase):
                 patch.object(network, 'restore') as restore, \
                 patch.object(network, 'trusted_json', side_effect=lambda file: json.loads(file.read_text())):
             network.configure(user)
-            restore.assert_called_once_with(user)
+            restore.assert_not_called()
+            self.assertIn(('systemctl', 'restart', 'elastos-browser-network-1001.service'), self.calls)
             unit = unit_dir / 'elastos-browser-network-1001.service'
             self.assertIn('restore --user elastos-agent', unit.read_text())
             self.assertIn('After=network.target nftables.service', unit.read_text())
+            services = 'nftables.service firewalld.service ufw.service netfilter-persistent.service'
+            self.assertIn(f'PartOf={services}', unit.read_text())
+            self.assertIn(f'ReloadPropagatedFrom={services}', unit.read_text())
+            self.assertIn('ExecStop=', unit.read_text())
+            self.assertIn('ExecStopPost=', unit.read_text())
+            self.assertIn('ExecReload=', unit.read_text())
             self.assertIn('-m u:1001:rw /dev/kvm', next(udev_dir.iterdir()).read_text())
             self.assertEqual(json.loads((state_dir / '1001.json').read_text()), {'previous_kvm_acl': None})
-            network.configure(user, remove=True)
+            # Model setup failing after its state write but before unit write.
+            unit.unlink()
+            def missing_unit(*args, **kwargs):
+                if args[:3] == ('systemctl', 'disable', '--now') and not kwargs.get('optional'):
+                    raise RuntimeError('Unit file does not exist')
+                return self.run_command(*args, **kwargs)
+            (network.SYSFS / self.pool[0]['tapName'] / 'flags').write_text('0x0')
+            read_text = Path.read_text
+            def down_tap(file, *args, **kwargs):
+                if file == network.SYSFS / self.pool[0]['tapName'] / 'carrier':
+                    raise OSError(errno.EINVAL, 'down TAP')
+                return read_text(file, *args, **kwargs)
+            with patch.object(network, 'run', side_effect=missing_unit), patch.object(Path, 'read_text', down_tap):
+                network.configure(user, remove=True)
             self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
             self.assertFalse(unit.exists())
             self.assertEqual(list(udev_dir.iterdir()), [])
