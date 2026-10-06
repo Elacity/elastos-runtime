@@ -8,15 +8,25 @@ with passkeys.
 
 The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
 
-The staged release root DID is
-`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Before a staged
-install, compare this DID with the `MAINTAINER_DID` value in the frozen installer.
-Promotion to the live installer requires staged install and update acceptance
-and operator approval.
+The maintainer release DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
+installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
+
+For an existing Home, re-trust the maintainer once. Run `elastos source list`
+to find the existing source name, then replace `EXISTING_SOURCE` below:
+
+```bash
+elastos source add --name EXISTING_SOURCE --publisher did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+```
+
+Type the complete new DID when Runtime asks for confirmation. This keeps the
+channel, install path, Carrier ticket and gateways. Then run `elastos update`.
+Until you re-trust, Home still trusts the old key and remains exposed if a copy
+exists. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
 
 The installer installs Runtime, sets up the Home profile, and opens Home. Keep
 the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
