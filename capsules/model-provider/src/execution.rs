@@ -2745,7 +2745,9 @@ mod tests {
     fn stalled_artifact_cancel_does_not_block_get_or_events() {
         let (stalled, release, started_flag) = stalled_cancel_json_action();
         let server = start_server(vec![stalled]);
-        let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
+        // A cancel that starts after its settlement deadline settles unknown
+        // without sending; keep the deadline beyond any scheduling delay.
+        let offer = artifact_offer_with_cancel_timeout(&server.base_url, 60_000);
         let root = temp_root("artifact-cancel-nonblocking");
         let input = artifact_input("cancel");
         let binding = create_binding("request:artifact-cancel-nonblocking", &offer, &input);
