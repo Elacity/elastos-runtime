@@ -1796,6 +1796,31 @@ pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyho
     require_disk_reserve(total, available, u128::from(needed))
 }
 
+/// Start a binary that was just written. On Linux a concurrent fork can briefly
+/// inherit the closed writer descriptor, so exec reports ETXTBSY until that
+/// child execs. Only that error is retried, with a bounded backoff (<2 s).
+pub(crate) fn retry_text_file_busy<T>(
+    attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    retry_text_file_busy_counted(attempt).0
+}
+
+fn retry_text_file_busy_counted<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> (std::io::Result<T>, u32) {
+    let mut delay = std::time::Duration::from_millis(20);
+    for busy in 0..9 {
+        match attempt() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(200));
+            }
+            result => return (result, busy),
+        }
+    }
+    (attempt(), 9)
+}
+
 #[cfg(test)]
 #[path = "install_transaction/restart_tests.rs"]
 mod restart_tests;
@@ -1804,6 +1829,45 @@ mod restart_tests;
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    /// Linux refuses exec while any writable descriptor to the binary is open;
+    /// startup must outlast a briefly inherited writer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_binary_start_retries_while_writer_descriptor_is_briefly_open() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("elastos");
+        let mut writer = fs::File::create(&bin).unwrap();
+        writer
+            .write_all(b"#!/bin/sh\necho 'elastos 0.1.0'\n")
+            .unwrap();
+        writer.sync_all().unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        let (output, busy) = retry_text_file_busy_counted(|| {
+            std::process::Command::new(&bin).arg("--version").output()
+        });
+        release.join().unwrap();
+        assert!(busy >= 1, "the writer must have made exec report ETXTBSY");
+        assert_eq!(output.unwrap().stdout, b"elastos 0.1.0\n");
+    }
+
+    #[test]
+    fn fresh_binary_start_fails_immediately_for_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let (result, busy) = retry_text_file_busy_counted(|| {
+            std::process::Command::new(dir.path().join("missing")).output()
+        });
+        assert_eq!(busy, 0);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(started.elapsed() < std::time::Duration::from_millis(20));
+    }
 
     fn previous(id: ReleaseFile) -> Vec<u8> {
         if id == ReleaseFile::RuntimeBinary {

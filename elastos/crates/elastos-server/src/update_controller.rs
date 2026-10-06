@@ -552,11 +552,14 @@ pub fn enter_browser_home() -> Result<()> {
     if inherited < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let error = std::process::Command::new(controller)
+    let mut command = std::process::Command::new(controller);
+    command
         .args(["__update-controller", "--receipt"])
         .arg(path)
-        .env(LEASE_ENV, inherited.to_string())
-        .exec();
+        .env(LEASE_ENV, inherited.to_string());
+    // exec returns only on failure; retry the controller copy we just wrote.
+    let error = crate::install_transaction::retry_text_file_busy(|| Err::<(), _>(command.exec()))
+        .unwrap_err();
     unsafe {
         libc::close(inherited);
     }

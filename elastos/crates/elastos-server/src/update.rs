@@ -512,9 +512,8 @@ async fn verify_installed_binary_version(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     command.as_std_mut().process_group(0);
-    let mut child = spawn_fresh_executable(&mut command)
-        .await
-        .map_err(|error| {
+    let mut child =
+        crate::install_transaction::retry_text_file_busy(|| command.spawn()).map_err(|error| {
             anyhow::anyhow!(
                 "failed to run installed binary {}: {error}",
                 bin_path.display()
@@ -554,25 +553,6 @@ async fn verify_installed_binary_version(
         }
     };
     verify_installed_binary_version_output(bin_path, expected_version, status.success(), &out, &err)
-}
-
-/// Spawn a binary this process just wrote. On Linux a concurrent fork can
-/// briefly inherit the closed writer descriptor, so exec reports ETXTBSY until
-/// that child execs; retry only that error with a bounded backoff (<2 s).
-async fn spawn_fresh_executable(
-    command: &mut tokio::process::Command,
-) -> std::io::Result<tokio::process::Child> {
-    let mut delay = std::time::Duration::from_millis(20);
-    for _ in 1..10 {
-        match command.spawn() {
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_millis(200));
-            }
-            result => return result,
-        }
-    }
-    command.spawn()
 }
 
 fn verify_installed_binary_version_output(
@@ -4036,43 +4016,6 @@ mod tests {
         assert!(msg.contains(&bin.display().to_string()));
         assert!(msg.contains("Installed binary version check failed"));
         assert!(msg.contains("permission denied"));
-    }
-
-    /// Linux returns ETXTBSY while any writable descriptor to the binary is open;
-    /// the version check must outlast a briefly inherited writer.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn version_check_retries_while_writer_descriptor_is_briefly_open() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("elastos");
-        let mut writer = std::fs::File::create(&bin).unwrap();
-        writer
-            .write_all(b"#!/bin/sh\necho 'elastos 0.1.0'\n")
-            .unwrap();
-        writer.sync_all().unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(writer);
-        });
-        verify_installed_binary_version(&bin, "0.1.0")
-            .await
-            .unwrap();
-        release.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn version_check_fails_immediately_for_missing_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("missing");
-        let started = std::time::Instant::now();
-        let err = verify_installed_binary_version(&bin, "0.1.0")
-            .await
-            .unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_millis(20));
-        assert!(err.to_string().contains("failed to run installed binary"));
     }
 
     #[tokio::test]
