@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-const PARENT_PIPE_ENV: &str = "ELASTOS_UPDATE_PARENT_PIPE";
+use elastos_common::process_lifetime::{parent_pipe, pipe_identity, set_cloexec, PARENT_PIPE_ENV};
 const GRACE_PERIOD: Duration = Duration::from_secs(12);
 const REAP_PERIOD: Duration = Duration::from_secs(2);
 const POLL_PERIOD: Duration = Duration::from_millis(20);
@@ -463,68 +463,6 @@ pub(crate) fn process_group(pid: u32) -> io::Result<Option<u32>> {
     } else {
         Err(error)
     }
-}
-
-fn set_cloexec(fd: libc::c_int, enabled: bool) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let flags = if enabled {
-        flags | libc::FD_CLOEXEC
-    } else {
-        flags & !libc::FD_CLOEXEC
-    };
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn parent_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    #[cfg(target_os = "linux")]
-    let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
-    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    #[cfg(not(target_os = "linux"))]
-    {
-        set_cloexec(reader.as_raw_fd(), true)?;
-        set_cloexec(writer.as_raw_fd(), true)?;
-    }
-    // A parent with a closed standard descriptor still passes a separate pipe.
-    Ok((above_stdio(reader)?, above_stdio(writer)?))
-}
-
-fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
-    if fd.as_raw_fd() >= 3 {
-        return Ok(fd);
-    }
-    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-}
-
-fn pipe_identity(fd: libc::c_int) -> io::Result<(u64, u64)> {
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
-        return Err(io::Error::other("update parent descriptor is not a pipe"));
-    }
-    #[cfg(target_os = "macos")]
-    let device = stat.st_dev as u64;
-    #[cfg(not(target_os = "macos"))]
-    let device = stat.st_dev;
-    Ok((device, stat.st_ino))
 }
 
 /// Call after installing SIGTERM handling and before launching subordinate groups.

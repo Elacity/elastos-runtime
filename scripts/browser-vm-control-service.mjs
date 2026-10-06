@@ -8,6 +8,48 @@ import path from "node:path";
 import process from "node:process";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
+import { fileURLToPath } from "node:url";
+// Same inherited pipe contract as Runtime's update-controller parent watcher.
+export const PARENT_PIPE_ENV = "ELASTOS_UPDATE_PARENT_PIPE";
+
+export function parentPipeFd(required = false) {
+  const marker = process.env[PARENT_PIPE_ENV];
+  if (!marker && !required) return null;
+  const match = /^(\d+):(\d+):(\d+)$/.exec(marker || "");
+  if (!match || Number(match[1]) < 3) throw new Error("Browser helper owner pipe is required");
+  const fd = Number(match[1]);
+  const stat = fs.fstatSync(fd, { bigint: true });
+  if (!stat.isFIFO() || String(stat.dev) !== match[2] || String(BigInt.asUintN(64, stat.ino)) !== match[3]) {
+    throw new Error("Browser helper owner pipe identity changed");
+  }
+  return fd;
+}
+
+export function forwardedParentPipeEnv(env) {
+  const fd = parentPipeFd(true);
+  const stat = fs.fstatSync(fd, { bigint: true });
+  return { ...env, ELASTOS_BROWSER_HELPER_GROUP_OWNER: "1",
+    [PARENT_PIPE_ENV]: `3:${stat.dev}:${BigInt.asUintN(64, stat.ino)}` };
+}
+
+export function watchParentPipe(handleSignal, timeoutMs) {
+  const ownerFd = parentPipeFd();
+  if (ownerFd !== null) {
+    // Runtime owns the writer. Its exit, abort, or SIGKILL yields EOF.
+    const owner = fs.createReadStream(null, { fd: ownerFd, autoClose: true });
+    owner.on("data", () => {});
+    const ownerLost = () => {
+      // Bound the whole service, including a pending launch which cannot settle.
+      setTimeout(() => process.kill(
+        process.env.ELASTOS_BROWSER_HELPER_GROUP_OWNER === "1" ? -process.pid : process.pid, "SIGKILL"),
+        timeoutMs + 5000).unref();
+      handleSignal();
+    };
+    owner.once("end", ownerLost);
+    owner.once("error", ownerLost);
+  }
+}
+
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let verifiedHostReadiness = null;
 
@@ -180,6 +222,7 @@ const TERMINAL_CLEANUP_EFFECT_KEYS = [
   "hibernation_state_absent",
 ];
 const ownedLauncherChildren = new Set();
+let launcherGroupNeedsForce = false;
 
 function fail(message) {
   console.error(message);
@@ -194,7 +237,10 @@ function codedError(code, message) {
 
 function trackOwnedLauncherChild(child) {
   ownedLauncherChildren.add(child);
-  child.once("exit", () => ownedLauncherChildren.delete(child));
+  child.once("exit", (code, signal) => {
+    if (signal || code !== 0) launcherGroupNeedsForce = true;
+    ownedLauncherChildren.delete(child);
+  });
   return child;
 }
 
@@ -4596,7 +4642,10 @@ function main() {
           accepted: true,
         });
         setImmediate(() => {
-          void shutdownService(false);
+          void shutdownService(false).then(
+            () => finishProcess(0),
+            (error) => { console.error(error.message); finishProcess(1); },
+          );
         });
         return;
       }
@@ -4670,17 +4719,26 @@ function main() {
     })();
     return shutdownPromise;
   };
+  const finishProcess = (status) => {
+    // The service still anchors its isolated group after a launcher was reaped.
+    // Forced launcher exit can leave cp/crosvm workers in that same group.
+    if ((status !== 0 || launcherGroupNeedsForce) && process.env.ELASTOS_BROWSER_HELPER_GROUP_OWNER === "1") {
+      process.kill(-process.pid, "SIGKILL");
+    }
+    process.exit(status);
+  };
   const handleSignal = () => {
     void shutdownService(true).then(
-      () => process.exit(0),
+      () => finishProcess(0),
       (error) => {
         console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
+        finishProcess(1);
       },
     );
   };
   process.once("SIGTERM", handleSignal);
   process.once("SIGINT", handleSignal);
+  watchParentPipe(handleSignal, Number(config.shutdown_timeout_ms ?? 30000));
   server.listen(config.control_socket_path, () => {
     const socketStat = fs.lstatSync(config.control_socket_path);
     if (!socketStat.isSocket()) {
@@ -4703,4 +4761,4 @@ function main() {
   });
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

@@ -37,6 +37,7 @@ const children = new Set();
 const servers = new Set();
 const cleanupFns = [];
 let exiting = false;
+let guestControlSocket = null;
 let launchSucceeded = false;
 const launchedAtMs = Date.now();
 
@@ -633,7 +634,7 @@ function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, sessionDir, s
   const logPath = path.join(sessionDir, "rootfs-pool-refill.log");
   const logFd = fs.openSync(logPath, "a");
   const refillCommand = rootfsPoolRefillCommand(refillScript);
-  const child = spawn(refillCommand.command, [
+  const child = spawnTracked(refillCommand.command, [
     ...refillCommand.args,
     "--data-dir",
     dataDir,
@@ -644,11 +645,9 @@ function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, sessionDir, s
     "--count",
     String(targetCount),
   ], {
-    detached: true,
     stdio: ["ignore", logFd, logFd],
     env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir },
   });
-  child.unref();
   fs.closeSync(logFd);
   logPhase(`prepared rootfs pool refill started pid=${child.pid} target=${targetCount} log=${logPath}`);
 }
@@ -1029,6 +1028,19 @@ function rewriteResult(result, launch, sessionDir, controlSocketPath) {
 async function cleanupAndExit(signal = null) {
   if (exiting) return;
   exiting = true;
+  if (guestControlSocket && children.size > 0) {
+    try {
+      const result = await httpJsonUnix(guestControlSocket, "/shutdown", {
+        method: "POST", body: {},
+        timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
+      });
+      if (result.ok !== true || result.profile_disk_flushed !== true || result.profile_disk_unmounted !== true) {
+        throw new Error("guest profile disk flush was unproved");
+      }
+    } catch (error) {
+      logPhase(`guest clean shutdown failed: ${error.message}`);
+    }
+  }
   for (const { server, socketPath } of Array.from(servers)) {
     try {
       server.close();
@@ -1150,6 +1162,7 @@ async function main() {
       crosvmLog: vm.crosvmLog,
     });
     logPhase("guest control ready");
+    guestControlSocket = controlSocketPath;
 
     logPhase("opening Browser page");
     let opened;

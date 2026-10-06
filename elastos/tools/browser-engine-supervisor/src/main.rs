@@ -406,6 +406,57 @@ fn validate_relay_ipc(endpoint: &RelayIpcEndpoint) -> Result<(), String> {
     Ok(())
 }
 
+// Native helpers use the same Runtime ownership pipe as VM helpers. Their
+// stdin is a lifetime channel; the transient supervisor owns only a reader.
+fn configure_helper_stdin(command: &mut Command) -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    let Ok(marker) = env::var("ELASTOS_UPDATE_PARENT_PIPE") else {
+        return Ok(());
+    };
+    let fields: Vec<_> = marker.split(':').collect();
+    if fields.len() != 3 {
+        return Err("invalid Browser helper owner pipe".into());
+    }
+    let fd: i32 = fields[0]
+        .parse()
+        .map_err(|_| "invalid Browser helper owner descriptor")?;
+    let dev: u64 = fields[1]
+        .parse()
+        .map_err(|_| "invalid Browser helper owner device")?;
+    let ino: u64 = fields[2]
+        .parse()
+        .map_err(|_| "invalid Browser helper owner inode")?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if fd < 3
+        || unsafe { libc::fstat(fd, &mut stat) } != 0
+        || stat.st_mode & libc::S_IFMT != libc::S_IFIFO
+        || stat.st_dev != dev
+        || stat.st_ino != ino
+    {
+        return Err("Browser helper owner pipe identity changed".into());
+    }
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
+    command
+        .stdin(Stdio::from(reader))
+        .env("ELASTOS_BROWSER_HELPER_PARENT_EOF", "1");
+    if command
+        .get_program()
+        .to_string_lossy()
+        .ends_with("browser-native-proxy-engine")
+        || command
+            .get_program()
+            .to_string_lossy()
+            .ends_with("browser-stream-bridge")
+    {
+        command.process_group(0);
+    }
+    Ok(())
+}
+
 fn spawn_stream_bridge(
     stream_bridge: Option<&StreamBridgeConfig>,
     request: &LaunchRequest,
@@ -414,14 +465,15 @@ fn spawn_stream_bridge(
         return Ok(None);
     };
     let bridge_config = stream_bridge_env_config(stream_bridge, request)?;
-    let mut child = Command::new(&stream_bridge.program)
+    let mut command = Command::new(&stream_bridge.program);
+    command
         .args(&stream_bridge.args)
         .env("ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG", bridge_config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(Stdio::null());
+    configure_helper_stdin(&mut command)?;
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     wait_for_stream_bridge(
         &mut child,
         &request.adapter_ipc.path,
@@ -508,6 +560,7 @@ fn spawn_engine(config: &SupervisorConfig, request: &LaunchRequest) -> Result<u3
         });
     }
 
+    configure_helper_stdin(&mut command)?;
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     if config.startup_grace_ms > 0 {
         std::thread::sleep(Duration::from_millis(config.startup_grace_ms));

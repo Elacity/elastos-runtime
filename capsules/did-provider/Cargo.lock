@@ -350,6 +350,7 @@ name = "elastos-common"
 version = "0.7.1"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

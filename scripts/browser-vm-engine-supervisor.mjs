@@ -7,6 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { PARENT_PIPE_ENV, parentPipeFd, forwardedParentPipeEnv } from "./browser-vm-control-service.mjs";
 
 const REQUEST_ENV = "ELASTOS_BROWSER_ENGINE_REQUEST";
 const CONTROL_SOCKET_ENV = "ELASTOS_BROWSER_VM_CONTROL_SOCKET";
@@ -302,6 +303,7 @@ function vmControlEnvFingerprintFields({ dataDir, platform, root }) {
 function vmControlConfigFingerprint({ config, controlService, dataDir, platform, root }) {
   return sha256Json({
     config,
+    owner: process.env[PARENT_PIPE_ENV] || null,
     env: vmControlEnvFingerprintFields({ dataDir, platform, root }),
     artifacts: {
       control_service: controlServiceArtifactFingerprints(controlService),
@@ -583,7 +585,7 @@ function sanitizedVmControlServiceEnv({ config, dataDir, root, platform }) {
   return serviceEnv;
 }
 
-function startLocalVmControlService({ controlSocket, dataDir, platform, root, expectedFingerprint }) {
+export function startLocalVmControlService({ controlSocket, dataDir, platform, root, expectedFingerprint }) {
   if (!localVmControlServiceAvailable({ dataDir, platform })) return false;
   const controlService = process.env[CONTROL_SERVICE_ENV] || path.join(dataDir, "bin/browser-vm-control-service");
   const launcher = localControlLauncherForPlatform({ dataDir, platform });
@@ -607,12 +609,15 @@ function startLocalVmControlService({ controlSocket, dataDir, platform, root, ex
     vmControlConfigFingerprint({ config, controlService, dataDir, platform, root });
   const logPath = process.env[CONTROL_SERVICE_LOG_ENV] || path.join(dataDir, "logs/browser-vm-control-service.log");
   fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+  const ownerFd = parentPipeFd(true);
   const logFd = fs.openSync(logPath, "a");
   try {
     const child = spawn(controlService, [], {
       detached: true,
-      env: sanitizedVmControlServiceEnv({ config, dataDir, root, platform }),
-      stdio: ["ignore", logFd, logFd],
+      // A separate group preserves the VM flush budget across Runtime's TERM.
+      // The adapter lifetime pipe owns this group even after this launcher exits.
+      env: forwardedParentPipeEnv(sanitizedVmControlServiceEnv({ config, dataDir, root, platform })),
+      stdio: ["ignore", logFd, logFd, ownerFd],
     });
     child.on("error", (error) => {
       process.stderr.write(`Browser VM control service auto-start failed: ${error.message}\n`);
@@ -1038,4 +1043,4 @@ async function main() {
   fail(`Browser VM engine target is not launch-ready. ${preflight.reason} Set ${CONTROL_SOCKET_ENV} to a Browser VM control service; on no-KVM gateway hosts this should point at a remote/operator VM provider instead of requiring local KVM. Preflight: ${JSON.stringify(preflight)}`);
 }
 
-main().catch(fail);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(fail);

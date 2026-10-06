@@ -62,6 +62,29 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
     prepare_adapter_socket_path(adapter_path, config.replace_existing_socket)?;
     let listener = UnixListener::bind(adapter_path).map_err(|err| err.to_string())?;
     let _socket_guard = SocketFileGuard::new(adapter_path);
+    if std::env::var("ELASTOS_BROWSER_HELPER_PARENT_EOF").as_deref() == Ok("1") {
+        let path = adapter_path.to_path_buf();
+        use std::os::unix::fs::MetadataExt;
+        let bound = fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut bytes = [0u8; 64];
+            loop {
+                match std::io::stdin().read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if fs::symlink_metadata(&path)
+                .is_ok_and(|current| current.dev() == bound.dev() && current.ino() == bound.ino())
+            {
+                let _ = fs::remove_file(path);
+            }
+            std::process::exit(0);
+        });
+    }
 
     writeln!(
         stdout,
