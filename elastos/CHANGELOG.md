@@ -46,6 +46,28 @@ All notable changes to the public ElastOS Runtime repository.
   after failed or interrupted activation. The default CLI update flow is preserved.
   Home restart ownership and integration remain a follow-up.
 
+## [0.8.0-alpha.8]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- From alpha.7 on, you update through System, also when a release changes its
+  support files.
+- Updates and installs now need 2 GB of free space. This one rule replaces the
+  old percentage checks.
+- The installer shows numbered steps. When its output goes to a file or another
+  program, it prints plain text without colours.
+- The install guide (docs/INSTALL.md) explains how to undo an update.
+
+### Fixed
+
+- Opening Chat again works offline and no longer downloads it again.
+- An owner action no longer fails with "Another Home owner action is in
+  progress" after Home started another process.
+- If an install into another folder is refused, nothing is left behind in that
+  folder.
+
 ## [0.8.0-alpha.7]
 
 Test-channel release. Signed releases show these notes in System before you update.
