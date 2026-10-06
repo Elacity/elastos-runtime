@@ -4411,6 +4411,7 @@ mod tests {
                 "0.7.0",
                 true,
                 false,
+                false,
             )
             .await
             .unwrap_err()
