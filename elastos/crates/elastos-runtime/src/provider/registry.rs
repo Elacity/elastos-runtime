@@ -1464,6 +1464,7 @@ impl ProviderRegistry {
 
     /// Observe the actual Ready backend volume through the exact local provider.
     /// The inventory owns reservations; this result grants no retention or admission.
+    /// Content and model downloads keep the shared free-space reserve on the backend volume.
     pub async fn check_local_ipfs_capacity(
         &self,
         required_bytes: u64,
@@ -1486,10 +1487,14 @@ impl ProviderRegistry {
             || observation.capacity_bytes == 0
             || observation.available_bytes > observation.capacity_bytes
             || observation.required_bytes != required_bytes
-            || required_bytes > observation.available_bytes
         {
             return Err(private_ipfs_unavailable());
         }
+        elastos_common::require_free_space(
+            u128::from(observation.available_bytes),
+            u128::from(required_bytes),
+        )
+        .map_err(|error| ProviderError::Provider(error.to_string()))?;
         Ok(observation)
     }
 
@@ -2962,7 +2967,9 @@ mod tests {
                     serde_json::json!({"status":"ok","data":{"cid":"bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"}})
                 }
                 "runtime_check_capacity" => serde_json::json!({"status":"ok","data":{
-                    "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":request["required_bytes"]
+                    "volume_id":7,"capacity_bytes":1_u64 << 40,
+                    "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                    "required_bytes":request["required_bytes"]
                 }}),
                 _ => panic!("unexpected operation"),
             })
@@ -3359,17 +3366,28 @@ mod tests {
                 observed.available_bytes,
                 observed.required_bytes
             ),
-            (7, 1000, 110, 10)
+            (
+                7,
+                1 << 40,
+                elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                10
+            )
         );
         assert_eq!(
             provider.requests.lock().await.as_slice(),
             &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
         );
-        // The work only has to fit the available bytes: exactly 110 fits, 111 does not.
+        // Exactly the work plus the shared reserve fits; one byte less does not.
         assert!(registry.check_local_ipfs_capacity(110).await.is_ok());
-        assert!(registry.check_local_ipfs_capacity(111).await.is_err());
+        let refused = registry.check_local_ipfs_capacity(111).await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            ProviderError::Provider(elastos_common::NotEnoughFreeSpace { needed: 111 }.to_string())
+                .to_string()
+        );
         let valid = serde_json::json!({"status":"ok","data":{
-            "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
+            "volume_id":7,"capacity_bytes":1_u64 << 40,
+            "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,"required_bytes":10
         }});
         let mut malformed = vec![
             serde_json::json!({"status":"ok"}),
@@ -3380,8 +3398,7 @@ mod tests {
             ("volume_id", serde_json::json!("private-repo-path")),
             ("capacity_bytes", serde_json::json!(0)),
             ("capacity_bytes", serde_json::json!(109)),
-            ("available_bytes", serde_json::json!(1001)),
-            ("available_bytes", serde_json::json!(9)),
+            ("available_bytes", serde_json::json!((1_u64 << 40) + 1)),
             ("required_bytes", serde_json::json!(11)),
             ("required_bytes", serde_json::json!(u64::MAX)),
             ("repo_path", serde_json::json!("private-repo-path")),

@@ -720,18 +720,14 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
         let block_size = stats.f_frsize;
         #[cfg(target_pointer_width = "32")]
         let block_size = u64::from(stats.f_frsize);
-        disk_budget(
-            needed,
-            disk_block_count(stats.f_bavail).saturating_mul(block_size),
-        )
+        let available = disk_block_count(stats.f_bavail).saturating_mul(block_size);
+        Ok(elastos_common::require_free_space(
+            u128::from(available),
+            u128::from(needed),
+        )?)
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
-}
-
-fn disk_budget(needed: u64, available: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available, "Browser image preparation needs {needed} bytes but only {available} bytes are free; free disk space and retry (previous set preserved)");
-    Ok(())
 }
 
 fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -1160,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_image_foreign_paths_and_low_disk_space_are_actionable() {
+    fn browser_image_foreign_paths_are_actionable() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("bin")).unwrap();
         fs::write(temp.path().join("bin/vmlinux"), b"operator-owned").unwrap();
@@ -1174,8 +1170,6 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 99).is_err());
-        assert!(disk_budget(100, 100).is_ok());
     }
 
     #[test]

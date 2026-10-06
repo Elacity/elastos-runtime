@@ -14,7 +14,7 @@ from pathlib import Path
 import tempfile
 
 
-BASE_SHA256 = "3f17ebaa8f01215788247696f25f8348cc846088f44b5f0d6e063bde3aeafc94"
+BASE_SHA256 = "18bb6c7285365fb7fabd5d778341b45226a9254f4d31c06cb565ebdc39d00e6c"
 MARKER = "# ElastOS bounded audio queue diagnostic v1"
 OBSERVER = r'''
 # ElastOS bounded audio queue diagnostic v1

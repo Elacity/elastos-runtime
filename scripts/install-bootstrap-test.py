@@ -33,13 +33,16 @@ exec(compile(PYTHON, str(INSTALLER) + ":embedded-verifier", "exec"), CRYPTO)
 PROCESS_SOURCE = SOURCE.split("<<'PY_RUNTIME_CONTROL'\n", 1)[1].split("\nPY_RUNTIME_CONTROL", 1)[0]
 PROCESSES = {"__name__": "installer_test"}
 exec(compile(PROCESS_SOURCE, str(INSTALLER) + ":runtime-control", "exec"), PROCESSES)
+# Published maintainer constant, checked by test_pinned_publisher_did_conversion.
 PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
+
+FIXTURE_DID = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
 
 
 def binding_fixture():
     # Fixed OpenSSL Ed25519 vectors from the disposable seed [7; 32]. This is
     # a test identity. Running these stdlib tests needs neither a key nor OpenSSL.
-    did = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    did = FIXTURE_DID
     payload = {"schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
                "platforms": {"x86_64-linux": {
                    "binary": {"cid": "binary-a", "sha256": "a" * 64},
@@ -264,7 +267,7 @@ class SignatureTests(unittest.TestCase):
         envelope = {
             "payload": {"z": {"β": "🌱", "a": [{"é": "café", "a": 1}]},
                         "a": "ElastOS\nHome", "m": "日本語"},
-            "signer_did": PUBLISHER_DID,
+            "signer_did": FIXTURE_DID,
             "signature": "00" * 64,
         }
         captured = []
@@ -274,7 +277,7 @@ class SignatureTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory, "unicode.json")
                 path.write_text(json.dumps(envelope), encoding="utf-8")
-                CRYPTO["verify_envelope"](path, "elastos.release.v1", PUBLISHER_DID)
+                CRYPTO["verify_envelope"](path, "elastos.release.v1", FIXTURE_DID)
         finally:
             CRYPTO["verify_ed25519"] = verifier
         self.assertEqual(len(captured), 1)
@@ -292,21 +295,26 @@ class ShellTests(unittest.TestCase):
             with self.subTest(ticket=ticket, node=node):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
-    def test_install_space_keeps_the_fixed_reserve(self):
+    def test_install_space_keeps_the_shared_reserve_at_its_exact_boundary(self):
         fake_df = ('df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n'
                    '/dev/x 1 1 %s 1%% /\\n" "$1"; }\n')
         reserve_kib = 2 * 1024 * 1024
-        for available_kib, size, accepted in [(reserve_kib + 1, "1024", True),
-                                              (reserve_kib, "1024", False),
-                                              (reserve_kib, "", True),
-                                              (reserve_kib - 1, "", False),
-                                              (reserve_kib + 10**9, "big", False)]:
-            result = shell(fake_df.replace('"$1"', str(available_kib))
+        needed_kib = 300 * 1024
+        available_kib = reserve_kib + needed_kib
+        # Exactly needed + reserve is accepted; needing one byte more than that is refused.
+        for available, size, accepted in [(available_kib, str(needed_kib * 1024), True),
+                                           (available_kib, str(needed_kib * 1024 + 1), False),
+                                           (reserve_kib, "", True),
+                                           (reserve_kib - 1, "", False),
+                                           (available_kib + 10**9, "big", False)]:
+            result = shell(fake_df.replace('"$1"', str(available))
                            + 'require_install_space /tmp "$1"\n', size)
-            with self.subTest(available_kib=available_kib, size=size):
+            with self.subTest(available_kib=available, size=size):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
-                if not accepted and size == "1024":
-                    self.assertIn("2 GiB reserve", result.stderr)
+        refused = shell(fake_df.replace('"$1"', str(available_kib))
+                        + 'require_install_space /tmp "$1"\n', str(needed_kib * 1024 + 1))
+        self.assertIn("not enough free space: this needs 0.3 GB plus 2 GB kept free",
+                      refused.stderr)
 
     def test_empty_gateway_array_fails_with_installer_message(self):
         result = shell('GATEWAYS=()\nipfs_fetch test-cid /unused\n')
@@ -648,10 +656,10 @@ validate_release_identity "$1" "$2"
         spec.loader.exec_module(signer)
         payload = {"schema": "elastos.release/v1", "channel": "stable", "version": "0.7.1", "note": "café"}
         backend = mock.Mock()
-        backend.public_key.return_value = CRYPTO["decode_did_key"](PUBLISHER_DID)
+        backend.public_key.return_value = CRYPTO["decode_did_key"](FIXTURE_DID)
         backend.sign.return_value = bytes(64)
         backend.verify.return_value = True
-        prepared = SimpleNamespace(publisher_did=PUBLISHER_DID, files=(), release=signer.json_bytes(payload),
+        prepared = SimpleNamespace(publisher_did=FIXTURE_DID, files=(), release=signer.json_bytes(payload),
                                    updated_at=1, prev_head_cid=None)
         publication = dict(signer.sign_publication(prepared, backend))
         release = publication["release.json"]
@@ -671,6 +679,16 @@ class InstallationTests(unittest.TestCase):
         "cid": ["https://test.invalid/ipfs/head-a", "https://test.invalid/ipfs/release-a",
                 "https://test.invalid/ipfs/binary-a"],
     }
+
+    def test_installer_prints_the_selected_maintainer_did_before_verification(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            result, _ = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("artifact-request-blocked", result.stderr)
+            label = f"Maintainer DID: {did}"
+            self.assertIn(label, result.stdout)
+            self.assertLess(result.stdout.index(label), result.stdout.index("Fetching release head"))
 
     def test_test_signer_reproduces_fixed_fixture_vectors(self):
         # The signer must agree with the fixed OpenSSL vectors that anchor binding_fixture(),
@@ -944,7 +962,7 @@ class InstallationTests(unittest.TestCase):
             ("tampered release", head, release.replace(b'"version":"0.7.1"', b'"version":"0.8.1"'), did,
              "Signature verification FAILED", 2),
             ("head bound to other release", unbound, release, did, "Release envelope differs from the signed head", 2),
-            ("foreign trust anchor", head, release, PUBLISHER_DID, "Signature verification FAILED", 1),
+            ("foreign trust anchor", head, release, "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw", "Signature verification FAILED", 1),
         ]
         for transport in ["publisher", "cid"]:
             for name, served_head, served_release, anchor, message, request_count in cases:

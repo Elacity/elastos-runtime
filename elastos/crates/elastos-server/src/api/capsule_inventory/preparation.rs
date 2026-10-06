@@ -10452,25 +10452,28 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_preparation_disk_check_requires_reservation_to_fit_available_bytes() {
-        assert!(storage::require_reservation_fits(1000, 200, 100).is_ok());
-        assert!(storage::require_reservation_fits(1000, 200, 200).is_ok());
-        assert!(storage::require_reservation_fits(1000, 200, 201).is_err());
+    fn model_preparation_disk_check_keeps_the_shared_free_space_reserve() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let capacity = 1 << 40;
+        assert!(storage::require_reservation_fits(capacity, reserve + 200, 200).is_ok());
+        let refused = storage::require_reservation_fits(capacity, reserve + 199, 200).unwrap_err();
+        assert!(refused.is::<elastos_common::NotEnoughFreeSpace>());
+        assert!(!storage::reservation_fits(capacity, reserve + 199, 200).unwrap());
         // Volume size alone never refuses a reservation that fits.
-        assert!(storage::require_reservation_fits(1 << 50, 10, 10).is_ok());
+        assert!(storage::require_reservation_fits(1 << 50, reserve + 10, 10).is_ok());
         assert!(storage::require_reservation_fits(0, 0, 0).is_err());
-        assert!(storage::require_reservation_fits(1000, 1001, 0).is_err());
-        assert!(storage::require_reservation_fits(u128::MAX, u128::MAX, u128::MAX).is_ok());
-        assert!(storage::require_reservation_fits(u128::MAX, u128::MAX - 1, u128::MAX).is_err());
+        assert!(storage::reservation_fits(capacity, capacity + 1, 0).is_err());
+        assert!(storage::require_reservation_fits(u128::MAX, u128::MAX, u128::MAX).is_err());
     }
 
     #[test]
     fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
+        let capacity = 1_u128 << 40;
         let margin = 1024 * 1024;
         let charge = preparation_charge(payload).unwrap();
-        let initial_free = u128::from(charge) + margin;
+        let initial_free =
+            u128::from(charge) + margin + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         assert!(storage::require_reservation_fits(capacity, initial_free, charge.into()).is_ok());
         for completed in [0, payload / 4, payload / 2, payload] {
             let index = if completed == 0 { 0 } else { 717 };
@@ -10499,8 +10502,8 @@ server.serve_forever()
     #[test]
     fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let margin = 1024 * 1024;
+        let capacity = 1_u128 << 40;
+        let margin = 1024 * 1024 + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         let stage_budget = staging_charge(payload).unwrap();
         let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
         let completed = payload / 4;
@@ -10524,8 +10527,9 @@ server.serve_forever()
             u128::from(backend),
             u128::from(stage) + u128::from(backend),
         ] {
-            assert!(storage::require_reservation_fits(capacity, required, required).is_ok());
-            assert!(storage::require_reservation_fits(capacity, required - 1, required).is_err());
+            let available = required + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+            assert!(storage::require_reservation_fits(capacity, available, required).is_ok());
+            assert!(storage::require_reservation_fits(capacity, available - 1, required).is_err());
         }
     }
 
@@ -10720,7 +10724,8 @@ server.serve_forever()
     #[tokio::test]
     async fn model_preparation_capacity_windows_runtime_check_counts_shared_backend_growth() {
         let (_root, mut record, _, _) = capacity_window_fixture(true, None).await;
-        let capacity = 1_u128 << 30;
+        let capacity = 1_u128 << 40;
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         for completed in [0, 65536, 1024 * 1024, record.total_bytes] {
             record.completed_bytes = completed;
             record.index_bytes = 717;
@@ -10732,13 +10737,13 @@ server.serve_forever()
                 assert_eq!(required, if shared { stage + backend } else { stage });
                 assert!(storage::require_reservation_fits(
                     capacity,
-                    u128::from(required),
+                    u128::from(required) + reserve,
                     required.into()
                 )
                 .is_ok());
                 assert!(storage::require_reservation_fits(
                     capacity,
-                    u128::from(required) - 1,
+                    u128::from(required) + reserve - 1,
                     required.into()
                 )
                 .is_err());
@@ -10746,7 +10751,7 @@ server.serve_forever()
             // A Runtime volume with only the stage allowance cannot pass as shared.
             assert!(storage::require_reservation_fits(
                 capacity,
-                u128::from(stage),
+                u128::from(stage) + reserve,
                 runtime_capacity_charge(&record, true).unwrap().into()
             )
             .is_err());
