@@ -452,7 +452,11 @@ jobs:
         run: |
           cache_args=()
           if [[ "${CI_USE_CACHE}" == "true" ]]; then
-            cache_args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+            cache_args+=(--cache-from type=gha)
+          fi
+          # Only trusted saving runs write; merge-queue and PR scopes are unreadable elsewhere.
+          if [[ "${CI_SAVE_CACHE}" == "true" ]]; then
+            cache_args+=(--cache-to type=gha,mode=max)
           fi
           docker buildx build \
             -f deploy/custody-host/Dockerfile \

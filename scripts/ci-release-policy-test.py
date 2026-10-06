@@ -144,7 +144,7 @@ def validate_cache_guards(source):
                 continue
             # Buildx shell cache arguments live inside this explicit cache-only branch.
             shell_guards = list(re.finditer(
-                r'(?ms)^\s*if \[\[ "\$\{CI_USE_CACHE\}" == "true" \]\]; then\n'
+                r'(?ms)^\s*if \[\[ "\$\{CI_(?:USE|SAVE)_CACHE\}" == "true" \]\]; then\n'
                 r'(.*?)^\s*fi\s*$', step))
             shell_guards = [guard for guard in shell_guards
                             if not re.search(r"(?m)^\s*(?:else|elif)\b", guard[1])]
@@ -640,13 +640,16 @@ class ReleasePolicyTests(unittest.TestCase):
         stub = 'docker() { printf "%s\\0" "$@"; }\n'
         base = ["buildx", "build", "-f", "deploy/custody-host/Dockerfile",
                 "-t", "elastos-custody-host:latest"]
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled):
+        # Reads need the cache enabled; writes need a trusted saving run as well.
+        for use, save in ((True, True), (True, False), (False, False)):
+            with self.subTest(use=use, save=save):
                 result = subprocess.run(["bash", "-eo", "pipefail", "-c", stub + script],
-                                        env={**os.environ, "CI_USE_CACHE": str(enabled).lower()},
+                                        env={**os.environ, "CI_USE_CACHE": str(use).lower(),
+                                             "CI_SAVE_CACHE": str(save).lower()},
                                         capture_output=True, check=True)
                 args = result.stdout.decode().split("\0")[:-1]
-                cache = ["--cache-from", "type=gha", "--cache-to", "type=gha,mode=max"] if enabled else []
+                cache = (["--cache-from", "type=gha"] if use else []) + \
+                    (["--cache-to", "type=gha,mode=max"] if save else [])
                 self.assertEqual(args, base + cache + ["--load", "."])
 
     def test_github_runners_check_names_and_release_dependencies_stay_fixed(self):
