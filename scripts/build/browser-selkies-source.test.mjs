@@ -63,6 +63,46 @@ test('a changed vendored byte fails before preparation', () => {
   });
 });
 
+test('recorded font fields match the TTF name tables and preserve the older Roboto license', () => {
+  const result = spawnSync('python3', ['-c', `
+import json, runpy, sys
+from pathlib import Path
+helper = runpy.run_path(sys.argv[1])
+vendor = Path(sys.argv[2])
+manifest = json.loads((vendor / 'provenance.json').read_text())
+for name, record in manifest['fonts'].items():
+    assert helper['font_name_fields']((vendor / name).read_bytes()) == record['name_fields']
+print(json.dumps(manifest['fonts']))
+`, helper, vendor], { encoding: 'utf8', timeout: 10000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const fonts = Object.values(JSON.parse(result.stdout));
+  assert.equal(fonts.length, 7);
+  const roboto = fonts.filter(font => font.name_fields.family[0].startsWith('Roboto'));
+  assert.equal(roboto.length, 6);
+  for (const font of roboto) {
+    assert.deepEqual(font.name_fields.license_url, ['http://www.apache.org/licenses/LICENSE-2.0']);
+    assert.deepEqual(font.name_fields.license_description, []);
+    assert.equal(font.license, 'Apache-2.0');
+  }
+  const icons = fonts.find(font => font.name_fields.family[0] === 'Material Icons');
+  assert.deepEqual(icons.name_fields.license_url, []);
+  assert.deepEqual(icons.name_fields.license_description, []);
+  assert.deepEqual(icons.name_fields.copyright, ['Copyright 2018 Google, Inc. All Rights Reserved.']);
+  assert.equal(icons.license_basis, 'operator-supplied upstream license; font has no license name fields');
+});
+
+test('incorrect font metadata fails even when every vendored file hash matches', () => {
+  fixture((root, out) => {
+    const path = join(root, 'provenance.json');
+    const manifest = JSON.parse(readFileSync(path));
+    const font = Object.values(manifest.fonts)[0];
+    font.name_fields.license_url = ['https://openfontlicense.org'];
+    writeFileSync(path, JSON.stringify(manifest));
+    assert.match(run(root, out).stderr, /font name metadata mismatch/);
+  });
+});
+
 test('builder rejects changed source before Cargo or guest network work', () => {
   fixture((root, out) => {
     const repo = join(out, '..', 'repo');

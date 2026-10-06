@@ -7,11 +7,44 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 
 
 VENDOR = Path(__file__).resolve().parents[2] / "third-party/selkies"
+
+
+def font_name_fields(data):
+    """Read copyright and license fields directly from the OpenType name table."""
+    names = {0: "copyright", 1: "family", 2: "subfamily", 5: "version",
+             13: "license_description", 14: "license_url"}
+    fields = {name: [] for name in names.values()}
+    for index in range(struct.unpack_from(">H", data, 4)[0]):
+        tag, _, offset, length = struct.unpack_from(">4sIII", data, 12 + index * 16)
+        if tag != b"name":
+            continue
+        table = data[offset:offset + length]
+        if len(table) != length:
+            raise ValueError("Truncated font name table")
+        _, count, strings = struct.unpack_from(">HHH", table)
+        for record in range(count):
+            platform, encoding, _, name, size, start = struct.unpack_from(">6H", table, 6 + record * 12)
+            if name not in names:
+                continue
+            raw = table[strings + start:strings + start + size]
+            if len(raw) != size:
+                raise ValueError("Truncated font name string")
+            if platform == 0 or (platform == 3 and encoding in (0, 1, 10)):
+                text = raw.decode("utf-16be")
+            elif platform == 1 and encoding == 0:
+                text = raw.decode("mac_roman")
+            else:
+                raise ValueError(f"Unsupported font name encoding: {platform}/{encoding}")
+            if text not in fields[names[name]]:
+                fields[names[name]].append(text)
+        return fields
+    raise ValueError("Font name table is missing")
 
 
 def verify(vendor):
@@ -28,6 +61,11 @@ def verify(vendor):
     for name, record in files.items():
         if hashlib.sha256((vendor / name).read_bytes()).hexdigest() != record["sha256"]:
             raise ValueError(f"Selkies SHA-256 mismatch: {name}")
+    if set(manifest["fonts"]) != {name for name in files if name.endswith(".ttf")}:
+        raise ValueError("Selkies font metadata list mismatch")
+    for name, record in manifest["fonts"].items():
+        if font_name_fields((vendor / name).read_bytes()) != record["name_fields"]:
+            raise ValueError(f"Selkies font name metadata mismatch: {name}")
     return manifest
 
 

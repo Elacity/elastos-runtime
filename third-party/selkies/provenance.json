@@ -195,16 +195,44 @@
       "origin": "ElastOS build patch"
     },
     "licenses/Vuetify-MIT.txt": {
-      "sha256": "db6a06478f13796b2a6fd001db15120bfce641c733c185a2a6befd2dff6390aa",
-      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+      "sha256": "9e48c297c002c4caea3ce081b9b1564d3beff6fb41605101ee31d44e94d1c91b",
+      "upstream_url": "https://raw.githubusercontent.com/vuetifyjs/vuetify/v1.5.24/LICENSE.md",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
     },
     "licenses/Vue-MIT.txt": {
-      "sha256": "546bf05e73d12681dca9a5b0a1e396e02c99b6e0d29e38cf82cd6fb21ae80230",
-      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+      "sha256": "17fb24bc303763f3fe1911ee24e5225c7ad59f0e3a5d8123e9b730c100a306a6",
+      "upstream_url": "https://raw.githubusercontent.com/vuejs/vue/v2.7.16/LICENSE",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
     },
     "licenses/Apache-2.0.txt": {
       "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
-      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+      "origin": "Standard license text; original notices remain in upstream source and font name tables",
+      "upstream_url": "http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    "licenses/Vue-spinner-MIT.txt": {
+      "sha256": "3c189d6839788748a90d94c39466d18759001f045d0522db2f0df2c4f30cb8d1",
+      "upstream_url": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/LICENSE",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
+    },
+    "licenses/WebRTC-adapter-BSD-3-Clause.txt": {
+      "sha256": "00a46c6cfc219593b97586398b477e188391556e70487225d3ff9d60ccda6dce",
+      "upstream_url": "https://raw.githubusercontent.com/webrtcHacks/adapter/v9.0.1/LICENSE.md",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
+    },
+    "licenses/Guacamole-LICENSE.txt": {
+      "sha256": "3c7f148c26065e0a581b5dda114e68e16243bf5ae0b4f6209749a0e3373201d5",
+      "upstream_url": "https://raw.githubusercontent.com/apache/guacamole-client/1.5.5/LICENSE",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
+    },
+    "licenses/Guacamole-NOTICE.txt": {
+      "sha256": "9f1ec0252c59b209f5470b739039fcb5d29f51d832cef643000bf5e1d3dd29ff",
+      "upstream_url": "https://raw.githubusercontent.com/apache/guacamole-client/1.5.5/NOTICE",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
+    },
+    "licenses/Material-Icons-Apache-2.0.txt": {
+      "sha256": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+      "upstream_url": "https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE",
+      "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
     }
   },
   "recovery_comparison": {
@@ -389,32 +417,58 @@
       "component": "Vue 2.7.16",
       "license": "MIT",
       "text": "licenses/Vue-MIT.txt",
+      "upstream_url": "https://raw.githubusercontent.com/vuejs/vue/v2.7.16/LICENSE",
       "notice_source": "upstream/addons/gst-web/src/lib/vue-v2.7.16.min.js"
     },
     {
       "component": "Vuetify 1.5.24 JS, CSS and source map",
       "license": "MIT",
       "text": "licenses/Vuetify-MIT.txt",
+      "upstream_url": "https://raw.githubusercontent.com/vuetifyjs/vuetify/v1.5.24/LICENSE.md",
       "notice_source": "upstream/addons/gst-web/src/lib/vuetify-1.5.24.min.js"
     },
     {
-      "component": "Guacamole keyboard and incorporated Google source",
-      "license": "Apache-2.0",
-      "text": "licenses/Apache-2.0.txt",
-      "notice_source": "upstream/addons/gst-web/src/lib/guacamole-keyboard-selkies.js"
+      "component": "vue-spinner 1.0.4",
+      "license": "MIT",
+      "text": "licenses/Vue-spinner-MIT.txt",
+      "upstream_url": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/LICENSE",
+      "notice_source": "Fetched upstream license includes Copyright (c) 2015 greyby. Bundled generated runtimes remain separate evidence gaps."
     },
     {
-      "component": "Roboto fonts (six KFO*.ttf files)",
+      "component": "webrtc-adapter 9.0.1",
+      "license": "BSD-3-Clause",
+      "text": "licenses/WebRTC-adapter-BSD-3-Clause.txt",
+      "upstream_url": "https://raw.githubusercontent.com/webrtcHacks/adapter/v9.0.1/LICENSE.md",
+      "notice_source": "Fetched upstream license includes WebRTC project (2014) and adapter.js project (2018) copyright notices. The minified artifact contains no license/copyright comments."
+    },
+    {
+      "component": "Guacamole keyboard customized by Selkies",
+      "license": "Apache-2.0",
+      "text": "licenses/Guacamole-LICENSE.txt",
+      "notice_text": "licenses/Guacamole-NOTICE.txt",
+      "upstream_url": "https://raw.githubusercontent.com/apache/guacamole-client/1.5.5/LICENSE",
+      "notice_url": "https://raw.githubusercontent.com/apache/guacamole-client/1.5.5/NOTICE",
+      "notice_source": "upstream/addons/gst-web/src/lib/guacamole-keyboard-selkies.js",
+      "scope": "Complete upstream client 1.5.5 LICENSE/NOTICE texts are preserved. Only the Selkies-customized Keyboard file is bundled; other client components described in the full LICENSE are outside this bundle."
+    },
+    {
+      "component": "Incorporated Google source and six Roboto fonts",
       "license": "Apache-2.0",
       "text": "licenses/Apache-2.0.txt",
-      "notice_source": "Embedded font name table: Copyright 2011 Google Inc. All Rights Reserved.; name ID 14 http://www.apache.org/licenses/LICENSE-2.0"
+      "upstream_url": "http://www.apache.org/licenses/LICENSE-2.0",
+      "notice_source": "Original source headers and each Roboto font name table; see fonts for exact fields."
+    },
+    {
+      "component": "Material Icons font",
+      "license": "Apache-2.0",
+      "text": "licenses/Material-Icons-Apache-2.0.txt",
+      "upstream_url": "https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE",
+      "notice_source": "Embedded Copyright 2018 Google, Inc. All Rights Reserved. The font carries no license-description or license-URL name fields."
     }
   ],
   "license_evidence_pending": [
-    "vue-spinner 1.0.4, including its bundled webpack/style-loader/css-loader runtime",
-    "webrtc-adapter 9.0.1, including bundled sdp and build helpers",
-    "Material Icons font flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf: embedded copyright is Copyright 2018 Google, Inc. All Rights Reserved.; full license is absent from supplied commit",
-    "Guacamole upstream NOTICE referenced by the preserved Apache header"
+    "License/copyright text and exact version identification for sdp, bundled as module 11 in webrtc-adapter 9.0.1; absent from the local license inputs.",
+    "Source/version identification and license/copyright notices for the webpack bootstrap, CSS-list/source-map and style-injection runtimes in vue-spinner 1.0.4 (webpack/css-loader/style-loader attribution remains unverified); absent from the local license inputs."
   ],
   "remaining_downloads": {
     "debootstrap": "Debian bookworm minbase and its resolved dependencies, from the configured Debian mirror.",
@@ -489,5 +543,192 @@
     "dependency_resolution": "APT and pip also fetch their resolved dependencies when absent. The complete versions and transitive package set remain repository-dependent. Node comes from Debian nodejs; this rootfs build performs no npm or separate Node download.",
     "cargo": "The three guest-binary Cargo builds can fetch uncached dependencies from their lockfiles unless CARGO_NET_OFFLINE=true.",
     "scope": "This change covers build-browser-vm-rootfs.sh. The separate hosted/Selkies operator Docker image continues to use upstream base images and a wheel; it is outside this rootfs task."
+  },
+  "fonts": {
+    "upstream/addons/gst-web/src/css/font/KFOkCnqEu92Fr1MmgWxP.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto Thin"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmEU9vAw.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto Medium"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmSU5vAw.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto Light"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmWUlvAw.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto"
+        ],
+        "subfamily": [
+          "Bold"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmYUtvAw.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto Black"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOmCnqEu92Fr1Me5Q.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2011 Google Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Roboto"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 2.137; 2017"
+        ],
+        "license_description": [],
+        "license_url": [
+          "http://www.apache.org/licenses/LICENSE-2.0"
+        ]
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Apache-2.0.txt",
+      "license_basis": "font name ID 14 states the Apache-2.0 URL"
+    },
+    "upstream/addons/gst-web/src/css/font/flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf": {
+      "name_fields": {
+        "copyright": [
+          "Copyright 2018 Google, Inc. All Rights Reserved."
+        ],
+        "family": [
+          "Material Icons"
+        ],
+        "subfamily": [
+          "Regular"
+        ],
+        "version": [
+          "Version 1.017"
+        ],
+        "license_description": [],
+        "license_url": []
+      },
+      "license": "Apache-2.0",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
+      "license_basis": "operator-supplied upstream license; font has no license name fields"
+    }
+  },
+  "excluded_license_inputs": [
+    {
+      "component": "Current Roboto OFL-1.1 text",
+      "upstream_url": "https://raw.githubusercontent.com/googlefonts/roboto-classic/main/OFL.txt",
+      "sha256": "061402327a96aadb0bfb694a960ed289ecd38d383e396243831ab81feb109c41",
+      "reason": "The six bundled Roboto version 2.137 (2017) fonts state the Apache-2.0 URL in name ID 14. Keep that license for these font bytes; the current OFL text is outside this bundle."
+    }
+  ],
+  "web_bundle_license_inspection": {
+    "webrtc-adapter-9.0.1.min.js": {
+      "license_or_copyright_notices": [],
+      "inspection": "No block/line license comments, Copyright, copyright, License or license strings. External dependency name sdp is imported and mapped to bundled module 11, which implements SDP helpers. The bundled dependency version is absent. Inlined transpiler and Browserify bootstrap helpers carry no package/version attribution.",
+      "named_third_party_dependencies": [
+        {
+          "name": "sdp",
+          "bundle_module": 11,
+          "version": null,
+          "license_text": null,
+          "evidence": "e(\"sdp\"), sdp:11, 11:[function ... generateIdentifier, splitLines, splitSections, writeRtpDescription ..."
+        }
+      ]
+    },
+    "vue-spinner-v1.0.4.min.js": {
+      "inspection": "The bundle includes a webpack-style module bootstrap, CSS list/source-map serialization runtime and style injection runtime. The only comment is an emitted sourceMappingURL string, with no package/version/copyright/license notices. The supplied vue-spinner MIT text covers the named package; separate runtime origin/notices remain unverified."
+    }
   }
 }
