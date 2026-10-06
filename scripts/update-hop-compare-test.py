@@ -2693,9 +2693,13 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
 
     def test_failure_keeps_redacted_controller_state_log_tails_and_support_listing(self):
-        stderr = "".join("apply line " + str(index) + "\n" for index in range(500)) + "Authorization: Bearer leaked-bearer\n"
+        planted = "planted-attach-secret-0123456789"
+        stderr = ("".join("apply line " + str(index) + "\n" for index in range(500))
+                  + "attach accepted " + planted + "\n" + "Authorization: Bearer leaked-bearer\n")
         code, _, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
         self.assertEqual(code, 1)
+        # The failure text in result.json passes the same redactor.
+        self.assertTrue(result["failure"].endswith("Authorization: Bearer [redacted]"))
         output = self.root / "results"
         data = output / "homes/cli" / observer.CLI_DATA
         (data / "update-controller").mkdir(parents=True, exist_ok=True)
@@ -2705,25 +2709,29 @@ class CliFixtureTests(unittest.TestCase):
         status.chmod(0o600)
         (data / "update-controller/runtime.log").write_text(
             "".join("runtime line " + str(index) + "\n" for index in range(450))
-            + 'WARN provider refused {"attach_secret":"leaked-secret"} url=/home?token=leaked-query\n')
+            + 'WARN provider refused {"attach_secret":"leaked-secret"} url=/home?token=leaked-query\n'
+            + "child attached with " + planted + "\n")
+        # The Home holds this secret in a record; a line carrying it is dropped even unnamed.
+        observer.write(data / "gateway-runtime-coords.json", {"attach_secret": planted, "pid": 1})
         (data / "bin").mkdir(exist_ok=True)
         manager = SimpleNamespace(output=output)
         diagnostics = observer.cli_failure_diagnostics(manager, self.manifest, [output / "homes/cli", output / "homes/absent"], "probe")
         self.assertEqual(diagnostics["errors"], [])
         written = {name: (output / name).read_text() for name in diagnostics["files"]}
         prefix = "diagnostics/probe/"
-        self.assertEqual(observer.cli_json(output / (prefix + "cli/update-controller-status.json")),
-                         {"phase": "restored", "attach_secret": "[redacted]", "home_token": "[redacted]",
-                          "detail": {"passkey_credential": "[redacted]"}})
+        self.assertEqual(observer.cli_json(output / (prefix + "cli/update-controller-status.json")), {"phase": "restored"})
         runtime = written[prefix + "cli/logs/update-controller__runtime.log"].splitlines()
-        self.assertEqual((len(runtime), runtime[0]), (400, "runtime line 51"))
+        self.assertEqual((len(runtime), runtime[0]), (399, "runtime line 52"))
         self.assertIn("WARN provider refused", runtime[-1])
         apply = written[prefix + "output/m2-apply.stderr"].splitlines()
-        self.assertEqual((len(apply), apply[-1]), (400, "Authorization: Bearer [redacted]"))
+        self.assertEqual((len(apply), apply[-1]), (399, "Authorization: Bearer [redacted]"))
+        detail = observer.cli_ci_stderr_detail(manager, self.manifest, "m2-apply", "m2-apply")
+        self.assertTrue(detail.endswith("Authorization: Bearer [redacted]") and "apply line 499" in detail)
+        self.assertNotIn(planted, detail)
         listing = written[prefix + "cli/ls-bin-installation.txt"]
         self.assertIn("$ ls -la bin\n", listing)
         self.assertIn("$ ls -la installation\n", listing)
-        self.assertFalse(any("leaked" in text or "a" * 64 in text for text in written.values()))
+        self.assertFalse(any("leaked" in text or "a" * 64 in text or planted in text for text in written.values()))
         # The run's own failure path collected the same kinds of files before cleanup.
         self.assertIn("diagnostics/after-failure/output/m2-apply.stderr", result["diagnostics"]["files"])
         self.assertIn("diagnostics/after-failure/cli/ls-bin-installation.txt", result["diagnostics"]["files"])

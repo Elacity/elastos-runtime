@@ -2163,7 +2163,7 @@ def cli_ci_stderr_detail(processes, manifest, label, description):
         with stderr.open("rb") as stream:
             stream.seek(max(0, stderr.stat().st_size - 4096))
             tail = stream.read(4096).decode(errors="replace")
-        tail = re.sub(r"\x1b\[[0-9;]*m", "", tail).strip()
+        tail = cli_redact_text(tail, cli_known_secrets(processes.output)).strip()
         return "; CI " + description + " stderr: " + tail[-1024:] if tail else ""
     except OSError:
         return "; CI " + description + " diagnostic is unavailable"
@@ -2189,11 +2189,44 @@ def cli_redact(value):
     return value
 
 
-def cli_tail(path, lines=400):
+def cli_known_secrets(output):
+    """Secret values the run's Homes hold in their small JSON records (attach secrets, tokens),
+    so a copied line that carries one is dropped even when nothing names it."""
+    secrets = set()
+
+    def collect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if CLI_SECRET_KEY.search(key) and isinstance(item, str) and len(item) >= 8:
+                    secrets.add(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    for directory in sorted((output / "homes").glob("*/" + CLI_DATA)):
+        for path in (*directory.glob("*.json"), *directory.glob("*/*.json")):
+            try:
+                if path.is_file() and not path.is_symlink() and path.stat().st_size <= 256 * 1024:
+                    collect(json.loads(path.read_bytes()))
+            except (OSError, ValueError):
+                continue
+    return secrets
+
+
+def cli_redact_text(text, secrets):
+    return "\n".join(cli_redact(line) for line in text.splitlines() if not any(secret in line for secret in secrets))
+
+
+def cli_tail(path, secrets, lines=400):
     with path.open("rb") as stream:
         stream.seek(max(0, path.stat().st_size - 1024 * 1024))
         text = stream.read().decode(errors="replace")
-    return "\n".join(cli_redact(line) for line in text.splitlines()[-lines:]) + "\n"
+    return cli_redact_text("\n".join(text.splitlines()[-lines:]), secrets) + "\n"
+
+
+# Controller status fields copied into diagnostics; nothing else leaves the Home.
+CLI_STATUS_FIELDS = ("phase", "message", "current_version", "new_version", "id", "generation", "host_pid")
 
 
 def cli_listing(directory):
@@ -2215,6 +2248,7 @@ def cli_failure_diagnostics(processes, manifest, homes, stage):
         return {}
     written, errors = [], []
     destination = processes.output / "diagnostics" / stage
+    secrets = cli_known_secrets(processes.output)
 
     def keep(name, produce):
         try:
@@ -2230,8 +2264,8 @@ def cli_failure_diagnostics(processes, manifest, homes, stage):
     try:
         # Controller, Home start, System browser, Undo and apply output of this run.
         for path in sorted(processes.output.glob("*.std*")):
-            if re.search(r"home-start|home-system|^undo-|^m2-apply", path.name) and path.stat().st_size:
-                keep("output/" + path.name, lambda path=path: cli_tail(path))
+            if re.search(r"home-start|home-system|^undo-|^cli-update|^m2-apply", path.name) and path.stat().st_size:
+                keep("output/" + path.name, lambda path=path: cli_tail(path, secrets))
         for home in homes:
             directory = home / CLI_DATA
             if not directory.is_dir():
@@ -2239,11 +2273,12 @@ def cli_failure_diagnostics(processes, manifest, homes, stage):
             prefix = home.name + "/"
             status = directory / "update-controller/status.json"
             if status.exists():
-                keep(prefix + "update-controller-status.json",
-                     lambda status=status: json.dumps(cli_redact(cli_private_json(status)), indent=2, sort_keys=True) + "\n")
+                keep(prefix + "update-controller-status.json", lambda status=status: json.dumps(
+                    {key: value for key, value in cli_private_json(status).items() if key in CLI_STATUS_FIELDS},
+                    indent=2, sort_keys=True) + "\n")
             logs = sorted(path for path in directory.rglob("*.log") if path.is_file() and "ipfs-repo" not in path.parts)[:30]
             for path in logs:
-                keep(prefix + "logs/" + str(path.relative_to(directory)).replace("/", "__"), lambda path=path: cli_tail(path))
+                keep(prefix + "logs/" + str(path.relative_to(directory)).replace("/", "__"), lambda path=path: cli_tail(path, secrets))
             keep(prefix + "ls-bin-installation.txt",
                  lambda directory=directory: "".join("$ ls -la " + name + "\n" + cli_listing(directory / name) for name in ("bin", "installation")))
     except (OSError, ValueError) as error:
