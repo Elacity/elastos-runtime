@@ -184,6 +184,41 @@ def validate_jetson_package_lifecycle(source):
                 raise AssertionError(f"Jetson verification lacks its package on {event} {runner}")
 
 
+def validate_journey_builds(source, release_source):
+    overrides = {"CARGO_PROFILE_RELEASE_LTO": "false",
+                 "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16"}
+    for key in overrides:
+        if key in release_source or key in source.split("\njobs:\n", 1)[0]:
+            raise AssertionError("journey profiles belong only to CI journey jobs")
+    for job, block in jobs(source).items():
+        if job not in ("source-home-macos", "source-home-linux"):
+            if any(key in block for key in overrides):
+                raise AssertionError(f"journey profile override in {job}")
+            continue
+        # End job env at the next four-space key, keeping six-space values.
+        environment = re.search(r"(?ms)^    env:\n(.*?)(?=^    \S|\Z)", block)
+        if environment is None:
+            raise AssertionError(f"missing job build environment in {job}")
+        for key, value in {**overrides,
+                           "CARGO_TARGET_DIR": "${{ runner.temp }}/" + job + "-target",
+                           "CARGO_BUILD_BUILD_DIR": "${{ runner.temp }}/" + job + "-build"}.items():
+            if field(environment[1], key).strip('"') != value or block.count(key + ":") != 1:
+                raise AssertionError(f"one shared job build setting required: {job} {key}")
+        job_steps = steps(job, jobs(source))
+        cache, = [step for step in job_steps if "Swatinem/rust-cache@" in step]
+        if field(cache, "cache-targets") != "false" or "cache-directories:" in cache or "source-home-registry" not in cache:
+            raise AssertionError(f"source journey cache contains build artifacts: {job}")
+        fresh, = [step for step in job_steps if 'test ! -e "$directory"' in step]
+        for token in ('"$CARGO_TARGET_DIR"', '"$CARGO_BUILD_BUILD_DIR"', 'test ! -L "$directory"'):
+            if token not in fresh:
+                raise AssertionError(f"fresh job artifacts required: {job}")
+        setup, = [step for step in job_steps if step.startswith("name: source-home into isolated")]
+        if job_steps.index(fresh) >= job_steps.index(setup):
+            raise AssertionError(f"freshness check must precede source-home: {job}")
+        if re.search(r"(?:CARGO_TARGET_DIR|CARGO_BUILD_BUILD_DIR|RUSTFLAGS)=|--target-dir", block):
+            raise AssertionError(f"step changes the shared build environment: {job}")
+
+
 class ReleasePolicyTests(unittest.TestCase):
     def test_merge_groups_run_every_proof_on_the_queued_commit(self):
         triggers = SOURCE.split("\npermissions:", 1)[0]
@@ -361,24 +396,132 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertFalse((root / "path").exists())
                 self.assertFalse((root / "env").exists())
 
-    def test_installed_mac_build_keeps_fresh_intermediates(self):
-        fresh, = [step for step in steps("source-home-macos")
-                  if step.startswith("name: require fresh Mac build intermediates\n")]
-        self.assertNotIn("if:", fresh)
-        script = textwrap.dedent(fresh.split("        run: |\n", 1)[1])
+    def test_journey_profiles_and_fresh_targets_are_job_scoped(self):
+        release = (WORKFLOW.parent / "release-package.yml").read_text()
+        validate_journey_builds(SOURCE, release)
+
+    def test_journey_build_policy_rejects_profile_leaks_and_split_targets(self):
+        release = (WORKFLOW.parent / "release-package.yml").read_text()
+        mutations = (
+            SOURCE.replace('CARGO_PROFILE_RELEASE_LTO: "false"', 'CARGO_PROFILE_RELEASE_LTO: "true"', 1),
+            SOURCE.replace('CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"', 1),
+            SOURCE.replace('source-home-linux-target', 'separate-target', 1),
+            SOURCE.replace('test ! -L "$directory"', 'true', 1),
+            SOURCE.replace('journey artifacts start fresh.\n          cache-targets: false',
+                           'journey artifacts start fresh.\n          cache-targets: true', 1),
+            SOURCE.replace('scripts/setup-source-home.sh 2>&1', 'CARGO_TARGET_DIR=other scripts/setup-source-home.sh 2>&1', 1),
+            SOURCE.replace('  lint:\n', '  lint:\n    env:\n      CARGO_PROFILE_RELEASE_LTO: "false"\n', 1),
+        )
+        for index, changed in enumerate(mutations):
+            self.assertNotEqual(changed, SOURCE)
+            with self.subTest(mutation=index), self.assertRaises(AssertionError):
+                validate_journey_builds(changed, release)
+        with self.assertRaises(AssertionError):
+            validate_journey_builds(SOURCE, release + '\nCARGO_PROFILE_RELEASE_LTO: "false"\n')
+
+    def test_fresh_job_directories_refuse_restored_outputs_and_links(self):
+        for job in ("source-home-linux", "source-home-macos"):
+            fresh, = [step for step in steps(job) if 'test ! -e "$directory"' in step]
+            script = textwrap.dedent(fresh.split("        run: |\n", 1)[1])
+            for existing in (None, "target", "build", "link"):
+                with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    target, build = root / "target", root / "build"
+                    if existing == "link":
+                        target.symlink_to(root / "missing")
+                    elif existing:
+                        (target if existing == "target" else build).mkdir()
+                    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                            env={**os.environ, "CARGO_TARGET_DIR": str(target),
+                                                 "CARGO_BUILD_BUILD_DIR": str(build), "GITHUB_ENV": str(root / "env")})
+                    self.assertEqual(result.returncode == 0, existing is None, result.stderr)
+
+    def test_packages_select_shared_outputs_and_preserve_binary_hashes(self):
+        for shared in (False, True):
+            with self.subTest(shared=shared), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                script = root / "scripts/package-release-binaries.sh"
+                script.parent.mkdir()
+                script.write_bytes((WORKFLOW.parents[2] / "scripts/package-release-binaries.sh").read_bytes())
+                target = root / "shared"
+                env = dict(os.environ)
+                env["COPYFILE_DISABLE"] = "1"
+                env.pop("CARGO_TARGET_DIR", None)
+                if shared:
+                    env["CARGO_TARGET_DIR"] = str(target)
+                outputs = target / "release" if shared else root / "elastos/target/release"
+                outputs.mkdir(parents=True)
+                for name in ("elastos", "custody-provider", "unused.rlib"):
+                    path = outputs / name
+                    path.write_bytes(name.encode())
+                    path.chmod(0o755)
+                if shared:
+                    stale = root / "elastos/target/release/stale"
+                    stale.parent.mkdir(parents=True)
+                    stale.write_bytes(b"restored artifact")
+                    stale.chmod(0o755)
+                subprocess.run(["bash", str(script)], cwd=root, env=env, capture_output=True, check=True)
+                package, = root.glob("*.tar.gz")
+                checksum = Path(str(package) + ".sha256").read_text().split()[0]
+                self.assertEqual(checksum, hashlib.sha256(package.read_bytes()).hexdigest())
+                with tarfile.open(package) as archive:
+                    binaries = {Path(item.name).name: hashlib.sha256(archive.extractfile(item).read()).hexdigest()
+                                for item in archive if item.isfile()}
+                self.assertEqual(binaries, {name: hashlib.sha256(name.encode()).hexdigest()
+                                            for name in ("elastos", "custody-provider")})
+
+    def test_carrier_binary_paths_use_the_shared_target_or_workspace_default(self):
+        source = (WORKFLOW.parents[2] / "scripts/local-carrier-setup-smoke.sh").read_text()
+        function = "cargo_release_binary() {" + source.split("cargo_release_binary() {", 1)[1].split("\n}\n", 1)[0] + "\n}"
+        self.assertNotIn("/target/release/", source)
+        for target in ("", "/shared job/target"):
+            env = {**os.environ, "CARGO_TARGET_DIR": target, "REPO_ROOT": "/checkout"}
+            for workspace, name in (("elastos", "localhost-provider"), ("capsules/custody-provider", "custody-provider")):
+                result = subprocess.run(["bash", "-c", function + '\ncargo_release_binary "$1" "$2"', "paths", workspace, name],
+                                        env=env, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), f"{target or '/checkout/' + workspace + '/target'}/release/{name}")
+
+    def test_component_build_and_componentizer_share_the_job_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            output = root / "env"
-            env = {**os.environ, "RUNNER_TEMP": str(root), "GITHUB_ENV": str(output)}
-            subprocess.run(["bash", "-e", "-c", script], env=env, check=True)
-            self.assertIn(f"CARGO_BUILD_BUILD_DIR={root}/source-home-macos-build\n", output.read_text())
-            self.assertIn("CI_MAC_BUILD_DIR_FRESH=true\n", output.read_text())
-            result = subprocess.run(["bash", "-e", "-c", script], env=env)
-            self.assertNotEqual(result.returncode, 0, "restored intermediates must be refused")
-        build, = [step for step in steps("source-home-macos")
-                  if step.startswith("name: build two actual Runtime versions\n")]
-        self.assertIn("assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'", build)
-        self.assertIn("'initially_absent': True", build)
+            capsule = root / "capsule"
+            capsule.mkdir()
+            (capsule / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+            wit = WORKFLOW.parents[2] / "elastos/wit/elastos-bus-v1.wit"
+            (capsule / "capsule.json").write_text(json.dumps({"runtime_abi": "elastos.component/v1",
+                "bus_contract": "elastos:bus@v1", "execution": "component", "entrypoint": "fixture.component.wasm",
+                "wit_world_sha256": hashlib.sha256(wit.read_bytes()).hexdigest()}))
+            cargo = root / "fake-cargo"
+            cargo.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''
+                import json, os, pathlib, sys
+                args = sys.argv[1:]
+                target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+                with open(os.environ['BUILD_CALLS'], 'a') as log:
+                    log.write(json.dumps({'command': args[0], 'target': str(target)}) + '\\n')
+                if args[0] == 'metadata':
+                    print(json.dumps({'packages': [{'manifest_path': args[args.index('--manifest-path') + 1],
+                          'targets': [{'crate_types': ['cdylib'], 'name': 'fixture'}]}]}))
+                elif args[0] == 'build':
+                    output = target / 'wasm32-unknown-unknown/release/fixture.wasm'
+                    output.parent.mkdir(parents=True)
+                    output.write_bytes(b'fixture wasm')
+                else:
+                    source, output = map(pathlib.Path, args[args.index('--') + 1:])
+                    output.write_bytes(source.read_bytes())
+            '''))
+            cargo.chmod(0o755)
+            rustc = root / "fake-rustc"
+            rustc.write_text("#!/bin/sh\nprintf '/fixture/rust\\n'\n")
+            rustc.chmod(0o755)
+            target = root / "shared target"
+            env = {**os.environ, "CARGO_TARGET_DIR": str(target), "CARGO_BIN": str(cargo),
+                   "RUSTC_BIN": str(rustc), "BUILD_CALLS": str(root / "calls")}
+            subprocess.run(["bash", str(WORKFLOW.parents[2] / "scripts/build-component-capsule.sh"), str(capsule)],
+                           env=env, capture_output=True, text=True, check=True)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            self.assertEqual([call['command'] for call in calls], ['metadata', 'build', 'run'])
+            self.assertEqual({call['target'] for call in calls}, {str(target)})
+            self.assertEqual((capsule / "fixture.component.wasm").read_bytes(), b'fixture wasm')
 
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
@@ -502,7 +645,9 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("prepare-ci-disk", mac_steps[capacity])
         self.assertEqual(build + 1, generate)
         self.assertIn("build-ci-hop", mac_steps[build])
-        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[build])
+        self.assertIn('--runtime "$CARGO_TARGET_DIR/release/elastos"', mac_steps[build])
+        setup = mac_steps[names.index("name: source-home into isolated MAC_TEST_HOME")]
+        self.assertIn('echo "ELASTOS_RELEASE_VERSION=$ELASTOS_RELEASE_VERSION" >> "$GITHUB_ENV"', setup)
         self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
         self.assertEqual(prove, generate + 1)
         self.assertNotIn("if:", mac_steps[generate])

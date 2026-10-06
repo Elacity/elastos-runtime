@@ -484,6 +484,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: [source-gate, engine-llama-arm64]
+    # Journey builds keep the shipped profiles except for LTO/codegen units.
+    # release-package.yml builds the shipped binaries with their full profiles.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-linux-target
+      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-linux-build
     strategy:
       fail-fast: false
       matrix:
@@ -508,15 +515,24 @@ jobs:
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
+      - name: require fresh Linux build artifacts
+        run: |
+          set -euo pipefail
+          # Reuse this job's fresh source only, including across capsule workspaces.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
       # A stalled mirror once held this step until the 90-minute job limit.
       - name: install host prerequisites
         timeout-minutes: 15
@@ -601,6 +617,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 90
     needs: source-gate
+    # Journey builds keep the shipped profiles except for LTO/codegen units.
+    # release-package.yml builds the shipped binaries with their full profiles.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-macos-target
+      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-macos-build
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -616,9 +639,9 @@ jobs:
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ runner.os }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: reserve hosted Mac build and fixture capacity
         timeout-minutes: 10
@@ -626,13 +649,13 @@ jobs:
       - name: require fresh Mac build intermediates
         run: |
           set -euo pipefail
-          # Cargo 1.91 stores fingerprints here. Start outside the restored
-          # cache, then share intermediates across this source tree's N/N+1.
-          directory="$RUNNER_TEMP/source-home-macos-build"
-          test ! -e "$directory"
-          test ! -L "$directory"
-          mkdir -m 700 "$directory"
-          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          # Keep outputs and Cargo 1.91 fingerprints outside restored caches.
+          # Reuse this job's fresh source across capsules and version builds.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
           echo "CI_MAC_BUILD_DIR_FRESH=true" >> "$GITHUB_ENV"
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
@@ -682,6 +705,7 @@ jobs:
           # version is X.Y.Z or X.Y.Z-{alpha|beta|rc}.N, never the default "-dev".
           export ELASTOS_RELEASE_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path elastos/Cargo.toml \
             | python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "elastos-server"))')"
+          echo "ELASTOS_RELEASE_VERSION=$ELASTOS_RELEASE_VERSION" >> "$GITHUB_ENV"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -709,7 +733,7 @@ jobs:
           mkdir -p "$CI_HOP_ROOT"
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
-            --runtime "$PWD/elastos/target/release/elastos"
+            --runtime "$CARGO_TARGET_DIR/release/elastos"
           python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
           import json, os, pathlib, sys
           path = pathlib.Path(sys.argv[1])
@@ -717,8 +741,12 @@ jobs:
           directory = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
           assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'
           assert directory.is_dir() and not directory.is_symlink()
+          target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+          assert target == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-target'
+          assert target.is_dir() and not target.is_symlink()
           assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'
           build['intermediates'] = {'directory': str(directory), 'initially_absent': True,
+                                    'target_directory': str(target),
                                     'source': build['source']}
           path.write_text(json.dumps(build, indent=2) + '\n')
           PY

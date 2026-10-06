@@ -38,10 +38,14 @@ collect() {
         -exec cp {} "${STAGE}/" \;
 }
 
-collect "${ROOT}/elastos/target/release"
-for lock in "${ROOT}"/capsules/*/Cargo.lock; do
-    collect "$(dirname "${lock}")/target/release"
-done
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    collect "${CARGO_TARGET_DIR}/release"
+else
+    collect "${ROOT}/elastos/target/release"
+    for lock in "${ROOT}"/capsules/*/Cargo.lock; do
+        collect "$(dirname "${lock}")/target/release"
+    done
+fi
 
 if [ -z "$(ls -A "${STAGE}")" ]; then
     echo "No release binaries found; run cargo build --workspace --release first." >&2
