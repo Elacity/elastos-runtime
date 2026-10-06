@@ -1001,7 +1001,8 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
         "http://127.0.0.1:8090/home/",
         "http://[::1]:8090/home/",
     ] {
-        assert_eq!(approved_home_url(value).unwrap().as_str(), value);
+        assert_eq!(approved_home_url(value, 8090).unwrap().as_str(), value);
+        assert!(approved_home_url(value, 8091).is_err(), "{value}");
     }
     for value in [
         "https://localhost:8090/home/",
@@ -1019,7 +1020,7 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
         "http://example.test:8090/home/",
         "http://localhost:8090/home/%2e%2e/",
     ] {
-        assert!(approved_home_url(value).is_err(), "{value}");
+        assert!(approved_home_url(value, 8090).is_err(), "{value}");
     }
 }
 
@@ -1095,7 +1096,8 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     let fixture = PrivateFixture::new();
-    let listener = tokio::net::TcpListener::bind("[::1]:8090").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let fetched = Arc::new(AtomicUsize::new(0));
     let observed = fetched.clone();
     let health_observed = fetched.clone();
@@ -1139,7 +1141,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let generation = "a".repeat(32);
     let binary_hash = digest(b"fixture owned gateway binary");
     let mut coords = json!({
-        "api_url":"http://[::1]:8090", "home_url":"http://[::1]:8090/home/",
+        "api_url":format!("http://[::1]:{port}"), "home_url":format!("http://[::1]:{port}/home/"),
         "attach_secret":"fixture-attach-secret", "runtime_kind":"gateway",
         "pid":pid, "generation":generation, "binary_sha256":binary_hash,
     });
@@ -1160,6 +1162,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let ready = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1170,6 +1173,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_document = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1182,6 +1186,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_generation = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1199,6 +1204,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_host_lock = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
