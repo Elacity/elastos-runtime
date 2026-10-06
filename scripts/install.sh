@@ -1002,6 +1002,7 @@ fi
 # ── Fetch + verify release head ──────────────────────────────────────
 
 step 2 "Verify the release"
+info "Maintainer DID: ${MAINTAINER_DID}"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT

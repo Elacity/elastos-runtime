@@ -3081,7 +3081,7 @@ finally:
     #[test]
     fn saved_public_pin_changes_require_approval_and_exact_confirmation() {
         let old = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
-        let new = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
+        let new = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("publish-state.json");
         let state = PublishState {

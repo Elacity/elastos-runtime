@@ -291,7 +291,7 @@ class PrepareWorkerTest(unittest.TestCase):
         template = json.loads(template_path.read_text())
         template["model_catalog"] = {
             "head_cid": "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(catalog).digest()).decode().lower().rstrip("="),
-            "publisher_dids": ["did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"],
+            "publisher_dids": ["did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"],
         }
         template_path.write_text(json.dumps(template))
         self.commit("public catalogue fixture")
