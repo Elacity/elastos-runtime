@@ -425,7 +425,7 @@ class CliFixtureTests(unittest.TestCase):
             if phase == "tampered-binary":
                 binary_binding["sha256"] = self.manifest["files"][new_bin]["sha256"]
             payload = {"schema": "elastos.release/v1", "channel": "canary",
-                       "version": self.manifest["old" if phase == "old" else "new"]["version"],
+                       "version": observer.cli_phase_version(self.manifest, phase),
                        "platforms": {"x86_64-darwin" if phase == "wrong-platform" else "aarch64-darwin": {"binary": binary_binding, "components": binding(components)}}}
             release = add(phase + "/release.json", {"payload": payload, "signature": "00" * 64,
                                                    "signer_did": "did:key:zother" if phase == "wrong-signer-release" else signer})
@@ -848,15 +848,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def positive(self):
         self.manifest["proof_scope"] = "production-positive"
-        self.manifest["publications"] = {"old": self.manifest["publications"]["old"],
-                                          "new": self.manifest["publications"]["wrong-signer-head"].copy()}
-        pub = self.manifest["publications"]["new"]
-        head = observer.cli_json(self.root / pub["head"])
-        head["signer_did"] = self.manifest["signer_did"]
-        pub["head"] = self.add("positive/head.json", head)
-        pub["receipt"] = self.add("positive/receipt.json", {"last_head_cid": self.manifest["files"][pub["head"]]["cid"],
-                                                            "last_release_cid": self.manifest["files"][pub["release"]]["cid"]}, cid=False)
-        self.manifest["holder"]["content"][self.manifest["files"][pub["head"]]["cid"]] = pub["head"]
+        self.manifest["publications"] = {name: self.manifest["publications"][name] for name in ("old", "new")}
         for selector in self.manifest["selectors"].values():
             selector["refusals"] = []
         observer.os.environ["ELASTOS_CI_FIXTURE_SCOPE"] = "production-positive"
@@ -1024,12 +1016,12 @@ class CliFixtureTests(unittest.TestCase):
             for changed_stdout, changed_stderr, unchanged in ((stdout, "Carrier connection failed", True), (stdout, stderr, False)):
                 self.assertEqual(observer.cli_refusal(case, failure, changed_stdout, changed_stderr, unchanged)["status"], "failed")
 
-    def qualified_home_support(self):
-        support = self.root / "support"
+    def qualified_home_support(self, support=None, marker=b""):
+        support = support or self.root / "support"
         (support / "bin").mkdir(parents=True, exist_ok=True)
         for name in (*observer.CLI_NATIVE_SETUP, "custody-provider"):
             path = support / "bin" / name
-            path.write_bytes(name.encode())
+            path.write_bytes(marker + name.encode())
             path.chmod(0o755)
         registry = {"capsules": {}, "external": {name: {
             "install_path": "bin/" + name, "platforms": {"darwin-arm64": {"checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
@@ -1039,7 +1031,7 @@ class CliFixtureTests(unittest.TestCase):
             (capsule / "browser").mkdir(parents=True, exist_ok=True)
             observer.write(capsule / "capsule.json", {"schema": "elastos.capsule/v1", "name": name, "role": "app",
                            "type": "wasm", "entrypoint": "browser/index.html", "execution": "web-projection"})
-            (capsule / "browser/index.html").write_bytes(b"<html>installed " + name.encode() + b" fixture</html>")
+            (capsule / "browser/index.html").write_bytes(b"<html>installed " + marker + name.encode() + b" fixture</html>")
             (capsule / "browser/shell.js").write_bytes(b"export const home = true;")
             document = capsule / "browser/index.html"
             registry["capsules"][name] = {"cid": "", "sha256": "", "size": 0, "install_path": "capsules/" + name,
@@ -1056,6 +1048,34 @@ class CliFixtureTests(unittest.TestCase):
             "darwin-arm64": {"release_path": "custody-provider-darwin-arm64", "install_path": "bin/custody-provider"}}}
         observer.write(support / "components.json", registry)
         return support
+
+    def previous_release(self, runtime, version="0.7.1"):
+        """A maintainer-signed published release laid out as fetch-previous-release writes it."""
+        previous = self.root / "previous"
+        support = self.qualified_home_support(previous / "support", b"published ")
+        (previous / "elastos").write_bytes(runtime.read_bytes())
+        (previous / "elastos").chmod(0o755)
+        observer.write(previous / "components.json", {"schema": "elastos.components/v1", "external": {
+            name: {"platforms": {"darwin-arm64": {"cid": "Qm" + name, "release_path": name + "-darwin-arm64", "size": 1,
+                                                  "checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
+            for name in observer.CLI_NATIVE_SETUP}})
+        (previous / "install.sh").write_text(Path(observer.__file__).with_name("install.sh").read_text())
+        source = {"commit": "9" * 40, "tree": "8" * 40}
+        artifacts = {key: {"cid": "Qm" + key, "sha256": observer.digest(previous / name), "size": (previous / name).stat().st_size}
+                     for key, name in (("binary", "elastos"), ("components", "components.json"))}
+        envelope = signing_fixture.sign_envelope({"schema": "elastos.release/v1", "channel": "canary", "version": version,
+                                                  "source": source, "platforms": {"aarch64-darwin": artifacts}},
+                                                 "elastos.release.v1", b"\x07" * 32)
+        observer.write(previous / "release.json", envelope)
+        raw = (previous / "release.json").read_bytes()
+        observer.write(self.root / "previous-pin.json", {
+            "schema": "elastos.update-hop.previous-release/v1", "version": version, "signer_did": envelope["signer_did"],
+            "release_cid": "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("="),
+            "release_sha256": hashlib.sha256(raw).hexdigest()})
+        pin = patch.object(observer, "CLI_PREVIOUS_PIN", self.root / "previous-pin.json")
+        pin.start()
+        self.addCleanup(pin.stop)
+        return previous, source
 
     def qualified_localhost_metadata(self, support, fault=None):
         files = {"capsule.json": json.dumps({"schema": "elastos.capsule/v1", "name": "localhost-provider",
@@ -1241,7 +1261,7 @@ class CliFixtureTests(unittest.TestCase):
                 with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), \
                      patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
                      patch.object(observer.subprocess, "run") as command, self.assertRaises(ValueError):
-                    observer.cli_generate_hop(generated, runtime, runtime, runtime, support,
+                    observer.cli_generate_hop(generated, runtime, runtime, runtime, support, self.root / "previous",
                                              localhost_metadata=None if fault == "absent" else archive)
                 command.assert_not_called()
                 self.assertFalse(generated.exists())
@@ -1811,10 +1831,12 @@ class CliFixtureTests(unittest.TestCase):
         next_runtime.write_bytes(native.read_bytes() + b"next version")
         build_receipt = self.root / "build-receipt.json"
         source = {"commit": "a" * 40, "tree": "a" * 40}
+        previous, published_source = self.previous_release(native)
         observer.write(build_receipt, {"schema": "elastos.update-hop.build/v1", "source": source,
             "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
-            "status": "passed", "cleanup": {"passed": True}, **{name: {"source": source, "version": version,
-            "sha256": observer.digest(path), "version_environment": version} for name, path, version in (("old", native, "0.7.1"), ("new", next_runtime, "0.7.2"))}})
+            "status": "passed", "cleanup": {"passed": True}, **{name: {"source": binary_source, "version": version,
+            "sha256": observer.digest(path), "version_environment": environment} for name, path, version, binary_source, environment in (
+                ("old", native, "0.7.1", published_source, None), ("new", next_runtime, "0.7.2", source, "0.7.2"))}})
         if local_rehearsal is not None or foreign_build:
             build = observer.cli_json(build_receipt)
             build.update(proof_scope="local-rehearsal", reference=local_rehearsal or "local-rehearsal:" + "a" * 40 + ":UP-03-test")
@@ -1863,12 +1885,12 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", side_effect=git):
             if foreign_build:
                 with self.assertRaisesRegex(ValueError, "hop build proof scope differs"):
-                    observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support)
+                    observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, previous)
                 self.assertTrue(key_paths)
                 self.assertTrue(all(not path.exists() for path in key_paths))
                 self.assertFalse((generated / "generator").exists())
                 return
-            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, local_rehearsal, metadata_path)
+            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, previous, local_rehearsal, metadata_path)
         self.assertEqual(receipt["proof_scope"], "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal")
         if local_rehearsal is not None:
             self.assertEqual(receipt["reference"], local_rehearsal)
@@ -1905,7 +1927,7 @@ class CliFixtureTests(unittest.TestCase):
                     observer.cli_admit_model_fixture(generated, changed)
         catalogue_path.write_bytes(original_catalogue)
         self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
-        components = observer.cli_json(generated / generated_manifest["publications"]["old"]["components"])
+        components = observer.cli_json(generated / generated_manifest["publications"]["new"]["components"])
         qualified = observer.cli_json(support / "components.json")
         if metadata:
             selected = observer.cli_localhost_metadata_info(components["external"]["localhost-provider"], "darwin-arm64")
@@ -1935,7 +1957,7 @@ class CliFixtureTests(unittest.TestCase):
                 self.assertEqual(generated_manifest["holder"]["files"][observer.CLI_DATA + "/" + target], relative)
             self.assertEqual(observer.digest(consumer_data / target), binding["sha256"])
             self.assertTrue((consumer_data / target).stat().st_mode & 0o111)
-            self.assertIn(target, generated_manifest["preserve"]["support"])
+            self.assertIn(target, observer.cli_setup_files(generated_manifest))
             selected = components["external"][name]["platforms"]["darwin-arm64"]
             self.assertEqual(selected["checksum"], "sha256:" + binding["sha256"])
             self.assertEqual(selected["size"], binding["bytes"])
@@ -1945,7 +1967,8 @@ class CliFixtureTests(unittest.TestCase):
         package_fields = {"cid", "sha256", "size"}
         self.assertEqual({key: value for key, value in components["capsules"]["home"].items() if key not in package_fields},
                          {key: value for key, value in qualified["capsules"]["home"].items() if key not in package_fields})
-        observer.cli_admit_setup(generated, generated_manifest)
+        for view in observer.cli_support_views(generated_manifest):
+            observer.cli_admit_setup(generated, view)
         self.assertEqual(components["profiles"]["home"]["components"], list(observer.CLI_SETUP_COMPONENTS))
         # A release lists custody outside the Home profile; Home must start without it (#238).
         custody = components["external"]["custody-provider"]["platforms"]["darwin-arm64"]
@@ -1953,10 +1976,28 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(custody["checksum"], "sha256:" + observer.digest(support / "bin/custody-provider"))
         self.assertNotIn(custody["cid"], generated_manifest["holder"]["content"])
         self.assertNotIn("bin/custody-provider", generated_manifest["consumer"]["files"])
-        self.assertTrue(all(generated_manifest["files"][generated_manifest["consumer"]["files"][target]].get("cid")
+        old_view = observer.cli_support_view(generated_manifest, "old")
+        self.assertTrue(all(generated_manifest["files"][old_view["consumer"]["files"][target]].get("cid")
                             for target in generated_manifest["initial_home"]["files"]))
         native = generated_manifest["files"][generated_manifest["consumer"]["files"]["bin/localhost-provider"]]
         self.assertEqual(components["external"]["localhost-provider"]["platforms"]["darwin-arm64"]["cid"], native["cid"])
+        # Old is the published release: its Runtime, source, support bytes and installer source.
+        publications = generated_manifest["publications"]
+        old_components = observer.cli_json(generated / publications["old"]["components"])
+        for name in ("ipfs-provider", "localhost-provider", *observer.CLI_PROTECTED_PROVIDERS):
+            self.assertEqual(old_components["external"][name]["platforms"]["darwin-arm64"]["checksum"],
+                             "sha256:" + observer.digest(previous / "support/bin" / name))
+            self.assertNotEqual(old_components["external"][name], components["external"][name])
+        self.assertEqual(old_view["consumer"]["files"]["capsules/home/browser/index.html"],
+                         generated_manifest["previous"]["support"]["capsules/home/browser/index.html"])
+        self.assertEqual(generated_manifest["old"]["source"], published_source)
+        self.assertEqual(observer.cli_json(generated / publications["old"]["release"])["payload"]["source"], published_source)
+        self.assertEqual(generated_manifest["files"][publications["old"]["binary"]]["sha256"], observer.digest(previous / "elastos"))
+        self.assertEqual(observer.cli_installer_metadata(generated / generated_manifest["previous"]["installer"], {}),
+                         [generated_manifest["signer_did"], ""])
+        # Refusals claim the release after new, so an installed new release must refuse them.
+        self.assertEqual({observer.cli_json(generated / publications[case]["release"])["payload"]["version"]
+                          for case in observer.CLI_REFUSALS}, {"0.7.3"})
         self.assertNotEqual(generated_manifest["signer_did"], observer.cli_json(generated / generated_manifest["publications"]["wrong-signer-head"]["head"])["signer_did"])
         generated_manifest["proof_kind"] = "harness-self-test"
         observer.write(generated / "manifest.json", generated_manifest)
@@ -1968,10 +2009,96 @@ class CliFixtureTests(unittest.TestCase):
         with patch.dict(observer.os.environ, admission_environment), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.subprocess, "check_output", side_effect=git):
             self.assertEqual(observer.cli_admit(config, local_rehearsal)["proof_kind"], "harness-self-test")
+        return generated, generated_manifest
+
+    def test_cross_version_admission_requires_the_pinned_release_on_the_old_side(self):
+        generated, manifest = self.assert_generated_signed_fixture()
+        observer.cli_admit_previous(generated, manifest, {})
+        def same_build_old(changed):
+            changed["publications"]["old"]["binary"] = changed["publications"]["new"]["binary"]
+        def same_source_old(changed):
+            changed["old"]["source"] = changed["source"]
+        def new_support_as_old(changed):
+            changed["previous"]["support"]["bin/ipfs-provider"] = changed["consumer"]["files"]["bin/ipfs-provider"]
+        def skipped_release(changed):
+            changed["new"]["version"] = "0.7.3"
+        def new_components_as_old(changed):
+            changed["publications"]["old"]["components"] = changed["publications"]["new"]["components"]
+        for change in (same_build_old, same_source_old, new_support_as_old, skipped_release, new_components_as_old):
+            with self.subTest(change=change.__name__):
+                changed = json.loads(json.dumps(manifest))
+                change(changed)
+                with self.assertRaises(ValueError):
+                    observer.cli_admit_previous(generated, changed, {})
+
+    def test_next_release_advances_the_last_prerelease_field_or_the_patch(self):
+        for version, expected in (("0.8.0-alpha.6", "0.8.0-alpha.7"), ("0.7.1", "0.7.2"), ("1.2.3-rc.9", "1.2.3-rc.10")):
+            self.assertEqual(observer.cli_next_version(version), expected)
+        for version in ("0.8.0-dev", "0.8", "v0.8.0"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                observer.cli_next_version(version)
+
+    def test_previous_release_admits_only_the_maintainer_signed_bytes_the_pin_names(self):
+        runtime = self.root / "runtime"
+        runtime.write_bytes(b"published Runtime")
+        previous, source = self.previous_release(runtime, "0.8.0-alpha.6")
+        pin = observer.cli_previous_pin()
+        self.assertEqual(observer.cli_previous_release(previous / "release.json", pin)["source"], source)
+        tampered = observer.cli_json(previous / "release.json")
+        tampered["payload"]["version"] = "0.8.0-alpha.7"
+        observer.write(self.root / "tampered-release.json", tampered)
+        for fault, path, changes in (("bytes", self.root / "tampered-release.json", {}),
+                                     ("signer", previous / "release.json", {"signer_did": public_did(b"\x01" * 32)}),
+                                     ("version", previous / "release.json", {"version": "0.8.0-alpha.5"})):
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                observer.cli_previous_release(path, {**pin, **changes})
+
+    def test_previous_release_fetch_refuses_bytes_that_differ_from_their_signed_hash(self):
+        runtime = self.root / "runtime"
+        runtime.write_bytes(b"published Runtime")
+        previous, _ = self.previous_release(runtime)
+        pin = observer.cli_previous_pin()
+        release = "/ipfs/" + pin["release_cid"]
+        served = {release: (previous / "release.json").read_bytes(), "/ipfs/Qmbinary": b"substituted Runtime bytes"}
+        reads = []
+        def origin(path, limit):
+            reads.append(path)
+            return served[path]
+        cache = self.root / "cache"
+        with patch.object(observer, "cli_origin_bytes", side_effect=origin), patch.object(observer.platform, "machine", return_value="arm64"):
+            for attempt in ("first", "cached"):
+                with self.subTest(attempt=attempt), self.assertRaisesRegex(ValueError, "elastos differs from its signed hash"):
+                    observer.cli_fetch_previous_release(cache, self.root / ("fetched-" + attempt))
+        # Only the signed release metadata was cached, and the second fetch read it from the cache.
+        self.assertEqual([path.name for path in cache.iterdir()], [pin["release_sha256"]])
+        self.assertEqual(reads, [release, "/ipfs/Qmbinary", "/ipfs/Qmbinary"])
+
+    def test_check_result_requires_the_published_start_no_new_provider_warnings_and_undo(self):
+        def result():
+            return {"schema": "elastos.update-hop.result/v1", "status": "passed",
+                    "old": {"version": "0.8.0-alpha.6"}, "new": {"version": "0.8.0-alpha.7"},
+                    "previous_release": {"version": "0.8.0-alpha.6"},
+                    "paths": {"m1-install": {"checks": {"initial-home": {
+                        "system": {"provider_warnings": {"new": []}},
+                        "undo": {"status": "passed", "version": "0.8.0-alpha.6",
+                                 "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}}}}
+        self.assertEqual(observer.cli_check_result(result())["from"], "0.8.0-alpha.6")
+        home = lambda value: value["paths"]["m1-install"]["checks"]["initial-home"]  # noqa: E731
+        faults = {"failed run": lambda value: value.update(status="failed", failure="System did not update"),
+                  "new provider warning": lambda value: home(value)["system"]["provider_warnings"].update(new=["provider refused"]),
+                  "same-build hop": lambda value: value.pop("previous_release"),
+                  "other old release": lambda value: value["old"].update(version="0.8.0-alpha.5"),
+                  "no Undo": lambda value: home(value).pop("undo"),
+                  "plain downgrade applied": lambda value: home(value)["undo"]["refused_plain_update"].update(exit=0)}
+        for name, fault in faults.items():
+            with self.subTest(fault=name), self.assertRaises(ValueError):
+                value = result()
+                fault(value)
+                observer.cli_check_result(value)
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
-            observer.cli_generate_hop(self.root / "generated", self.root / "missing", self.root / "missing", self.root / "missing", self.root)
+            observer.cli_generate_hop(self.root / "generated", self.root / "missing", self.root / "missing", self.root / "missing", self.root, self.root / "missing")
 
     def test_hop_builder_preserves_n_and_compiles_n_plus_one_with_version_input(self):
         self.assert_hop_builder()
@@ -1980,8 +2107,11 @@ class CliFixtureTests(unittest.TestCase):
         self.assert_hop_builder("local-rehearsal:" + "a" * 40 + ":UP-03-test")
 
     def assert_hop_builder(self, local_rehearsal=None):
-        runtime = self.root / "built-runtime"
         header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
+        published = self.root / "published-runtime"
+        published.write_bytes(header + b"published")
+        previous, published_source = self.previous_release(published, "0.8.0-alpha.6")
+        runtime = self.root / "built-runtime"
         runtime.write_bytes(header + b"N")
         destination = self.root / "build-inputs"
         calls = []
@@ -1989,13 +2119,14 @@ class CliFixtureTests(unittest.TestCase):
             calls.append((argv, env, timeout))
             stdout = b""
             if label == "old-version":
-                stdout = b"elastos 0.7.1-dev\n"
+                self.assertEqual(argv[0], str(destination / "elastos-old"))
+                stdout = b"elastos 0.8.0-alpha.6\n"
             elif label == "build-next":
-                self.assertEqual(env["ELASTOS_RELEASE_VERSION"], "0.7.2")
+                self.assertEqual(env["ELASTOS_RELEASE_VERSION"], "0.8.0-alpha.7")
                 self.assertEqual(timeout, 900)
                 runtime.write_bytes(header + b"N+1")
             else:
-                stdout = b"elastos 0.7.2\n"
+                stdout = b"elastos 0.8.0-alpha.7\n"
             (destination / (label + ".stdout")).write_bytes(stdout)
             (destination / (label + ".stderr")).write_bytes(b"")
             return {"exit": 0}
@@ -2008,23 +2139,39 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
              patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}):
-            receipt = observer.cli_build_hop(destination, runtime, local_rehearsal)
+            receipt = observer.cli_build_hop(destination, runtime, previous, local_rehearsal)
         self.assertEqual(receipt["status"], "passed")
-        self.assertEqual((destination / "elastos-old").read_bytes(), header + b"N")
+        # Old is the published release, not this source's build.
+        self.assertEqual((destination / "elastos-old").read_bytes(), header + b"published")
+        self.assertEqual((receipt["old"]["version"], receipt["old"]["source"]), ("0.8.0-alpha.6", published_source))
         self.assertEqual((destination / "elastos-new").read_bytes(), header + b"N+1")
-        self.assertEqual(receipt["new"]["version_environment"], "0.7.2")
+        self.assertEqual(receipt["new"]["version_environment"], "0.8.0-alpha.7")
         self.assertEqual(receipt["new"]["sha256"], observer.digest(destination / "elastos-new"))
         self.assertEqual(calls[1][0], receipt["command"])
         if local_rehearsal is not None:
             self.assertEqual((receipt["proof_scope"], receipt["reference"]), ("local-rehearsal", local_rehearsal))
 
+    def test_hop_builder_refuses_a_published_runtime_that_differs_from_its_pin(self):
+        header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
+        published = self.root / "published-runtime"
+        published.write_bytes(header + b"published")
+        previous, _ = self.previous_release(published)
+        (previous / "elastos").write_bytes(header + b"substituted")
+        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.CliProcesses, "command") as command, \
+             self.assertRaisesRegex(ValueError, "previous release Runtime differs from its signed hash"):
+            observer.cli_build_hop(self.root / "build-inputs", published, previous)
+        command.assert_not_called()
+        self.assertFalse((self.root / "build-inputs").exists())
+
     def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
         runtime = self.root / "built-runtime"
         original = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         runtime.write_bytes(original)
+        previous, _ = self.previous_release(runtime)
         destination = self.root / "build-inputs"
         def command(manager, argv, env, cwd, label, timeout):
-            (destination / (label + ".stdout")).write_bytes(b"elastos 0.7.1-dev\n" if label == "old-version" else b"")
+            (destination / (label + ".stdout")).write_bytes(b"elastos 0.7.1\n" if label == "old-version" else b"")
             (destination / (label + ".stderr")).write_bytes(b"")
             return {"exit": 0 if label == "old-version" else 124}
         def git(argv, **kwargs):
@@ -2034,7 +2181,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
              self.assertRaisesRegex(ValueError, "next Runtime build failed"):
-            observer.cli_build_hop(destination, runtime)
+            observer.cli_build_hop(destination, runtime, previous)
         receipt = observer.cli_json(destination / "build.json")
         self.assertEqual(receipt["status"], "failed")
         self.assertTrue(receipt["cleanup"]["passed"])
@@ -2045,6 +2192,7 @@ class CliFixtureTests(unittest.TestCase):
         runtime = self.root / "built-runtime"
         original = b"retained old Runtime bytes"
         runtime.write_bytes(original)
+        previous, _ = self.previous_release(runtime)
         before = runtime.stat()
         paths = set(self.root.iterdir())
         destination = self.root / "build-inputs"
@@ -2053,7 +2201,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.subprocess, "check_output") as git, patch.object(observer.CliProcesses, "command") as command, \
              patch.object(observer.CliProcesses, "cleanup") as cleanup, patch.object(observer.shutil, "copyfile") as copy, \
              patch.object(observer.Path, "mkdir") as mkdir, self.assertRaisesRegex(ValueError, "hop rebuild would breach the disk reserve"):
-            observer.cli_build_hop(destination, runtime)
+            observer.cli_build_hop(destination, runtime, previous)
         for action in (git, command, cleanup, copy, mkdir):
             action.assert_not_called()
         self.assertFalse(destination.exists())
@@ -2065,8 +2213,12 @@ class CliFixtureTests(unittest.TestCase):
         support = self.qualified_home_support()
         runtime = self.root / "runtime"
         runtime.write_bytes(b"Runtime command substitute")
+        previous, _ = self.previous_release(runtime)
         generated = self.root / "generated"
+        real_run = observer.subprocess.run
         def failed(argv, **kwargs):
+            if argv[0] == "/bin/bash":
+                return real_run(argv, **kwargs)
             self.assertTrue((generated / "generator/approved.key").is_file())
             self.assertTrue((generated / "generator/other.key").is_file())
             return subprocess.CompletedProcess(argv, 1, b"", b"private command error stays out of receipts")
@@ -2074,7 +2226,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
              patch.object(observer.subprocess, "run", side_effect=failed), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"), \
              self.assertRaisesRegex(ValueError, "disposable fixture command failed"):
-            observer.cli_generate_hop(generated, runtime, runtime, runtime, support)
+            observer.cli_generate_hop(generated, runtime, runtime, runtime, support, previous)
         self.assertFalse((generated / "generator").exists())
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,
@@ -2154,7 +2306,7 @@ class CliFixtureTests(unittest.TestCase):
                     if setup_exit:
                         self.returncode = setup_exit
                     else:
-                        publication = manifest["publications"]["old"]
+                        publication = manifest["publications"][phase()]
                         for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
                             (directory / filename).write_bytes((root / publication[key]).read_bytes())
                         if "setup" in manifest:
@@ -2332,7 +2484,7 @@ class CliFixtureTests(unittest.TestCase):
         self.manifest["initial_home"] = {"files": []}
         self.freeze()
         owned_roots = {}
-        def initial_home(manager, manifest, home, evidence, publish_next):
+        def initial_home(manager, manifest, home, evidence, publish_next, root):
             for name in ("ipfs-provider", "kubo"):
                 target = "bin/" + name
                 path = str(home / observer.CLI_DATA / target)
@@ -2401,7 +2553,7 @@ class CliFixtureTests(unittest.TestCase):
     def test_runner_rejects_substituted_legacy_metadata_before_update(self):
         code, calls, result = self.fake_run(metadata_drift="legacy")
         self.assertEqual(code, 1)
-        self.assertIn("old legacy installed metadata hash differs", result["failure"])
+        self.assertIn("legacy installed metadata hash differs", result["failure"])
         self.assertFalse(any(argv[1] == "update" for argv, _ in calls))
         self.assertTrue(result["cleanup"]["passed"])
 

@@ -692,6 +692,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
+      # The hop starts from the published release the pin names. Its signed bytes are
+      # cached by the pin; only a miss reads them from the public seed.
+      - name: restore the pinned published release
+        id: previous-release-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ runner.temp }}/previous-release-cache
+          key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
+      - name: fetch the pinned published release
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py fetch-previous-release \
+            "$RUNNER_TEMP/previous-release-cache" "$RUNNER_TEMP/previous-release"
+      - name: save the pinned published release
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.previous-release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ runner.temp }}/previous-release-cache
+          key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
       - name: build two actual Runtime versions
         timeout-minutes: 16
         run: |
@@ -701,7 +722,7 @@ jobs:
           mkdir -p "$CI_HOP_ROOT"
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
-            --runtime "$PWD/elastos/target/release/elastos"
+            --runtime "$PWD/elastos/target/release/elastos" --previous "$RUNNER_TEMP/previous-release"
           python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
           import json, os, pathlib, sys
           path = pathlib.Path(sys.argv[1])
@@ -723,9 +744,10 @@ jobs:
             --next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new" \
             --build-receipt "$CI_HOP_ROOT/build-inputs/build.json" \
             --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
+            --previous "$RUNNER_TEMP/previous-release" \
             > "$CI_HOP_ROOT/generation.json"
       - name: prove installed Home account and System update with Carrier hop and refusals
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal
           ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
@@ -734,15 +756,8 @@ jobs:
           export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$CI_HOP_ROOT/generation.json")"
           python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
           python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
-      - name: require no new provider warnings after the System update
-        run: |
-          python3 -I - "$CI_HOP_ROOT/package/results/result.json" <<'PY'
-          import json, sys
-          result = json.load(open(sys.argv[1]))
-          new = result["paths"]["m1-install"]["checks"]["initial-home"]["system"]["provider_warnings"]["new"]
-          print("\n".join(new) or "no new provider warnings after the update")
-          sys.exit(1 if new else 0)
-          PY
+      - name: require the update from the published release, no new provider warnings and Undo
+        run: python3 scripts/update-hop-compare.py check-result "$CI_HOP_ROOT/package/results/result.json"
       - name: retain the safe CI hop receipt
         if: always()
         uses: actions/upload-artifact@v5

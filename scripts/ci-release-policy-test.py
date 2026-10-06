@@ -69,7 +69,8 @@ CASES = [
 # Only pushes of merged code to these branches may write shared caches.
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
-                "steps.engine-cache.outputs.cache-hit": "false"}
+                "steps.engine-cache.outputs.cache-hit": "false",
+                "steps.previous-release-cache.outputs.cache-hit": "false"}
 
 
 def validate_cache_guards(source):
@@ -126,7 +127,7 @@ class ReleasePolicyTests(unittest.TestCase):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 11)
+        self.assertEqual(len(caches), 13)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -243,7 +244,20 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("prepare-ci-disk", mac_steps[capacity])
         self.assertEqual(build + 1, generate)
         self.assertIn("build-ci-hop", mac_steps[build])
-        self.assertIn('--runtime "$PWD/elastos/target/release/elastos"', mac_steps[build])
+        self.assertIn('--runtime "$PWD/elastos/target/release/elastos" --previous "$RUNNER_TEMP/previous-release"', mac_steps[build])
+        # The old side is the pinned published release; the cache serves it and a miss reads the seed.
+        restore = names.index("name: restore the pinned published release")
+        fetch = names.index("name: fetch the pinned published release")
+        save = names.index("name: save the pinned published release")
+        self.assertEqual((fetch, save, build), (restore + 1, restore + 2, restore + 3))
+        key = "previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}"
+        self.assertEqual(field(mac_steps[restore], "key"), key)
+        self.assertEqual(field(mac_steps[save], "key"), key)
+        for step in (mac_steps[restore], mac_steps[save]):
+            self.assertRegex(field(step, "uses"), r"^actions/cache/(?:restore|save)@[0-9a-f]{40} # v")
+        self.assertIn('fetch-previous-release \\\n            "$RUNNER_TEMP/previous-release-cache" "$RUNNER_TEMP/previous-release"', mac_steps[fetch])
+        self.assertNotIn("if:", mac_steps[fetch])
+        self.assertIn('--previous "$RUNNER_TEMP/previous-release"', mac_steps[generate])
         self.assertLess(names.index("name: source-home into isolated MAC_TEST_HOME"), generate)
         self.assertEqual(prove, generate + 1)
         self.assertNotIn("if:", mac_steps[generate])
@@ -256,6 +270,9 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal", mac_steps[prove])
         self.assertIn('ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"', mac_steps[prove])
         self.assertIn('python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json"', mac_steps[prove])
+        verdict = mac_steps[prove + 1]
+        self.assertIn('update-hop-compare.py check-result "$CI_HOP_ROOT/package/results/result.json"', verdict)
+        self.assertNotIn("if:", verdict)
         for step in mac_steps[generate:prove + 1]:
             self.assertNotIn("FIXTURE_ARTIFACT_ID", step)
             self.assertNotIn("GH_TOKEN", step)
