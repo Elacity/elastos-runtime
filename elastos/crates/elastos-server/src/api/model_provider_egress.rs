@@ -370,8 +370,8 @@ async fn fetch_validation_inner(
     if !operator_route
         && active_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id)).is_err()
     {
-        let _decision = model_provider_egress_decision::transition_gate()
-            .lock()
+        let _decision = model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
             .await;
         request_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id))?;
         anyhow::bail!("hosted egress requires an Inbox decision");
@@ -604,8 +604,8 @@ async fn handle(
         &destination,
     );
     if !operator_route && active_decision(data_dir, &scope, &destination, None).is_err() {
-        let _decision = model_provider_egress_decision::transition_gate()
-            .lock()
+        let _decision = model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
             .await;
         let prior = refusal_state(data_dir, &scope, &destination).ok().flatten();
         let requested = request_decision(data_dir, &scope, &destination, None);

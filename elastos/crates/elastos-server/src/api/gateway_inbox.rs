@@ -472,11 +472,11 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
-        let _setup = super::gateway_home_system_ai_provider::hosted_setup_gate()
-            .lock()
+        let _setup = super::gateway_home_system_ai_provider::hosted_setup_gate(data_dir)
+            .lock_owned()
             .await;
-        let _decision = crate::api::model_provider_egress_decision::transition_gate()
-            .lock()
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
             .await;
         let _offer_id = crate::api::model_provider_egress_decision::endable_decision_offer_id(
             data_dir, request_id, proof,
@@ -498,8 +498,8 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
-        let _decision = crate::api::model_provider_egress_decision::transition_gate()
-            .lock()
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
             .await;
         crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
         let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
@@ -516,8 +516,8 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
-        let _decision = crate::api::model_provider_egress_decision::transition_gate()
-            .lock()
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
             .await;
         crate::api::model_provider_egress_decision::deny(data_dir, request_id, proof)?;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);

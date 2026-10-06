@@ -24,7 +24,7 @@ const SCHEMA: &str = "elastos.model.egress-decisions/v1";
 const DURATION_MS: u64 = 10 * 60 * 1000;
 const MAX_DECISIONS: usize = 1024;
 static DECISION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static TRANSITION_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static TRANSITION_GATES: OnceLock<super::model_provider_config::HostedHomeGates> = OnceLock::new();
 
 pub(super) struct ActiveDecision {
     #[cfg(target_os = "macos")]
@@ -166,8 +166,8 @@ fn lock() -> &'static Mutex<()> {
 
 // Product End holds this across its decision write and admission drain. Other
 // product decision transitions take it before changing the same decision.
-pub(super) fn transition_gate() -> &'static tokio::sync::Mutex<()> {
-    TRANSITION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+pub(super) fn transition_gate(data_dir: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    super::model_provider_config::hosted_home_gate(&TRANSITION_GATES, data_dir)
 }
 
 fn now_ms() -> anyhow::Result<u64> {

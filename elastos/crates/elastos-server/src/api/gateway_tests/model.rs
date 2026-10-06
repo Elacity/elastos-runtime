@@ -1899,25 +1899,49 @@ async fn owner_end_commits_before_cancellation_and_failed_write_preserves_send()
         let sink_task = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             let (mut socket, _) = sink.accept().await.unwrap();
-            let mut first = [0u8; 1];
-            socket.read_exact(&mut first).await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+            }
             accepted_tx.send(()).unwrap();
             let _ = release_rx.await;
             let _ = socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .await;
+            sink
         });
-        let send = fetch_validation(
-            dir.path(),
-            ValidationEndpoint::OpenRouterModels,
-            "fixture-key",
-            &authority.proof_binding_id,
-        );
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let send = async {
+            let result = fetch_validation(
+                dir.path(),
+                ValidationEndpoint::OpenRouterModels,
+                "fixture-key",
+                &authority.proof_binding_id,
+            )
+            .await;
+            if !fail_write {
+                assert!(result.is_err());
+                assert_eq!(history()[0]["status"], "ended");
+            }
+            let _ = stopped_tx.send(());
+            result
+        };
         let end = async {
             tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
                 .await
                 .unwrap()
                 .unwrap();
+            // A different Home can be in setup or draining its own End.
+            // Its gates must not delay this Home's durable End write.
+            let other_home = tempfile::tempdir().unwrap();
+            let _other_setup =
+                super::super::gateway_home_system_ai_provider::hosted_setup_gate(other_home.path())
+                    .lock_owned()
+                    .await;
+            let _other_transition =
+                crate::api::model_provider_egress_decision::transition_gate(other_home.path())
+                    .lock_owned()
+                    .await;
             let held = if fail_write {
                 None
             } else {
@@ -1962,6 +1986,10 @@ async fn owner_end_commits_before_cancellation_and_failed_write_preserves_send()
                         .is_err()
                 );
                 assert_eq!(history()[0]["status"], "ended");
+                tokio::time::timeout(std::time::Duration::from_secs(1), stopped_rx)
+                    .await
+                    .expect("saved End must stop the admitted send before upstream is released")
+                    .unwrap();
                 drop(action); // The client leaves while committed End drains admission.
                 assert_eq!(history()[0]["status"], "ended");
             }
@@ -1977,7 +2005,35 @@ async fn owner_end_commits_before_cancellation_and_failed_write_preserves_send()
         } else {
             assert!(result.is_err());
         }
-        sink_task.await.unwrap();
+        let sink = sink_task.await.unwrap();
+        if !fail_write {
+            // Reopen Runtime state after all admission guards have gone away.
+            let restarted = gateway_router(test_state(dir.path()));
+            let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+            let (status, summary) = status_json(
+                restarted
+                    .oneshot(inbox_summary_request(token))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(summary["hosted_routes"][0]["status"], "ended");
+            assert!(fetch_validation(
+                dir.path(),
+                ValidationEndpoint::OpenRouterModels,
+                "fixture-key",
+                &authority.proof_binding_id,
+            )
+            .await
+            .is_err());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), sink.accept())
+                    .await
+                    .is_err(),
+                "restart must keep hosted dispatch closed until a fresh approval"
+            );
+        }
     }
 }
 
@@ -2022,8 +2078,8 @@ async fn system_hosted_mutations_recheck_revoked_admin_after_waits() {
             std::fs::read(dir.path().join("providers/model-provider/config.json")).unwrap();
         let setup = if wait == "setup" {
             Some(
-                super::super::gateway_home_system_ai_provider::hosted_setup_gate()
-                    .lock()
+                super::super::gateway_home_system_ai_provider::hosted_setup_gate(dir.path())
+                    .lock_owned()
                     .await,
             )
         } else {
@@ -2031,8 +2087,8 @@ async fn system_hosted_mutations_recheck_revoked_admin_after_waits() {
         };
         let transition = if wait == "transition" {
             Some(
-                crate::api::model_provider_egress_decision::transition_gate()
-                    .lock()
+                crate::api::model_provider_egress_decision::transition_gate(dir.path())
+                    .lock_owned()
                     .await,
             )
         } else {

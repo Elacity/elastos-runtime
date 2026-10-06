@@ -10,9 +10,11 @@ use std::sync::OnceLock;
 
 use super::*;
 
-pub(super) fn hosted_setup_gate() -> &'static tokio::sync::Mutex<()> {
-    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+pub(super) fn hosted_setup_gate(
+    data_dir: &std::path::Path,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: OnceLock<crate::api::model_provider_config::HostedHomeGates> = OnceLock::new();
+    crate::api::model_provider_config::hosted_home_gate(&GATES, data_dir)
 }
 
 async fn discard_staged_setup(
@@ -20,10 +22,10 @@ async fn discard_staged_setup(
     id: &str,
     authorize: impl Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let _guard = hosted_setup_gate().lock().await;
+    let _guard = hosted_setup_gate(data_dir).lock_owned().await;
     #[cfg(unix)]
-    let _transition = crate::api::model_provider_egress_decision::transition_gate()
-        .lock()
+    let _transition = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+        .lock_owned()
         .await;
     authorize()?;
     crate::api::model_provider_config::require_staged_hosted_key(data_dir, id)?;
@@ -560,10 +562,10 @@ pub(super) async fn system_approval_lens_revoke(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
-    let _setup = hosted_setup_gate().lock().await;
+    let _setup = hosted_setup_gate(&state.data_dir).lock_owned().await;
     #[cfg(unix)]
-    let _transition = crate::api::model_provider_egress_decision::transition_gate()
-        .lock()
+    let _transition = crate::api::model_provider_egress_decision::transition_gate(&state.data_dir)
+        .lock_owned()
         .await;
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
@@ -777,7 +779,7 @@ pub(super) async fn system_ai_provider_validate(
         .id
         .clone()
         .unwrap_or_else(|| format!("model:hosted-{:032x}", rand::random::<u128>()));
-    let _setup = hosted_setup_gate().lock().await;
+    let _setup = hosted_setup_gate(&state.data_dir).lock_owned().await;
     let api_key = match crate::api::model_provider_config::hosted_key_for_save(
         &state.data_dir,
         provider,
@@ -837,7 +839,7 @@ pub(super) async fn system_ai_provider_save(
         .id
         .clone()
         .unwrap_or_else(|| format!("model:hosted-{:032x}", rand::random::<u128>()));
-    let _setup = hosted_setup_gate().lock().await;
+    let _setup = hosted_setup_gate(&state.data_dir).lock_owned().await;
     let api_key = match if req.api_key.trim().is_empty() {
         crate::api::model_provider_config::hosted_key_for_save(
             &state.data_dir,
@@ -932,10 +934,10 @@ pub(super) async fn system_ai_provider_delete(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
-    let _setup = hosted_setup_gate().lock().await;
+    let _setup = hosted_setup_gate(&state.data_dir).lock_owned().await;
     #[cfg(unix)]
-    let _transition = crate::api::model_provider_egress_decision::transition_gate()
-        .lock()
+    let _transition = crate::api::model_provider_egress_decision::transition_gate(&state.data_dir)
+        .lock_owned()
         .await;
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
@@ -1102,7 +1104,7 @@ mod parse_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let id = "model:hosted-0123456789abcdef0123456789abcdef";
-        let guard = super::hosted_setup_gate().lock().await;
+        let guard = super::hosted_setup_gate(dir.path()).lock_owned().await;
         crate::api::model_provider_config::stage_hosted_key(
             dir.path(),
             crate::api::HostedAiProvider::OpenRouter,
