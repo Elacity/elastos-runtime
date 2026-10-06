@@ -524,16 +524,7 @@ fn spawn_engine(config: &SupervisorConfig, request: &LaunchRequest) -> Result<u3
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    unsafe {
-        command.pre_exec(|| {
-            if libc::unshare(libc::CLONE_NEWNET) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            bring_loopback_up()?;
-            Ok(())
-        });
-    }
-
+    isolate_engine_network(&mut command)?;
     configure_helper_stdin(&mut command)?;
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     if config.startup_grace_ms > 0 {
@@ -549,12 +540,34 @@ fn spawn_engine(config: &SupervisorConfig, request: &LaunchRequest) -> Result<u3
     Ok(child.id())
 }
 
+/// The engine runs in its own network namespace; only Linux has one.
+#[cfg(target_os = "linux")]
+fn isolate_engine_network(command: &mut Command) -> Result<(), String> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            bring_loopback_up()?;
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn isolate_engine_network(_command: &mut Command) -> Result<(), String> {
+    Err("the browser engine supervisor runs engines only on Linux".to_string())
+}
+
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct LinuxIfReq {
     name: [libc::c_char; libc::IFNAMSIZ],
     data: [u8; 24],
 }
 
+#[cfg(target_os = "linux")]
 impl LinuxIfReq {
     fn loopback_up() -> Self {
         let mut req = Self {
@@ -580,6 +593,7 @@ impl LinuxIfReq {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn bring_loopback_up() -> std::io::Result<()> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -804,6 +818,7 @@ mod tests {
             .contains("runtime_stream_path"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn loopback_ifreq_sets_only_loopback_name_and_up_flag() {
         let req = LinuxIfReq::loopback_up();
