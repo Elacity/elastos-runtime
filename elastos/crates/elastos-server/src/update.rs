@@ -512,12 +512,14 @@ async fn verify_installed_binary_version(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     command.as_std_mut().process_group(0);
-    let mut child = command.spawn().map_err(|error| {
-        anyhow::anyhow!(
-            "failed to run installed binary {}: {error}",
-            bin_path.display()
-        )
-    })?;
+    let mut child = crate::install_transaction::retry_text_file_busy_async(|| command.spawn())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to run installed binary {}: {error}",
+                bin_path.display()
+            )
+        })?;
     let pid = child.id().expect("spawned version probe has a PID");
     let mut stdout = child.stdout.take().unwrap().take(4097);
     let mut stderr = child.stderr.take().unwrap().take(4097);
@@ -4015,6 +4017,22 @@ mod tests {
         assert!(msg.contains(&bin.display().to_string()));
         assert!(msg.contains("Installed binary version check failed"));
         assert!(msg.contains("permission denied"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn version_check_outlasts_a_briefly_busy_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, release) =
+            crate::install_transaction::tests::briefly_busy_binary(dir.path(), "0.1.0");
+        verify_installed_binary_version(&bin, "0.1.0")
+            .await
+            .unwrap();
+        release.join().unwrap();
+        assert!(
+            crate::install_transaction::TEXT_FILE_BUSY_SEEN.get() >= 1,
+            "exec must have reported ETXTBSY"
+        );
     }
 
     #[tokio::test]

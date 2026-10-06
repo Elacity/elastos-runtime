@@ -552,11 +552,14 @@ pub fn enter_browser_home() -> Result<()> {
     if inherited < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let error = std::process::Command::new(controller)
+    let mut command = std::process::Command::new(controller);
+    command
         .args(["__update-controller", "--receipt"])
         .arg(path)
-        .env(LEASE_ENV, inherited.to_string())
-        .exec();
+        .env(LEASE_ENV, inherited.to_string());
+    // exec returns only on failure; retry the controller copy we just wrote.
+    let error = crate::install_transaction::retry_text_file_busy(|| Err::<(), _>(command.exec()))
+        .unwrap_err();
     unsafe {
         libc::close(inherited);
     }
@@ -798,7 +801,7 @@ impl Controller {
             )
         })?;
         self.publish_ready_result()?;
-        println!("Home: http://localhost:8090/home/");
+        println!("Home: http://localhost:{BROWSER_HOME_PORT}/home/");
         println!("Keep this terminal open. Press Ctrl+C to stop Home.");
         Ok(())
     }
@@ -851,6 +854,7 @@ impl Controller {
                 prove_ready(
                     &client,
                     &self.receipt.data_dir,
+                    BROWSER_HOME_PORT,
                     pid,
                     generation,
                     version,
@@ -1771,14 +1775,14 @@ async fn response_bytes(response: reqwest::Response, limit: usize) -> Result<Vec
     Ok(bytes)
 }
 
-fn approved_home_url(value: &str) -> Result<url::Url> {
+/// The browser Home always listens here; `home --browser` binds this port.
+pub const BROWSER_HOME_PORT: u16 = 8090;
+
+fn approved_home_url(value: &str, port: u16) -> Result<url::Url> {
     anyhow::ensure!(
-        matches!(
-            value,
-            "http://localhost:8090/home/"
-                | "http://127.0.0.1:8090/home/"
-                | "http://[::1]:8090/home/"
-        ),
+        ["localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .any(|host| value == format!("http://{host}:{port}/home/")),
         "Home listener has not reported an approved readiness URL"
     );
     Ok(url::Url::parse(value)?)
@@ -1788,6 +1792,7 @@ fn approved_home_url(value: &str) -> Result<url::Url> {
 async fn prove_ready(
     client: &reqwest::Client,
     data_dir: &Path,
+    home_port: u16,
     pid: u32,
     generation: &str,
     version: &str,
@@ -1815,7 +1820,7 @@ async fn prove_ready(
             && metadata["role"] == "gateway",
         "Home host lock differs from the claimed generation"
     );
-    let home_url = approved_home_url(&coords.home_url)?;
+    let home_url = approved_home_url(&coords.home_url, home_port)?;
     let base = crate::local_http::LoopbackHttpBaseUrl::parse(&coords.api_url)?;
     let health: serde_json::Value = serde_json::from_slice(
         &response_bytes(client.get(base.join("/api/health")?).send().await?, 4096).await?,

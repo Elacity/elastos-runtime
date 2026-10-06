@@ -1796,14 +1796,113 @@ pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyho
     require_disk_reserve(total, available, u128::from(needed))
 }
 
+/// Waits between attempts to start a binary that was just written. On Linux a
+/// concurrent fork can briefly inherit the closed writer descriptor, so exec
+/// reports ETXTBSY until that child execs. Only that error is retried (<2 s).
+const TEXT_FILE_BUSY_WAITS_MS: [u64; 9] = [20, 40, 80, 160, 200, 200, 200, 200, 200];
+
+fn text_file_busy(error: &std::io::Error) -> bool {
+    let busy = error.raw_os_error() == Some(libc::ETXTBSY);
+    #[cfg(test)]
+    if busy {
+        TEXT_FILE_BUSY_SEEN.with(|seen| seen.set(seen.get() + 1));
+    }
+    busy
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ETXTBSY results observed on this thread, so tests prove the retry ran.
+    pub(crate) static TEXT_FILE_BUSY_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Blocking form for synchronous callers; see [`TEXT_FILE_BUSY_WAITS_MS`].
+pub(crate) fn retry_text_file_busy<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for wait in TEXT_FILE_BUSY_WAITS_MS {
+        match attempt() {
+            Err(error) if text_file_busy(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(wait))
+            }
+            result => return result,
+        }
+    }
+    attempt()
+}
+
+/// Non-blocking form for async callers; see [`TEXT_FILE_BUSY_WAITS_MS`].
+pub(crate) async fn retry_text_file_busy_async<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for wait in TEXT_FILE_BUSY_WAITS_MS {
+        match attempt() {
+            Err(error) if text_file_busy(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await
+            }
+            result => return result,
+        }
+    }
+    attempt()
+}
+
 #[cfg(test)]
 #[path = "install_transaction/restart_tests.rs"]
 mod restart_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    /// Writes a version script and holds a writable descriptor to it for 100 ms;
+    /// Linux refuses exec meanwhile, like a fork that inherited our writer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn briefly_busy_binary(
+        dir: &Path,
+        version: &str,
+    ) -> (PathBuf, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("elastos");
+        let mut writer = fs::File::create(&bin).unwrap();
+        write!(writer, "#!/bin/sh\necho 'elastos {version}'\n").unwrap();
+        writer.sync_all().unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        (bin, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_binary_start_retries_while_writer_descriptor_is_briefly_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, release) = briefly_busy_binary(dir.path(), "0.1.0");
+        let output =
+            retry_text_file_busy(|| std::process::Command::new(&bin).arg("--version").output());
+        release.join().unwrap();
+        assert!(
+            TEXT_FILE_BUSY_SEEN.get() >= 1,
+            "exec must have reported ETXTBSY"
+        );
+        assert_eq!(output.unwrap().stdout, b"elastos 0.1.0\n");
+    }
+
+    #[tokio::test]
+    async fn fresh_binary_start_fails_immediately_for_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = || std::process::Command::new(dir.path().join("missing")).output();
+        let started = std::time::Instant::now();
+        let sync = retry_text_file_busy(missing).unwrap_err();
+        let async_ = retry_text_file_busy_async(missing).await.unwrap_err();
+        assert_eq!(TEXT_FILE_BUSY_SEEN.get(), 0);
+        assert_eq!(sync.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(async_.kind(), std::io::ErrorKind::NotFound);
+        assert!(started.elapsed() < std::time::Duration::from_millis(40));
+    }
 
     fn previous(id: ReleaseFile) -> Vec<u8> {
         if id == ReleaseFile::RuntimeBinary {
