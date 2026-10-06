@@ -108,6 +108,7 @@ DIM='\033[2m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
+ACCENT='\033[38;5;208m'
 NC='\033[0m'
 
 # ── Help ──────────────────────────────────────────────────────────────
@@ -159,8 +160,132 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────
 
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
-info() { echo -e "  ${GREEN:-}▶${NC:-} $*"; }
-warn() { echo -e "  ${YELLOW:-}!${NC:-} $*"; }
+
+# Colour, the banner and the step layout are for a person at a terminal.
+# Pipes, CI, NO_COLOR and dumb terminals get plain [OK] and [WARN] lines.
+installer_rich_output() {
+    [[ -t 1 && -z "${NO_COLOR:-}" && -z "${CI:-}" && "${TERM:-dumb}" != dumb ]]
+}
+
+installer_select_output() {
+    if installer_rich_output; then
+        INSTALLER_RICH=true
+    else
+        INSTALLER_RICH=false
+        BOLD='' DIM='' GREEN='' YELLOW='' RED='' NC='' ACCENT=''
+    fi
+}
+
+INSTALLER_STEPS=5
+
+show_banner() {
+    if [[ "${INSTALLER_RICH:-false}" != true ]]; then
+        echo "ElastOS Installer"
+        return 0
+    fi
+    local line
+    echo ""
+    # shellcheck disable=SC1003  # the art's trailing backslashes are literal
+    for line in \
+        '    _____ _           _    ___  ____' \
+        '   | ____| | __ _ ___| |_ / _ \/ ___|' \
+        '   |  _| | |/ _` / __| __| | | \___ \' \
+        '   | |___| | (_| \__ \ |_| |_| |___) |' \
+        '   |_____|_|\__,_|___/\__|\___/|____/'; do
+        printf '%b%s%b\n' "${ACCENT:-}" "$line" "${NC:-}"
+    done
+    echo ""
+    echo -e "   ${BOLD:-}ElastOS Installer${NC:-}  ${DIM:-}signed release · verified before anything changes${NC:-}"
+}
+
+step() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo ""
+        echo -e "  ${ACCENT:-}[$1/${INSTALLER_STEPS}]${NC:-} ${BOLD:-}$2${NC:-}"
+    else
+        echo "[$1/${INSTALLER_STEPS}] $2"
+    fi
+}
+
+info() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${DIM:-}$*${NC:-}"
+    else
+        echo -e "  ... $*"
+    fi
+}
+
+ok() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${GREEN:-}✓${NC:-} $*"
+    else
+        echo -e "  [OK] $*"
+    fi
+}
+
+warn() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${YELLOW:-}!${NC:-} $*"
+    else
+        echo -e "  [WARN] $*"
+    fi
+}
+
+format_elapsed() {
+    local seconds="$1"
+    if (( seconds < 60 )); then
+        printf '%s s\n' "$seconds"
+    else
+        printf '%s min %s s\n' "$((seconds / 60))" "$((seconds % 60))"
+    fi
+}
+
+# Free space, in MB, on the volume that holds a path's nearest existing parent.
+free_space_mb() {
+    local path="$1"
+    while [[ ! -e "$path" && "$path" != / ]]; do
+        path="$(dirname "$path")"
+    done
+    df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }'
+}
+
+# Below this, setup may run out of space; the installer warns and continues.
+INSTALLER_MIN_FREE_MB=1024
+
+platform_label() {
+    case "$1" in
+        aarch64-darwin)
+            local version
+            version="$(sw_vers -productVersion 2>/dev/null || true)"
+            printf 'macOS%s on Apple silicon\n' "${version:+ $version}"
+            ;;
+        x86_64-linux) printf 'Linux on x86-64\n' ;;
+        aarch64-linux) printf 'Linux on ARM64\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+# Reads the installed version from the trusted source record without running
+# the installed binary. Empty when this computer has no ElastOS installation.
+installed_version() {
+    local sources="$1/sources.json" version
+    [[ -f "$sources" ]] || return 0
+    version="$(json_get "$sources" \
+        '(lambda v: v if isinstance(v, str) else None)(d["sources"][0]["installed_version"])' \
+        2>/dev/null || true)"
+    if [[ "$version" =~ ^[0-9A-Za-z.+-]{1,64}$ ]]; then
+        printf '%s\n' "$version"
+    fi
+}
+
+short_did() {
+    local did="$1"
+    if (( ${#did} > 24 )); then
+        printf '%s…%s\n' "${did:0:14}" "${did: -6}"
+    else
+        printf '%s\n' "$did"
+    fi
+}
 
 installer_data_dir() {
     local home_dir="$1"
@@ -653,7 +778,7 @@ PY_ED25519
     then
         die "Signature verification FAILED"
     fi
-    info "Signature verified"
+    ok "Signature verified"
 }
 
 validate_release_identity() {
@@ -694,6 +819,47 @@ PY_RELEASE_IDENTITY
     fi
 }
 
+# A path a person can paste into a shell: ~/... under HOME, quoted elsewhere.
+display_path() {
+    local path="$1" quoted
+    quoted="$(printf '%q' "$path")"
+    if [[ "$quoted" == "$path" && -n "${HOME:-}" && "$path" == "${HOME%/}"/* ]]; then
+        printf '%s/%s' '~' "${path#"${HOME%/}"/}"
+    else
+        printf '%s' "$quoted"
+    fi
+}
+
+runtime_command() {
+    local runtime_bin="$1"
+    if [[ "$(command -v elastos 2>/dev/null || true)" == "$runtime_bin" ]]; then
+        printf 'elastos'
+    else
+        display_path "$runtime_bin"
+    fi
+}
+
+show_ready() {
+    local runtime_bin="$1" command elapsed
+    command="$(runtime_command "$runtime_bin")"
+    elapsed="$(format_elapsed $((SECONDS - ${INSTALL_STARTED_AT:-0})))"
+    echo ""
+    echo -e "  ${GREEN}${BOLD}ElastOS ${RELEASE_VERSION:-} is ready${NC} ${DIM}(took ${elapsed})${NC}"
+    printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
+    printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
+    if [[ "$command" != elastos ]]; then
+        local quoted path_entry
+        quoted="$(printf '%q' "$INSTALL_DIR")"
+        if [[ "$quoted" == "$INSTALL_DIR" && -n "${HOME:-}" && "$INSTALL_DIR" == "${HOME%/}"/* ]]; then
+            path_entry="\"\$HOME/${INSTALL_DIR#"${HOME%/}"/}:\$PATH\""
+        else
+            path_entry="${quoted}:\"\$PATH\""
+        fi
+        printf '    %b%-12s%b %s\n' "$DIM" "Add to PATH" "$NC" "export PATH=${path_entry}"
+    fi
+    echo ""
+}
+
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
 finish_install() {
@@ -702,8 +868,10 @@ finish_install() {
         info "Runtime installed: ${runtime_bin}"
         return 0
     fi
+    step 5 "Set up Home"
     info "Setting up Home..."
     "$runtime_bin" setup </dev/null || return $?
+    show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."
         "$runtime_bin" home --browser </dev/tty || return $?
@@ -723,6 +891,8 @@ fi
 
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
+INSTALL_STARTED_AT=$SECONDS
+installer_select_output
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -752,8 +922,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
+    INSTALLER_STEPS=4
+fi
+
+show_banner
+step 1 "Check this computer"
 detect_platform
-info "Platform: ${PLATFORM}"
+ok "Platform: $(platform_label "$PLATFORM") (${PLATFORM})"
 
 validate_explicit_source_bootstrap_pair
 
@@ -802,12 +978,33 @@ done
 if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
     die "Neither sha256sum nor shasum found"
 fi
+ok "Tools: curl, python3 and SHA-256 are available"
 
-echo ""
-echo -e "${BOLD}ElastOS Installer${NC}"
-echo ""
+DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+PREVIOUS_VERSION="$(installed_version "$DATA_DIR")"
+EXISTING_INSTALL=false
+if [[ -n "$PREVIOUS_VERSION" ]]; then
+    EXISTING_INSTALL=true
+    ok "Existing installation: ElastOS ${PREVIOUS_VERSION}"
+elif [[ -e "${INSTALL_DIR}/elastos" || -e "${DATA_DIR}/sources.json" ]]; then
+    EXISTING_INSTALL=true
+    ok "Existing installation found"
+else
+    ok "Fresh install: no ElastOS installation found"
+fi
+
+FREE_MB="$(free_space_mb "$DATA_DIR" || true)"
+if [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
+    if (( FREE_MB < INSTALLER_MIN_FREE_MB )); then
+        warn "Only ${FREE_MB} MB free; a Home needs about 1 GB. Free some space if setup stops."
+    else
+        ok "Disk: $((FREE_MB / 1024)) GB free"
+    fi
+fi
 
 # ── Fetch + verify release head ──────────────────────────────────────
+
+step 2 "Verify the release"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -839,7 +1036,12 @@ RELEASE_CHANNEL=$(json_get "${TMPDIR}/release-head.json" 'd["payload"].get("chan
 if ! is_allowed_channel "$RELEASE_CHANNEL"; then
     die "Unsupported release channel '${RELEASE_CHANNEL}' in release-head.json. Allowed channels: ${ALLOWED_CHANNELS[*]}"
 fi
-info "Version: ${RELEASE_VERSION}"
+ok "Release: ElastOS ${RELEASE_VERSION} (${RELEASE_CHANNEL}), signed by $(short_did "$MAINTAINER_DID")"
+if [[ "$PREVIOUS_VERSION" == "$RELEASE_VERSION" ]]; then
+    info "Reinstalling the installed version"
+elif [[ -n "$PREVIOUS_VERSION" ]]; then
+    info "Update: ${PREVIOUS_VERSION} → ${RELEASE_VERSION}"
+fi
 
 # ── Fetch + verify release.json ──────────────────────────────────────
 
@@ -873,8 +1075,15 @@ fi
 
 # ── Download + verify binary ─────────────────────────────────────────
 
+step 3 "Download ElastOS Runtime"
+BINARY_SIZE=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary'].get('size')")
+BINARY_SIZE_LABEL=""
+if [[ "$BINARY_SIZE" =~ ^[0-9]+$ ]] && (( BINARY_SIZE >= 1048576 )); then
+    BINARY_SIZE_LABEL=" ($((BINARY_SIZE / 1048576)) MB)"
+fi
+
 if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Downloading binary from bootstrap publisher URL"
+    info "Downloading binary${BINARY_SIZE_LABEL} from ${PG}"
     CURL_BINARY_FLAGS=(-fL)
     if [[ -t 2 ]]; then
         CURL_BINARY_FLAGS+=(--progress-bar)
@@ -892,7 +1101,7 @@ if [[ -n "$PUBLISHER_GATEWAY" ]]; then
         -o "${TMPDIR}/elastos" "${PG}/artifacts/elastos-${PLATFORM}" \
         || die "Failed to download binary from ${PG}/artifacts/elastos-${PLATFORM}"
 else
-    info "Downloading binary by CID: ${BINARY_CID} (bootstrap mode)"
+    info "Downloading binary${BINARY_SIZE_LABEL} by CID: ${BINARY_CID} (bootstrap mode)"
     ipfs_fetch "$BINARY_CID" "${TMPDIR}/elastos"
 fi
 
@@ -901,7 +1110,6 @@ sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
 # ── Admit the verified release with the shared installation writer ──
 
-DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
 [[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
 mkdir -p "$INSTALL_DIR"
 
@@ -925,6 +1133,7 @@ fi
 if [[ "${STAGED_VERSION_OUTPUT}" != "elastos ${RELEASE_VERSION}" || -s "${STAGED_VERSION_STDERR_PATH}" ]]; then
     die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
+ok "Checksum and version match the signed release"
 
 # ── Carrier contact + release metadata for `elastos upgrade` ─────────
 
@@ -997,25 +1206,29 @@ PY
 INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
     --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
     "${TMPDIR}/release-head.json" "${TMPDIR}/release.json")
+step 4 "Install"
 "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
-info "Stopping verified Runtime processes for this installation before its protected-root check..."
+info "Stopping verified Runtime processes for this installation so the new version can be installed..."
 installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
     || die "Close this installation's Runtime and retry; its existing files were preserved"
-info "Open Home again after installation to reconnect."
+if [[ "${EXISTING_INSTALL:-true}" == true ]]; then
+    info "Open Home again after installation to reconnect."
+fi
 
 # One journaled transaction replaces the Runtime, trusted sources and the
 # verified release pair; an interrupted run restores the previous set.
-info "Installing binary to ${INSTALL_DIR}/elastos..."
+info "Installing binary to $(display_path "${INSTALL_DIR}/elastos")..."
 "${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "${INSTALL_DIR}/elastos")"
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."
 "${INSTALL_DIR}/elastos" principal-root-upgrade \
     --data-dir "${DATA_DIR}" \
     --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
-info "Saved trusted source config to ${DATA_DIR}/sources.json"
-info "Saved verified release inputs for Runtime setup and updates"
+ok "Saved trusted source config to $(display_path "${DATA_DIR}/sources.json")"
+ok "Saved verified release inputs for Runtime setup and updates"
 
 # ── Complete installation ─────────────────────────────────────────────
 

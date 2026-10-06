@@ -298,6 +298,43 @@ class ShellTests(unittest.TestCase):
         self.assertIn("Failed to fetch CID", result.stderr)
         self.assertNotIn("unbound variable", result.stderr)
 
+    def test_output_mode_is_plain_off_a_terminal_and_rich_on_request(self):
+        script = 'show_banner\nstep 1 Title\ninfo note\nok done\nwarn careful\n'
+        for prefix in ("", "export NO_COLOR=1 TERM=xterm\n", "export CI=true TERM=xterm\n"):
+            result = shell(prefix + "installer_select_output\n" + script)
+            with self.subTest(prefix=prefix):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "ElastOS Installer\n[1/5] Title\n  ... note\n"
+                                                "  [OK] done\n  [WARN] careful\n")
+        rich = shell("INSTALLER_RICH=true\n" + script)
+        self.assertEqual(rich.returncode, 0, rich.stderr)
+        self.assertIn("|_____|", rich.stdout)
+        self.assertIn("[1/5]", rich.stdout)
+        self.assertIn("✓", rich.stdout)
+        self.assertNotIn("[OK]", rich.stdout)
+
+    def test_installed_version_reads_sources_and_rejects_control_text(self):
+        with tempfile.TemporaryDirectory(prefix="installer-version-") as directory:
+            sources = Path(directory, "sources.json")
+            for value, expected in (("0.7.1", "0.7.1"), ("0.8.0-rc.1+abc", "0.8.0-rc.1+abc"),
+                                    ("\x1b]0;owned\x07", ""), ("1 2", ""), (7, "")):
+                sources.write_text(json.dumps({"sources": [{"installed_version": value}]}))
+                result = shell('installed_version "$1"\n', directory)
+                with self.subTest(value=value):
+                    self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+            sources.write_text("not json")
+            self.assertEqual(shell('installed_version "$1"\n', directory).stdout, "")
+            self.assertEqual(shell('installed_version "$1/missing"\n', directory).stdout, "")
+
+    def test_display_path_shortens_home_and_quotes_the_rest(self):
+        result = shell('HOME=/home/ada\nfor p in /home/ada/.local/bin/elastos "/home/ada/a b" /opt/elastos "/opt/a b"; do '
+                       'display_path "$p"; echo; done\n')
+        self.assertEqual(result.stdout, "~/.local/bin/elastos\n/home/ada/a\\ b\n/opt/elastos\n/opt/a\\ b\n")
+
+    def test_elapsed_time_reads_in_seconds_then_minutes(self):
+        result = shell('format_elapsed 9\nformat_elapsed 60\nformat_elapsed 135\n')
+        self.assertEqual(result.stdout, "9 s\n1 min 0 s\n2 min 15 s\n")
+
     def test_json_path_can_contain_quote_and_spaces(self):
         with tempfile.TemporaryDirectory(prefix="installer test's ") as directory:
             path = Path(directory, "metadata.json")
@@ -734,6 +771,47 @@ class InstallationTests(unittest.TestCase):
                             self.assertIn("Carrier transport is outside this fixture", marker.read_text())
                             self.assertEqual(sandbox.runtime_calls()[-1], "setup")
                         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_piped_run_prints_plain_numbered_steps_and_ready_summary(self):
+        # curl | bash with captured stdout is the CI and log case: no colour,
+        # no banner art, and every step line in order.
+        did, head, release = installable_fixture()
+        version = json.loads(release)["payload"]["version"]
+        for install_only, total in ((False, 5), (True, 4)):
+            with self.subTest(install_only=install_only), InstallerSandbox(head, release, did) as sandbox:
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, _ = sandbox.run(*(["--install-only"] if install_only else []))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("\033", result.stdout + result.stderr)
+                self.assertNotIn("|_____|", result.stdout)
+                self.assertTrue(result.stdout.startswith("ElastOS Installer\n"), result.stdout)
+                titles = ["Check this computer", "Verify the release", "Download ElastOS Runtime",
+                          "Install", "Set up Home"][:total]
+                steps = ["[%d/%d] %s\n" % (number, total, title) for number, title in enumerate(titles, 1)]
+                self.assertEqual(sorted(steps, key=result.stdout.index), steps)
+                self.assertNotIn("[%d/" % (total + 1), result.stdout)
+                self.assertIn("[OK] Fresh install", result.stdout)
+                self.assertIn("[OK] Release: ElastOS %s (stable)" % version, result.stdout)
+                self.assertIn("[OK] Checksum and version match the signed release", result.stdout)
+                self.assertNotIn("Open Home again", result.stdout)
+                if install_only:
+                    self.assertNotIn("is ready", result.stdout)
+                else:
+                    ready = result.stdout.index("ElastOS %s is ready" % version)
+                    self.assertLess(ready, result.stdout.index("Home is installed"))
+                    self.assertIn("update", result.stdout[ready:])
+                    self.assertIn("export PATH=", result.stdout[ready:])
+
+    def test_existing_installation_is_reported_before_download(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertLess(result.stdout.index("[OK] Existing installation found"),
+                            result.stdout.index("[3/4] Download ElastOS Runtime"))
+            self.assertIn("Open Home again after installation to reconnect.", result.stdout)
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
         did, head, release = installable_fixture()
