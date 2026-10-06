@@ -644,6 +644,10 @@ pub fn install_release(
         .default_source()
         .context("installer trusted source is missing")?;
     crate::installed_release::admit_candidate(binary, source, &executable, &head, &release)?;
+    // A refused path must not gain an installation lock, so compare before taking it.
+    if let Some(current) = installed_source(data_dir) {
+        ensure_recorded_install_path(&current, binary)?;
+    }
     let mut transaction = InstallTransaction::acquire(data_dir, binary)?;
     if transaction.restart_record_if_any()?.is_some()
         || crate::update_controller::has_queued_update(transaction.data_dir())?
@@ -662,23 +666,8 @@ pub fn install_release(
         // Recovery keeps its journal's layout; the next writer selects the current one.
         transaction = InstallTransaction::acquire(data_dir, binary)?;
     }
-    let current = load_trusted_sources(transaction.data_dir())
-        .ok()
-        .and_then(|config| config.default_source().cloned())
-        .filter(|current| !current.installed_version.is_empty());
-    if let Some(current) = current {
-        let installed = Path::new(&current.install_path);
-        if let (Some(Ok(parent)), Some(name)) = (
-            installed.parent().map(std::fs::canonicalize),
-            installed.file_name(),
-        ) {
-            anyhow::ensure!(
-                parent.join(name) == transaction.binary_path(),
-                "This Home's Runtime is installed at {}. Run the installer with --install-dir {}; this installation was not changed.",
-                installed.display(),
-                parent.display()
-            );
-        }
+    if let Some(current) = installed_source(transaction.data_dir()) {
+        ensure_recorded_install_path(&current, transaction.binary_path())?;
         anyhow::ensure!(
             compare_release_versions(&current.installed_version, &source.installed_version)?
                 != Ordering::Less,
@@ -707,6 +696,38 @@ pub fn install_release(
         (ReleaseFile::ReleaseManifest, release.as_slice()),
     ])?;
     transaction.commit_checked(|| Ok(()))
+}
+
+fn installed_source(data_dir: &Path) -> Option<crate::sources::TrustedSource> {
+    load_trusted_sources(data_dir)
+        .ok()
+        .and_then(|config| config.default_source().cloned())
+        .filter(|current| !current.installed_version.is_empty())
+}
+
+fn ensure_recorded_install_path(
+    current: &crate::sources::TrustedSource,
+    binary: &Path,
+) -> anyhow::Result<()> {
+    let installed = Path::new(&current.install_path);
+    let requested = binary
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .zip(binary.file_name())
+        .map(|(parent, name)| parent.join(name));
+    if let (Some(Ok(parent)), Some(name), Some(requested)) = (
+        installed.parent().map(std::fs::canonicalize),
+        installed.file_name(),
+        requested,
+    ) {
+        anyhow::ensure!(
+            parent.join(name) == requested,
+            "This Home's Runtime is installed at {}. Run the installer with --install-dir {}; this installation was not changed.",
+            installed.display(),
+            parent.display()
+        );
+    }
+    Ok(())
 }
 
 /// Main update flow. Discovers the latest release, verifies signatures, and installs.
@@ -4364,8 +4385,6 @@ mod tests {
             let binary = fixture.path().join("other install/bin/elastos");
             std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
             std::fs::write(&binary, b"preserve other executable").unwrap();
-            // The persistent lock already exists, so the snapshot includes both locks.
-            drop(InstallTransaction::acquire(&data, &binary).unwrap());
             let candidates = tempfile::tempdir().unwrap();
             let next = candidate(candidates.path(), &binary, "0.7.2", 7);
             let before = files(fixture.path(), false);
@@ -4382,6 +4401,7 @@ mod tests {
                 );
                 assert_eq!(files(fixture.path(), false), before);
                 assert!(!InstallTransaction::has_pending_recovery(&binary));
+                assert!(!binary.with_file_name(".elastos.install.lock").exists());
             }
         }
 
