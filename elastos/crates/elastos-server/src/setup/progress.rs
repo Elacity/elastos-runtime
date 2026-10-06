@@ -69,6 +69,7 @@ struct Line<'a> {
     received: u64,
     elapsed: Duration,
     status: Status,
+    detail: Option<&'a str>,
 }
 
 pub(super) fn format_elapsed(elapsed: Duration) -> String {
@@ -140,6 +141,9 @@ fn render(line: &Line) -> String {
                 Status::Done => out.push_str("  \x1b[32m✓\x1b[0m"),
                 Status::Failed => out.push_str("  \x1b[31m✗\x1b[0m"),
             }
+            if let (Some(detail), Status::Done | Status::Failed) = (line.detail, line.status) {
+                out.push_str(&format!("  {detail}"));
+            }
             out
         }
         OutputMode::Plain => {
@@ -151,13 +155,18 @@ fn render(line: &Line) -> String {
                 Status::Done => "ok",
                 Status::Failed => "failed",
             };
+            let detail = line
+                .detail
+                .map(|detail| format!("; {detail}"))
+                .unwrap_or_default();
             format!(
-                "{} {}{} ... {} ({})",
+                "{} {}{} ... {} ({}){}",
                 prefix(line.mode, line.index, line.total),
                 line.name,
                 size,
                 result,
-                elapsed
+                elapsed,
+                detail
             )
         }
     }
@@ -201,6 +210,7 @@ pub(super) struct ComponentProgress {
     size: Option<u64>,
     started: Instant,
     transfer: Mutex<Transfer>,
+    detail: Mutex<Option<String>>,
 }
 
 impl ComponentProgress {
@@ -221,7 +231,16 @@ impl ComponentProgress {
             size,
             started: Instant::now(),
             transfer: Mutex::new(Transfer::default()),
+            detail: Mutex::new(None),
         })
+    }
+
+    /// Keeps the refresh reason for the line's final result.
+    pub(super) fn refreshing(&self, reason: &str) {
+        *self
+            .detail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(format!("refresh: {reason}"));
     }
 
     /// Runs one fetch with this line as its progress sink. A failure ends the
@@ -304,6 +323,11 @@ impl ComponentProgress {
     }
 
     fn draw(&self, status: Status, received: u64) {
+        let detail = self
+            .detail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         let text = render(&Line {
             mode: self.mode,
             index: self.index,
@@ -314,6 +338,7 @@ impl ComponentProgress {
             received,
             elapsed: self.started.elapsed(),
             status,
+            detail: detail.as_deref(),
         });
         match (self.mode, status) {
             (OutputMode::Rich, _) => self.write(&text, status != Status::Running),
@@ -352,7 +377,33 @@ mod tests {
             received,
             elapsed: Duration::from_millis(400),
             status,
+            detail: None,
         })
+    }
+
+    #[test]
+    fn refresh_reason_rides_on_the_result_line_only() {
+        let render_with = |mode, status| {
+            render(&Line {
+                mode,
+                index: 3,
+                total: 41,
+                name: "chain-provider",
+                name_width: 16,
+                size: Some(1_048_576),
+                received: 524_288,
+                elapsed: Duration::from_millis(400),
+                status,
+                detail: Some("refresh: checksum changed"),
+            })
+        };
+        assert_eq!(
+            render_with(OutputMode::Plain, Status::Done),
+            "[3/41] chain-provider 1.0 MB ... ok (0.4 s); refresh: checksum changed"
+        );
+        assert!(render_with(OutputMode::Rich, Status::Failed)
+            .ends_with("✗\x1b[0m  refresh: checksum changed"));
+        assert!(!render_with(OutputMode::Rich, Status::Running).contains("refresh"));
     }
 
     #[test]
@@ -447,6 +498,7 @@ mod tests {
             received: 1_000,
             elapsed: Duration::from_secs(75),
             status: Status::Done,
+            detail: None,
         });
         let visible = longest.replace("\x1b[32m", "").replace("\x1b[0m", "");
         assert!(

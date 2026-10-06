@@ -372,9 +372,9 @@ async fn run_with_data_dir(
         if name == "llama-server" {
             verify_arm64_model_host(&platform)?;
         }
-        let installable =
-            platform_info.is_some_and(|info| info.strategy.as_deref() != Some("source-build"));
-        if installable
+        let binary_install_state =
+            component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info);
+        if !skipped_before_install(comp, platform_info, &binary_install_state)
             && !matches!(
                 effective_component_install_state_for_name(
                     &manifest,
@@ -388,14 +388,17 @@ async fn run_with_data_dir(
             )
         {
             pending_count += 1;
-            pending_bytes += pending_signed_size(
-                comp,
-                platform_info,
-                &component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info),
-                capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform).as_ref(),
-                &platform,
-            )
-            .unwrap_or(0);
+            pending_bytes = pending_bytes.saturating_add(
+                pending_signed_size(
+                    comp,
+                    platform_info,
+                    &binary_install_state,
+                    capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform)
+                        .as_ref(),
+                    &platform,
+                )
+                .unwrap_or(0),
+            );
         }
     }
     let size = if pending_bytes > 0 {
@@ -454,14 +457,19 @@ async fn run_with_data_dir(
         ) {
             InstallState::Installed => {
                 if let Some(platform_info) = platform_info {
-                    ensure_bundle_executable_link(&data_dir, name, platform_info)?;
+                    if let Err(error) =
+                        ensure_bundle_executable_link(&data_dir, name, platform_info)
+                    {
+                        line.failed();
+                        return Err(error);
+                    }
                 }
                 line.note("already installed");
                 skipped_count += 1;
                 continue;
             }
             InstallState::Stale(reason) => {
-                line.note(&format!("refreshing: {reason}"));
+                line.refreshing(&reason);
             }
             InstallState::Missing => {}
         }
@@ -631,6 +639,32 @@ async fn run_with_data_dir(
 /// Signed bytes setup fetches for a component in its current state: the
 /// artifact when it is not installed, plus capsule metadata when that is
 /// missing or stale. `None` when a fetched artifact has no signed size.
+/// True when the component loop in `run` skips this component before any
+/// effect. Keep in step with that loop's skip branches.
+fn skipped_before_install(
+    component: &Component,
+    platform_info: Option<&PlatformInfo>,
+    binary: &InstallState,
+) -> bool {
+    let Some(info) = platform_info else {
+        return true;
+    };
+    if info.strategy.as_deref() == Some("source-build") {
+        return true;
+    }
+    if matches!(binary, InstallState::Installed) {
+        return false;
+    }
+    let source_ready = if info.strategy.as_deref() == Some("local-copy") {
+        info.source
+            .as_deref()
+            .is_some_and(|source| Path::new(source).is_file())
+    } else {
+        resolve_component_download_url(info).is_some()
+    };
+    !source_ready || resolve_install_path(component, Some(info)).is_none()
+}
+
 fn pending_signed_size(
     component: &Component,
     platform_info: Option<&PlatformInfo>,
@@ -4080,6 +4114,61 @@ pub(crate) mod tests {
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn pending_count_leaves_out_the_components_the_loop_skips() {
+        let temp = tempfile::tempdir().unwrap();
+        let present = temp.path().join("vmlinux");
+        fs::write(&present, b"kernel").unwrap();
+        let component = |install_path: Option<&str>, info: serde_json::Value| {
+            let mut value = serde_json::json!({ "platforms": { "p": info } });
+            if let Some(path) = install_path {
+                value["install_path"] = serde_json::json!(path);
+            }
+            serde_json::from_value::<Component>(value).unwrap()
+        };
+        let skipped = |component: &Component, binary: InstallState| {
+            skipped_before_install(component, resolve_platform_info(component, "p"), &binary)
+        };
+        let download = component(Some("bin/a"), serde_json::json!({ "release_path": "a" }));
+        assert!(!skipped(&download, InstallState::Missing));
+        assert!(skipped(
+            &component(None, serde_json::json!({ "release_path": "a" })),
+            InstallState::Missing
+        ));
+        assert!(skipped(
+            &component(Some("bin/a"), serde_json::json!({})),
+            InstallState::Missing
+        ));
+        assert!(skipped(
+            &component(
+                Some("bin/a"),
+                serde_json::json!({ "release_path": "a", "strategy": "source-build" })
+            ),
+            InstallState::Missing
+        ));
+        let local = |source: &Path| {
+            component(
+                Some("vmlinux"),
+                serde_json::json!({ "strategy": "local-copy", "source": source.display().to_string() }),
+            )
+        };
+        assert!(!skipped(&local(&present), InstallState::Missing));
+        assert!(skipped(
+            &local(&temp.path().join("missing")),
+            InstallState::Missing
+        ));
+        assert!(skipped_before_install(
+            &download,
+            None,
+            &InstallState::Missing
+        ));
+        // An installed binary still reaches the capsule metadata step.
+        assert!(!skipped(
+            &component(Some("bin/a"), serde_json::json!({})),
+            InstallState::Installed
+        ));
+    }
 
     #[test]
     fn arm64_model_profile_requires_dot_product_and_both_fp16_features() {
