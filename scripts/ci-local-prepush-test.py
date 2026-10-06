@@ -705,9 +705,7 @@ class PrepushTests(unittest.TestCase):
     def test_repository_clean_runs_only_for_a_shared_build_dir(self):
         for extra, cleaned in (({}, True),
                                ({"CARGO_BUILD_BUILD_DIR": str(self.tmp / "shared")}, True),
-                               ({"CARGO_BUILD_BUILD_DIR": str(self.root / "target/private")}, False),
-                               ({"CARGO_BUILD_BUILD_DIR": str(self.tmp / "shared"),
-                                 "ELASTOS_PREPUSH_PRIVATE_BUILD_DIR": "1"}, False)):
+                               ({"CARGO_BUILD_BUILD_DIR": str(self.root / "target/private")}, False)):
             with self.subTest(extra=extra):
                 self.log.unlink(missing_ok=True)
                 result = self.invoke(extra=extra)

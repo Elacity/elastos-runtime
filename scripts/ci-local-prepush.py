@@ -564,8 +564,7 @@ def main():
     os.environ["CARGO_BUILD_BUILD_DIR"] = str(build_dir)
     # Only this worktree compiles into a private build dir, so its fingerprints
     # already track these sources; the shared default needs the package clean.
-    PRIVATE_BUILD_DIR = os.environ.get("ELASTOS_PREPUSH_PRIVATE_BUILD_DIR") == "1" or (
-        build_dir != shared and build_dir.is_relative_to(root.resolve()))
+    PRIVATE_BUILD_DIR = build_dir != shared and build_dir.is_relative_to(root.resolve())
     print("build-dir={} clean={}".format(build_dir, "skip-private" if PRIVATE_BUILD_DIR else "shared"),
           flush=True)
     disk_reserve(root)
