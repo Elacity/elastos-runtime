@@ -135,6 +135,27 @@ SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.engine-cache.outputs.cache-hit": "false"}
 
 
+def job_runs(job, context, workflow_jobs=JOBS):
+    guard = re.search(r"(?m)^    if: (.*)$", workflow_jobs[job])
+    return evaluate(guard[1], context) if guard else True
+
+
+def custody_should_run(source, context, paths):
+    workflow_jobs = jobs(source)
+    if not job_runs("custody-harness-smoke", context, workflow_jobs):
+        return False
+    step, = [step for step in steps("custody-harness-smoke", workflow_jobs) if "id: should-run" in step]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    context = {**context, "steps.filter.outputs.custody": paths}
+    script = re.sub(r"\$\{\{.*?\}\}", lambda match: str(evaluate(match[0], context)), script)
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "output"
+        subprocess.run(["bash", "-e", "-c", script], check=True,
+                       env={**os.environ, "GITHUB_OUTPUT": str(output),
+                            "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")})
+        return output.read_text() == "run=true\n"
+
+
 def validate_cache_guards(source):
     workflow_jobs = jobs(source)
     for job in workflow_jobs:
@@ -162,9 +183,11 @@ def validate_cache_guards(source):
                     continue
                 context = {"github.event_name": event, "github.ref": ref,
                            "github.ref_type": ref_type, "inputs.ref": override,
-                           "env.CI_USE_CACHE": "false", "env.CI_SAVE_CACHE": "true",
-                           "steps.should-run.outputs.run": "true", **NO_CACHE_HIT}
-                if evaluate(guard, context):
+                           **NO_CACHE_HIT}
+                for name in ("CI_USE_CACHE", "CI_SAVE_CACHE"):
+                    context["env." + name] = str(evaluate(field(source, name), context)).lower()
+                context["steps.should-run.outputs.run"] = str(custody_should_run(source, context, "true")).lower()
+                if job_runs(job, context, workflow_jobs) and evaluate(guard, context):
                     raise AssertionError(f"cache guard permits uncached build in {job}")
 
 
@@ -195,15 +218,18 @@ def validate_journey_builds(source, release_source):
             if any(key in block for key in overrides):
                 raise AssertionError(f"journey profile override in {job}")
             continue
-        # End job env at the next four-space key, keeping six-space values.
+        # Runner paths are available in steps, not in job-level env expressions.
         environment = re.search(r"(?ms)^    env:\n(.*?)(?=^    \S|\Z)", block)
-        if environment is None:
-            raise AssertionError(f"missing job build environment in {job}")
-        for key, value in {"CARGO_TARGET_DIR": "${{ runner.temp }}/" + job + "-target",
-                           "CARGO_BUILD_BUILD_DIR": "${{ runner.temp }}/" + job + "-build"}.items():
-            if field(environment[1], key).strip('"') != value or block.count(key + ":") != 1:
-                raise AssertionError(f"one shared job build setting required: {job} {key}")
+        if environment and re.search(r"CARGO_(?:TARGET_DIR|BUILD_BUILD_DIR):|runner\.temp", environment[1]):
+            raise AssertionError(f"runner build paths belong in the first step: {job}")
         job_steps = steps(job, jobs(source))
+        paths, = [step for step in job_steps if step.startswith("name: set job build directories\n")]
+        if paths != job_steps[0] or re.search(r"(?m)^        if:", paths):
+            raise AssertionError(f"build paths must be set by the first unconditional step: {job}")
+        for key, value in {"CARGO_TARGET_DIR": "$RUNNER_TEMP/" + job + "-target",
+                           "CARGO_BUILD_BUILD_DIR": "$RUNNER_TEMP/" + job + "-build"}.items():
+            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in paths or block.count(key + "=") != 1:
+                raise AssertionError(f"one shared job build setting required: {job} {key}")
         profile, = [step for step in job_steps if step.startswith("name: use CI journey release profile\n")]
         for key, value in overrides.items():
             if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in profile or block.count(key) != 1:
@@ -226,7 +252,8 @@ def validate_journey_builds(source, release_source):
         setup, = [step for step in job_steps if step.startswith("name: source-home into isolated")]
         if job_steps.index(fresh) >= job_steps.index(setup):
             raise AssertionError(f"freshness check must precede source-home: {job}")
-        if re.search(r"(?:CARGO_TARGET_DIR|CARGO_BUILD_BUILD_DIR|RUSTFLAGS)=|--target-dir", block):
+        if re.search(r"(?:CARGO_TARGET_DIR|CARGO_BUILD_BUILD_DIR|RUSTFLAGS)=|--target-dir",
+                     "\n".join(step for step in job_steps if step != paths)):
             raise AssertionError(f"step changes the shared build environment: {job}")
 
 
@@ -236,7 +263,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("\n  merge_group:\n    types: [checks_requested]\n", triggers)
         self.assertIn("\n  pull_request:\n", triggers)
         self.assertIn("branches: [main, develop]", triggers)
-        context = {"github.event_name": "merge_group"}
+        context = {"github.event_name": "merge_group", "github.ref": "refs/heads/gh-readonly-queue/develop/pr-1"}
         for job in JOBS:
             if job == "release":
                 continue
@@ -246,21 +273,17 @@ class ReleasePolicyTests(unittest.TestCase):
             checkout, = [step for step in steps(job) if "uses: actions/checkout@" in step]
             self.assertEqual(field(checkout, "ref"),
                              "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}")
-        should_run, = [step for step in steps("custody-harness-smoke") if "id: should-run" in step]
-        script = textwrap.dedent(should_run.split("        run: |\n", 1)[1])
-        with tempfile.TemporaryDirectory() as directory:
-            for event, paths, expected in (("merge_group", "", True),
-                                           ("workflow_dispatch", "", True),
-                                           ("pull_request", "true", True),
-                                           ("pull_request", "false", False)):
-                output = Path(directory) / "output"
-                output.write_text("")
-                command = script.replace("${{ github.event_name }}", event).replace(
-                    "${{ steps.filter.outputs.custody }}", paths)
-                subprocess.run(["bash", "-e", "-c", command], check=True,
-                               env={**os.environ, "GITHUB_OUTPUT": str(output),
-                                    "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")})
-                self.assertEqual(output.read_text(), f"run={str(expected).lower()}\n")
+        for event, ref, ref_type, override, _, _ in CASES:
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override}
+            context["env.CI_SAVE_CACHE"] = str(evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)).lower()
+            expected_job = event in ("merge_group", "workflow_dispatch", "pull_request") or \
+                (event == "push" and ref in SAVING_REFS)
+            self.assertEqual(job_runs("custody-harness-smoke", context), expected_job)
+            for paths in ("true", "false"):
+                with self.subTest(event=event, ref=ref, paths=paths):
+                    expected = expected_job and (event != "pull_request" or paths == "true")
+                    self.assertEqual(custody_should_run(SOURCE, context, paths), expected)
 
     def test_sccache_is_scoped_to_test_jobs(self):
         action = "./.github/actions/rust-compile-cache"
@@ -417,6 +440,10 @@ class ReleasePolicyTests(unittest.TestCase):
             SOURCE.replace('CARGO_PROFILE_RELEASE_LTO=false', 'CARGO_PROFILE_RELEASE_LTO=true', 1),
             SOURCE.replace('CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1', 1),
             SOURCE.replace('source-home-linux-target', 'separate-target', 1),
+            SOURCE.replace('name: set job build directories\n',
+                           'name: set job build directories\n        if: false\n', 1),
+            SOURCE.replace('  source-home-linux:\n',
+                           '  source-home-linux:\n    env:\n      CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-linux-target\n', 1),
             SOURCE.replace("if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')",
                            "if: github.event_name == 'push'", 1),
             SOURCE.replace('name: require fresh Linux build artifacts\n',
@@ -438,19 +465,27 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_fresh_job_directories_refuse_restored_outputs_and_links(self):
         for job in ("source-home-linux", "source-home-macos"):
+            paths, = [step for step in steps(job) if step.startswith("name: set job build directories\n")]
+            exports = textwrap.dedent(paths.split("        run: |\n", 1)[1])
             fresh, = [step for step in steps(job) if 'test ! -e "$directory"' in step]
             script = textwrap.dedent(fresh.split("        run: |\n", 1)[1])
             for existing in (None, "target", "build", "link"):
                 with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    target, build = root / "target", root / "build"
+                    env = {**os.environ, "RUNNER_TEMP": str(root), "GITHUB_ENV": str(root / "env")}
+                    subprocess.run(["bash", "-e", "-c", exports], env=env, check=True)
+                    env.update(dict(line.split("=", 1) for line in (root / "env").read_text().splitlines()))
+                    target, build = Path(env["CARGO_TARGET_DIR"]), Path(env["CARGO_BUILD_BUILD_DIR"])
+                    self.assertEqual(target, root / (job + "-target"))
+                    self.assertEqual(build, root / (job + "-build"))
+                    self.assertFalse(target.exists())
+                    self.assertFalse(build.exists())
                     if existing == "link":
                         target.symlink_to(root / "missing")
                     elif existing:
                         (target if existing == "target" else build).mkdir()
                     result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                                            env={**os.environ, "CARGO_TARGET_DIR": str(target),
-                                                 "CARGO_BUILD_BUILD_DIR": str(build), "GITHUB_ENV": str(root / "env")})
+                                            env=env)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
 
     def test_packages_select_shared_outputs_and_preserve_binary_hashes(self):
@@ -581,14 +616,16 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(save, event == "push" and ref in SAVING_REFS)
                 context["env.CI_SAVE_CACHE"] = str(save).lower()
                 context.update(NO_CACHE_HIT)
-                for should_run in (True, False):
+                for paths in ("true", "false"):
+                    should_run = custody_should_run(SOURCE, context, paths)
                     context["steps.should-run.outputs.run"] = str(should_run).lower()
                     for job, step in caches:
-                        expected = cached and (job != "custody-harness-smoke" or should_run)
+                        allowed = job_runs(job, context)
+                        expected = allowed and cached and (job != "custody-harness-smoke" or should_run)
                         if "actions/cache/save@" in step:
                             expected = expected and (event == "push" and ref == "refs/heads/develop"
                                                      if job == "engine-llama-arm64" else save)
-                        self.assertEqual(evaluate(field(step, "if"), context), expected,
+                        self.assertEqual(allowed and evaluate(field(step, "if"), context), expected,
                                          f"cache guard in {job}")
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
@@ -640,17 +677,29 @@ class ReleasePolicyTests(unittest.TestCase):
         stub = 'docker() { printf "%s\\0" "$@"; }\n'
         base = ["buildx", "build", "-f", "deploy/custody-host/Dockerfile",
                 "-t", "elastos-custody-host:latest"]
-        # Reads need the cache enabled; writes need a trusted saving run as well.
-        for use, save in ((True, True), (True, False), (False, False)):
-            with self.subTest(use=use, save=save):
-                result = subprocess.run(["bash", "-eo", "pipefail", "-c", stub + script],
-                                        env={**os.environ, "CI_USE_CACHE": str(use).lower(),
-                                             "CI_SAVE_CACHE": str(save).lower()},
-                                        capture_output=True, check=True)
-                args = result.stdout.decode().split("\0")[:-1]
-                cache = (["--cache-from", "type=gha"] if use else []) + \
-                    (["--cache-to", "type=gha,mode=max"] if save else [])
-                self.assertEqual(args, base + cache + ["--load", "."])
+        # Derive cache settings from actual events, then apply the job and step guards.
+        for event, ref, ref_type, override, cached, _ in CASES:
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override}
+            use = evaluate(field(SOURCE, "CI_USE_CACHE"), context)
+            save = evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)
+            context.update({"env.CI_USE_CACHE": str(use).lower(), "env.CI_SAVE_CACHE": str(save).lower()})
+            for paths in ("true", "false"):
+                with self.subTest(event=event, ref=ref, override=override, paths=paths):
+                    context["steps.should-run.outputs.run"] = str(custody_should_run(SOURCE, context, paths)).lower()
+                    args = []
+                    if job_runs("custody-harness-smoke", context) and evaluate(field(step, "if"), context):
+                        result = subprocess.run(["bash", "-eo", "pipefail", "-c", stub + script],
+                                                env={**os.environ, "CI_USE_CACHE": str(use).lower(),
+                                                     "CI_SAVE_CACHE": str(save).lower()},
+                                                capture_output=True, check=True)
+                        args = result.stdout.decode().split("\0")[:-1]
+                    trusted_push = event == "push" and ref in SAVING_REFS
+                    expected_run = event in ("merge_group", "workflow_dispatch") or trusted_push or \
+                        (event == "pull_request" and paths == "true")
+                    cache = (["--cache-from", "type=gha"] if cached else []) + \
+                        (["--cache-to", "type=gha,mode=max"] if trusted_push else [])
+                    self.assertEqual(args, base + cache + ["--load", "."] if expected_run else [])
 
     def test_github_runners_check_names_and_release_dependencies_stay_fixed(self):
         expected = {

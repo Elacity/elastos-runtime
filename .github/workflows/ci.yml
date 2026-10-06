@@ -369,16 +369,16 @@ jobs:
   # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
   # owns all the logic (throwaway client identity, throwaway compose
   # project, receipt assertions, full teardown); this job is thin glue over
-  # it. Runs for every merge group, workflow_dispatch, and PRs that touch the harness
+  # it. Trusted develop/main pushes warm the shared image cache. Runs also for
+  # every merge group, workflow_dispatch, and PRs that touch the harness
   # image, the proof driver, or the protected-content/carrier crates it
-  # exercises -- NOT every push, since the image build + 3-node bring-up
-  # add real wall time.
+  # exercises.
   custody-harness-smoke:
     name: custody-harness-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: source-gate
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'))
     # The top-level `permissions: contents: read` above zeroes every other
     # scope for every job; dorny/paths-filter resolves a pull_request's
     # changed files via the GitHub API (this job's checkout is fetch-depth 1,
@@ -421,7 +421,7 @@ jobs:
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
       - id: should-run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ env.CI_SAVE_CACHE }}" = "true" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -488,9 +488,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: [source-gate, engine-llama-arm64]
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-linux-target
-      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-linux-build
     strategy:
       fail-fast: false
       matrix:
@@ -501,6 +498,10 @@ jobs:
           - os: ubuntu-22.04-arm
             check_name: ubuntu-24.04-arm
     steps:
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-linux-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-linux-build" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
@@ -623,10 +624,11 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 90
     needs: source-gate
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-macos-target
-      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-macos-build
     steps:
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-macos-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-macos-build" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
