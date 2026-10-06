@@ -103,6 +103,40 @@ for (const [name, mutate, message] of [
   });
 }
 
+for (const [name, field, invalid, message] of [
+  ["documents", "type", "wasm", /projection type/],
+  ["home-cli", "type", "wasm", /projection type/],
+  ["home-gui", "type", "microvm", /projection type/],
+  ["browser", "execution", "component", /projection execution/],
+  ["documents", "execution", null, /projection execution/],
+  ["documents", "runtime_abi", "elastos.provider-stdio/v1", /projection ABI/],
+  ["documents", "microvm", {}, /projection.*metadata/],
+  ["chain-provider", "type", "microvm", /native provider type/],
+  ["chain-provider", "type", "wasm", /native provider type/],
+  ["chain-provider", "execution", "microvm", /native provider execution/],
+  ["chain-provider", "execution", null, /native provider execution/],
+  ["chain-provider", "runtime_abi", "elastos.component/v1", /native provider ABI/],
+  ["chain-provider", "microvm", {}, /native provider.*metadata/],
+  ["chain-provider", "bus_contract", "elastos.runtime-projection/v1", /projection type/],
+  ["shell", "type", "wasm", /native host type/],
+  ["shell", "execution", null, /native host execution/],
+  ["shell", "entrypoint", "arbitrary-program", /native host entrypoint/],
+]) {
+  test(`${name} refuses contradictory ${field}=${JSON.stringify(invalid)}`, () => {
+    const value = clone(manifests[name]);
+    value[field] = invalid;
+    assert.throws(() => validateCapsule(value), message);
+  });
+}
+
+test("descriptive types require their execution metadata in both directions", () => {
+  for (const [name, message] of [["documents", /projection execution/], ["chain-provider", /native provider execution/], ["shell", /native host execution/]]) {
+    const value = clone(manifests[name]);
+    for (const field of ["execution", "runtime_abi", "bus_contract"]) delete value[field];
+    assert.throws(() => validateCapsule(value), message);
+  }
+});
+
 for (const name of ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"]) {
   for (const platform of ["linux-amd64", "linux-arm64"]) {
     test(`${name} refuses missing ${platform} extraction metadata for a changed archive format`, () => {

@@ -76,12 +76,31 @@ export function validateCapsule(manifest, label = manifest?.name) {
     }
     for (const dependency of manifest.requires ?? []) assert(dependency.kind !== "external", `${label}: Runtime owns external dependencies`);
   }
-  if (manifest.execution === "web-projection") {
-    same(manifest.type, "wasm", `${label}: projection type`);
+  if (manifest.type === "web-projection" || manifest.execution === "web-projection"
+      || manifest.runtime_abi === "elastos.runtime-projection/v1" || manifest.bus_contract === "elastos.runtime-projection/v1") {
+    same(manifest.type, "web-projection", `${label}: projection type`);
+    same(manifest.execution, "web-projection", `${label}: projection execution`);
+    assert(["app", "viewer", "shell"].includes(manifest.role), `${label}: projection role`);
     same(manifest.runtime_abi, "elastos.runtime-projection/v1", `${label}: projection ABI`);
     same(manifest.bus_contract, "elastos.runtime-projection/v1", `${label}: projection bus`);
-    assert(manifest.wit_world_sha256 === undefined, `${label}: web projection uses Runtime ABI`);
+    assert(manifest.microvm === undefined && manifest.wit_world_sha256 === undefined, `${label}: incompatible projection execution metadata`);
     assert(requireList(manifest.projections, `${label}: projections`).includes("web"), `${label}: web projection is missing`);
+  }
+  if (manifest.type === "native-provider" || manifest.execution === "native-provider" || manifest.runtime_abi === "elastos.provider-stdio/v1") {
+    same(manifest.type, "native-provider", `${label}: native provider type`);
+    same(manifest.execution, "native-provider", `${label}: native provider execution`);
+    same(manifest.role, "provider", `${label}: native provider role`);
+    same(manifest.runtime_abi, "elastos.provider-stdio/v1", `${label}: native provider ABI`);
+    assert(manifest.microvm === undefined && manifest.bus_contract === undefined && manifest.wit_world_sha256 === undefined, `${label}: incompatible native provider execution metadata`);
+  }
+  if (manifest.type === "native-host" || manifest.execution === "native-host" || manifest.runtime_abi === "native-host") {
+    same(manifest.type, "native-host", `${label}: native host type`);
+    same(manifest.execution, "native-host", `${label}: native host execution`);
+    same(manifest.runtime_abi, "native-host", `${label}: native host ABI`);
+    same(manifest.role, "shell", `${label}: native host role`);
+    same(manifest.name, "shell", `${label}: native host name`);
+    same(manifest.entrypoint, "shell", `${label}: native host entrypoint`);
+    assert(manifest.microvm === undefined && manifest.bus_contract === undefined && manifest.wit_world_sha256 === undefined && !(manifest.projections?.length), `${label}: incompatible native host execution metadata`);
   }
   if (manifest.interfaces !== undefined) {
     const interfaces = requireList(manifest.interfaces, `${label}: interfaces`);
