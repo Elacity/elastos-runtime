@@ -59,6 +59,8 @@ jobs:
         run: node scripts/check-product-data.mjs
       - name: local pre-push gate behavior
         run: python3 scripts/ci-local-prepush-test.py
+      - name: build unit key behavior
+        run: python3 scripts/build-key-test.py
       - name: product UI source proofs
         run: |
           node --version

@@ -1,0 +1,33 @@
+{
+ "_doc": [
+  "Non-Rust and cross-package inputs of build units, read by scripts/build-key.py.",
+  "packages.<crate>: repository files (or directories) the crate reads from outside its own directory",
+  "  (include_str!/include_bytes!, bindgen wit paths). The compiler's dep-info proves each of these;",
+  "  an undeclared cross-package read yields no key (miss) until it is listed here.",
+  "units.<package>/<kind>: inputs the compiler cannot see, hashed into that unit's key:",
+  "  paths (files or directories, repository-relative) and env (variable names)."
+ ],
+ "packages": {
+  "elastos-common": [
+   "elastos/wit/elastos-bus-v1.wit",
+   "scripts/install.sh",
+   "templates/capsules/component-app/capsule.json",
+   "templates/capsules/provider-contract/capsule.json",
+   "templates/capsules/viewer-content/content.capsule.json",
+   "templates/capsules/viewer-content/viewer.capsule.json",
+   "templates/capsules/web-app/capsule.json"
+  ],
+  "elastos-compute": [
+   "elastos/wit/elastos-bus-v1.wit"
+  ],
+  "elastos-server": [
+   "elastos/wit/elastos-bus-v1.wit"
+  ]
+ },
+ "units": {
+  "chain-provider/bin": {
+   "paths": ["capsules/chain-provider/capsule.json", "capsules/chain-provider/icons"],
+   "env": []
+  }
+ }
+}
