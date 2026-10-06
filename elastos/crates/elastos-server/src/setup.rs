@@ -4474,7 +4474,11 @@ pub(crate) mod tests {
 
         assert_eq!(reason(format!("sha256:{digest}")), stale, "receipt missing");
         // Registry capsule installs record the bare digest of the same archive.
-        fs::write(tmp.path().join(CACHED_ARTIFACT_SHA_FILE), format!("{digest}\n")).unwrap();
+        fs::write(
+            tmp.path().join(CACHED_ARTIFACT_SHA_FILE),
+            format!("{digest}\n"),
+        )
+        .unwrap();
         assert_eq!(reason(format!("sha256:{digest}")), None);
         assert_eq!(reason(format!("sha256:{}", "b".repeat(64))), stale);
         assert_eq!(reason(format!("sha512:{digest}")), stale);

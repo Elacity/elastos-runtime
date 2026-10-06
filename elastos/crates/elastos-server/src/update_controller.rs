@@ -880,7 +880,7 @@ impl Controller {
                 &expected,
                 readiness_budget(false),
             )
-                .await
+            .await
         }
         .await
         .with_context(|| {
