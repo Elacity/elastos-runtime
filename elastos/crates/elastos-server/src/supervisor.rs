@@ -1698,6 +1698,99 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn on_demand_chat_home_launch_uses_carrier_and_refuses_checksum_mismatch() {
+        let capsule = include_bytes!("../../../../capsules/chat-room/capsule.json");
+        let page = b"<!doctype html><title>Chat fixture</title>";
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("chat-room/capsule.json", capsule.as_slice()),
+            ("chat-room/browser/index.html", page.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, bytes).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+
+        for mismatch in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let (server, serving, mut info) =
+                crate::setup::tests::carrier_component_download_fixture(
+                    data,
+                    "chat-room.tar.gz",
+                    bytes.clone(),
+                )
+                .await;
+            info.extract_path = Some("chat-room".into());
+            info.install_path = Some("capsules/chat-room".into());
+            if mismatch {
+                info.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+            }
+            let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+                "external": {"chat-room": {
+                    "install_path": "capsules/chat-room", "platforms": {"*": info}
+                }},
+                "capsules": {"chat-room": {
+                    "cid": info.cid, "size": bytes.len(),
+                    "sha256": info.checksum.as_deref().unwrap().strip_prefix("sha256:").unwrap()
+                }},
+                "profiles": {"home": {"components": []}}
+            }))
+            .unwrap();
+            let registry_path = data.join("components.json");
+            let registry_bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(&registry_path, &registry_bytes).unwrap();
+            let supervisor = Supervisor::new(data.to_path_buf(), manifest);
+            let dest = data.join("capsules/chat-room");
+
+            let result =
+                crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room").await;
+            server.close().await;
+            serving.await.unwrap();
+
+            assert_eq!(std::fs::read(&registry_path).unwrap(), registry_bytes);
+            if mismatch {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Checksum mismatch for chat-room"), "{error}");
+                assert!(
+                    !dest.parent().unwrap().exists(),
+                    "refusal left a partial install"
+                );
+            } else {
+                assert_eq!(result.unwrap().status, "materialized");
+                assert_eq!(std::fs::read(dest.join("capsule.json")).unwrap(), capsule);
+                assert_eq!(
+                    std::fs::read(dest.join("browser/index.html")).unwrap(),
+                    page
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_CID_FILE))
+                        .unwrap()
+                        .trim(),
+                    info.cid.as_deref().unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_ARTIFACT_SHA_FILE))
+                        .unwrap()
+                        .trim(),
+                    hex::encode(sha2::Sha256::digest(&bytes))
+                );
+                // A second open uses the verified package even with Carrier stopped.
+                let ensure =
+                    crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
+                        .await
+                        .unwrap();
+                assert_eq!(ensure.status, "installed");
+                assert_eq!(supervisor.ensure_capsule("chat-room").await.unwrap(), dest);
+            }
+        }
+    }
+
     #[test]
     fn test_supervisor_request_wait_capsule() {
         let json = r#"{"op":"wait_capsule","handle":"vm-chat-3"}"#;
