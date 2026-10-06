@@ -1784,6 +1784,20 @@ pub(crate) fn require_controller_update_space(path: &Path, needed: u64) -> anyho
     require_update_space(total, available, u128::from(needed))
 }
 
+/// Device and available bytes of the volume holding `path` or its nearest
+/// existing ancestor. A volume that reports no size has nothing available.
+pub(crate) fn volume_space(path: &Path) -> anyhow::Result<(u64, u128)> {
+    let mut volume = path;
+    while !volume.exists() {
+        volume = volume.parent().context("disk parent missing")?;
+    }
+    let (total, available) = disk_space(volume)?;
+    Ok((
+        fs::metadata(volume)?.dev(),
+        if total == 0 { 0 } else { available },
+    ))
+}
+
 /// Waits between attempts to start a binary that was just written. On Linux a
 /// concurrent fork can briefly inherit the closed writer descriptor, so exec
 /// reports ETXTBSY until that child execs. Only that error is retried (<2 s).
