@@ -664,6 +664,8 @@ pub async fn run(receipt_path: PathBuf) -> Result<()> {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        #[cfg(test)]
+        test_readiness: None,
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -795,6 +797,8 @@ struct Controller {
     host_ready: bool,
     carrier: Option<Arc<crate::carrier::CarrierClient>>,
     carrier_close: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)]
+    test_readiness: Option<(Duration, u16)>,
 }
 
 impl Controller {
@@ -917,7 +921,9 @@ impl Controller {
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let budget = readiness_budget(restarting);
+        let (budget, home_port) = (readiness_budget(restarting), BROWSER_HOME_PORT);
+        #[cfg(test)]
+        let (budget, home_port) = self.test_readiness.unwrap_or((budget, home_port));
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             if child.observed_exit()?.is_some() {
@@ -932,7 +938,7 @@ impl Controller {
                 prove_ready(
                     &client,
                     &self.receipt.data_dir,
-                    BROWSER_HOME_PORT,
+                    home_port,
                     pid,
                     generation,
                     version,
