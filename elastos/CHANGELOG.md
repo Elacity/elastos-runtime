@@ -56,8 +56,8 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Removed
 
-- Local AI models are no longer part of the release. They will return later as a
-  separate download.
+- Local AI models are no longer part of the release, so Home shows no models for
+  now. They will return as a separate signed download.
 
 ## [0.7.1] - 2026-09-30
 
