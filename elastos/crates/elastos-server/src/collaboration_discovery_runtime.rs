@@ -887,6 +887,45 @@ impl CollaborationDiscoveryService {
         project_discovery_status(&state, enabled, store)
     }
 
+    /// Leaves this principal's Discovery as a finished relay pass would: on,
+    /// with a published current advertisement and the given verified
+    /// advertisements visible. Gateway tests have no relay to reach.
+    #[cfg(test)]
+    pub(crate) fn seed_visible_discovery_for_test(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        visible: Vec<Vec<u8>>,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let profile_did = self.require_profile_store_match(store, profile)?;
+        store.set_discovery_enabled(true, now)?;
+        if store.published_local_advertisement(now)?.is_none() {
+            let current = self.authority.prepare_advertisement(profile, now)?;
+            store.store_local_advertisement(&current, now)?;
+        }
+        let mut states = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
+        let state = client_state_mut(&mut states, profile_did)?;
+        for envelope_bytes in visible {
+            let verified = verify_collaboration_discovery_advertisement(
+                &envelope_bytes,
+                &self.authority.profile,
+                now,
+            )?;
+            state.visible_advertisements.insert(
+                verified.profile_did().to_string(),
+                CachedAdvertisement {
+                    envelope_bytes,
+                    verified,
+                },
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn client_state_snapshot_for_test(&self) -> serde_json::Value {
         let Ok(states) = self.state.lock() else {

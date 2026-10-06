@@ -1326,6 +1326,13 @@ pub(super) async fn chat_room_contact_request(
     headers: HeaderMap,
     Json(body): Json<ChatRoomContactRequestBody>,
 ) -> Response {
+    // The Chat session comes first, so a refused caller learns nothing about
+    // this Home's Discovery setup.
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return room_service_error_response(err),
+        };
     let Some(service) = state.collaboration_discovery_service.clone() else {
         return (
             StatusCode::CONFLICT,
@@ -1333,11 +1340,6 @@ pub(super) async fn chat_room_contact_request(
         )
             .into_response();
     };
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return room_service_error_response(err),
-        };
     let authority = match gateway_home_system::load_configured_contact_authority_for_context(
         &state.data_dir,
         &context,

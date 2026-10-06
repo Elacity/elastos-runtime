@@ -1,5 +1,6 @@
 use super::*;
 
+mod contact_request;
 mod direct;
 
 struct MockPeerProvider;

@@ -156,12 +156,12 @@ pub(super) fn configured_discovery_network_profile_for_test(
     }
 }
 
-struct TestCollaborationMessageScope<'a> {
-    network_id: &'a str,
-    conversation_id: &'a str,
+pub(super) struct TestCollaborationMessageScope<'a> {
+    pub(super) network_id: &'a str,
+    pub(super) conversation_id: &'a str,
 }
 
-fn signed_discovery_message_for_test(
+pub(super) fn signed_discovery_message_for_test(
     signing_key: &SigningKey,
     sender_profile_did: &str,
     scope: TestCollaborationMessageScope<'_>,
