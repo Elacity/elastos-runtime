@@ -20,7 +20,7 @@
 # bootstrap flow, they should already be stamped into install.sh.
 #
 # Downloads the signed release head, release envelope, and Runtime binary.
-# Runtime setup fetches component metadata and the pinned model catalog over Carrier.
+# Runtime setup fetches component metadata over Carrier.
 #
 # After bootstrap, setup installs the Home profile and opens browser Home.
 # Use --install-only for automated provisioning or other profiles.
@@ -248,9 +248,6 @@ free_space_mb() {
     done
     df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }'
 }
-
-# Below this, setup may run out of space; the installer warns and continues.
-INSTALLER_MIN_FREE_MB=1024
 
 platform_label() {
     case "$1" in
@@ -995,8 +992,8 @@ fi
 
 FREE_MB="$(free_space_mb "$DATA_DIR" || true)"
 if [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
-    if (( FREE_MB < INSTALLER_MIN_FREE_MB )); then
-        warn "Only ${FREE_MB} MB free; a Home needs about 1 GB. Free some space if setup stops."
+    if (( FREE_MB < 1024 )); then
+        ok "Disk: ${FREE_MB} MB free"
     else
         ok "Disk: $((FREE_MB / 1024)) GB free"
     fi
