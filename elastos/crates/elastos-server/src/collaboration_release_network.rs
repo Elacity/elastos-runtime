@@ -80,21 +80,85 @@ impl ReleaseNetworkOutcome {
     }
 }
 
-/// Records that this Home stays isolated. A Home that already joined a
-/// network keeps it, because Runtime refuses to drop an accepted network.
+/// Records that this Home stays isolated.
+///
+/// Before the first start this also removes the release network file that
+/// setup installed, so Runtime never joins it. A Home whose Runtime already
+/// accepted a network keeps it, because Runtime refuses to drop an accepted
+/// network; leaving Community is a separate step. A configuration that is
+/// not the release network belongs to the Home's operator and is kept.
 pub fn choose_isolated(data_dir: &Path) -> anyhow::Result<()> {
     let config = data_dir.join(COLLABORATION_STARTUP_CONFIG_FILE);
-    if fs::symlink_metadata(&config).is_ok() {
-        anyhow::bail!(
-            "this Home already has a collaboration network configuration; isolation applies to a new Home"
-        );
-    }
     let marker = data_dir.join(COLLABORATION_ISOLATED_MARKER_FILE);
-    if fs::symlink_metadata(&marker).is_ok() {
-        return Ok(());
+    let release_bytes = match fs::symlink_metadata(&config) {
+        Ok(_) => {
+            require_not_started(data_dir)?;
+            let bytes = read_collaboration_startup_config_candidate(&config)?;
+            if !is_installed_release_network(data_dir, &bytes)? {
+                anyhow::bail!(
+                    "this Home has its own collaboration network configuration; isolation applies only to the release network"
+                );
+            }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to inspect collaboration configuration"),
+    };
+    // The choice is recorded first, so an interrupted run leaves a Home that
+    // setup and update keep isolated; running `--isolated` again finishes it.
+    if fs::symlink_metadata(&marker).is_err() {
+        fs::create_dir_all(data_dir)?;
+        create_owner_only_file(&marker, b"isolated\n", "collaboration isolation choice")?;
     }
-    fs::create_dir_all(data_dir)?;
-    create_owner_only_file(&marker, b"isolated\n", "collaboration isolation choice")
+    let Some(release_bytes) = release_bytes else {
+        return Ok(());
+    };
+    fs::remove_file(&config).context("failed to remove the release collaboration network")?;
+    fs::File::open(data_dir)?.sync_all()?;
+    // A Runtime that started meanwhile may have read the file already; put it
+    // back rather than leave that Runtime's accepted network without it.
+    if let Err(started) = require_not_started(data_dir) {
+        create_owner_only_file(
+            &config,
+            &release_bytes,
+            "collaboration network configuration",
+        )?;
+        return Err(started);
+    }
+    tracing::debug!("removed the release collaboration network before the first start");
+    Ok(())
+}
+
+/// Runtime creates the collaboration namespace when it first accepts a
+/// network, so its presence means this Home already joined.
+fn require_not_started(data_dir: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(data_dir.join("collaboration")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to inspect collaboration state"),
+        Ok(_) => anyhow::bail!(
+            "this Home already joined Community; isolation applies only before its first start"
+        ),
+    }
+}
+
+/// True when `bytes` are exactly the network the Home's installed release pins.
+fn is_installed_release_network(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
+    const MAX_INSTALLED_COMPONENTS_BYTES: u64 = 4 * 1024 * 1024;
+    let path = data_dir.join("components.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("failed to inspect installed components"),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_INSTALLED_COMPONENTS_BYTES {
+        return Ok(false);
+    }
+    let manifest: crate::setup::ComponentsManifest =
+        serde_json::from_slice(&fs::read(&path)?).context("installed components are invalid")?;
+    let Some(pin) = manifest.collaboration_network else {
+        return Ok(false);
+    };
+    Ok(crate::setup::catalog_head_cid(bytes)? == pin.head_cid)
 }
 
 pub fn is_isolated(data_dir: &Path) -> bool {
@@ -433,17 +497,102 @@ pub(crate) mod tests {
         assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
     }
 
+    /// The Home's installed `components.json`, pinning `pin`.
+    fn install_components_pin(data: &Path, pin: &CollaborationNetworkPin) {
+        let manifest = serde_json::json!({
+            "external": {},
+            "profiles": {},
+            "collaboration_network": pin,
+        });
+        fs::write(data.join("components.json"), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn isolation_before_the_first_start_removes_the_release_network() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let (_release, release_path) = release_dir_with(&chain[0]);
+        let data = private_data_dir();
+        let pin = pin_for(&chain[0]);
+        install_components_pin(data.path(), &pin);
+        install_release_network(data.path(), Some(&pin), &release_path).unwrap();
+
+        choose_isolated(data.path()).unwrap();
+
+        assert!(is_isolated(data.path()));
+        assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
+        // Setup and update now leave it uninstalled, and the choice is idempotent.
+        assert_eq!(
+            install_release_network(data.path(), Some(&pin), &release_path).unwrap(),
+            ReleaseNetworkOutcome::Isolated
+        );
+        assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
+        choose_isolated(data.path()).unwrap();
+    }
+
     #[test]
     fn isolation_is_refused_after_a_home_joined() {
         let (_signer, chain) = signed_profile_chain_config(1);
         let (_release, release_path) = release_dir_with(&chain[0]);
         let data = private_data_dir();
-        install_release_network(data.path(), Some(&pin_for(&chain[0])), &release_path).unwrap();
+        let pin = pin_for(&chain[0]);
+        install_components_pin(data.path(), &pin);
+        install_release_network(data.path(), Some(&pin), &release_path).unwrap();
+        // Runtime accepted the network at its first start.
+        fs::create_dir(data.path().join("collaboration")).unwrap();
 
         let err = choose_isolated(data.path()).unwrap_err().to_string();
 
-        assert!(err.contains("isolation applies to a new Home"), "{err}");
+        assert!(err.contains("already joined Community"), "{err}");
         assert!(!is_isolated(data.path()));
+        assert_eq!(
+            fs::read(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).unwrap(),
+            chain[0]
+        );
+    }
+
+    #[test]
+    fn isolation_keeps_an_operator_network() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let (_other_signer, other) = signed_profile_chain_config(1);
+        let (_release, release_path) = release_dir_with(&chain[0]);
+        let data = private_data_dir();
+        install_release_network(data.path(), Some(&pin_for(&chain[0])), &release_path).unwrap();
+
+        // No installed pin, then a pin for another network: neither marks
+        // this file as the release network.
+        for pin in [None, Some(pin_for(&other[0]))] {
+            if let Some(pin) = &pin {
+                install_components_pin(data.path(), pin);
+            }
+            let err = choose_isolated(data.path()).unwrap_err().to_string();
+            assert!(err.contains("its own collaboration network"), "{err}");
+            assert!(!is_isolated(data.path()));
+            assert_eq!(
+                fs::read(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).unwrap(),
+                chain[0]
+            );
+        }
+    }
+
+    #[test]
+    fn an_interrupted_isolation_finishes_on_the_next_run() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let (_release, release_path) = release_dir_with(&chain[0]);
+        let data = private_data_dir();
+        let pin = pin_for(&chain[0]);
+        install_components_pin(data.path(), &pin);
+        install_release_network(data.path(), Some(&pin), &release_path).unwrap();
+        // The choice was recorded, then the run stopped before the removal.
+        create_owner_only_file(
+            &data.path().join(COLLABORATION_ISOLATED_MARKER_FILE),
+            b"isolated\n",
+            "test",
+        )
+        .unwrap();
+
+        choose_isolated(data.path()).unwrap();
+
+        assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
     }
 
     #[test]

@@ -122,10 +122,14 @@ Setup and update apply the release network to the data root:
   chain. The accepted-head marker then advances at the next start.
 - A Home that already holds a configuration for another network keeps it.
 - `elastos setup --isolated` (or `install.sh --isolated`) records the
-  owner-only choice `collaboration-isolated-v1` before the first start. Setup
-  and update then leave the release network uninstalled. A Home that already
-  joined a network keeps it, because Runtime refuses to drop an accepted
-  network.
+  owner-only choice `collaboration-isolated-v1`. Before the first start it
+  also removes the release network file that setup installed, so Runtime never
+  joins it; setup and update then leave the release network uninstalled.
+  Setup refuses and keeps the file when Runtime already accepted a network
+  (the `collaboration` state directory exists), because Runtime refuses to
+  drop an accepted network, and when the file is not the network the installed
+  release pins, because it then belongs to the Home's operator. Leaving
+  Community after joining is a separate, later step.
 - Source-home setup keeps its explicit `ELASTOS_COLLABORATION_STARTUP_MODE`
   (`configured` or `isolated`) and ignores the release pin.
 
