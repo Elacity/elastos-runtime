@@ -96,9 +96,11 @@ ci-local-prepush:
 test-ci-local-prepush:
     python3 scripts/ci-local-prepush-test.py
 
-# Build-unit input keys on a fixture workspace; builds it with the real cargo.
+# Build-unit keys and hermetic builds on a fixture workspace; needs cargo and
+# bubblewrap (Linux) or sandbox-exec (macOS).
 test-build-key:
     python3 scripts/build-key-test.py
+    python3 scripts/build-hermetic-test.py
 
 # Cold Debian container check for test-elastos when Docker is available.
 # It copies the working tree and installs Node for integration tests.

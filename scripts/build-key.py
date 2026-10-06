@@ -592,9 +592,19 @@ def sdk_identity():
     if sys.platform == "darwin":
         return {"xcrun-sdk-version": _first_line(["xcrun", "--show-sdk-version"]),
                 "xcrun-sdk-build": _first_line(["xcrun", "--show-sdk-build-version"])}
-    # openssl-sys links the system library it finds through pkg-config.
+    # openssl-sys links the system library it finds through pkg-config; the
+    # installed package list identifies the rest of the sysroot (runner image).
     return {"cc": _first_line(["cc", "--version"]), "libc": _first_line(["ldd", "--version"]),
-            "openssl": _first_line(["pkg-config", "--modversion", "openssl"])}
+            "openssl": _first_line(["pkg-config", "--modversion", "openssl"]),
+            "packages": _digest(["dpkg-query", "-W", "-f", "${Package}=${Version}\\n"])}
+
+
+def _digest(args):
+    try:
+        done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    return hashlib.sha256(done.stdout).hexdigest() if done.returncode == 0 else None
 
 
 def build_environment(environ):

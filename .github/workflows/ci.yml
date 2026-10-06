@@ -60,7 +60,10 @@ jobs:
       - name: local pre-push gate behavior
         run: python3 scripts/ci-local-prepush-test.py
       - name: build unit key behavior
-        run: python3 scripts/build-key-test.py
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap
+          python3 scripts/build-key-test.py
+          python3 scripts/build-hermetic-test.py
       - name: product UI source proofs
         run: |
           node --version
