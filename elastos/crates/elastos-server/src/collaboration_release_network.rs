@@ -27,6 +27,8 @@ use crate::collaboration_startup::{
 pub const RELEASE_COLLABORATION_NETWORK_FILE: &str = "collaboration-network-release-v1.json";
 /// Present when the person chose an isolated Home.
 pub const COLLABORATION_ISOLATED_MARKER_FILE: &str = "collaboration-isolated-v1";
+/// Serializes the isolation choice with Runtime startup's network acceptance.
+const COLLABORATION_NETWORK_CHOICE_LOCK_FILE: &str = ".collaboration-network-choice.lock";
 /// Source-home setup owns collaboration through its own explicit mode.
 const SOURCE_HOME_COLLABORATION_MODE_ENV: &str = "ELASTOS_COLLABORATION_STARTUP_MODE";
 
@@ -88,9 +90,13 @@ impl ReleaseNetworkOutcome {
 /// network; leaving Community is a separate step. A configuration that is
 /// not the release network belongs to the Home's operator and is kept.
 pub fn choose_isolated(data_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    // Runtime startup takes the same lock to read and accept the network, so
+    // the check, the choice and the removal below cannot interleave with it.
+    let _choice = lock_network_choice(data_dir)?;
     let config = data_dir.join(COLLABORATION_STARTUP_CONFIG_FILE);
     let marker = data_dir.join(COLLABORATION_ISOLATED_MARKER_FILE);
-    let release_bytes = match fs::symlink_metadata(&config) {
+    let release_config = match fs::symlink_metadata(&config) {
         Ok(_) => {
             require_not_started(data_dir)?;
             let bytes = read_collaboration_startup_config_candidate(&config)?;
@@ -99,34 +105,44 @@ pub fn choose_isolated(data_dir: &Path) -> anyhow::Result<()> {
                     "this Home has its own collaboration network configuration; isolation applies only to the release network"
                 );
             }
-            Some(bytes)
+            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error).context("failed to inspect collaboration configuration"),
     };
-    // The choice is recorded first, so an interrupted run leaves a Home that
-    // setup and update keep isolated; running `--isolated` again finishes it.
+    // The choice is recorded first. Startup honours it until the Home joins,
+    // so an interrupted run stays isolated and a rerun finishes the removal.
     if fs::symlink_metadata(&marker).is_err() {
-        fs::create_dir_all(data_dir)?;
         create_owner_only_file(&marker, b"isolated\n", "collaboration isolation choice")?;
     }
-    let Some(release_bytes) = release_bytes else {
-        return Ok(());
-    };
-    fs::remove_file(&config).context("failed to remove the release collaboration network")?;
-    fs::File::open(data_dir)?.sync_all()?;
-    // A Runtime that started meanwhile may have read the file already; put it
-    // back rather than leave that Runtime's accepted network without it.
-    if let Err(started) = require_not_started(data_dir) {
-        create_owner_only_file(
-            &config,
-            &release_bytes,
-            "collaboration network configuration",
-        )?;
-        return Err(started);
+    if release_config {
+        fs::remove_file(&config).context("failed to remove the release collaboration network")?;
+        fs::File::open(data_dir)?.sync_all()?;
+        tracing::debug!("removed the release collaboration network before the first start");
     }
-    tracing::debug!("removed the release collaboration network before the first start");
     Ok(())
+}
+
+/// Holds the network-choice lock for one isolation choice or one Runtime
+/// startup acceptance. A missing data root has nothing to serialize.
+pub(crate) fn lock_network_choice(
+    data_dir: &Path,
+) -> anyhow::Result<Option<crate::collaboration_core::ExclusiveFileLock>> {
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    crate::collaboration_core::ExclusiveFileLock::acquire(
+        &data_dir.join(COLLABORATION_NETWORK_CHOICE_LOCK_FILE),
+    )
+    .map(Some)
+    .context("failed to lock the collaboration network choice")
+}
+
+/// True when Runtime startup must stay isolated: the person chose isolation
+/// and Runtime has not accepted a network yet. A leftover release file from an
+/// interrupted `--isolated` run is then ignored.
+pub(crate) fn isolation_applies_at_startup(data_dir: &Path) -> bool {
+    is_isolated(data_dir) && require_not_started(data_dir).is_ok()
 }
 
 /// Runtime creates the collaboration namespace when it first accepts a
@@ -590,9 +606,53 @@ pub(crate) mod tests {
         )
         .unwrap();
 
+        // Until the rerun, startup honours the recorded choice: it stays
+        // isolated and does not join the leftover release network.
+        let startup =
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                data.path(),
+            )
+            .unwrap();
+        assert!(startup.is_isolated_for_test());
+        assert!(fs::symlink_metadata(data.path().join("collaboration")).is_err());
+
         choose_isolated(data.path()).unwrap();
 
         assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
+    }
+
+    #[test]
+    fn isolation_waits_for_a_startup_that_is_accepting_the_network() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let (_release, release_path) = release_dir_with(&chain[0]);
+        let data = private_data_dir();
+        let pin = pin_for(&chain[0]);
+        install_components_pin(data.path(), &pin);
+        install_release_network(data.path(), Some(&pin), &release_path).unwrap();
+
+        // A starting Runtime holds the lock while it reads and accepts.
+        let startup = lock_network_choice(data.path()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let data_path = data.path().to_path_buf();
+        let isolation = std::thread::spawn(move || {
+            let result = choose_isolated(&data_path).map_err(|err| err.to_string());
+            done_tx.send(()).unwrap();
+            result
+        });
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        // The Runtime accepted the network before releasing the lock.
+        fs::create_dir(data.path().join("collaboration")).unwrap();
+        drop(startup);
+
+        let err = isolation.join().unwrap().unwrap_err();
+        assert!(err.contains("already joined Community"), "{err}");
+        assert!(!is_isolated(data.path()));
+        assert_eq!(
+            fs::read(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).unwrap(),
+            chain[0]
+        );
     }
 
     #[test]

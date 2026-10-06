@@ -64,6 +64,16 @@ pub struct CollaborationStartupConfiguration {
     configuration: CollaborationNetworkConfiguration,
 }
 
+#[cfg(test)]
+impl CollaborationStartupConfiguration {
+    pub(crate) fn is_isolated_for_test(&self) -> bool {
+        matches!(
+            self.configuration,
+            CollaborationNetworkConfiguration::Isolated
+        )
+    }
+}
+
 /// Owns the one collaboration worker started for this Runtime process.
 pub struct CollaborationRuntimeService {
     shutdown: watch::Sender<bool>,
@@ -130,6 +140,20 @@ pub fn load_and_accept_collaboration_startup_configuration(
     data_root: &Path,
 ) -> anyhow::Result<CollaborationStartupConfiguration> {
     let loader = CollaborationProfileChainLoader::new(data_root);
+    // Shared with `elastos setup --isolated`, so a Home is never isolated and
+    // joined at once. Only a present file can race that choice, and an absent
+    // one keeps this load free of writes; everything below re-reads under it.
+    let _choice = if fs::symlink_metadata(data_root.join(COLLABORATION_STARTUP_CONFIG_FILE)).is_ok()
+    {
+        crate::collaboration_release_network::lock_network_choice(data_root)?
+    } else {
+        None
+    };
+    if crate::collaboration_release_network::isolation_applies_at_startup(data_root) {
+        return Ok(CollaborationStartupConfiguration {
+            configuration: loader.load_absent()?,
+        });
+    }
     let Some(config_bytes) = read_startup_config_bytes(data_root)? else {
         return Ok(CollaborationStartupConfiguration {
             configuration: loader.load_absent()?,
