@@ -4,6 +4,8 @@ runs:
   using: composite
   steps:
     - name: install checksummed sccache
+      id: install
+      continue-on-error: true
       shell: bash
       env:
         CACHE_NAMESPACE: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
@@ -22,8 +24,6 @@ runs:
         tar -xzf "$directory/$archive.tar.gz" -C "$directory" "$archive/sccache"
         echo "$directory/$archive" >> "$GITHUB_PATH"
         {
-          echo "RUSTC_WRAPPER=sccache"
-          echo "CARGO_INCREMENTAL=0"
           echo "SCCACHE_GHA_ENABLED=on"
           echo "SCCACHE_GHA_VERSION=$CACHE_NAMESPACE"
           echo "SCCACHE_GHA_RW_MODE=$CACHE_RW_MODE"
@@ -34,3 +34,13 @@ runs:
         script: |
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: enable Rust compile cache when ready
+      if: steps.install.outcome == 'success'
+      shell: bash
+      run: |
+        if sccache --start-server; then
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> "$GITHUB_ENV"
+        fi
