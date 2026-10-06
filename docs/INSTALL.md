@@ -169,9 +169,9 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Native Home and chat use the host Runtime without a Browser VM. The current
-Linux/crosvm Browser launcher uses passwordless `sudo` for network setup.
-Root-free Browser networking is a target under the isolation plan.
+Native Home and chat use the host Runtime without a Browser VM. Linux/crosvm
+Browser has a separate host network setup path that requires administrator
+access. The installed host adapter determines the launch-time privileges.
 The default Home profile omits `crosvm` and `vmlinux`. Use an explicit profile
 or source-home provisioning for microVM and Browser VM work.
 

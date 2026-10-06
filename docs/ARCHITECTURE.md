@@ -228,9 +228,9 @@ behind the same Runtime and Browser contracts. See [WINDOWS.md](WINDOWS.md).
 
 ### Layer 1: Runtime (`elastos` binary)
 
-The Runtime core is the host-side enforcement authority. It owns isolation,
-signature verification, capability enforcement, trusted object routing, and
-the lifecycle needed to maintain those guarantees. Work that does not need
+The Runtime core is the host-side enforcement authority. It owns capsule
+admission, signature verification, capability enforcement, trusted object routing,
+and the configured execution boundaries and lifecycle. Work that does not need
 that authority belongs in a capsule, provider, or explicit operator service.
 The Capsule Runtime is the per-capsule execution surface, not the host Runtime
 core.
@@ -397,7 +397,7 @@ policy and validate every requested effect.
 
 1. Runtime loads its local identity and installed-component metadata. Each
    authority subsystem loads only the state its contract marks durable.
-2. The trusted Runtime core initializes isolation, verification, capability
+2. The trusted Runtime core initializes execution boundaries, verification, capability
    enforcement, object routing, and the provider registry.
 3. Runtime serves the neutral Home front door. Principal and child-app
    authority remain unavailable until their required proofs and scoped grants
