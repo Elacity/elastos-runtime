@@ -4384,8 +4384,6 @@ async function launchSystem(page, homeToken, passkey) {
   return { ...system, recoveryExport, systemUpdate };
 }
 
-const RESTORED_MESSAGE = "The update could not start. Your previous release is ready. Check the update again.";
-
 async function checkSystemUpdate(page, passkey) {
   assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW, "System update check needs the current and next version");
   let shownFrame = null;
@@ -4413,6 +4411,8 @@ async function checkSystemUpdate(page, passkey) {
           new_version: text(field("update-new-version")),
           changes: field("update-changes")?.hidden === false ? text(field("update-changes")) : "",
           installed_version: text(field("source-installed-version")),
+          // Set before an approval; a Home restart remounts System and loses it.
+          same_window: window.__elastosUpdateWindowMarker === true,
         };
       });
     } catch (error) {
@@ -4440,16 +4440,22 @@ async function checkSystemUpdate(page, passkey) {
     && state.current_version === SYSTEM_UPDATE_CURRENT && state.new_version === SYSTEM_UPDATE_NEW
     && state.changes === `Fixture ${publication}`;
   const approve = async () => {
+    const frame = capsuleFrameForTarget(page, "system");
+    await frame.evaluate(() => { window.__elastosUpdateWindowMarker = true; });
     // Home asks the virtual authenticator for the owner's step-up proof.
-    await capsuleFrameForTarget(page, "system").locator("#runtime-update-apply").evaluate((button) => button.click());
+    await frame.locator("#runtime-update-apply").evaluate((button) => button.click());
   };
   const upToDate = await reach("up-to-date", (state) => state.shown && !state.offer
     && state.status === "Home is up to date." && state.installed_version === SYSTEM_UPDATE_CURRENT,
   "System did not report Home up to date");
   const tampered = await reach("tampered-offer", offered("tampered-binary"), "System did not offer the tampered fixture");
   await approve();
-  const refused = await reach("refused", (state) => state.shown && state.status === RESTORED_MESSAGE
-    && state.installed_version === SYSTEM_UPDATE_CURRENT, "System did not show a plain refusal on the current version");
+  // A refused release stops before Home stops: the same System window shows a new
+  // message on the current version and Update can be selected again.
+  const refused = await reach("refused", (state) => state.shown && state.same_window
+    && state.installed_version === SYSTEM_UPDATE_CURRENT && state.can_apply
+    && state.status !== "" && state.status !== tampered.status,
+  "System did not refuse the tampered release on the current version without restarting Home");
   const next = await reach("next-offer", offered("new"), "System did not offer the next signed version");
   await approve();
   const updated = await reach("updated", (state) => state.shown && !state.offer
