@@ -257,13 +257,15 @@ mod tests {
     }
 
     fn temp_socket_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "elastos-browser-stream-bridge-{}-{}",
+        // Unix socket paths must stay under SUN_LEN (104 bytes on macOS), and
+        // macOS's per-user temp dir alone takes about half of that.
+        let path = PathBuf::from("/tmp").join(format!(
+            "esb-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time")
-                .as_nanos()
+                .subsec_nanos()
         ));
         fs::create_dir_all(&path).expect("temp socket dir");
         path
