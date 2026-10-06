@@ -1226,7 +1226,7 @@ def cli_admit_home_support(root, manifest):
     components = cli_json(cli_path(root, manifest["publications"][manifest.get("support_of", "old")]["components"]))
     platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
     cli_home_activation_descriptor(components, platform_name)
-    entry = components["capsules"]["home"]
+    entry = cli_capsule_entries(root, manifest, components)["home"]
     need(entry["install_path"] == "capsules/home" and entry["entrypoint"] == "browser/index.html",
          "signed Home entrypoint differs")
     document = manifest["files"][mapping[fixture["entrypoint"]]]
@@ -1351,7 +1351,7 @@ def cli_support_view(manifest, release):
     if release == "old":
         shared = {target: relative for target, relative in manifest["consumer"]["files"].items() if target not in setup_files}
         return {**manifest, "support_of": "old", "setup": previous["setup"], "consumer": {"files": {**shared, **previous["support"]}},
-                "publications": {"old": manifest["publications"]["old"]}}
+                "qualified_capsules": previous["qualified_capsules"], "publications": {"old": manifest["publications"]["old"]}}
     return {**manifest, "support_of": "new", "initial_home": {**manifest["initial_home"], "files": sorted({*setup_files, "fixture-tools/open"})},
             "publications": {name: value for name, value in manifest["publications"].items() if name != "old"}}
 
@@ -1360,12 +1360,22 @@ def cli_support_views(manifest):
     return [cli_support_view(manifest, release) for release in ("old", "new")] if "previous" in manifest else [manifest]
 
 
+def cli_capsule_entries(root, manifest, components):
+    """Qualified web capsule entries of one support set. A cross-version fixture publishes
+    components.json as releases do, with an empty capsules map (release-platform-input.py),
+    and keeps the qualified entries in an inventoried record beside it."""
+    if "qualified_capsules" in manifest:
+        need(components.get("capsules") == {}, "fixture components.json differs from a release's empty capsules map")
+        return cli_json(cli_path(root, manifest["qualified_capsules"]))
+    return components["capsules"]
+
+
 def cli_admit_previous(root, manifest, env):
     """The old side must be the pinned published release, republished under the fixture signer."""
     previous = manifest["previous"]
-    need(set(previous) == {"release", "published_components", "installer", "components", "setup", "support"}
-         and all(previous[key] in manifest["files"] for key in ("release", "published_components", "installer", "components")),
-         "previous release fixture differs")
+    need(set(previous) == {"release", "published_components", "installer", "components", "setup", "support", "qualified_capsules"}
+         and all(previous[key] in manifest["files"] for key in ("release", "published_components", "installer", "components", "qualified_capsules"))
+         and manifest.get("qualified_capsules") in manifest["files"], "previous release fixture differs")
     pin = cli_previous_pin()
     release = cli_previous_release(cli_path(root, previous["release"]), pin)
     artifacts, old = release["platforms"][manifest["platform"]], manifest["publications"]["old"]
@@ -1453,7 +1463,7 @@ def cli_admit_setup(root, manifest):
             need(manifest["files"].get(manifest["holder"]["content"].get(binding["cid"]), {}).get("sha256") == binding["sha256"],
                  "setup holder artifact is missing")
             if name in CLI_WEB_CAPSULES:
-                entry = components["capsules"][name]
+                entry = cli_capsule_entries(root, manifest, components)[name]
                 need(cli_path(root, relative).read_bytes() == cli_home_archive(root, manifest, mapping, name),
                      "Home setup archive differs from qualified bytes")
                 need(selected.get("extract_path") == name
@@ -1494,14 +1504,23 @@ def cli_verify_setup_support(root, manifest, home_path):
     directory = home_path / CLI_DATA
     for target, relative in cli_setup_files(manifest).items():
         path, binding = cli_path(directory, target), manifest["files"][relative]
+        need(path.exists() or path.is_symlink(), "installed setup support is missing: " + target)
         info = path.lstat()
         need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
              and digest(path) == binding["sha256"] and info.st_size == binding["bytes"]
              and stat.S_IMODE(info.st_mode) == binding["mode"],
              "installed setup support differs: " + target)
     components = cli_json(directory / "components.json")
-    caches = [("capsules/" + name, (components["capsules"][name]["cid"], components["capsules"][name]["sha256"]))
-              for name in CLI_WEB_CAPSULES]
+    platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
+
+    def cache_identity(name):
+        # Runtime records a capsules-map entry when it has one, else the signed archive (as releases publish).
+        entry = components["capsules"].get(name)
+        if entry and entry.get("cid", "").strip():
+            return entry["cid"], entry["sha256"]
+        selected = cli_platform_entry(components["external"][name], platform_name)
+        return selected["cid"], selected["checksum"]
+    caches = [("capsules/" + name, cache_identity(name)) for name in CLI_WEB_CAPSULES]
     if "localhost_metadata" in manifest["setup"]:
         platform_name = "darwin-arm64" if manifest["platform"] == "aarch64-darwin" else "darwin-amd64"
         selected = cli_localhost_metadata_info(components["external"]["localhost-provider"], platform_name)
@@ -1906,11 +1925,15 @@ def cli_generate_hop(root, runtime, next_runtime, system_runtime, build_receipt,
         external["custody-provider"] = {**current["qualified"]["external"]["custody-provider"], "platforms": {component_platform: {
             "release_path": "custody-provider", "install_path": "bin/custody-provider", "cid": custody_cid,
             "checksum": "sha256:" + digest(custody), "size": custody.stat().st_size}}}
-        components = add(prefix + "components.json", {"schema": "elastos.components/v1", "capsules": capsules, "external": external,
+        # As releases publish (release-platform-input.py): an empty capsules map; web capsules
+        # are external archives. A capsules entry makes `update` evict capsules/<name> after
+        # refreshing it, which no released Home does.
+        components = add(prefix + "components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
                          "profiles": {"home": {"description": "Qualified fixture Home", "components": list(CLI_SETUP_COMPONENTS)}},
                          "model_catalog": {"head_cid": manifest["files"][catalogue]["cid"], "publisher_dids": [manifest["signer_did"]]}})
         content(components)
-        return {"components": components, "setup": setup, "support": mapping}
+        return {"components": components, "setup": setup, "support": mapping,
+                "qualified_capsules": add(prefix + "qualified-capsules.json", capsules)}
 
     def stamp(installer):
         need(installer.count('__MAINTAINER_DID__') == 1 and installer.count('__HEAD_CID__') == 1, "installer stamp placeholders differ")
@@ -1951,13 +1974,14 @@ def cli_generate_hop(root, runtime, next_runtime, system_runtime, build_receipt,
         content(opener)
         new = package_support("", sets["new"], catalogue)
         old = package_support("previous/", sets["old"], catalogue)
-        manifest["setup"] = new["setup"]
+        manifest["setup"], manifest["qualified_capsules"] = new["setup"], new["qualified_capsules"]
         # The old side is the published release: its Runtime, its Home support bytes and
         # the installer of its signed source, stamped with this fixture's disposable signer.
         manifest["previous"] = {"release": add("previous/release.json", previous / "release.json"),
                                 "published_components": add("previous/published-components.json", previous / "components.json"),
                                 "installer": add("previous/install.sh", stamp((previous / "install.sh").read_text())),
-                                "components": old["components"], "setup": old["setup"], "support": old["support"]}
+                                "components": old["components"], "setup": old["setup"], "support": old["support"],
+                                "qualified_capsules": old["qualified_capsules"]}
         content(runtime_relative)
         content(next_relative)
         content(system_relative)

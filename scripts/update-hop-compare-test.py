@@ -1965,13 +1965,16 @@ class CliFixtureTests(unittest.TestCase):
         consumer_data = generated / "copied-consumer" / observer.CLI_DATA
         observer.cli_copy(generated, generated_manifest, generated_manifest["consumer"]["files"], consumer_data)
         self.assertEqual(components["external"]["home"]["platforms"]["darwin-arm64"]["release_path"], "home.tar.gz")
+        # Published like a release: an empty capsules map, so `update` cannot evict a refreshed capsule.
+        self.assertEqual(components["capsules"], {})
+        entries = observer.cli_capsule_entries(generated, generated_manifest, components)
         home_activation = observer.cli_home_activation_descriptor(components, "darwin-arm64")
         active_home = consumer_data / home_activation["platforms"]["darwin-arm64"]["install_path"]
         self.assertTrue(active_home.is_dir())
         copied_home = observer.cli_json(active_home / "capsule.json")
         self.assertEqual(copied_home["name"], "home")
         self.assertEqual(observer.digest(active_home / copied_home["entrypoint"]),
-                         components["capsules"]["home"]["entrypoint_sha256"].removeprefix("sha256:"))
+                         entries["home"]["entrypoint_sha256"].removeprefix("sha256:"))
         for name in ("ipfs-provider", "kubo", "localhost-provider"):
             target = "bin/" + name
             relative = generated_manifest["consumer"]["files"][target]
@@ -1988,7 +1991,7 @@ class CliFixtureTests(unittest.TestCase):
             if "provider_runtime" in qualified["external"][name]:
                 self.assertEqual(components["external"][name]["provider_runtime"], qualified["external"][name]["provider_runtime"])
         package_fields = {"cid", "sha256", "size"}
-        self.assertEqual({key: value for key, value in components["capsules"]["home"].items() if key not in package_fields},
+        self.assertEqual({key: value for key, value in entries["home"].items() if key not in package_fields},
                          {key: value for key, value in qualified["capsules"]["home"].items() if key not in package_fields})
         for view in observer.cli_support_views(generated_manifest):
             observer.cli_admit_setup(generated, view)
