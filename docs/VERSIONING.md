@@ -18,8 +18,11 @@ This repo currently has three distinct version layers. They should not be read a
 
 2. **Stamped public release version**
    - the publish/install/update version injected through `ELASTOS_RELEASE_VERSION`
-   - this is what installed binaries, published providers, and published capsules should report to users
+   - this is what installed Runtime binaries and published app capsules report to users
    - non-stamped source builds may append `-dev`
+   - providers do not read it: they report their crate version, so an unchanged
+     provider keeps identical bytes across releases; the Runtime accepts a provider by
+     its protocol version and request/response schemas, never by its reported version
 
 3. **Capsule-local package version**
    - many standalone capsules and helper tools still carry local package versions like `0.1.0`
