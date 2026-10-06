@@ -1601,6 +1601,7 @@ impl CollaborationDirectMessageService {
         // presentation this receive just verified against.
         let _ = crate::notifications::upsert_direct_message_notification(
             context.contact_store.data_root(),
+            context.contact_store.local_profile_did(),
             contact.conversation_id(),
             contact.remote_display_name(),
             now,

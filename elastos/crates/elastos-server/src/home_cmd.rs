@@ -861,6 +861,7 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
                         Ok(message) => {
                             let _ = elastos_server::notifications::mark_acted_for_action(
                                 &default_data_dir(),
+                                None,
                                 action_id,
                             );
                             message
@@ -1926,14 +1927,21 @@ async fn dispatch_action(
         return dispatch_people_action(action_id, snapshot, coords, dashboard).await;
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
-        return match elastos_server::notifications::mark_read(&default_data_dir(), notification_id)?
-        {
+        return match elastos_server::notifications::mark_read(
+            &default_data_dir(),
+            None,
+            notification_id,
+        )? {
             true => Ok("Marked inbox entry read.".to_string()),
             false => Ok("That inbox entry was already read or is no longer present.".to_string()),
         };
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
-        return match elastos_server::notifications::dismiss(&default_data_dir(), notification_id)? {
+        return match elastos_server::notifications::dismiss(
+            &default_data_dir(),
+            None,
+            notification_id,
+        )? {
             true => Ok("Dismissed inbox entry.".to_string()),
             false => Ok("That inbox entry is already gone.".to_string()),
         };

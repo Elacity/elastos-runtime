@@ -884,6 +884,13 @@ pub(super) fn apply_contact_request_notification_projection(
         None => Vec::new(),
     };
     let mut summary = crate::notifications::load_summary(data_dir)?;
+    if let Some(store) = contact_store {
+        crate::notifications::project_direct_message_notifications(
+            &mut summary,
+            data_dir,
+            store.local_profile_did(),
+        )?;
+    }
     crate::notifications::project_contact_request_notifications(&mut summary, &pending);
     *notifications = home_notifications_summary(summary);
     Ok(())

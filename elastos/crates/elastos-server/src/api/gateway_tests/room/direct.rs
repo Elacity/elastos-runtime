@@ -684,3 +684,101 @@ async fn direct_api_authority_configuration_and_corruption_fail_closed() {
     assert!(!error.contains(fixture.dir.path().to_string_lossy().as_ref()));
     assert!(!error.contains("did:key"));
 }
+
+#[tokio::test]
+async fn direct_api_unread_dot_and_inbox_entry_belong_to_one_account() {
+    let fixture = direct_api_route_fixture().await;
+    let data = fixture.dir.path();
+    let conversation = fixture.peer.conversation_id.clone();
+    let owner = fixture.profile.document().profile_did.clone();
+    // Another account on the same Home.
+    let other = "did:key:z6MkOtherAccountOnThisHome";
+    let inbox_token = issue_home_projection_launch_token_with_context(
+        data,
+        INBOX_CAPSULE_ID,
+        INBOX_CAPSULE_ID,
+        &fixture.chat_context,
+    )
+    .unwrap();
+    let unread = |app: Router| {
+        let token = fixture.chat_token.clone();
+        async move {
+            let list = app
+                .oneshot(direct_api_request(
+                    Some(&token),
+                    "GET",
+                    "/api/apps/chat-room/direct/conversations",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            json_response(list).await["conversations"][0]["unread"].clone()
+        }
+    };
+    let inbox_direct_entries = |app: Router| {
+        let token = inbox_token.clone();
+        async move {
+            let summary = app
+                .oneshot(direct_api_request(
+                    Some(&token),
+                    "GET",
+                    "/api/apps/inbox/summary",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(summary.status(), StatusCode::OK);
+            json_response(summary).await["notifications"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["kind"] == "direct_message")
+                .count()
+        }
+    };
+
+    // Another account's message alert never shows for this account.
+    crate::notifications::upsert_direct_message_notification(
+        data,
+        other,
+        &conversation,
+        "Remote Person",
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(unread(fixture.app.clone()).await, json!(false));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 0);
+
+    // Its own alert shows as a dot and an Inbox entry.
+    crate::notifications::upsert_direct_message_notification(
+        data,
+        &owner,
+        &conversation,
+        "Remote Person",
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(unread(fixture.app.clone()).await, json!(true));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 1);
+
+    // Opening the conversation clears only this account's alert.
+    let opened = fixture
+        .app
+        .clone()
+        .oneshot(direct_api_request(
+            Some(&fixture.chat_token),
+            "GET",
+            &format!("/api/apps/chat-room/direct/conversations/{conversation}/messages"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::OK);
+    assert_eq!(unread(fixture.app.clone()).await, json!(false));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 0);
+    assert!(
+        crate::notifications::unread_direct_message_conversations(data, other)
+            .unwrap()
+            .contains(&conversation)
+    );
+}

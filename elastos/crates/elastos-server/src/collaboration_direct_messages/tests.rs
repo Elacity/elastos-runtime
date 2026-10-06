@@ -704,8 +704,23 @@ async fn incoming_direct_message_notifies_until_the_conversation_is_read() {
 
     // A verified incoming message tells the person, named by the signed
     // contact presentation, pointing at Chat — never carrying the message
-    // decision surface itself.
-    let summary = crate::notifications::load_summary(&b_root).unwrap();
+    // decision surface itself. Only the receiving account sees it.
+    let b_profile = pair.store_b.local_profile_did().to_string();
+    let b_summary = || {
+        let mut summary = crate::notifications::load_summary(&b_root).unwrap();
+        crate::notifications::project_direct_message_notifications(
+            &mut summary,
+            &b_root,
+            &b_profile,
+        )
+        .unwrap();
+        summary
+    };
+    assert!(crate::notifications::load_summary(&b_root)
+        .unwrap()
+        .entries
+        .is_empty());
+    let summary = b_summary();
     assert_eq!(summary.entries.len(), 1);
     assert_eq!(summary.entries[0].kind, "direct_message");
     assert_eq!(summary.entries[0].title, "New message from Alice");
@@ -724,20 +739,14 @@ async fn incoming_direct_message_notifies_until_the_conversation_is_read() {
     // replay of the same envelope returns the stored receipt without
     // resurfacing it.
     assert_eq!(
-        crate::notifications::mark_acted_for_action(&b_root, &action_id).unwrap(),
+        crate::notifications::mark_acted_for_action(&b_root, Some(&b_profile), &action_id).unwrap(),
         1
     );
-    assert!(crate::notifications::load_summary(&b_root)
-        .unwrap()
-        .entries
-        .is_empty());
+    assert!(b_summary().entries.is_empty());
     direct_b
         .receive(&message, &fixture_source_endpoint(&message), now + 1)
         .unwrap();
-    assert!(crate::notifications::load_summary(&b_root)
-        .unwrap()
-        .entries
-        .is_empty());
+    assert!(b_summary().entries.is_empty());
 
     // A genuinely new message resurfaces it.
     let second = test_message(
@@ -751,7 +760,7 @@ async fn incoming_direct_message_notifies_until_the_conversation_is_read() {
     direct_b
         .receive(&second, &fixture_source_endpoint(&second), now + 2)
         .unwrap();
-    let resurfaced = crate::notifications::load_summary(&b_root).unwrap();
+    let resurfaced = b_summary();
     assert_eq!(resurfaced.entries.len(), 1);
     assert!(!resurfaced.entries[0].read);
 }

@@ -79,8 +79,11 @@ pub(super) async fn chat_direct_conversations(
         .conversation_summaries(authority.store.as_ref())
     {
         Ok(mut conversations) => {
-            let unread = crate::notifications::unread_direct_message_conversations(&state.data_dir)
-                .unwrap_or_default();
+            let unread = crate::notifications::unread_direct_message_conversations(
+                &state.data_dir,
+                authority.store.local_profile_did(),
+            )
+            .unwrap_or_default();
             for conversation in &mut conversations {
                 conversation.unread = unread.contains(&conversation.conversation_id);
             }
@@ -112,6 +115,7 @@ pub(super) async fn chat_direct_conversation_messages(
             // notification; the next incoming message resurfaces it.
             let _ = crate::notifications::mark_acted_for_action(
                 &state.data_dir,
+                Some(authority.store.local_profile_did()),
                 &crate::notifications::direct_message_notification_action_id(&conversation_id),
             );
             Json(serde_json::json!({
