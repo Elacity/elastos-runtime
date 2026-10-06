@@ -4411,7 +4411,7 @@ async function checkSystemUpdate(page, passkey) {
           new_version: text(field("update-new-version")),
           changes: field("update-changes")?.hidden === false ? text(field("update-changes")) : "",
           installed_version: text(field("source-installed-version")),
-          // Set before an approval; a Home restart remounts System and loses it.
+          // Set before an approval: true while the same System window stays open.
           same_window: window.__elastosUpdateWindowMarker === true,
         };
       });
@@ -4450,12 +4450,13 @@ async function checkSystemUpdate(page, passkey) {
   "System did not report Home up to date");
   const tampered = await reach("tampered-offer", offered("tampered-binary"), "System did not offer the tampered fixture");
   await approve();
-  // A refused release stops before Home stops: the same System window shows a new
-  // message on the current version and Update can be selected again.
+  // What the person sees after a refusal: the same System window, the current version, a
+  // new message, and Update usable again. update-hop-compare.py checks that the
+  // controller recorded the failure and that the same Home process kept running.
   const refused = await reach("refused", (state) => state.shown && state.same_window
     && state.installed_version === SYSTEM_UPDATE_CURRENT && state.can_apply
     && state.status !== "" && state.status !== tampered.status,
-  "System did not refuse the tampered release on the current version without restarting Home");
+  "System did not show the refusal on the current version in the same window");
   const next = await reach("next-offer", offered("new"), "System did not offer the next signed version");
   await approve();
   const updated = await reach("updated", (state) => state.shown && !state.offer

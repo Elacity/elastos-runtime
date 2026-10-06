@@ -2367,8 +2367,16 @@ def cli_home_system_journey(processes, manifest, home_path, publish):
 
     reached("up-to-date", 240, "installed Home sign-up or up-to-date System state failed")
     warnings_before = cli_provider_warnings(home_path)
+    coords_path = home_path / CLI_DATA / "gateway-runtime-coords.json"
+    home_before = {key: cli_private_json(coords_path)[key] for key in ("pid", "generation")}
     publish("tampered-binary")
     reached("refused", 330, "System did not refuse the tampered fixture plainly")
+    # A refused release fails while staging: the controller records the failure and
+    # the same Home process and generation keep running.
+    refusal = cli_private_json(home_path / CLI_DATA / "update-controller/status.json")
+    need(refusal["phase"] == "failed", "the controller did not record the tampered release as refused")
+    need({key: cli_private_json(coords_path)[key] for key in ("pid", "generation")} == home_before,
+         "a refused release restarted Home")
     need(digest(binary) == shas["old"] and source() == manifest["old"]["version"], "refused update changed the installed release")
     publish("new")
     need(browser.wait(timeout=420) == 0,
