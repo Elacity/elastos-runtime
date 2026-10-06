@@ -1519,7 +1519,7 @@ fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
 
 fn controller_space_error(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<crate::install_transaction::UpdateSpaceError>()
+        .downcast_ref::<elastos_common::NotEnoughFreeSpace>()
         .is_some()
         || error
             .downcast_ref::<std::io::Error>()

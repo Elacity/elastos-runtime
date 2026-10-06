@@ -32,11 +32,12 @@ All notable changes to the public ElastOS Runtime repository.
   output preserve the previous installation.
 
 - Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
-  Each step now requires that its own bytes fit in the free space; updates and
-  the installer also keep a fixed 2 GiB reserve, so a disk is never filled to
-  zero. An update that does not fit still refuses and keeps the previous
-  release. Source-home setup keeps its 16 GiB minimum and the media tools build
-  its 4 GiB minimum.
+  Each step now requires that its own bytes fit in the free space. Update
+  staging, the installer, model and content downloads and Browser image
+  preparation also keep one shared 2 GiB reserve, so a disk is never filled to
+  zero, and refuse with "not enough free space: this needs N GB plus 2 GB kept
+  free". An update that does not fit keeps the previous release. Source-home
+  setup keeps its 16 GiB minimum and the media tools build its 4 GiB minimum.
 
 ### Added
 

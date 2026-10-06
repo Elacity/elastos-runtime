@@ -732,21 +732,22 @@ pub(super) fn reservation_fits(
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<bool> {
-    ensure!(
-        capacity > 0 && available <= capacity,
-        "invalid preparation disk capacity"
-    );
-    Ok(reserved <= available)
+    match require_reservation_fits(capacity, available, reserved) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is::<elastos_common::NotEnoughFreeSpace>() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
+/// Model and content preparation keep the shared free-space reserve.
 pub(super) fn require_reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<()> {
     ensure!(
-        reservation_fits(capacity, available, reserved)?,
-        "insufficient preparation space"
+        capacity > 0 && available <= capacity,
+        "invalid preparation disk capacity"
     );
-    Ok(())
+    Ok(elastos_common::require_free_space(available, reserved)?)
 }

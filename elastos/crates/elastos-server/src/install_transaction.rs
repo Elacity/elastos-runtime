@@ -26,21 +26,6 @@ const STAGE: &str = ".elastos.update-stage";
 const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
 
-/// The update's own bytes plus the fixed free-space reserve do not fit in the
-/// volume's available space.
-#[derive(Debug)]
-pub(crate) struct UpdateSpaceError;
-
-impl std::fmt::Display for UpdateSpaceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "not enough free space for the update and its 2 GiB reserve; previous release preserved",
-        )
-    }
-}
-
-impl std::error::Error for UpdateSpaceError {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReleaseFile {
@@ -1786,12 +1771,12 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
     ))
 }
 
+/// Update staging, support staging, the update controller and the installer's
+/// `install-release` writer all admit their bytes through this one check.
 fn require_update_space(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
-    let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
-    if total == 0 || needed.saturating_add(reserve) > available {
-        return Err(UpdateSpaceError.into());
-    }
-    Ok(())
+    // A volume that reports no size has nothing to admit.
+    let available = if total == 0 { 0 } else { available };
+    Ok(elastos_common::require_free_space(available, needed)?)
 }
 
 pub(crate) fn require_controller_update_space(path: &Path, needed: u64) -> anyhow::Result<()> {
@@ -3131,15 +3116,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn update_space_keeps_the_fixed_reserve_and_accepts_exact_fit() {
+    fn update_and_installer_writes_keep_the_shared_free_space_reserve() {
         let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
-        let total = 1 << 40;
-        assert!(require_update_space(total, reserve + 200, 201).is_err());
-        assert!(require_update_space(total, reserve + 200, 200).is_ok());
-        assert!(require_update_space(total, reserve, 0).is_ok());
-        assert!(require_update_space(total, reserve - 1, 0).is_err());
-        // Volume size alone never refuses an update whose bytes fit.
-        assert!(require_update_space(1 << 50, reserve + 10, 10).is_ok());
-        assert!(require_update_space(0, reserve + 200, 0).is_err());
+        let needed = 300 * 1024 * 1024;
+        // Exactly needed + reserve is admitted; one byte less is refused.
+        assert!(require_update_space(1 << 40, needed + reserve, needed).is_ok());
+        let refused = require_update_space(1 << 40, needed + reserve - 1, needed).unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<elastos_common::NotEnoughFreeSpace>(),
+            Some(&elastos_common::NotEnoughFreeSpace { needed })
+        );
+        // Volume size alone never refuses; a volume reporting no size admits nothing.
+        assert!(require_update_space(1 << 50, needed + reserve, needed).is_ok());
+        assert!(require_update_space(0, needed + reserve, needed).is_err());
     }
 }
