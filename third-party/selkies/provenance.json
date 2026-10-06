@@ -233,6 +233,46 @@
       "sha256": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
       "upstream_url": "https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE",
       "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
+    },
+    "licenses/SDP-MIT.txt": {
+      "sha256": "798e82590af6a84bfbde3d6bb0fb9162c519edf16122404fea00acefdc55cbd9",
+      "upstream_url": "https://raw.githubusercontent.com/fippo/sdp/master/LICENSE",
+      "version_range": "^3.2.0",
+      "version_range_source": "https://raw.githubusercontent.com/webrtcHacks/adapter/v9.0.1/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    "licenses/Webpack-MIT.txt": {
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack/webpack/main/LICENSE",
+      "version_range": "^1.12.2",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "main",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    "licenses/CSS-loader-MIT.txt": {
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack-contrib/css-loader/master/LICENSE",
+      "version_range": "^0.21.0",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    "licenses/Style-loader-MIT.txt": {
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack-contrib/style-loader/master/LICENSE",
+      "version_range": "^0.13.0",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
     }
   },
   "recovery_comparison": {
@@ -432,7 +472,7 @@
       "license": "MIT",
       "text": "licenses/Vue-spinner-MIT.txt",
       "upstream_url": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/LICENSE",
-      "notice_source": "Fetched upstream license includes Copyright (c) 2015 greyby. Bundled generated runtimes remain separate evidence gaps."
+      "notice_source": "Fetched upstream license includes Copyright (c) 2015 greyby. Bundled runtime license texts and declared version ranges are recorded separately."
     },
     {
       "component": "webrtc-adapter 9.0.1",
@@ -464,12 +504,65 @@
       "text": "licenses/Material-Icons-Apache-2.0.txt",
       "upstream_url": "https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE",
       "notice_source": "Embedded Copyright 2018 Google, Inc. All Rights Reserved. The font carries no license-description or license-URL name fields."
+    },
+    {
+      "component": "sdp",
+      "scope": "webrtc-adapter 9.0.1 bundled module 11",
+      "license": "MIT",
+      "text": "licenses/SDP-MIT.txt",
+      "sha256": "798e82590af6a84bfbde3d6bb0fb9162c519edf16122404fea00acefdc55cbd9",
+      "upstream_url": "https://raw.githubusercontent.com/fippo/sdp/master/LICENSE",
+      "version_range": "^3.2.0",
+      "version_range_source": "https://raw.githubusercontent.com/webrtcHacks/adapter/v9.0.1/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    {
+      "component": "webpack",
+      "scope": "vue-spinner 1.0.4 module bootstrap",
+      "license": "MIT",
+      "text": "licenses/Webpack-MIT.txt",
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack/webpack/main/LICENSE",
+      "version_range": "^1.12.2",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "main",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    {
+      "component": "css-loader",
+      "scope": "vue-spinner 1.0.4 CSS-list/source-map runtime",
+      "license": "MIT",
+      "text": "licenses/CSS-loader-MIT.txt",
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack-contrib/css-loader/master/LICENSE",
+      "version_range": "^0.21.0",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
+    },
+    {
+      "component": "style-loader",
+      "scope": "vue-spinner 1.0.4 style-injection runtime",
+      "license": "MIT",
+      "text": "licenses/Style-loader-MIT.txt",
+      "sha256": "9068a8782d2fb4c6e432cfa25334efa56f722822180570802bf86e71b6003b1e",
+      "upstream_url": "https://raw.githubusercontent.com/webpack-contrib/style-loader/master/LICENSE",
+      "version_range": "^0.13.0",
+      "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+      "version_range_evidence": "Operator-supplied SOURCES.md records the range from the parent package.json at its version tag.",
+      "license_source_ref": "master",
+      "license_source_kind": "default branch",
+      "origin": "Unmodified current-default-branch license text fetched by the operator on 2026-10-05"
     }
   ],
-  "license_evidence_pending": [
-    "License/copyright text and exact version identification for sdp, bundled as module 11 in webrtc-adapter 9.0.1; absent from the local license inputs.",
-    "Source/version identification and license/copyright notices for the webpack bootstrap, CSS-list/source-map and style-injection runtimes in vue-spinner 1.0.4 (webpack/css-loader/style-loader attribution remains unverified); absent from the local license inputs."
-  ],
+  "license_evidence_pending": [],
   "remaining_downloads": {
     "debootstrap": "Debian bookworm minbase and its resolved dependencies, from the configured Debian mirror.",
     "apt_direct_packages": [
@@ -722,13 +815,43 @@
           "name": "sdp",
           "bundle_module": 11,
           "version": null,
-          "license_text": null,
-          "evidence": "e(\"sdp\"), sdp:11, 11:[function ... generateIdentifier, splitLines, splitSections, writeRtpDescription ..."
+          "license_text": "licenses/SDP-MIT.txt",
+          "evidence": "e(\"sdp\"), sdp:11, 11:[function ... generateIdentifier, splitLines, splitSections, writeRtpDescription ...",
+          "version_range": "^3.2.0",
+          "version_range_source": "https://raw.githubusercontent.com/webrtcHacks/adapter/v9.0.1/package.json",
+          "license_source_kind": "default branch"
         }
       ]
     },
     "vue-spinner-v1.0.4.min.js": {
-      "inspection": "The bundle includes a webpack-style module bootstrap, CSS list/source-map serialization runtime and style injection runtime. The only comment is an emitted sourceMappingURL string, with no package/version/copyright/license notices. The supplied vue-spinner MIT text covers the named package; separate runtime origin/notices remain unverified."
+      "inspection": "The bundle includes a webpack module bootstrap, CSS list/source-map serialization runtime and style injection runtime. The only comment is an emitted sourceMappingURL string, with no package/version/copyright/license notices. Operator-supplied upstream package.json evidence identifies the declared runtime dependency ranges; each runtime has a separate default-branch MIT text.",
+      "runtime_dependencies": [
+        {
+          "name": "webpack",
+          "version": null,
+          "version_range": "^1.12.2",
+          "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+          "license_text": "licenses/Webpack-MIT.txt",
+          "license_source_kind": "default branch"
+        },
+        {
+          "name": "css-loader",
+          "version": null,
+          "version_range": "^0.21.0",
+          "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+          "license_text": "licenses/CSS-loader-MIT.txt",
+          "license_source_kind": "default branch"
+        },
+        {
+          "name": "style-loader",
+          "version": null,
+          "version_range": "^0.13.0",
+          "version_range_source": "https://raw.githubusercontent.com/greyby/vue-spinner/v1.0.4/package.json",
+          "license_text": "licenses/Style-loader-MIT.txt",
+          "license_source_kind": "default branch"
+        }
+      ]
     }
-  }
+  },
+  "license_provenance_limits": "The SDP and vue-spinner runtime license texts are snapshots of upstream default branches, with SHA-256 identities. Their version ranges come from operator-recorded package.json evidence at the parent version tags. Ranges do not identify the exact resolved dependency versions in the minified bundles; version fields remain null. The shipped minified bytes remain pinned to the Selkies source commit and file SHA-256 records."
 }
