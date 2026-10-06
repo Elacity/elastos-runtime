@@ -1692,13 +1692,14 @@ fn probe_arm64_model_engine(path: &Path) -> anyhow::Result<()> {
             libraries += 1;
         }
         anyhow::ensure!(libraries > 0, "ARM64 model engine libraries are missing");
-        let mut child = Command::new(path)
+        let mut command = Command::new(path);
+        command
             .arg("--version")
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = crate::install_transaction::retry_text_file_busy(|| command.spawn())
             .map_err(|error| anyhow::anyhow!("ARM64 model engine cannot start: {error}"))?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
