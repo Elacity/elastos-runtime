@@ -2277,12 +2277,16 @@ async fn verify_package_identity(
 fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Value> {
     // Runtime-owned profiles from verified local engine proofs. Catalog
     // metadata cannot tune execution. Other hosts require their own proof.
+    crate::setup::verify_arm64_model_host(platform)?;
     let (threads, gpu_layers) = match platform {
         // Apple silicon offloads every layer to Metal (local Qwen proof).
         "darwin-arm64" => (8, 99),
         // Linux x86-64 runs on a bounded CPU thread budget without GPU offload
         // (pinned SmolLM2 proof on the b10516 Ubuntu bundle).
         "linux-amd64" => (4, 0),
+        // Jetson uses the pinned ARMv8.2 bundle on CPU. Runtime checks CPU
+        // features and host library loading before it admits the engine.
+        "linux-arm64" => (4, 0),
         _ => anyhow::bail!("admitted model host profile is unavailable"),
     };
     Ok(serde_json::json!({
@@ -2852,7 +2856,7 @@ async fn append_admitted_model_offers_locked(
         let entry = current_entry(data_dir, record)?;
         require_cache_budget(data_dir, &snapshot)?;
         let settings = local_model_startup_profile(&crate::setup::detect_platform())?;
-        let engine = crate::setup::verified_local_model_engine(data_dir, &manifest)?;
+        let engine = crate::setup::ensure_local_model_engine(data_dir, &manifest_bytes).await?;
         let stage = Inventory::open(data_dir, false)?.admitted(&record.admission_id)?;
         let closure = crate::content::parse_content_object_manifest(
             &entry.cid,
@@ -3423,14 +3427,11 @@ mod tests {
                 "shutdown_timeout_ms":5000, "enable_thinking":false
             })
         );
-        for platform in [
-            "linux-arm64",
-            "darwin-amd64",
-            "linux-x86_64",
-            "Linux-amd64",
-            "*",
-            "",
-        ] {
+        assert_eq!(
+            local_model_startup_profile("linux-arm64").unwrap(),
+            local_model_startup_profile("linux-amd64").unwrap()
+        );
+        for platform in ["darwin-amd64", "linux-x86_64", "Linux-amd64", "*", ""] {
             assert!(
                 local_model_startup_profile(platform).is_err(),
                 "{platform:?} has no proved host profile"
@@ -3441,7 +3442,8 @@ mod tests {
     // Startup binding runs wherever a Runtime-owned host profile exists.
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "linux", target_arch = "x86_64")
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64")
     ))]
     mod startup_binding {
         use super::*;

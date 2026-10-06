@@ -65,7 +65,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
           response: { clientDataJSON: new Uint8Array([2]).buffer, authenticatorData: new Uint8Array([3]).buffer,
             signature: new Uint8Array([4]).buffer, userHandle: null } };
       } } },
-      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, atob, btoa,
+      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, AbortSignal, atob, btoa,
       setHomeAuthorityToken() {}, clearHomeAuthorityToken() {},
       async fetchJson(path, options = {}) {
         requests.push({ path, options });
@@ -572,7 +572,7 @@ if (process.argv.includes("--browser")) {
       assert(url.pathname.startsWith("/apps/home/"));
       if (name === "home-shell-host.js") {
         return route.fulfill({ contentType: "text/javascript", body: `
-          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-20260802a";
+          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-update-20261003a";
           document.querySelector("#home-shell-boot-mask").hidden = true;
           bindHomeUnlock();
           await showHomeUnlock(() => { throw new Error("Unexpected enrollment dispatch"); });

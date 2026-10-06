@@ -350,8 +350,8 @@ def assert_setup_order():
     success_index = install_function.index('SOURCE_HOME_KUBO_INSTALLED="1"')
     for marker in [
         'if [[ "$mode" == "0" ]]',
-        'if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]',
-        'setup --with kubo',
+        '"$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]',
+        'scripts/seed-kubo-cache.sh',
         'if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]',
     ]:
         if install_function.index(marker) >= success_index:

@@ -9,6 +9,25 @@ use base64::Engine;
 
 use elastos_runtime::provider;
 
+/// Runtime selects the backend lifetime from its command, before provider Init.
+/// User-role backends retain idle stop; native IPFS root selection stays unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IpfsHostRole {
+    #[default]
+    User,
+    Gateway,
+}
+
+pub fn ipfs_provider_config(role: IpfsHostRole) -> provider::BridgeProviderConfig {
+    provider::BridgeProviderConfig {
+        extra: serde_json::json!({"runtime_host_role": match role {
+            IpfsHostRole::User => "user",
+            IpfsHostRole::Gateway => "gateway",
+        }}),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IpfsStatus {
     #[serde(default)]
@@ -599,7 +618,31 @@ pub fn collect_files_for_ipfs(
 
 #[cfg(test)]
 mod tests {
-    use super::viewer_root_is_valid;
+    use super::*;
+
+    #[test]
+    fn runtime_host_role_init_is_explicit_and_user_is_default() {
+        assert_eq!(IpfsHostRole::default(), IpfsHostRole::User);
+        for (role, value) in [
+            (IpfsHostRole::User, "user"),
+            (IpfsHostRole::Gateway, "gateway"),
+        ] {
+            let config = ipfs_provider_config(role);
+            let wire =
+                serde_json::to_value(provider::bridge::ProviderRequest::Init { config }).unwrap();
+            assert_eq!(
+                wire["config"]["extra"],
+                serde_json::json!({"runtime_host_role":value})
+            );
+            let mut expected =
+                serde_json::to_value(provider::BridgeProviderConfig::default()).unwrap();
+            expected["extra"] = serde_json::json!({"runtime_host_role":value});
+            assert_eq!(wire["config"], expected);
+            assert_eq!(wire["config"]["base_path"], "");
+            assert!(wire["config"]["extra"].get("data_dir").is_none());
+            assert!(wire["config"].get("runtime_host_role").is_none());
+        }
+    }
 
     #[test]
     fn viewer_root_accepts_index_html_only_layout() {

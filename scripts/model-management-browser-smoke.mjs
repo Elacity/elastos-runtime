@@ -130,7 +130,7 @@ let activePage;
 try {
   for (const app of ["marketplace", "system"]) {
     // Marketplace renders the compact detail: Get instead of Use, device-centred phase copy, no hints.
-    const acquire = app === "marketplace" ? "Get" : "Use";
+    const acquire = app === "marketplace" ? "Get" : "Download";
     const copy = app === "marketplace"
       ? { absent: "Not on this device yet", reclaimed: "Removed from this device" }
       : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };

@@ -1454,6 +1454,8 @@ mod tests {
         );
 
         let mut provider = IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -1580,6 +1582,8 @@ mod tests {
 
     fn ready_provider(root: &Path, port: u16) -> IpfsProvider {
         IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Ready,
             api_port: port,
             gateway_port: 0,

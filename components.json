@@ -1345,7 +1345,7 @@
     },
     "gba-nonogram": {
       "install_path": "capsules/gba-nonogram",
-      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
+      "description": "Nonogram Advance \u2014 MIT homebrew cartridge for the browser GBA viewer",
       "platforms": {
         "*": {
           "cid": "",
@@ -1397,48 +1397,44 @@
           "cid": "Qmeb1qaqfMiri7G123FWmMz6qt74xhPjAgAJEy8ZSrFKh7",
           "checksum": "sha256:eccb4f318ba37309af5fae01bc610b76033707ec8149002d26675aed66d8578b",
           "install_path": "bin/vmlinux"
-        },
-        "linux-arm64": {
-          "strategy": "local-copy",
-          "source": "/boot/Image",
-          "note": "Upstream crosvm aarch64 test kernel is broken on GICv3-only hosts (Jetson). Uses host kernel instead.",
-          "install_path": "bin/vmlinux"
         }
       }
     },
     "kubo": {
       "platforms": {
         "linux-amd64": {
-          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz",
-          "checksum": "sha512:86f9c07bca62d09839e53553df0f81bc306364b1467a459d52f3e4505cc948d196ed0c219c03c667cd681e057bb24bbfc0e0eebf4b83bc64a36a0e9923a60e05",
+          "release_path": "kubo-linux-amd64.tar.gz",
           "extract_path": "kubo/ipfs",
-          "install_path": "bin/kubo"
+          "install_path": "bin/kubo",
+          "strategy": "source-build"
         },
         "linux-arm64": {
-          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz",
-          "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
+          "release_path": "kubo-linux-arm64.tar.gz",
           "extract_path": "kubo/ipfs",
-          "install_path": "bin/kubo"
+          "install_path": "bin/kubo",
+          "strategy": "source-build"
         },
         "darwin-arm64": {
-          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz",
-          "checksum": "sha512:13b6d5dc04e661bfde6b8ba469bcf5b19d9d0062fe8ed50c7aadd8a078f500d0bceee4be7c9bfa476b48c4eb84c246ba083605ed1ed24d16b98e6cd0f09140bb",
+          "release_path": "kubo-darwin-arm64.tar.gz",
           "extract_path": "kubo/ipfs",
-          "install_path": "bin/kubo"
+          "install_path": "bin/kubo",
+          "strategy": "source-build"
         }
       }
     },
     "cloudflared": {
       "platforms": {
         "linux-amd64": {
-          "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64",
-          "checksum": "sha256:176746db3be7dc7bd48f3dd287c8930a4645ebb6e6700f883fddda5a4c307c16",
-          "install_path": "bin/cloudflared"
+          "release_path": "cloudflared-linux-amd64.tar.gz",
+          "extract_path": "cloudflared/cloudflared",
+          "install_path": "bin/cloudflared",
+          "strategy": "source-build"
         },
         "linux-arm64": {
-          "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-arm64",
-          "checksum": "sha256:03c5d58e283f521d752dc4436014eb341092edf076eb1095953ab82debe54a8e",
-          "install_path": "bin/cloudflared"
+          "release_path": "cloudflared-linux-arm64.tar.gz",
+          "extract_path": "cloudflared/cloudflared",
+          "install_path": "bin/cloudflared",
+          "strategy": "source-build"
         }
       }
     },
@@ -1446,66 +1442,25 @@
       "version": "b10516",
       "platforms": {
         "linux-amd64": {
-          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
-          "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
+          "release_path": "llama-server-linux-amd64.tar.gz",
           "extract_path": "llama-b10516",
           "install_path": "libexec/llama.cpp/b10516/linux-amd64",
+          "strategy": "source-build",
           "binary_path": "llama-server"
         },
         "linux-arm64": {
+          "release_path": "llama-server-linux-arm64.tar.gz",
+          "extract_path": "llama-b10516",
+          "install_path": "libexec/llama.cpp/b10516/linux-arm64",
           "strategy": "source-build",
-          "note": "No official aarch64 binary. Run: scripts/build-llama-server.sh"
+          "binary_path": "llama-server"
         },
         "darwin-arm64": {
-          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
-          "checksum": "sha256:ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+          "release_path": "llama-server-darwin-arm64.tar.gz",
           "extract_path": "llama-b10516",
           "install_path": "libexec/llama.cpp/b10516/darwin-arm64",
+          "strategy": "source-build",
           "binary_path": "llama-server"
-        }
-      }
-    },
-    "model-qwen3.5-0.8b": {
-      "size_mb": 507,
-      "description": "Qwen3.5 0.8B Q4_K_M — small default for fast local startup",
-      "platforms": {
-        "*": {
-          "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
-          "checksum": "sha256:bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
-          "install_path": "models/Qwen3.5-0.8B-Q4_K_M.gguf"
-        }
-      }
-    },
-    "model-qwen3.5-4b": {
-      "size_mb": 2740,
-      "description": "Qwen3.5 4B Q4_K_M — default for Orin Nano reliability",
-      "platforms": {
-        "*": {
-          "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
-          "checksum": "sha256:00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
-          "install_path": "models/Qwen3.5-4B-Q4_K_M.gguf"
-        }
-      }
-    },
-    "model-qwen3.5-9b": {
-      "size_mb": 6170,
-      "description": "Qwen3.5 9B Q4_K_M — stable Mac evaluation candidate",
-      "platforms": {
-        "*": {
-          "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/bc658f7a1ae222ee901a565aafd2f5b8c839e176/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
-          "checksum": "sha256:d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43",
-          "install_path": "models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
-        }
-      }
-    },
-    "model-bonsai-8b-q1": {
-      "size_mb": 1160,
-      "description": "PrismML Bonsai 8B Q1_0 — experimental low-memory Mac candidate",
-      "platforms": {
-        "*": {
-          "url": "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/48516770dd04643643e9f9019a2a349cf26c5dbd/Bonsai-8B-Q1_0.gguf",
-          "checksum": "sha256:284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
-          "install_path": "models/Bonsai-8B-Q1_0.gguf"
         }
       }
     }
@@ -1560,8 +1515,7 @@
         "archive-manager",
         "inbox",
         "assistant",
-        "model-provider",
-        "llama-server"
+        "model-provider"
       ]
     },
     "demo": {
@@ -1687,8 +1641,7 @@
         "inbox",
         "assistant",
         "model-provider",
-        "llama-server",
-        "model-qwen3.5-0.8b"
+        "llama-server"
       ]
     },
     "public-gateway": {
@@ -1797,21 +1750,8 @@
         "vmlinux",
         "kubo",
         "cloudflared",
-        "llama-server",
-        "model-qwen3.5-0.8b",
-        "model-qwen3.5-4b",
-        "model-qwen3.5-9b"
+        "llama-server"
       ]
-    }
-  },
-  "model_catalog": {
-    "head_cid": "bafkreigidvbvotnjdljhqmao3jmtgdh56h6wveso6lv7mnsyvmhcmhjpfq",
-    "publisher_dids": [
-      "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
-    ],
-    "local_use": {
-      "max_cache_bytes": 21474836480,
-      "max_model_memory_bytes": 8589934592
     }
   }
 }

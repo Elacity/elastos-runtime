@@ -7,7 +7,7 @@ compatibility is an optional adapter for software that cannot use typed Runtime
 resources.
 
 This is target architecture. Current implementation and proof remain in
-[`state.md`](../state.md). Open work remains in [`TASKS.md`](../TASKS.md).
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues), with open work.
 
 ## Decision
 
@@ -186,4 +186,3 @@ known.
 - [Human and agent architecture](AGENT_ARCHITECTURE.md)
 - [Browser capsule](BROWSER_CAPSULE.md)
 - [People and conversations](PEOPLE_CONVERSATIONS.md)
-- [Current state](../state.md)

@@ -4,26 +4,56 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Removed
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. Removed the model CAR retention and import path from release
+  preparation, signing and publication, `model-package-handoff.py`,
+  `fetch-model.sh` and their tests. Models return later as a separate signed
+  publication.
+
+### Fixed
+
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
+
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths, including
+  entries with a CID. Explicit CID-only operator gateways verify checksums before
+  replacing installed bytes.
+
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer. It then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed manifest
+  bytes stay unchanged.
+
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output, and unexpected version
+  output preserve the previous installation.
+
+### Added
+
+- An internal offline update foundation stages and verifies release files with
+  unchanged support assets, an installation lock and journal, and restoration
+  after failed or interrupted activation. The default CLI update flow is preserved.
+  Home restart ownership and integration remain a follow-up.
+
 ### Isolation status
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-sets the acceptance gates. Apps use opaque browser sandbox frames and Runtime
-capability checks after the S0 changes are integrated and tested together.
-Home can still obtain every app's capability. Providers run as operating-system
-processes; only the model provider is partly confined. Keys remain beside the
-data they protect, and full backups contain all keys. The seed operator can
-read stored data, wallet keys and recovery phrases. Recovery from a stolen
-device or profile key requires a new identity. Source checks and installed
-product proof are separate gates. The public demo remains paused until its
-approved deployment passes the reopening gate.
+- Apps use opaque browser frames and Runtime capability checks. Home retains
+  cross-app capability authority. Providers run as native processes; only the
+  model provider is partly confined. Stored keys and full backups remain
+  accessible to the host operator. A stolen device or profile key requires a
+  new identity. The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+  sets the remaining installed acceptance gates.
 
 ### Changed
 
-Execution descriptors use `web-projection` for browser code and `native-provider`
-for native providers. Legacy third-party manifests that combine `type: wasm`
-with `execution.mode: web-projection` fail validation and need corrected
-metadata. Third-party executable capsules remain unavailable until their
-publisher, package approval and revocation gates are accepted.
+- Execution descriptors use `web-projection` for browser code and `native-provider`
+  for native providers. Legacy manifests that combine `type: wasm` with
+  `execution: web-projection` fail validation and need corrected metadata.
+  Third-party executable admission remains gated by publisher, package approval
+  and revocation checks.
 
 ## [0.7.1] - 2026-09-30
 
@@ -35,18 +65,6 @@ update channel do not change. An earlier signed preview build also reports
 `0.7.1`; it is older code, and the next signed release replaces it. The first
 release for users is planned as 0.8.0, and issues #83 to #93 track what it
 still needs.
-
-### Isolation status
-
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-records limits found after this developer snapshot. In the published snapshot,
-Home and apps share the Runtime's origin, Home can obtain every app's capability,
-and the web Terminal runs commands as the host user. Providers run as
-operating-system processes, with only partial model-provider confinement.
-Opaque content frames, tighter front-door checks and a Terminal disabled by
-default are source work that needs integration, review and installed proof.
-This snapshot does not establish the complete isolation target. A stolen device
-or profile key requires a new identity.
 
 ### Added
 - Local models: signed model catalogue metadata, verified model content that

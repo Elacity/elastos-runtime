@@ -189,7 +189,7 @@ impl ModelContentMetadata {
             );
         }
         if self.format != "gguf"
-            || !matches!(self.quantization.as_str(), "Q4_K_M" | "Q8_0")
+            || !matches!(self.quantization.as_str(), "Q1_0" | "Q4_K_M" | "Q8_0")
             || self.engine != "llama.cpp"
             || self.consumer_interface != "elastos.provider.model"
             || self.consumer_interface_version != "0.1.0"
@@ -1255,12 +1255,14 @@ mod tests {
             serde_json::to_value(manifest).unwrap()["model_content"],
             value["model_content"]
         );
-        let mut q8 = value.clone();
-        q8["model_content"]["quantization"] = serde_json::json!("Q8_0");
-        serde_json::from_value::<CapsuleManifest>(q8)
-            .unwrap()
-            .validate()
-            .unwrap();
+        for quantization in ["Q1_0", "Q8_0"] {
+            let mut model = value.clone();
+            model["model_content"]["quantization"] = serde_json::json!(quantization);
+            serde_json::from_value::<CapsuleManifest>(model)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
     }
 
     #[test]

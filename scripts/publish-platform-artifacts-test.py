@@ -28,11 +28,19 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def publication_stamp(path):
+    """The gateway cache identity excludes access time."""
+    metadata = path.stat()
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+            metadata.st_ctime_ns, metadata.st_mode, metadata.st_nlink)
+
+
 def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
     """Write a tiny three-platform publication set and return the served files it advertises."""
     artifacts = prepared / "artifacts"
     artifacts.mkdir(parents=True)
-    files = {"home.tar.gz": b"universal app" + salt, "shell-capsule-metadata.tar.gz": b"provider metadata" + salt}
+    files = {"home.tar.gz": b"universal app" + salt, "shell-capsule-metadata.tar.gz": b"provider metadata" + salt,
+             "kubo.capsule.tar.gz": b"inert upstream capsule bytes" + salt}
     for platform, setup in RELEASE_PLATFORMS.items():
         files[f"elastos-{platform}"] = b"runtime " + platform.encode() + salt
         files[f"shell-{setup}"] = b"native shell " + platform.encode() + salt
@@ -58,8 +66,7 @@ def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
                           "platforms": {setup: descriptor(f"shell-{setup}", "bin/shell")},
                           "capsule_metadata": {"install_path": "capsules/shell", "platforms": {
                               "*": descriptor("shell-capsule-metadata.tar.gz", "capsules/shell", "shell")}}},
-                "kubo": {"platforms": {"*": {"url": "https://example.invalid/kubo.tar.gz", "install_path": "bin/ipfs",
-                                             "checksum": "sha256:" + "d" * 64, "size": 100}}},
+                "kubo": {"platforms": {"*": descriptor("kubo.capsule.tar.gz", "bin/ipfs")}},
             },
             "profiles": {"home": {"components": ["home", "shell", "kubo"]}},
         }
@@ -72,18 +79,24 @@ def publication_fixture(prepared, salt=b"", version="0.7.1", channel="stable"):
         }
     for name, data in files.items():
         (artifacts / name).write_bytes(data)
+    publisher = "did:key:fixture" + salt.decode().replace(" ", "-")
     release = json.dumps({"payload": {"schema": "elastos.release/v1", "channel": channel, "version": version,
                                       "released_at": 1, "prev_release_cid": None, "platforms": platforms},
-                          "signature": "fixture", "signer_did": "did:key:fixture"}).encode()
+                          "signature": "fixture", "signer_did": publisher}).encode()
     head = json.dumps({"payload": {"schema": "elastos.release.head/v1", "channel": channel, "version": version,
                                    "latest_release_cid": "bafy-release", "release_sha256": sha256(release),
-                                   "signer_did": "did:key:fixture"},
-                       "signature": "fixture", "signer_did": "did:key:fixture"}).encode()
+                                   "signer_did": publisher},
+                       "signature": "fixture", "signer_did": publisher}).encode()
     install = b"#!/bin/sh\necho install" + salt + b"\n"
     (prepared / "release.json").write_bytes(release)
     (prepared / "release-head.json").write_bytes(head)
     (prepared / "install.sh").write_bytes(install)
-    served = {"release.json": release, "release-head.json": head, "install.sh": install}
+    state = json.dumps({"publisher_did": publisher, "last_release_cid": "bafy-release",
+                        "last_head_cid": "bafy-head", "last_version": version,
+                        "last_published_at": 1}).encode()
+    (prepared / "publish-state.json").write_bytes(state)
+    served = {"release.json": release, "release-head.json": head, "install.sh": install,
+              "publish-state.json": state}
     served.update({"artifacts/" + name: data for name, data in files.items()})
     return served
 
@@ -222,33 +235,6 @@ printf '%s\\n' "$result"
                     self.assertEqual(received, data)
                     self.assertEqual(len((root / "uploaded").read_text().splitlines()), 3)
 
-    def test_failed_asset_preparation_stops_before_any_upload(self):
-        source = PUBLISHER.read_text()
-        start = source.index('info "Preparing direct share/open support assets..."')
-        phase = source[start:source.index("# ── Step 5:", start)]
-        for failure in ("apps", "metadata", "native", "cross"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
-                result = subprocess.run(["bash", "-euc", '''
-info() { :; }
-build_platform_independent_direct_assets() { [[ "$TEST_FAILURE" != apps ]] || return 93; echo '{}'; }
-build_platform_independent_provider_capsule_metadata_assets() { [[ "$TEST_FAILURE" != metadata ]] || return 93; echo '{}'; }
-build_supported_direct_assets() {
-    [[ "$TEST_FAILURE" != native ]] || return 93
-    [[ "$TEST_FAILURE" != cross || "$1" != aarch64-linux ]] || return 93
-    echo '{}'
-}
-merge_direct_assets() { echo '{}'; }
-publish_platform_capsules() { touch "$TEST_UPLOAD"; echo '{}'; }
-publish_direct_assets() { touch "$TEST_UPLOAD"; echo '{}'; }
-''' + phase], env={**os.environ, "TEST_FAILURE": failure, "TEST_UPLOAD": str(Path(root) / "uploaded"),
-                  "PLATFORM": "aarch64-darwin", "SETUP_PLATFORM": "darwin-arm64",
-                  "NATIVE_RUST_TARGET": "aarch64-apple-darwin", "CROSS_ARCH": "aarch64",
-                  "CROSS_PLATFORM": "aarch64-linux", "CROSS_SETUP_PLATFORM": "linux-arm64",
-                  "CROSS_RUST_TARGET": "aarch64-unknown-linux-musl", "ARTIFACTS_DIR": root,
-                  "CROSS_ARTIFACTS_DIR": root}, capture_output=True, text=True)
-                self.assertNotEqual(result.returncode, 0, result.stderr)
-                self.assertFalse((Path(root) / "uploaded").exists())
-
     def test_fresh_projection_packaging_and_asset_records_do_not_publish(self):
         source = PUBLISHER.read_text()
         names = ("capsule_manifest_field", "copy_clean_capsule_tree", "copy_release_source_file", "create_capsule_tar",
@@ -382,77 +368,39 @@ touch "$TEST_FALSE_SUCCESS"
             self.assertFalse((root / "state").exists())
             self.assertIn("elastos publish-release --dry-run", result.stderr)
 
-    def test_artifact_gate_stops_before_release_signing(self):
-        source = PUBLISHER.read_text()
-        function = "stage_release_artifacts() {" + source.split(
-            "stage_release_artifacts() {", 1
-        )[1].split("\n}\n", 1)[0] + "\n}\n"
-        start = source.index("# Assemble the files advertised by this release")
-        gate = source[start:source.index("# End build-mode preparation.", start)]
-        for failure in (None, "missing", "stale", "runtime", "manifest",
-                        "cross-valid", "cross-missing", "cross-runtime", "cross-manifest", "cross-app"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
-                root = Path(root)
-                app = b"app bytes"
-                runtime = b"runtime"
-                manifest = json.dumps({"external": {"home": {"platforms": {"*": {
-                    "release_path": "home.tar.gz", "size": len(app),
-                    "checksum": "sha256:" + hashlib.sha256(app).hexdigest(),
-                }}}}}).encode()
-                (root / "elastos").write_bytes(runtime)
-                (root / "components.json").write_bytes(manifest)
-                cross = bool(failure and failure.startswith("cross-"))
-                cross_runtime = b"cross runtime"
-                cross_manifest = manifest
-                if cross:
-                    (root / "cross-elastos").write_bytes(cross_runtime)
-                    if failure == "cross-app":
-                        other = json.loads(manifest)
-                        other["external"]["home"]["platforms"]["*"]["checksum"] = "sha256:" + "0" * 64
-                        cross_manifest = json.dumps(other).encode()
-                    if failure != "cross-missing":
-                        (root / "components-aarch64-linux.json").write_bytes(cross_manifest)
-                universal = root / "supported-assets-universal"
-                universal.mkdir()
-                if failure != "missing":
-                    (universal / "home.tar.gz").write_bytes(b"bad bytes" if failure == "stale" else app)
-                result = subprocess.run(
-                    ["bash", "-euc", '''
-die() { echo "$*" >&2; exit 1; }
-sha256() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
-''' + function + gate + 'touch "$TEST_SIGN_MARKER"'],
-                    cwd=PUBLISHER.parent.parent,
-                    env={
-                        **os.environ,
-                        "TMPDIR": str(root),
-                        "TEST_SIGN_MARKER": str(root / "signing-reached"),
-                        "STAGED_ELASTOS": str(root / "elastos"),
-                        "ARTIFACTS_DIR": str(root / "artifacts"),
-                        "PLATFORM": "aarch64-darwin", "SETUP_PLATFORM": "darwin-arm64",
-                        "CROSS_PLATFORM": "aarch64-linux" if cross else "",
-                        "CROSS_SETUP_PLATFORM": "linux-arm64" if cross else "",
-                        "CROSS_ELASTOS": str(root / "cross-elastos") if cross else "",
-                        "CROSS_ARCH": "aarch64" if cross else "",
-                        "CROSS_BINARY_SHA256": "0" * 64 if failure == "cross-runtime" else hashlib.sha256(cross_runtime).hexdigest(),
-                        "CROSS_COMPONENTS_SHA256": "0" * 64 if failure == "cross-manifest" else hashlib.sha256(cross_manifest).hexdigest(),
-                        "BINARY_SHA256": "0" * 64 if failure == "runtime" else hashlib.sha256(runtime).hexdigest(),
-                        "COMPONENTS_SHA256": "0" * 64 if failure == "manifest" else hashlib.sha256(manifest).hexdigest(),
-                    },
-                    capture_output=True, text=True,
-                )
-                if failure in (None, "cross-valid"):
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertTrue((root / "signing-reached").exists())
-                else:
+    def test_legacy_signing_and_publication_reject_before_input_reads_or_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "commands"
+            commands.mkdir()
+            effects = root / "effects"
+            for command in (*PUBLICATION_COMMANDS, "python3", "jq", "cat", "mktemp", "mkdir", "sha256sum", "shasum", "bash"):
+                stub = commands / command
+                stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$TEST_EFFECT_LOG"\nexit 93\n')
+                stub.chmod(0o755)
+            before = snapshot(root)
+            key = root / "unreadable-key-fifo"
+            os.mkfifo(key)
+            cases = [
+                ["--version", "0.7.1"],
+                ["--version", "0.7.1", "--key", str(key)],
+                ["--key=" + str(key)],
+                ["--prepare-only", str(root / "unsigned"), "--key", str(key)],
+                ["--version", "0.7.1", "--platform-input", "aarch64-darwin=" + str(key)],
+            ]
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(["/bin/bash", str(PUBLISHER), *arguments],
+                        env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                             "TEST_EFFECT_LOG": str(effects), "ELASTOS_PUBLISH_STATE_DIR": str(root / "state")},
+                        capture_output=True, text=True, timeout=3)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertFalse((root / "signing-reached").exists())
-                    expected_error = {
-                        "missing": "home.tar.gz", "stale": "artifact checksum mismatch",
-                        "runtime": "Staged runtime differs", "manifest": "Staged components differ",
-                        "cross-runtime": "Staged runtime differs", "cross-manifest": "Staged components differ",
-                        "cross-missing": "components-aarch64-linux.json", "cross-app": "artifact checksum mismatch",
-                    }[failure]
-                    self.assertIn(expected_error, result.stderr)
+                    self.assertIn("retired", result.stderr)
+                    self.assertFalse(effects.exists(), result.stderr)
+                    self.assertFalse((root / "state").exists())
+                    self.assertFalse((root / "unsigned").exists())
+            key.unlink()
+            self.assertEqual(snapshot(root), before)
 
     def test_advertised_provider_and_capsule_bytes_are_checked(self):
         with tempfile.TemporaryDirectory() as root:
@@ -557,92 +505,7 @@ sha256() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1]
                 {p.name: p.read_bytes() for p in (root / "served").iterdir()}, expected
             )
 
-    def test_native_tools_use_host_os_while_guests_stay_linux(self):
-        source = PUBLISHER.read_text()
-        start = source.index("OS=$(uname -s")
-        end = source.index("# ── Cross-compilation setup", start)
-        platform_setup = source[start:end]
-        native_call = next(
-            line for line in source.splitlines()
-            if line.startswith("HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets")
-        )
-        for system, machine, release_platform, setup_platform, native_target, guest_target in (
-            ("Linux", "x86_64", "x86_64-linux", "linux-amd64", "x86_64-unknown-linux-musl", "x86_64-unknown-linux-musl"),
-            ("Linux", "aarch64", "aarch64-linux", "linux-arm64", "aarch64-unknown-linux-musl", "aarch64-unknown-linux-musl"),
-            ("Darwin", "arm64", "aarch64-darwin", "darwin-arm64", "aarch64-apple-darwin", "aarch64-unknown-linux-musl"),
-        ):
-            with self.subTest(system=system, machine=machine):
-                result = subprocess.run(
-                    ["bash", "-euc", '''
-uname() { case "$1" in -s) echo "$TEST_SYSTEM";; -m) echo "$TEST_MACHINE";; *) return 1;; esac; }
-info() { :; }
-die() { echo "$*" >&2; exit 1; }
-default_elastos_data_dir() { echo unused; }
-build_supported_direct_assets() { printf '%s|%s|%s|%s' "$@"; }
-''' + platform_setup + native_call + '''
-printf '%s\\n' "$HOST_PLATFORM_DIRECT_ASSETS" "${GUEST_RUST_TARGET:-${HOST_RUST_TARGET}}"
-'''],
-                    env={**os.environ, "TEST_SYSTEM": system, "TEST_MACHINE": machine},
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(result.stdout.splitlines(), [
-                    f"{release_platform}|{setup_platform}|{native_target}|false",
-                    guest_target,
-                ])
-
-    def test_host_and_cross_manifests_keep_their_platform_names(self):
-        source = PUBLISHER.read_text()
-        start = source.index("# Persist stamped install.sh and metadata")
-        end = source.index('info "Installer CID:', start)
-        export = source[start:end]
-        for host, cross in (
-            ("x86_64-linux", "aarch64-linux"),
-            ("aarch64-darwin", "aarch64-linux"),
-            ("aarch64-linux", ""),
-        ):
-            with self.subTest(host=host, cross=cross), tempfile.TemporaryDirectory() as root:
-                root = Path(root)
-                inputs = root / "inputs"
-                inputs.mkdir()
-                for name in ("install.sh", "release.json", "release-head.json"):
-                    (inputs / name).write_text(name)
-                prepared = inputs / "publication-artifacts"
-                prepared.mkdir()
-                (prepared / f"components-{host}.json").write_text(f"host:{host}")
-                if cross:
-                    (prepared / f"components-{cross}.json").write_text(f"cross:{cross}")
-                    # Prepare both names so this test detects the output naming
-                    # defect independently of the temporary input naming change.
-                    for name in (cross, cross.split("-")[0]):
-                        (inputs / f"components-{name}.json").write_text(f"cross:{cross}")
-                subprocess.run(
-                    ["bash", "-euc", export + "\n:"],
-                    cwd=root,
-                    env={
-                        **os.environ,
-                        "TMPDIR": str(inputs),
-                        "PREPARED_ARTIFACTS_DIR": str(prepared),
-                        "STAMPED_INSTALL": str(inputs / "install.sh"),
-                        "PLATFORM": host,
-                        "CROSS_PLATFORM": cross,
-                        "CROSS_ARCH": cross.split("-")[0],
-                    },
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                outputs = root / "artifacts"
-                expected = {"install.sh", "release.json", "release-head.json", f"components-{host}.json"}
-                if cross:
-                    expected.add(f"components-{cross}.json")
-                self.assertEqual({p.name for p in outputs.iterdir()}, expected)
-                self.assertEqual((outputs / f"components-{host}.json").read_text(), f"host:{host}")
-                if cross:
-                    self.assertEqual((outputs / f"components-{cross}.json").read_text(), f"cross:{cross}")
-
-    def run_publication_export(self, prepared, publisher_root, stubs=""):
+    def run_publication_export(self, prepared, publisher_root, stubs="", disk_free=50_000_000):
         """Export a prepared set into a disposable Publisher root with real commands stubbed out."""
         with tempfile.TemporaryDirectory() as commands:
             commands = Path(commands)
@@ -652,23 +515,45 @@ printf '%s\\n' "$HOST_PLATFORM_DIRECT_ASSETS" "${GUEST_RUST_TARGET:-${HOST_RUST_
                 stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$TEST_EFFECT_LOG"\nexit 93\n')
                 stub.chmod(0o755)
             result = subprocess.run(
-                ["bash", "-euc", 'source "$1"; shift\n' + stubs + '''
-export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/install.sh" "$2/artifacts"
+                ["bash", "-euc", 'source "$1"; shift\n' + '''
+python3() {
+    command python3 -c 'import os, shutil, sys
+shutil.disk_usage = lambda path: shutil._ntuple_diskusage(100_000_000, 100_000_000-int(os.environ["TEST_DISK_FREE"]), int(os.environ["TEST_DISK_FREE"]))
+exec(compile(sys.stdin.read(), "publication-fixture", "exec"))' "${@:2}"
+}
+''' + stubs + '''
+export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/install.sh" "$2/artifacts" "$2/publish-state.json"
 ''', "publication-test", str(PUBLISHER), str(publisher_root), str(prepared)],
                 cwd=PUBLISHER.parent.parent,
                 env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"],
-                     "TEST_EFFECT_LOG": str(effects), "LC_ALL": "C"},
+                     "TEST_EFFECT_LOG": str(effects), "LC_ALL": "C",
+                     "PYTHONDONTWRITEBYTECODE": "1", "TEST_DISK_FREE": str(disk_free)},
                 capture_output=True, text=True,
             )
             self.assertFalse(effects.exists(), "publication export invoked a real publication command")
         return result
 
+    def test_publication_space_refusal_preserves_public_pin_and_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = root / "publisher"
+            publication_fixture(root / "previous", salt=b" previous")
+            self.assertEqual(self.run_publication_export(root / "previous", publisher).returncode, 0)
+            before = snapshot(publisher)
+            prepared = root / "prepared"
+            publication_fixture(prepared, salt=b" next")
+            required = sum(path.stat().st_size for path in prepared.rglob("*") if path.is_file())
+            required += (publisher / "release-head.json").stat().st_size
+            for free in (14_000_000, 15_000_000, 15_000_000 + required - 1):
+                with self.subTest(free=free):
+                    result = self.run_publication_export(prepared, publisher, disk_free=free)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("15% free-space floor", result.stderr)
+                    self.assertEqual(snapshot(publisher), before)
+            result = self.run_publication_export(prepared, publisher, disk_free=15_000_000 + required)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_publication_export_promotes_exact_advertised_set_head_last(self):
-        source = PUBLISHER.read_text()
-        start = source.index("# Save release metadata to runtime-owned publisher state")
-        call_site = source[start:source.index('info "Saved release artifacts', start)]
-        self.assertIn('export_release_publication "$PUBLISHER_ROOT"', call_site)
-        self.assertNotIn("cp ", call_site)
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             publisher = root / "data/ElastOS/SystemServices/Publisher"
@@ -689,7 +574,7 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                     self.assertEqual(snapshot(publisher), served_view(expected))
                     order = [os.path.relpath(line, publisher) for line in moves.read_text().splitlines()]
                     artifacts = sorted(name for name in expected if name.startswith("artifacts/"))
-                    self.assertEqual(order, artifacts + ["install.sh", "release.json", "release-head.json"])
+                    self.assertEqual(order, artifacts + ["install.sh", "release.json", "publish-state.json", "release-head.json"])
 
     def test_publication_export_rejects_incomplete_or_mismatched_sets_before_mutation(self):
         def replace(name, data):
@@ -716,7 +601,22 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
         def unsigned(release):
             del release["signature"]
 
+        def state_change(**changes):
+            def edit(prepared):
+                path = prepared / "publish-state.json"
+                state = json.loads(path.read_bytes())
+                state.update(changes)
+                path.write_bytes(json.dumps(state).encode())
+            return edit
+
         cases = {
+            "state-pin": (state_change(publisher_did="did:key:foreign"), "publisher_did differs"),
+            "state-release": (state_change(last_release_cid="foreign-release"), "release receipt differs"),
+            "state-version": (state_change(last_version="0.7.10"), "release receipt differs"),
+            "state-head": (state_change(last_head_cid=""), "requires last_head_cid"),
+            "state-time": (state_change(last_published_at=True), "requires last_published_at"),
+            "state-shape": (replace("publish-state.json", b"[]"), "must be an object"),
+            "state-empty": (replace("publish-state.json", b""), "is empty"),
             "missing-app": ((lambda p: (p / "artifacts/home.tar.gz").unlink()), "home.tar.gz"),
             "missing-runtime": ((lambda p: (p / "artifacts/elastos-aarch64-linux").unlink()), "elastos-aarch64-linux"),
             "missing-components": ((lambda p: (p / "artifacts/components-x86_64-linux.json").unlink()),
@@ -804,6 +704,24 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             (publisher / "artifacts/home.tar.gz").unlink()
             (publisher / "artifacts/home.tar.gz").mkdir()
 
+        def state_link(prepared, publisher, outside):
+            outside.write_bytes(b"outside public pin")
+            (publisher / "publish-state.json").unlink()
+            (publisher / "publish-state.json").symlink_to(outside)
+
+        def state_dir(prepared, publisher, outside):
+            (publisher / "publish-state.json").unlink()
+            (publisher / "publish-state.json").mkdir()
+
+        def input_state_link(prepared, publisher, outside):
+            outside.write_bytes((prepared / "publish-state.json").read_bytes())
+            (prepared / "publish-state.json").unlink()
+            (prepared / "publish-state.json").symlink_to(outside)
+
+        def root_link(prepared, publisher, outside):
+            publisher.rename(outside)
+            publisher.symlink_to(outside)
+
         def root_file(prepared, publisher, outside):
             shutil.rmtree(publisher)
             publisher.write_bytes(b"not a directory")
@@ -819,6 +737,10 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             "destination-artifacts-file": (artifacts_file, "Publisher artifacts path must be a regular directory"),
             "destination-artifacts-link": (artifacts_link, "Publisher artifacts path must be a regular directory"),
             "destination-artifact-dir": (artifact_dir_collision, "Publisher destination must be a regular file or absent"),
+            "destination-state-link": (state_link, "Publisher destination must be a regular file or absent"),
+            "destination-state-dir": (state_dir, "Publisher destination must be a regular file or absent"),
+            "source-state-link": (input_state_link, "publish-state.json must be a regular file"),
+            "destination-root-link": (root_link, "Publisher root is not a directory"),
             "destination-root-file": (root_file, "Publisher root is not a directory"),
         }
         with tempfile.TemporaryDirectory() as root:
@@ -842,8 +764,12 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
 
     def test_publication_staging_failure_keeps_publication_and_foreign_scratch(self):
         stubs = {
+            "state-copy-error": 'cp() { case "$1" in */publish-state.json) return 93;; esac; command cp "$@"; }\n',
+            "state-short-write": 'cp() { case "$1" in */publish-state.json) printf short > "$2";; *) command cp "$@";; esac; }\n',
             "copy-error": 'cp() { case "$1" in */release.json) return 93;; esac; command cp "$@"; }\n',
             "short-write": 'cp() { case "$1" in */elastos-aarch64-linux) printf short > "$2";; *) command cp "$@";; esac; }\n',
+            "recovery-head-copy-error": 'cp() { case "$2" in */recovered-head.json) return 93;; esac; command cp "$@"; }\n',
+            "recovery-head-short-write": 'cp() { case "$2" in */recovered-head.json) printf short > "$2";; *) command cp "$@";; esac; }\n',
         }
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -864,8 +790,6 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                     self.assertEqual(snapshot(publisher), before)
 
     def test_publication_promotion_failure_restores_previous_and_never_advertises_new_head(self):
-        boundaries = ("artifacts/components-aarch64-darwin.json", "artifacts/elastos-aarch64-linux",
-                      "artifacts/shell-x86_64-linux.capsule.tar.gz", "install.sh", "release.json", "release-head.json")
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             publisher = root / "publisher"
@@ -873,13 +797,23 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             self.assertEqual(self.run_publication_export(root / "previous", publisher).returncode, 0)
             before = snapshot(publisher)
             expected = served_view(publication_fixture(root / "prepared", salt=b" next"))
+            boundaries = sorted(key for key in expected if key.startswith("artifacts/")) + [
+                "install.sh", "release.json", "publish-state.json", "release-head.json"]
             for boundary in boundaries:
                 with self.subTest(boundary=boundary):
+                    head_before = publication_stamp(publisher / "release-head.json")
                     result = self.run_publication_export(root / "prepared", publisher,
                         'mv() { case "$2" in */staged/%s) return 93;; esac; command mv "$@"; }\n' % boundary)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("the previous publication was restored", result.stderr)
                     self.assertEqual(snapshot(publisher), before)
+                    self.assertNotEqual(publication_stamp(publisher / "release-head.json"), head_before)
+            with self.subTest(boundary="state rename reports failure after replacement"):
+                result = self.run_publication_export(root / "prepared", publisher,
+                    'mv() { case "$2" in */staged/publish-state.json) command mv "$@"; return 93;; esac; command mv "$@"; }\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("the previous publication was restored", result.stderr)
+                self.assertEqual(snapshot(publisher), before)
             with self.subTest(boundary="hard link of the current file"):
                 result = self.run_publication_export(root / "prepared", publisher, 'ln() { return 93; }\n')
                 self.assertNotEqual(result.returncode, 0)
@@ -887,11 +821,13 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                 self.assertEqual(snapshot(publisher), before)
             with self.subTest(boundary="restore itself fails"):
                 # The attempt keeps its scratch, which still holds the previous bytes it could not put back.
+                head_before = publication_stamp(publisher / "release-head.json")
                 result = self.run_publication_export(root / "prepared", publisher,
                     'mv() { case "$2" in */staged/release.json|*/previous/artifacts/home.tar.gz) return 93;; esac;'
                     ' command mv "$@"; }\n')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("could not restore every previous file", result.stderr)
+                self.assertIn("could not complete recovery", result.stderr)
+                self.assertEqual(publication_stamp(publisher / "release-head.json"), head_before)
                 after = snapshot(publisher)
                 scratch = sorted(key for key in after if key.startswith(".publish-release."))
                 self.assertTrue(scratch)
@@ -922,17 +858,19 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             self.assertEqual(self.run_publication_export(root / "previous", publisher).returncode, 0)
             before = snapshot(publisher)
             expected = served_view(publication_fixture(root / "prepared", salt=b" next"))
-            for relative in ("artifacts/home.tar.gz", "release.json", "release-head.json"):
+            for relative in ("artifacts/home.tar.gz", "release.json", "publish-state.json", "release-head.json"):
                 with self.subTest(pending_record=relative):
+                    head_before = publication_stamp(publisher / "release-head.json")
                     result = self.run_publication_export(root / "prepared", publisher, pending % relative)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("the previous publication was restored", result.stderr)
                     self.assertEqual(snapshot(publisher), before)
+                    self.assertNotEqual(publication_stamp(publisher / "release-head.json"), head_before)
             with self.subTest(pending_record="restore of an earlier file fails"):
                 result = self.run_publication_export(root / "prepared", publisher, pending % "release.json" +
                     'mv() { case "$2" in */previous/artifacts/home.tar.gz) return 93;; esac; command mv "$@"; }\n')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("could not restore every previous file", result.stderr)
+                self.assertIn("could not complete recovery", result.stderr)
                 after = snapshot(publisher)
                 scratch = sorted(key for key in after if key.startswith(".publish-release."))
                 kept = [key for key in scratch if key.endswith("/previous/artifacts/home.tar.gz")]
@@ -940,6 +878,89 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
                 self.assertEqual({key: value for key, value in after.items() if key not in scratch},
                                  {**before, "artifacts/home.tar.gz": expected["artifacts/home.tar.gz"]})
                 self.assertEqual(after["release-head.json"], before["release-head.json"])
+
+    def test_rollback_recommits_prior_head_after_single_link_restoration(self):
+        # The first backup link already makes the admitted artifact unsafe,
+        # while the receipt/head cache key still belongs to the prior set.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, prepared, publisher = (root / name for name in ("previous", "prepared", "publisher"))
+            files = publication_fixture(previous, salt=b" previous")
+            publication_fixture(prepared, salt=b" next")
+            self.assertEqual(self.run_publication_export(previous, publisher).returncode, 0)
+            before = snapshot(publisher)
+            head = publisher / "release-head.json"
+            receipt = publisher / "publish-state.json"
+            receipt_before = publication_stamp(receipt)
+            first = sorted(name for name in files if name.startswith("artifacts/"))[0]
+            events = root / "events"
+            stub = '''
+export TEST_PREVIOUS="%s" TEST_PUBLISHER="%s" TEST_EVENTS="%s"
+mv() {
+    case "$2" in
+        */staged/%s)
+            command python3 -c 'import os; from pathlib import Path
+root = Path(os.environ["TEST_PUBLISHER"])
+assert (root / "%s").stat().st_nlink == 2
+assert (root / "release-head.json").stat().st_nlink == 1
+assert (root / "publish-state.json").stat().st_nlink == 1
+with open(os.environ["TEST_EVENTS"], "a") as log: log.write("single-link refusal\\n")' || return
+            return 93;;
+        */recovered-head.json)
+            command python3 -c 'import os; from pathlib import Path
+root, previous = (Path(os.environ[name]) for name in ("TEST_PUBLISHER", "TEST_PREVIOUS"))
+for path in previous.rglob("*"):
+    if path.is_file():
+        restored = root / path.relative_to(previous)
+        assert restored.read_bytes() == path.read_bytes()
+        assert restored.stat().st_nlink == 1
+assert not any(root.glob(".publish-release.*/previous"))
+with open(os.environ["TEST_EVENTS"], "a") as log: log.write("complete restore before head commit\\n")' || return;;
+    esac
+    command mv "$@"
+}
+''' % (previous, publisher, events, first, first)
+            with head.open("rb") as held_head:
+                old_inode = os.fstat(held_head.fileno()).st_ino
+                result = self.run_publication_export(prepared, publisher, stub)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("the previous publication was restored", result.stderr)
+                self.assertNotEqual(head.stat().st_ino, old_inode)
+            self.assertEqual(snapshot(publisher), before)
+            self.assertEqual(publication_stamp(receipt), receipt_before)
+            self.assertEqual(events.read_text().splitlines(),
+                             ["single-link refusal", "complete restore before head commit"])
+
+    def test_rollback_recovery_failures_keep_evidence_and_report_incomplete(self):
+        failures = {
+            "backup-link-cleanup": 'rm() { case "$2" in */previous) return 93;; esac; command rm "$@"; }\n',
+            "head-byte-comparison": 'cmp() { case "$2" in */recovered-head.json) return 93;; esac; command cmp "$@"; }\n',
+            "head-reactivation": 'mv() { case "$2" in */recovered-head.json) return 93;; esac; command mv "$@"; }\n',
+            "head-reactivation-reports-failure": 'mv() { case "$2" in */recovered-head.json) command mv "$@"; return 93;; esac; command mv "$@"; }\n',
+            "final-scratch-cleanup": 'rm() { case "$2" in */previous) command rm "$@";; */.publish-release.*) return 93;; *) command rm "$@";; esac; }\n',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, prepared = root / "previous", root / "prepared"
+            files = publication_fixture(previous, salt=b" previous")
+            publication_fixture(prepared, salt=b" next")
+            first = sorted(name for name in files if name.startswith("artifacts/"))[0]
+            for name, failure in failures.items():
+                with self.subTest(failure=name):
+                    publisher = root / name
+                    self.assertEqual(self.run_publication_export(previous, publisher).returncode, 0)
+                    old_head = publication_stamp(publisher / "release-head.json")
+                    # Failure before the first rename also covers an unchanged
+                    # live inode which still shares its pending backup link.
+                    fail_promotion = 'promote_release_publication() { ln "$2/%s" "$1/previous/%s"; printf "%%s\\n" "%s" > "$1/promoted"; return 93; }\n' % (first, first, first)
+                    result = self.run_publication_export(prepared, publisher, failure + fail_promotion)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("could not complete recovery", result.stderr)
+                    self.assertTrue(list(publisher.glob(".publish-release.*")))
+                    self.assertEqual({key: value for key, value in snapshot(publisher).items()
+                                      if not key.startswith(".publish-release.")}, served_view(files))
+                    if name in ("backup-link-cleanup", "head-byte-comparison", "head-reactivation"):
+                        self.assertEqual(publication_stamp(publisher / "release-head.json"), old_head)
 
     def test_killed_promotion_leaves_old_head_over_mixed_artifacts_until_retry(self):
         # A shell error rolls back; a killed process does not. Per-file renames are
@@ -953,7 +974,7 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             previous = served_view(publication_fixture(root / "previous", salt=b" previous"))
             expected = served_view(publication_fixture(root / "prepared", salt=b" next"))
             order = sorted(name for name in expected if name.startswith("artifacts/")) + [
-                "install.sh", "release.json", "release-head.json"]
+                "install.sh", "release.json", "publish-state.json", "release-head.json"]
             for boundary in ("artifacts/elastos-aarch64-linux", "release-head.json"):
                 with self.subTest(boundary=boundary):
                     shutil.rmtree(publisher, ignore_errors=True)

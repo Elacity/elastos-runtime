@@ -22,7 +22,7 @@ does not describe the later SmolLM2 result.
 A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
 Marketplace and Carrier, then completed a terminal Assistant reply. Its current
 installed readiness regression also passed after Runtime restart; the exact
-local receipt is recorded in [state.md](../state.md#current-model-foundation-23-september-2026-utc).
+local receipt is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Full Qwen, combined retention and failure-path acceptance, and public delivery
 remain open.
 
@@ -127,7 +127,7 @@ workflow, file picker or editable model path. It uses this sequence:
 Off-box catalog and package delivery uses the existing Content and availability
 contracts over Carrier. Runtime applies the same publisher, identity and
 authority checks. A bounded local miss can fetch from an authenticated holder;
-the installed direct-Carrier SmolLM2 result is recorded in [state.md](../state.md).
+the installed direct-Carrier SmolLM2 result is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Independent-holder and wider route acceptance remain open.
 
 The CID proves the closure bytes. The publisher signature proves who made the
@@ -322,7 +322,7 @@ unknown settlement when backend stop is unconfirmed. The catalog signer and
 successful revalidation callback belong to the fixture. They do not prove the
 installed Home grant/session path. The installed operator catalog and receipt
 exist. That earlier Qwen Use failed; the later SmolLM2 installed journey passed.
-Their separate evidence and limits are in [state.md](../state.md).
+Their separate evidence and limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
@@ -483,7 +483,7 @@ llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
 signed closure size. The local operator package records exact bytes,
 complete-closure CID, publisher signature/trust, licenses, provenance claims,
 resource limits and local availability. Its verified scope and upstream
-provenance limits are in [state.md](../state.md#model-and-assistant-truth).
+provenance limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 That local package proof does not establish off-box distribution. The existing
 engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing

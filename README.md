@@ -36,6 +36,12 @@ front-door and disabled-terminal changes to be integrated and tested together.
 
 The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
 
+The staged release root DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Before a staged
+install, compare this DID with the `MAINTAINER_DID` value in the frozen installer.
+Promotion to the live installer requires staged install and update acceptance
+and operator approval.
+
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
@@ -101,13 +107,13 @@ admission is a separate, node-local verification decision. See the
 ## Status and verification
 
 Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for current
-behavior, proof and open gaps. They distinguish source checks from accepted
-installed journeys. Browser source and proof tooling alone do not establish
-complete Browser product support.
+behavior, known gaps and proof. [Install and update #89](https://github.com/Elacity/elastos-runtime/issues/89)
+owns installed release acceptance. A source checkout and a published install
+have separate artifact identities; source checks alone do not prove installed
+product or Browser support.
 
-Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for open work,
-[ROADMAP.md](ROADMAP.md) for future
-direction, and [elastos/CHANGELOG.md](elastos/CHANGELOG.md) for release history.
+[ROADMAP.md](ROADMAP.md) links planned work;
+[elastos/CHANGELOG.md](elastos/CHANGELOG.md) records release history.
 
 For command ownership across Home and operator lanes, see the [command
 matrix](docs/COMMAND_MATRIX.md).

@@ -81,8 +81,9 @@ topology stays private.
 
 Capsule URI lookup, public provider proxying, interface projection, and route
 lists exclude all four targets. Runtime registers a target only after the
-provider returns the exact successful identity, version, configured state,
-schema, and ordered operation set. Rejected startup settles and reaps the child
+provider returns the exact successful identity, a valid release version (it may
+differ from the Runtime's after a Runtime-only update), configured state,
+schema or protocol version, and ordered operation set. Rejected startup settles and reaps the child
 before it returns an error.
 
 Protect, media, and decrypt run as local native provider processes. Custody can
@@ -106,7 +107,7 @@ Verified deployed read behavior is:
   access returns `false`.
 
 The configured Base 8453 contract uses these operations. Deployed verification
-evidence belongs in [state.md](../state.md):
+evidence belongs in its GitHub issue:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -238,7 +239,7 @@ the resulting composition end to end.
 
 ## Remaining work
 
-The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
+The ordered release proof is in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues). The protected-content
 part requires:
 
 1. final combined-source review and CI;
@@ -261,7 +262,7 @@ part requires:
 7. the installed two-Runtime mint-list-deny-buy-open-play-close journey,
    including restart, replay, tamper rejection, settlement and cleanup;
    proven headless by the same driver (`finalize` reads `overall_ok: true`,
-   see `state.md`), not yet through Brave on the seed;
+   see its GitHub issue), not yet through Brave on the seed;
 8. the manual J5 UI acceptance in the [0.7.1 release plan](https://app.notion.com/p/3d6b682adcca81948f78d12abcd677b9); and
 9. one atomic cutover that removes the provisional authority surfaces.
 
