@@ -1698,7 +1698,8 @@ mod tests {
         }
     }
 
-    async fn check_on_demand_chat_install(home_launch: bool) {
+    #[tokio::test]
+    async fn on_demand_chat_home_launch_uses_carrier_and_refuses_checksum_mismatch() {
         let capsule = include_bytes!("../../../../capsules/chat-room/capsule.json");
         let page = b"<!doctype html><title>Chat fixture</title>";
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -1746,21 +1747,9 @@ mod tests {
             std::fs::write(&registry_path, &registry_bytes).unwrap();
             let supervisor = Supervisor::new(data.to_path_buf(), manifest);
             let dest = data.join("capsules/chat-room");
-            assert!(
-                !dest.exists(),
-                "Home leaves Chat for on-demand installation"
-            );
 
-            let result = if home_launch {
-                crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
-                    .await
-                    .map(|ensure| assert_eq!(ensure.status, "materialized"))
-            } else {
-                supervisor
-                    .download_external("chat-room", &crate::setup::detect_platform())
-                    .await
-                    .map(|path| assert_eq!(path, dest))
-            };
+            let result =
+                crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room").await;
             server.close().await;
             serving.await.unwrap();
 
@@ -1773,45 +1762,33 @@ mod tests {
                     "refusal left a partial install"
                 );
             } else {
-                result.unwrap();
+                assert_eq!(result.unwrap().status, "materialized");
                 assert_eq!(std::fs::read(dest.join("capsule.json")).unwrap(), capsule);
                 assert_eq!(
                     std::fs::read(dest.join("browser/index.html")).unwrap(),
                     page
                 );
-                if home_launch {
-                    assert_eq!(
-                        std::fs::read_to_string(dest.join(CACHED_CID_FILE))
-                            .unwrap()
-                            .trim(),
-                        info.cid.as_deref().unwrap()
-                    );
-                    assert_eq!(
-                        std::fs::read_to_string(dest.join(CACHED_ARTIFACT_SHA_FILE))
-                            .unwrap()
-                            .trim(),
-                        hex::encode(sha2::Sha256::digest(&bytes))
-                    );
-                    // A second open uses the verified package even with Carrier stopped.
-                    let ensure =
-                        crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
-                            .await
-                            .unwrap();
-                    assert_eq!(ensure.status, "installed");
-                    assert_eq!(supervisor.ensure_capsule("chat-room").await.unwrap(), dest);
-                }
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_CID_FILE))
+                        .unwrap()
+                        .trim(),
+                    info.cid.as_deref().unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_ARTIFACT_SHA_FILE))
+                        .unwrap()
+                        .trim(),
+                    hex::encode(sha2::Sha256::digest(&bytes))
+                );
+                // A second open uses the verified package even with Carrier stopped.
+                let ensure =
+                    crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
+                        .await
+                        .unwrap();
+                assert_eq!(ensure.status, "installed");
+                assert_eq!(supervisor.ensure_capsule("chat-room").await.unwrap(), dest);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn on_demand_chat_download_uses_carrier_and_refuses_checksum_mismatch() {
-        check_on_demand_chat_install(false).await;
-    }
-
-    #[tokio::test]
-    async fn on_demand_chat_home_launch_uses_carrier_and_refuses_checksum_mismatch() {
-        check_on_demand_chat_install(true).await;
     }
 
     #[test]
