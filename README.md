@@ -12,21 +12,23 @@ The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
 installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
 
+The maintainer changed the release signing key because the previous key was
+stored on the public server.
+
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-For an existing Home, re-trust the maintainer once. Run `elastos source list`
-to find the existing source name, then replace `EXISTING_SOURCE` below:
+For an existing Home, re-trust the maintainer once by running the same installer
+over the old installation:
 
 ```bash
-elastos source add --name EXISTING_SOURCE --publisher did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Type the complete new DID when Runtime asks for confirmation. This keeps the
-channel, install path, Carrier ticket and gateways. Then run `elastos update`.
-Until you re-trust, Home still trusts the old key and remains exposed if a copy
-exists. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
+The installer trusts the new DID, installs the release and keeps your existing
+identity, accounts and user files. Homes that already trust this DID can use
+normal updates. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
 
 The installer installs Runtime, sets up the Home profile, and opens Home. Keep
 the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you

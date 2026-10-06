@@ -236,20 +236,21 @@ maintainer. `elastos update` reports:
 
 ```text
 Signer DID mismatch: trusted set = ["<old DID>"], got did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+  This release is signed by a new publisher key. Run the publisher's install.sh to trust it; this installation was not changed.
 ```
 
-The trusted set shows your Home's current DID. To fix this, run
-`elastos source list` to find the existing source name, then replace
-`EXISTING_SOURCE` below and re-trust once:
+The trusted set shows your Home's current DID. To re-trust once, run the
+publisher's installer over the existing installation, using the same command
+as a fresh install:
 
 ```sh
-elastos source add --name EXISTING_SOURCE --publisher did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Runtime asks for the complete new DID. Entering another value cancels the
-change. This step keeps the source's channel, install path, Carrier ticket and
-gateways. After confirmation, Runtime accepts release signatures from the new
-DID and refuses signatures from the former DID. Then run `elastos update`.
+The installer trusts the new DID, installs the release and keeps your existing
+identity, accounts and user files. Later updates accept release signatures from
+the new DID and refuse signatures from the former DID. Homes that already trust
+this DID can use normal updates.
 Until you re-trust, Home still trusts the old key and remains exposed if a copy
 of that key exists.
 
