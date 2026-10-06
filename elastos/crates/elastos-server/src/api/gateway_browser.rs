@@ -1610,7 +1610,8 @@ enum BrowserLaunchReconciliationDecision {
 
 pub(in crate::api::gateway) const BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT: Duration =
     Duration::from_secs(30);
-const BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF: Duration = Duration::from_millis(100);
+pub(in crate::api::gateway) const BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF: Duration =
+    Duration::from_millis(100);
 const BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT: usize = 8;
 
