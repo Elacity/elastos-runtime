@@ -12,7 +12,7 @@ separate artifact identities and verification records.
 ## Current isolation and target boundary
 
 First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks their capability tokens before it performs an effect.
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
 Home can currently obtain every app's capability, so a compromised Home can
 reach those apps' authority. The target limits Home to delegation and gives each
 app a separate, revocable capability. The WASM Component authoring path runs in
@@ -52,10 +52,8 @@ and operator approval.
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-The source installer installs Runtime, sets up the Home profile, and opens Home.
-The published installer and signed release have their own acceptance evidence
-in GitHub issues. Keep
-the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
+The installer installs Runtime, sets up the Home profile, and opens Home. Its release acceptance evidence lives in GitHub issues.
+Keep the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
 later run `elastos` from a new shell. You do not need a separate `elastos serve`
 process for this path. Home is the user-facing front door to the managed
 Runtime.

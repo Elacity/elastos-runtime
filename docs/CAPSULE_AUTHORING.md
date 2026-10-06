@@ -29,7 +29,7 @@ whether to admit it under local trust policy.
 ## Current isolation and target boundary
 
 First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks their capability tokens before it performs an effect.
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
 Home can currently obtain every app's capability, so a compromised Home can
 reach those apps' authority. The target limits Home to delegation and gives each
 app a separate, revocable capability. The WASM Component authoring path runs in
@@ -112,6 +112,14 @@ The Component imports only `elastos:bus@v1`. It receives no WASI, environment,
 filesystem preopens, FIFO, raw socket, or gateway authority. Runtime validates
 Bus requests, chooses providers, and records audit events.
 
+Shipped first-party manifests retain legacy labels for update compatibility:
+web projections use `type=wasm`, and native providers and the host shell helper
+use `type=microvm` without the new native execution or ABI fields. Runtime
+accepts both formats and reports their actual execution in Home, Marketplace
+and the contract audit. These legacy labels grant the same Runtime-owned launch
+paths as the honest descriptors below. Shipped labels will change only after
+all supported Runtimes can parse the honest values.
+
 ### Web-projection fields
 
 A web projection uses:
@@ -138,7 +146,7 @@ projection path.
 
 ### Native-provider fields
 
-An installed native provider uses:
+Runtime accepts this honest descriptor for a native provider:
 
 ```json
 {
@@ -156,8 +164,8 @@ its contract; it does not make that provider available for installation or
 execution. `authority` describes requested ownership, not an operating-system
 sandbox. The current provider boundary is described above.
 
-The repository also has one internal `shell` host helper with descriptive
-`type`, `execution`, and `runtime_abi` values of `native-host`. It remains an
+Runtime accepts `native-host` for the `type`, `execution`, and `runtime_abi`
+fields of the internal `shell` host helper. It remains an
 existing trusted host launcher. Generic capsule compute and CLI `run` reject
 this helper type. It is separate from a sandboxed web shell projection.
 

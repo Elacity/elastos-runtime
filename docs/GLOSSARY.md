@@ -13,7 +13,7 @@ Key terms used in the ElastOS codebase and documentation.
 ## Current isolation and target boundary
 
 First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks their capability tokens before it performs an effect.
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
 Home can currently obtain every app's capability, so a compromised Home can
 reach those apps' authority. The target limits Home to delegation and gives each
 app a separate, revocable capability. The WASM Component authoring path runs in
