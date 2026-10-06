@@ -470,8 +470,8 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
         total += record["size"]
         require(total <= policy["max_snapshot_bytes"], "publication snapshot too large")
     usage = shutil.disk_usage(snapshot_root)
-    require((usage.free - total - 3 * MAX_JSON) * 100 >= usage.total * 15,
-            "snapshot would cross the 15 percent free-space floor")
+    require(usage.free >= total + 3 * MAX_JSON,
+            "snapshot needs more free space than the volume has")
     for name, record in sorted(records.items()):
         destination = snapshot_root / name
         snapshot_artifact(Path(name), destination, record, root_fd=held_root)

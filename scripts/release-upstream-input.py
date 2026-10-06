@@ -71,8 +71,8 @@ def directory(path):
 
 def disk_gate(path, additional):
     usage = shutil.disk_usage(path)
-    if (usage.free - additional) * 100 < usage.total * 15:
-        raise ValueError("build input would leave less than 15% free disk space")
+    if usage.free < additional:
+        raise ValueError("build input needs more free disk space than the volume has")
 
 
 def checksum_parts(checksum):

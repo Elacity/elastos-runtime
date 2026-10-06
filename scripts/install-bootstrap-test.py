@@ -295,6 +295,27 @@ class ShellTests(unittest.TestCase):
             with self.subTest(ticket=ticket, node=node):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
+    def test_install_space_keeps_the_shared_reserve_at_its_exact_boundary(self):
+        fake_df = ('df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n'
+                   '/dev/x 1 1 %s 1%% /\\n" "$1"; }\n')
+        reserve_kib = 2 * 1024 * 1024
+        needed_kib = 300 * 1024
+        available_kib = reserve_kib + needed_kib
+        # Exactly needed + reserve is accepted; needing one byte more than that is refused.
+        for available, size, accepted in [(available_kib, str(needed_kib * 1024), True),
+                                           (available_kib, str(needed_kib * 1024 + 1), False),
+                                           (reserve_kib, "", True),
+                                           (reserve_kib - 1, "", False),
+                                           (available_kib + 10**9, "big", False)]:
+            result = shell(fake_df.replace('"$1"', str(available))
+                           + 'require_install_space /tmp "$1"\n', size)
+            with self.subTest(available_kib=available, size=size):
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+        refused = shell(fake_df.replace('"$1"', str(available_kib))
+                        + 'require_install_space /tmp "$1"\n', str(needed_kib * 1024 + 1))
+        self.assertIn("not enough free space: this needs 0.3 GB plus 2 GB kept free",
+                      refused.stderr)
+
     def test_empty_gateway_array_fails_with_installer_message(self):
         result = shell('GATEWAYS=()\nipfs_fetch test-cid /unused\n')
         self.assertNotEqual(result.returncode, 0)

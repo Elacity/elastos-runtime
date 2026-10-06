@@ -137,7 +137,7 @@ fn copy_tree(source: &Path, dest: &Path) -> anyhow::Result<()> {
                 break;
             }
             let (total, available) = disk_space(dest.parent().unwrap())?;
-            require_disk_reserve(total, available, count as u128)?;
+            require_update_space(total, available, count as u128)?;
             output.write_all(&buffer[..count])?;
         }
         output.sync_all()?;
