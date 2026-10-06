@@ -1,12 +1,9 @@
 # Deferred and future work
 
 The [dated backlog snapshot](audits/2026-09-23-open-backlog-snapshot.md)
-preserves the open follow-up removed from `TASKS.md`. It is a record for later
-triage, not a second execution queue. [TASKS.md](../TASKS.md#now) owns the
-ordered release queue, [state.md](../state.md) owns verified facts, and the
-[0.7.1 release plan](https://app.notion.com/p/3d6b682adcca81948f78d12abcd677b9)
-decides what is Required, Optional or Later. A later item enters Now when scope
-changes; execution starts only after its owner, target and next proof are named.
+preserves earlier open follow-up. It is a record for later triage, not a second
+execution queue. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own the work queue and verified facts; an item
+starts only when it has an issue with an owner, target and next proof.
 
 ## Retained source integration
 

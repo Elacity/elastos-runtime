@@ -23,14 +23,11 @@ are the only place for work status, acceptance criteria and proof.
 - Run at most one heavy local build on this Mac at a time. Workers agree which
   issue owns that build before starting it. CI builds do not count toward this
   local limit. Continue reviews, source work or other light checks in parallel.
-- Update the owning GitHub issue before reporting a state change. Routine
-  status notes and check-ins link the PR, CI run and review, then state the
-  result and remaining work. Keep exact source, tree and artifact identities
-  in installed-binary and release receipts, and in the private lifecycle
-  inventory. A routine status note uses those links instead of copied hashes.
+- Comment on GitHub only for a decision, a result with its link, a blocker or a review verdict.
+  Keep comments to at most 3 lines: no narration, hashes, receipts or agent-to-agent coordination.
+  Put status in the issue checklist.
 - Keep one work record. Do not create briefings, plans, gists or notes files.
-  Existing `state.md`, `TASKS.md` and dated audits are historical references;
-  move useful open work to its issue instead of maintaining a parallel queue.
+  Move useful open work from dated audits to its issue.
 - Keep seed security details, credentials and private operator data out of
   public issues, PRs and logs. Give the public issue only a safe summary and
   the approval or verification still needed. Retain sensitive raw evidence
@@ -74,7 +71,7 @@ are the only place for work status, acceptance criteria and proof.
   identities in the lifecycle inventory or the installed-artifact receipt;
   routine check-ins link the related PR, CI run and review.
 - Always report remote divergence. A local branch being green is not the same as
-  `elacity/<branch>` being up to date.
+  the remote branch being up to date.
 
 ## Creating Work Branches
 
@@ -105,6 +102,12 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
   merges back into `develop`.
 - 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets
   its Done means.
+
+## Canary releases
+
+Canary builds come from a `develop` commit through
+`.github/workflows/release-package.yml` and are published with
+`scripts/release-publish.sh` (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)).
 
 ## Branch Lifecycle
 
@@ -292,8 +295,8 @@ capsules, provider config, and `components.json`.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
-- Put work status and proof in the owning GitHub issue. Keep release history in
-  `elastos/CHANGELOG.md` and product instructions in the relevant documentation.
+- Keep release history in `elastos/CHANGELOG.md` and product instructions in
+  the relevant documentation.
 - Keep product documentation release-neutral. Use version numbers only for
   exact release state, compatibility or migration, release notes or changelogs,
   manifests, and exact Git refs or evidence. Keep standing instructions,

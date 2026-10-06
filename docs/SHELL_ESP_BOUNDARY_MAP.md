@@ -1,8 +1,8 @@
 # Shell ESP Boundary Map
 
 This map is the durable public boundary for Home shells, ESP, Inspector, and
-shared projection code. It is not a branch extraction log. Current truth belongs
-in `state.md`, open work belongs in `TASKS.md`, and release history belongs in
+shared projection code. It is not a branch extraction log. Current truth and open
+work belong in GitHub issues, and release history belongs in
 `elastos/CHANGELOG.md`.
 
 ## Ground Rule

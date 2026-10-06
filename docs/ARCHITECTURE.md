@@ -1,9 +1,8 @@
 # ElastOS architecture
 
-This document describes the intended system architecture. For current behavior,
-proof level, and command expectations, see [state.md](../state.md) and
-[COMMAND_MATRIX.md](COMMAND_MATRIX.md). Verified security findings belong in
-[SECURITY.md](../SECURITY.md), and open work belongs in [TASKS.md](../TASKS.md).
+This document describes the intended system architecture. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+own current status and proof; [COMMAND_MATRIX.md](COMMAND_MATRIX.md) defines
+command expectations and [SECURITY.md](../SECURITY.md) records security findings.
 
 ## Architectural direction
 
@@ -62,9 +61,8 @@ candidate's bounded People discovery uses the same Runtime-owned path. Wider
 discovery rendezvous and the old Services remote-Exit social/contact path remain
 separate work.
 
-Sequencing and incomplete work belong in [ROADMAP.md](../ROADMAP.md) and
-[TASKS.md](../TASKS.md). This document defines the following authority
-and recovery invariants:
+Sequencing and incomplete work belong in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+This document defines the following authority and recovery invariants:
 
 - A passkey proves local principal authority. It is not a DID, wallet key,
   decryption key, or source of ambient administrator authority.
@@ -77,7 +75,7 @@ and recovery invariants:
   revoke replaced sessions, and leave an audit trail. It must not fall back to
   a device-global key.
 - Protection configured, root encrypted, and root recoverable are separate
-  claims. Current coverage and exclusions belong in [state.md](../state.md).
+  claims. [Private-data acceptance](https://github.com/Elacity/elastos-runtime/issues/209) owns coverage and exclusions.
 
 ### Identity and object claims
 
@@ -176,8 +174,8 @@ separate capsule contracts or support claims.
 
 Capsules depend on the Capsule Runtime contract, not a presentation host. A web
 projection declares its browser entrypoint and projection metadata; the host
-adapter decides how to present it. See [INSTALL.md](INSTALL.md) and
-[state.md](../state.md) for current platform evidence.
+adapter decides how to present it. See [INSTALL.md](INSTALL.md) for the contract
+and [install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89) for platform evidence.
 
 Keep these concerns separate:
 

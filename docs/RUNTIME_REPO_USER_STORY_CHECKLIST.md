@@ -3,8 +3,7 @@
 This checklist defines evidence to collect; it does not declare that a check
 passed.
 
-Current behavior and known limitations belong in [state.md](../state.md).
-Open work belongs in [TASKS.md](../TASKS.md). Release history belongs in
+Current behavior, known limitations and open work belong in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Release history belongs in
 [elastos/CHANGELOG.md](../elastos/CHANGELOG.md).
 
 ## Proof rules
@@ -36,7 +35,7 @@ git diff --stat "${ELASTOS_REVIEW_BASE}...HEAD"
 git rev-list --left-right --count "${ELASTOS_REVIEW_BASE}...HEAD"
 ```
 
-Select the candidate and integration base from `state.md` and fetched refs.
+Select the candidate and integration base from the owning GitHub issue and fetched refs.
 Set `ELASTOS_REVIEW_BASE` to that fetched base before running the comparison.
 Source integration does not publish release artifacts or activate the new
 protected-content path.
@@ -45,7 +44,7 @@ protected-content path.
 
 Before a separately approved merge to `main`:
 
-1. Account for the included work in `TASKS.md` and the explicitly deferred scope in `docs/DEFERRED_WORK.md`.
+1. Account for the included work in its GitHub issues and the explicitly deferred scope in `docs/DEFERRED_WORK.md`.
 2. Pass all CI jobs on the exact candidate, including both Linux architectures,
    macOS source-home and the release build.
 3. Preserve reviewed ancestry and authorship. Integrate dependent work into its
@@ -97,7 +96,7 @@ Review the candidate in authority-owned slices:
 7. Model/Assistant contracts and configured-offer behavior.
 8. Release metadata, manifests, checksums, documentation, and installer truth.
 
-Use `TASKS.md`, `docs/DEFERRED_WORK.md` and `state.md` to identify the included and deferred scope for
+Use the GitHub issues and `docs/DEFERRED_WORK.md` to identify the included and deferred scope for
 the candidate under review.
 
 ## Installed acceptance
@@ -121,7 +120,7 @@ provider evidence pass together.
 
 The bounded Browser claim and its restart, login-retention,
 profile-protection, and performance limitations are recorded in
-[state.md](../state.md). Do not advertise general-purpose, cross-platform, or
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Do not advertise general-purpose, cross-platform, or
 arbitrary-dapp Browser reliability without the matching acceptance evidence.
 
 ## Release gate
@@ -154,5 +153,5 @@ bash scripts/public-install-operator-smoke.sh
 
 Release only when all required source and installed checks pass for the exact
 tree, every public claim has matching evidence, and remaining limitations are
-written plainly in `state.md` and the changelog. Otherwise keep the branch as a
+written plainly in the owning issue and the changelog. Otherwise keep the branch as a
 review candidate and name the first failing boundary.

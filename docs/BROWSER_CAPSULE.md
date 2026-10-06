@@ -1,7 +1,7 @@
 # Browser Capsule Architecture
 
 > Architecture target, not current shipped behavior. For current proof level see
-> [../state.md](../state.md).
+> [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 The shared wire definitions and version rules are in
 [Browser contract](BROWSER_PROTOCOL.md). Device roles, resource requirements and
@@ -53,7 +53,7 @@ tamper rejection. Execution-service unavailability is tested separately. Browser
 proof then distinguishes local Engine admission from remote service use without a local
 Engine image. Runtime preserves user state and reports unavailable content or
 services as separate outcomes. This section defines the target contract; current
-installation and replication evidence remains in state.md.
+installation and replication evidence belongs in the owning GitHub issue.
 
 ## Decision
 

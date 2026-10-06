@@ -13,5 +13,4 @@ Runtime serves the projection at `/apps/home/`. Browser assets live under
 
 The [Home shell host contract](../../docs/HOME_SHELL_HOST_CONTRACT.md) owns the
 authority, isolation, lifecycle, and message rules. See
-[state.md](../../state.md) for verified implementation status and
-[TASKS.md](../../TASKS.md) for open work.
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for status and open work.

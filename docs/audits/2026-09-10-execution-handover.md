@@ -15,8 +15,8 @@ checks. Recurring monitoring stays paused. Full J1–J5 and D1–D6 acceptance r
 
 ## Resume here
 
-Read this document, the single Now queue in [TASKS.md](../../TASKS.md),
-[state.md](../../state.md), [PRINCIPLES.md](../../PRINCIPLES.md), and the approved
+Read this document, the single Now queue in [TASKS.md](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/TASKS.md),
+[state.md](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md), [PRINCIPLES.md](../../PRINCIPLES.md), and the approved
 [Notion plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9).
 Notion owns D1–D6 and required acceptance. TASKS owns next work; state owns
 verified facts. Private process, path, proof and inventory details are in the

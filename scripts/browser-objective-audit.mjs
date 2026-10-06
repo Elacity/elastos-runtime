@@ -295,8 +295,6 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
       architectureOk,
       [
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
-        "ROADMAP.md",
-        "TASKS.md",
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-runbook.mjs",
       ],
@@ -333,8 +331,6 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
       "Keep the plan and implementation gates current after each Browser iteration.",
       architectureOk && criterionOk(criteria, "native_media_preflight_gate"),
       [
-        "TASKS.md",
-        "ROADMAP.md",
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
         "scripts/browser-provider-runbook.mjs",
         "scripts/browser-objective-audit.mjs",
@@ -353,11 +349,8 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const tasks = readRepo("TASKS.md");
-  const roadmap = readRepo("ROADMAP.md");
   const browserDocs = readRepo("docs/BROWSER_CAPSULE.md");
   const bakeoffDocs = readRepo("docs/BROWSER_PROVIDER_BAKEOFF.md");
-  const planningSurface = [tasks, roadmap, browserDocs, bakeoffDocs].join("\n");
   const supervisor = readRepo("elastos/tools/browser-engine-supervisor/src/main.rs");
   const nativeConfig = readRepo("scripts/browser-native-operator-config.mjs");
   const nativePreflightScript = readRepo("scripts/browser-native-target-preflight.sh");
@@ -400,29 +393,22 @@ function main() {
       "Browser work uses one Browser/Net/Exit ABI instead of one-off host iframes or fallback display paths.",
       browserDocs.includes("Browser UI capsule") &&
         bakeoffDocs.includes("Runtime Browser open route") &&
-        bakeoffDocs.includes("No candidate gets a new Browser ABI") &&
-        tasks.includes("one Browser/Net/Exit ABI"),
-      ["docs/BROWSER_CAPSULE.md", "docs/BROWSER_PROVIDER_BAKEOFF.md", "TASKS.md"],
+        bakeoffDocs.includes("No candidate gets a new Browser ABI"),
+      ["docs/BROWSER_CAPSULE.md", "docs/BROWSER_PROVIDER_BAKEOFF.md"],
       "Document the one Browser/Net/Exit ABI and reject candidate-specific Browser ABIs.",
     ),
     criterion(
       "selkies_is_baseline_not_product",
       "Selkies/Docker is treated as backend packaging and baseline proof, not the final browser answer.",
-      bakeoffDocs.includes("Selkies remains the self-hosted baseline/proof") &&
-        roadmap.includes("not the final product") &&
-        (planningSurface.includes("Selkies is the current self-hosted baseline") ||
-          planningSurface.includes("Selkies as the current self-hosted baseline")) &&
-        planningSurface.includes("not the acceptance answer"),
-      ["docs/BROWSER_PROVIDER_BAKEOFF.md", "ROADMAP.md", "TASKS.md"],
-      "Make Selkies baseline-only language explicit in docs/tasks.",
+      bakeoffDocs.includes("Selkies remains the self-hosted baseline/proof"),
+      ["docs/BROWSER_PROVIDER_BAKEOFF.md"],
+      "Make Selkies baseline-only language explicit in the bake-off docs.",
     ),
     criterion(
       "native_product_path_defined",
       "Native/local adapter is the product-performance path for low latency and real audio/video surfaces.",
-      bakeoffDocs.includes("performance path is native/local first") &&
-        roadmap.includes("native/local browser adapters for lowest-latency") &&
-        planningSurface.includes("native Chromium/CEF-style adapter"),
-      ["docs/BROWSER_PROVIDER_BAKEOFF.md", "ROADMAP.md", "TASKS.md"],
+      bakeoffDocs.includes("performance path is native/local first"),
+      ["docs/BROWSER_PROVIDER_BAKEOFF.md"],
       "Record native/local browser adapter as the product-performance path.",
     ),
     criterion(
@@ -450,12 +436,10 @@ function main() {
         decisionReport.includes("provision_kasm_workspaces_first") &&
         runbook.includes("## Next Action") &&
         runbook.includes("nextActionBlock") &&
-        planningSurface.includes("structured `next_action`") &&
         bakeoffDocs.includes("structured `next_action`"),
       [
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-runbook.mjs",
-        "TASKS.md",
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
       ],
       "Make the decision report emit a structured next_action and render it in the runbook before candidate-specific commands.",
@@ -468,16 +452,10 @@ function main() {
         decisionReport.includes("separate provider instance") &&
         decisionReport.includes("provision_kasm_workspaces_first") &&
         decisionReportSmoke.includes("busy_selkies_next_action_exercised") &&
-        decisionReportSmoke.includes("must not recommend more Selkies tuning") &&
-        planningSurface.includes("Freeze new Browser provider implementation") &&
-        planningSurface.includes("do not spend more branch time tuning Selkies as the product path") &&
-        roadmap.includes("Browser work should stop") &&
-        roadmap.includes("contract/gate layer"),
+        decisionReportSmoke.includes("must not recommend more Selkies tuning"),
       [
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-decision-report-smoke.sh",
-        "TASKS.md",
-        "ROADMAP.md",
       ],
       "Make this host's stop condition explicit: do not keep tuning the running Selkies baseline when product proof requires an operator-owned hosted candidate or a native target with compositor/audio/network isolation.",
     ),

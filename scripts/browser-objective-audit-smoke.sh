@@ -136,8 +136,6 @@ fi
   if (
     !plannedItem ||
     !Array.isArray(plannedItem.evidence) ||
-    !plannedItem.evidence.includes("TASKS.md") ||
-    !plannedItem.evidence.includes("ROADMAP.md") ||
     !plannedItem.evidence.includes("docs/BROWSER_PROVIDER_BAKEOFF.md") ||
     !plannedItem.evidence.includes("scripts/browser-objective-audit.mjs")
   ) {
