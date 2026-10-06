@@ -592,8 +592,8 @@ jobs:
   source-home-macos:
     name: source-home-macos
     runs-on: macos-14
-    # The update journey step alone may take 45 minutes.
-    timeout-minutes: 120
+    # The two hop builds may take 30 minutes and the update journey step 75.
+    timeout-minutes: 150
     needs: source-gate
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -715,7 +715,8 @@ jobs:
           path: ${{ runner.temp }}/previous-release-cache
           key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
       - name: build two actual Runtime versions
-        timeout-minutes: 16
+        # This source compiled twice (new and next) over the restored intermediates.
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
@@ -743,15 +744,17 @@ jobs:
           python3 scripts/update-hop-compare.py generate-ci-hop "$CI_HOP_ROOT/package" \
             --runtime "$CI_HOP_ROOT/build-inputs/elastos-old" \
             --next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new" \
+            --system-runtime "$CI_HOP_ROOT/build-inputs/elastos-system" \
             --build-receipt "$CI_HOP_ROOT/build-inputs/build.json" \
             --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
             --previous "$RUNNER_TEMP/previous-release" \
             > "$CI_HOP_ROOT/generation.json"
       - name: prove installed Home account and System update with Carrier hop and refusals
-        # Expected about 15 minutes. Its longest waits are the Home journey's caps (sign-up
-        # 240 s, update 420 s, refusal 330 s, preference 120 s, Undo commands 2 x 300 s,
-        # Home start 150 s, reconnect 420 s): 38 minutes, plus the CLI installs and refusals.
-        timeout-minutes: 45
+        # Expected about 20 minutes. The Home journey's waits are capped at: sign-up 240 s,
+        # old System refusal 330 s, CLI update 300 s, 3 Home starts x 150 s, 3 reconnects
+        # x 420 s (CLI update, next release, Undo), tampered refusal 330 s, Undo commands
+        # 2 x 300 s: 59 minutes in the worst case, plus the CLI installs and refusals.
+        timeout-minutes: 75
         env:
           ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal
           ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"

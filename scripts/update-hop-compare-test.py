@@ -1261,7 +1261,7 @@ class CliFixtureTests(unittest.TestCase):
                 with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), \
                      patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
                      patch.object(observer.subprocess, "run") as command, self.assertRaises(ValueError):
-                    observer.cli_generate_hop(generated, runtime, runtime, runtime, support, self.root / "previous",
+                    observer.cli_generate_hop(generated, runtime, runtime, runtime, runtime, support, self.root / "previous",
                                              localhost_metadata=None if fault == "absent" else archive)
                 command.assert_not_called()
                 self.assertFalse(generated.exists())
@@ -1829,6 +1829,8 @@ class CliFixtureTests(unittest.TestCase):
         native.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16)
         next_runtime = self.root / "next-runtime"
         next_runtime.write_bytes(native.read_bytes() + b"next version")
+        system_runtime = self.root / "system-runtime"
+        system_runtime.write_bytes(native.read_bytes() + b"System-applied version")
         build_receipt = self.root / "build-receipt.json"
         source = {"commit": "a" * 40, "tree": "a" * 40}
         previous, published_source = self.previous_release(native)
@@ -1836,7 +1838,8 @@ class CliFixtureTests(unittest.TestCase):
             "command": ["cargo", "build", "--locked", "--release", "-p", "elastos-server", "--bin", "elastos"],
             "status": "passed", "cleanup": {"passed": True}, **{name: {"source": binary_source, "version": version,
             "sha256": observer.digest(path), "version_environment": environment} for name, path, version, binary_source, environment in (
-                ("old", native, "0.7.1", published_source, None), ("new", next_runtime, "0.7.2", source, "0.7.2"))}})
+                ("old", native, "0.7.1", published_source, None), ("new", next_runtime, "0.7.2", source, "0.7.2"),
+                ("next", system_runtime, "0.7.3", source, "0.7.3"))}})
         if local_rehearsal is not None or foreign_build:
             build = observer.cli_json(build_receipt)
             build.update(proof_scope="local-rehearsal", reference=local_rehearsal or "local-rehearsal:" + "a" * 40 + ":UP-03-test")
@@ -1846,9 +1849,10 @@ class CliFixtureTests(unittest.TestCase):
         generated = self.root / "generated"
         real_run, key_paths = observer.subprocess.run, []
         def command(argv, **kwargs):
-            if Path(argv[0]).name in ("elastos", "elastos-next"):
+            versions = {"elastos": b"elastos 0.7.1\n", "elastos-next": b"elastos 0.7.2\n", "elastos-system": b"elastos 0.7.3\n"}
+            if Path(argv[0]).name in versions:
                 if argv[1] == "--version":
-                    return subprocess.CompletedProcess(argv, 0, b"elastos 0.7.2\n" if Path(argv[0]).name == "elastos-next" else b"elastos 0.7.1\n", b"")
+                    return subprocess.CompletedProcess(argv, 0, versions[Path(argv[0]).name], b"")
                 self.assertEqual(argv[1], "sign-payload")
                 key = Path(argv[argv.index("--key") + 1])
                 key_paths.append(key)
@@ -1885,12 +1889,13 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.subprocess, "run", side_effect=command), patch.object(observer.subprocess, "check_output", side_effect=git):
             if foreign_build:
                 with self.assertRaisesRegex(ValueError, "hop build proof scope differs"):
-                    observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, previous)
+                    observer.cli_generate_hop(generated, native, next_runtime, system_runtime, build_receipt, support, previous)
                 self.assertTrue(key_paths)
                 self.assertTrue(all(not path.exists() for path in key_paths))
                 self.assertFalse((generated / "generator").exists())
                 return
-            receipt = observer.cli_generate_hop(generated, native, next_runtime, build_receipt, support, previous, local_rehearsal, metadata_path)
+            receipt = observer.cli_generate_hop(generated, native, next_runtime, system_runtime, build_receipt, support, previous,
+                                                local_rehearsal, metadata_path)
         self.assertEqual(receipt["proof_scope"], "local-rehearsal" if local_rehearsal is not None else "ci-rehearsal")
         if local_rehearsal is not None:
             self.assertEqual(receipt["reference"], local_rehearsal)
@@ -1926,7 +1931,7 @@ class CliFixtureTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     observer.cli_admit_model_fixture(generated, changed)
         catalogue_path.write_bytes(original_catalogue)
-        self.assertEqual(set(generated_manifest["publications"]), set(observer.CLI_PHASES))
+        self.assertEqual(set(generated_manifest["publications"]), {*observer.CLI_PHASES, observer.CLI_SYSTEM_PHASE})
         components = observer.cli_json(generated / generated_manifest["publications"]["new"]["components"])
         qualified = observer.cli_json(support / "components.json")
         if metadata:
@@ -2024,7 +2029,12 @@ class CliFixtureTests(unittest.TestCase):
             changed["new"]["version"] = "0.7.3"
         def new_components_as_old(changed):
             changed["publications"]["old"]["components"] = changed["publications"]["new"]["components"]
-        for change in (same_build_old, same_source_old, new_support_as_old, skipped_release, new_components_as_old):
+        def new_build_as_system_release(changed):
+            changed["publications"]["next"]["binary"] = changed["publications"]["new"]["binary"]
+        def system_release_skips_one(changed):
+            changed["next"]["version"] = "0.7.4"
+        for change in (same_build_old, same_source_old, new_support_as_old, skipped_release, new_components_as_old,
+                       new_build_as_system_release, system_release_skips_one):
             with self.subTest(change=change.__name__):
                 changed = json.loads(json.dumps(manifest))
                 change(changed)
@@ -2079,7 +2089,8 @@ class CliFixtureTests(unittest.TestCase):
                     "old": {"version": "0.8.0-alpha.6"}, "new": {"version": "0.8.0-alpha.7"},
                     "previous_release": {"version": "0.8.0-alpha.6"},
                     "paths": {"m1-install": {"checks": {"initial-home": {
-                        "system": {"provider_warnings": {"new": []}},
+                        "system": {"provider_warnings": {"new": []}, "frozen_support": {"phase": "restored"},
+                                   "cli_update": {"status": "passed"}},
                         "undo": {"status": "passed", "version": "0.8.0-alpha.6",
                                  "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}}}}
         self.assertEqual(observer.cli_check_result(result())["from"], "0.8.0-alpha.6")
@@ -2089,6 +2100,9 @@ class CliFixtureTests(unittest.TestCase):
                   "same-build hop": lambda value: value.pop("previous_release"),
                   "other old release": lambda value: value["old"].update(version="0.8.0-alpha.5"),
                   "no Undo": lambda value: home(value).pop("undo"),
+                  # alpha.6's System applying changed support would hide the known limit; record it.
+                  "published System applied changed support": lambda value: home(value)["system"]["frozen_support"].update(phase="updated"),
+                  "no CLI update from the published release": lambda value: home(value)["system"].pop("cli_update"),
                   "plain downgrade applied": lambda value: home(value)["undo"]["refused_plain_update"].update(exit=0)}
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
@@ -2098,7 +2112,7 @@ class CliFixtureTests(unittest.TestCase):
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
-            observer.cli_generate_hop(self.root / "generated", self.root / "missing", self.root / "missing", self.root / "missing", self.root, self.root / "missing")
+            observer.cli_generate_hop(self.root / "generated", *(self.root / "missing" for _ in range(4)), self.root, self.root / "missing")
 
     def test_hop_builder_preserves_n_and_compiles_n_plus_one_with_version_input(self):
         self.assert_hop_builder()
@@ -2121,12 +2135,13 @@ class CliFixtureTests(unittest.TestCase):
             if label == "old-version":
                 self.assertEqual(argv[0], str(destination / "elastos-old"))
                 stdout = b"elastos 0.8.0-alpha.6\n"
-            elif label == "build-next":
-                self.assertEqual(env["ELASTOS_RELEASE_VERSION"], "0.8.0-alpha.7")
+            elif label in ("build-next", "build-system"):
+                version = "0.8.0-alpha.7" if label == "build-next" else "0.8.0-alpha.8"
+                self.assertEqual(env["ELASTOS_RELEASE_VERSION"], version)
                 self.assertEqual(timeout, 900)
-                runtime.write_bytes(header + b"N+1")
+                runtime.write_bytes(header + (b"N+1" if label == "build-next" else b"N+2"))
             else:
-                stdout = b"elastos 0.8.0-alpha.7\n"
+                stdout = b"elastos 0.8.0-alpha.7\n" if label == "new-version" else b"elastos 0.8.0-alpha.8\n"
             (destination / (label + ".stdout")).write_bytes(stdout)
             (destination / (label + ".stderr")).write_bytes(b"")
             return {"exit": 0}
@@ -2147,7 +2162,11 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual((destination / "elastos-new").read_bytes(), header + b"N+1")
         self.assertEqual(receipt["new"]["version_environment"], "0.8.0-alpha.7")
         self.assertEqual(receipt["new"]["sha256"], observer.digest(destination / "elastos-new"))
-        self.assertEqual(calls[1][0], receipt["command"])
+        # The release new's System applies is this source compiled again as the one after it.
+        self.assertEqual((destination / "elastos-system").read_bytes(), header + b"N+2")
+        self.assertEqual((receipt["next"]["version"], receipt["next"]["source"]), ("0.8.0-alpha.8", receipt["new"]["source"]))
+        self.assertEqual(receipt["next"]["sha256"], observer.digest(destination / "elastos-system"))
+        self.assertEqual([argv for argv, _, _ in calls if argv == receipt["command"]], [receipt["command"]] * 2)
         if local_rehearsal is not None:
             self.assertEqual((receipt["proof_scope"], receipt["reference"]), ("local-rehearsal", local_rehearsal))
 
@@ -2184,7 +2203,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
              patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
-             self.assertRaisesRegex(ValueError, "next Runtime build failed"):
+             self.assertRaisesRegex(ValueError, "new Runtime build failed"):
             observer.cli_build_hop(destination, runtime, previous)
         receipt = observer.cli_json(destination / "build.json")
         self.assertEqual(receipt["status"], "failed")
@@ -2230,7 +2249,7 @@ class CliFixtureTests(unittest.TestCase):
              patch.object(observer.sys, "platform", "darwin"), patch.object(observer.platform, "machine", return_value="arm64"), \
              patch.object(observer.subprocess, "run", side_effect=failed), patch.object(observer.subprocess, "check_output", return_value="a" * 40 + "\n"), \
              self.assertRaisesRegex(ValueError, "disposable fixture command failed"):
-            observer.cli_generate_hop(generated, runtime, runtime, runtime, support, previous)
+            observer.cli_generate_hop(generated, runtime, runtime, runtime, runtime, support, previous)
         self.assertFalse((generated / "generator").exists())
 
     def fake_run(self, apply_stderr="", local_did=HOLDER_DID, bootstrap_fields=None, restart_fields=None,

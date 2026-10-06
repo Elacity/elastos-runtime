@@ -58,13 +58,15 @@ update-hop-previous-release.json (pin-previous-release moves the pin after a
 publish; fetch-previous-release fetches its signed bytes into a SHA-256 cache).
 Old keeps that release's Runtime, Home support and source installer; CI
 republishes them under one disposable key, so this proves the published code and
-data layout, not the maintainer key. build.rs compiles this source as the next
-release; the build receipt binds sources, version environment, command and both
-binary hashes. Refusals claim the release after new and are offered to an
-installed new release, so this source's update code refuses them. Home updates
-through System, refuses a tampered offer, writes data, and is undone with
-`update --rollback-to` after a plain update to old is refused. check-result is
-the CI verdict on result.json.
+data layout, not the maintainer key. build.rs compiles this source twice: as new,
+the release after old, and as next, the release after new; the build receipt
+binds sources, version environments, command and the binary hashes. Refusals claim
+next's version and are offered to an installed new release, so this source's
+update code refuses them. Through the pages, old's System refuses new (its support
+changed, a known limit of old: #246) and keeps Home; old's CLI `update` installs
+new; new's System refuses a tampered offer and applies next; data is written and
+the hop is undone with `update --rollback-to` after a plain update to old is
+refused. check-result is the CI verdict on result.json.
 `selectors` uses m1-install/old and m2-discovery/new with the same refusal list.
 
 `holder.files` maps Home-relative destinations to inventoried public payload
@@ -566,6 +568,8 @@ def run(config, output):
 CLI_MODE = "cli-install-update"
 CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", "wrong-platform", "wrong-version")
 CLI_PHASES = ("old", "new", *CLI_REFUSALS)
+# A cross-version fixture also publishes the release after new, which new's System applies.
+CLI_SYSTEM_PHASE = "next"
 CLI_DATA = "Library/Application Support/elastos"
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
 CLI_INSTALLED_METADATA = ("installation/release-head.json", "installation/release.json")
@@ -802,7 +806,8 @@ def cli_admit(config, local_rehearsal=None):
     need(set(selectors) == {"m1-install", "m2-discovery"}, "fixed CLI selectors required")
     for selector, positive in (("m1-install", "old"), ("m2-discovery", "new")):
         need(selectors[selector] == {"positive": positive, "refusals": list(refusals)}, "selector phase mapping differs")
-    need(set(manifest["publications"]) == (set(CLI_PHASES) if refusals else {"old", "new"}), "complete scoped publication set required")
+    expected_phases = (set(CLI_PHASES) if refusals else {"old", "new"}) | ({CLI_SYSTEM_PHASE} if "previous" in manifest else set())
+    need(set(manifest["publications"]) == expected_phases, "complete scoped publication set required")
     for phase, publication in manifest["publications"].items():
         need(set(publication) == {"head", "release", "receipt", "binary", "components", "catalogue"}, "publication snapshot incomplete")
         need(all(relative in manifest["files"] for relative in publication.values()), "publication bytes missing from inventory")
@@ -1077,7 +1082,8 @@ def cli_prepare_ci_disk():
 
 
 def cli_build_hop(root, runtime, previous, local_rehearsal=None):
-    """Keep the pinned published Runtime as old; compile this source as its next release."""
+    """Keep the pinned published Runtime as old; compile this source as the release after it
+    (new, which old's CLI installs) and the one after that (next, which new's System applies)."""
     local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
     if local_source is None:
         need(os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true"
@@ -1115,18 +1121,21 @@ def cli_build_hop(root, runtime, previous, local_rehearsal=None):
         new_version = cli_next_version(pin["version"])
         receipt["old"] = {"version": pin["version"], "sha256": digest(old), "source": published["source"],
                           "release_sha256": pin["release_sha256"], "version_environment": None}
-        env = dict(os.environ)
-        env["ELASTOS_RELEASE_VERSION"] = new_version
-        built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", "build-next", timeout=900)
-        need(built["exit"] == 0, "next Runtime build failed")
-        new = root / "elastos-new"
-        shutil.copyfile(runtime, new)
-        new.chmod(0o755)
-        cli_macho(new, release_platform)
-        reply = processes.command([str(new), "--version"], cli_environment(root), root, "new-version", timeout=15)
-        need(reply["exit"] == 0 and processes.text("new-version") == "elastos " + new_version + "\n"
-             and not processes.text("new-version", "stderr") and digest(new) != digest(old), "next Runtime exact version or bytes differ")
-        receipt["new"] = {"version": new_version, "sha256": digest(new), "source": source, "version_environment": new_version}
+        for name, label, version in (("new", "build-next", new_version), ("next", "build-system", cli_next_version(new_version))):
+            env = dict(os.environ)
+            env["ELASTOS_RELEASE_VERSION"] = version
+            built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", label, timeout=900)
+            need(built["exit"] == 0, name + " Runtime build failed")
+            binary = root / ("elastos-new" if name == "new" else "elastos-system")
+            shutil.copyfile(runtime, binary)
+            binary.chmod(0o755)
+            cli_macho(binary, release_platform)
+            reply = processes.command([str(binary), "--version"], cli_environment(root), root, name + "-version", timeout=15)
+            need(reply["exit"] == 0 and processes.text(name + "-version") == "elastos " + version + "\n"
+                 and not processes.text(name + "-version", "stderr")
+                 and digest(binary) not in {value["sha256"] for value in receipt.values() if isinstance(value, dict) and "sha256" in value},
+                 name + " Runtime exact version or bytes differ")
+            receipt[name] = {"version": version, "sha256": digest(binary), "source": source, "version_environment": version}
         need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
              and all(subprocess.check_output(["git", "rev-parse", ref], text=True).strip() == source[key]
                      for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))), "hop source changed during build")
@@ -1362,6 +1371,18 @@ def cli_admit_previous(root, manifest, env):
          and manifest["files"][previous["published_components"]]["sha256"] == artifacts["components"]["sha256"]
          and old["components"] == previous["components"], "old publication is not the pinned release")
     need(manifest["new"]["version"] == cli_next_version(pin["version"]), "new publication is not the next release")
+    # New's System applies the release after it: this source compiled again, with new's support.
+    system, new = manifest["publications"][CLI_SYSTEM_PHASE], manifest["publications"]["new"]
+    build = cli_json(cli_path(root, manifest["build"]))
+    need(manifest[CLI_SYSTEM_PHASE]["version"] == cli_next_version(manifest["new"]["version"])
+         and manifest[CLI_SYSTEM_PHASE]["source"] == manifest["new"]["source"]
+         and build[CLI_SYSTEM_PHASE]["version"] == manifest[CLI_SYSTEM_PHASE]["version"]
+         and build[CLI_SYSTEM_PHASE]["sha256"] == manifest["files"][system["binary"]]["sha256"]
+         and manifest["files"][system["binary"]]["sha256"] not in
+             {manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("old", "new")}
+         and system["components"] == new["components"], "System publication is not this source's following release")
+    if manifest["proof_kind"] == "real-runtime":
+        cli_macho(cli_path(root, system["binary"]), manifest["platform"])
     need(cli_installer_metadata(cli_path(root, previous["installer"]), env) == [manifest["signer_did"], ""],
          "previous installer signer or blank HEAD_CID differs")
     # Native support is published unpacked, so its signed hash binds the installed bytes;
@@ -1698,7 +1719,7 @@ def cli_fetch_previous_release(cache, output, pin_path=None):
     return receipt
 
 
-def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, previous, local_rehearsal=None, localhost_metadata=None):
+def cli_generate_hop(root, runtime, next_runtime, system_runtime, build_receipt, support_home, previous, local_rehearsal=None, localhost_metadata=None):
     """Generate a disposable signed hop from the pinned published release to this source
     and its refusal set for the admitted scope."""
     local_source = cli_local_rehearsal(local_rehearsal) if local_rehearsal is not None else None
@@ -1744,7 +1765,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
     published = cli_previous_release(previous / "release.json", pin)
     previous_metadata = previous / CLI_LOCALHOST_METADATA
     sets["old"] = qualify(previous / "support", previous_metadata if previous_metadata.exists() else None)
-    for path in (runtime, next_runtime, build_receipt, previous / "install.sh", previous / "components.json"):
+    for path in (runtime, next_runtime, system_runtime, build_receipt, previous / "install.sh", previous / "components.json"):
         need(path.is_file() and not path.is_symlink(), "built refusal input is unavailable")
     need(release_platform in published["platforms"]
          and digest(runtime) == published["platforms"][release_platform]["binary"]["sha256"]
@@ -1753,7 +1774,8 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
     disk = shutil.disk_usage(root.parent)
     # Two Runtime copies plus their CID blocks, both releases' support, package copies
     # and eight isolated installed Homes fit within this conservative bound.
-    growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum(value["bytes"] for value in sets.values()))
+    growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + system_runtime.stat().st_size
+                   + sum(value["bytes"] for value in sets.values()))
     need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
     root.mkdir(mode=0o700)
     scratch = root / "generator"
@@ -1785,8 +1807,9 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
 
     runtime_relative = add("elastos", runtime, 0o755)
     next_relative = add("elastos-next", next_runtime, 0o755)
+    system_relative = add("elastos-system", system_runtime, 0o755)
     manifest["build"] = add("build.json", build_receipt)
-    runtime_copy, next_copy = root / runtime_relative, root / next_relative
+    runtime_copy, next_copy, system_copy = root / runtime_relative, root / next_relative, root / system_relative
     kubo_relative = add("kubo", support_home / "bin/kubo", 0o755)
     env = cli_environment(scratch)
     env["IPFS_PATH"] = str(scratch / "ipfs-repo")
@@ -1928,9 +1951,12 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
                                 "components": old["components"], "setup": old["setup"], "support": old["support"]}
         content(runtime_relative)
         content(next_relative)
+        content(system_relative)
         old_version, new_version = pin["version"], cli_next_version(pin["version"])
+        system_version = cli_next_version(new_version)
         need(execute([str(runtime_copy), "--version"]).decode() == "elastos " + old_version + "\n", "old Runtime must be the pinned release")
         need(execute([str(next_copy), "--version"]).decode() == "elastos " + new_version + "\n", "next Runtime must be a real compiled next release")
+        need(execute([str(system_copy), "--version"]).decode() == "elastos " + system_version + "\n", "System Runtime must be a real compiled later release")
         build = cli_json(build_receipt)
         need(build["status"] == "passed" and build["cleanup"]["passed"] and build["source"] == source, "hop build receipt differs")
         need(build.get("proof_scope", "ci-rehearsal") == manifest["proof_scope"], "hop build proof scope differs")
@@ -1941,7 +1967,8 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
             need(isinstance(build_reference, str) and not build_reference.startswith("local-rehearsal:"),
                  "local build requires its explicit selector")
         for name, relative, version, binary_source in (("old", runtime_relative, old_version, published["source"]),
-                                                        ("new", next_relative, new_version, source)):
+                                                        ("new", next_relative, new_version, source),
+                                                        ("next", system_relative, system_version, source)):
             need(build[name]["sha256"] == manifest["files"][relative]["sha256"] and build[name]["version"] == version
                  and build[name]["source"] == binary_source, "hop build Runtime binding differs")
             manifest[name] = {"version": version, "source": binary_source, "binary_sha256": build[name]["sha256"],
@@ -1956,8 +1983,9 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, p
             item = manifest["files"][relative]
             return {"cid": item["cid"], "sha256": item["sha256"], "size": item["bytes"]}
 
-        for phase in CLI_PHASES:
-            binary_relative = tampered if phase == "tampered-binary" else runtime_relative if phase in ("old", "wrong-version") else next_relative
+        for phase in (*CLI_PHASES, CLI_SYSTEM_PHASE):
+            binary_relative = {"tampered-binary": tampered, "old": runtime_relative, "wrong-version": runtime_relative,
+                               CLI_SYSTEM_PHASE: system_relative}.get(phase, next_relative)
             binary_binding = binding(binary_relative)
             if phase == "tampered-binary":
                 binary_binding["sha256"] = manifest["files"][runtime_relative]["sha256"]
@@ -2627,8 +2655,9 @@ def cli_port_released(value):
 
 
 def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None, root=None):
-    """Run the installed entrypoint; Runtime alone admits and owns its child. A cross-version
-    fixture then updates through System, Undoes the update and starts Home again on old."""
+    """Run the installed entrypoint; Runtime alone admits and owns its child. A real-runtime
+    fixture then runs the supported update path through the pages (cli_home_system_journey)
+    and undoes it, starting Home again on the published release."""
     before = cli_home_snapshot(manifest, home_path)
     expected_metadata = cli_expected_installed_metadata(manifest, "old")
     need(before["installed_metadata"] in (None, expected_metadata), "initial Home installed metadata differs from signed old release")
@@ -2650,17 +2679,25 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
     processes.roots[str(opener)] = {binding["sha256"]}
     process, proof, failure, cleanup_failure, exit_code, identities = None, None, None, None, None, []
     evidence = {} if evidence is None else evidence
+    binary = home_path / ".local/bin/elastos"
+    stages = processes.output / "home-system" if hasattr(processes, "output") else None
 
-    def expect(release, head_cid):
+    def head(release):
+        return manifest["files"][manifest["publications"][release]["head"]]["cid"]
+
+    def expect(release):
         publication = manifest["publications"][release]
         before.update(binary=manifest["files"][publication["binary"]]["sha256"],
                       components=manifest["files"][publication["components"]]["sha256"],
                       installed_metadata=cli_expected_installed_metadata(manifest, release))
-        before["sources"]["sources"][0].update(installed_version=manifest[release]["version"], head_cid=head_cid)
+        before["sources"]["sources"][0].update(installed_version=manifest[release]["version"], head_cid=head(release))
+
+    def command(label, args):
+        return processes.command([str(binary), *args], cli_environment(home_path), home_path, label, timeout=300)
 
     def start(label, release):
         nonlocal process
-        process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, label)
+        process = processes.spawn([str(binary), "home", "--browser"], env, home_path, label)
         deadline = time.monotonic() + 150
         while process.poll() is None and time.monotonic() < deadline:
             status_path = directory / "update-controller/status.json"
@@ -2691,10 +2728,35 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         for value in (proof["home_url"], "http://127.0.0.1:8090/home/", proof["api_url"]):
             cli_port_released(value)
 
+    def restart(name, label, release):
+        """Start Home on the installed release; the browser reopens it when it sees this file."""
+        ready = start(label, release)
+        write(stages / ("restart-" + name + ".json"), {"version": manifest[release]["version"], "generation": ready["generation"]})
+        return {key: ready[key] for key in ("generation", "controller_sha256", "authenticated_health")}
+
+    def update_with_cli(running_host):
+        """The supported path from the published release: stop Home (including the Home
+        process its System kept running), run its own `elastos update` over Carrier, start
+        Home on the new release."""
+        identities.append(running_host)
+        need(stop() == 0, "Home did not stop cleanly before the CLI update")
+        released()
+        need(cli_home_snapshot(manifest, home_path) == before, "Home stop changed the installation or user data")
+        reply = command("cli-update", ["update", "--yes"])
+        need(cli_success(processes, "cli-update", reply) and "Discovery: Carrier" in processes.text("cli-update"),
+             "the published release's CLI did not update to the new release; command exit " + str(reply["exit"])
+             + cli_ci_stderr_detail(processes, manifest, "cli-update", "CLI update"))
+        version = command("cli-update-version", ["--version"])
+        need(version["exit"] == 0 and processes.text("cli-update-version") == "elastos " + manifest["new"]["version"] + "\n",
+             "the CLI update did not install the new Runtime")
+        expect("new")
+        need(cli_home_snapshot(manifest, home_path) == before, "the CLI update changed user data or installed another release")
+        cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
+        return {"status": "passed", "update": reply, "readiness": restart("cli-update", "cli-update-home-start", "new")}
+
     def undo(browser):
         """Data written on the updated release survives an explicit CLI Undo; a plain update
         to the older release is refused; Home starts again on it with the same account."""
-        stages = processes.output / "home-system"
         written = cli_path(directory, "state/written-after-update")
         written.write_text(os.urandom(16).hex() + "\n")
         written.chmod(0o600)
@@ -2702,34 +2764,29 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         need(stop() == 0, "Home did not stop cleanly before Undo")
         released()
         need(cli_home_snapshot(manifest, home_path) == before, "Home stop changed the updated installation or user data")
-        binary = home_path / ".local/bin/elastos"
-        command = lambda label, args: processes.command([str(binary), *args], cli_environment(home_path), home_path, label, timeout=300)  # noqa: E731
         # The publisher now offers the older release, as an accidental downgrade would.
         publish("old")
         refused = command("undo-plain-update", ["update", "--yes"])
         need(refused["exit"] != 0 and "older than installed release" in processes.text("undo-plain-update", "stderr")
              + processes.text("undo-plain-update") and cli_home_snapshot(manifest, home_path) == before,
              "a plain update to the older release was not refused unchanged")
-        old_head = manifest["files"][manifest["publications"]["old"]["head"]]["cid"]
-        rollback = command("undo-rollback", ["update", "--rollback-to", old_head, "--yes"])
+        rollback = command("undo-rollback", ["update", "--rollback-to", head("old"), "--yes"])
         need(cli_success(processes, "undo-rollback", rollback) and "Rollback plan" in processes.text("undo-rollback"),
              "explicit Undo failed; command exit " + str(rollback["exit"]) + cli_ci_stderr_detail(processes, manifest, "undo-rollback", "Undo"))
         version = command("undo-version", ["--version"])
         need(version["exit"] == 0 and processes.text("undo-version") == "elastos " + manifest["old"]["version"] + "\n",
              "Undo did not restore the previous Runtime")
-        expect("old", old_head)
+        expect("old")
         need(cli_home_snapshot(manifest, home_path) == before, "Undo changed user data or installed another release")
         cli_verify_setup_support(root, cli_support_view(manifest, "old"), home_path)
-        ready = start("undo-home-start", "old")
-        # The browser reloads Home once the previous release is ready.
-        write(stages / "restarted.json", {"version": manifest["old"]["version"], "generation": ready["generation"]})
+        readiness = restart("undo", "undo-home-start", "old")
         need(browser.wait(timeout=420) == 0 and (stages / "undone.json").exists(),
              "Home did not reconnect the same account and preference on the previous release"
              + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
         need(cli_home_snapshot(manifest, home_path) == before, "the previous release changed data written after the update")
-        return {"status": "passed", "version": manifest["old"]["version"], "head_cid": old_head,
+        return {"status": "passed", "version": manifest["old"]["version"], "head_cid": head("old"),
                 "refused_plain_update": {"boundary": "older than installed release", **refused}, "rollback": rollback,
-                "readiness": {key: ready[key] for key in ("generation", "controller_sha256", "authenticated_health")},
+                "readiness": readiness,
                 "user_data": {"before_update": sorted(relative for group in before["preserved"].values() for relative in group),
                               "after_update": ["state/written-after-update"]},
                 "account": {"written": cli_json(stages / "post-update-item.json"), "after_undo": cli_json(stages / "undone.json")}}
@@ -2738,13 +2795,12 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         proof = start("initial-home-start", "old")
         need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
         if manifest["proof_kind"] == "real-runtime":
-            proof["system"], browser = cli_home_system_journey(processes, manifest, home_path, publish)
+            proof["system"], browser = cli_home_system_journey(processes, manifest, home_path, publish, update_with_cli)
             identities.append(proof["system"]["host"])
-            # The approved update replaced the installed release; shutdown must keep exactly that.
-            expect("new", manifest["files"][manifest["publications"]["new"]["head"]]["cid"])
-            if "previous" in manifest:
-                cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
-                proof["undo"] = undo(browser)
+            # The System update replaced the installed release; shutdown must keep exactly that.
+            expect(CLI_SYSTEM_PHASE)
+            cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
+            proof["undo"] = undo(browser)
     except Exception as error:
         failure = error
         # Before the stop below rewrites controller status: the failed start as it was.
@@ -2780,10 +2836,12 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
     return proof
 
 
-def cli_home_system_journey(processes, manifest, home_path, publish):
-    """Through the real pages: create the first account, see Home up to date, approve the
-    next version and reconnect after the controller restart, then refuse a tampered offer on
-    it. A cross-version journey also stores an account preference and stays open for Undo."""
+def cli_home_system_journey(processes, manifest, home_path, publish, update_with_cli):
+    """Through the real pages, the supported update path from the published release:
+    create the first account and see Home up to date; the published release's System refuses
+    a release whose support changed (its known limit) and keeps Home; its CLI updates to
+    this source; this source's System refuses a tampered offer, applies the next release and
+    reconnects; the account stores a preference and the browser stays open for Undo."""
     need(publish is not None, "installed System journey requires the fixture publisher")
     node = shutil.which("node")
     need(node is not None and "PLAYWRIGHT_BROWSERS_PATH" in os.environ, "installed System journey requires Node and Playwright")
@@ -2793,14 +2851,15 @@ def cli_home_system_journey(processes, manifest, home_path, publish):
     env.update(PLAYWRIGHT_BROWSERS_PATH=os.environ["PLAYWRIGHT_BROWSERS_PATH"],
                HOME_VIRTUAL_AUTH_PROFILE=str(output / "browser-profile"), HOME_VIRTUAL_AUTH_CLEANUP="0",
                HOME_VIRTUAL_AUTH_SHELL_SWITCH="0", HOME_VIRTUAL_AUTH_UPDATE_DIR=str(output),
-               HOME_VIRTUAL_AUTH_UPDATE_VERSIONS=" ".join(cli_phase_version(manifest, name) for name in ("old", "new", "tampered-binary")),
-               HOME_VIRTUAL_AUTH_UPDATE_UNDO="1" if "previous" in manifest else "0")
+               HOME_VIRTUAL_AUTH_UPDATE_VERSIONS=" ".join(manifest[name]["version"] for name in ("old", "new", CLI_SYSTEM_PHASE)))
     browser = processes.spawn([node, str(Path(__file__).with_name("home-passkey-virtual-auth-smoke.mjs"))],
                               env, home_path, "home-system")
     binary = home_path / ".local/bin/elastos"
+    status_path = home_path / CLI_DATA / "update-controller/status.json"
+    coords_path = home_path / CLI_DATA / "gateway-runtime-coords.json"
     source = lambda: source_for_home(home_path)["installed_version"]  # noqa: E731
-    shas = {name: manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("old", "new")}
-    # The approved update replaces the installed executable while its processes are owned.
+    shas = {name: manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("old", "new", CLI_SYSTEM_PHASE)}
+    # Updates replace the installed executable while its processes are owned.
     for path in (binary, home_path / CLI_DATA / "update-controller/runtime"):
         processes.roots[str(path)] = set(shas.values())
 
@@ -2811,36 +2870,47 @@ def cli_home_system_journey(processes, manifest, home_path, publish):
         need((output / (stage + ".json")).exists() and browser.poll() is None,
              message + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
 
+    def installed(release):
+        return digest(binary) == shas[release] and source() == manifest[release]["version"]
+
     reached("up-to-date", 240, "installed Home sign-up or up-to-date System state failed")
     warnings_before = cli_provider_warnings(home_path)
+    # The published release's System applies only releases with unchanged support (#246):
+    # it refuses this one, restores and keeps Home on its own release.
     publish("new")
-    reached("updated", 420, "System did not update and reconnect on the next version")
-    status = cli_private_json(home_path / CLI_DATA / "update-controller/status.json")
-    host = cli_process_identity(status["host_pid"]) if status.get("host_pid") else None
-    need(status["phase"] == "updated" and status["current_version"] == manifest["new"]["version"]
-         and digest(binary) == shas["new"] and source() == manifest["new"]["version"] and host is not None
-         and cli_process_executable(host["pid"]) == str(binary), "controller did not restart Home on the next version")
+    reached("frozen-refused", 330, "the published release's System did not refuse the changed-support release plainly")
+    frozen = cli_private_json(status_path)
+    frozen_host = cli_process_identity(frozen["host_pid"]) if frozen.get("host_pid") else None
+    need(frozen["phase"] == "restored" and installed("old") and frozen_host is not None
+         and cli_process_executable(frozen_host["pid"]) == str(binary),
+         "the published release's System did not keep Home on its release after refusing")
+    cli_update = update_with_cli(frozen_host)
+    reached("updated", 420, "Home did not reconnect the same account on the new release after the CLI update")
     # alpha.6: the updated Runtime refused the installed protected-content providers
     # while System said "up to date". check-result requires `new` to be empty.
     warnings_after = cli_provider_warnings(home_path)
-    # The updated release refuses a tampered offer: the controller records the failure
+    # This source's System refuses a tampered offer: the controller records the failure
     # while staging and the same Home process and generation keep running.
-    coords_path = home_path / CLI_DATA / "gateway-runtime-coords.json"
     home_before = {key: cli_private_json(coords_path)[key] for key in ("pid", "generation")}
     publish("tampered-binary")
     reached("refused", 330, "System did not refuse the tampered fixture plainly")
-    refusal = cli_private_json(home_path / CLI_DATA / "update-controller/status.json")
+    refusal = cli_private_json(status_path)
     need(refusal["phase"] == "failed", "the controller did not record the tampered release as refused")
     need({key: cli_private_json(coords_path)[key] for key in ("pid", "generation")} == home_before,
          "a refused release restarted Home")
-    need(digest(binary) == shas["new"] and source() == manifest["new"]["version"], "refused update changed the installed release")
-    stages = ["up-to-date", "next-offer", "updated", "tampered-offer", "refused"]
-    if "previous" in manifest:
-        stages.append("post-update-item")
-        reached("post-update-item", 120, "Home did not store the account preference on the next version")
-    else:
-        need(browser.wait(timeout=120) == 0, "System journey did not finish" + cli_ci_stderr_detail(processes, manifest, "home-system", "System"))
+    need(installed("new"), "refused update changed the installed release")
+    publish(CLI_SYSTEM_PHASE)
+    reached("post-update-item", 420, "System did not update to the next release, reconnect and store the account preference")
+    status = cli_private_json(status_path)
+    host = cli_process_identity(status["host_pid"]) if status.get("host_pid") else None
+    need(status["phase"] == "updated" and status["current_version"] == manifest[CLI_SYSTEM_PHASE]["version"]
+         and installed(CLI_SYSTEM_PHASE) and host is not None
+         and cli_process_executable(host["pid"]) == str(binary), "controller did not restart Home on the next release")
+    stages = ("up-to-date", "frozen-offer", "frozen-refused", "updated", "tampered-offer", "refused",
+              "next-offer", "next-updated", "post-update-item")
     return {"stages": {name: cli_json(output / (name + ".json")) for name in stages}, "host": host,
+            "frozen_support": {"phase": frozen["phase"], "version": manifest["old"]["version"], "kept_home": True},
+            "cli_update": cli_update,
             "provider_warnings": {"before": warnings_before, "after": warnings_after,
                                   "new": sorted(set(warnings_after) - set(warnings_before))}}, browser
 
@@ -3054,6 +3124,8 @@ def cli_run(config, output, local_rehearsal=None):
             setup(initial, "initial-home-setup", "old")
             verify(initial, "old", "initial-home-version", fresh=True)
             prepare(initial, "initial-home", "old")
+            # The updates refresh support while Home runs its providers; cleanup admits both releases' bytes.
+            track(initial, {CLI_DATA + "/" + target: relative for target, relative in cli_setup_files(cli_support_view(manifest, "new")).items()})
             result["paths"]["m1-install"]["checks"]["initial-home"] = {
                 "status": "failed", "proof_scope": "installed-initial-home", "support_scope": "frozen-source-home"}
             result["paths"]["m1-install"]["checks"]["initial-home"] = cli_initial_home(
@@ -3154,8 +3226,9 @@ def cli_run(config, output, local_rehearsal=None):
 
 
 def cli_check_result(result):
-    """The CI verdict on a run's result.json: the journey passed, the update added no
-    provider warnings, and a hop from the published release was undone explicitly."""
+    """The CI verdict on a run's result.json: the journey passed along the supported path
+    from the pinned published release (its System refused changed support, its CLI updated),
+    the update added no provider warnings, and the hop was undone explicitly."""
     need(result.get("schema") == "elastos.update-hop.result/v1" and result.get("status") == "passed",
          "update hop failed: " + str(result.get("failure", "status " + str(result.get("status")))))
     home = result["paths"]["m1-install"]["checks"]["initial-home"]
@@ -3164,6 +3237,9 @@ def cli_check_result(result):
     previous = result.get("previous_release")
     need(previous is not None and result["old"]["version"] == previous["version"],
          "the hop did not start from the pinned published release")
+    need(home["system"].get("frozen_support", {}).get("phase") == "restored"
+         and home["system"].get("cli_update", {}).get("status") == "passed",
+         "the published release did not refuse changed support in System and update with its CLI")
     undo = home.get("undo", {})
     need(undo.get("status") == "passed" and undo["version"] == previous["version"]
          and undo["refused_plain_update"]["exit"] != 0 and undo["rollback"]["exit"] == 0,
@@ -3180,7 +3256,8 @@ def main():
     parser.add_argument("output", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, help="physical downloaded CLI fixture root")
     parser.add_argument("--runtime", type=Path, help="built Runtime for CI refusal generation")
-    parser.add_argument("--next-runtime", type=Path, help="compiled N+1 Runtime for CI hop generation")
+    parser.add_argument("--next-runtime", type=Path, help="compiled Runtime for the release after the published one")
+    parser.add_argument("--system-runtime", type=Path, help="compiled Runtime for the release after that, which System applies")
     parser.add_argument("--build-receipt", type=Path, help="exact CI Runtime build receipt")
     parser.add_argument("--support-home", type=Path, help="built source-home data directory for CI refusal generation")
     parser.add_argument("--previous", type=Path, help="fetch-previous-release output: the pinned published release")
@@ -3196,7 +3273,7 @@ def main():
             need(args.operation in ("build-ci-hop", "generate-ci-hop", "inspect", "run"),
                  "local rehearsal applies only to CLI fixture build, generation, inspect and run")
         if args.operation in ("prepare-ci-disk", "pin-previous-release"):
-            need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.build_receipt, args.support_home, args.previous)), "this operation has fixed inputs")
+            need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.system_runtime, args.build_receipt, args.support_home, args.previous)), "this operation has fixed inputs")
             print(json.dumps(cli_prepare_ci_disk() if args.operation == "prepare-ci-disk" else cli_pin_previous_release()))
             return 0
         need(args.input is not None, "fixture input required")
@@ -3213,10 +3290,10 @@ def main():
             print(json.dumps(cli_build_hop(args.input, args.runtime, args.previous, args.local_rehearsal)))
             return 0
         if args.operation == "generate-ci-hop":
-            need(all(path is not None for path in (args.runtime, args.next_runtime, args.build_receipt, args.support_home, args.previous))
+            need(all(path is not None for path in (args.runtime, args.next_runtime, args.system_runtime, args.build_receipt, args.support_home, args.previous))
                  and args.output is None and args.root is None,
-                 "hop generation requires both Runtimes, build receipt, support-home and previous release inputs")
-            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.build_receipt, args.support_home,
+                 "hop generation requires the three Runtimes, build receipt, support-home and previous release inputs")
+            print(json.dumps(cli_generate_hop(args.input, args.runtime, args.next_runtime, args.system_runtime, args.build_receipt, args.support_home,
                                              args.previous, args.local_rehearsal, args.localhost_metadata)))
             return 0
         value = read(args.input)
