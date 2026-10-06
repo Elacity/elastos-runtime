@@ -1,5 +1,5 @@
-# Key-free release inputs: the Apple silicon pair (install N, update N+1 that
-# reuses N's support) and, when asked, the matching Linux seed package, all from
+# Key-free release inputs: native Mac and Linux pairs (install N, update N+1
+# that reuses N's support) and the optional Linux seed package, all from
 # one exact source. Signing and seed import are operator steps; see
 # docs/VERSIONING.md.
 name: Release package
@@ -170,6 +170,194 @@ jobs:
           retention-days: 14
       - name: record the artifact
         run: echo "Mac inputs artifact ${{ steps.upload.outputs.artifact-id }}, zip sha256:${{ steps.upload.outputs.artifact-digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  engine-llama-arm64:
+    name: pinned Jetson CPU engine
+    needs: admit
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    # Match ci.yml's Ubuntu 22.04 engine recipe and Jetson's glibc 2.35.
+    container:
+      image: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_CONTAINER_IMAGE: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+      ENGINE_BUILD_TOOLS: build-essential cmake git ca-certificates curl binutils file python3
+    steps:
+      - name: install engine build tools
+        working-directory: /tmp
+        run: |
+          apt-get update -qq
+          read -r -a tools <<< "$ENGINE_BUILD_TOOLS"
+          apt-get install -y -qq --no-install-recommends "${tools[@]}"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - name: build and verify the recipe-pinned ARM64 engine
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == github-hosted/Linux/ARM64 ]]
+          [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          export RECIPE_COMMIT="$SOURCE_COMMIT"
+          CI_LLAMA_ARM64_SHA256=$(python3 -I -S - <<'PYTHON'
+          import json
+          recipes = json.load(open("scripts/release-upstream-recipes.json"))["recipes"]
+          print(next(r["source"]["checksum"].removeprefix("sha256:") for r in recipes
+                     if r["component"] == "llama-server" and r["platform"] == "linux-arm64"))
+          PYTHON
+          )
+          export CI_LLAMA_ARM64_SHA256
+          bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
+          bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: release-llama-arm64-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llama-arm64-bundle
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: ${{ matrix.platform }} N and N+1
+    needs: [admit, engine-llama-arm64]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: X64
+            platform: x86_64-linux
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            arch: ARM64
+            platform: aarch64-linux
+            target: aarch64-unknown-linux-musl
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - name: bind the source and allocate an owned root
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == "github-hosted/Linux/$RELEASE_ARCH" ]]
+          [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          root="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          install -d -m 700 "$root" "$root/inputs" "$root/home"
+          echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - name: install host prerequisites
+        timeout-minutes: 15
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+      - name: download pinned ARM64 engine input
+        if: matrix.platform == 'aarch64-linux'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-llama-arm64-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llama-arm64-bundle
+      - name: build N, then N+1 with N's support, each in fresh Cargo directories
+        timeout-minutes: 240
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export ELASTOS_LLAMA_ARM64_BUNDLE="$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+          inputs="$RELEASE_ROOT/inputs"
+          for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
+            read -r name version <<< "$build"
+            export CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-$name" CARGO_BUILD_BUILD_DIR="$RELEASE_ROOT/cargo-build-$name"
+            [[ ! -e "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" ]]
+            reuse=()
+            [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
+            HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+            python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
+            rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
+          done
+      - name: check native versions, source and support parity
+        run: |
+          set -euo pipefail
+          inputs="$RELEASE_ROOT/inputs"
+          cmp "$inputs/N1/support-input.json" "$inputs/N/platform-input.json"
+          for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
+            read -r name version <<< "$build"
+            [[ "$(jq -r '[.source.commit, .source.tree, .platform, .version] | join(" ")' "$inputs/$name/platform-input.json")" \
+              == "$SOURCE_COMMIT $SOURCE_TREE $RELEASE_PLATFORM $version" ]]
+            [[ "$(HOME="$RELEASE_ROOT/home" "$inputs/$name/artifacts/elastos-$RELEASE_PLATFORM" --version 2>&1)" == "elastos $version" ]]
+          done
+          [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+      - name: verify Jetson release compatibility
+        if: matrix.platform == 'aarch64-linux'
+        run: |
+          set -euo pipefail
+          for name in N N1; do
+            # Reuse the CI package gate for every directly installed executable.
+            python3 -I -S - "$RELEASE_ROOT/inputs/$name/artifacts" "$RELEASE_ROOT/jetson-$name.tar.gz" <<'PYTHON'
+          import pathlib, sys, tarfile
+          with tarfile.open(sys.argv[2], "w:gz") as archive:
+              for path in sorted(pathlib.Path(sys.argv[1]).iterdir()):
+                  with path.open("rb") as source:
+                      if source.read(4) != b"\x7fELF":
+                          continue
+                  name = path.name.removesuffix("-aarch64-linux").removesuffix("-linux-arm64")
+                  archive.add(path, arcname="elastos-runtime-linux-arm64/" + name)
+          PYTHON
+            python3 -I -S scripts/verify-linux-arm64-package.py "$RELEASE_ROOT/jetson-$name.tar.gz" \
+              --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+              --receipt "$RELEASE_ROOT/jetson-$name.receipt.json"
+            rm "$RELEASE_ROOT/jetson-$name.tar.gz"
+          done
+      - name: seal the inputs in mode-preserving parts
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$RELEASE_ROOT"
+          rm -rf home
+          (cd inputs && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../SHA256SUMS && mv ../SHA256SUMS .)
+          install -d -m 700 package
+          if [[ "$RELEASE_PLATFORM" == aarch64-linux ]]; then
+            cp jetson-*.receipt.json package/
+          fi
+          tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
+          (cd package && shasum -a 256 -- * > SHA256SUMS)
+      - id: upload
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: release-${{ matrix.platform }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_ROOT }}/package
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: record the artifact
+        run: echo "$RELEASE_PLATFORM inputs artifact ${{ steps.upload.outputs.artifact-id }}, zip sha256:${{ steps.upload.outputs.artifact-digest }}" >> "$GITHUB_STEP_SUMMARY"
 
   seed:
     name: matching Linux seed package

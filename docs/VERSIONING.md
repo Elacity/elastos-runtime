@@ -154,16 +154,20 @@ the version by the contract change (see Meaning) and update the changelog first;
    ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
    with the source commit, the install version N and the update version N+1.
    The source is a commit on `develop`, or the head of an open pull request into
-   `develop` that already contains `develop`. The run builds the Apple silicon
-   pair (N+1 reuses N's support bytes) in fresh Cargo directories and checks
-   versions, source and support parity. Each job summary records its artifact
-   ID and digest.
+   `develop` that already contains `develop`. The run builds native pairs for
+   `aarch64-darwin`, `x86_64-linux` and `aarch64-linux` (Jetson). N+1 reuses
+   N's support bytes. Each pair uses fresh Cargo directories and checks versions,
+   source and support parity; ARM64 also passes the Jetson compatibility gate.
+   Each job summary records its artifact ID and digest.
 2. **Prepare.** On the operator Mac, from a clone of this repository, run
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
    succeeded and that its source is on `develop` (merge an open pull request
-   first), downloads and checks the Mac artifact, verifies the inputs, checks
-   out the exact source as a worktree, takes Kubo from the build, reads the
-   publisher bootstrap and signer DID from the public origin, copies the seed's
+   first), downloads and verifies all three platform artifacts, and passes one
+   `--platform-input PLATFORM=DIR` per platform. For a Mac-only preview, run
+   `scripts/release-publish.sh prepare RUN_ID VERSION aarch64-darwin`. The Mac
+   coordinator requires `aarch64-darwin` in every selection; only a single
+   platform uses `--preview-platform`. Prepare checks out the exact source as
+   a worktree, takes Kubo from the Mac build, reads the publisher bootstrap and signer DID from the public origin, copies the seed's
    current `publish-state.json` and runs `scripts/publish-release.sh
    --prepare-only` in an isolated data directory.
 3. **Sign.** `scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL`
@@ -171,9 +175,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    the `release-signer.py` command. The operator runs it and types the DID.
    The signer refuses a commit that is not on `develop`.
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
-   seed sequence for the seed's installed Runtime: copy the four small signed
-   files, rebuild the rest from the CI artifact, verify every hash, stop the
-   service, run the preflight, import, and start the service. An import run
+   seed sequence for the seed's installed Runtime: copy the signed installer
+   and manifests, rebuild the rest from the selected CI artifacts, verify every
+   hash, stop the service, run the preflight, import, and start the service. An import run
    while the service is stopped ends with the known gossip error
    `No running runtime found` after the commit, and the sequence accepts only
    that error.

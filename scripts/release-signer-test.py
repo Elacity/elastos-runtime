@@ -180,6 +180,17 @@ class SignerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "release fields refused"):
             self.prepare()
 
+    def test_signer_accepts_all_three_release_platforms(self):
+        platform = self.manifest["release"]["platforms"]["x86_64-linux"]
+        self.manifest["release"]["platforms"] = {
+            name: copy.deepcopy(platform)
+            for name in ("aarch64-darwin", "x86_64-linux", "aarch64-linux")
+        }
+        self.approve_manifest()
+        prepared = self.prepare()
+        self.assertEqual(set(S.parse_json(prepared.release)["platforms"]),
+                         {"aarch64-darwin", "x86_64-linux", "aarch64-linux"})
+
     def test_annotated_tag_and_identical_main_are_supported(self):
         prefix = f"/repos/{S.REPOSITORY}"
         self.policy["tag_oid"] = TAG

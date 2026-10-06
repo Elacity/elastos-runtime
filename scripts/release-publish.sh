@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Operator Mac steps between the key-free Release package run and the seed.
 #
-#   scripts/release-publish.sh prepare RUN_ID VERSION
-#       Download and verify the run's Mac inputs, then write unsigned signing
-#       input for VERSION (the run's install or update version).
+#   scripts/release-publish.sh prepare RUN_ID VERSION [PLATFORM ...]
+#       Verify the run's native inputs and write unsigned signing input for
+#       VERSION. Defaults to all three platforms; include aarch64-darwin.
 #   scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL
 #       Write the exact signer policy for that unsigned input and print the
 #       signing command. SIGNER is the installed release-signer.py copy.
@@ -32,6 +32,9 @@ SOURCE_ROOT=/opt/elastos/release-source
 die() { echo "release-publish: $*" >&2; exit 1; }
 need_env() { local name; for name; do [[ -n "${!name:-}" ]] || die "set $name"; done; }
 sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+artifact_prefix() {
+    case "$1" in aarch64-darwin) echo release-mac ;; *) echo "release-$1" ;; esac
+}
 
 # Checks the run (Release package, success) and prints "id digest commit" of its
 # newest live PREFIX-<commit>-<attempt> artifact after checking commit is on develop.
@@ -62,45 +65,68 @@ EOF
 work_dir() { printf '%s/%s\n' "$WORK_ROOT" "$1"; }
 
 prepare() {
-    [[ $# == 2 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: prepare RUN_ID VERSION"
-    local run="$1" version="$2" work id digest name commit tree did state
+    [[ $# -ge 2 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: prepare RUN_ID VERSION [PLATFORM ...]"
+    local run="$1" version="$2" work id digest name commit="" tree="" did state platform input artifact_commit pair=""
+    shift 2
+    local platforms=("$@") args=() seen=" "
+    [[ ${#platforms[@]} -gt 0 ]] || platforms=(aarch64-darwin x86_64-linux aarch64-linux)
+    for platform in "${platforms[@]}"; do
+        case "$platform" in aarch64-darwin|x86_64-linux|aarch64-linux) ;; *) die "unsupported platform: $platform" ;; esac
+        [[ "$seen" != *" $platform "* ]] || die "duplicate platform: $platform"
+        seen+="$platform "
+    done
+    [[ "$seen" == *" aarch64-darwin "* ]] || die "operator Mac inputs must include aarch64-darwin"
     need_env RELEASE_SEED RELEASE_SEED_DATA
     work=$(work_dir "$version")
     [[ ! -e "$work" ]] || die "$work exists; remove it to prepare again"
     mkdir -p "$work/state" "$work/data"
-    id=$(checked_artifact "$run" release-mac)
-    read -r id digest _ <<< "$id"
-    gh api "repos/$REPO/actions/artifacts/$id/zip" > "$work/mac.zip"
-    [[ "$(sha "$work/mac.zip")" == "$digest" ]] || die "Mac artifact digest differs"
-    unzip -q "$work/mac.zip" -d "$work/parts"
-    rm "$work/mac.zip"
-    (cd "$work/parts" && shasum -a 256 -c --quiet SHA256SUMS)
-    cat "$work/parts"/release-inputs.tar.gz.part* | tar -xzf - -C "$work"
-    rm -r "$work/parts"
-    (cd "$work/inputs" && shasum -a 256 -c --quiet SHA256SUMS)
-    for name in N N1; do
-        [[ "$(jq -r .version "$work/inputs/$name/platform-input.json")" == "$version" ]] && break
-        [[ "$name" == N1 ]] && die "run $run built neither input for $version"
+    for platform in "${platforms[@]}"; do
+        id=$(checked_artifact "$run" "$(artifact_prefix "$platform")")
+        read -r id digest artifact_commit <<< "$id"
+        gh api "repos/$REPO/actions/artifacts/$id/zip" > "$work/input.zip"
+        [[ "$(sha "$work/input.zip")" == "$digest" ]] || die "$platform artifact digest differs"
+        unzip -q "$work/input.zip" -d "$work/parts"
+        rm "$work/input.zip"
+        (cd "$work/parts" && shasum -a 256 -c --quiet SHA256SUMS)
+        input="$work/inputs/$platform"
+        mkdir -p "$input"
+        cat "$work/parts"/release-inputs.tar.gz.part* | tar -xzf - --strip-components=1 -C "$input"
+        rm -r "$work/parts"
+        (cd "$input" && shasum -a 256 -c --quiet SHA256SUMS)
+        for name in N N1; do
+            [[ "$(jq -r .version "$input/$name/platform-input.json")" == "$version" ]] && break
+            [[ "$name" == N1 ]] && die "run $run built neither $platform input for $version"
+        done
+        [[ -n "$pair" ]] || pair="$name"
+        [[ "$name" == "$pair" ]] || die "$platform selected a different N/N1 input"
+        [[ -n "$commit" ]] || commit=$(jq -r .source.commit "$input/$name/platform-input.json")
+        [[ -n "$tree" ]] || tree=$(jq -r .source.tree "$input/$name/platform-input.json")
+        [[ "$artifact_commit" == "$commit" && "$(jq -r '[.source.commit, .source.tree, .platform, .version] | join(" ")' "$input/$name/platform-input.json")" \
+            == "$commit $tree $platform $version" ]] || die "$platform input source, tree, platform or version differs"
+        args+=(--platform-input "$platform=$input/$name")
     done
-    commit=$(jq -r .source.commit "$work/inputs/$name/platform-input.json")
-    tree=$(jq -r .source.tree "$work/inputs/$name/platform-input.json")
+    name="$pair"
+    [[ ${#platforms[@]} -gt 1 ]] || args+=(--preview-platform aarch64-darwin)
     git -C "$ROOT" fetch -q origin "$commit"
     git -C "$ROOT" worktree add -q --detach "$work/source" "$commit"
     [[ "$(git -C "$work/source" rev-parse 'HEAD^{tree}')" == "$tree" ]] || die "source tree differs"
-    (cd "$work/source" && python3 -I -S scripts/release-platform-input.py verify "$work/inputs/$name" > /dev/null)
-    tar -xzf "$work/inputs/$name/artifacts/kubo-darwin-arm64.tar.gz" -C "$work" kubo/ipfs
+    for platform in "${platforms[@]}"; do
+        (cd "$work/source" && python3 -I -S scripts/release-platform-input.py verify "$work/inputs/$platform/$name" > /dev/null)
+    done
+    tar -xzf "$work/inputs/aarch64-darwin/$name/artifacts/kubo-darwin-arm64.tar.gz" -C "$work" kubo/ipfs
     curl -fsS --max-time 20 "$ORIGIN/.well-known/elastos/carrier-bootstrap.json?role=publisher" > "$work/bootstrap.json"
     did=$(curl -fsS --max-time 20 "$ORIGIN/release-head.json" | jq -er .signer_did)
     state="$RELEASE_SEED_DATA/ElastOS/SystemServices/Publisher/publish-state.json"
     scp -q "$RELEASE_SEED:$state" "$work/state/publish-state.json"
-    jq -n --arg run "$run" --arg name "$name" '{run: $run, input: $name}' > "$work/run.json"
+    printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" \
+        '{run: $run, input: $name, platforms: [inputs]}' > "$work/run.json"
     (cd "$work/source" && env ELASTOS_DATA_DIR="$work/data" ELASTOS_PUBLISH_STATE_DIR="$work/state" \
         ELASTOS_IPFS_KUBO_PATH="$work/kubo/ipfs" \
         ELASTOS_SOURCE_CONNECT_TICKET="$(jq -er .ticket "$work/bootstrap.json")" \
         ELASTOS_PUBLISHER_NODE_ID="$(jq -er .node_id "$work/bootstrap.json")" \
         scripts/publish-release.sh --version "$version" --channel canary \
         --prepare-only "$work/unsigned" --publisher-did "$did" \
-        --platform-input "aarch64-darwin=$work/inputs/$name" --preview-platform aarch64-darwin)
+        "${args[@]}")
     echo "Unsigned input: $work/unsigned (signing-input.json sha256 $(sha "$work/unsigned/signing-input.json"))"
 }
 
@@ -132,28 +158,36 @@ policy() {
 seed() {
     [[ $# == 2 ]] || die "usage: seed VERSION SIGNED_DIR"
     need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
-    local version="$1" signed work run name did mac mac_digest stage
+    local version="$1" signed work run name did platform id digest stage
     signed=$(realpath "$2") work=$(work_dir "$version")
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
     did=$(jq -er .signer_did "$signed/release-head.json")
-    mac=$(checked_artifact "$run" release-mac)
-    read -r mac mac_digest _ <<< "$mac"
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
     cat <<EOF
-# On this Mac: copy the four small signed files and the signed hash list.
+# On this Mac: copy the signed manifests, installer and signed hash list.
 ssh $RELEASE_SEED 'install -d -m 700 $stage/signed'
-scp $signed/{install.sh,release.json,release-head.json,components-aarch64-darwin.json} $RELEASE_SEED:$stage/signed/
+scp $signed/{install.sh,release.json,release-head.json,components-*.json} $RELEASE_SEED:$stage/signed/
 scp $work/signed.SHA256SUMS $RELEASE_SEED:$stage/
 
 EOF
     seed_preamble "$stage"
+    while read -r platform; do
+        id=$(checked_artifact "$run" "$(artifact_prefix "$platform")")
+        read -r id digest _ <<< "$id"
+        cat <<EOF
+get $platform $id $digest
+mkdir -p inputs/$platform
+cat $platform/release-inputs.tar.gz.part* | tar -xzf - --strip-components=1 -C inputs/$platform
+(cd inputs/$platform && sha256sum -c --quiet SHA256SUMS)
+EOF
+    done < <(jq -er '.platforms[]' "$work/run.json")
     cat <<EOF
-get mac $mac $mac_digest
-cat mac/release-inputs.tar.gz.part* | tar -xzf -
-(cd inputs && sha256sum -c --quiet SHA256SUMS)
-cut -c67- signed.SHA256SUMS | while read -r f; do [ -e "signed/\$f" ] || cp "inputs/$name/artifacts/\$f" signed/; done
+cut -c67- signed.SHA256SUMS | while read -r f; do
+    [ -e "signed/\$f" ] && continue
+    for input in inputs/*/$name/artifacts/"\$f"; do [ -f "\$input" ] && { cp "\$input" signed/; break; }; done
+done
 (cd signed && sha256sum -c --quiet ../signed.SHA256SUMS)
 [ "\$(ls signed | wc -l)" = "\$(wc -l < signed.SHA256SUMS)" ]
 export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
