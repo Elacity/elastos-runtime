@@ -18,9 +18,6 @@
 # Deliberately NOT built via scripts/setup-source-home.sh: that installs
 # ~30 unrelated binaries and 33 app capsules for the full-home topology.
 # Direct `cargo build` of just the 4 workspaces this role needs instead.
-# CI supplies this named context with one verified archive. Local builds use
-# the empty stage and the same pinned download gate below.
-FROM scratch AS kubo-input
 FROM rust:1.91-bookworm AS builder
 
 ARG APP_UID=10001
@@ -45,6 +42,52 @@ ARG TARGETARCH
 RUN apt-get update -qq \
     && apt-get install -y -qq --no-install-recommends jq curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep this verified input layer before source-dependent builds, so the
+# existing BuildKit layer cache reuses it across source changes.
+# ── Kubo ─────────────────────────────────────────────────────────────
+# ipfs-provider's replica plane hard-errors without a kubo binary
+# (ensure_kubo() at capsules/ipfs-provider/src/main.rs:372); this repo has
+# no Cargo path to it (kubo is a separate Go project), so the pinned
+# official release tarball is fetched here instead, over TLS, and verified
+# against a checksum hardcoded per architecture below (computed locally
+# from a freshly downloaded copy of each tarball and cross-checked against
+# the corresponding *.sha512 file dist.ipfs.tech publishes for this exact
+# release) before anything is extracted -- fail closed on any mismatch,
+# same posture as every other pinned artifact in this Dockerfile. The
+# per-arch case statement mirrors the libgcc triplet lookup further below.
+ARG KUBO_VERSION=v0.42.0
+RUN <<'EOF'
+set -eu
+case "${TARGETARCH}" in
+    amd64) kubo_sha256="284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e" ;;
+    arm64) kubo_sha256="edc6f485ab623f9327bf2ad7aa7a29d84c87c72f1e2584376a77240134a96e69" ;;
+    *)
+        echo "FAIL: unsupported TARGETARCH=${TARGETARCH} for kubo fetch (expected amd64 or arm64)" >&2
+        exit 1
+        ;;
+esac
+kubo_tarball="kubo_${KUBO_VERSION}_linux-${TARGETARCH}.tar.gz"
+kubo_url="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${kubo_tarball}"
+# The same release tarball is mirrored on GitHub; the original pin below
+# verifies either route before extraction. A bad checksum fails this RUN.
+if ! curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" "${kubo_url}"; then
+    rm -f "/tmp/${kubo_tarball}"
+    curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" \
+        "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${kubo_tarball}"
+fi
+echo "${kubo_sha256}  /tmp/${kubo_tarball}" | sha256sum -c -
+tar -xzf "/tmp/${kubo_tarball}" -C /tmp kubo/ipfs
+mv /tmp/kubo/ipfs /tmp/kubo-binary
+# Same "strip after checksum-relevant steps are done" posture as the 4
+# cargo-built binaries below: the upstream release ships full debug info
+# (unstripped ~83MB on arm64, ~121MB on amd64); strip runs after the
+# checksum verify above so the verified bytes are exactly what was
+# downloaded, not a derivative the checksum never covered.
+strip --strip-all /tmp/kubo-binary
+chmod 0755 /tmp/kubo-binary
+rm -rf "/tmp/${kubo_tarball}" /tmp/kubo
+EOF
 
 RUN groupadd -g "${APP_GID}" custody \
     && useradd -m -u "${APP_UID}" -g "${APP_GID}" custody
@@ -92,52 +135,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/src/target-build,uid=10001,gid=10001 \
     cargo build --release --manifest-path capsules/chain-provider/Cargo.toml
-
-# ── Kubo ─────────────────────────────────────────────────────────────
-# ipfs-provider's replica plane hard-errors without a kubo binary
-# (ensure_kubo() at capsules/ipfs-provider/src/main.rs:372); this repo has
-# no Cargo path to it (kubo is a separate Go project), so the pinned
-# official release tarball is fetched here instead, over TLS, and verified
-# against a checksum hardcoded per architecture below (computed locally
-# from a freshly downloaded copy of each tarball and cross-checked against
-# the corresponding *.sha512 file dist.ipfs.tech publishes for this exact
-# release) before anything is extracted -- fail closed on any mismatch,
-# same posture as every other pinned artifact in this Dockerfile. The
-# per-arch case statement mirrors the libgcc triplet lookup further below.
-ARG KUBO_VERSION=v0.42.0
-RUN --mount=type=bind,from=kubo-input,target=/kubo-input <<'EOF'
-set -eu
-case "${TARGETARCH}" in
-    amd64) kubo_sha256="284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e" ;;
-    arm64) kubo_sha256="edc6f485ab623f9327bf2ad7aa7a29d84c87c72f1e2584376a77240134a96e69" ;;
-    *)
-        echo "FAIL: unsupported TARGETARCH=${TARGETARCH} for kubo fetch (expected amd64 or arm64)" >&2
-        exit 1
-        ;;
-esac
-kubo_tarball="kubo_${KUBO_VERSION}_linux-${TARGETARCH}.tar.gz"
-kubo_url="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${kubo_tarball}"
-# The same release tarball is mirrored on GitHub; the original pin below
-# verifies either route before extraction. A bad checksum fails this RUN.
-if [ -f "/kubo-input/sha256-${kubo_sha256}" ]; then
-    cp "/kubo-input/sha256-${kubo_sha256}" "/tmp/${kubo_tarball}"
-elif ! curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" "${kubo_url}"; then
-    rm -f "/tmp/${kubo_tarball}"
-    curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" \
-        "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${kubo_tarball}"
-fi
-echo "${kubo_sha256}  /tmp/${kubo_tarball}" | sha256sum -c -
-tar -xzf "/tmp/${kubo_tarball}" -C /tmp kubo/ipfs
-mv /tmp/kubo/ipfs /tmp/kubo-binary
-# Same "strip after checksum-relevant steps are done" posture as the 4
-# cargo-built binaries below: the upstream release ships full debug info
-# (unstripped ~83MB on arm64, ~121MB on amd64); strip runs after the
-# checksum verify above so the verified bytes are exactly what was
-# downloaded, not a derivative the checksum never covered.
-strip --strip-all /tmp/kubo-binary
-chmod 0755 /tmp/kubo-binary
-rm -rf "/tmp/${kubo_tarball}" /tmp/kubo
-EOF
 
 # Assemble the minimal artifact set the runtime stage will COPY wholesale:
 # only the 4 binaries this role needs plus components.json, nothing else

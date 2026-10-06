@@ -91,15 +91,11 @@ def digest(path, algorithm="sha256"):
 
 
 def source_spec(source, limit=MAX_BYTES):
-    if not isinstance(source, dict) or set(source) - {"url", "path", "checksum", "sha256", "max_bytes", "redirect_hosts"}:
+    if not isinstance(source, dict) or set(source) - {"url", "path", "checksum", "max_bytes", "redirect_hosts"}:
         raise ValueError("unknown upstream source fields")
     if ("url" in source) == ("path" in source):
         raise ValueError("upstream source requires exactly one URL or local path")
     checksum_parts(source.get("checksum"))
-    if "sha256" in source:
-        if not isinstance(source["sha256"], str):
-            raise ValueError("upstream SHA-256 pin must be a string")
-        checksum_parts("sha256:" + source["sha256"])
     maximum = source.get("max_bytes")
     if type(maximum) is not int or not 0 < maximum <= limit:
         raise ValueError("upstream source requires a positive bounded max_bytes")
@@ -172,9 +168,7 @@ def cached_input(source, cache, limit=MAX_BYTES):
     algorithm, expected = checksum_parts(source["checksum"])
     destination = cache / f"{algorithm}-{expected}"
     if destination.exists() or destination.is_symlink():
-        if (not 0 < regular(destination).stat().st_size <= source["max_bytes"]
-                or digest(destination, algorithm) != expected
-                or ("sha256" in source and digest(destination) != source["sha256"])):
+        if not 0 < regular(destination).stat().st_size <= source["max_bytes"] or digest(destination, algorithm) != expected:
             raise ValueError("cached upstream input failed its recorded checksum or bound")
         return destination
     disk_gate(cache, source["max_bytes"])
@@ -195,8 +189,6 @@ def cached_input(source, cache, limit=MAX_BYTES):
             os.fsync(output.fileno())
         if size == 0 or value.hexdigest() != expected:
             raise ValueError("upstream input checksum mismatch")
-        if "sha256" in source and digest(temporary) != source["sha256"]:
-            raise ValueError("upstream input SHA-256 mismatch")
         if destination.exists() or destination.is_symlink():
             raise ValueError("upstream cache destination changed during download")
         os.link(temporary, destination)

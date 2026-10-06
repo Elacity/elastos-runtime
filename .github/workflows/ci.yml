@@ -28,8 +28,8 @@ env:
   CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
-  # Only merged code saves build and apt caches. Immutable Kubo inputs may
-  # save after verification on PRs; each consumer checks their recorded hashes.
+  # Only merged code saves shared build, apt and Kubo input caches. PRs restore
+  # these caches; custody retains its existing PR-scoped BuildKit layer cache.
   CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
@@ -439,28 +439,7 @@ jobs:
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: bind custody Kubo cache to its pin
-        id: kubo-pin
-        if: steps.should-run.outputs.run == 'true'
-        run: python3 scripts/ci-kubo-cache.py key linux-amd64 "$RUNNER_TEMP/kubo-cache" --custody
-      - name: restore verified Kubo inputs
-        if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ steps.kubo-pin.outputs.paths }}
-          key: ${{ steps.kubo-pin.outputs.key }}
-      - name: verify or download Kubo inputs
-        if: steps.should-run.outputs.run == 'true'
-        timeout-minutes: 5
-        run: python3 scripts/ci-kubo-cache.py fetch linux-amd64 "$RUNNER_TEMP/kubo-cache" --custody
-      - name: save verified Kubo inputs
-        if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ steps.kubo-pin.outputs.paths }}
-          key: ${{ steps.kubo-pin.outputs.key }}
-      # Build and load the image once. The harness uses these exact bytes;
-      # its Compose startup keeps the verified Kubo context out of a rebuild.
+      # The verified Kubo layer precedes COPY, so source changes reuse it.
       - name: pre-build custody-host image (GHA layer cache)
         if: steps.should-run.outputs.run == 'true'
         run: |
@@ -471,14 +450,11 @@ jobs:
           docker buildx build \
             -f deploy/custody-host/Dockerfile \
             -t elastos-custody-host:latest \
-            --build-context "kubo-input=${RUNNER_TEMP}/kubo-cache" \
             "${cache_args[@]}" \
             --load \
             .
       - name: custody harness smoke
         if: steps.should-run.outputs.run == 'true'
-        env:
-          CUSTODY_HOST_PREBUILT: '1'
         run: scripts/custody-harness-ci-smoke.sh
       - name: upload evidence receipt on failure
         if: failure() && steps.should-run.outputs.run == 'true'
@@ -544,7 +520,8 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: /var/cache/apt/archives/*.deb
-          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
+          restore-keys: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-
       - name: install host prerequisites
         timeout-minutes: 13
         run: bash scripts/ci-apt-prerequisites.sh
@@ -553,7 +530,7 @@ jobs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: /var/cache/apt/archives/*.deb
-          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
       - name: bind Kubo cache to its pin
         id: kubo-pin
         run: |
@@ -563,6 +540,7 @@ jobs:
           echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
           python3 scripts/ci-kubo-cache.py key "$platform" "$RUNNER_TEMP/kubo-cache"
       - name: restore verified Kubo inputs
+        id: kubo-cache
         if: env.CI_USE_CACHE == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -572,7 +550,7 @@ jobs:
         timeout-minutes: 10
         run: python3 scripts/ci-kubo-cache.py fetch "$KUBO_PLATFORM" "$KUBO_CACHE_DIR"
       - name: save verified Kubo inputs
-        if: env.CI_USE_CACHE == 'true'
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ steps.kubo-pin.outputs.paths }}
@@ -693,6 +671,7 @@ jobs:
           echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
           python3 scripts/ci-kubo-cache.py key darwin-arm64 "$RUNNER_TEMP/kubo-cache"
       - name: restore verified Kubo inputs
+        id: kubo-cache
         if: env.CI_USE_CACHE == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -702,7 +681,7 @@ jobs:
         timeout-minutes: 10
         run: python3 scripts/ci-kubo-cache.py fetch darwin-arm64 "$KUBO_CACHE_DIR"
       - name: save verified Kubo inputs
-        if: env.CI_USE_CACHE == 'true'
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ steps.kubo-pin.outputs.paths }}

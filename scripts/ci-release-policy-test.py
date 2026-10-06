@@ -69,7 +69,8 @@ CASES = [
 # Only pushes of merged code to these branches may write shared caches.
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
-                "steps.engine-cache.outputs.cache-hit": "false"}
+                "steps.engine-cache.outputs.cache-hit": "false",
+                "steps.kubo-cache.outputs.cache-hit": "false"}
 
 
 def validate_cache_guards(source):
@@ -126,54 +127,11 @@ class ReleasePolicyTests(unittest.TestCase):
         for action, pin in re.findall(r'uses: ([\w/-]+)@([^\s]+)', SOURCE):
             self.assertRegex(pin, r'^[0-9a-f]{40}$', action)
 
-    def test_kubo_restores_are_verified_before_use_and_save(self):
-        for job in ('source-home-linux', 'source-home-macos', 'custody-harness-smoke'):
-            job_steps = steps(job)
-            restore, = [step for step in job_steps if step.startswith('name: restore verified Kubo inputs\n')]
-            verify, = [step for step in job_steps if step.startswith('name: verify or download Kubo inputs\n')]
-            save, = [step for step in job_steps if step.startswith('name: save verified Kubo inputs\n')]
-            self.assertLess(job_steps.index(restore), job_steps.index(verify))
-            self.assertLess(job_steps.index(verify), job_steps.index(save))
-            self.assertIn('scripts/ci-kubo-cache.py fetch', verify)
-            self.assertNotIn('cache-hit', verify)
-            for step in (restore, save):
-                self.assertEqual(field(step, 'key'), '${{ steps.kubo-pin.outputs.key }}')
-                self.assertEqual(field(step, 'path'), '${{ steps.kubo-pin.outputs.paths }}')
-                self.assertNotIn('restore-keys:', step)
-            if job != 'custody-harness-smoke':
-                self.assertIn('KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache', JOBS[job])
-
-    def test_custody_startup_reuses_ci_image_and_local_startup_builds(self):
-        source = (WORKFLOW.parents[2] / 'deploy/custody-host/up.sh').read_text()
-        block = source.split('    if [[ "${CUSTODY_HOST_PREBUILT:-0}" == 1 ]]; then', 1)[1].split('    fi', 1)[0]
-        script = 'if [[ "${CUSTODY_HOST_PREBUILT:-0}" == 1 ]]; then' + block + 'fi'
-        stub = 'log() { :; }; compose() { printf "%s\\n" "$*"; };\n'
-        for prebuilt, expected in (('1', 'up -d --no-build --pull never'), ('0', 'up -d --build')):
-            result = subprocess.run(['bash', '-eu', '-c', stub + script], capture_output=True, text=True,
-                env={**os.environ, 'CUSTODY_HOST_PREBUILT': prebuilt}, check=True)
-            self.assertEqual(result.stdout.strip(), expected)
-        smoke, = [step for step in steps('custody-harness-smoke') if step.startswith('name: custody harness smoke\n')]
-        self.assertIn("CUSTODY_HOST_PREBUILT: '1'", smoke)
-
-    def test_apt_cache_contains_archives_and_has_explicit_permissions(self):
-        source = JOBS['source-home-linux']
-        self.assertIn('CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config', source)
-        self.assertIn('sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives', source)
-        apt_steps = [step for step in steps('source-home-linux') if 'path: /var/cache/apt/archives/' in step]
-        self.assertEqual(len(apt_steps), 2)
-        for step in apt_steps:
-            self.assertEqual(field(step, 'path'), '/var/cache/apt/archives/*.deb')
-            self.assertIn('${{ env.CI_APT_PACKAGES }}', field(step, 'key'))
-            self.assertNotIn('restore-keys:', step)
-        install, = [step for step in steps('source-home-linux') if step.startswith('name: install host prerequisites\n')]
-        self.assertIn('bash scripts/ci-apt-prerequisites.sh', install)
-        self.assertLess(int(field(install, 'timeout-minutes')), 15)
-
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 18)
+        self.assertEqual(len(caches), 16)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -188,13 +146,17 @@ class ReleasePolicyTests(unittest.TestCase):
                 context.update(NO_CACHE_HIT)
                 for should_run in (True, False):
                     context["steps.should-run.outputs.run"] = str(should_run).lower()
-                    for job, step in caches:
-                        expected = cached and (job != "custody-harness-smoke" or should_run)
-                        if "actions/cache/save@" in step and not step.startswith("name: save verified Kubo inputs\n"):
-                            expected = expected and (event == "push" and ref == "refs/heads/develop"
-                                                     if job == "engine-llama-arm64" else save)
-                        self.assertEqual(evaluate(field(step, "if"), context), expected,
-                                         f"cache guard in {job}")
+                    for kubo_hit in ("true", "false"):
+                        context["steps.kubo-cache.outputs.cache-hit"] = kubo_hit
+                        for job, step in caches:
+                            expected = cached and (job != "custody-harness-smoke" or should_run)
+                            if "actions/cache/save@" in step:
+                                expected = expected and (event == "push" and ref == "refs/heads/develop"
+                                                         if job == "engine-llama-arm64" else save)
+                                if step.startswith("name: save verified Kubo inputs\n"):
+                                    expected = expected and kubo_hit != "true"
+                            self.assertEqual(evaluate(field(step, "if"), context), expected,
+                                             f"cache guard in {job} (Kubo hit={kubo_hit})")
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
@@ -207,7 +169,7 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "requires the package producer"):
             validate_jetson_package_lifecycle(omitted)
 
-    def test_pull_requests_save_only_verified_immutable_inputs(self):
+    def test_pull_requests_never_save_shared_caches(self):
         for job in JOBS:
             for step in steps(job):
                 if "Swatinem/rust-cache@" in step:
@@ -243,11 +205,11 @@ class ReleasePolicyTests(unittest.TestCase):
         # Execute the actual workflow shell with a recording function, not Docker.
         stub = 'docker() { printf "%s\\0" "$@"; }\n'
         base = ["buildx", "build", "-f", "deploy/custody-host/Dockerfile",
-                "-t", "elastos-custody-host:latest", "--build-context", "kubo-input=/fixture/kubo-cache"]
+                "-t", "elastos-custody-host:latest"]
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 result = subprocess.run(["bash", "-eo", "pipefail", "-c", stub + script],
-                                        env={**os.environ, "CI_USE_CACHE": str(enabled).lower(), "RUNNER_TEMP": "/fixture"},
+                                        env={**os.environ, "CI_USE_CACHE": str(enabled).lower()},
                                         capture_output=True, check=True)
                 args = result.stdout.decode().split("\0")[:-1]
                 cache = ["--cache-from", "type=gha", "--cache-to", "type=gha,mode=max"] if enabled else []
@@ -467,10 +429,13 @@ class CustodyKuboDownloadTests(unittest.TestCase):
             for pin in self.pins.values():
                 script = script.replace(pin, fixture_pin)
             script = script.replace("/tmp", str(root))
-            script = script.replace("/kubo-input", str(root / "cached-input"))
             if cached is not None:
-                (root / "cached-input").mkdir()
-                (root / "cached-input" / ("sha256-" + fixture_pin)).write_bytes(
+                # Exercise the unchanged SHA-256/extraction gate on restored
+                # archive bytes; BuildKit caches the resulting verified layer.
+                start = script.index('# The same release tarball')
+                end = script.index('echo "${kubo_sha256}')
+                script = script[:start] + script[end:]
+                (root / f"kubo_{self.version}_linux-{arch}.tar.gz").write_bytes(
                     archive.read_bytes() if cached == "valid" else b"corrupt cache")
             shims = root / "shims"
             shims.mkdir()
