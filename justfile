@@ -97,7 +97,8 @@ test-ci-local-prepush:
     python3 scripts/ci-local-prepush-test.py
 
 # Build-unit keys and hermetic builds on a fixture workspace; needs cargo and
-# bubblewrap (Linux) or sandbox-exec (macOS).
+# sandbox-exec (macOS) or bubblewrap plus HERMETIC_SYSROOT=<sealed rootfs from
+# `scripts/build-hermetic.py make-sysroot DIR`> (Linux).
 test-build-key:
     python3 scripts/build-key-test.py
     python3 scripts/build-hermetic-test.py

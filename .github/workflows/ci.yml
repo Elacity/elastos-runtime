@@ -63,7 +63,8 @@ jobs:
         run: |
           sudo apt-get install -y -qq --no-install-recommends bubblewrap
           python3 scripts/build-key-test.py
-          python3 scripts/build-hermetic-test.py
+          python3 scripts/build-hermetic.py make-sysroot "$RUNNER_TEMP/hermetic-sysroot"
+          HERMETIC_SYSROOT="$RUNNER_TEMP/hermetic-sysroot" python3 scripts/build-hermetic-test.py
       - name: product UI source proofs
         run: |
           node --version
