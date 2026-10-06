@@ -636,9 +636,6 @@ async fn run_with_data_dir(
     Ok(())
 }
 
-/// Signed bytes setup fetches for a component in its current state: the
-/// artifact when it is not installed, plus capsule metadata when that is
-/// missing or stale. `None` when a fetched artifact has no signed size.
 /// True when the component loop in `run` skips this component before any
 /// effect. Keep in step with that loop's skip branches.
 fn skipped_before_install(
@@ -665,6 +662,9 @@ fn skipped_before_install(
     !source_ready || resolve_install_path(component, Some(info)).is_none()
 }
 
+/// Signed bytes setup fetches for a component in its current state: the
+/// artifact when it is not installed, plus capsule metadata when that is
+/// missing or stale. `None` when a fetched artifact has no signed size.
 fn pending_signed_size(
     component: &Component,
     platform_info: Option<&PlatformInfo>,

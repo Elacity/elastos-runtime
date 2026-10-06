@@ -141,9 +141,6 @@ fn render(line: &Line) -> String {
                 Status::Done => out.push_str("  \x1b[32m✓\x1b[0m"),
                 Status::Failed => out.push_str("  \x1b[31m✗\x1b[0m"),
             }
-            if let (Some(detail), Status::Done | Status::Failed) = (line.detail, line.status) {
-                out.push_str(&format!("  {detail}"));
-            }
             out
         }
         OutputMode::Plain => {
@@ -235,7 +232,8 @@ impl ComponentProgress {
         })
     }
 
-    /// Keeps the refresh reason for the line's final result.
+    /// Keeps the refresh reason for the plain result line. A rich line has no
+    /// room for it within 80 columns.
     pub(super) fn refreshing(&self, reason: &str) {
         *self
             .detail
@@ -382,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_reason_rides_on_the_result_line_only() {
+    fn refresh_reason_rides_on_the_plain_result_line_only() {
         let render_with = |mode, status| {
             render(&Line {
                 mode,
@@ -401,9 +399,9 @@ mod tests {
             render_with(OutputMode::Plain, Status::Done),
             "[3/41] chain-provider 1.0 MB ... ok (0.4 s); refresh: checksum changed"
         );
-        assert!(render_with(OutputMode::Rich, Status::Failed)
-            .ends_with("✗\x1b[0m  refresh: checksum changed"));
-        assert!(!render_with(OutputMode::Rich, Status::Running).contains("refresh"));
+        for status in [Status::Running, Status::Done, Status::Failed] {
+            assert!(!render_with(OutputMode::Rich, status).contains("refresh"));
+        }
     }
 
     #[test]
