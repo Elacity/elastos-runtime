@@ -123,20 +123,28 @@ if '--download-only' in args:
                      'CI_APT_PACKAGES': 'coturn e2fsprogs ffmpeg musl-tools nasm pkg-config',
                      'FIXTURE_LOG': str(root / 'log'), 'FIXTURE_SHA256': hashlib.sha256(payload).hexdigest(),
                      'FIXTURE_BAD_DOWNLOAD': '1' if bad_download else '0',
-                     'FIXTURE_ARCHIVES': str(archives)})
+                     'FIXTURE_ARCHIVES': str(archives), 'GITHUB_OUTPUT': str(root / 'output')})
             events = [json.loads(line) for line in (root / 'log').read_text().splitlines()]
-            return result, events
+            output = (root / 'output').read_text() if (root / 'output').exists() else ''
+            return result, events, output
 
     def test_corrupt_restore_is_removed_before_download(self):
-        result, _ = self.run_install(corrupt=True)
+        result, _, output = self.run_install(corrupt=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Removed unverified apt archive', result.stderr)
+        self.assertEqual(output, 'changed=true\n')
 
     def test_corrupt_download_stops_before_package_install(self):
-        result, events = self.run_install(bad_download=True)
+        result, events, output = self.run_install(bad_download=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('signed-index SHA-256 check', result.stderr)
         self.assertFalse(any('--no-download' in e['args'] for e in events if e['command'] == 'apt-get'))
+        self.assertEqual(output, '')
+
+    def test_unchanged_verified_archive_set_skips_save(self):
+        result, _, output = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, 'changed=false\n')
 
 
 if __name__ == '__main__':

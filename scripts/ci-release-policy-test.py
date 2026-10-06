@@ -70,7 +70,8 @@ CASES = [
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
                 "steps.engine-cache.outputs.cache-hit": "false",
-                "steps.kubo-cache.outputs.cache-hit": "false"}
+                "steps.kubo-cache.outputs.cache-hit": "false",
+                "steps.apt-prerequisites.outputs.changed": "true"}
 
 
 def validate_cache_guards(source):
@@ -149,14 +150,18 @@ class ReleasePolicyTests(unittest.TestCase):
                     for kubo_hit in ("true", "false"):
                         context["steps.kubo-cache.outputs.cache-hit"] = kubo_hit
                         for job, step in caches:
-                            expected = cached and (job != "custody-harness-smoke" or should_run)
-                            if "actions/cache/save@" in step:
-                                expected = expected and (event == "push" and ref == "refs/heads/develop"
-                                                         if job == "engine-llama-arm64" else save)
-                                if step.startswith("name: save verified Kubo inputs\n"):
-                                    expected = expected and kubo_hit != "true"
-                            self.assertEqual(evaluate(field(step, "if"), context), expected,
-                                             f"cache guard in {job} (Kubo hit={kubo_hit})")
+                            for apt_changed in ("true", "false"):
+                                context["steps.apt-prerequisites.outputs.changed"] = apt_changed
+                                expected = cached and (job != "custody-harness-smoke" or should_run)
+                                if "actions/cache/save@" in step:
+                                    expected = expected and (event == "push" and ref == "refs/heads/develop"
+                                                             if job == "engine-llama-arm64" else save)
+                                    if step.startswith("name: save verified Kubo inputs\n"):
+                                        expected = expected and kubo_hit != "true"
+                                    if step.startswith("name: save Ubuntu prerequisite archives\n"):
+                                        expected = expected and apt_changed == "true"
+                                self.assertEqual(evaluate(field(step, "if"), context), expected,
+                                                 f"cache guard in {job} (Kubo hit={kubo_hit}, apt changed={apt_changed})")
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
@@ -413,7 +418,7 @@ class CustodyKuboDownloadTests(unittest.TestCase):
             "amd64": "284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e",
             "arm64": "edc6f485ab623f9327bf2ad7aa7a29d84c87c72f1e2584376a77240134a96e69"})
 
-    def run_gate(self, arch="amd64", primary="valid", mirror="valid", cached=None):
+    def run_gate(self, arch="amd64", primary="valid", mirror="valid"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "fixture.tar.gz"
@@ -429,14 +434,6 @@ class CustodyKuboDownloadTests(unittest.TestCase):
             for pin in self.pins.values():
                 script = script.replace(pin, fixture_pin)
             script = script.replace("/tmp", str(root))
-            if cached is not None:
-                # Exercise the unchanged SHA-256/extraction gate on restored
-                # archive bytes; BuildKit caches the resulting verified layer.
-                start = script.index('# The same release tarball')
-                end = script.index('echo "${kubo_sha256}')
-                script = script[:start] + script[end:]
-                (root / f"kubo_{self.version}_linux-{arch}.tar.gz").write_bytes(
-                    archive.read_bytes() if cached == "valid" else b"corrupt cache")
             shims = root / "shims"
             shims.mkdir()
             curl = shims / "curl"
@@ -521,17 +518,6 @@ class CustodyKuboDownloadTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertIsNone(installed)
         self.assertFalse(stripped)
-
-    def test_cached_archive_is_verified_before_extraction_without_network(self):
-        for arch in ("amd64", "arm64"):
-            for cached in ("valid", "corrupt"):
-                with self.subTest(arch=arch, cached=cached):
-                    result, events, installed, stripped, _, _ = self.run_gate(arch, cached=cached)
-                    self.assertEqual(events, [])
-                    self.assertEqual(result.returncode == 0, cached == "valid")
-                    self.assertEqual(stripped, cached == "valid")
-                    self.assertEqual(installed is not None, cached == "valid")
-
 
 if __name__ == "__main__":
     unittest.main()

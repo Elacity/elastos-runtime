@@ -65,8 +65,13 @@ for archive in Path('/var/cache/apt/archives').glob('*.deb'):
 PY
 }
 verify_archives restore
+archives_before="$(find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' | sort)"
 retry apt-get "${options[@]}" install --download-only -y --no-install-recommends "${packages[@]}"
 verify_archives strict
+archives_after="$(find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' | sort)"
+changed=false
+if [[ "$archives_before" != "$archives_after" ]]; then changed=true; fi
+printf 'changed=%s\n' "$changed" >> "$GITHUB_OUTPUT"
 # Installation is local after the bounded download phase. It may need longer
 # than a download attempt; --no-download keeps mirrors out of this phase.
 sudo env DEBIAN_FRONTEND=noninteractive timeout --kill-after=5s 180s \

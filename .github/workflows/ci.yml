@@ -399,8 +399,6 @@ jobs:
               - 'scripts/protected-content-installed-e2e-proof.sh'
               - 'scripts/protected-content-installed-static-audit.py'
               - 'scripts/custody-harness-ci-smoke.sh'
-              - 'scripts/ci-kubo-cache.py'
-              - '.github/workflows/ci.yml'
               - 'capsules/custody-provider/**'
               - 'capsules/availability-provider/**'
               - 'capsules/ipfs-provider/**'
@@ -523,10 +521,11 @@ jobs:
           key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
           restore-keys: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-
       - name: install host prerequisites
+        id: apt-prerequisites
         timeout-minutes: 13
         run: bash scripts/ci-apt-prerequisites.sh
       - name: save Ubuntu prerequisite archives
-        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true'
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.apt-prerequisites.outputs.changed == 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: /var/cache/apt/archives/*.deb
