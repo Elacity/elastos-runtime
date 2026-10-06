@@ -2141,6 +2141,88 @@ def cli_ci_stderr_detail(processes, manifest, label, description):
         return "; CI " + description + " diagnostic is unavailable"
 
 
+CLI_SECRET_KEY = re.compile(r"secret|token|passkey|credential|password|cookie|ticket|authorization|private|signature", re.I)
+CLI_SECRET_TEXT = (
+    (re.compile(r"\x1b\[[0-9;]*m"), ""),
+    (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer [redacted]"),
+    (re.compile(r"(?i)(\"?[\w.-]*(?:secret|token|passkey|credential|password|cookie|ticket|authorization|signature)[\w.-]*\"?\s*[:=]\s*)"
+                r"(?!Bearer \[redacted\])(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"), r'\1"[redacted]"'))
+
+
+def cli_redact(value):
+    """Remove attach secrets, tokens, tickets and passkey material from diagnostic copies."""
+    if isinstance(value, dict):
+        return {key: "[redacted]" if CLI_SECRET_KEY.search(key) else cli_redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cli_redact(item) for item in value]
+    if isinstance(value, str):
+        for pattern, replacement in CLI_SECRET_TEXT:
+            value = pattern.sub(replacement, value)
+    return value
+
+
+def cli_tail(path, lines=400):
+    with path.open("rb") as stream:
+        stream.seek(max(0, path.stat().st_size - 1024 * 1024))
+        text = stream.read().decode(errors="replace")
+    return "\n".join(cli_redact(line) for line in text.splitlines()[-lines:]) + "\n"
+
+
+def cli_listing(directory):
+    if not directory.is_dir():
+        return "absent: " + str(directory) + "\n"
+    rows = []
+    for path in sorted(directory.iterdir()):
+        info = path.lstat()
+        target = " -> " + os.readlink(path) if path.is_symlink() else ""
+        rows.append(f"{stat.filemode(info.st_mode)} {info.st_nlink} {info.st_uid} {info.st_size} "
+                    f"{datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).isoformat()} {path.name}{target}")
+    return "\n".join(rows) + "\n"
+
+
+def cli_failure_diagnostics(processes, manifest, homes, stage):
+    """After a failure, keep redacted controller state and log tails in results/diagnostics:
+    result.json keeps only hashes of private output. Disposable rehearsal fixtures only."""
+    if manifest.get("proof_scope") not in ("ci-rehearsal", "local-rehearsal") or not hasattr(processes, "output"):
+        return {}
+    written, errors = [], []
+    destination = processes.output / "diagnostics" / stage
+
+    def keep(name, produce):
+        try:
+            text = produce()
+            path = destination / name
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_text(text)
+            path.chmod(0o600)
+            written.append(str(path.relative_to(processes.output)))
+        except (OSError, ValueError) as error:
+            errors.append(name + ": " + cli_safe_error(error))
+
+    try:
+        # Controller, Home start, System browser, Undo and apply output of this run.
+        for path in sorted(processes.output.glob("*.std*")):
+            if re.search(r"home-start|home-system|^undo-|^m2-apply", path.name) and path.stat().st_size:
+                keep("output/" + path.name, lambda path=path: cli_tail(path))
+        for home in homes:
+            directory = home / CLI_DATA
+            if not directory.is_dir():
+                continue
+            prefix = home.name + "/"
+            status = directory / "update-controller/status.json"
+            if status.exists():
+                keep(prefix + "update-controller-status.json",
+                     lambda status=status: json.dumps(cli_redact(cli_private_json(status)), indent=2, sort_keys=True) + "\n")
+            logs = sorted(path for path in directory.rglob("*.log") if path.is_file() and "ipfs-repo" not in path.parts)[:30]
+            for path in logs:
+                keep(prefix + "logs/" + str(path.relative_to(directory)).replace("/", "__"), lambda path=path: cli_tail(path))
+            keep(prefix + "ls-bin-installation.txt",
+                 lambda directory=directory: "".join("$ ls -la " + name + "\n" + cli_listing(directory / name) for name in ("bin", "installation")))
+    except (OSError, ValueError) as error:
+        errors.append(cli_safe_error(error))
+    return {"directory": str(destination.relative_to(processes.output)), "files": written, "errors": errors}
+
+
 class CliBootstrap:
     """Serve admitted installer bytes; record and refuse every M2 HTTP fallback."""
     def __init__(self, root, manifest):
@@ -2665,6 +2747,8 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
                 proof["undo"] = undo(browser)
     except Exception as error:
         failure = error
+        # Before the stop below rewrites controller status: the failed start as it was.
+        evidence["diagnostics"] = cli_failure_diagnostics(processes, manifest, [home_path], "at-failure")
     finally:
         try:
             if process is not None:
@@ -3037,6 +3121,8 @@ def cli_run(config, output, local_rehearsal=None):
             entry["status"] = "passed"
     except (OSError, ValueError, TypeError, KeyError, StopIteration, subprocess.SubprocessError, KeyboardInterrupt) as error:
         result["failure"] = cli_safe_error(error)
+        homes = sorted(path for path in (output / "homes").iterdir() if path.is_dir()) if (output / "homes").is_dir() else []
+        result["diagnostics"] = cli_failure_diagnostics(processes, manifest, homes, "after-failure")
     finally:
         result["cleanup"] = processes.cleanup()
         try:

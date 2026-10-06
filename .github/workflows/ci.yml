@@ -770,6 +770,7 @@ jobs:
           path: |
             ${{ env.CI_HOP_ROOT }}/package/results/result.json
             ${{ env.CI_HOP_ROOT }}/package/results/home-system/*.png
+            ${{ env.CI_HOP_ROOT }}/package/results/diagnostics/
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

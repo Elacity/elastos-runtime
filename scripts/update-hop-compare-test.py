@@ -2673,6 +2673,45 @@ class CliFixtureTests(unittest.TestCase):
         self.assertTrue(result["cleanup"]["passed"])
         self.assertEqual(result["transport"]["m2_http_fallback_requests"], 0)
 
+    def test_failure_keeps_redacted_controller_state_log_tails_and_support_listing(self):
+        stderr = "".join("apply line " + str(index) + "\n" for index in range(500)) + "Authorization: Bearer leaked-bearer\n"
+        code, _, result = self.fake_run(apply_exit=1, apply_stderr=stderr)
+        self.assertEqual(code, 1)
+        output = self.root / "results"
+        data = output / "homes/cli" / observer.CLI_DATA
+        (data / "update-controller").mkdir(parents=True, exist_ok=True)
+        status = data / "update-controller/status.json"
+        observer.write(status, {"phase": "restored", "attach_secret": "a" * 64, "home_token": "leaked-token",
+                                "detail": {"passkey_credential": "leaked-passkey"}})
+        status.chmod(0o600)
+        (data / "update-controller/runtime.log").write_text(
+            "".join("runtime line " + str(index) + "\n" for index in range(450))
+            + 'WARN provider refused {"attach_secret":"leaked-secret"} url=/home?token=leaked-query\n')
+        (data / "bin").mkdir(exist_ok=True)
+        manager = SimpleNamespace(output=output)
+        diagnostics = observer.cli_failure_diagnostics(manager, self.manifest, [output / "homes/cli", output / "homes/absent"], "probe")
+        self.assertEqual(diagnostics["errors"], [])
+        written = {name: (output / name).read_text() for name in diagnostics["files"]}
+        prefix = "diagnostics/probe/"
+        self.assertEqual(observer.cli_json(output / (prefix + "cli/update-controller-status.json")),
+                         {"phase": "restored", "attach_secret": "[redacted]", "home_token": "[redacted]",
+                          "detail": {"passkey_credential": "[redacted]"}})
+        runtime = written[prefix + "cli/logs/update-controller__runtime.log"].splitlines()
+        self.assertEqual((len(runtime), runtime[0]), (400, "runtime line 51"))
+        self.assertIn("WARN provider refused", runtime[-1])
+        apply = written[prefix + "output/m2-apply.stderr"].splitlines()
+        self.assertEqual((len(apply), apply[-1]), (400, "Authorization: Bearer [redacted]"))
+        listing = written[prefix + "cli/ls-bin-installation.txt"]
+        self.assertIn("$ ls -la bin\n", listing)
+        self.assertIn("$ ls -la installation\n", listing)
+        self.assertFalse(any("leaked" in text or "a" * 64 in text for text in written.values()))
+        # The run's own failure path collected the same kinds of files before cleanup.
+        self.assertIn("diagnostics/after-failure/output/m2-apply.stderr", result["diagnostics"]["files"])
+        self.assertIn("diagnostics/after-failure/cli/ls-bin-installation.txt", result["diagnostics"]["files"])
+        # Production fixtures keep operator logs private.
+        self.assertEqual(observer.cli_failure_diagnostics(manager, {**self.manifest, "proof_scope": "production-positive"},
+                                                         [output / "homes/cli"], "private"), {})
+
     def test_failed_operator_apply_keeps_diagnostic_private_and_reply_available(self):
         self.positive()
         stderr = "private operator apply diagnostic\n"
