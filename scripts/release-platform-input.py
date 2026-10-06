@@ -1068,7 +1068,10 @@ def installer_source_blob(source):
 
 
 def changelog_changes(version):
-    """Use bounded change bullets from this release, or Unreleased until cut."""
+    """Bounded change bullets from this release's own section.
+
+    System shows these words to people before they update, so a release never
+    borrows [Unreleased], which records developer detail."""
     sections = {}
     text = (SOURCE_ROOT / "elastos/CHANGELOG.md").read_text(encoding="utf-8")
     for section in re.split(r"(?m)^## ", text)[1:]:
@@ -1081,8 +1084,11 @@ def changelog_changes(version):
     number = 0
     continuing = False
     include = True
-    section_name = version if version in sections else "Unreleased"
-    for line in sections.get(section_name, "").split("\n"):
+    if version not in sections:
+        raise ValueError(f"elastos/CHANGELOG.md has no [{version}] section; "
+                         "write this release's change notes for people first")
+    section_name = version
+    for line in sections[section_name].split("\n"):
         subsection = re.match(r"^###\s+(\S+)", line)
         if subsection:
             include = subsection[1].casefold() in {"added", "changed", "fixed", "removed", "security"}
