@@ -1365,7 +1365,7 @@ fn first_start_enospc_rechecks_a_journal_created_during_bootstrap() {
 }
 
 #[test]
-fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
+fn verified_current_controller_reuses_its_inode_without_a_free_space_check() {
     let fixture = PrivateFixture::new();
     publish_retained_receipt(&fixture);
     let _lease = acquire_lease(&fixture.directory).unwrap();
@@ -1379,7 +1379,7 @@ fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
         &fixture.directory,
         &fixture.binary,
         &expected,
-        |_, _| panic!("same-hash reuse requested disk reserve")
+        |_, _| panic!("same-hash reuse requested a free-space check")
     )
     .unwrap());
     let after = fs::metadata(fixture.controller()).unwrap();
@@ -1390,7 +1390,7 @@ fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
 #[test]
 fn first_controller_low_space_keeps_ordinary_home_available_without_creating_a_controller() {
     for error in [
-        anyhow::Error::from(crate::install_transaction::DiskReserveError),
+        anyhow::Error::from(elastos_common::NotEnoughFreeSpace { needed: 1 }),
         anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
     ] {
         let fixture = PrivateFixture::new();
@@ -1477,7 +1477,7 @@ fn low_space_cannot_hide_unsafe_controller_state_or_foreign_errors() {
                 &fixture.directory,
                 &fixture.binary,
                 &digest(b"signed fixture Runtime"),
-                |_, _| Err(crate::install_transaction::DiskReserveError.into())
+                |_, _| Err(elastos_common::NotEnoughFreeSpace { needed: 1 }.into())
             )
             .is_err(),
             "{state}"
@@ -2764,7 +2764,7 @@ fn migration_space_refusal_reuses_only_the_exact_current_signed_controller() {
             &fixture.binary,
             &source,
             &fixture.directory,
-            Err(crate::install_transaction::DiskReserveError.into()),
+            Err(elastos_common::NotEnoughFreeSpace { needed: 1 }.into()),
         );
         assert_eq!(result.is_ok(), case == "current", "{case}");
         assert_eq!(fixture.snapshot(), before, "{case}");
@@ -3422,7 +3422,7 @@ fn apply_failures_are_classified_only_from_typed_evidence() {
             ApplyFailure::SourceUnavailable,
         ),
         (
-            anyhow::Error::from(crate::install_transaction::DiskReserveError),
+            anyhow::Error::from(elastos_common::NotEnoughFreeSpace { needed: 1 }),
             ApplyFailure::NotEnoughSpace,
         ),
         (

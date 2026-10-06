@@ -3421,6 +3421,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
         || release_path.ends_with(".tgz")
         || platform_info.extract_path.is_some();
 
+    require_component_space(dest, &bytes, is_tarball)?;
     if is_tarball {
         extract_from_tarball(&bytes, dest, platform_info)?;
     } else {
@@ -3562,6 +3563,7 @@ async fn download_component(
 
         verify_checksum(name, &bytes, platform_info)?;
 
+        require_component_space(dest, &bytes, is_tarball)?;
         if is_tarball {
             extract_from_tarball(&bytes, dest, platform_info)?;
         } else {
@@ -3709,6 +3711,42 @@ fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> any
     }
 
     Ok(())
+}
+
+/// Component installs keep the shared free-space reserve. A tarball is written
+/// and unpacked under the system temp directory, then copied to `dest`.
+fn require_component_space(dest: &Path, bytes: &[u8], is_tarball: bool) -> anyhow::Result<()> {
+    let temp = is_tarball
+        .then(|| crate::install_transaction::volume_space(&std::env::temp_dir()))
+        .transpose()?;
+    component_space_fits(bytes, temp, crate::install_transaction::volume_space(dest)?)
+}
+
+/// `temp` and `dest` are (device, available bytes); `temp` is set for a tarball.
+fn component_space_fits(
+    bytes: &[u8],
+    temp: Option<(u64, u128)>,
+    dest: (u64, u128),
+) -> anyhow::Result<()> {
+    let Some(temp) = temp else {
+        return Ok(elastos_common::require_free_space(
+            dest.1,
+            bytes.len() as u128,
+        )?);
+    };
+    let mut unpacked = 0u128;
+    for entry in tar::Archive::new(flate2::read::GzDecoder::new(bytes)).entries()? {
+        unpacked += u128::from(entry?.size());
+    }
+    let staged = bytes.len() as u128 + unpacked;
+    if temp.0 == dest.0 {
+        return Ok(elastos_common::require_free_space(
+            dest.1,
+            staged + unpacked,
+        )?);
+    }
+    elastos_common::require_free_space(temp.1, staged)?;
+    Ok(elastos_common::require_free_space(dest.1, unpacked)?)
 }
 
 fn extract_from_tarball(
@@ -4026,6 +4064,46 @@ pub(crate) mod tests {
         let mut corrupt = bytes;
         corrupt[0] ^= 1;
         assert!(verify_checksum("home-cli", &corrupt, &info).is_err());
+    }
+
+    #[test]
+    fn component_writes_keep_the_shared_free_space_reserve_at_the_boundary() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let fits = |bytes: &[u8], temp, dest_available| {
+            component_space_fits(bytes, temp, (1, dest_available)).is_ok()
+        };
+        // A plain component writes its own bytes to the destination volume.
+        let plain = vec![7u8; 1000];
+        assert!(fits(&plain, None, 1000 + reserve));
+        assert!(!fits(&plain, None, 1000 + reserve - 1));
+
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, size) in [("tool/bin/tool", 3000_usize), ("tool/share/data", 5000)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(size as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, vec![1u8; size].as_slice())
+                .unwrap();
+        }
+        let tarball = archive.into_inner().unwrap().finish().unwrap();
+        let unpacked = 8000;
+        let staged = tarball.len() as u128 + unpacked;
+        // Separate volumes: the archive and its unpacked tree on temp, the tree on dest.
+        let temp_fits = Some((2, staged + reserve));
+        assert!(fits(&tarball, temp_fits, unpacked + reserve));
+        assert!(!fits(&tarball, temp_fits, unpacked + reserve - 1));
+        assert!(!fits(
+            &tarball,
+            Some((2, staged + reserve - 1)),
+            unpacked + reserve
+        ));
+        // One volume holds the staged archive, its unpacked tree and the copy.
+        let shared = staged + unpacked + reserve;
+        assert!(fits(&tarball, Some((1, 0)), shared));
+        assert!(!fits(&tarball, Some((1, 0)), shared - 1));
     }
 
     #[cfg(unix)]

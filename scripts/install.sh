@@ -284,6 +284,29 @@ short_did() {
     fi
 }
 
+# User-facing writes keep this much free on top of their own bytes, so a disk is
+# never filled to zero. A Runtime test keeps it equal to FREE_SPACE_RESERVE_BYTES.
+FREE_SPACE_RESERVE_BYTES=2147483648
+
+require_install_space() {
+    local dir="$1"
+    # A release that omits the size still keeps the reserve; the Runtime's
+    # installation writer checks the exact bytes again before writing.
+    local bytes="${2:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || die "Release states an invalid binary size"
+    local available_kib
+    available_kib="$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')"
+    [[ "$available_kib" =~ ^[0-9]+$ ]] || die "Cannot read free space for ${dir}"
+    if (( available_kib * 1024 < bytes + FREE_SPACE_RESERVE_BYTES )); then
+        # Same wording and rounding (up to a tenth of a GB) as the Runtime.
+        local gib=1073741824 tenths needed
+        tenths=$(( (bytes * 10 + gib - 1) / gib ))
+        needed="$(( tenths / 10 ))"
+        (( tenths % 10 == 0 )) || needed="${needed}.$(( tenths % 10 ))"
+        die "not enough free space: this needs ${needed} GB plus $(( FREE_SPACE_RESERVE_BYTES / gib )) GB kept free"
+    fi
+}
+
 installer_data_dir() {
     local home_dir="$1"
     local xdg_data_home="${2:-}"
@@ -1069,6 +1092,7 @@ validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
 
 BINARY_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
 BINARY_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
+BINARY_SIZE=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['size']")
 
 if [[ -z "$BINARY_CID" ]]; then
     AVAILABLE=$(json_get "${TMPDIR}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
@@ -1078,7 +1102,7 @@ fi
 # ── Download + verify binary ─────────────────────────────────────────
 
 step 3 "Download ElastOS Runtime"
-BINARY_SIZE=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary'].get('size')")
+require_install_space "$TMPDIR" "$BINARY_SIZE"
 BINARY_SIZE_LABEL=""
 if [[ "$BINARY_SIZE" =~ ^[0-9]+$ ]] && (( BINARY_SIZE >= 1048576 )); then
     BINARY_SIZE_LABEL=" ($((BINARY_SIZE / 1048576)) MB)"
@@ -1118,6 +1142,7 @@ mkdir -p "$INSTALL_DIR"
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
 
+require_install_space "$INSTALL_DIR" "$BINARY_SIZE"
 TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
 trap 'rm -rf "$TMPDIR" "$TMP_INSTALL_BIN"' EXIT
 cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
