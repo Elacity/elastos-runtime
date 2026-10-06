@@ -140,15 +140,22 @@ pub fn load_and_accept_collaboration_startup_configuration(
     data_root: &Path,
 ) -> anyhow::Result<CollaborationStartupConfiguration> {
     let loader = CollaborationProfileChainLoader::new(data_root);
-    // Shared with `elastos setup --isolated`, so a Home is never isolated and
-    // joined at once. Only a present file can race that choice, and an absent
-    // one keeps this load free of writes; everything below re-reads under it.
-    let _choice = if fs::symlink_metadata(data_root.join(COLLABORATION_STARTUP_CONFIG_FILE)).is_ok()
-    {
-        crate::collaboration_release_network::lock_network_choice(data_root)?
-    } else {
-        None
-    };
+    // An absent file is final for this load, so it stays free of writes and
+    // never reads the path again. A present file is read and accepted only
+    // under the lock `elastos setup --isolated` takes, after rechecking the
+    // isolation choice, so a Home is never isolated and joined at once.
+    match fs::symlink_metadata(data_root.join(COLLABORATION_STARTUP_CONFIG_FILE)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CollaborationStartupConfiguration {
+                configuration: loader.load_absent()?,
+            });
+        }
+        Err(error) => {
+            return Err(error).context("failed to inspect collaboration startup configuration")
+        }
+    }
+    let _choice = crate::collaboration_release_network::lock_network_choice(data_root)?;
     if crate::collaboration_release_network::isolation_applies_at_startup(data_root) {
         return Ok(CollaborationStartupConfiguration {
             configuration: loader.load_absent()?,
