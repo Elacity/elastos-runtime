@@ -109,6 +109,8 @@ pub(crate) struct CollaborationDiscoveryStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
     advertisement_id: String,
+    /// Kept inside Runtime to match a visible person to a Chat participant.
+    profile_did: String,
     display_name: String,
     handle: Option<String>,
     last_seen_at: u64,
@@ -990,9 +992,13 @@ impl CollaborationDiscoveryService {
         } else {
             Ok(())
         };
+        // The outbox retries on every pass; a refused item is not a relay
+        // outage, so it neither blocks the query nor reads as unavailable.
         if let Err(err) = outbox_result {
-            self.set_transport_available(profile_did, false)?;
-            return Err(err.context("discovery relay outbox delivery failed"));
+            tracing::debug!(
+                error = %format!("{err:#}"),
+                "discovery relay outbox delivery failed; retrying on the next pass"
+            );
         }
         if let Err(err) = mailbox_result {
             self.set_transport_available(profile_did, false)?;
@@ -1380,6 +1386,8 @@ impl CollaborationDiscoveryService {
         let mut decisions =
             VecDeque::from(store.resendable_contact_decisions(now, MAX_DISCOVERY_QUERY_RESULTS)?);
         let mut prefer_requests = true;
+        // One refused item must not starve the rest of the outbox.
+        let mut first_failure: Option<anyhow::Error> = None;
         for _ in 0..MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC {
             let next_is_request = match (requests.is_empty(), decisions.is_empty()) {
                 (true, true) => break,
@@ -1391,7 +1399,7 @@ impl CollaborationDiscoveryService {
                 let request = requests
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("pending contact request queue underflow"))?;
-                let response = self
+                let sent = match self
                     .invoke_bootstrap(
                         "send_contact_request",
                         serde_json::to_value(DiscoveryProviderContactRequest {
@@ -1399,13 +1407,21 @@ impl CollaborationDiscoveryService {
                             request: encode_bytes(&request),
                         })?,
                     )
-                    .await?;
-                require_discovery_provider_success(response, "contact request submission")?;
+                    .await
+                {
+                    Ok(response) => {
+                        require_discovery_provider_success(response, "contact request submission")
+                    }
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = sent {
+                    first_failure.get_or_insert(err);
+                }
             } else {
                 let receipt = decisions
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("pending contact decision queue underflow"))?;
-                let response = self
+                let sent = match self
                     .invoke_bootstrap(
                         "submit_contact_decision_receipt",
                         serde_json::to_value(DiscoveryProviderDecisionReceiptRequest {
@@ -1413,8 +1429,16 @@ impl CollaborationDiscoveryService {
                             receipt: encode_bytes(&receipt),
                         })?,
                     )
-                    .await?;
-                require_discovery_provider_success(response, "contact decision submission")?;
+                    .await
+                {
+                    Ok(response) => {
+                        require_discovery_provider_success(response, "contact decision submission")
+                    }
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = sent {
+                    first_failure.get_or_insert(err);
+                }
             }
             if !requests.is_empty() && !decisions.is_empty() {
                 prefer_requests = !prefer_requests;
@@ -1422,7 +1446,10 @@ impl CollaborationDiscoveryService {
                 prefer_requests = !requests.is_empty();
             }
         }
-        Ok(())
+        match first_failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn set_transport_available(&self, profile_did: &str, available: bool) -> anyhow::Result<()> {
@@ -1669,6 +1696,7 @@ fn project_discovery_status(
             .values()
             .map(|cached| DiscoveryVisiblePerson {
                 advertisement_id: cached.verified.message().envelope_sha256().to_string(),
+                profile_did: cached.verified.profile_did().to_string(),
                 display_name: cached.verified.display_name().to_string(),
                 handle: cached.verified.handle().map(str::to_string),
                 last_seen_at: cached.verified.message().envelope().payload.created_at,
@@ -1882,6 +1910,10 @@ impl DiscoveryVisiblePerson {
         &self.advertisement_id
     }
 
+    pub(crate) fn profile_did(&self) -> &str {
+        &self.profile_did
+    }
+
     pub(crate) fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -1902,8 +1934,10 @@ impl DiscoveryVisiblePerson {
         last_seen_at: u64,
         expires_at: u64,
     ) -> Self {
+        let advertisement_id = advertisement_id.into();
         Self {
-            advertisement_id: advertisement_id.into(),
+            profile_did: format!("did:key:test-{advertisement_id}"),
+            advertisement_id,
             display_name: display_name.into(),
             handle,
             last_seen_at,
@@ -5885,19 +5919,23 @@ pub(crate) mod tests {
             )
             .unwrap()
             .expect("request must remain stored for retry");
-        assert!(local_service
+        // A refused outbox item stays queued, but the pass still reaches the
+        // relay's mailbox and query, so Discovery keeps working meanwhile.
+        let during_outage = local_service
             .refresh(local_store.as_ref(), &local_profile, current_timestamp())
             .await
-            .is_err());
+            .unwrap();
+        assert!(during_outage.available());
         assert!(remote_store.pending_incoming_requests().unwrap().is_empty());
 
         seed_provider.allow_requests();
         seed_provider
             .set_request_submission_response(serde_json::json!({"status":"error","data":{}}));
-        assert!(local_service
+        local_service
             .refresh(local_store.as_ref(), &local_profile, current_timestamp())
             .await
-            .is_err());
+            .unwrap();
+        assert!(remote_store.pending_incoming_requests().unwrap().is_empty());
         assert_eq!(
             local_store
                 .stored_outgoing_contact_request(

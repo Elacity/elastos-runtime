@@ -25,6 +25,9 @@ pub(super) struct DirectConversationView {
     /// The relationship ended. History stays readable; composing stops.
     #[serde(default)]
     pub(super) removed: bool,
+    /// A message arrived that this person has not opened yet.
+    #[serde(default)]
+    pub(super) unread: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -232,6 +235,7 @@ mod tests {
             conversation_id: id.to_string(),
             display_name: name.to_string(),
             removed: false,
+            unread: false,
         }
     }
 

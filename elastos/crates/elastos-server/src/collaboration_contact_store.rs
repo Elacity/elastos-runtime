@@ -213,6 +213,10 @@ impl PendingIncomingContactRequest {
         &self.request_hash
     }
 
+    pub(crate) fn requester_profile_did(&self) -> &str {
+        &self.requester_profile_did
+    }
+
     pub(crate) fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -811,9 +815,15 @@ impl CollaborationContactStore {
                         .revoked_request_hashes
                         .contains(request.message().envelope_sha256())
                     && !loaded.decisions.contains_key(request.message().envelope_sha256())
+                    // The relay admits a request only while its bound
+                    // advertisement is live; after that the recipient's own
+                    // copy carries it, so resending would only be refused.
                     && loaded
                         .advertisements
-                        .contains_key(request.advertisement_envelope_sha256())
+                        .get(request.advertisement_envelope_sha256())
+                        .is_some_and(|advertisement| {
+                            advertisement.message().envelope().payload.expires_at > now
+                        })
             })
             .collect::<Vec<_>>();
         resendable.sort_by(|left, right| {

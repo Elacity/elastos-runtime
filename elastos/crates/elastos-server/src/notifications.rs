@@ -396,6 +396,27 @@ pub fn direct_message_notification_action_id(conversation_id: &str) -> String {
     format!("chat-open-direct:{conversation_id}")
 }
 
+/// Direct conversations whose newest message notification has not been
+/// acted on yet, which is when the person opens the conversation.
+pub fn unread_direct_message_conversations(
+    data_dir: &Path,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let path = notifications_path(data_dir)?;
+    let store = read_json_or_default::<NotificationStore>(&path)?;
+    Ok(store
+        .entries
+        .iter()
+        .filter(|entry| !entry.acted)
+        .filter_map(|entry| entry.id.strip_prefix(DIRECT_MESSAGE_ID_PREFIX))
+        .map(str::to_string)
+        .collect())
+}
+
+/// True for the per-conversation direct message notification entries.
+pub fn is_direct_message_notification_id(id: &str) -> bool {
+    id.starts_with(DIRECT_MESSAGE_ID_PREFIX)
+}
+
 fn direct_message_notification_id(conversation_id: &str) -> String {
     format!("{DIRECT_MESSAGE_ID_PREFIX}{conversation_id}")
 }
@@ -717,6 +738,26 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn direct_conversation_is_unread_until_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(unread_direct_message_conversations(tmp.path())
+            .unwrap()
+            .is_empty());
+        upsert_direct_message_notification(tmp.path(), "direct:abc", "Alex", now_ts()).unwrap();
+        assert!(unread_direct_message_conversations(tmp.path())
+            .unwrap()
+            .contains("direct:abc"));
+        mark_acted_for_action(
+            tmp.path(),
+            &direct_message_notification_action_id("direct:abc"),
+        )
+        .unwrap();
+        assert!(unread_direct_message_conversations(tmp.path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

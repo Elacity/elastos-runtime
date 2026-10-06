@@ -131,6 +131,7 @@ show_help() {
     echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
+    echo "  --isolated            Keep this Home out of the shared Community room"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
@@ -721,7 +722,11 @@ finish_install() {
         return 0
     fi
     info "Setting up Home..."
-    "$runtime_bin" setup </dev/null || return $?
+    if [[ "${ISOLATED:-false}" == true ]]; then
+        "$runtime_bin" setup --isolated </dev/null || return $?
+    else
+        "$runtime_bin" setup </dev/null || return $?
+    fi
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."
         "$runtime_bin" home --browser </dev/tty || return $?
@@ -739,6 +744,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
     return 0
 fi
 
+ISOLATED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
@@ -763,6 +769,7 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
+        --isolated) ISOLATED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
             INSTALL_DIR="$2"; shift 2 ;;

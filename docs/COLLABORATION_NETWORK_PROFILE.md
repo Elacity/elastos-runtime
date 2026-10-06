@@ -16,6 +16,16 @@ an absent setting keeps the default listener and ephemeral-port fallback.
 The setting changes the listener address only. Carrier network policy and
 collaboration authority keep their own checks.
 
+> **Tip — pin the bootstrap Runtime's Carrier address before exporting its
+> receipt.** The bootstrap receipt, and so every Home's network file, records
+> the bootstrap Runtime's exact IP address and UDP port. Without
+> `carrier_bind_addr`, a Runtime takes `0.0.0.0:4433` when that port is free
+> and a random port otherwise, so a restart can move it. Pin a port that every
+> joining Home can reach, for example `0.0.0.0:4433`: `127.0.0.1` answers only
+> on the same machine, while the receipt usually names the LAN or public
+> address. When two Runtimes share one machine, give each its own port.
+> See [Troubleshooting](TROUBLESHOOTING.md#collaboration-network-and-carrier).
+
 The canonical JSON envelope uses lexicographically ordered object keys with no
 insignificant whitespace and has exactly three fields: `payload`, `signature`,
 and `signer_did`. The canonical bytes of its `payload` field are signed with the
@@ -69,6 +79,46 @@ fallback. Absence selects isolation. A present file is validated and accepted
 before Carrier subscription or worker startup; invalid permissions, bounds,
 encoding, trust, chain, or grant fail closed.
 
+## Release default network
+
+Every Home joins the shared Community room by default. The signed release
+names that network, and setup installs it; a Home stays isolated only when its
+person chooses isolation.
+
+The release pins the network in `components.json` as `collaboration_network`:
+
+- `head_cid`, the raw SHA-256 CIDv1 of the exact startup configuration bytes;
+- `expected_network_id`;
+- `trusted_profile_signer_dids`, the complete trusted signer set.
+
+The release ships those bytes beside `components.json` as
+`collaboration-network-release-v1.json`. The release signature covers
+`components.json`, so the release publisher vouches for the pin, and the pin
+fixes the exact configuration, network and signer set. Setup then checks the
+configuration with the same validator Runtime startup uses. Runtime startup
+itself still reads only `collaboration-network-v1.json`.
+
+Setup and update apply the release network to the data root:
+
+- A new Home receives `collaboration-network-v1.json` from the release copy
+  and prints one line saying it joins the Community room and how to stay
+  isolated.
+- An update that pins a newer revision of the same network and signer set
+  replaces the file only when the new chain strictly extends the installed
+  chain. The accepted-head marker then advances at the next start.
+- A Home that already holds a configuration for another network keeps it.
+- `elastos setup --isolated` (or `install.sh --isolated`) records the
+  owner-only choice `collaboration-isolated-v1` before the first start. Setup
+  and update then leave the release network uninstalled. A Home that already
+  joined a network keeps it, because Runtime refuses to drop an accepted
+  network.
+- Source-home setup keeps its explicit `ELASTOS_COLLABORATION_STARTUP_MODE`
+  (`configured` or `isolated`) and ignores the release pin.
+
+A release without `collaboration_network` leaves every Home's collaboration
+configuration unchanged. The operator provisioning below creates the network
+and its configuration bytes that a release then pins.
+
 ## Operator provisioning
 
 `elastos collaboration-config` is the only repository tool that creates this
@@ -119,6 +169,22 @@ elastos collaboration-config verify \
   --input <data-root>/collaboration-network-v1.json
 ```
 
+When the bootstrap Runtime's address changes, export a fresh bootstrap
+receipt and generate the next signed revision from the current file with the
+same authority key. The network ID, trusted signer set and default-conversation
+grant stay the same; only the bootstrap peers change:
+
+```text
+elastos collaboration-config generate-revision \
+  --authority-key <owner-only-key-path> \
+  --input <current collaboration-network-v1.json> \
+  --bootstrap-peer <owner-only-bootstrap-receipt> \
+  --output <next collaboration-network-v1.json>
+```
+
+Ship the new revision in the next release with its pin; update then advances
+each joined Home along the same chain.
+
 Generation fixes the logical sender service to Chat (`chat`); Runtime startup
 separately binds the operation capsule to `chat-room`. The command creates the
 canonical `profile_scoped_signer` grant, binds its raw SHA-256 CID into the
@@ -129,7 +195,9 @@ accepted-head marker, create a Runtime device identity, join Carrier, or write
 product state. Its receipt contains only public identifiers and hashes; it
 never prints the authority key or connect ticket.
 
-An absent profile means isolated mode. It never falls back to a public network.
+At Runtime startup, an absent profile means isolated mode; Runtime never
+substitutes a network of its own. Joining the default network is a setup and
+update step governed by the release pin above.
 A profile with another valid network ID is a separate namespace and is rejected
 when a different network was requested. Updates fail closed on signature,
 canonicalization, bounds, signer, network, revision, or previous-hash errors.

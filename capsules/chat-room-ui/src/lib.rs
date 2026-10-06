@@ -150,6 +150,12 @@ struct App {
     emoji_buttons: Vec<HtmlButtonElement>,
     participant_count: HtmlElement,
     participant_list: HtmlElement,
+    participant_card: HtmlElement,
+    participant_card_avatar: HtmlElement,
+    participant_card_name: HtmlElement,
+    participant_card_state: HtmlElement,
+    participant_card_action: HtmlButtonElement,
+    participant_card_close: HtmlButtonElement,
     browser_access_section: HtmlElement,
     browser_access_count: HtmlElement,
     browser_access_list: HtmlElement,
@@ -221,6 +227,9 @@ impl ShellSessionBootstrapFailure {
 struct ConversationObjectView {
     seq: u64,
     sender: String,
+    /// Opaque reference to the sender's profile card, when Runtime has one.
+    #[serde(default)]
+    sender_ref: Option<String>,
     /// `Some(true)`: `sender` is the sender's verified Profile display name.
     /// `Some(false)`/`None`: configured shared Chat omits the row; other modes
     /// keep their existing server-stamped naming.
@@ -264,8 +273,25 @@ struct AttachmentView {
     is_video: bool,
 }
 
+/// A Community profile card. Runtime supplies only an opaque reference and
+/// the relationship; it never sends a Profile or device DID.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ParticipantCard {
+    participant_ref: String,
+    relationship: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
+    can_add_contact: bool,
+    /// Shared presence (Discovery on) that has not expired.
+    #[serde(default)]
+    active_now: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ParticipantView {
+    #[serde(default)]
+    card: Option<ParticipantCard>,
     display_name: String,
     /// Same contract as `ConversationObjectView::sender_profile_verified`.
     #[serde(default)]
@@ -552,6 +578,12 @@ pub fn start() -> Result<(), JsValue> {
             .collect::<Result<Vec<_>, _>>()?,
         participant_count: element_by_id(&document, "participant-count")?,
         participant_list: element_by_id(&document, "participant-list")?,
+        participant_card: element_by_id(&document, "participant-card")?,
+        participant_card_avatar: element_by_id(&document, "participant-card-avatar")?,
+        participant_card_name: element_by_id(&document, "participant-card-name")?,
+        participant_card_state: element_by_id(&document, "participant-card-state")?,
+        participant_card_action: button_by_id(&document, "participant-card-action")?,
+        participant_card_close: button_by_id(&document, "participant-card-close")?,
         browser_access_section: element_by_id(&document, "browser-access-section")?,
         browser_access_count: element_by_id(&document, "browser-access-count")?,
         browser_access_list: element_by_id(&document, "browser-access-list")?,
@@ -616,7 +648,13 @@ impl App {
         let poll_app = Rc::clone(self);
         spawn_local(async move {
             loop {
+                let was_active = poll_app.state.borrow().session_active;
                 poll_app.poll_and_render_once().await;
+                // A session that just became active loads its history at
+                // once instead of after one more poll interval.
+                if !was_active && poll_app.state.borrow().session_active {
+                    continue;
+                }
                 TimeoutFuture::new(poll_app.poll_interval_ms()).await;
             }
         });
@@ -1048,50 +1086,7 @@ impl App {
             let Some(choice) = choice else {
                 return;
             };
-            let selection_guard = {
-                let mut state = selector_app.state.borrow_mut();
-                state.error_text = None;
-                state.error_transient = false;
-                if choice == "shared" {
-                    commit_shared_selection(&mut state)
-                } else {
-                    let Some(guard) = commit_direct_selection(&mut state, &choice) else {
-                        return;
-                    };
-                    guard
-                }
-            };
-            let _ = selector_app.render();
-            if choice == "shared" {
-                selector_app.publish_home_navigation(&selection_guard);
-            }
-            selector_app.start_poll_loop();
-            let app = Rc::clone(&selector_app);
-            spawn_local(async move {
-                if choice == "shared" {
-                    if let Err(error) = app.ensure_shell_session_for_guard(&selection_guard).await {
-                        if app.selection_guard_is_current(&selection_guard) {
-                            app.set_error(Some(error));
-                        }
-                    }
-                } else if let Err(status) = app
-                    .refresh_direct_messages_for_guard(&selection_guard)
-                    .await
-                {
-                    if app.selection_guard_is_current(&selection_guard) {
-                        if status == 403 {
-                            app.return_to_conversation_selector(Some(&choice));
-                        } else {
-                            app.set_error(Some(
-                                "Direct messages are temporarily unavailable.".to_string(),
-                            ));
-                        }
-                    }
-                }
-                if app.selection_guard_is_current(&selection_guard) {
-                    let _ = app.render();
-                }
-            });
+            selector_app.select_conversation(choice);
         }));
         self.conversation_selector
             .add_event_listener_with_callback("click", selector_click.as_ref().unchecked_ref())?;
@@ -1200,6 +1195,7 @@ impl App {
             browser_access_click.as_ref().unchecked_ref(),
         )?;
         browser_access_click.forget();
+        self.install_participant_card_listeners()?;
 
         let join_invite_app = Rc::clone(self);
         let join_invite_submit =
@@ -1534,6 +1530,9 @@ impl App {
                     }
                     let app = Rc::clone(&runtime_events_app);
                     spawn_local(async move {
+                        // New direct messages and new contacts change the
+                        // conversation list as well as the open thread.
+                        let _ = app.refresh_direct_conversations().await;
                         app.poll_and_render_once().await;
                     });
                 }));
@@ -2529,6 +2528,274 @@ impl App {
         Ok(true)
     }
 
+    /// Switches this Chat window to the shared room or one direct
+    /// conversation. The rail, the profile card and Home selection use it.
+    fn select_conversation(self: &Rc<Self>, choice: String) {
+        let selection_guard = {
+            let mut state = self.state.borrow_mut();
+            state.error_text = None;
+            state.error_transient = false;
+            if choice == "shared" {
+                commit_shared_selection(&mut state)
+            } else {
+                let Some(guard) = commit_direct_selection(&mut state, &choice) else {
+                    return;
+                };
+                guard
+            }
+        };
+        let _ = self.render();
+        if choice == "shared" {
+            self.publish_home_navigation(&selection_guard);
+        }
+        self.start_poll_loop();
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            if choice == "shared" {
+                if let Err(error) = app.ensure_shell_session_for_guard(&selection_guard).await {
+                    if app.selection_guard_is_current(&selection_guard) {
+                        app.set_error(Some(error));
+                    }
+                }
+            } else if let Err(status) = app
+                .refresh_direct_messages_for_guard(&selection_guard)
+                .await
+            {
+                if app.selection_guard_is_current(&selection_guard) {
+                    if status == 403 {
+                        app.return_to_conversation_selector(Some(&choice));
+                    } else {
+                        app.set_error(Some(
+                            "Direct messages are temporarily unavailable.".to_string(),
+                        ));
+                    }
+                }
+            }
+            if app.selection_guard_is_current(&selection_guard) {
+                let _ = app.render();
+            }
+        });
+    }
+
+    /// Opens a direct conversation named by a profile card, refreshing the
+    /// conversation list first when it is new to this window.
+    fn open_direct_conversation(self: &Rc<Self>, conversation_id: String) {
+        let known = self
+            .state
+            .borrow()
+            .direct
+            .conversations
+            .iter()
+            .any(|conversation| conversation.conversation_id == conversation_id);
+        if known {
+            self.select_conversation(conversation_id);
+            return;
+        }
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            let _ = app.refresh_direct_conversations().await;
+            app.select_conversation(conversation_id);
+        });
+    }
+
+    fn participant_card_for(&self, participant_ref: &str) -> Option<(String, ParticipantCard)> {
+        let state = self.state.borrow();
+        state.participants.iter().find_map(|participant| {
+            participant
+                .card
+                .as_ref()
+                .filter(|card| card.participant_ref == participant_ref)
+                .map(|card| {
+                    (
+                        participant_shown_name(participant).to_string(),
+                        card.clone(),
+                    )
+                })
+        })
+    }
+
+    fn participant_activity_for(&self, participant_ref: &str) -> Option<String> {
+        let state = self.state.borrow();
+        let participant = state.participants.iter().find(|participant| {
+            participant
+                .card
+                .as_ref()
+                .is_some_and(|card| card.participant_ref == participant_ref)
+        })?;
+        let card = participant.card.as_ref()?;
+        if card.active_now {
+            Some("Active now".to_string())
+        } else if participant.last_seen_at > 0 {
+            Some(last_message_text(participant.last_seen_at))
+        } else {
+            None
+        }
+    }
+
+    fn open_participant_card(&self, participant_ref: &str) {
+        let Some((name, card)) = self.participant_card_for(participant_ref) else {
+            return;
+        };
+        let (state_text, action) = participant_card_copy(&card, self.config.home_token.is_some());
+        let activity = self.participant_activity_for(participant_ref);
+        self.participant_card_avatar
+            .set_text_content(Some(&participant_initial(&name)));
+        self.participant_card_name.set_text_content(Some(&name));
+        self.participant_card_state
+            .set_text_content(Some(&match activity {
+                Some(activity) if card.relationship != "you" => {
+                    format!("{state_text} · {activity}")
+                }
+                _ => state_text.to_string(),
+            }));
+        match action {
+            Some((label, action)) => {
+                self.participant_card_action.set_text_content(Some(label));
+                let _ = self
+                    .participant_card_action
+                    .set_attribute("data-card-action", action);
+                self.participant_card_action.set_disabled(false);
+                self.participant_card_action.set_hidden(false);
+            }
+            None => {
+                let _ = self
+                    .participant_card_action
+                    .remove_attribute("data-card-action");
+                self.participant_card_action.set_hidden(true);
+            }
+        }
+        let _ = self
+            .participant_card
+            .set_attribute("data-participant-ref", participant_ref);
+        self.participant_card.set_hidden(false);
+        let _ = self.participant_card_close.focus();
+    }
+
+    fn close_participant_card(&self) {
+        self.participant_card.set_hidden(true);
+        let _ = self
+            .participant_card
+            .remove_attribute("data-participant-ref");
+    }
+
+    fn run_participant_card_action(self: &Rc<Self>) {
+        let Some(participant_ref) = self.participant_card.get_attribute("data-participant-ref")
+        else {
+            return;
+        };
+        let Some(action) = self
+            .participant_card_action
+            .get_attribute("data-card-action")
+        else {
+            return;
+        };
+        let Some((_, card)) = self.participant_card_for(&participant_ref) else {
+            self.close_participant_card();
+            return;
+        };
+        match action.as_str() {
+            "message" => {
+                self.close_participant_card();
+                if let Some(conversation_id) = card.conversation_id {
+                    self.open_direct_conversation(conversation_id);
+                }
+            }
+            "add-contact" => {
+                self.participant_card_action.set_disabled(true);
+                let app = Rc::clone(self);
+                spawn_local(async move {
+                    match app.request_contact(&participant_ref).await {
+                        Ok(()) => {
+                            app.participant_card_state
+                                .set_text_content(Some(PARTICIPANT_CARD_REQUEST_SENT));
+                            app.participant_card_action.set_hidden(true);
+                        }
+                        Err(error) => {
+                            app.participant_card_state.set_text_content(Some(&error));
+                            app.participant_card_action.set_disabled(false);
+                        }
+                    }
+                });
+            }
+            "inbox" | "people" => {
+                self.close_participant_card();
+                let _ = self.post_library_picker_message(serde_json::json!({
+                    "type": "home:open-target", "target": action, "query": {},
+                    "homeToken": self.config.home_token,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    async fn request_contact(&self, participant_ref: &str) -> Result<(), String> {
+        let _: serde_json::Value = api_post_json_with_headers(
+            &self.room_api_url("/contacts/request"),
+            &serde_json::json!({ "participant_ref": participant_ref }),
+            &self.home_token_headers(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Profile cards: a click, Enter or Space on any name with a card opens
+    /// it; the card closes on its close button or Escape.
+    fn install_participant_card_listeners(self: &Rc<Self>) -> Result<(), JsValue> {
+        for list in [&self.participant_list, &self.message_list] {
+            let card_app = Rc::clone(self);
+            let open_card = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+                if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
+                    if key_event.key() != "Enter" && key_event.key() != " " {
+                        return;
+                    }
+                }
+                let Some(target) = event
+                    .target()
+                    .and_then(|value| value.dyn_into::<Element>().ok())
+                else {
+                    return;
+                };
+                let Some(named) = target.closest("[data-participant-ref]").ok().flatten() else {
+                    return;
+                };
+                let Some(participant_ref) = named.get_attribute("data-participant-ref") else {
+                    return;
+                };
+                event.prevent_default();
+                card_app.open_participant_card(&participant_ref);
+            }));
+            list.add_event_listener_with_callback("click", open_card.as_ref().unchecked_ref())?;
+            list.add_event_listener_with_callback("keydown", open_card.as_ref().unchecked_ref())?;
+            open_card.forget();
+        }
+        let card_action_app = Rc::clone(self);
+        let card_action = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            card_action_app.run_participant_card_action();
+        }));
+        self.participant_card_action
+            .add_event_listener_with_callback("click", card_action.as_ref().unchecked_ref())?;
+        card_action.forget();
+        let card_close_app = Rc::clone(self);
+        let card_close = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            card_close_app.close_participant_card();
+        }));
+        self.participant_card_close
+            .add_event_listener_with_callback("click", card_close.as_ref().unchecked_ref())?;
+        card_close.forget();
+        let card_escape_app = Rc::clone(self);
+        let card_escape = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+            if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
+                if key_event.key() == "Escape" && !card_escape_app.participant_card.hidden() {
+                    card_escape_app.close_participant_card();
+                }
+            }
+        }));
+        self.document
+            .add_event_listener_with_callback("keydown", card_escape.as_ref().unchecked_ref())?;
+        card_escape.forget();
+        Ok(())
+    }
+
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
         if self.config.home_token.is_none() || self.home_parent_origin.is_none() {
             return Ok(false);
@@ -2992,10 +3259,11 @@ impl App {
             let selected = direct.selected_conversation_id.as_deref()
                 == Some(conversation.conversation_id.as_str());
             button.set_attribute("aria-current", if selected { "true" } else { "false" })?;
-            button.set_class_name(if selected {
-                "conversation-choice active"
-            } else {
-                "conversation-choice"
+            let unread = conversation.unread && !selected;
+            button.set_class_name(match (selected, unread) {
+                (true, _) => "conversation-choice active",
+                (false, true) => "conversation-choice unread",
+                (false, false) => "conversation-choice",
             });
             append_conversation_choice_content(
                 &self.document,
@@ -3004,10 +3272,18 @@ impl App {
                 &conversation.display_name,
                 if conversation.removed {
                     "Removed contact"
+                } else if unread {
+                    "New message"
                 } else {
                     "Direct message"
                 },
             )?;
+            if unread {
+                let dot = self.document.create_element("span")?;
+                dot.set_class_name("conversation-unread-dot");
+                dot.set_attribute("aria-label", "Unread")?;
+                button.append_child(&dot)?;
+            }
             self.conversation_selector.append_child(&button)?;
         }
 
@@ -3051,7 +3327,9 @@ impl App {
             self.message_list.append_child(&empty)?;
             return Ok(());
         }
+        let mut last_day = None;
         for message in &direct.messages {
+            self.append_day_separator_if_new(&mut last_day, message.created_at)?;
             let outgoing = message.direction == DirectMessageDirection::Outgoing;
             let item = self.document.create_element("li")?;
             item.set_class_name(if outgoing {
@@ -3136,6 +3414,12 @@ impl App {
             } else {
                 "participant"
             });
+            if let Some(card) = participant.card.as_ref() {
+                item.set_class_name(&format!("{} participant-clickable", item.class_name()));
+                item.set_attribute("data-participant-ref", &card.participant_ref)?;
+                item.set_attribute("role", "button")?;
+                item.set_attribute("tabindex", "0")?;
+            }
 
             let shown_name = participant_shown_name(participant);
             let avatar = self.document.create_element("div")?;
@@ -3399,6 +3683,27 @@ impl App {
         Ok(())
     }
 
+    /// Adds a day separator before the first message of each local day.
+    fn append_day_separator_if_new(
+        &self,
+        last_day: &mut Option<(u32, u32, u32)>,
+        timestamp_secs: u64,
+    ) -> Result<(), JsValue> {
+        let day = local_day(timestamp_secs);
+        if *last_day == Some(day) {
+            return Ok(());
+        }
+        *last_day = Some(day);
+        let separator = self.document.create_element("li")?;
+        separator.set_class_name("day-separator");
+        separator.set_attribute("role", "separator")?;
+        let label = self.document.create_element("span")?;
+        label.set_text_content(Some(&day_separator_text(timestamp_secs)));
+        separator.append_child(&label)?;
+        self.message_list.append_child(&separator)?;
+        Ok(())
+    }
+
     fn render_objects(
         &self,
         objects: &[ConversationObjectView],
@@ -3416,7 +3721,9 @@ impl App {
             return Ok(());
         }
 
+        let mut last_day = None;
         for object in objects {
+            self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
             let is_self = object.from_current_session;
             item.set_class_name(
@@ -3432,6 +3739,12 @@ impl App {
             let sender = self.document.create_element("span")?;
             let sender_name = object_sender_name(object);
             sender.set_text_content(Some(if is_self { "You" } else { sender_name }));
+            if let Some(sender_ref) = object.sender_ref.as_deref().filter(|_| !is_self) {
+                sender.set_class_name("message-sender-link");
+                sender.set_attribute("data-participant-ref", sender_ref)?;
+                sender.set_attribute("role", "button")?;
+                sender.set_attribute("tabindex", "0")?;
+            }
             let time = self.document.create_element("span")?;
             time.set_text_content(Some(&format_time(object.created_at)));
             meta.append_child(&sender)?;
@@ -4038,6 +4351,7 @@ mod tests {
             conversation_id: "direct:sha256:conversation-b".into(),
             display_name: "B".into(),
             removed: false,
+            unread: false,
         }];
         let guard = commit_direct_selection(&mut state, "direct:sha256:conversation-b").unwrap();
         let conversations = state.direct.conversations.clone();
@@ -4224,6 +4538,7 @@ mod tests {
     #[test]
     fn configured_chat_uses_verified_profile_names_without_device_details() {
         let participant = ParticipantView {
+            card: None,
             display_name: "Owner".to_string(),
             profile_verified: Some(true),
             device_label: "MacBook".to_string(),
@@ -4236,6 +4551,7 @@ mod tests {
         assert_eq!(participant_detail(&participant, false, false), "active now");
 
         let object = ConversationObjectView {
+            sender_ref: None,
             seq: 1,
             sender: "Owner".to_string(),
             sender_profile_verified: Some(true),
@@ -4259,6 +4575,7 @@ mod tests {
             latest_seq: 4,
             participants: vec![
                 ParticipantView {
+                    card: None,
                     display_name: "Owner".to_string(),
                     profile_verified: Some(true),
                     device_label: String::new(),
@@ -4268,6 +4585,7 @@ mod tests {
                     is_current_session: true,
                 },
                 ParticipantView {
+                    card: None,
                     display_name: "Wrong endpoint".to_string(),
                     profile_verified: Some(false),
                     device_label: "Laptop".to_string(),
@@ -4277,6 +4595,7 @@ mod tests {
                     is_current_session: false,
                 },
                 ParticipantView {
+                    card: None,
                     display_name: "Unsigned guest".to_string(),
                     profile_verified: None,
                     device_label: "Browser".to_string(),
@@ -4286,6 +4605,7 @@ mod tests {
                     is_current_session: false,
                 },
                 ParticipantView {
+                    card: None,
                     display_name: String::new(),
                     profile_verified: Some(true),
                     device_label: String::new(),
@@ -4297,6 +4617,7 @@ mod tests {
             ],
             objects: vec![
                 ConversationObjectView {
+                    sender_ref: None,
                     seq: 1,
                     sender: "Owner".to_string(),
                     sender_profile_verified: Some(true),
@@ -4309,6 +4630,7 @@ mod tests {
                     created_at: 1,
                 },
                 ConversationObjectView {
+                    sender_ref: None,
                     seq: 2,
                     sender: "Wrong profile".to_string(),
                     sender_profile_verified: Some(false),
@@ -4321,6 +4643,7 @@ mod tests {
                     created_at: 2,
                 },
                 ConversationObjectView {
+                    sender_ref: None,
                     seq: 3,
                     sender: "Wrong endpoint".to_string(),
                     sender_profile_verified: Some(false),
@@ -4333,6 +4656,7 @@ mod tests {
                     created_at: 3,
                 },
                 ConversationObjectView {
+                    sender_ref: None,
                     seq: 4,
                     sender: String::new(),
                     sender_profile_verified: None,
@@ -4597,6 +4921,7 @@ mod tests {
             conversation_id: "direct:sha256:fixture-conversation".to_string(),
             display_name: "Fixture Friend".to_string(),
             removed: false,
+            unread: false,
         }];
         let bootstrap_generation = state.selection_generation;
         let shared_guard = commit_shared_selection(&mut state);
@@ -4624,6 +4949,7 @@ mod tests {
             conversation_id: "direct:sha256:fixture-conversation".to_string(),
             display_name: "Fixture Friend".to_string(),
             removed: false,
+            unread: false,
         }];
         let direct_guard =
             commit_direct_selection(&mut state, "direct:sha256:fixture-conversation")
@@ -4647,6 +4973,7 @@ mod tests {
                 conversation_id: "direct:sha256:fixture-conversation".to_string(),
                 display_name: "Fixture Friend".to_string(),
                 removed: false,
+                unread: false,
             }],
             direct_messages,
         );
@@ -4669,6 +4996,7 @@ mod tests {
             conversation_id: "direct:sha256:fixture-conversation".to_string(),
             display_name: "Fixture Friend".to_string(),
             removed: false,
+            unread: false,
         }];
         let shared_guard = current_selection_guard(&state);
         let direct_guard =
@@ -4965,10 +5293,33 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
     } else if participant.local_session_count > 0 {
         parts.push("web guest".to_string());
     }
-    if participant.last_seen_at > 0 && !is_local && !local_runtime_participant && !shell_mode {
+    let remote_card = participant
+        .card
+        .as_ref()
+        .filter(|card| card.relationship != "you");
+    if let Some(card) = remote_card {
+        // Community members: presence when they share it, otherwise the
+        // time of their last public message.
+        if card.active_now {
+            parts.push("active now".to_string());
+        } else if participant.last_seen_at > 0 {
+            parts.push(last_message_text(participant.last_seen_at));
+        }
+    } else if participant.last_seen_at > 0 && !is_local && !local_runtime_participant && !shell_mode
+    {
         parts.push(format!("seen {}", format_time(participant.last_seen_at)));
     }
     parts.join(" · ")
+}
+
+/// "last message 14:02" today, otherwise with the day.
+fn last_message_text(timestamp_secs: u64) -> String {
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    if local_day(timestamp_secs) == local_day(now) {
+        format!("last message {}", format_time(timestamp_secs))
+    } else {
+        format!("last message {}", day_separator_text(timestamp_secs))
+    }
 }
 
 /// The declared direct-conversation attachment policy, stated where the
@@ -4988,6 +5339,32 @@ fn object_sender_name(object: &ConversationObjectView) -> &str {
 
 fn participant_shown_name(participant: &ParticipantView) -> &str {
     &participant.display_name
+}
+
+const PARTICIPANT_CARD_REQUEST_SENT: &str =
+    "Contact request sent. They accept or decline it in Inbox.";
+
+/// The card's status line and its one action (label, action id).
+fn participant_card_copy(
+    card: &ParticipantCard,
+    can_act: bool,
+) -> (&'static str, Option<(&'static str, &'static str)>) {
+    let (text, action) = match card.relationship.as_str() {
+        "you" => ("This is you.", None),
+        "contact" if card.conversation_id.is_some() => ("Contact", Some(("Message", "message"))),
+        "contact" => ("Contact", None),
+        "requested" => ("Contact request sent. Waiting for them to accept.", None),
+        "pending" => (
+            "Wants to add you as a contact.",
+            Some(("Open Inbox", "inbox")),
+        ),
+        _ if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
+        _ => (
+            "To add each other, both of you turn on Discovery in People.",
+            Some(("Open People", "people")),
+        ),
+    };
+    (text, if can_act { action } else { None })
 }
 
 fn participant_initial(name: &str) -> String {
@@ -5018,15 +5395,65 @@ fn room_access_policy_enabled_default() -> bool {
     true
 }
 
+fn local_date(timestamp_secs: u64) -> js_sys::Date {
+    js_sys::Date::new(&(timestamp_secs as f64 * 1000.0).into())
+}
+
+/// Hours and minutes in the viewer's own time zone.
 fn format_time(timestamp_secs: u64) -> String {
-    let iso = js_sys::Date::new(&(timestamp_secs as f64 * 1000.0).into())
-        .to_iso_string()
-        .as_string()
-        .unwrap_or_default();
-    if iso.len() >= 16 {
-        iso[11..16].to_string()
+    let date = local_date(timestamp_secs);
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+}
+
+/// The viewer's local calendar day: (year, month 0-11, day of month).
+fn local_day(timestamp_secs: u64) -> (u32, u32, u32) {
+    let date = local_date(timestamp_secs);
+    (date.get_full_year(), date.get_month(), date.get_date())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayLabel {
+    Today,
+    Yesterday,
+    Date { same_year: bool },
+}
+
+/// Chooses the separator label for a message day, given today and
+/// yesterday in the viewer's time zone.
+fn day_label(day: (u32, u32, u32), today: (u32, u32, u32), yesterday: (u32, u32, u32)) -> DayLabel {
+    if day == today {
+        DayLabel::Today
+    } else if day == yesterday {
+        DayLabel::Yesterday
     } else {
-        timestamp_secs.to_string()
+        DayLabel::Date {
+            same_year: day.0 == today.0,
+        }
+    }
+}
+
+fn day_separator_text(timestamp_secs: u64) -> String {
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    match day_label(
+        local_day(timestamp_secs),
+        local_day(now),
+        local_day(now.saturating_sub(86_400)),
+    ) {
+        DayLabel::Today => "Today".to_string(),
+        DayLabel::Yesterday => "Yesterday".to_string(),
+        DayLabel::Date { same_year } => {
+            let options = JsObject::new();
+            let _ = Reflect::set(&options, &"weekday".into(), &"short".into());
+            let _ = Reflect::set(&options, &"month".into(), &"short".into());
+            let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
+            if !same_year {
+                let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
+            }
+            local_date(timestamp_secs)
+                .to_locale_date_string("default", &options)
+                .as_string()
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -5399,4 +5826,103 @@ fn js_error(error: JsValue) -> String {
     error
         .as_string()
         .unwrap_or_else(|| "browser storage error".to_string())
+}
+
+#[cfg(test)]
+mod participant_card_tests {
+    use super::*;
+
+    fn card(
+        relationship: &str,
+        conversation_id: Option<&str>,
+        can_add_contact: bool,
+    ) -> ParticipantCard {
+        ParticipantCard {
+            participant_ref: "contact:0".to_string(),
+            relationship: relationship.to_string(),
+            conversation_id: conversation_id.map(str::to_string),
+            can_add_contact,
+            active_now: false,
+        }
+    }
+
+    #[test]
+    fn participant_card_offers_one_action_per_relationship() {
+        assert_eq!(
+            participant_card_copy(&card("you", None, false), true).1,
+            None
+        );
+        assert_eq!(
+            participant_card_copy(&card("contact", Some("direct:1"), false), true).1,
+            Some(("Message", "message"))
+        );
+        assert_eq!(
+            participant_card_copy(&card("requested", None, false), true).1,
+            None
+        );
+        assert_eq!(
+            participant_card_copy(&card("pending", None, false), true).1,
+            Some(("Open Inbox", "inbox"))
+        );
+        assert_eq!(
+            participant_card_copy(&card("none", None, true), true).1,
+            Some(("Add contact", "add-contact"))
+        );
+        assert_eq!(
+            participant_card_copy(&card("none", None, false), true).1,
+            Some(("Open People", "people"))
+        );
+        assert_eq!(
+            participant_card_copy(&card("contact", Some("direct:1"), false), false).1,
+            None,
+            "without a Home token the card only informs"
+        );
+    }
+
+    #[test]
+    fn participant_card_reads_runtime_json() {
+        let participant: ParticipantView = serde_json::from_value(serde_json::json!({
+            "card": {
+                "participant_ref": "contact:abc",
+                "relationship": "contact",
+                "conversation_id": "direct:1",
+                "can_add_contact": false
+            },
+            "display_name": "Alex",
+            "profile_verified": true,
+            "device_label": "",
+            "last_seen_at": 0
+        }))
+        .unwrap();
+        let parsed = participant.card.unwrap();
+        assert_eq!(parsed.participant_ref, "contact:abc");
+        assert_eq!(parsed.conversation_id.as_deref(), Some("direct:1"));
+        let object: ConversationObjectView = serde_json::from_value(serde_json::json!({
+            "seq": 1, "sender": "Alex", "sender_ref": "contact:abc", "kind": "text",
+            "body": "hi", "created_at": 1
+        }))
+        .unwrap();
+        assert_eq!(object.sender_ref.as_deref(), Some("contact:abc"));
+    }
+}
+
+#[cfg(test)]
+mod day_label_tests {
+    use super::*;
+
+    #[test]
+    fn day_label_names_today_yesterday_and_older_dates() {
+        let today = (2026, 8, 30);
+        let yesterday = (2026, 8, 29);
+        assert_eq!(day_label(today, today, yesterday), DayLabel::Today);
+        assert_eq!(day_label(yesterday, today, yesterday), DayLabel::Yesterday);
+        assert_eq!(
+            day_label((2026, 7, 1), today, yesterday),
+            DayLabel::Date { same_year: true }
+        );
+        assert_eq!(
+            day_label((2025, 11, 31), today, yesterday),
+            DayLabel::Date { same_year: false }
+        );
+    }
 }

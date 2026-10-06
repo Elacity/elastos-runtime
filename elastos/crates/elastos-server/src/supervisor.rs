@@ -1665,6 +1665,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -1866,6 +1867,7 @@ mod tests {
             tempfile::tempdir().unwrap().keep(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2014,6 +2016,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2070,6 +2073,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2114,6 +2118,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2158,6 +2163,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -2203,6 +2209,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),

@@ -229,6 +229,7 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
             "conversation_id": fixture.peer.conversation_id,
             "display_name": "Remote Person",
             "removed": false,
+            "unread": false,
         })
     );
     let list_text = list.to_string();

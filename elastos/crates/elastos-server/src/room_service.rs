@@ -82,6 +82,10 @@ pub struct RoomSummary {
     pub browser_access_block_reason: Option<String>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    /// Sequence number of the newest room object, so Home can signal new
+    /// messages without reading them.
+    #[serde(default)]
+    pub latest_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +874,7 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
             browser_access_allowed: true,
             browser_access_block_reason: None,
             transport: RoomTransportView::default(),
+            latest_seq: state.next_seq.saturating_sub(1),
         })
     })
 }

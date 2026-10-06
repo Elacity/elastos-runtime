@@ -54,6 +54,19 @@ pub enum CollaborationConfigCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Generate the next signed revision of an existing startup configuration
+    /// with a new bootstrap peer, for example after the bootstrap Runtime's
+    /// address changed. Network, signer set and grant stay the same.
+    GenerateRevision {
+        #[arg(long)]
+        authority_key: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        bootstrap_peer: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Purely verify one candidate startup configuration.
     Verify {
         #[arg(long)]
@@ -130,18 +143,28 @@ async fn run_collaboration_config_command_with_writer(
             output: output_path,
         } => {
             let signing_key = read_authority_key(&authority_key)?;
-            let peer_bytes = read_owner_only_file(
-                &bootstrap_peer,
-                MAX_BOOTSTRAP_RECEIPT_BYTES,
-                "collaboration bootstrap receipt",
-            )?;
-            let peer: CollaborationBootstrapPeer = serde_json::from_slice(&peer_bytes)
-                .context("invalid collaboration bootstrap receipt")?;
-            if serde_json::to_vec(&serde_json::to_value(&peer)?)? != peer_bytes {
-                anyhow::bail!("collaboration bootstrap receipt is not canonical JSON");
-            }
+            let peer = read_bootstrap_peer(&bootstrap_peer)?;
             let config_bytes =
                 initial_config_bytes(&signing_key, &network_id, &conversation_id, peer)?;
+            let receipt = verified_receipt(&config_bytes)?;
+            create_owner_only_file(
+                &output_path,
+                &config_bytes,
+                "collaboration startup configuration",
+            )?;
+            write_receipt(output, &receipt)
+        }
+        CollaborationConfigCommand::GenerateRevision {
+            authority_key,
+            input,
+            bootstrap_peer,
+            output: output_path,
+        } => {
+            let signing_key = read_authority_key(&authority_key)?;
+            validate_owner_only_parent(&input)?;
+            let current = read_collaboration_startup_config_candidate(&input)?;
+            let peer = read_bootstrap_peer(&bootstrap_peer)?;
+            let config_bytes = next_revision_config_bytes(&signing_key, &current, peer)?;
             let receipt = verified_receipt(&config_bytes)?;
             create_owner_only_file(
                 &output_path,
@@ -195,6 +218,88 @@ fn write_local_bootstrap_receipt(
     )
 }
 
+fn read_bootstrap_peer(path: &Path) -> anyhow::Result<CollaborationBootstrapPeer> {
+    let peer_bytes = read_owner_only_file(
+        path,
+        MAX_BOOTSTRAP_RECEIPT_BYTES,
+        "collaboration bootstrap receipt",
+    )?;
+    let peer: CollaborationBootstrapPeer =
+        serde_json::from_slice(&peer_bytes).context("invalid collaboration bootstrap receipt")?;
+    if serde_json::to_vec(&serde_json::to_value(&peer)?)? != peer_bytes {
+        anyhow::bail!("collaboration bootstrap receipt is not canonical JSON");
+    }
+    Ok(peer)
+}
+
+fn sign_network_profile(
+    signing_key: &SigningKey,
+    profile: CollaborationNetworkProfile,
+) -> anyhow::Result<Vec<u8>> {
+    let payload_bytes = canonical_collaboration_network_profile_payload_bytes(&profile)?;
+    let (signature, envelope_signer) = crate::crypto::domain_separated_sign(
+        signing_key,
+        COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
+        &payload_bytes,
+    );
+    Ok(serde_json::to_vec(&serde_json::to_value(
+        SignedCollaborationNetworkProfile {
+            payload: profile,
+            signature,
+            signer_did: envelope_signer,
+        },
+    )?)?)
+}
+
+/// Appends revision N+1 to a validated configuration's signed chain. It keeps
+/// the network ID, trusted signer set and default-conversation grant, and
+/// replaces the bootstrap peers.
+fn next_revision_config_bytes(
+    signing_key: &SigningKey,
+    current_bytes: &[u8],
+    bootstrap_peer: CollaborationBootstrapPeer,
+) -> anyhow::Result<Vec<u8>> {
+    let validated = parse_and_validate_collaboration_startup_configuration(current_bytes)
+        .context("current collaboration configuration is invalid")?;
+    let head = validated
+        .network()
+        .head()
+        .context("current collaboration profile chain is empty")?
+        .profile()
+        .clone();
+    let mut config: CollaborationStartupConfigFile = serde_json::from_slice(current_bytes)?;
+    let signer_did = crate::crypto::encode_signing_key_did(signing_key);
+    if !config.trusted_profile_signer_dids.contains(&signer_did) {
+        anyhow::bail!("authority key is not a trusted signer of this collaboration network");
+    }
+    let last_envelope = base64::engine::general_purpose::STANDARD.decode(
+        config
+            .profile_chain_base64
+            .last()
+            .context("current collaboration profile chain is empty")?,
+    )?;
+    let profile = CollaborationNetworkProfile {
+        schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
+        network_id: head.network_id.clone(),
+        revision: head
+            .revision
+            .checked_add(1)
+            .context("collaboration profile revision overflow")?,
+        previous_profile_sha256: Some(sha256_label(&last_envelope)),
+        signer_did,
+        bootstrap_peers: vec![bootstrap_peer],
+        default_conversation: head.default_conversation.clone(),
+    };
+    let profile_bytes = sign_network_profile(signing_key, profile)?;
+    config
+        .profile_chain_base64
+        .push(base64::engine::general_purpose::STANDARD.encode(profile_bytes));
+    let bytes = canonical_startup_config_bytes(&config)?;
+    parse_and_validate_collaboration_startup_configuration(&bytes)
+        .context("next collaboration configuration revision is invalid")?;
+    Ok(bytes)
+}
+
 fn initial_config_bytes(
     signing_key: &SigningKey,
     network_id: &str,
@@ -219,18 +324,7 @@ fn initial_config_bytes(
         bootstrap_peers: vec![bootstrap_peer],
         default_conversation: Some(DefaultConversationGrantDescriptor { grant_cid }),
     };
-    let payload_bytes = canonical_collaboration_network_profile_payload_bytes(&profile)?;
-    let (signature, envelope_signer) = crate::crypto::domain_separated_sign(
-        signing_key,
-        COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
-        &payload_bytes,
-    );
-    let profile_bytes =
-        serde_json::to_vec(&serde_json::to_value(SignedCollaborationNetworkProfile {
-            payload: profile,
-            signature,
-            signer_did: envelope_signer,
-        })?)?;
+    let profile_bytes = sign_network_profile(signing_key, profile)?;
     let config = CollaborationStartupConfigFile {
         schema: COLLABORATION_STARTUP_CONFIG_SCHEMA.to_string(),
         expected_network_id: network_id.to_string(),
@@ -509,6 +603,47 @@ mod tests {
         )
         .unwrap();
         (key, peer, bytes)
+    }
+
+    #[test]
+    fn next_revision_extends_the_signed_chain_with_a_new_bootstrap_peer() {
+        let (key, _, initial) = valid_config();
+        let moved_peer = bootstrap_peer(11);
+        let next = next_revision_config_bytes(&key, &initial, moved_peer.clone()).unwrap();
+
+        let validated = parse_and_validate_collaboration_startup_configuration(&next).unwrap();
+        let head = validated.network().head().unwrap().profile();
+        assert_eq!(head.revision, 2);
+        assert_eq!(head.bootstrap_peers, vec![moved_peer.clone()]);
+        let before: CollaborationStartupConfigFile = serde_json::from_slice(&initial).unwrap();
+        let after: CollaborationStartupConfigFile = serde_json::from_slice(&next).unwrap();
+        assert_eq!(after.profile_chain_base64.len(), 2);
+        assert_eq!(
+            after.profile_chain_base64[0],
+            before.profile_chain_base64[0]
+        );
+        assert_eq!(after.expected_network_id, before.expected_network_id);
+        assert_eq!(
+            after.trusted_profile_signer_dids,
+            before.trusted_profile_signer_dids
+        );
+        assert_eq!(
+            after.default_conversation_grant_base64,
+            before.default_conversation_grant_base64
+        );
+        let third = next_revision_config_bytes(&key, &next, bootstrap_peer(10)).unwrap();
+        let validated = parse_and_validate_collaboration_startup_configuration(&third).unwrap();
+        assert_eq!(validated.network().head().unwrap().profile().revision, 3);
+    }
+
+    #[test]
+    fn next_revision_refuses_a_key_outside_the_trusted_signer_set() {
+        let (_, _, initial) = valid_config();
+        let (other, _) = elastos_runtime::signature::generate_keypair();
+        let error = next_revision_config_bytes(&other, &initial, bootstrap_peer(9))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a trusted signer"), "{error}");
     }
 
     #[tokio::test]

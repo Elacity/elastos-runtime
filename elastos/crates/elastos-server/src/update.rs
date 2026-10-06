@@ -1166,6 +1166,38 @@ pub(crate) fn verify_release_binding(
 }
 
 /// Execute upgrade from a verified release head.
+/// Fetches the release-pinned collaboration network by its CID, keeps the
+/// verified release copy beside `components.json`, and joins or advances the
+/// Home's Community network unless the Home is isolated.
+async fn install_release_collaboration_network_for_update<F, Fut>(
+    data_dir: &Path,
+    components: &[u8],
+    fetch: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    use crate::collaboration_release_network as release_network;
+    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(components)?;
+    let Some(pin) = manifest.collaboration_network.as_ref() else {
+        return Ok(());
+    };
+    let release_copy = data_dir.join(release_network::RELEASE_COLLABORATION_NETWORK_FILE);
+    if !release_network::is_isolated(data_dir) {
+        let bytes = fetch(pin.head_cid.clone()).await?;
+        release_network::verify_release_network_bytes(pin, &bytes)?;
+        let staged = data_dir.join(".collaboration-network-release.upgrade.tmp");
+        std::fs::write(&staged, &bytes)?;
+        std::fs::rename(&staged, &release_copy)?;
+    }
+    let outcome = release_network::install_release_network(data_dir, Some(pin), &release_copy)?;
+    if let Some(line) = outcome.summary_line() {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 async fn run_upgrade_from_head(
@@ -1583,6 +1615,12 @@ async fn run_upgrade_with_restart(
                     refreshed_components.join(", ")
                 );
             }
+
+            // 11b. Join or advance the release-pinned Community network.
+            install_release_collaboration_network_for_update(data_dir, &comp_data, |cid| {
+                fetch_fn(cid, ordered_gateways.to_vec())
+            })
+            .await?;
 
             // 12. Clear only changed capsule cache entries.
             let cleared = evict_changed_capsule_cache(data_dir, &changed_capsules);
@@ -4553,5 +4591,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn release_components_with_network(config: &[u8]) -> Vec<u8> {
+        let parsed: serde_json::Value = serde_json::from_slice(config).unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "external": {},
+            "profiles": {},
+            "collaboration_network": {
+                "head_cid": crate::setup::catalog_head_cid(config).unwrap(),
+                "expected_network_id": parsed["expected_network_id"],
+                "trusted_profile_signer_dids": parsed["trusted_profile_signer_dids"],
+            },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_joins_the_release_pinned_community_network() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let data = tempfile::tempdir().unwrap();
+        let components = release_components_with_network(&chain[0]);
+        let fetched = std::sync::Mutex::new(Vec::new());
+
+        install_release_collaboration_network_for_update(data.path(), &components, |cid| {
+            fetched.lock().unwrap().push(cid);
+            let bytes = chain[0].clone();
+            async move { Ok(bytes) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(fetched.lock().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read(
+                data.path()
+                    .join(crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE)
+            )
+            .unwrap(),
+            chain[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_leaves_an_isolated_home_isolated_without_fetching() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let data = tempfile::tempdir().unwrap();
+        crate::collaboration_release_network::choose_isolated(data.path()).unwrap();
+        let components = release_components_with_network(&chain[0]);
+
+        install_release_collaboration_network_for_update(data.path(), &components, |_cid| async {
+            anyhow::bail!("an isolated Home fetches no network")
+        })
+        .await
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(
+            data.path()
+                .join(crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE)
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn update_rejects_a_network_that_differs_from_the_pin() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_other, other_chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let data = tempfile::tempdir().unwrap();
+        let components = release_components_with_network(&chain[0]);
+
+        let err =
+            install_release_collaboration_network_for_update(data.path(), &components, |_cid| {
+                let bytes = other_chain[0].clone();
+                async move { Ok(bytes) }
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("does not match the pinned"), "{err}");
+        assert!(std::fs::symlink_metadata(
+            data.path()
+                .join(crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE)
+        )
+        .is_err());
     }
 }
