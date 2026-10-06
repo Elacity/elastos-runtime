@@ -1,0 +1,36 @@
+name: Rust compile cache
+description: Content-addressed Rust compile cache for Linux test jobs
+runs:
+  using: composite
+  steps:
+    - name: install checksummed sccache
+      shell: bash
+      env:
+        CACHE_NAMESPACE: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        CACHE_RW_MODE: ${{ env.CI_SAVE_CACHE == 'true' && 'READ_WRITE' || 'READ_ONLY' }}
+      run: |
+        set -euo pipefail
+        test "$RUNNER_OS" = Linux
+        test "$RUNNER_ARCH" = X64
+        archive=sccache-v0.18.0-x86_64-unknown-linux-musl
+        directory="$RUNNER_TEMP/rust-compile-cache"
+        mkdir -p "$directory"
+        curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 \
+          "https://github.com/mozilla/sccache/releases/download/v0.18.0/$archive.tar.gz" \
+          -o "$directory/$archive.tar.gz"
+        echo "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89  $directory/$archive.tar.gz" | sha256sum -c -
+        tar -xzf "$directory/$archive.tar.gz" -C "$directory" "$archive/sccache"
+        echo "$directory/$archive" >> "$GITHUB_PATH"
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "CARGO_INCREMENTAL=0"
+          echo "SCCACHE_GHA_ENABLED=on"
+          echo "SCCACHE_GHA_VERSION=$CACHE_NAMESPACE"
+          echo "SCCACHE_GHA_RW_MODE=$CACHE_RW_MODE"
+        } >> "$GITHUB_ENV"
+    - name: expose Actions cache runtime to sccache
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');

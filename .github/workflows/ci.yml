@@ -12,6 +12,8 @@ on:
     branches: [main, develop]
     tags: ["v*"]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -42,13 +44,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
         with:
+          toolchain: 1.91.0
           components: rustfmt
-      - uses: actions/setup-node@v4
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
 
@@ -77,6 +83,9 @@ jobs:
           python3 scripts/update-hop-compare-test.py
           python3 .github/scripts/release-mac-capacity-test.py
           python3 scripts/install-bootstrap-test.py
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-behaviour:
     name: test-behaviour
@@ -84,10 +93,10 @@ jobs:
     timeout-minutes: 10
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       - name: install explicit Browser test inputs
@@ -128,7 +137,7 @@ jobs:
           apt-get update -qq
           read -r -a tools <<< "$ENGINE_BUILD_TOOLS"
           apt-get install -y -qq --no-install-recommends "${tools[@]}"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
           persist-credentials: false
@@ -143,7 +152,7 @@ jobs:
       - name: restore pinned ARM64 engine
         id: engine-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/llama-arm64-bundle
           key: ${{ steps.engine-recipe.outputs.cache-key }}
@@ -158,7 +167,7 @@ jobs:
         run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: save pinned ARM64 engine
         if: env.CI_USE_CACHE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && steps.engine-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/llama-arm64-bundle
           key: ${{ steps.engine-cache.outputs.cache-primary-key }}
@@ -166,7 +175,7 @@ jobs:
         # Retain build receipts on a pin mismatch for review; dependent jobs
         # require this job to succeed before they can consume the archive.
         if: "!cancelled() && (steps.engine-cache.outputs.cache-hit == 'true' || steps.engine-build.outcome == 'success')"
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: llama-arm64-bundle
           path: ${{ runner.temp }}/llama-arm64-bundle/
@@ -180,13 +189,17 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
         with:
+          toolchain: 1.91.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
@@ -199,6 +212,9 @@ jobs:
       - name: cargo clippy
         working-directory: elastos
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-elastos:
     name: test-elastos
@@ -206,11 +222,16 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
+        with:
+          toolchain: 1.91.0
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
@@ -224,7 +245,7 @@ jobs:
       - name: restore provider build artifacts
         id: providers-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             capsules/protected-content-protect-provider/target
@@ -240,7 +261,7 @@ jobs:
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
       - name: save provider build artifacts
         if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             capsules/protected-content-protect-provider/target
@@ -272,7 +293,7 @@ jobs:
           git rev-parse HEAD HEAD^{tree}
           sha256sum elastos/tools/browser-engine-supervisor/target/debug/browser-engine-supervisor elastos/tools/browser-native-proxy-engine/target/debug/browser-native-proxy-engine
           sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       - name: install content boundary browser fixture
@@ -288,6 +309,9 @@ jobs:
         env:
           ELASTOS_PLAYWRIGHT_MODULE: ${{ runner.temp }}/content-sandbox-browser/node_modules/playwright/index.mjs
         run: cargo test -p elastos-server content_sandbox_browser -- --ignored --nocapture
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-capsules:
     name: test-capsules
@@ -295,13 +319,17 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
         with:
+          toolchain: 1.91.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           # Registry/index cache only. The capsule build artifacts (about
@@ -328,7 +356,7 @@ jobs:
           exit "$failed"
       # Playwright 1.59.1's installer hangs extracting Chromium under Node 26;
       # the smokes themselves run on Node 26 below.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: install browser layout smoke tools
@@ -338,7 +366,7 @@ jobs:
           sudo apt-get install -y just
           npm ci --prefix elastos/tools/browser-playwright-engine
           npx --prefix elastos/tools/browser-playwright-engine playwright install --with-deps chromium
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       # The smokes default to a macOS Brave install unless BRAVE_BIN is set.
@@ -359,13 +387,16 @@ jobs:
           done
           total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/capsules-test-list.txt")
           echo "Capsules listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
   # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
   # owns all the logic (throwaway client identity, throwaway compose
   # project, receipt assertions, full teardown); this job is thin glue over
-  # it. Gated to workflow_dispatch and PRs that actually touch the harness
+  # it. Runs for every merge group, workflow_dispatch, and PRs that touch the harness
   # image, the proof driver, or the protected-content/carrier crates it
   # exercises -- NOT every push, since the image build + 3-node bring-up
   # add real wall time.
@@ -374,7 +405,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: source-gate
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'merge_group'
     # The top-level `permissions: contents: read` above zeroes every other
     # scope for every job; dorny/paths-filter resolves a pull_request's
     # changed files via the GitHub API (this job's checkout is fetch-depth 1,
@@ -385,13 +416,13 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - name: detect custody/carrier-relevant changes
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         with:
           filters: |
             custody:
@@ -417,26 +448,28 @@ jobs:
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
       - id: should-run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "no custody/carrier-relevant paths changed on this PR; skipping the smoke run" >> "$GITHUB_STEP_SUMMARY"
           fi
       - if: steps.should-run.outputs.run == 'true'
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
+        with:
+          toolchain: 1.91.0
       # Builds the host `elastos` binary the smoke script itself invokes
       # (identity show, node peer add, node status) -- same cache shape as
       # the test-elastos/lint jobs above.
       - if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-custody-smoke-bd
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       # Pre-warms the custody-host image's BuildKit layer cache via the GHA
       # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
       # own `docker compose up -d --build` expects it -- that later build
@@ -459,7 +492,7 @@ jobs:
         run: scripts/custody-harness-ci-smoke.sh
       - name: upload evidence receipt on failure
         if: failure() && steps.should-run.outputs.run == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: custody-harness-smoke-evidence
           path: /tmp/custody-harness-ci-smoke-evidence/
@@ -488,16 +521,17 @@ jobs:
           - os: ubuntu-22.04-arm
             check_name: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
         with:
+          toolchain: 1.91.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
@@ -541,7 +575,7 @@ jobs:
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       - name: download pinned ARM64 engine input
         if: matrix.os == 'ubuntu-22.04-arm'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: llama-arm64-bundle
           path: ${{ runner.temp }}/llama-arm64-bundle
@@ -573,7 +607,7 @@ jobs:
             --receipt elastos-runtime-linux-arm64.receipt.json
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: elastos-runtime-${{ matrix.os }}
           path: |
@@ -582,7 +616,7 @@ jobs:
             elastos-runtime-*.receipt.json
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: source-home-linux-${{ matrix.os }}-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -595,16 +629,17 @@ jobs:
     timeout-minutes: 90
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # pinned action
         with:
+          toolchain: 1.91.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
@@ -632,7 +667,7 @@ jobs:
       # skips the download entirely (ELACITY-2308).
       - name: cache kubo release
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/kubo-cache
           key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('components.json') }}
@@ -679,7 +714,7 @@ jobs:
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       # The installed Home journey signs up through the real page. Playwright
       # 1.59.1's installer hangs extracting Chromium under Node 26; the journey runs on 26.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: prepare installed Home browser
@@ -689,7 +724,7 @@ jobs:
           export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/installed-home-browser"
           npx --prefix elastos/tools/browser-playwright-engine playwright install chromium --only-shell
           echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       - name: build two actual Runtime versions
@@ -745,7 +780,7 @@ jobs:
           PY
       - name: retain the safe CI hop receipt
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: macos-cli-update-hop-receipt
           path: |
@@ -781,7 +816,7 @@ jobs:
           scripts/package-release-binaries.sh
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: elastos-runtime-macos-14
           path: |
@@ -789,7 +824,7 @@ jobs:
             elastos-runtime-*.tar.gz.sha256
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: source-home-macos-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -814,12 +849,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: elastos-runtime-*
           merge-multiple: true
       - name: publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ElastOS Runtime ${{ github.ref_name }}
           generate_release_notes: true

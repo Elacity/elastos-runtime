@@ -58,6 +58,7 @@ CASES = [
     ("push", "refs/tags/v0.7.1", "tag", "", False, True),
     ("push", "refs/tags/candidate", "tag", "", False, False),
     ("pull_request", "refs/pull/1/merge", "branch", "", True, False),
+    ("merge_group", "refs/heads/gh-readonly-queue/develop/pr-1", "branch", "", True, False),
     ("workflow_dispatch", "refs/heads/main", "branch", "", True, False),
     ("workflow_dispatch", "refs/tags/v0.7.1", "tag", "", False, False),
     ("workflow_dispatch", "refs/heads/main", "branch", "v0.7.1", False, False),
@@ -122,6 +123,120 @@ def validate_jetson_package_lifecycle(source):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_merge_groups_run_every_proof_on_the_queued_commit(self):
+        triggers = SOURCE.split("\npermissions:", 1)[0]
+        self.assertIn("\n  merge_group:\n    types: [checks_requested]\n", triggers)
+        self.assertIn("\n  pull_request:\n", triggers)
+        self.assertIn("branches: [main, develop]", triggers)
+        context = {"github.event_name": "merge_group"}
+        for job in JOBS:
+            if job == "release":
+                continue
+            guard = re.search(r"(?m)^    if: (.*)$", JOBS[job])
+            if guard:
+                self.assertTrue(evaluate(guard[1], context), job)
+            checkout, = [step for step in steps(job) if "uses: actions/checkout@" in step]
+            self.assertEqual(field(checkout, "ref"),
+                             "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}")
+        should_run, = [step for step in steps("custody-harness-smoke") if "id: should-run" in step]
+        script = textwrap.dedent(should_run.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            for event, paths, expected in (("merge_group", "", True),
+                                           ("workflow_dispatch", "", True),
+                                           ("pull_request", "true", True),
+                                           ("pull_request", "false", False)):
+                output = Path(directory) / "output"
+                output.write_text("")
+                command = script.replace("${{ github.event_name }}", event).replace(
+                    "${{ steps.filter.outputs.custody }}", paths)
+                subprocess.run(["bash", "-e", "-c", command], check=True,
+                               env={**os.environ, "GITHUB_OUTPUT": str(output),
+                                    "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")})
+                self.assertEqual(output.read_text(), f"run={str(expected).lower()}\n")
+
+    def test_sccache_is_scoped_to_test_jobs_with_content_and_toolchain_keys(self):
+        action = "./.github/actions/rust-compile-cache"
+        expected = {"source-gate", "lint", "test-elastos", "test-capsules"}
+        self.assertEqual({job for job in JOBS if f"uses: {action}" in JOBS[job]}, expected)
+        for job in expected:
+            setup, = [step for step in steps(job) if f"uses: {action}" in step]
+            self.assertEqual(field(setup, "if"), "env.CI_USE_CACHE == 'true'")
+            self.assertLess(JOBS[job].index(setup), JOBS[job].index("run: cargo")
+                            if job != "test-capsules" else JOBS[job].index("name: lint and test"))
+            self.assertIn("run: sccache --show-stats", JOBS[job])
+        setup_source = (WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml").read_text()
+        self.assertIn("SCCACHE_GHA_ENABLED=on", setup_source)
+        self.assertIn("RUSTC_WRAPPER=sccache", setup_source)
+        self.assertIn("CARGO_INCREMENTAL=0", setup_source)
+        self.assertIn("hashFiles('**/Cargo.lock', 'rust-toolchain.toml')", setup_source)
+        self.assertIn("runner.os", setup_source)
+        self.assertIn("runner.arch", setup_source)
+        self.assertIn("env.CI_SAVE_CACHE == 'true' && 'READ_WRITE' || 'READ_ONLY'", setup_source)
+        self.assertIn("SCCACHE_GHA_RW_MODE=", setup_source)
+        for name in ("ACTIONS_RESULTS_URL", "ACTIONS_RUNTIME_TOKEN"):
+            self.assertIn(f"core.exportVariable('{name}', process.env.{name}", setup_source)
+        uncached = SOURCE.split("\njobs:\n", 1)[0] + "\n".join(
+            JOBS[job] for job in JOBS if job not in expected)
+        uncached += (WORKFLOW.parent / "release-package.yml").read_text()
+        self.assertNotRegex(uncached, r"(?i)sccache|RUSTC_WRAPPER|rust-compile-cache")
+
+    def test_ci_actions_and_sccache_release_are_immutable(self):
+        action = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
+        for path in (WORKFLOW, WORKFLOW.parent / "release-package.yml", action):
+            for uses in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", path.read_text()):
+                if uses == "./.github/actions/rust-compile-cache":
+                    continue
+                self.assertRegex(uses, r"^[\w./-]+@[0-9a-f]{40}$", str(path))
+        setup_source = action.read_text()
+        self.assertIn("sccache-v0.18.0-x86_64-unknown-linux-musl", setup_source)
+        self.assertIn("45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89", setup_source)
+        self.assertLess(setup_source.index("sha256sum -c"), setup_source.index("tar -xzf"))
+        self.assertLess(setup_source.index("tar -xzf"), setup_source.index("RUSTC_WRAPPER=sccache"))
+
+    def test_sccache_installer_refuses_corrupt_bytes_before_extraction(self):
+        source = (WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml").read_text()
+        script = textwrap.dedent(source.split("      run: |\n", 1)[1].split("    - name:", 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shims = root / "shims"
+            shims.mkdir()
+            for name, body in {
+                "curl": '#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\nprintf corrupt > "$2"\n',
+                "tar": '#!/bin/bash\ntouch "$RUNNER_TEMP/extracted"\n',
+            }.items():
+                path = shims / name
+                path.write_text(body)
+                path.chmod(0o700)
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                                    env={**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+                                         "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "RUNNER_TEMP": str(root),
+                                         "GITHUB_PATH": str(root / "path"), "GITHUB_ENV": str(root / "env"),
+                                         "CACHE_NAMESPACE": "fixture", "CACHE_RW_MODE": "READ_ONLY"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("FAILED", result.stdout)
+            self.assertFalse((root / "extracted").exists())
+            self.assertFalse((root / "path").exists())
+            self.assertFalse((root / "env").exists())
+
+    def test_installed_mac_build_keeps_fresh_intermediates(self):
+        fresh, = [step for step in steps("source-home-macos")
+                  if step.startswith("name: require fresh Mac build intermediates\n")]
+        self.assertNotIn("if:", fresh)
+        script = textwrap.dedent(fresh.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "env"
+            env = {**os.environ, "RUNNER_TEMP": str(root), "GITHUB_ENV": str(output)}
+            subprocess.run(["bash", "-e", "-c", script], env=env, check=True)
+            self.assertIn(f"CARGO_BUILD_BUILD_DIR={root}/source-home-macos-build\n", output.read_text())
+            self.assertIn("CI_MAC_BUILD_DIR_FRESH=true\n", output.read_text())
+            result = subprocess.run(["bash", "-e", "-c", script], env=env)
+            self.assertNotEqual(result.returncode, 0, "restored intermediates must be refused")
+        build, = [step for step in steps("source-home-macos")
+                  if step.startswith("name: build two actual Runtime versions\n")]
+        self.assertIn("assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'", build)
+        self.assertIn("'initially_absent': True", build)
+
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
