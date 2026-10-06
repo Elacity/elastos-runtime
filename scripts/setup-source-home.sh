@@ -891,6 +891,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-linux-network.py" \
+        "${DATA_DIR}/scripts/browser-vm-linux-network.py"
     install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
         "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-engine-preflight.sh" \
