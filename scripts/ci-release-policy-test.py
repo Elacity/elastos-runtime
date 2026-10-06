@@ -170,6 +170,18 @@ class ReleasePolicyTests(unittest.TestCase):
                 if "actions/cache@" in step and "kubo-cache" not in step:
                     self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
+    def test_every_action_is_pinned_to_one_commit_with_its_version(self):
+        uses = re.findall(r"(?m)^\s+(?:- )?uses: (\S+)(.*)$", SOURCE)
+        self.assertTrue(uses)
+        commits = {}
+        for action, comment in uses:
+            with self.subTest(action=action):
+                self.assertRegex(action, r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+                self.assertRegex(comment, r"^ # \S+$")
+                commits.setdefault((action.split("@")[0], comment), set()).add(action.split("@")[1])
+        # One version comment names one commit, so a pin cannot drift under the same label.
+        self.assertEqual({key: len(value) for key, value in commits.items() if len(value) > 1}, {})
+
     def test_unguarded_cache_paths_are_rejected(self):
         additions = [
             "      - uses: actions/cache/restore@v4\n",
