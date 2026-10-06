@@ -18,6 +18,9 @@
 # Deliberately NOT built via scripts/setup-source-home.sh: that installs
 # ~30 unrelated binaries and 33 app capsules for the full-home topology.
 # Direct `cargo build` of just the 4 workspaces this role needs instead.
+# CI supplies this named context with one verified archive. Local builds use
+# the empty stage and the same pinned download gate below.
+FROM scratch AS kubo-input
 FROM rust:1.91-bookworm AS builder
 
 ARG APP_UID=10001
@@ -102,7 +105,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
 # same posture as every other pinned artifact in this Dockerfile. The
 # per-arch case statement mirrors the libgcc triplet lookup further below.
 ARG KUBO_VERSION=v0.42.0
-RUN <<'EOF'
+RUN --mount=type=bind,from=kubo-input,target=/kubo-input <<'EOF'
 set -eu
 case "${TARGETARCH}" in
     amd64) kubo_sha256="284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e" ;;
@@ -116,9 +119,11 @@ kubo_tarball="kubo_${KUBO_VERSION}_linux-${TARGETARCH}.tar.gz"
 kubo_url="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${kubo_tarball}"
 # The same release tarball is mirrored on GitHub; the original pin below
 # verifies either route before extraction. A bad checksum fails this RUN.
-if ! curl -fsSL --connect-timeout 30 --max-time 300 -o "/tmp/${kubo_tarball}" "${kubo_url}"; then
+if [ -f "/kubo-input/sha256-${kubo_sha256}" ]; then
+    cp "/kubo-input/sha256-${kubo_sha256}" "/tmp/${kubo_tarball}"
+elif ! curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" "${kubo_url}"; then
     rm -f "/tmp/${kubo_tarball}"
-    curl -fsSL --connect-timeout 30 --max-time 300 -o "/tmp/${kubo_tarball}" \
+    curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-all-errors --retry-delay 5 --retry-max-time 200 -o "/tmp/${kubo_tarball}" \
         "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${kubo_tarball}"
 fi
 echo "${kubo_sha256}  /tmp/${kubo_tarball}" | sha256sum -c -

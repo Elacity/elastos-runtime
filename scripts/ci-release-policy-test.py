@@ -122,11 +122,58 @@ def validate_jetson_package_lifecycle(source):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_every_ci_action_has_a_full_commit_pin(self):
+        for action, pin in re.findall(r'uses: ([\w/-]+)@([^\s]+)', SOURCE):
+            self.assertRegex(pin, r'^[0-9a-f]{40}$', action)
+
+    def test_kubo_restores_are_verified_before_use_and_save(self):
+        for job in ('source-home-linux', 'source-home-macos', 'custody-harness-smoke'):
+            job_steps = steps(job)
+            restore, = [step for step in job_steps if step.startswith('name: restore verified Kubo inputs\n')]
+            verify, = [step for step in job_steps if step.startswith('name: verify or download Kubo inputs\n')]
+            save, = [step for step in job_steps if step.startswith('name: save verified Kubo inputs\n')]
+            self.assertLess(job_steps.index(restore), job_steps.index(verify))
+            self.assertLess(job_steps.index(verify), job_steps.index(save))
+            self.assertIn('scripts/ci-kubo-cache.py fetch', verify)
+            self.assertNotIn('cache-hit', verify)
+            for step in (restore, save):
+                self.assertEqual(field(step, 'key'), '${{ steps.kubo-pin.outputs.key }}')
+                self.assertEqual(field(step, 'path'), '${{ steps.kubo-pin.outputs.paths }}')
+                self.assertNotIn('restore-keys:', step)
+            if job != 'custody-harness-smoke':
+                self.assertIn('KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache', JOBS[job])
+
+    def test_custody_startup_reuses_ci_image_and_local_startup_builds(self):
+        source = (WORKFLOW.parents[2] / 'deploy/custody-host/up.sh').read_text()
+        block = source.split('    if [[ "${CUSTODY_HOST_PREBUILT:-0}" == 1 ]]; then', 1)[1].split('    fi', 1)[0]
+        script = 'if [[ "${CUSTODY_HOST_PREBUILT:-0}" == 1 ]]; then' + block + 'fi'
+        stub = 'log() { :; }; compose() { printf "%s\\n" "$*"; };\n'
+        for prebuilt, expected in (('1', 'up -d --no-build --pull never'), ('0', 'up -d --build')):
+            result = subprocess.run(['bash', '-eu', '-c', stub + script], capture_output=True, text=True,
+                env={**os.environ, 'CUSTODY_HOST_PREBUILT': prebuilt}, check=True)
+            self.assertEqual(result.stdout.strip(), expected)
+        smoke, = [step for step in steps('custody-harness-smoke') if step.startswith('name: custody harness smoke\n')]
+        self.assertIn("CUSTODY_HOST_PREBUILT: '1'", smoke)
+
+    def test_apt_cache_contains_archives_and_has_explicit_permissions(self):
+        source = JOBS['source-home-linux']
+        self.assertIn('CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config', source)
+        self.assertIn('sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives', source)
+        apt_steps = [step for step in steps('source-home-linux') if 'path: /var/cache/apt/archives/' in step]
+        self.assertEqual(len(apt_steps), 2)
+        for step in apt_steps:
+            self.assertEqual(field(step, 'path'), '/var/cache/apt/archives/*.deb')
+            self.assertIn('${{ env.CI_APT_PACKAGES }}', field(step, 'key'))
+            self.assertNotIn('restore-keys:', step)
+        install, = [step for step in steps('source-home-linux') if step.startswith('name: install host prerequisites\n')]
+        self.assertIn('bash scripts/ci-apt-prerequisites.sh', install)
+        self.assertLess(int(field(install, 'timeout-minutes')), 15)
+
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 11)
+        self.assertEqual(len(caches), 18)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -143,7 +190,7 @@ class ReleasePolicyTests(unittest.TestCase):
                     context["steps.should-run.outputs.run"] = str(should_run).lower()
                     for job, step in caches:
                         expected = cached and (job != "custody-harness-smoke" or should_run)
-                        if "actions/cache/save@" in step:
+                        if "actions/cache/save@" in step and not step.startswith("name: save verified Kubo inputs\n"):
                             expected = expected and (event == "push" and ref == "refs/heads/develop"
                                                      if job == "engine-llama-arm64" else save)
                         self.assertEqual(evaluate(field(step, "if"), context), expected,
@@ -160,13 +207,13 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "requires the package producer"):
             validate_jetson_package_lifecycle(omitted)
 
-    def test_pull_requests_never_save_shared_caches(self):
+    def test_pull_requests_save_only_verified_immutable_inputs(self):
         for job in JOBS:
             for step in steps(job):
                 if "Swatinem/rust-cache@" in step:
                     self.assertEqual(field(step, "save-if"), "${{ env.CI_SAVE_CACHE == 'true' }}",
                                      f"rust-cache in {job} must save only from develop or main")
-                if "actions/cache@" in step and "kubo-cache" not in step:
+                if "actions/cache@" in step:
                     self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
     def test_unguarded_cache_paths_are_rejected(self):
@@ -196,11 +243,11 @@ class ReleasePolicyTests(unittest.TestCase):
         # Execute the actual workflow shell with a recording function, not Docker.
         stub = 'docker() { printf "%s\\0" "$@"; }\n'
         base = ["buildx", "build", "-f", "deploy/custody-host/Dockerfile",
-                "-t", "elastos-custody-host:latest"]
+                "-t", "elastos-custody-host:latest", "--build-context", "kubo-input=/fixture/kubo-cache"]
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 result = subprocess.run(["bash", "-eo", "pipefail", "-c", stub + script],
-                                        env={**os.environ, "CI_USE_CACHE": str(enabled).lower()},
+                                        env={**os.environ, "CI_USE_CACHE": str(enabled).lower(), "RUNNER_TEMP": "/fixture"},
                                         capture_output=True, check=True)
                 args = result.stdout.decode().split("\0")[:-1]
                 cache = ["--cache-from", "type=gha", "--cache-to", "type=gha,mode=max"] if enabled else []
@@ -397,14 +444,14 @@ class CustodyKuboDownloadTests(unittest.TestCase):
     def setUp(self):
         self.source = (WORKFLOW.parents[2] / "deploy/custody-host/Dockerfile").read_text()
         self.version = re.search(r"(?m)^ARG KUBO_VERSION=(\S+)$", self.source)[1]
-        self.script = self.source.split("ARG KUBO_VERSION=", 1)[1].split("RUN <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+        self.script = self.source.split("ARG KUBO_VERSION=", 1)[1].split("<<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
         self.pins = dict(re.findall(r'(amd64|arm64)\) kubo_sha256="([0-9a-f]{64})"', self.script))
         self.assertEqual(self.version, "v0.42.0")
         self.assertEqual(self.pins, {
             "amd64": "284145534168b51fe980f73c90f0ce84b55ca293034836b2ba8ea8f93435116e",
             "arm64": "edc6f485ab623f9327bf2ad7aa7a29d84c87c72f1e2584376a77240134a96e69"})
 
-    def run_gate(self, arch="amd64", primary="valid", mirror="valid"):
+    def run_gate(self, arch="amd64", primary="valid", mirror="valid", cached=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "fixture.tar.gz"
@@ -420,6 +467,11 @@ class CustodyKuboDownloadTests(unittest.TestCase):
             for pin in self.pins.values():
                 script = script.replace(pin, fixture_pin)
             script = script.replace("/tmp", str(root))
+            script = script.replace("/kubo-input", str(root / "cached-input"))
+            if cached is not None:
+                (root / "cached-input").mkdir()
+                (root / "cached-input" / ("sha256-" + fixture_pin)).write_bytes(
+                    archive.read_bytes() if cached == "valid" else b"corrupt cache")
             shims = root / "shims"
             shims.mkdir()
             curl = shims / "curl"
@@ -478,7 +530,8 @@ class CustodyKuboDownloadTests(unittest.TestCase):
                             f"https://github.com/ipfs/kubo/releases/download/{self.version}/{tarball}"]
                     self.assertEqual([event["args"][-1] for event in events], urls[:len(events)])
                     for event in events:
-                        self.assertEqual(event["args"][:5], ["-fsSL", "--connect-timeout", "30", "--max-time", "300"])
+                        self.assertEqual(event["args"][:13], ["-fsSL", "--connect-timeout", "15", "--max-time", "90",
+                            "--retry", "2", "--retry-all-errors", "--retry-delay", "5", "--retry-max-time", "200", "-o"])
                     if primary == "failed":
                         self.assertFalse(events[1]["existing"], "failed primary bytes must be removed before fallback")
 
@@ -503,6 +556,16 @@ class CustodyKuboDownloadTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertIsNone(installed)
         self.assertFalse(stripped)
+
+    def test_cached_archive_is_verified_before_extraction_without_network(self):
+        for arch in ("amd64", "arm64"):
+            for cached in ("valid", "corrupt"):
+                with self.subTest(arch=arch, cached=cached):
+                    result, events, installed, stripped, _, _ = self.run_gate(arch, cached=cached)
+                    self.assertEqual(events, [])
+                    self.assertEqual(result.returncode == 0, cached == "valid")
+                    self.assertEqual(stripped, cached == "valid")
+                    self.assertEqual(installed is not None, cached == "valid")
 
 
 if __name__ == "__main__":

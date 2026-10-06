@@ -192,8 +192,13 @@ cmd_up() {
     chmod 1777 shared || fail "could not make shared/ writable for the containers' custody user (chmod 1777 shared)"
     sync_chain_config "${client_data_dir}" yes
 
-    log "== docker compose up -d --build =="
-    compose up -d --build
+    if [[ "${CUSTODY_HOST_PREBUILT:-0}" == 1 ]]; then
+        log "== docker compose up with the CI-built image =="
+        compose up -d --no-build --pull never
+    else
+        log "== docker compose up -d --build =="
+        compose up -d --build
+    fi
 
     log "== polling up to ${POLL_BUDGET_SECS}s for 3 distinct DID-keyed descriptors in shared/ =="
     local waited=0 count=0
