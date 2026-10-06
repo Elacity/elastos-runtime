@@ -370,6 +370,7 @@ mod tests {
         BACKEND_REPORT_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
     use crate::journal::{deterministic_run_id, RunJournal, StoredRun};
+    use crate::test_support::FIXTURE_EVENT_TIMEOUT;
     use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
     use serde_json::{json, Value};
     use std::io::{self, Read, Write};
@@ -383,8 +384,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const SHUTDOWN_RETURN_BOUND: Duration = Duration::from_millis(500);
-    // Bounds a hang only: every wait ends on its condition, so load must not trip it.
-    const FIXTURE_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_LOCAL_TEXT_STREAM_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
     struct ResponseAction {
@@ -725,7 +724,7 @@ mod tests {
                         threads: 1,
                         batch_threads: 1,
                         gpu_layers: 0,
-                        health_timeout_ms: 2_000,
+                        health_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
                         shutdown_timeout_ms: 250,
                         enable_thinking: false,
                     },
@@ -748,7 +747,7 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_fake_llama_event(path: &Path, expected: &str) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while !fake_llama_events(path).iter().any(|line| line == expected) {
             assert!(
                 Instant::now() < deadline,
@@ -1273,7 +1272,7 @@ mod tests {
         // The same real ECHILD injection as the engine-owner test. Reap the
         // exact fixture child outside Tokio; the coordinator must retain uncertainty.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
             if result == pid {
@@ -3413,7 +3412,8 @@ mod tests {
         let started = Instant::now();
         let _ = cancel_run(&provider, run_id, &access_binding(&binding));
         let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Without the interruption, the stalled count would last until the run deadline.
+        assert!(started.elapsed() < Duration::from_millis(offer.policy.runtime_ms_limit));
         assert_eq!(terminal["data"]["status"], "settlement_unknown");
         assert_eq!(
             fake_llama_events(&events)
