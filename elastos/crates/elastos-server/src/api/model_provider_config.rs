@@ -3,12 +3,13 @@ use anyhow::Context as _;
 use elastos_runtime::provider;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
@@ -21,6 +22,27 @@ const MODEL_PROVIDER_SECRETS_DIR_NAME: &str = "secrets";
 const HOSTED_DISPLAY_NAME_MAX_BYTES: usize = 80;
 const HOSTED_SECRET_REF_PREFIX: &str = "runtime:model-provider:";
 static MODEL_PROVIDER_CONFIG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) type HostedHomeGates = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+
+// Setup and decision transitions serialize within the Home that owns the
+// authority. An owned guard keeps its gate alive through cancellation/drain.
+pub(super) fn hosted_home_gate(
+    gates: &OnceLock<HostedHomeGates>,
+    data_dir: &Path,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = gates
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(gate) = gates.get(data_dir).and_then(Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(data_dir.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
 
 /// Loopback HTTP(S) URL accepted only from owner-scoped validate-fixtures.json.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1031,13 +1053,18 @@ pub(crate) fn discard_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyh
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    require_staged_hosted_key(data_dir, offer_id)?;
+    #[cfg(unix)]
+    super::model_provider_egress_decision::end_offer(data_dir, offer_id)?;
+    clear_staged_hosted_key(data_dir, offer_id)
+}
+
+pub(super) fn require_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         read_staged_hosted_key(data_dir, offer_id)?.is_some(),
         "staged hosted connection unavailable"
     );
-    #[cfg(unix)]
-    super::model_provider_egress_decision::end_offer(data_dir, offer_id)?;
-    clear_staged_hosted_key(data_dir, offer_id)
+    Ok(())
 }
 
 fn write_hosted_secret(data_dir: &Path, offer_id: &str, api_key: &str) -> anyhow::Result<()> {
@@ -1745,7 +1772,33 @@ pub(crate) async fn save_hosted_offer(
     ai_provider_status(data_dir)
 }
 
+#[cfg(test)]
 pub(crate) async fn remove_hosted_offer(
+    data_dir: &Path,
+    registry: Option<&provider::ProviderRegistry>,
+    offer_id: &str,
+) -> anyhow::Result<AiProviderStatus> {
+    remove_hosted_offer_configuration(data_dir, offer_id)?;
+    finish_hosted_offer_removal(data_dir, registry, offer_id).await
+}
+
+pub(super) fn remove_hosted_offer_configuration(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<()> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    validate_hosted_instance_id(offer_id)?;
+    let offers = load_model_provider_operator_offers(data_dir)?
+        .into_iter()
+        .filter(|offer| !is_same_hosted_instance(offer, offer_id))
+        .collect::<Vec<_>>();
+    persist_model_provider_operator_offers(data_dir, offers)
+}
+
+pub(super) async fn finish_hosted_offer_removal(
     data_dir: &Path,
     registry: Option<&provider::ProviderRegistry>,
     offer_id: &str,
@@ -1755,12 +1808,6 @@ pub(crate) async fn remove_hosted_offer(
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        validate_hosted_instance_id(offer_id)?;
-        let offers = load_model_provider_operator_offers(data_dir)?
-            .into_iter()
-            .filter(|offer| !is_same_hosted_instance(offer, offer_id))
-            .collect::<Vec<_>>();
-        persist_model_provider_operator_offers(data_dir, offers)?;
         delete_hosted_secret(data_dir, offer_id)?;
         clear_staged_hosted_key(data_dir, offer_id)?;
     }
