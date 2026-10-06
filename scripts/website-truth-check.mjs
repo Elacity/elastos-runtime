@@ -93,7 +93,7 @@ check("page and evidence links resolve", () => {
 check("the paused demo has no Home launch action", () => {
   assert.ok(!html.includes(`href="${HOME_PATH}"`), "public demo remains paused");
   assert.ok(html.includes("Public demo paused"));
-  assert.ok(html.includes("This describes the source boundary after the required changes pass integration."));
+  assert.ok(html.includes("This describes the current source boundary."));
   assert.ok(html.includes('href="#isolation"'));
 });
 
@@ -102,7 +102,9 @@ check("isolation copy states the current boundary and proof scope", () => {
     "operating-system processes", "Only the model provider is partly confined",
     "Keys are stored next to the data", "Full backups contain all keys", "seed operator can read",
     "stolen device or profile key requires a new identity", "integrated and tested together",
-    "Accepted installed proof binds the exact Runtime"]) assert.ok(html.includes(phrase), phrase);
+    "Accepted installed proof binds the exact Runtime", "WASM Components", "Runtime user's rights",
+    "Passkeys control sign-in", "while Home is locked", "Use hosted accounts only for public demos",
+    "other software or OS users while a self-hosted Home is locked"]) assert.ok(html.includes(phrase), phrase);
   assert.ok(!/zero ambient authority|every app runs as a sandboxed capsule|fully isolated providers/i.test(html));
 });
 

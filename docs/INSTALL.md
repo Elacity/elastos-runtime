@@ -2,26 +2,26 @@
 
 ## Current isolation and target boundary
 
-Apps run as web projections in the browser's opaque sandboxed frames. Runtime
-checks their capability tokens before it performs an effect. Home can currently
-obtain every app's capability, so a compromised Home can reach those apps'
-authority. The target gives Home only delegation and gives each app a separate,
-revocable capability inside its frame. The web Terminal is disabled by default
-after the terminal gate is integrated. If an owner enables it, Terminal runs
-commands as the host user through a host process. Treat that choice as trusted
-operator access.
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks their capability tokens before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
 
-Providers run as operating-system processes. Only the model provider is partly
-confined; a provider declaration does not prove host isolation. Complete provider
-confinement and Runtime-owned key custody are target behavior. Recovery from a
-stolen device key requires a new identity.
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The [data, keys and backups](#data-keys-and-backups) section explains current
+host access and the protection target for hosted and locked self-hosted Homes.
 
 The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-records the remaining gates. Source checks describe a source candidate. Accepted
-installation proof binds the exact Runtime, components and app assets to the
-journeys tested on that device. An installed version label alone proves neither
-artifact parity nor isolation. These statements require the content sandbox,
-front-door and disabled-terminal changes to be integrated and tested together.
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
 
 ## Install from the publisher
 
@@ -294,11 +294,19 @@ backup of that home contains all keys, including wallet keys. Protect the backup
 with the same care as the running Home. A Recovery Kit is sensitive recovery
 material; keep it under your own control.
 
-The seed operator can read the data, wallet keys and recovery phrases stored on
-the seed. Use a Home whose operator you trust for sensitive work. Encryption on
-the seed does not protect stored secrets from its operator. Recovery can restore
-lost access with valid recovery material, but recovery from a stolen device or
-profile key requires a new identity.
+Use hosted accounts only for public demos. Keep wallets, private data and
+recovery material on your own device until
+[hosted protection](https://github.com/Elacity/elastos-runtime/issues/209) passes
+its acceptance gate. The seed operator can read hosted data, wallet keys and
+recovery phrases stored on the seed. Host-side encryption with keys stored
+beside the data leaves those secrets accessible to that operator.
+
+Passkeys control sign-in. Locking Home stops UI use; the Runtime account and root
+retain access to stored data and keys. The protection target covers hosted
+operators and root, and other software or OS users while a self-hosted Home is
+locked. An unlocked self-hosted Home trusts its owner and their host software.
+Recovery can restore lost access with valid recovery material. A stolen device
+or profile key requires a new identity.
 
 ## Capability policy
 

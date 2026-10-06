@@ -67,8 +67,13 @@ test("expired receipts and identities outside accepted installation stay unverif
 test("isolation claims refuse stronger guarantees than the source boundary", () => {
   const facts = JSON.parse(readFileSync(new URL("../website/elastos/claims.json", import.meta.url)));
   assert.equal(validIsolationClaims(facts.isolation), true);
-  for (const [key, value] of Object.entries({ apps: "all-wasm", home: "delegation-only", providers: "fully-confined", stolen_device_key: "same-identity-recovery", stored_keys: "hardware-protected", seed_operator: "cannot-read", proof: "live-accepted" })) {
+  for (const [key, value] of Object.entries({ apps: "all-wasm", home: "delegation-only", providers: "fully-confined", stolen_device_key: "same-identity-recovery", stored_keys: "hardware-protected", seed_operator: "cannot-read", proof: "live-accepted", host_protection: "lock-encrypts-all-host-data", protection_target: "host-root-out-of-scope", hosted_use: "private-hosted-wallets" })) {
     assert.equal(validIsolationClaims({ ...facts.isolation, [key]: value }), false, key);
+  }
+  for (const key of Object.keys(facts.isolation)) {
+    const incomplete = { ...facts.isolation };
+    delete incomplete[key];
+    assert.equal(validIsolationClaims(incomplete), false, key);
   }
   assert.equal(validIsolationClaims({ ...facts.isolation, fully_isolated: true }), false);
 });

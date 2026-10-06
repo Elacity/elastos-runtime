@@ -20,6 +20,9 @@ export function validIsolationClaims(isolation) {
     stored_keys: "beside-data-backups-include-all-keys",
     seed_operator: "can-read-data-wallet-keys-recovery-phrases",
     proof: "requires-integrated-s0-and-installed-acceptance",
+    host_protection: "sign-in-controls-host-access-remains-while-locked",
+    protection_target: "hosted-operators-root-locked-self-host-software-users",
+    hosted_use: "public-demos-wallets-stay-on-own-device",
     evidence: "https://github.com/Elacity/elastos-runtime/issues/173",
   };
   return isolation != null && Object.keys(isolation).length === Object.keys(scope).length
