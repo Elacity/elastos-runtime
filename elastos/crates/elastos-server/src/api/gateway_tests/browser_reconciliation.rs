@@ -101,12 +101,6 @@ async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: us
     );
 }
 
-async fn finish_current_reconciliation_sweep() {
-    for _ in 0..1_000 {
-        tokio::task::yield_now().await;
-    }
-}
-
 // Keep this paused clock under the test's explicit control while other test
 // runtimes hold the shared Browser registry lock. An idle runtime would otherwise
 // advance lifecycle deadlines during those unrelated lock waits.
@@ -142,10 +136,10 @@ async fn settle_sweep_without_virtual_time_autoadvance(
 }
 
 // Drives one backoff retry of a controlled reconciler parked after sweep
-// `completed_sweeps`. Run it under `with_manual_test_clock`: the parked
-// reconciler arms its backoff timer before the clock moves, and the manual clock
-// keeps registry-lock waits on other test runtimes from auto-advancing call
-// timeouts. Every wait is a notification, not a real-time budget.
+// `completed_sweeps`. Run it under `with_manual_test_clock`, which keeps
+// registry-lock waits on other test runtimes from auto-advancing call timeouts.
+// The reconciler reports its backoff deadline before the clock moves, so every
+// wait here is a notification; only the manual clock's hang guard is timed.
 async fn retry_reconciliation_after_minimum_backoff(
     reconciler: &BrowserLifecycleReconciler,
     calls: &BrowserReconciliationCallRecorder,
@@ -153,7 +147,7 @@ async fn retry_reconciliation_after_minimum_backoff(
 ) {
     let calls_before_backoff = calls.count();
     reconciler.resume_sweeps();
-    finish_current_reconciliation_sweep().await;
+    reconciler.wait_for_armed_backoffs(completed_sweeps).await;
     assert_eq!(
         calls.count(),
         calls_before_backoff,

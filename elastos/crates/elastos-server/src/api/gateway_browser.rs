@@ -1653,6 +1653,7 @@ pub(in crate::api::gateway) struct BrowserLifecycleReconciler {
 struct BrowserLifecycleSweepObserver {
     completed: std::sync::atomic::AtomicUsize,
     completed_tx: watch::Sender<usize>,
+    backoffs_armed_tx: watch::Sender<usize>,
     continue_sweeps: tokio::sync::Semaphore,
 }
 
@@ -1660,24 +1661,40 @@ struct BrowserLifecycleSweepObserver {
 impl BrowserLifecycleSweepObserver {
     fn new() -> Self {
         let (completed_tx, _) = watch::channel(0);
+        let (backoffs_armed_tx, _) = watch::channel(0);
         Self {
             completed: std::sync::atomic::AtomicUsize::new(0),
             completed_tx,
+            backoffs_armed_tx,
             continue_sweeps: tokio::sync::Semaphore::new(0),
         }
     }
 
     async fn wait_for(&self, expected: usize) {
-        let mut completed_rx = self.completed_tx.subscribe();
+        Self::wait_for_count(&self.completed_tx, expected).await;
+    }
+
+    async fn wait_for_armed_backoffs(&self, expected: usize) {
+        Self::wait_for_count(&self.backoffs_armed_tx, expected).await;
+    }
+
+    async fn wait_for_count(count: &watch::Sender<usize>, expected: usize) {
+        let mut count = count.subscribe();
         loop {
-            if *completed_rx.borrow_and_update() >= expected {
+            if *count.borrow_and_update() >= expected {
                 return;
             }
-            completed_rx
+            count
                 .changed()
                 .await
                 .expect("Browser lifecycle sweep observer must remain available");
         }
+    }
+
+    // The backoff deadline is fixed when its timer is created, so a test may
+    // move the paused clock past it from here on.
+    fn backoff_armed(&self) {
+        self.backoffs_armed_tx.send_modify(|armed| *armed += 1);
     }
 
     async fn complete_and_pause(&self) {
@@ -1720,6 +1737,15 @@ impl BrowserLifecycleReconciler {
             .as_ref()
             .expect("controlled Browser lifecycle reconciler")
             .wait_for(expected)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::api::gateway) async fn wait_for_armed_backoffs(&self, expected: usize) {
+        self.sweep_observer
+            .as_ref()
+            .expect("controlled Browser lifecycle reconciler")
+            .wait_for_armed_backoffs(expected)
             .await;
     }
 
@@ -1830,6 +1856,11 @@ async fn run_browser_lifecycle_reconciler(
         if settled {
             backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
         }
+        let backoff_elapsed = tokio::time::sleep(backoff);
+        #[cfg(test)]
+        if let Some(observer) = sweep_observer.as_ref() {
+            observer.backoff_armed();
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1839,7 +1870,7 @@ async fn run_browser_lifecycle_reconciler(
             _ = wake.notified() => {
                 backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
             }
-            _ = tokio::time::sleep(backoff) => {
+            _ = backoff_elapsed => {
                 backoff = backoff
                     .saturating_mul(2)
                     .min(BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF);

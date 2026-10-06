@@ -308,6 +308,13 @@ impl Drop for OwnerActionGuard {
     }
 }
 
+#[cfg(test)]
+impl AsRawFd for OwnerActionGuard {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, OwnerActionGuard)> {
     let data_dir = fs::canonicalize(data_dir)?;
     let directory = controller_directory(&data_dir)?;

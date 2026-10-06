@@ -2509,6 +2509,46 @@ fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
 }
 
 #[test]
+fn ended_owner_action_frees_its_lock_while_a_command_spawned_during_it_runs() {
+    let (fixture, request) = owner_queue_fixture();
+    let (_, action) = owner_action_guard(&fixture.data).unwrap();
+    let lock = action.as_raw_fd();
+    // Another thread spawns a command while the action holds its lock. A fork
+    // shares the lock's open description until exec closes its CLOEXEC copy;
+    // keeping the child's copy across exec holds that window open.
+    let mut child = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(lock, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    })
+    .join()
+    .unwrap();
+    drop(action);
+    let next = queue_owner_update(
+        &fixture.data,
+        request,
+        "passkey:step-up:fixture",
+        &owner_effect_sha(),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    next.expect("the next owner action must not wait for a command spawned during the last");
+    assert!(has_queued_update(&fixture.data).unwrap());
+}
+
+#[test]
 fn recovered_consumed_request_reports_terminal_result_after_readiness() {
     let (_, request, _) = choice_fixture();
     assert_eq!(
