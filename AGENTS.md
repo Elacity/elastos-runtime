@@ -249,10 +249,11 @@ git diff --stat <upstream>...HEAD
 git rev-list --left-right --count <upstream>...HEAD
 ```
 
-Before each push, fetch and merge current `origin/develop`, then check the
-clean candidate with `just ci-local-prepush`. The committed pre-push hook
-checks the exact pushed HEAD and refuses a stale base. It runs formatting,
-workspace/all-targets checks, Clippy for touched crates, and their unit targets.
+Before each push, commit the candidate and check it with
+`just ci-local-prepush`. The committed pre-push hook checks the exact pushed
+HEAD and refuses a base that conflicts or shares changed files with develop.
+It runs formatting, workspace/all-targets checks, Clippy for touched crates, and
+their unit targets.
 Use the [local pre-push procedure](scripts/README.md#local-pre-push-gate) to
 activate the hook and share the local heavy-build lease across worktrees.
 Reproduce an unclear failed Mac install, update, or Home startup step locally
