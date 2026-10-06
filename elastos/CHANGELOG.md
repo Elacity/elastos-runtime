@@ -57,6 +57,27 @@ All notable changes to the public ElastOS Runtime repository.
   execution boundaries during this transition. Third-party executable admission
   remains gated by publisher, package approval and revocation checks.
 
+## [0.8.0-alpha.7]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Home keeps running while an update downloads and checks the whole new version.
+  Home restarts only once, at the end.
+- If an update cannot be used, your current version stays and System says why.
+- ElastOS now installs on Linux (x86-64) and NVIDIA Jetson with the same
+  install.sh command as on Mac.
+
+### Fixed
+
+- After an update, protected media could stop opening. It opens again.
+
+### Removed
+
+- Local AI models are no longer part of the release, so Home shows no models for
+  now. They will return as a separate signed download.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for
