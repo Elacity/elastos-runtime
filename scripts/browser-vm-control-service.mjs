@@ -3649,7 +3649,10 @@ async function openPage(
   };
   const processOwnershipId = newHostProcessOwnershipId();
   const serialized = JSON.stringify(request);
-  const launcherEnvironment = { ...process.env };
+  const launcherEnvironment = {
+    ...process.env,
+    ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS: String(config.shutdown_timeout_ms ?? 30000),
+  };
   if (launch.transport_authority) {
     delete launcherEnvironment[OPEN_REQUEST_ENV];
   } else {
@@ -4761,4 +4764,4 @@ function main() {
   });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

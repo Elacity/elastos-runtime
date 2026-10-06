@@ -22,9 +22,9 @@ def alive(pid):
         return False
 
 
-def worker(directory, spawn_only=False, provider=False):
+def worker(directory, spawn_only=False, provider=False, inherited=False):
     directory = Path(directory)
-    if provider:
+    if provider or inherited:
         reader = int(os.environ["ELASTOS_UPDATE_PARENT_PIPE"].split(":")[0])
     else:
         reader, writer = os.pipe()  # writer remains with this Runtime stand-in
@@ -84,7 +84,9 @@ startLocalVmControlService({{controlSocket:'{directory}/control.sock', dataDir:'
     # The transient engine launcher has exited; the adapter still owns the helper.
     assert alive(pid), "control service stopped before its owner"
     (directory / "ready.json").write_text(json.dumps({"helper": pid}))
-    if provider:
+    if inherited:
+        os.read(reader, 1)
+    elif provider:
         for line in sys.stdin:
             request = json.loads(line)
             print('{"status":"ok"}', flush=True)
@@ -102,11 +104,27 @@ class BrowserHelperLifetime(unittest.TestCase):
     def test_real_autostart_stops_after_term_int_and_crash(self):
         self.check_parent_loss(spawn_only=False)
 
-    def check_parent_loss(self, spawn_only):
+    def test_main_runs_through_symlink(self):
+        for script in ("browser-vm-control-service.mjs", "browser-vm-engine-supervisor.mjs"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="browser-main-") as directory:
+                link = Path(directory) / "entry.mjs"
+                link.symlink_to(ROOT / "scripts" / script)
+                result = subprocess.run([shutil.which("node"), str(link), "--invalid-option"],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, "symlink entry silently skipped main")
+                self.assertTrue(result.stderr, "main must report its invalid input")
+
+    def test_shared_smoke_owner_stops_real_spawn(self):
+        self.check_parent_loss(spawn_only=True, wrapped=True)
+
+    def check_parent_loss(self, spawn_only, wrapped=False):
         for stop_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
             with self.subTest(signal=stop_signal), tempfile.TemporaryDirectory(prefix="browser-owner-", dir="/tmp") as directory:
-                parent = subprocess.Popen([sys.executable, __file__, "--spawn-worker" if spawn_only else "--worker", directory],
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                command = [sys.executable, __file__, "--spawn-worker" if spawn_only else "--worker", directory]
+                if wrapped:
+                    command = [sys.executable, str(ROOT / "scripts/browser-helper-owner.py"),
+                               sys.executable, __file__, "--owned-worker", directory]
+                parent = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
                 helper = None
                 try:
                     ready = Path(directory) / "ready.json"
@@ -136,7 +154,7 @@ class BrowserHelperLifetime(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] in ("--worker", "--spawn-worker", "--provider"):
-        worker(sys.argv[2], spawn_only=sys.argv[1] != "--worker", provider=sys.argv[1] == "--provider")
+    if len(sys.argv) == 3 and sys.argv[1] in ("--worker", "--spawn-worker", "--provider", "--owned-worker"):
+        worker(sys.argv[2], spawn_only=sys.argv[1] != "--worker", provider=sys.argv[1] == "--provider", inherited=sys.argv[1] == "--owned-worker")
     else:
         unittest.main()

@@ -80,7 +80,8 @@ fn run(stdout: &mut dyn Write) -> Result<(), String> {
         buffer_bytes: config.buffer_bytes,
     })?;
 
-    let owned_helpers = std::env::var("ELASTOS_BROWSER_HELPER_PARENT_EOF").as_deref() == Ok("1");
+    let owned_helpers =
+        std::env::var("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF").as_deref() == Ok("1");
     let mut command = Command::new(&config.browser_program);
     command
         .args(expand_args(

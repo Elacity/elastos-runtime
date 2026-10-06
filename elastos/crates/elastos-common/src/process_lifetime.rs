@@ -23,19 +23,9 @@ impl ParentLifetime {
 
     /// Forward the Runtime's reader through a transient provider or launcher.
     pub fn configure_inherited(command: &mut Command) -> io::Result<bool> {
-        let Ok(marker) = std::env::var(PARENT_PIPE_ENV) else {
+        let Some((fd, marker)) = inherited_parent_fd()? else {
             return Ok(false);
         };
-        let fields: Vec<_> = marker.split(':').collect();
-        if fields.len() != 3 {
-            return Err(io::Error::other("invalid parent pipe marker"));
-        }
-        let fd: libc::c_int = fields[0].parse().map_err(io::Error::other)?;
-        let device: u64 = fields[1].parse().map_err(io::Error::other)?;
-        let inode: u64 = fields[2].parse().map_err(io::Error::other)?;
-        if fd < 3 || pipe_identity(fd)? != (device, inode) {
-            return Err(io::Error::other("parent pipe identity changed"));
-        }
         command.env(PARENT_PIPE_ENV, marker);
         unsafe {
             command.pre_exec(move || set_cloexec(fd, false));
@@ -56,6 +46,35 @@ impl ParentLifetime {
         }
         Ok(())
     }
+}
+
+fn inherited_parent_fd() -> io::Result<Option<(libc::c_int, String)>> {
+    let Ok(marker) = std::env::var(PARENT_PIPE_ENV) else {
+        return Ok(None);
+    };
+    let fields: Vec<_> = marker.split(':').collect();
+    if fields.len() != 3 {
+        return Err(io::Error::other("invalid parent pipe marker"));
+    }
+    let fd: libc::c_int = fields[0].parse().map_err(io::Error::other)?;
+    let device: u64 = fields[1].parse().map_err(io::Error::other)?;
+    let inode: u64 = fields[2].parse().map_err(io::Error::other)?;
+    if fd < 3 || pipe_identity(fd)? != (device, inode) {
+        return Err(io::Error::other("parent pipe identity changed"));
+    }
+    Ok(Some((fd, marker)))
+}
+
+/// Validate and duplicate the inherited reader for a helper's stdin channel.
+pub fn inherited_parent_reader() -> io::Result<Option<OwnedFd>> {
+    let Some((fd, _marker)) = inherited_parent_fd()? else {
+        return Ok(None);
+    };
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(duplicate) }))
 }
 
 pub fn set_cloexec(fd: libc::c_int, enabled: bool) -> io::Result<()> {

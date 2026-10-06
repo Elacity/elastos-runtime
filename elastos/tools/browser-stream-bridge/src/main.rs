@@ -62,7 +62,7 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
     prepare_adapter_socket_path(adapter_path, config.replace_existing_socket)?;
     let listener = UnixListener::bind(adapter_path).map_err(|err| err.to_string())?;
     let _socket_guard = SocketFileGuard::new(adapter_path);
-    if std::env::var("ELASTOS_BROWSER_HELPER_PARENT_EOF").as_deref() == Ok("1") {
+    if std::env::var("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF").as_deref() == Ok("1") {
         let path = adapter_path.to_path_buf();
         use std::os::unix::fs::MetadataExt;
         let bound = fs::symlink_metadata(&path).map_err(|err| err.to_string())?;

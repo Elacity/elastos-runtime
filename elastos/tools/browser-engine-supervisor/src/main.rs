@@ -409,40 +409,14 @@ fn validate_relay_ipc(endpoint: &RelayIpcEndpoint) -> Result<(), String> {
 // Native helpers use the same Runtime ownership pipe as VM helpers. Their
 // stdin is a lifetime channel; the transient supervisor owns only a reader.
 fn configure_helper_stdin(command: &mut Command) -> Result<(), String> {
-    use std::os::fd::FromRawFd;
-    let Ok(marker) = env::var("ELASTOS_UPDATE_PARENT_PIPE") else {
+    let Some(reader) = elastos_common::process_lifetime::inherited_parent_reader()
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(());
     };
-    let fields: Vec<_> = marker.split(':').collect();
-    if fields.len() != 3 {
-        return Err("invalid Browser helper owner pipe".into());
-    }
-    let fd: i32 = fields[0]
-        .parse()
-        .map_err(|_| "invalid Browser helper owner descriptor")?;
-    let dev: u64 = fields[1]
-        .parse()
-        .map_err(|_| "invalid Browser helper owner device")?;
-    let ino: u64 = fields[2]
-        .parse()
-        .map_err(|_| "invalid Browser helper owner inode")?;
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if fd < 3
-        || unsafe { libc::fstat(fd, &mut stat) } != 0
-        || stat.st_mode & libc::S_IFMT != libc::S_IFIFO
-        || stat.st_dev != dev
-        || stat.st_ino != ino
-    {
-        return Err("Browser helper owner pipe identity changed".into());
-    }
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
     command
         .stdin(Stdio::from(reader))
-        .env("ELASTOS_BROWSER_HELPER_PARENT_EOF", "1");
+        .env("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF", "1");
     if command
         .get_program()
         .to_string_lossy()
@@ -891,5 +865,56 @@ mod tests {
         let result = supervisor_result(&config, &request, 42, None);
         assert_eq!(result["display_session"]["audio"], false);
         assert_eq!(result["display_session"]["video"], false);
+    }
+}
+
+#[cfg(test)]
+mod helper_lifetime_tests {
+    use super::*;
+    use elastos_common::process_lifetime::ParentLifetime;
+    use std::io::{BufRead, BufReader};
+    use std::time::Instant;
+
+    #[test]
+    fn native_helper_stdin_closes_with_its_owner() {
+        let owner = ParentLifetime::new().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "helper_lifetime_tests::stdin_helper_fixture",
+            ])
+            .stdout(Stdio::piped());
+        owner.configure(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(output.by_ref().any(|line| line.unwrap() == "helper ready"));
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("native helper survived ownership EOF");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for native_helper_stdin_closes_with_its_owner"]
+    fn stdin_helper_fixture() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'helper ready\\n'; IFS= read -r line; exit 0"]);
+        configure_helper_stdin(&mut command).unwrap();
+        assert!(command.get_envs().any(|(name, value)| name
+            == "ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF"
+            && value == Some(std::ffi::OsStr::new("1"))));
+        assert!(command.status().unwrap().success());
     }
 }

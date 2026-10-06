@@ -1043,4 +1043,4 @@ async function main() {
   fail(`Browser VM engine target is not launch-ready. ${preflight.reason} Set ${CONTROL_SOCKET_ENV} to a Browser VM control service; on no-KVM gateway hosts this should point at a remote/operator VM provider instead of requiring local KVM. Preflight: ${JSON.stringify(preflight)}`);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(fail);
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(fail);

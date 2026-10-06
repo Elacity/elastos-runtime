@@ -371,20 +371,21 @@ and it must be constrainable by scheme and port:
 }
 ```
 
-The helper's lifetime is bound to the Runtime that launched it. The Runtime
-spawns it with a piped stdin it holds open and sets
-`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`; the helper watches that pipe and
-reaps itself the moment it reaches EOF. `HostHelperProcess::drop` covers only
-graceful shutdown, and SIGKILL, an abort on panic, and the installed-binary
-supersession watch's `std::process::exit` all skip it — without the pipe each of
-those stranded a helper at PPID=1 holding the relay socket, one per launch.
-Teardown is scoped by inode identity to the socket the helper actually bound, so
-a stranded helper can never unlink a successor's relay socket at the same path.
-For the same reason the Runtime refuses to replace a relay socket that a live
-helper is still serving, instead of silently taking the path from it. Launches
-that run the helper directly leave `ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF` unset
-and keep their existing lifetime. `scripts/browser-local-exit-orphan-cleanup-smoke.sh`
-is the regression proof.
+Runtime owns Browser helper lifetime through a pipe with one writer. Local Exit,
+native proxy, and stream bridge helpers receive the reader on stdin with
+`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`. EOF starts their cleanup, including
+when Runtime exits after SIGTERM, SIGINT, SIGKILL, or an abort. Native proxy
+cleanup gives Chromium time to flush its profile before a bounded hard stop.
+VM and hosted engine launchers forward the verified reader identified by
+`ELASTOS_UPDATE_PARENT_PIPE` across short-lived launch commands. The shared
+`elastos-common::process_lifetime` module verifies that descriptor's identity.
+
+Helpers remove only the socket inode they bound. Runtime preserves a relay
+socket while its owning helper serves it. Direct operator launches leave the
+stdin EOF marker unset and keep their operator-owned lifetime.
+`scripts/browser-local-exit-orphan-cleanup-smoke.sh` checks Local Exit cleanup.
+The Playwright smoke scripts use `scripts/browser-helper-owner.py` to hold the
+sole writer for the full smoke run.
 
 `address_family` is an Exit routing policy, not a browser fallback. Supported
 values are `system`, `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, and
