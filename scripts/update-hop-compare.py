@@ -1085,15 +1085,16 @@ def cli_build_hop(root, runtime, previous, local_rehearsal=None):
     need(root.is_absolute() and not root.exists() and root.parent.resolve() == root.parent
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable build root required")
     need(runtime.is_file() and not runtime.is_symlink(), "built Runtime input is unavailable")
+    disk = shutil.disk_usage(root.parent)
+    need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
     pin = cli_previous_pin()
     published = cli_previous_release(previous / "release.json", pin)
     release_platform = "aarch64-darwin" if platform.machine() == "arm64" else "x86_64-darwin"
+    need(release_platform in published["platforms"], "previous release has no build for this Mac")
     published_binary = previous / "elastos"
     need(published_binary.is_file() and not published_binary.is_symlink()
          and digest(published_binary) == published["platforms"][release_platform]["binary"]["sha256"],
          "previous release Runtime differs from its signed hash")
-    disk = shutil.disk_usage(root.parent)
-    need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
     need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(), "hop build requires a clean admitted source")
     root.mkdir(mode=0o700)
     source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()

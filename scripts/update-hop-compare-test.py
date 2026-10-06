@@ -2151,18 +2151,22 @@ class CliFixtureTests(unittest.TestCase):
         if local_rehearsal is not None:
             self.assertEqual((receipt["proof_scope"], receipt["reference"]), ("local-rehearsal", local_rehearsal))
 
-    def test_hop_builder_refuses_a_published_runtime_that_differs_from_its_pin(self):
+    def test_hop_builder_refuses_a_published_runtime_that_differs_from_its_pin_or_this_mac(self):
         header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         published = self.root / "published-runtime"
         published.write_bytes(header + b"published")
         previous, _ = self.previous_release(published)
-        (previous / "elastos").write_bytes(header + b"substituted")
-        with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
-             patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.CliProcesses, "command") as command, \
-             self.assertRaisesRegex(ValueError, "previous release Runtime differs from its signed hash"):
-            observer.cli_build_hop(self.root / "build-inputs", published, previous)
-        command.assert_not_called()
-        self.assertFalse((self.root / "build-inputs").exists())
+        for machine, substituted, message in (("arm64", True, "previous release Runtime differs from its signed hash"),
+                                              ("x86_64", False, "previous release has no build for this Mac")):
+            with self.subTest(machine=machine):
+                (previous / "elastos").write_bytes(header + (b"substituted" if substituted else b"published"))
+                with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
+                     patch.object(observer.platform, "machine", return_value=machine), patch.object(observer.CliProcesses, "command") as command, \
+                     patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
+                     self.assertRaisesRegex(ValueError, message):
+                    observer.cli_build_hop(self.root / "build-inputs", published, previous)
+                command.assert_not_called()
+                self.assertFalse((self.root / "build-inputs").exists())
 
     def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
         runtime = self.root / "built-runtime"
