@@ -965,6 +965,10 @@ fi
 if [[ -z "$MAINTAINER_DID" ]]; then
     die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
 fi
+# The DID reaches the terminal before its signature check, so only base58 did:key text passes.
+if [[ ! "$MAINTAINER_DID" =~ ^did:key:z[1-9A-HJ-NP-Za-km-z]{1,128}$ ]]; then
+    die "MAINTAINER_DID must be a did:key value (did:key:z6Mk...)."
+fi
 
 # ── Preflight ─────────────────────────────────────────────────────────
 

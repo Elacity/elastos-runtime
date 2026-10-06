@@ -696,6 +696,18 @@ class InstallationTests(unittest.TestCase):
                 "https://test.invalid/ipfs/binary-a"],
     }
 
+    def test_installer_refuses_a_maintainer_did_with_control_text_before_printing_it(self):
+        did, head, release = installable_fixture()
+        for bad in (did + "\x1b]0;owned\x07", did + "\nMaintainer DID: did:key:zOther", did + " ",
+                    "did:web:example.com"):
+            with self.subTest(bad=bad), InstallerSandbox(head, release, bad) as sandbox:
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertIn("MAINTAINER_DID must be a did:key value", result.stderr)
+                self.assertNotIn("Maintainer DID:", result.stdout)
+                self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
