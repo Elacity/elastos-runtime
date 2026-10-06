@@ -383,7 +383,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const SHUTDOWN_RETURN_BOUND: Duration = Duration::from_millis(500);
-    const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+    // Bounds a hang only: every wait ends on its condition, so load must not trip it.
     const FIXTURE_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_LOCAL_TEXT_STREAM_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -1088,7 +1088,7 @@ mod tests {
             request.value["config"]["extra"]["runtime_admitted_offers"] = json!([]);
             request
         };
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             // Drop every withdrawal reply, including the first effectful one.
             // A terminal journal result can precede the worker's exit update.
@@ -1539,7 +1539,7 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        wait_for_terminal_with_timeout(provider, run_id, binding, WAIT_TIMEOUT)
+        wait_for_terminal_with_timeout(provider, run_id, binding, FIXTURE_EVENT_TIMEOUT)
     }
 
     fn wait_for_terminal_with_timeout(
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     fn load_run(root: &str, run_id: &str) -> StoredRun {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let journal = match RunJournal::open(crate::config::journal_root(root, None).unwrap()) {
                 Ok(journal) => journal,
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     fn wait_for_flag(flag: &Arc<AtomicBool>) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while !flag.load(Ordering::Relaxed) {
             assert!(
                 Instant::now() < deadline,
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     fn wait_for_request_count(server: &TestServer, expected: usize) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             if server.requests.lock().unwrap().len() == expected {
                 return;
@@ -1755,7 +1755,7 @@ mod tests {
         description: &str,
         predicate: impl Fn(&StoredRun) -> bool,
     ) -> StoredRun {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let journal = match RunJournal::open(crate::config::journal_root(root, None).unwrap()) {
                 Ok(journal) => journal,
@@ -2059,7 +2059,7 @@ mod tests {
         binding: &RuntimeAccessBinding,
         expected_request_count: usize,
     ) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while server.requests.lock().unwrap().len() < expected_request_count {
             let _ = get_run(provider, run_id, binding);
             assert!(
@@ -2203,7 +2203,7 @@ mod tests {
 
         release.store(true, Ordering::Relaxed);
         let stalled_response = stalled_get
-            .recv_timeout(WAIT_TIMEOUT)
+            .recv_timeout(FIXTURE_EVENT_TIMEOUT)
             .unwrap_or_else(|_| panic!("stalled get must finish after release"))
             .unwrap();
         assert_eq!(stalled_response["status"], "ok");
@@ -3653,7 +3653,7 @@ mod tests {
         let binding = create_binding("request:local-no-poll-deadline", &offer, &input);
         let created = create_run(&provider, &offer, &binding, &input);
         let run_id = created["data"]["run_id"].as_str().unwrap();
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         let run = loop {
             let run = load_run(&root, run_id);
             if run.status.is_terminal() {
@@ -4758,7 +4758,7 @@ mod tests {
             update_tx,
         };
         runtime.block_on(async {
-            let apply = tokio::time::timeout(WAIT_TIMEOUT, coordinator.updates.recv())
+            let apply = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, coordinator.updates.recv())
                 .await
                 .expect("timed out waiting for create worker apply update")
                 .expect("create worker apply update was dropped");
@@ -4777,7 +4777,7 @@ mod tests {
             }
             coordinator.handle_update(apply).await;
 
-            let exited = tokio::time::timeout(WAIT_TIMEOUT, coordinator.updates.recv())
+            let exited = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, coordinator.updates.recv())
                 .await
                 .expect("timed out waiting for create worker exit update")
                 .expect("create worker exit update was dropped");
