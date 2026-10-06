@@ -1344,8 +1344,8 @@ if previous_head.is_file():
 while not root.exists():
     root = root.parent
 disk = shutil.disk_usage(root)
-if (disk.free - required) * 100 < disk.total * 15:
-    raise SystemExit("Release publication staging would cross the 15% free-space floor")
+if disk.free < required:
+    raise SystemExit("Release publication staging needs more free space than the volume has")
 PY
 }
 

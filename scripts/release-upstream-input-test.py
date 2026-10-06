@@ -113,9 +113,11 @@ class UpstreamTest(unittest.TestCase):
             fetch.assert_not_called()
         self.assertFalse(self.cache.exists())
 
-    def test_disk_floor_refuses_fetch(self):
+    def test_disk_check_refuses_fetch_that_does_not_fit(self):
         source = self.recipe()["source"]
-        with patch.object(upstream.shutil, "disk_usage", return_value=upstream.shutil._ntuple_diskusage(1000, 851, 149)), self.assertRaisesRegex(ValueError, "15%"):
+        free = source["max_bytes"] - 1
+        with patch.object(upstream.shutil, "disk_usage", return_value=upstream.shutil._ntuple_diskusage(source["max_bytes"], 1, free)), \
+                self.assertRaisesRegex(ValueError, "needs more free disk space"):
             upstream.cached_input(source, self.cache)
         self.assertEqual(list(self.cache.iterdir()), [])
 

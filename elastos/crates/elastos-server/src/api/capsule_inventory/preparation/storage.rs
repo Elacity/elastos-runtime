@@ -378,7 +378,7 @@ impl Inventory {
 
     pub(super) fn space_fits(&self, reserved_bytes: u64) -> anyhow::Result<bool> {
         let (capacity, available, required) = space_observation(&self.dir, reserved_bytes)?;
-        space_floor_fits(capacity, available, required)
+        reservation_fits(capacity, available, required)
     }
 
     pub(super) fn volume(&self) -> anyhow::Result<u64> {
@@ -704,7 +704,7 @@ impl Stage {
 
 fn require_available_space(dir: &File, reserved_bytes: u64) -> anyhow::Result<()> {
     let (capacity, available, required) = space_observation(dir, reserved_bytes)?;
-    require_space_floor(capacity, available, required)
+    require_reservation_fits(capacity, available, required)
 }
 
 fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u128, u128)> {
@@ -727,31 +727,27 @@ fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u
     Ok((capacity, available, required))
 }
 
-pub(super) fn space_floor_fits(
+pub(super) fn reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<bool> {
-    ensure!(
-        capacity > 0 && available <= capacity,
-        "invalid preparation disk capacity"
-    );
-    let Some(remaining) = available.checked_sub(reserved) else {
-        return Ok(false);
-    };
-    Ok(remaining.checked_mul(10).context("disk floor overflow")? >= capacity)
+    match require_reservation_fits(capacity, available, reserved) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is::<elastos_common::NotEnoughFreeSpace>() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-pub(super) fn require_space_floor(
+/// Model and content preparation keep the shared free-space reserve.
+pub(super) fn require_reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<()> {
-    let fits = space_floor_fits(capacity, available, reserved)?;
-    ensure!(available >= reserved, "insufficient preparation space");
     ensure!(
-        fits,
-        "preparation requires ten percent free space after reservation"
+        capacity > 0 && available <= capacity,
+        "invalid preparation disk capacity"
     );
-    Ok(())
+    Ok(elastos_common::require_free_space(available, reserved)?)
 }
