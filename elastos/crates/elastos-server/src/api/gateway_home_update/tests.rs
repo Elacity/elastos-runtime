@@ -240,7 +240,6 @@ fn configure_update_summary(data_dir: &std::path::Path) {
                 .unwrap(),
             host_pid: Some(std::process::id()),
             generation: "a".repeat(32),
-            refused_release: None,
         })
         .unwrap(),
     )
@@ -438,11 +437,22 @@ async fn system_update_summary_never_reoffers_a_refused_release_but_offers_a_new
         serde_json::from_slice(&std::fs::read(&status_path).unwrap()).unwrap();
     status.phase = "failed".into();
     status.message = crate::update_controller::REFUSED_MESSAGE.into();
-    status.refused_release = Some(crate::update_controller::RefusedRelease {
-        head_cid: TEST_CIDV1.into(),
-        release_cid: TEST_CIDV0.into(),
-    });
     std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let offer = cached_offer();
+    crate::update_controller::record_refused_release(
+        &dir.path().join("update-controller"),
+        &crate::update_controller::UpdateRequest {
+            id: "c".repeat(32),
+            source_name: offer.source_name,
+            channel: offer.channel,
+            publisher_did: offer.publisher_did,
+            current_version: offer.current_version,
+            new_version: offer.latest_version,
+            head_cid: TEST_CIDV1.into(),
+            release_cid: TEST_CIDV0.into(),
+        },
+    )
+    .unwrap();
     let summary = |offer: crate::operator_control::OperatorUpdateCheck| {
         let context = &context;
         let path = dir.path();
@@ -913,7 +923,6 @@ async fn system_update_exact_retry_recovers_both_queue_write_boundaries() {
                     .unwrap(),
                     host_pid: Some(std::process::id()),
                     generation: "a".repeat(32),
-                    refused_release: None,
                 })
                 .unwrap(),
             )

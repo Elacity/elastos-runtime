@@ -256,11 +256,14 @@ where
         UpdateCheckSnapshot::Completed(check) => check.as_deref(),
     };
     // A refused release can never install; offer again only when a different one appears.
-    let refused = check.is_some_and(|check| {
-        controller.refused_release.as_ref().is_some_and(|refused| {
-            refused.matches(check.head_cid.as_deref(), check.release_cid.as_deref())
-        })
-    });
+    let refused = match check {
+        Some(crate::operator_control::OperatorUpdateCheck {
+            head_cid: Some(head_cid),
+            release_cid: Some(release_cid),
+            ..
+        }) => crate::update_controller::release_refused(data_dir, head_cid, release_cid).ok()?,
+        _ => false,
+    };
     let available = !refused && check.is_some_and(|check| check.update_available);
     let can_apply = available
         && require_admin_principal(data_dir, context).is_ok()
@@ -363,11 +366,11 @@ async fn system_update_apply_inner(
     }
     let request = input.request()?;
     anyhow::ensure!(
-        !crate::update_controller::status(&state.data_dir)?
-            .and_then(|status| status.refused_release)
-            .is_some_and(|refused| {
-                refused.matches(Some(&request.head_cid), Some(&request.release_cid))
-            }),
+        !crate::update_controller::release_refused(
+            &state.data_dir,
+            &request.head_cid,
+            &request.release_cid
+        )?,
         "Home refused this release"
     );
     let intent = input.intent();

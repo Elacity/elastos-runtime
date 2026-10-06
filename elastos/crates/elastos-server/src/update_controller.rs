@@ -32,6 +32,9 @@ const RECEIPT: &str = "receipt.json";
 const STATUS: &str = "status.json";
 const REQUEST: &str = "request.json";
 const ACTIVE_REQUEST: &str = "active-request.json";
+const REFUSED: &str = "refused-releases.json";
+const REFUSED_SCHEMA: &str = "elastos.update-controller.refused-releases/v1";
+const MAX_REFUSED: usize = 8;
 const LEASE_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_LEASE";
 const HOST_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_HOST";
 const MAX_PRIVATE_JSON: u64 = 256 * 1024;
@@ -204,9 +207,70 @@ pub struct RefusedRelease {
 }
 
 impl RefusedRelease {
-    pub fn matches(&self, head_cid: Option<&str>, release_cid: Option<&str>) -> bool {
-        head_cid == Some(self.head_cid.as_str()) || release_cid == Some(self.release_cid.as_str())
+    fn matches(&self, head_cid: &str, release_cid: &str) -> bool {
+        head_cid == self.head_cid || release_cid == self.release_cid
     }
+}
+
+/// Kept beside status.json so older controllers never see an unknown status field.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusedReleases {
+    schema: String,
+    releases: Vec<RefusedRelease>,
+}
+
+fn read_refused_releases(directory: &Path) -> Result<Vec<RefusedRelease>> {
+    let path = directory.join(REFUSED);
+    if !path_present(&path)? {
+        return Ok(Vec::new());
+    }
+    let file: RefusedReleases = read_private_json(&path)?;
+    anyhow::ensure!(
+        file.schema == REFUSED_SCHEMA && file.releases.len() <= MAX_REFUSED,
+        "Refused release record is invalid."
+    );
+    Ok(file.releases)
+}
+
+fn write_refused_releases(directory: &Path, releases: Vec<RefusedRelease>) -> Result<()> {
+    write_private(
+        &directory.join(REFUSED),
+        &RefusedReleases {
+            schema: REFUSED_SCHEMA.into(),
+            releases,
+        },
+    )
+}
+
+pub(crate) fn record_refused_release(directory: &Path, request: &UpdateRequest) -> Result<()> {
+    let refused = RefusedRelease {
+        head_cid: request.head_cid.clone(),
+        release_cid: request.release_cid.clone(),
+    };
+    let mut releases = read_refused_releases(directory)?;
+    releases.retain(|release| release != &refused);
+    releases.push(refused);
+    let excess = releases.len().saturating_sub(MAX_REFUSED);
+    releases.drain(..excess);
+    write_refused_releases(directory, releases)
+}
+
+fn forget_refused_release(directory: &Path, request: &UpdateRequest) -> Result<()> {
+    let mut releases = read_refused_releases(directory)?;
+    let before = releases.len();
+    releases.retain(|release| !release.matches(&request.head_cid, &request.release_cid));
+    if releases.len() == before {
+        return Ok(());
+    }
+    write_refused_releases(directory, releases)
+}
+
+/// Whether this Home's controller refused the exact release named by either CID.
+pub fn release_refused(data_dir: &Path, head_cid: &str, release_cid: &str) -> Result<bool> {
+    Ok(read_refused_releases(&data_dir.join(DIRECTORY))?
+        .iter()
+        .any(|release| release.matches(head_cid, release_cid)))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,9 +285,6 @@ pub struct UpdateStatus {
     pub controller_start: String,
     pub host_pid: Option<u32>,
     pub generation: String,
-    /// Kept across later phases so System never offers this exact release again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refused_release: Option<RefusedRelease>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -929,24 +990,6 @@ impl Controller {
     }
 
     fn publish(&self, phase: &str, message: &str) -> Result<()> {
-        // A refusal binds the exact release, so it survives later phases until an update lands.
-        let path = self.directory.join(STATUS);
-        let refused_release = if phase == "updated" || !path_present(&path)? {
-            None
-        } else {
-            read_private_json::<UpdateStatus>(&path)
-                .ok()
-                .and_then(|status| status.refused_release)
-        };
-        self.write_status(phase, message, refused_release)
-    }
-
-    fn write_status(
-        &self,
-        phase: &str,
-        message: &str,
-        refused_release: Option<RefusedRelease>,
-    ) -> Result<()> {
         let source = installed_source(&self.receipt.data_dir)?;
         write_private(
             &self.directory.join(STATUS),
@@ -964,13 +1007,15 @@ impl Controller {
                     .context("controller identity unavailable")?,
                 host_pid: self.child.as_ref().map(|child| child.pid()),
                 generation: self.generation.clone(),
-                refused_release,
             },
         )
     }
 
     fn publish_apply_result(&self, result: &Result<()>) -> Result<()> {
         if result.is_ok() {
+            if let Some(request) = self.request.as_ref() {
+                forget_refused_release(&self.directory, request)?;
+            }
             self.publish("updated", "Home is up to date.")
         } else if self.host_ready
             && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
@@ -981,18 +1026,13 @@ impl Controller {
                 )
             })
         {
-            let error = result.as_ref().unwrap_err();
-            match classify_apply_failure(error) {
-                ApplyFailure::Refused => self.write_status(
-                    "failed",
-                    REFUSED_MESSAGE,
-                    self.request.as_ref().map(|request| RefusedRelease {
-                        head_cid: request.head_cid.clone(),
-                        release_cid: request.release_cid.clone(),
-                    }),
-                ),
-                failure => self.publish("failed", failure.message()),
+            let failure = classify_apply_failure(result.as_ref().unwrap_err());
+            if failure == ApplyFailure::Refused {
+                if let Some(request) = self.request.as_ref() {
+                    record_refused_release(&self.directory, request)?;
+                }
             }
+            self.publish("failed", failure.message())
         } else if self.host_ready && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
         {
             self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")
@@ -1433,12 +1473,13 @@ fn controller_file_digest(path: &Path) -> Result<Option<String>> {
     Ok(Some(hex::encode(digest.finalize())))
 }
 
-pub(crate) const REFUSED_MESSAGE: &str = "This update was refused because it does not match what the publisher signed. Your current version is unchanged.";
+pub(crate) const REFUSED_MESSAGE: &str = "This update was refused because the publisher's signed release is not valid for this Home. Your current version is unchanged.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApplyFailure {
     SourceUnavailable,
     NotEnoughSpace,
+    DownloadMismatch,
     Refused,
     Unknown,
 }
@@ -1448,6 +1489,7 @@ impl ApplyFailure {
         match self {
             Self::SourceUnavailable => "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.",
             Self::NotEnoughSpace => "There is not enough free disk space for this update. Your current version is unchanged. Free some space and select Update again.",
+            Self::DownloadMismatch => "The downloaded update did not match what the publisher signed. Your current version is unchanged. Select Update again.",
             Self::Refused => REFUSED_MESSAGE,
             Self::Unknown => "The update could not be completed. Your current version is unchanged. Select Update again.",
         }
@@ -1460,6 +1502,11 @@ fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
         ApplyFailure::SourceUnavailable
     } else if controller_space_error(error) {
         ApplyFailure::NotEnoughSpace
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::update::DownloadMismatch>())
+    {
+        ApplyFailure::DownloadMismatch
     } else if error
         .chain()
         .any(|cause| cause.is::<crate::update::ReleaseRefused>())

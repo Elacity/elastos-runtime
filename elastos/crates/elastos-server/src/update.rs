@@ -854,28 +854,44 @@ impl std::fmt::Display for UpdateSourceUnavailable {
 }
 impl std::error::Error for UpdateSourceUnavailable {}
 
-/// The signed release itself was refused (signature, content identity, binding,
-/// version order or admission). Retrying the same release can never succeed.
-#[derive(Debug)]
-pub(crate) struct ReleaseRefused(anyhow::Error);
-impl std::fmt::Display for ReleaseRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if f.alternate() {
-            write!(f, "{:#}", self.0)
-        } else {
-            write!(f, "{}", self.0)
+/// Wraps a release-check error with a typed marker while keeping its text and chain.
+macro_rules! release_check_marker {
+    ($(#[$meta:meta])* $name:ident, $helper:ident) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        pub(crate) struct $name(anyhow::Error);
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                if f.alternate() {
+                    write!(f, "{:#}", self.0)
+                } else {
+                    write!(f, "{}", self.0)
+                }
+            }
         }
-    }
-}
-impl std::error::Error for ReleaseRefused {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.chain().nth(1)
-    }
+        impl std::error::Error for $name {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.0.chain().nth(1)
+            }
+        }
+        pub(crate) fn $helper<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+            result.map_err(|error| $name(error).into())
+        }
+    };
 }
 
-pub(crate) fn refused<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
-    result.map_err(|error| ReleaseRefused(error).into())
-}
+release_check_marker!(
+    /// The publisher's signed statement refuses this release (signature or signer,
+    /// channel, binding, version order, admission). Retrying it can never succeed.
+    ReleaseRefused,
+    refused
+);
+release_check_marker!(
+    /// Fetched bytes differ from what the publisher signed. Transport corruption can
+    /// cause this, so a retry may succeed.
+    DownloadMismatch,
+    mismatched
+);
 
 pub(crate) fn download_message(size: Option<u64>) -> String {
     let size = size
@@ -1113,7 +1129,7 @@ async fn run_update_with_restart(
         fetch_fn(head_cid, ordered_gateways.clone()).await?
     };
     if let Some(cid) = resolved_head_cid.as_deref() {
-        refused(verify_release_metadata_cid(cid, &head_bytes))?;
+        mismatched(verify_release_metadata_cid(cid, &head_bytes))?;
     }
 
     // 4. Verify signature
@@ -1285,7 +1301,7 @@ async fn run_upgrade_with_restart(
     };
     // Gateway bytes are bound by verify_release_binding; release_sha256 must stay mandatory.
     if working_gateway.is_none() {
-        refused(verify_release_metadata_cid(release_cid, &release_bytes))?;
+        mismatched(verify_release_metadata_cid(release_cid, &release_bytes))?;
     }
 
     // Verify the chosen envelope, then its binding to the already verified head.
@@ -1447,7 +1463,7 @@ async fn run_upgrade_with_restart(
         let hash = sha2::Sha256::digest(&binary_data);
         let actual = hex::encode(hash);
         if actual != binary_sha256 {
-            return refused(Err(anyhow::anyhow!(
+            return mismatched(Err(anyhow::anyhow!(
                 "Binary SHA-256 mismatch!\n  Expected: {}\n  Got:      {}",
                 binary_sha256,
                 actual
@@ -1492,7 +1508,7 @@ async fn run_upgrade_with_restart(
         let hash = sha2::Sha256::digest(&comp_data);
         let actual = hex::encode(hash);
         if actual != comp_sha256 {
-            return refused(Err(anyhow::anyhow!(
+            return mismatched(Err(anyhow::anyhow!(
                 "Components SHA-256 mismatch!\n  Expected: {}\n  Got:      {}",
                 comp_sha256,
                 actual
@@ -1500,22 +1516,23 @@ async fn run_upgrade_with_restart(
         }
     }
     println!("  Components verified (SHA-256 ✓)");
-    let admitted = (|| {
+    mismatched((|| {
         crate::installed_release::admit_descriptor(
             binary_info,
             binary_sha256,
             binary_data.len() as u64,
         )?;
-        crate::installed_release::admit_descriptor(comp_info, comp_sha256, comp_data.len() as u64)?;
+        crate::installed_release::admit_descriptor(comp_info, comp_sha256, comp_data.len() as u64)
+    })())?;
+    // These bytes already match the signed digest, so a refusal here is the publisher's.
+    refused((|| {
         anyhow::ensure!(
             comp_data.len() <= 4 * 1024 * 1024,
             "Installed components exceed their byte bound"
         );
         let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
-        crate::setup::admit_release_components(&manifest, &component_platform)?;
-        Ok(())
-    })();
-    refused(admitted)?;
+        crate::setup::admit_release_components(&manifest, &component_platform)
+    })())?;
 
     if apply_mode == ApplyMode::Normal {
         // 10. Atomic replace binary
