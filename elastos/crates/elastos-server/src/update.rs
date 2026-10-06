@@ -4291,6 +4291,101 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn custom_install_directory_is_used_by_updates_and_reruns_under_one_lock() {
+            use crate::install_transaction::InstallationGuard;
+            use std::os::unix::fs::MetadataExt;
+
+            let (fixture, data, default_binary) = empty();
+            let binary = fixture.path().join("custom install/bin/elastos");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            let candidates = tempfile::tempdir().unwrap();
+            let first = candidate(candidates.path(), &binary, "0.7.0", 7);
+            install(&data, &binary, &first).unwrap();
+            assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.0"));
+            let source = load_trusted_sources(&data).unwrap();
+            let source = source.default_source().unwrap();
+            assert_eq!(Path::new(&source.install_path), binary);
+
+            // Complete the setup-owned components before using the signed update path.
+            let components =
+                br#"{"schema":"elastos.components/v1","external":{},"profiles":{},"capsules":{}}"#;
+            std::fs::write(data.join("components.json"), components).unwrap();
+            publish_installed_fixture(&data, &binary, source, components);
+            std::fs::write(data.join("owner-data"), b"owner data").unwrap();
+            let next = candidate(candidates.path(), &binary, "0.7.1", 7);
+            let parent = std::fs::canonicalize(binary.parent().unwrap()).unwrap();
+            let lock_path = parent.join(".elastos.install.lock");
+            let lock = std::fs::metadata(&lock_path).unwrap();
+            let writer = InstallationGuard::acquire(&parent).unwrap();
+            let before = files(fixture.path(), false);
+            for check in [true, false] {
+                let error =
+                    install_release(&data, &binary, next.each_ref().map(PathBuf::as_path), check)
+                        .unwrap_err();
+                assert!(format!("{error:#}").contains("another writer owns the installation lock"));
+            }
+            let error =
+                apply_signed_executable_fixture(&data, source, &runtime("0.7.1"), components)
+                    .await
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("another writer owns the installation lock"));
+            assert_eq!(files(fixture.path(), false), before);
+            drop(writer);
+
+            apply_signed_executable_fixture(&data, source, &runtime("0.7.1"), components)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.1"));
+            install(&data, &binary, &next).unwrap();
+            let source = load_trusted_sources(&data).unwrap();
+            let source = source.default_source().unwrap();
+            assert_eq!(
+                std::fs::canonicalize(&source.install_path).unwrap(),
+                parent.join("elastos")
+            );
+            assert_eq!(source.installed_version, "0.7.1");
+            assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.1"));
+            let after_lock = std::fs::metadata(lock_path).unwrap();
+            assert_eq!(
+                (after_lock.dev(), after_lock.ino()),
+                (lock.dev(), lock.ino())
+            );
+            assert!(!default_binary.exists());
+            assert_eq!(
+                std::fs::read(data.join("owner-data")).unwrap(),
+                b"owner data"
+            );
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+        }
+
+        #[tokio::test]
+        async fn installer_refuses_a_different_custom_path_without_changing_files() {
+            let (fixture, data, installed) = migrated().await;
+            let binary = fixture.path().join("other install/bin/elastos");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(&binary, b"preserve other executable").unwrap();
+            // The persistent lock already exists, so the snapshot includes both locks.
+            drop(InstallTransaction::acquire(&data, &binary).unwrap());
+            let candidates = tempfile::tempdir().unwrap();
+            let next = candidate(candidates.path(), &binary, "0.7.2", 7);
+            let before = files(fixture.path(), false);
+            for check in [true, false] {
+                let error =
+                    install_release(&data, &binary, next.each_ref().map(PathBuf::as_path), check)
+                        .unwrap_err();
+                let parent = std::fs::canonicalize(installed.parent().unwrap()).unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("--install-dir {}", parent.display())),
+                    "{error:#}"
+                );
+                assert_eq!(files(fixture.path(), false), before);
+                assert!(!InstallTransaction::has_pending_recovery(&binary));
+            }
+        }
+
+        #[tokio::test]
         async fn older_installer_after_update_is_refused_without_changes() {
             let (fixture, data, binary) = migrated().await;
             let candidates = tempfile::tempdir().unwrap();
