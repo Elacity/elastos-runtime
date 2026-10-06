@@ -232,12 +232,16 @@ installer's `Maintainer DID:` line with the complete DID in the repository
 [README](../README.md#install-from-the-publisher).
 
 An existing Home with the old source pin refuses a release signed by the new
-maintainer. `elastos update` reports:
+maintainer. On the Runtimes that still trust the old key, `elastos update`
+reports one line:
 
 ```text
-Signer DID mismatch: trusted set = ["<old DID>"], got did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
-  This release is signed by a new publisher key. Run the publisher's install.sh to trust it; this installation was not changed.
+Error: Signer DID mismatch: trusted set = ["<old DID>"], got did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
 ```
+
+Newer Runtimes add a second line: `This release is signed by a new publisher
+key. Run the publisher's install.sh to trust it; this installation was not
+changed.`
 
 The trusted set shows your Home's current DID. To re-trust once, run the
 publisher's installer over the existing installation, using the same command
