@@ -23,6 +23,11 @@ use sha2::{Digest, Sha256};
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};
 pub use types::{CapsuleId, CapsuleStatus};
 
+/// Free space a user-facing write keeps on its volume on top of the bytes it
+/// writes, so a disk is never filled to zero: update staging, the update
+/// controller and `scripts/install.sh`, which repeats this value.
+pub const FREE_SPACE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Convert a Runtime principal/profile label into the non-reversible Browser
 /// profile key used for profile-disk names and guest boot args.
 pub fn browser_profile_key_from_value(value: &str) -> Option<String> {
@@ -65,5 +70,21 @@ mod browser_profile_tests {
         assert_eq!(browser_profile_key_from_value(" \n "), None);
         assert!(is_safe_browser_profile_key("profile-a_1.ext4"));
         assert!(!is_safe_browser_profile_key("../profile"));
+    }
+}
+
+#[cfg(test)]
+mod free_space_reserve_tests {
+    #[test]
+    fn installer_keeps_the_same_free_space_reserve() {
+        let installer = include_str!("../../../../scripts/install.sh");
+        let line = format!(
+            "FREE_SPACE_RESERVE_BYTES={}\n",
+            super::FREE_SPACE_RESERVE_BYTES
+        );
+        assert!(
+            installer.contains(&line),
+            "install.sh must keep FREE_SPACE_RESERVE_BYTES equal to the Runtime's"
+        );
     }
 }

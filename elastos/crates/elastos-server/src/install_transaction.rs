@@ -26,13 +26,16 @@ const STAGE: &str = ".elastos.update-stage";
 const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
 
-/// The update's own bytes do not fit in the volume's available space.
+/// The update's own bytes plus the fixed free-space reserve do not fit in the
+/// volume's available space.
 #[derive(Debug)]
 pub(crate) struct UpdateSpaceError;
 
 impl std::fmt::Display for UpdateSpaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("not enough free space for the update; previous release preserved")
+        formatter.write_str(
+            "not enough free space for the update and its 2 GiB reserve; previous release preserved",
+        )
     }
 }
 
@@ -1784,7 +1787,8 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
 }
 
 fn require_update_space(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
-    if total == 0 || needed > available {
+    let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+    if total == 0 || needed.saturating_add(reserve) > available {
         return Err(UpdateSpaceError.into());
     }
     Ok(())
@@ -3127,12 +3131,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn update_space_counts_projected_peak_and_accepts_exact_fit() {
-        assert!(require_update_space(1000, 200, 201).is_err());
-        assert!(require_update_space(1000, 200, 200).is_ok());
-        assert!(require_update_space(1000, 0, 0).is_ok());
+    fn update_space_keeps_the_fixed_reserve_and_accepts_exact_fit() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let total = 1 << 40;
+        assert!(require_update_space(total, reserve + 200, 201).is_err());
+        assert!(require_update_space(total, reserve + 200, 200).is_ok());
+        assert!(require_update_space(total, reserve, 0).is_ok());
+        assert!(require_update_space(total, reserve - 1, 0).is_err());
         // Volume size alone never refuses an update whose bytes fit.
-        assert!(require_update_space(1 << 50, 10, 10).is_ok());
-        assert!(require_update_space(0, 200, 0).is_err());
+        assert!(require_update_space(1 << 50, reserve + 10, 10).is_ok());
+        assert!(require_update_space(0, reserve + 200, 0).is_err());
     }
 }

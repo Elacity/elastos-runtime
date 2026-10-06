@@ -292,6 +292,22 @@ class ShellTests(unittest.TestCase):
             with self.subTest(ticket=ticket, node=node):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
+    def test_install_space_keeps_the_fixed_reserve(self):
+        fake_df = ('df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n'
+                   '/dev/x 1 1 %s 1%% /\\n" "$1"; }\n')
+        reserve_kib = 2 * 1024 * 1024
+        for available_kib, size, accepted in [(reserve_kib + 1, "1024", True),
+                                              (reserve_kib, "1024", False),
+                                              (reserve_kib, "", True),
+                                              (reserve_kib - 1, "", False),
+                                              (reserve_kib + 10**9, "big", False)]:
+            result = shell(fake_df.replace('"$1"', str(available_kib))
+                           + 'require_install_space /tmp "$1"\n', size)
+            with self.subTest(available_kib=available_kib, size=size):
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                if not accepted and size == "1024":
+                    self.assertIn("2 GiB reserve", result.stderr)
+
     def test_empty_gateway_array_fails_with_installer_message(self):
         result = shell('GATEWAYS=()\nipfs_fetch test-cid /unused\n')
         self.assertNotEqual(result.returncode, 0)
