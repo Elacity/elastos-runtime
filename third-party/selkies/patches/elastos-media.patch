@@ -1,0 +1,121 @@
+--- a/src/selkies_gstreamer/gstwebrtc_app.py
++++ b/src/selkies_gstreamer/gstwebrtc_app.py
+@@ -84,6 +84,7 @@
+         self.webrtcbin = None
+         self.data_channel = None
+         self.rtpgccbwe = None
++        self.opusenc = None
+         self.congestion_control = congestion_control
+         self.encoder = encoder
+         self.gpu_id = gpu_id
+@@ -166,6 +167,16 @@
+ 
+         # Set default jitterbuffer latency to the minimum possible
+         self.webrtcbin.set_property("latency", 0)
++        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
++        if elastos_ice_transport_policy:
++            if elastos_ice_transport_policy not in ("all", "relay"):
++                raise GSTWebRTCAppError("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY must be all or relay")
++            try:
++                policy_value = getattr(GstWebRTC.WebRTCICETransportPolicy, elastos_ice_transport_policy.upper())
++            except AttributeError:
++                policy_value = elastos_ice_transport_policy
++            self.webrtcbin.set_property("ice-transport-policy", policy_value)
++            logger.info("using ICE transport policy: %s", elastos_ice_transport_policy)
+ 
+         # Connect signal handlers
+         if self.congestion_control and not audio_only:
+@@ -190,6 +201,9 @@
+                     self.webrtcbin.set_property("turn-server", turn_server)
+                 else:
+                     self.webrtcbin.emit("add-turn-server", turn_server)
++        if elastos_ice_transport_policy:
++            self.webrtcbin.set_property("ice-transport-policy", policy_value)
++            logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
+ 
+         # Add element to the pipeline.
+         self.pipeline.add(self.webrtcbin)
+@@ -1005,7 +1019,8 @@
+         """
+ 
+         # Create element for receiving audio from pulseaudio.
+-        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")
++        pulsesrc = Gst.ElementFactory.make("pulsesrc")
++        pulsesrc.set_property("device", "auto_null.monitor")
+ 
+         # Let the audio source provide the global clock.
+         # This is important when trying to keep the audio and video
+@@ -1032,7 +1047,7 @@
+ 
+         # Encode the raw PulseAudio stream to the Opus format which is
+         # the default packetized streaming format for the web
+-        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")
++        opusenc = Gst.ElementFactory.make("opusenc")
+ 
+         # Low-latency and high-quality configurations
+         opusenc.set_property("audio-type", "restricted-lowdelay")
+@@ -1050,19 +1065,20 @@
+         # Set audio bitrate
+         # This can be dynamically changed using set_audio_bitrate()
+         opusenc.set_property("bitrate", self.audio_bitrate)
++        self.opusenc = opusenc
+ 
+         # Create the rtpopuspay element to convert buffers into
+         # RTP packets that are sent over the connection transport.
+         rtpopuspay = Gst.ElementFactory.make("rtpopuspay")
+         rtpopuspay.set_property("mtu", 1200)
+ 
+-        # Add WebRTC RTP extensions
+-        extensions_return = self.rtp_add_extensions(rtpopuspay, audio=True)
+-        if not extensions_return:
+-            logger.warning("WebRTC RTP extension configuration failed with audio, this may lead to suboptimal performance")
++        # Selkies 1.6.1 audio RTP header extensions are fragile in the split
++        # product audio peer. Keep the audio track
++        # simple and let WebRTC/NACK handle media recovery through Runtime TURN.
++        extensions_return = True
+ 
+         # Insert a queue for the RTP packets.
+-        rtpopuspay_queue = Gst.ElementFactory.make("queue", "rtpopuspay_queue")
++        rtpopuspay_queue = Gst.ElementFactory.make("queue")
+ 
+         # Make the queue leaky in the downstream direction, drop packets if the queue is behind.
+         rtpopuspay_queue.set_property("leaky", "downstream")
+@@ -1104,6 +1120,8 @@
+         pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
+ 
+         for pipeline_element in pipeline_elements:
++            if pipeline_element is None:
++                raise GSTWebRTCAppError("Audio pipeline element is unavailable")
+             self.pipeline.add(pipeline_element)
+ 
+         # Link the pipeline elements and raise exception of linking fails
+@@ -1345,7 +1363,9 @@
+                 self.rtpgccbwe.set_property("min-bitrate", max(100000 + fec_bitrate, int(self.video_bitrate * 1000 * 0.1 + fec_bitrate)))
+                 self.rtpgccbwe.set_property("max-bitrate", int(self.video_bitrate * 1000 + fec_bitrate))
+                 self.rtpgccbwe.set_property("estimated-bitrate", int(self.video_bitrate * 1000 + fec_bitrate))
+-            element = Gst.Bin.get_by_name(self.pipeline, "opusenc")
++            element = self.opusenc or Gst.Bin.get_by_name(self.pipeline, "opusenc")
++            if element is None:
++                raise GSTWebRTCAppError("Audio encoder is unavailable")
+             element.set_property("bitrate", bitrate)
+ 
+             logger.info("audio bitrate set to: %d" % bitrate)
+@@ -1648,7 +1668,7 @@
+             mlineindex {integer} -- ice candidate mlineindex
+             candidate {string} -- ice candidate string
+         """
+-        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)
++        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)
+         loop = asyncio.new_event_loop()
+         loop.run_until_complete(self.on_ice(mlineindex, candidate))
+ 
+@@ -1711,6 +1731,9 @@
+                 'on-message-string', lambda _, msg: self.on_data_message(msg))
+ 
+         logger.info("{} pipeline started".format("audio" if audio_only else "video"))
++        if audio_only:
++            logger.info("forcing audio SDP offer for split product audio peer")
++            self.__on_negotiation_needed(self.webrtcbin)
+ 
+     async def handle_bus_calls(self):
+         # Start bus call loop

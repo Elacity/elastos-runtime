@@ -1,2 +1,5 @@
 capsules/gba-emulator/browser/mgba.js -diff linguist-generated=true
 capsules/gba-emulator/browser/mgba.wasm -diff linguist-generated=true
+# Preserve identified upstream bytes and unified-diff context lines.
+third-party/selkies/upstream/** -whitespace
+third-party/selkies/patches/*.patch -whitespace

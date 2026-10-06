@@ -1,0 +1,493 @@
+{
+  "schema": 1,
+  "upstream_repository": "https://github.com/selkies-project/selkies",
+  "upstream_commit": "b5e0a5ecd732e0b5a1a1a6998c84feffb5cb1a96",
+  "package_version": "1.6.1",
+  "license": "MPL-2.0",
+  "web_cache_version": "b5e0a5ecd732e0b5a1a1a6998c84feffb5cb1a96",
+  "patches": [
+    "patches/package-identity.patch",
+    "patches/elastos-media.patch"
+  ],
+  "patched_files": {
+    "setup.cfg": "c89b97fd2389dd478554c45c698c030b6aed6a8ecc92257b27ee53653a1e3a5e",
+    "src/selkies_gstreamer/gstwebrtc_app.py": "3f17ebaa8f01215788247696f25f8348cc846088f44b5f0d6e063bde3aeafc94"
+  },
+  "files": {
+    "upstream/LICENSE": {
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+      "upstream_path": "LICENSE"
+    },
+    "upstream/addons/gst-web/install.sh": {
+      "sha256": "a3b2e5b1176a3dc7dda6be6d6be27c69ef20934dc96018354dcbc95a3ad5ff7f",
+      "upstream_path": "addons/gst-web/install.sh"
+    },
+    "upstream/addons/gst-web/src/app.js": {
+      "sha256": "13cad9c4bfe9f6bec271783a3813d67929aa8f1b611d4c3207f90a24f004f6fd",
+      "upstream_path": "addons/gst-web/src/app.js"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOkCnqEu92Fr1MmgWxP.ttf": {
+      "sha256": "0292343754ec9499ada68db5f61ae849ebe9ccd4b96f81b086c4732171a2612d",
+      "upstream_path": "addons/gst-web/src/css/font/KFOkCnqEu92Fr1MmgWxP.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmEU9vAw.ttf": {
+      "sha256": "bd6e16dcf973d77e746a62b112acf1cdde2c9d579520f017eb3b9c0919533e52",
+      "upstream_path": "addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmEU9vAw.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmSU5vAw.ttf": {
+      "sha256": "d305a976e225bdeb9c39382f5245810b37f70bdbbd0dcf2e74feb2bf7109a3bd",
+      "upstream_path": "addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmSU5vAw.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmWUlvAw.ttf": {
+      "sha256": "7d922a769bf8383bd1cd9f75a3d5935a7938d15741978b060efcf6cb74d00061",
+      "upstream_path": "addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmWUlvAw.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmYUtvAw.ttf": {
+      "sha256": "bb10b908227d3d0555191fd1366b7a67655c52ee5415b59321f060a3fcebc511",
+      "upstream_path": "addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmYUtvAw.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/KFOmCnqEu92Fr1Me5Q.ttf": {
+      "sha256": "e294f7580d272f024161c6e5c744278f90d45ee67846f66d4083f7aef61c979e",
+      "upstream_path": "addons/gst-web/src/css/font/KFOmCnqEu92Fr1Me5Q.ttf"
+    },
+    "upstream/addons/gst-web/src/css/font/flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf": {
+      "sha256": "bc66ff963b638caf6fdeb18428a75e55bd329f4aac1d50249d3345e0531d58f3",
+      "upstream_path": "addons/gst-web/src/css/font/flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf"
+    },
+    "upstream/addons/gst-web/src/css/vuetify.css": {
+      "sha256": "de1a508e603fde2328f10822f3d29232a690f34180897ea6180ce358a147de6e",
+      "upstream_path": "addons/gst-web/src/css/vuetify.css"
+    },
+    "upstream/addons/gst-web/src/css/vuetify.css.map": {
+      "sha256": "f0cc63bfd21d2d9762895487458fd8c608a27dc8ffc0e38cb76fa230cade3d5e",
+      "upstream_path": "addons/gst-web/src/css/vuetify.css.map"
+    },
+    "upstream/addons/gst-web/src/favicon.ico": {
+      "sha256": "ee43b29027473fc1ec0843b51ca050b37b1cbf8df77a9db40ff9938d893e4f42",
+      "upstream_path": "addons/gst-web/src/favicon.ico"
+    },
+    "upstream/addons/gst-web/src/gamepad.js": {
+      "sha256": "d1608c8faa1be75accbd9497ff5e95fc88c424803fa82f08e4d7df48f1d5e47e",
+      "upstream_path": "addons/gst-web/src/gamepad.js"
+    },
+    "upstream/addons/gst-web/src/icon-192x192.png": {
+      "sha256": "19554fc308a0754e1595c07fb23bdb0bc643824b1c8edbe21d1cfcf7003b55e1",
+      "upstream_path": "addons/gst-web/src/icon-192x192.png"
+    },
+    "upstream/addons/gst-web/src/icon-512x512.png": {
+      "sha256": "9ac3fb7fa4f3c6c2058fe1b94dd604d0ec619703d60f21522dcf64ba808a10bd",
+      "upstream_path": "addons/gst-web/src/icon-512x512.png"
+    },
+    "upstream/addons/gst-web/src/index.html": {
+      "sha256": "60e05a2059450278ec947a336a8cbc833506d0a239444d1436b191890c23149d",
+      "upstream_path": "addons/gst-web/src/index.html"
+    },
+    "upstream/addons/gst-web/src/input.js": {
+      "sha256": "58090ba0df7a06326265fd8f66e25d6c41bcc98c3b7940f879e4a28dbf0e09ed",
+      "upstream_path": "addons/gst-web/src/input.js"
+    },
+    "upstream/addons/gst-web/src/lib/guacamole-keyboard-selkies.js": {
+      "sha256": "a10f1593b06d52b979a239353c9861a92063e73c48cf256162d92ec85f4187aa",
+      "upstream_path": "addons/gst-web/src/lib/guacamole-keyboard-selkies.js"
+    },
+    "upstream/addons/gst-web/src/lib/vue-spinner-v1.0.4.min.js": {
+      "sha256": "03f11a795ff9952e7af156cb4b7b05b1e52fc67e4edc15be71f7805bc0adb98f",
+      "upstream_path": "addons/gst-web/src/lib/vue-spinner-v1.0.4.min.js"
+    },
+    "upstream/addons/gst-web/src/lib/vue-v2.7.16.min.js": {
+      "sha256": "df7af7a46db8cde009ce99ce328415483b124e298d8586f419de8396c88580ea",
+      "upstream_path": "addons/gst-web/src/lib/vue-v2.7.16.min.js"
+    },
+    "upstream/addons/gst-web/src/lib/vuetify-1.5.24.min.js": {
+      "sha256": "f5944eaaf8c6e5972404a8215b2049c377396b752ea8b2460df9cb9a39bbfac0",
+      "upstream_path": "addons/gst-web/src/lib/vuetify-1.5.24.min.js"
+    },
+    "upstream/addons/gst-web/src/lib/webrtc-adapter-9.0.1.min.js": {
+      "sha256": "2a804c1dadccb2488475bc824fd4c97e3b8f5ef8bcd47eff683bd989b610b02d",
+      "upstream_path": "addons/gst-web/src/lib/webrtc-adapter-9.0.1.min.js"
+    },
+    "upstream/addons/gst-web/src/manifest.json": {
+      "sha256": "10eeb7178573643d217494279bb1784ec35701b710d02d3a1f2136e0540f4e3c",
+      "upstream_path": "addons/gst-web/src/manifest.json"
+    },
+    "upstream/addons/gst-web/src/signalling.js": {
+      "sha256": "17829db232fc118ab9cac1b4463372bdcdd842e7bfa32f6140a7883639ef762d",
+      "upstream_path": "addons/gst-web/src/signalling.js"
+    },
+    "upstream/addons/gst-web/src/sw.js": {
+      "sha256": "fac784b66a01c7d9ac7675b046d43ca853bc738e866046337fa480a2a149b052",
+      "upstream_path": "addons/gst-web/src/sw.js"
+    },
+    "upstream/addons/gst-web/src/util.js": {
+      "sha256": "9bb429e6a5bb846e8126a010803d0929b7a7731aaead28360875de00ac008bd4",
+      "upstream_path": "addons/gst-web/src/util.js"
+    },
+    "upstream/addons/gst-web/src/webrtc.js": {
+      "sha256": "0352126179520df87f094d1db6907acb5bf0980c09dca8debee88365dc9a00b3",
+      "upstream_path": "addons/gst-web/src/webrtc.js"
+    },
+    "upstream/pyproject.toml": {
+      "sha256": "4b5f4916dfc7c0e05e65ad70950e2d236857767ee01e21d82ef8e0783cd7315a",
+      "upstream_path": "pyproject.toml"
+    },
+    "upstream/setup.cfg": {
+      "sha256": "bc0c1ede690a405507b0898d2792a9761ed994b1d5cacd6810faaf5dae80c731",
+      "upstream_path": "setup.cfg"
+    },
+    "upstream/src/selkies_gstreamer/__init__.py": {
+      "sha256": "358838e6eba55c646280fbbbc6cce34c78ec696697107cc6c4d3130910bfc7ba",
+      "upstream_path": "src/selkies_gstreamer/__init__.py"
+    },
+    "upstream/src/selkies_gstreamer/__main__.py": {
+      "sha256": "714b3b2204d486ec26af882150c8631412d9d92091d14a2d4594f2d12f750843",
+      "upstream_path": "src/selkies_gstreamer/__main__.py"
+    },
+    "upstream/src/selkies_gstreamer/gamepad.py": {
+      "sha256": "4ffbb79de90e3d3602721299548fc068f522e5613a742d436f28551aa0eb3f3b",
+      "upstream_path": "src/selkies_gstreamer/gamepad.py"
+    },
+    "upstream/src/selkies_gstreamer/gpu_monitor.py": {
+      "sha256": "5e5edf34d4e10990eb710aff0cdc68cf122ab74ef3e012b042f751f30b228886",
+      "upstream_path": "src/selkies_gstreamer/gpu_monitor.py"
+    },
+    "upstream/src/selkies_gstreamer/gstwebrtc_app.py": {
+      "sha256": "5d638d004666cf2745cfcc4841a8fda1412aec6def42423070774081892db5c0",
+      "upstream_path": "src/selkies_gstreamer/gstwebrtc_app.py"
+    },
+    "upstream/src/selkies_gstreamer/input_event_codes.py": {
+      "sha256": "73598b940d0f2522dbd63f123830fa80600bde8a8ba2f253835ff42ba7215e30",
+      "upstream_path": "src/selkies_gstreamer/input_event_codes.py"
+    },
+    "upstream/src/selkies_gstreamer/metrics.py": {
+      "sha256": "a3a133713699e6f348a67cbe8dfb288e57908f30ca84946e4ea54b7e809aa905",
+      "upstream_path": "src/selkies_gstreamer/metrics.py"
+    },
+    "upstream/src/selkies_gstreamer/resize.py": {
+      "sha256": "1a18f3a850106842c7c16906f31ab3b9e304c3e7bf1eb679add77d2fc4c05f6f",
+      "upstream_path": "src/selkies_gstreamer/resize.py"
+    },
+    "upstream/src/selkies_gstreamer/signalling_web.py": {
+      "sha256": "ee9a448ab1746d18f8aeb2388fb23f829868c563d0f652a3d217b4843d646791",
+      "upstream_path": "src/selkies_gstreamer/signalling_web.py"
+    },
+    "upstream/src/selkies_gstreamer/system_monitor.py": {
+      "sha256": "070ebd04f643f1048f5d3c95c8b2fc48052e0bd5c0e214065dff844613a1dcb6",
+      "upstream_path": "src/selkies_gstreamer/system_monitor.py"
+    },
+    "upstream/src/selkies_gstreamer/watch_test.py": {
+      "sha256": "30637e27aa252ed643f189db3746d3aba8b8dd5f69e7420cfde264de6c96edc9",
+      "upstream_path": "src/selkies_gstreamer/watch_test.py"
+    },
+    "upstream/src/selkies_gstreamer/webrtc_input.py": {
+      "sha256": "3b035597e03408d432cab51c68fa6124205bea5504d862de7e236e5e17695d66",
+      "upstream_path": "src/selkies_gstreamer/webrtc_input.py"
+    },
+    "upstream/src/selkies_gstreamer/webrtc_signalling.py": {
+      "sha256": "fd47be9c4619716680afaf05290f85eb0e186caffa5c2dc1e6355578f9f2f7c4",
+      "upstream_path": "src/selkies_gstreamer/webrtc_signalling.py"
+    },
+    "patches/package-identity.patch": {
+      "sha256": "093ad79f1ac6da4724e938d8fdaba9399bf43a8532ddf82ca0715a9471d8d030",
+      "origin": "ElastOS build patch"
+    },
+    "patches/elastos-media.patch": {
+      "sha256": "c9eceda61bc50e4b17c797721fb11e92af4ba69b87050a53bfdddbac2e334032",
+      "origin": "ElastOS build patch"
+    },
+    "licenses/Vuetify-MIT.txt": {
+      "sha256": "db6a06478f13796b2a6fd001db15120bfce641c733c185a2a6befd2dff6390aa",
+      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+    },
+    "licenses/Vue-MIT.txt": {
+      "sha256": "546bf05e73d12681dca9a5b0a1e396e02c99b6e0d29e38cf82cd6fb21ae80230",
+      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+    },
+    "licenses/Apache-2.0.txt": {
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+      "origin": "Standard license text; original notices remain in upstream source and font name tables"
+    }
+  },
+  "recovery_comparison": {
+    "python": "All 12 unmodified Python files match this commit by git blob SHA-1. This commit is a matching source, not a unique match across all later history. Later commits also retain the 12 blobs.",
+    "python_files": {
+      "__init__.py": "358838e6eba55c646280fbbbc6cce34c78ec696697107cc6c4d3130910bfc7ba",
+      "__main__.py": "714b3b2204d486ec26af882150c8631412d9d92091d14a2d4594f2d12f750843",
+      "gamepad.py": "4ffbb79de90e3d3602721299548fc068f522e5613a742d436f28551aa0eb3f3b",
+      "gpu_monitor.py": "5e5edf34d4e10990eb710aff0cdc68cf122ab74ef3e012b042f751f30b228886",
+      "gstwebrtc_app.py": "d1813fc03015077d0c96e697123c53115220d870d44616431594bbc77fda9168",
+      "input_event_codes.py": "73598b940d0f2522dbd63f123830fa80600bde8a8ba2f253835ff42ba7215e30",
+      "metrics.py": "a3a133713699e6f348a67cbe8dfb288e57908f30ca84946e4ea54b7e809aa905",
+      "resize.py": "1a18f3a850106842c7c16906f31ab3b9e304c3e7bf1eb679add77d2fc4c05f6f",
+      "signalling_web.py": "ee9a448ab1746d18f8aeb2388fb23f829868c563d0f652a3d217b4843d646791",
+      "system_monitor.py": "070ebd04f643f1048f5d3c95c8b2fc48052e0bd5c0e214065dff844613a1dcb6",
+      "watch_test.py": "30637e27aa252ed643f189db3746d3aba8b8dd5f69e7420cfde264de6c96edc9",
+      "webrtc_input.py": "3b035597e03408d432cab51c68fa6124205bea5504d862de7e236e5e17695d66",
+      "webrtc_signalling.py": "fd47be9c4619716680afaf05290f85eb0e186caffa5c2dc1e6355578f9f2f7c4"
+    },
+    "gstwebrtc_app": "The media patch reproduces the current rootfs builder byte for byte. The recovered file additionally contains the existing optional audio-queue diagnostic. Applying scripts/build/browser-audio-queue-diagnostic.py to the prepared file reproduces all recovered bytes (+195/-9 against upstream). The builder intentionally keeps that optional diagnostic separate.",
+    "diagnostic_source_sha256": "a26fd4613573719bb20b2d082484a9e0ef8dc3c0b7ba36559c439b76812e97c8",
+    "web_summary": "22 of 27 files match pinned upstream bytes; index.html and sw.js have only upstream release cache substitutions; app.js has that substitution and older upstream TURN path spelling; webrtc.js has an older upstream typo; 50x.html is from the nginx base image. No recovered web difference requires an ElastOS patch. The 26 vendored web files are unmodified at the pinned commit, including already-minified upstream libraries.",
+    "web_files": [
+      {
+        "path": "50x.html",
+        "recovered_sha256": "876766b4e80133fd490603e073d3567425b88794828a9292104244c9e40875ed",
+        "classification": "nginx base-image artifact",
+        "detail": "Default nginx 50x.html, copied by the upstream nginx:alpine release image; omitted from this source build."
+      },
+      {
+        "path": "app.js",
+        "recovered_sha256": "e87c55f483c18eaf47b79781aaad9734d01abaeac94ea397cb0736a371011e17",
+        "classification": "upstream release cache substitution plus older upstream source",
+        "detail": "CACHE_VERSION -> 1720533911; fetch(\"/turn/\") matches earlier upstream source. Pinned commit uses fetch(\"/turn\").",
+        "matching_source_commit": "3a242aba88e721ce7082e1f8b69b64ce45256f8a"
+      },
+      {
+        "path": "css/font/KFOkCnqEu92Fr1MmgWxP.ttf",
+        "recovered_sha256": "0292343754ec9499ada68db5f61ae849ebe9ccd4b96f81b086c4732171a2612d",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/KFOlCnqEu92Fr1MmEU9vAw.ttf",
+        "recovered_sha256": "bd6e16dcf973d77e746a62b112acf1cdde2c9d579520f017eb3b9c0919533e52",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/KFOlCnqEu92Fr1MmSU5vAw.ttf",
+        "recovered_sha256": "d305a976e225bdeb9c39382f5245810b37f70bdbbd0dcf2e74feb2bf7109a3bd",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/KFOlCnqEu92Fr1MmWUlvAw.ttf",
+        "recovered_sha256": "7d922a769bf8383bd1cd9f75a3d5935a7938d15741978b060efcf6cb74d00061",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/KFOlCnqEu92Fr1MmYUtvAw.ttf",
+        "recovered_sha256": "bb10b908227d3d0555191fd1366b7a67655c52ee5415b59321f060a3fcebc511",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/KFOmCnqEu92Fr1Me5Q.ttf",
+        "recovered_sha256": "e294f7580d272f024161c6e5c744278f90d45ee67846f66d4083f7aef61c979e",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/font/flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf",
+        "recovered_sha256": "bc66ff963b638caf6fdeb18428a75e55bd329f4aac1d50249d3345e0531d58f3",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/vuetify.css",
+        "recovered_sha256": "de1a508e603fde2328f10822f3d29232a690f34180897ea6180ce358a147de6e",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "css/vuetify.css.map",
+        "recovered_sha256": "f0cc63bfd21d2d9762895487458fd8c608a27dc8ffc0e38cb76fa230cade3d5e",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "favicon.ico",
+        "recovered_sha256": "ee43b29027473fc1ec0843b51ca050b37b1cbf8df77a9db40ff9938d893e4f42",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "gamepad.js",
+        "recovered_sha256": "d1608c8faa1be75accbd9497ff5e95fc88c424803fa82f08e4d7df48f1d5e47e",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "icon-192x192.png",
+        "recovered_sha256": "19554fc308a0754e1595c07fb23bdb0bc643824b1c8edbe21d1cfcf7003b55e1",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "icon-512x512.png",
+        "recovered_sha256": "9ac3fb7fa4f3c6c2058fe1b94dd604d0ec619703d60f21522dcf64ba808a10bd",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "index.html",
+        "recovered_sha256": "d8d93e2a4c1e82bf06be00d2b1ffa6de4707c0a6a2365bdd8f6a972bd963375b",
+        "classification": "upstream release cache substitution",
+        "detail": "Upstream install.sh substitutes CACHE_VERSION and script ?ts=1 with 1720533911."
+      },
+      {
+        "path": "input.js",
+        "recovered_sha256": "58090ba0df7a06326265fd8f66e25d6c41bcc98c3b7940f879e4a28dbf0e09ed",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "lib/guacamole-keyboard-selkies.js",
+        "recovered_sha256": "a10f1593b06d52b979a239353c9861a92063e73c48cf256162d92ec85f4187aa",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "lib/vue-spinner-v1.0.4.min.js",
+        "recovered_sha256": "03f11a795ff9952e7af156cb4b7b05b1e52fc67e4edc15be71f7805bc0adb98f",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "lib/vue-v2.7.16.min.js",
+        "recovered_sha256": "df7af7a46db8cde009ce99ce328415483b124e298d8586f419de8396c88580ea",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "lib/vuetify-1.5.24.min.js",
+        "recovered_sha256": "f5944eaaf8c6e5972404a8215b2049c377396b752ea8b2460df9cb9a39bbfac0",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "lib/webrtc-adapter-9.0.1.min.js",
+        "recovered_sha256": "2a804c1dadccb2488475bc824fd4c97e3b8f5ef8bcd47eff683bd989b610b02d",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "manifest.json",
+        "recovered_sha256": "10eeb7178573643d217494279bb1784ec35701b710d02d3a1f2136e0540f4e3c",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "signalling.js",
+        "recovered_sha256": "17829db232fc118ab9cac1b4463372bdcdd842e7bfa32f6140a7883639ef762d",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "sw.js",
+        "recovered_sha256": "4a29b99bcb97443d88db1ee75bd60bd21736d665a5ff16a576b9321d460a869e",
+        "classification": "upstream release cache substitution",
+        "detail": "Upstream install.sh substitutes CACHE_VERSION and script ?ts=1 with 1720533911."
+      },
+      {
+        "path": "util.js",
+        "recovered_sha256": "9bb429e6a5bb846e8126a010803d0929b7a7731aaead28360875de00ac008bd4",
+        "classification": "unmodified upstream bytes"
+      },
+      {
+        "path": "webrtc.js",
+        "recovered_sha256": "b47b3d18d3e3838b491ecfb2129d34ee61399de706ac41007fc5ddec1dcc9758",
+        "classification": "older upstream source",
+        "detail": "Recovered text says \"recevied\"; pinned commit corrects it to \"received\".",
+        "matching_source_commit": "5dd0d740e70cb7d37be8387b375632f8e0ca8dde"
+      }
+    ]
+  },
+  "build_notes": {
+    "package_identity_patch": "Replicates upstream release packaging name/version substitution for selkies 1.6.1. Uses the recovered python-xlib requirement instead of the old fork URL. Dependencies install separately; the local Selkies wheel uses --no-index --no-deps --no-build-isolation.",
+    "web_cache": "Replicates upstream install.sh cache substitutions with the full source commit instead of a wall-clock timestamp. This changes the PWA cache identity deterministically.",
+    "guest_source": "/usr/share/doc/selkies/source retains pristine upstream source, licenses, patches and this manifest.",
+    "checksum_scope": "files contains SHA-256 for every vendored source, patch and license file. This provenance.json is the review-controlled manifest and is excluded from its own file list."
+  },
+  "licenses": [
+    {
+      "component": "Selkies Python and web source",
+      "license": "MPL-2.0",
+      "text": "upstream/LICENSE",
+      "notice": "Original source headers, including incorporated Google Apache-2.0 notices, stay intact."
+    },
+    {
+      "component": "Vue 2.7.16",
+      "license": "MIT",
+      "text": "licenses/Vue-MIT.txt",
+      "notice_source": "upstream/addons/gst-web/src/lib/vue-v2.7.16.min.js"
+    },
+    {
+      "component": "Vuetify 1.5.24 JS, CSS and source map",
+      "license": "MIT",
+      "text": "licenses/Vuetify-MIT.txt",
+      "notice_source": "upstream/addons/gst-web/src/lib/vuetify-1.5.24.min.js"
+    },
+    {
+      "component": "Guacamole keyboard and incorporated Google source",
+      "license": "Apache-2.0",
+      "text": "licenses/Apache-2.0.txt",
+      "notice_source": "upstream/addons/gst-web/src/lib/guacamole-keyboard-selkies.js"
+    },
+    {
+      "component": "Roboto fonts (six KFO*.ttf files)",
+      "license": "Apache-2.0",
+      "text": "licenses/Apache-2.0.txt",
+      "notice_source": "Embedded font name table: Copyright 2011 Google Inc. All Rights Reserved.; name ID 14 http://www.apache.org/licenses/LICENSE-2.0"
+    }
+  ],
+  "license_evidence_pending": [
+    "vue-spinner 1.0.4, including its bundled webpack/style-loader/css-loader runtime",
+    "webrtc-adapter 9.0.1, including bundled sdp and build helpers",
+    "Material Icons font flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf: embedded copyright is Copyright 2018 Google, Inc. All Rights Reserved.; full license is absent from supplied commit",
+    "Guacamole upstream NOTICE referenced by the preserved Apache header"
+  ],
+  "remaining_downloads": {
+    "debootstrap": "Debian bookworm minbase and its resolved dependencies, from the configured Debian mirror.",
+    "apt_direct_packages": [
+      "busybox-static",
+      "ca-certificates",
+      "chromium",
+      "dbus",
+      "fontconfig",
+      "fonts-dejavu-core",
+      "gcc",
+      "gir1.2-gst-plugins-bad-1.0",
+      "gir1.2-gst-plugins-base-1.0",
+      "gir1.2-gstreamer-1.0",
+      "gstreamer1.0-libav",
+      "gstreamer1.0-nice",
+      "gstreamer1.0-pulseaudio",
+      "gstreamer1.0-plugins-bad",
+      "gstreamer1.0-plugins-base",
+      "gstreamer1.0-plugins-good",
+      "gstreamer1.0-plugins-ugly",
+      "gstreamer1.0-tools",
+      "gstreamer1.0-x",
+      "kmod",
+      "libasound2",
+      "libgbm1",
+      "libgtk-3-0",
+      "libnss3",
+      "libx11-6",
+      "libxcomposite1",
+      "libxdamage1",
+      "libxfixes3",
+      "libxkbcommon0",
+      "libxrandr2",
+      "libc6-dev",
+      "linux-libc-dev",
+      "nodejs",
+      "pipewire",
+      "pipewire-pulse",
+      "python3",
+      "python3-aiohttp",
+      "python3-gi",
+      "python3-gi-cairo",
+      "python3-gst-1.0",
+      "python3-numpy",
+      "python3-dev",
+      "python3-pip",
+      "python3-setuptools",
+      "python3-wheel",
+      "python3-websockets",
+      "tini",
+      "xauth",
+      "x11-xserver-utils",
+      "xclip",
+      "xsel",
+      "xvfb",
+      "wireplumber",
+      "linux-image-arm64 (linux-arm64) or linux-image-amd64 (linux-amd64)"
+    ],
+    "pip_direct_packages": [
+      "websockets",
+      "basicauth",
+      "gputil",
+      "prometheus_client",
+      "msgpack",
+      "pynput",
+      "psutil",
+      "watchdog",
+      "Pillow",
+      "python-xlib"
+    ],
+    "dependency_resolution": "APT and pip also fetch their resolved dependencies when absent. The complete versions and transitive package set remain repository-dependent. Node comes from Debian nodejs; this rootfs build performs no npm or separate Node download.",
+    "cargo": "The three guest-binary Cargo builds can fetch uncached dependencies from their lockfiles unless CARGO_NET_OFFLINE=true.",
+    "scope": "This change covers build-browser-vm-rootfs.sh. The separate hosted/Selkies operator Docker image continues to use upstream base images and a wheel; it is outside this rootfs task."
+  }
+}
