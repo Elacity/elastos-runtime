@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -11,6 +11,14 @@ const source = dirname(fileURLToPath(import.meta.url));
 const platforms = ['aarch64-darwin', 'x86_64-linux', 'aarch64-linux'];
 const commit = 'a'.repeat(40);
 const tree = 'b'.repeat(40);
+const ciRun = { id: 456, html_url: 'https://github.com/Elacity/elastos-runtime/actions/runs/456',
+  head_sha: commit, head_branch: 'develop', event: 'push', path: '.github/workflows/ci.yml',
+  status: 'completed', conclusion: 'success' };
+const requiredJobs = ['test-elastos', 'source-home-macos'];
+const pathWorkflow = readFileSync(join(source, '../.github/workflows/ci.yml'), 'utf8');
+const skippedCustody = { name: 'custody-harness-smoke', status: 'completed', conclusion: 'skipped' };
+const changesJob = { id: 789, name: 'changes', status: 'completed', conclusion: 'success',
+  steps: [{ name: 'detect custody/carrier-relevant changes', status: 'completed', conclusion: 'success' }] };
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 
 function run(command, args, options = {}) {
@@ -20,14 +28,15 @@ function run(command, args, options = {}) {
 }
 
 function fixture(t, changes = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'release-publish-fixture-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'release-publish-fixture-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const repo = join(root, 'repo');
   const bin = join(root, 'bin');
   mkdirSync(join(repo, 'scripts'), { recursive: true });
   mkdirSync(bin);
   cpSync(join(source, 'release-publish.sh'), join(repo, 'scripts/release-publish.sh'));
-  const config = { root, repo, commit, tree, artifacts: {}, ...changes };
+  const config = { root, repo, commit, tree, artifacts: {}, ciRuns: [ciRun], requiredJobs,
+    ciJobs: requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), ...changes };
   for (const [index, platform] of platforms.entries()) {
     const input = join(root, platform, 'inputs');
     mkdirSync(input, { recursive: true });
@@ -67,7 +76,23 @@ const args = process.argv.slice(2);
 fs.appendFileSync(path.join(c.root, 'calls.jsonl'), JSON.stringify({ command, args }) + '\\n');
 if (command === 'gh') {
   const endpoint = args[1];
-  if (endpoint.endsWith('/zip')) {
+  if (c.failCiApi && endpoint.includes(c.failCiApi)) process.exit(94);
+  let payload;
+  if (endpoint.includes('/workflows/ci.yml/runs?')) {
+    if (!endpoint.includes('head_sha=' + c.commit) || !endpoint.includes('branch=develop') || !endpoint.includes('event=push')) process.exit(93);
+    payload = { workflow_runs: c.ciRuns };
+  } else if (endpoint.endsWith('/branches/develop/protection')) payload = { required_status_checks: { contexts: c.requiredJobs } };
+  else if (endpoint.includes('/runs/456/jobs?')) payload = { jobs: c.ciJobs };
+  else if (endpoint.includes('/contents/.github/workflows/ci.yml?ref=' + c.commit)) payload = { content: Buffer.from(c.ciWorkflow || '').toString('base64') };
+  else if (endpoint.endsWith('/jobs/789/logs')) {
+    if (!args.includes('--allow-escape-sequences')) process.exit(95);
+    console.log(c.filterLog || ''); process.exit(0);
+  }
+  if (payload) {
+    if (!args.includes('--jq')) { console.log(JSON.stringify(payload)); process.exit(0); }
+    const result = require('node:child_process').spawnSync('jq', ['-r', args[args.indexOf('--jq') + 1]], { input: JSON.stringify(payload), encoding: 'utf8' });
+    process.stdout.write(result.stdout); process.stderr.write(result.stderr); process.exit(result.status);
+  } else if (endpoint.endsWith('/zip')) {
     const id = endpoint.split('/').at(-2);
     process.stdout.write(fs.readFileSync(Object.values(c.artifacts).find(a => a.id === id).zip));
   } else if (endpoint.includes('/artifacts?')) {
@@ -75,6 +100,7 @@ if (command === 'gh') {
     const a = c.artifacts[prefix];
     console.log(a.id + ' ' + a.digest + ' ' + prefix + '-' + c.commit + '-1');
   } else if (endpoint.includes('/compare/')) console.log('ahead');
+  else if (endpoint.endsWith('/git/ref/heads/develop')) console.log(c.commit);
   else console.log('.github/workflows/release-package.yml success');
 } else if (command === 'git') {
   if (args.includes('add')) fs.cpSync(c.repo, args[args.indexOf('add') + 3], { recursive: true });
@@ -105,7 +131,7 @@ const args = process.argv.slice(2);
 fs.writeFileSync(process.env.ARGUMENT_LOG, JSON.stringify(args));
 const output = args[args.indexOf('--prepare-only') + 1];
 fs.mkdirSync(output, { recursive: true });
-fs.writeFileSync(output + '/signing-input.json', '{}');
+fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { commit: '${commit}', tree: '${tree}' }, files: [{ size: 1 }], installer: { stamps: { MAINTAINER_DID: 'did:fixture' } } }));
 `, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_CONFIG: join(root, 'config.json'),
     RELEASE_WORK: join(root, 'work'), RELEASE_ORIGIN: 'https://fixture.invalid',
@@ -121,6 +147,51 @@ fs.writeFileSync(output + '/signing-input.json', '{}');
     args() { return JSON.parse(readFileSync(env.ARGUMENT_LOG)); } };
 }
 
+test('prepare records a required skip proved by the source workflow path filter', t => {
+  const f = fixture(t, { requiredJobs: [...requiredJobs, 'custody-harness-smoke'],
+    ciJobs: [...requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), skippedCustody, changesJob],
+    ciWorkflow: pathWorkflow, filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false' });
+  const result = f.prepare();
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(readFileSync(join(f.root, 'work/1.2.3/run.json')));
+  assert.deepEqual(record.ci_skipped, [{ name: 'custody-harness-smoke', reason: 'path filter: custody unchanged' }]);
+  assert.match(result.stdout, /custody-harness-smoke: path filter: custody unchanged/);
+  const signer = join(f.root, 'signer.py');
+  const key = join(f.root, 'fixture-key');
+  writeFileSync(signer, '# fixture signer');
+  writeFileSync(key, 'fixture key');
+  const policy = run('bash', [f.script, 'policy', '1.2.3', signer, key, run('which', ['openssl']).stdout.trim()], { env: f.env });
+  assert.match(policy.stdout, /custody-harness-smoke: path filter: custody unchanged/);
+  const signed = join(f.root, 'signed');
+  mkdirSync(signed);
+  writeFileSync(join(signed, 'release-head.json'), JSON.stringify({ signer_did: 'did:fixture' }));
+  const seed = run('bash', [f.script, 'seed', '1.2.3', signed], { env: f.env });
+  assert.match(seed.stdout, /custody-harness-smoke: path filter: custody unchanged/);
+});
+
+for (const [label, delta] of [
+  ['changed custody paths', { filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = true' }],
+  ['missing filter result', { filterLog: '' }],
+  ['ambiguous filter results', { filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false\n2026-10-06T12:00:01.000Z ##[group]Filter custody = true' }],
+  ['event-only condition', { ciWorkflow: pathWorkflow.replace("needs.changes.outputs.custody == 'true'", "github.event_name == 'pull_request'") }],
+  ['another skip condition', { ciWorkflow: pathWorkflow.replace("needs.changes.outputs.custody == 'true'", "needs.changes.outputs.custody == 'true' && false") }],
+  ['wrong output binding', { ciWorkflow: pathWorkflow.replace('steps.filter.outputs.custody', 'steps.other.outputs.custody') }],
+  ['cancelled required job', { smokeJob: { ...skippedCustody, conclusion: 'cancelled' }, error: /custody-harness-smoke: cancelled/ }],
+  ['failed required job', { smokeJob: { ...skippedCustody, conclusion: 'failure' }, error: /custody-harness-smoke: failure/ }],
+  ['failed filter job', { filterJob: { ...changesJob, conclusion: 'failure' } }],
+  ['failed filter step', { filterJob: { ...changesJob, steps: [{ name: 'detect custody/carrier-relevant changes', status: 'completed', conclusion: 'skipped' }] } }],
+]) {
+  test(`prepare refuses custody skip with ${label}`, t => {
+    const f = fixture(t, { requiredJobs: [...requiredJobs, 'custody-harness-smoke'],
+      ciJobs: [...requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), delta.smokeJob || skippedCustody, delta.filterJob || changesJob],
+      ciWorkflow: pathWorkflow, filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false', ...delta });
+    const result = f.prepare();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, delta.error || /custody-harness-smoke: skipped/);
+    assert.throws(() => f.args(), { code: 'ENOENT' });
+  });
+}
+
 for (const selected of [[], ['aarch64-darwin', 'x86_64-linux'], ['aarch64-darwin']]) {
   test(`prepare passes each platform once: ${selected.join(',') || 'all'}`, t => {
     const f = fixture(t);
@@ -132,8 +203,51 @@ for (const selected of [[], ['aarch64-darwin', 'x86_64-linux'], ['aarch64-darwin
     assert.deepEqual(inputs, expected.map(p => `${p}=${f.root}/work/1.2.4/inputs/${p}/N1`));
     assert.equal(args.includes('--preview-platform'), expected.length === 1);
     assert.equal(readFileSync(f.env.VERIFY_LOG, 'utf8').trim().split('\n').length, expected.length);
+    const record = JSON.parse(readFileSync(join(f.root, 'work/1.2.4/run.json')));
+    assert.deepEqual(record.ci_run, { id: ciRun.id, url: ciRun.html_url });
+    assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
   });
 }
+
+for (const [label, changes, error] of [
+  ['failed CI', { ciRuns: [{ ...ciRun, conclusion: 'failure' }] }, /successful develop push CI run/],
+  ['no CI run', { ciRuns: [] }, /successful develop push CI run/],
+  ['skipped required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'skipped' },
+    { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: skipped/],
+  ['failed required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'failure' },
+    { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: failure/],
+  ['missing required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'success' }] }, /source-home-macos: missing/],
+  ['wrong source CI', { ciRuns: [{ ...ciRun, head_sha: 'c'.repeat(40) }] }, /successful develop push CI run/],
+  ['PR CI', { ciRuns: [{ ...ciRun, event: 'pull_request' }] }, /successful develop push CI run/],
+  ['wrong branch CI', { ciRuns: [{ ...ciRun, head_branch: 'main' }] }, /successful develop push CI run/],
+  ['incomplete CI', { ciRuns: [{ ...ciRun, status: 'in_progress' }] }, /successful develop push CI run/],
+  ['unreadable branch protection', { failCiApi: '/branches/develop/protection' }, /cannot read develop required jobs/],
+  ['unreadable CI jobs', { failCiApi: '/runs/456/jobs?' }, /cannot read develop CI jobs/],
+]) {
+  test(`prepare refuses ${label} before unsigned preparation`, t => {
+    const f = fixture(t, changes);
+    const result = f.prepare();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, error);
+    assert.throws(() => f.args(), { code: 'ENOENT' });
+    const calls = readFileSync(join(f.root, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(calls.some(c => c.command === 'git' || c.command === 'scp'), false);
+  });
+}
+
+test('policy prints the prepared source, package run and develop CI run', t => {
+  const f = fixture(t);
+  assert.equal(f.prepare().status, 0);
+  const signer = join(f.root, 'signer.py');
+  const key = join(f.root, 'fixture-key');
+  writeFileSync(signer, '# fixture signer');
+  writeFileSync(key, 'fixture key');
+  const openssl = run('which', ['openssl']).stdout.trim();
+  const result = run('bash', [f.script, 'policy', '1.2.3', signer, key, openssl], { env: f.env });
+  assert.match(result.stdout, new RegExp(`Source commit: ${commit}`));
+  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/123/);
+  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
+});
 
 for (const selected of [['x86_64-linux'], ['aarch64-darwin', 'aarch64-darwin'], ['unknown']]) {
   test(`prepare refuses invalid platform selection: ${selected.join(',')}`, t => {
@@ -171,6 +285,9 @@ test('seed reconstructs all platform files and shared support from checked artif
   }
   cpSync(join(f.root, 'aarch64-darwin/inputs/N/artifacts/shared.tar.gz'), join(signed, 'shared.tar.gz'));
   const result = run('bash', [f.script, 'seed', '1.2.3', signed], { env: f.env });
+  assert.match(result.stdout, new RegExp(`Source commit: ${commit}`));
+  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/123/);
+  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
   run('bash', ['-n'], { input: result.stdout });
   const stage = join(f.root, 'stage/1.2.3');
   mkdirSync(join(stage, 'signed'), { recursive: true });

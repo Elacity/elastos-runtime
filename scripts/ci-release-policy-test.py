@@ -45,7 +45,7 @@ def evaluate(expression, context):
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
+    expression = re.sub(r"(?:github|inputs|env|steps|matrix|needs)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
     return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
 
@@ -100,7 +100,7 @@ def validate_cache_guards(source):
                 context = {"github.event_name": event, "github.ref": ref,
                            "github.ref_type": ref_type, "inputs.ref": override,
                            "env.CI_USE_CACHE": "false", "env.CI_SAVE_CACHE": "true",
-                           "steps.should-run.outputs.run": "true", **NO_CACHE_HIT}
+                           **NO_CACHE_HIT}
                 if evaluate(guard, context):
                     raise AssertionError(f"cache guard permits uncached build in {job}")
 
@@ -139,15 +139,31 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(save, event == "push" and ref in SAVING_REFS)
                 context["env.CI_SAVE_CACHE"] = str(save).lower()
                 context.update(NO_CACHE_HIT)
-                for should_run in (True, False):
-                    context["steps.should-run.outputs.run"] = str(should_run).lower()
-                    for job, step in caches:
-                        expected = cached and (job != "custody-harness-smoke" or should_run)
-                        if "actions/cache/save@" in step:
-                            expected = expected and (event == "push" and ref == "refs/heads/develop"
-                                                     if job == "engine-llama-arm64" else save)
-                        self.assertEqual(evaluate(field(step, "if"), context), expected,
-                                         f"cache guard in {job}")
+                for job, step in caches:
+                    expected = cached
+                    if "actions/cache/save@" in step:
+                        expected = expected and (event == "push" and ref == "refs/heads/develop"
+                                                 if job == "engine-llama-arm64" else save)
+                    self.assertEqual(evaluate(field(step, "if"), context), expected,
+                                     f"cache guard in {job}")
+
+    def test_custody_smoke_uses_path_decision_on_develop_and_prs(self):
+        self.assertEqual(field(JOBS["custody-harness-smoke"], "needs"), "[source-gate, changes]")
+        self.assertIn("custody: ${{ steps.filter.outputs.custody }}", JOBS["changes"])
+        filter_step, = [step for step in steps("changes") if "id: filter" in step]
+        self.assertEqual(field(filter_step, "uses"), "dorny/paths-filter@v3")
+        self.assertEqual(field(filter_step, "base"), "${{ github.event_name == 'push' && github.event.before || '' }}")
+        self.assertEqual(field(filter_step, "ref"), "${{ github.event_name == 'push' && github.sha || '' }}")
+        self.assertIn("pull-requests: read", JOBS["changes"])
+        for event, ref, _, _, _, _ in CASES:
+            for changed in (True, False):
+                eligible = event in ("pull_request", "workflow_dispatch") or ref == "refs/heads/develop"
+                context = {"github.event_name": event, "github.ref": ref,
+                           "needs.changes.outputs.custody": str(changed).lower() if eligible else ""}
+                self.assertEqual(evaluate(field(JOBS["changes"], "if"), context), eligible)
+                self.assertEqual(evaluate(field(JOBS["custody-harness-smoke"], "if"), context),
+                                 event == "workflow_dispatch" or (eligible and changed))
+        self.assertNotIn("steps.should-run", JOBS["custody-harness-smoke"])
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
@@ -215,6 +231,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
+            "changes": ("changes", "ubuntu-24.04"),
             "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
             "release": ("publish-github-release", "ubuntu-24.04"),

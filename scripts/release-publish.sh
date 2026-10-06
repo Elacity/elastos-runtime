@@ -51,6 +51,73 @@ checked_artifact() {
     echo "${found% *} $commit"
 }
 
+# Read one job from this repository's fixed workflow indentation.
+workflow_job() {
+    awk -v job="$1" '$0 == "  " job ":" {found=1; next}
+        found && /^  [^ ]/ {exit} found {print}'
+}
+
+# The custody filter is the only path-based required-job condition in CI.
+path_skips() {
+    local commit="$1" jobs="$2" required="$3" filter_id workflow smoke changes logs
+    jq -e 'index("custody-harness-smoke") != null' <<< "$required" > /dev/null \
+        && jq -e 'any(.[]; .name == "custody-harness-smoke" and .status == "completed" and .conclusion == "skipped")' \
+        <<< "$jobs" > /dev/null || { echo '[]'; return; }
+    filter_id=$(jq -r '[.[] | select(.name == "changes" and .status == "completed" and .conclusion == "success"
+        and any(.steps[]?; .name == "detect custody/carrier-relevant changes" and .status == "completed" and .conclusion == "success"))]
+        | if length == 1 then .[0].id else empty end' <<< "$jobs")
+    [[ -n "$filter_id" ]] || { echo '[]'; return; }
+    workflow=$(gh api "repos/$REPO/contents/.github/workflows/ci.yml?ref=$commit" --jq '.content | @base64d') \
+        || die "cannot read source CI workflow"
+    smoke=$(workflow_job custody-harness-smoke <<< "$workflow")
+    changes=$(workflow_job changes <<< "$workflow")
+    grep -Fqx '    needs: [source-gate, changes]' <<< "$smoke" \
+        && grep -Fqx "    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.custody == 'true'" <<< "$smoke" \
+        && grep -Fqx '      custody: ${{ steps.filter.outputs.custody }}' <<< "$changes" \
+        && [[ "$changes" == *$'        id: filter\n        uses: dorny/paths-filter@v3'* ]] || { echo '[]'; return; }
+    logs=$(gh api "repos/$REPO/actions/jobs/$filter_id/logs" --allow-escape-sequences) || die "cannot read CI path filter result"
+    [[ "$(grep -Ec '^[0-9T:.Z-]+ ##\[group\]Filter custody = (true|false)$' <<< "$logs" || true)" == 1 ]] \
+        && grep -Eq '^[0-9T:.Z-]+ ##\[group\]Filter custody = false$' <<< "$logs" || { echo '[]'; return; }
+    echo '[{"name":"custody-harness-smoke","reason":"path filter: custody unchanged"}]'
+}
+
+# Bind the package source to a successful develop push and its required jobs.
+checked_ci() {
+    local commit="$1" ci required jobs refused skipped
+    ci=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$commit&branch=develop&event=push&per_page=100" \
+        --paginate | jq -s "[.[].workflow_runs[] | select(.head_sha == \"$commit\"
+        and .path == \".github/workflows/ci.yml\" and .event == \"push\" and .head_branch == \"develop\"
+        and .status == \"completed\" and .conclusion == \"success\")] | sort_by(.id)
+        | last | if . == null then empty else {id, url: .html_url} end") || die "cannot read develop CI runs for $commit"
+    [[ -n "$ci" ]] || die "source $commit needs a completed successful develop push CI run"
+    required=$(gh api "repos/$REPO/branches/develop/protection" --jq .required_status_checks.contexts) \
+        || die "cannot read develop required jobs"
+    jobs=$(gh api "repos/$REPO/actions/runs/$(jq -r .id <<< "$ci")/jobs?filter=latest&per_page=100" \
+        --paginate | jq -s '[.[].jobs[] | {id, name, status, conclusion, steps}]') || die "cannot read develop CI jobs"
+    skipped=$(path_skips "$commit" "$jobs" "$required") || die "cannot check CI path skips"
+    refused=$(jq -nr --argjson required "$required" --argjson jobs "$jobs" --argjson skipped "$skipped" '
+        $required[] as $name | [$jobs[] | select(.name == $name)] as $matches |
+        if ($matches | length) == 0 then "\($name): missing"
+        else $matches[] | select(.status != "completed" or (.conclusion != "success"
+            and (.conclusion != "skipped" or ([$skipped[].name] | index($name)) == null))) |
+            "\($name): \(.conclusion // .status)" end') || die "cannot check develop required jobs"
+    [[ -z "$refused" ]] || die "develop CI run $(jq -r .id <<< "$ci") required jobs refused: $refused"
+    jq --argjson skipped "$skipped" '. + {skipped: $skipped}' <<< "$ci"
+}
+
+# Print the same source and run identities at each operator handoff.
+publication_record() {
+    local work="$1" commit run ci_id ci_url
+    commit=$(jq -er .source.commit "$work/unsigned/signing-input.json")
+    run=$(jq -er .run "$work/run.json")
+    ci_id=$(jq -er .ci_run.id "$work/run.json")
+    ci_url=$(jq -er .ci_run.url "$work/run.json")
+    echo "# Source commit: $commit"
+    echo "# Package run: $run https://github.com/$REPO/actions/runs/$run"
+    echo "# Develop CI run: $ci_id $ci_url"
+    jq -r '(.ci_skipped // [])[] | "# Skipped required job: \(.name): \(.reason)"' "$work/run.json"
+}
+
 # Prints the seed-side preamble and get NAME ID DIGEST: download, check, unpack.
 seed_preamble() {
     cat <<EOF
@@ -66,7 +133,7 @@ work_dir() { printf '%s/%s\n' "$WORK_ROOT" "$1"; }
 
 prepare() {
     [[ $# -ge 2 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: prepare RUN_ID VERSION [PLATFORM ...]"
-    local run="$1" version="$2" work id digest name commit="" tree="" did state platform input artifact_commit pair=""
+    local run="$1" version="$2" work id digest name commit="" tree="" did state platform input artifact_commit pair="" ci_run
     shift 2
     local platforms=("$@") args=() seen=" "
     [[ ${#platforms[@]} -gt 0 ]] || platforms=(aarch64-darwin x86_64-linux aarch64-linux)
@@ -106,6 +173,9 @@ prepare() {
         args+=(--platform-input "$platform=$input/$name")
     done
     name="$pair"
+    ci_run=$(checked_ci "$commit")
+    echo "# Develop CI run: $(jq -r '[(.id | tostring), .url] | join(" ")' <<< "$ci_run")"
+    jq -r '.skipped[] | "# Skipped required job: \(.name): \(.reason)"' <<< "$ci_run"
     [[ ${#platforms[@]} -gt 1 ]] || args+=(--preview-platform aarch64-darwin)
     git -C "$ROOT" fetch -q origin "$commit"
     git -C "$ROOT" worktree add -q --detach "$work/source" "$commit"
@@ -118,8 +188,9 @@ prepare() {
     did=$(curl -fsS --max-time 20 "$ORIGIN/release-head.json" | jq -er .signer_did)
     state="$RELEASE_SEED_DATA/ElastOS/SystemServices/Publisher/publish-state.json"
     scp -q "$RELEASE_SEED:$state" "$work/state/publish-state.json"
-    printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" \
-        '{run: $run, input: $name, platforms: [inputs]}' > "$work/run.json"
+    printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" --argjson ci_run "$ci_run" \
+        '{run: $run, ci_run: ($ci_run | del(.skipped)), ci_skipped: $ci_run.skipped,
+          input: $name, platforms: [inputs]}' > "$work/run.json"
     (cd "$work/source" && env ELASTOS_DATA_DIR="$work/data" ELASTOS_PUBLISH_STATE_DIR="$work/state" \
         ELASTOS_IPFS_KUBO_PATH="$work/kubo/ipfs" \
         ELASTOS_SOURCE_CONNECT_TICKET="$(jq -er .ticket "$work/bootstrap.json")" \
@@ -135,6 +206,7 @@ policy() {
     local work input python signer key openssl develop
     work=$(work_dir "$1") input="$(work_dir "$1")/unsigned"
     [[ -f "$input/signing-input.json" ]] || die "prepare $1 first"
+    publication_record "$work"
     python=$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')
     signer=$(realpath "$2") key=$(realpath "$3") openssl=$(realpath "$4")
     [[ "$signer" == "$2" && "$key" == "$3" ]] || die "SIGNER and KEY must be canonical absolute paths"
@@ -162,6 +234,7 @@ seed() {
     signed=$(realpath "$2") work=$(work_dir "$version")
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
+    publication_record "$work"
     did=$(jq -er .signer_did "$signed/release-head.json")
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
