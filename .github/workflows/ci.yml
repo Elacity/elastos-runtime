@@ -30,10 +30,9 @@ env:
   CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
-  # Only merged code on develop or main saves caches. PR runs restore them but
-  # never save, so one PR cannot evict every other PR's cache (10 GB repo cap)
-  # or write a cache that later runs trust.
-  CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+  # Merge-queue builds and develop/main pushes warm shared caches. PR runs
+  # read them so trusted builds own cache writes within the 10 GB repo cap.
+  CI_SAVE_CACHE: ${{ github.event_name == 'merge_group' || (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')) }}
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -204,8 +203,8 @@ jobs:
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
@@ -236,38 +235,14 @@ jobs:
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
-      # The three provider workspaces are release-built from cold on every
-      # run otherwise; with the cache restored, cargo only re-fingerprints
-      # the workspace members and reuses every dependency artifact.
-      - name: restore provider build artifacts
-        id: providers-cache
-        if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            providers-bd-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
           cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
-      - name: save provider build artifacts
-        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo test
         working-directory: elastos
         env:
@@ -332,13 +307,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
-          # Registry/index cache only. The capsule build artifacts (about
-          # 2.3 GB) are not cached: this job finishes well inside the
-          # source-home critical path, and the develop caches that set wall
-          # time must fit the 10 GB repository cap.
+          # Registry/index cache only; sccache owns compilation reuse.
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
