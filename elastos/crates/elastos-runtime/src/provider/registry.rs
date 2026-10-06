@@ -1486,10 +1486,7 @@ impl ProviderRegistry {
             || observation.capacity_bytes == 0
             || observation.available_bytes > observation.capacity_bytes
             || observation.required_bytes != required_bytes
-            || observation
-                .available_bytes
-                .checked_sub(required_bytes)
-                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
+            || required_bytes > observation.available_bytes
         {
             return Err(private_ipfs_unavailable());
         }
@@ -3368,7 +3365,9 @@ mod tests {
             provider.requests.lock().await.as_slice(),
             &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
         );
-        assert!(registry.check_local_ipfs_capacity(11).await.is_err());
+        // The work only has to fit the available bytes: exactly 110 fits, 111 does not.
+        assert!(registry.check_local_ipfs_capacity(110).await.is_ok());
+        assert!(registry.check_local_ipfs_capacity(111).await.is_err());
         let valid = serde_json::json!({"status":"ok","data":{
             "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
         }});
@@ -3380,7 +3379,7 @@ mod tests {
             ("volume_id", serde_json::json!(0)),
             ("volume_id", serde_json::json!("private-repo-path")),
             ("capacity_bytes", serde_json::json!(0)),
-            ("capacity_bytes", serde_json::json!(1001)),
+            ("capacity_bytes", serde_json::json!(109)),
             ("available_bytes", serde_json::json!(1001)),
             ("available_bytes", serde_json::json!(9)),
             ("required_bytes", serde_json::json!(11)),

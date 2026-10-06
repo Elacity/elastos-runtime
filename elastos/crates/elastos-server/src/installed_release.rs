@@ -107,7 +107,7 @@ pub(crate) fn load_or_migrate_for_update(
             repair_version,
         )?,
     };
-    crate::install_transaction::require_controller_disk_reserve(
+    crate::install_transaction::require_controller_update_space(
         data,
         (admitted.head.len() + admitted.release.len()) as u64,
     )?;

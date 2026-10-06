@@ -521,7 +521,7 @@ pub fn enter_browser_home() -> Result<()> {
     };
     let controller = directory.join("runtime");
     if !prepare_controller(&directory, &binary, &expected, |path, needed| {
-        crate::install_transaction::require_controller_disk_reserve(path, needed)
+        crate::install_transaction::require_controller_update_space(path, needed)
     })? {
         eprintln!("Home will open. Free disk space before updating.");
         return Ok(());
@@ -1397,7 +1397,7 @@ fn controller_file_digest(path: &Path) -> Result<Option<String>> {
 
 fn controller_space_error(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<crate::install_transaction::DiskReserveError>()
+        .downcast_ref::<crate::install_transaction::UpdateSpaceError>()
         .is_some()
         || error
             .downcast_ref::<std::io::Error>()
@@ -1409,7 +1409,7 @@ fn prepare_controller(
     directory: &Path,
     binary: &Path,
     expected: &str,
-    reserve: impl FnOnce(&Path, u64) -> Result<()>,
+    require_space: impl FnOnce(&Path, u64) -> Result<()>,
 ) -> Result<bool> {
     crate::install_transaction::refuse_pending_home_start(directory.parent().unwrap(), binary)?;
     let controller = directory.join("runtime");
@@ -1437,7 +1437,7 @@ fn prepare_controller(
         // Also repairs a crash after current signed bytes replaced an older receipt's bytes.
         return Ok(true);
     }
-    let result = reserve(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
+    let result = require_space(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
         .and_then(|()| copy_controller(binary, &controller, expected));
     match result {
         Ok(()) => Ok(true),
@@ -1613,7 +1613,7 @@ fn copy_controller(binary: &Path, controller: &Path, expected: &str) -> Result<(
             if count == 0 {
                 break;
             }
-            crate::install_transaction::require_controller_disk_reserve(
+            crate::install_transaction::require_controller_update_space(
                 controller.parent().unwrap(),
                 count as u64,
             )?;

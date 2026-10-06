@@ -203,8 +203,8 @@ class PlatformInputTest(unittest.TestCase):
 
     def test_support_reuse_refuses_nested_origin_and_low_disk(self):
         args = self.reuse_fixture()
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
-                self.assertRaisesRegex(ValueError, "15% free"):
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
+                self.assertRaisesRegex(ValueError, "needs free space for its copy"):
             inputs.copy_support(args)
         self.assertEqual(list(args.root.iterdir()), [])
         inputs.copy_support(args)
@@ -1237,12 +1237,12 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.assertFalse(fixture.output.exists())
         self.assertEqual((fixture.stage / "components.json").read_bytes(), admitted)
 
-    def test_unsigned_stage_refuses_15_percent_floor_before_any_copy(self):
+    def test_unsigned_stage_refuses_copy_that_does_not_fit_before_any_copy(self):
         output = self.root / "low-disk-stage"
         platform = "aarch64-darwin"
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=14_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk stage copied")):
-            with self.assertRaisesRegex(ValueError, "15%"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 inputs.stage_inputs([f"{platform}={self.bundles[platform]}"], "0.7.1", output,
                                     preview_platform=platform)
         self.assertFalse(output.exists())
@@ -1382,9 +1382,9 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
         fixture = self.signing_fixture()
         with self.assertRaisesRegex(ValueError, "preview requires canary"):
             self.prepare_signing_fixture(fixture, channel="stable")
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk input copied")):
-            with self.assertRaisesRegex(ValueError, "15 percent"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 self.prepare_signing_fixture(fixture)
         self.assertFalse(fixture.output.exists())
         self.assertFalse(list(self.root.glob(".signing-input-*")))

@@ -723,15 +723,14 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
         disk_budget(
             needed,
             disk_block_count(stats.f_bavail).saturating_mul(block_size),
-            disk_block_count(stats.f_blocks).saturating_mul(block_size),
         )
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
 }
 
-fn disk_budget(needed: u64, available: u64, total: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available.saturating_sub(total / 10), "Browser image preparation needs {needed} bytes while keeping 10% free space; free disk space and retry (previous set preserved)");
+fn disk_budget(needed: u64, available: u64) -> anyhow::Result<()> {
+    ensure!(needed <= available, "Browser image preparation needs {needed} bytes but only {available} bytes are free; free disk space and retry (previous set preserved)");
     Ok(())
 }
 
@@ -1175,8 +1174,8 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 199, 1000).is_err());
-        assert!(disk_budget(100, 200, 1000).is_ok());
+        assert!(disk_budget(100, 99).is_err());
+        assert!(disk_budget(100, 100).is_ok());
     }
 
     #[test]

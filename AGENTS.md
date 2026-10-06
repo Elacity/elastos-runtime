@@ -190,9 +190,6 @@ them creates a cleanup obligation; "temporary" is not a lifecycle.
   condition, and must be removed when that gate closes. Do not recursively copy
   a live data root without an explicit size estimate and exclusion list for
   existing backups, VM images, caches, identity state, and user data.
-- Maintain at least 10% free space on development and staging volumes. If free
-  space falls below that threshold, stop creating worktrees, builds, VM images,
-  and backups until the ledger is reconciled and safe reclaim has completed.
 - Before handoff, rerun the branch/worktree inventory, check every touched
   worktree for dirt, report local/remote divergence, and update the local
   ledger. Do not describe a cleanup as complete while an unexplained ref,
