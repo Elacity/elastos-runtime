@@ -1478,6 +1478,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "chat-room",
         "assistant",
         "model-provider"
       ]
@@ -1603,6 +1604,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "chat-room",
         "assistant",
         "model-provider",
         "llama-server"
@@ -1652,6 +1654,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "chat-room",
         "assistant",
         "cloudflared"
       ]

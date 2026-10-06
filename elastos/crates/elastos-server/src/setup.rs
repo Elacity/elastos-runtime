@@ -4588,6 +4588,16 @@ pub(crate) mod tests {
             .any(|component| component == "archive-manager"));
         let selected = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
         assert!(selected.iter().any(|name| name == "model-provider"));
+        // Home lists only installed capsules; each Home profile installs its apps.
+        for profile_name in ["home", "agent-local-ai", "public-gateway", "demo", "full"] {
+            let selected = resolve_components(&manifest, Some(profile_name), &[], &[]).unwrap();
+            for app in ["chat-room", "people", "inbox"] {
+                assert!(
+                    selected.iter().any(|name| name == app),
+                    "{profile_name} must install {app}"
+                );
+            }
+        }
         assert!(
             !selected.iter().any(|name| name == "llama-server"
                 || manifest
