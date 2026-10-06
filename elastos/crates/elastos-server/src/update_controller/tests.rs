@@ -2626,7 +2626,12 @@ async fn initial_home_readiness_has_a_finite_budget_beyond_the_restart_limit() {
     for restarting in [false, true] {
         let started = tokio::time::Instant::now();
         let message = {
-            let proof = controller.wait_ready(&generation, "0.7.0", &binary_hash, restarting);
+            let proof = controller.wait_ready(
+                &generation,
+                "0.7.0",
+                &binary_hash,
+                readiness_budget(restarting),
+            );
             tokio::pin!(proof);
             if !restarting {
                 tokio::select! {
@@ -2841,16 +2846,6 @@ async fn real_controller_restart_failure(failure: &str) {
     };
     fixture.publish_installed_release_with_components(&components(b"old support"));
     publish_retained_receipt(&fixture);
-    // The fixture listens on a private ephemeral port, away from the operator's Home.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    assert_ne!(port, BROWSER_HOME_PORT);
-    fixture.file(
-        &fixture.data.join("readiness-port"),
-        port.to_string().as_bytes(),
-        0o600,
-    );
-    drop(listener);
 
     let interpreter = fixture.data.join("candidate-interpreter");
     let candidate = if failure == "loader" {
@@ -2914,7 +2909,7 @@ async fn real_controller_restart_failure(failure: &str) {
             host_ready: false,
             carrier: None,
             carrier_close: None,
-            test_readiness: Some((Duration::from_secs(3), port)),
+            test_readiness: Some(Duration::from_secs(3)),
         },
         starts: Vec::new(),
         stops: 0,
@@ -3115,14 +3110,11 @@ async fn restart_home_fixture() {
             .write_all(b"start\n")
             .unwrap();
     }
-    let port: u16 = fs::read_to_string(data.join("readiness-port"))
-        .unwrap()
-        .parse()
-        .unwrap();
+    // A private ephemeral port, away from the operator's Home, reported to the controller.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     assert_ne!(port, BROWSER_HOME_PORT);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .unwrap();
+    write_private(&data.join("readiness-port"), &port).unwrap();
     let coords_path = crate::runtime_control::gateway_runtime_coord_path(&data);
     write_private(&coords_path, &json!({
         "api_url":format!("http://127.0.0.1:{port}"), "home_url":format!("http://127.0.0.1:{port}/home/"),
