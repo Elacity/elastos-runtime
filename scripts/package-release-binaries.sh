@@ -27,25 +27,33 @@ STAGE="${STAGE_ROOT}/${PACKAGE}"
 mkdir -p "${STAGE}"
 trap 'rm -rf "${STAGE_ROOT}"' EXIT
 
-# Top-level executables of the elastos workspace and of every own-workspace
-# capsule (providers, home-cli, ...). Skip cargo bookkeeping files and
-# libraries; -maxdepth 1 keeps deps/ and build/ intermediates out.
+# Select binary targets from the elastos workspace and each own-workspace
+# capsule. A shared target also contains standalone tools outside this set.
 collect() {
-    local dir="$1"
-    [ -d "${dir}" ] || return 0
-    find "${dir}" -maxdepth 1 -type f -perm -u+x \
-        ! -name '*.d' ! -name '*.rlib' ! -name '*.so' ! -name '*.dylib' \
-        -exec cp {} "${STAGE}/" \;
+    local workspace="$1" names name binary
+    names="$(cargo metadata --locked --offline --no-deps --format-version 1 \
+        --manifest-path "${workspace}/Cargo.toml" | python3 -c '
+import json, sys
+metadata = json.load(sys.stdin)
+for package in metadata["packages"]:
+    if package["id"] in metadata["workspace_members"]:
+        for target in package["targets"]:
+            if "bin" in target["kind"]:
+                print(target["name"])
+')"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        binary="${CARGO_TARGET_DIR:-${workspace}/target}/release/${name}"
+        if [ -f "$binary" ] && [ -x "$binary" ]; then
+            cp "$binary" "${STAGE}/"
+        fi
+    done <<< "$names"
 }
 
-if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-    collect "${CARGO_TARGET_DIR}/release"
-else
-    collect "${ROOT}/elastos/target/release"
-    for lock in "${ROOT}"/capsules/*/Cargo.lock; do
-        collect "$(dirname "${lock}")/target/release"
-    done
-fi
+collect "${ROOT}/elastos"
+for lock in "${ROOT}"/capsules/*/Cargo.lock; do
+    collect "$(dirname "${lock}")"
+done
 
 if [ -z "$(ls -A "${STAGE}")" ]; then
     echo "No release binaries found; run cargo build --workspace --release first." >&2

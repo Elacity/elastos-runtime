@@ -130,7 +130,7 @@ CASES = [
     ("workflow_dispatch", "refs/heads/main", "branch", "a" * 40, False, False),
     ("workflow_dispatch", "refs/tags/v0.7.1", "tag", "main", False, False),
 ]
-# These branch pushes and merge-queue builds may write shared caches.
+# Only these branch pushes may write shared caches.
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.engine-cache.outputs.cache-hit": "false"}
 
@@ -199,16 +199,27 @@ def validate_journey_builds(source, release_source):
         environment = re.search(r"(?ms)^    env:\n(.*?)(?=^    \S|\Z)", block)
         if environment is None:
             raise AssertionError(f"missing job build environment in {job}")
-        for key, value in {**overrides,
-                           "CARGO_TARGET_DIR": "${{ runner.temp }}/" + job + "-target",
+        for key, value in {"CARGO_TARGET_DIR": "${{ runner.temp }}/" + job + "-target",
                            "CARGO_BUILD_BUILD_DIR": "${{ runner.temp }}/" + job + "-build"}.items():
             if field(environment[1], key).strip('"') != value or block.count(key + ":") != 1:
                 raise AssertionError(f"one shared job build setting required: {job} {key}")
         job_steps = steps(job, jobs(source))
+        profile, = [step for step in job_steps if step.startswith("name: use CI journey release profile\n")]
+        for key, value in overrides.items():
+            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in profile or block.count(key) != 1:
+                raise AssertionError(f"missing journey profile setting: {job} {key}")
+        for event, ref, ref_type, override, _, _ in CASES:
+            context = {"github.event_name": event, "github.ref": ref,
+                       "github.ref_type": ref_type, "inputs.ref": override}
+            expected = event in ("pull_request", "merge_group") or (event == "push" and ref == "refs/heads/develop")
+            if evaluate(field(profile, "if"), context) != expected:
+                raise AssertionError(f"journey profile changes shipped build: {job} {event} {ref}")
         cache, = [step for step in job_steps if "Swatinem/rust-cache@" in step]
         if field(cache, "cache-targets") != "false" or "cache-directories:" in cache or "source-home-registry" not in cache:
             raise AssertionError(f"source journey cache contains build artifacts: {job}")
         fresh, = [step for step in job_steps if 'test ! -e "$directory"' in step]
+        if re.search(r"(?m)^        if:", fresh):
+            raise AssertionError(f"freshness check must run on every event: {job}")
         for token in ('"$CARGO_TARGET_DIR"', '"$CARGO_BUILD_BUILD_DIR"', 'test ! -L "$directory"'):
             if token not in fresh:
                 raise AssertionError(f"fresh job artifacts required: {job}")
@@ -358,7 +369,7 @@ class ReleasePolicyTests(unittest.TestCase):
                            "github.ref_type": ref_type, "inputs.ref": override}
                 context["env.CI_SAVE_CACHE"] = str(evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)).lower()
                 mode = evaluate(expression, context)
-                expected = "READ_WRITE" if event == "merge_group" or (event == "push" and ref in SAVING_REFS) else "READ_ONLY"
+                expected = "READ_WRITE" if event == "push" and ref in SAVING_REFS else "READ_ONLY"
                 self.assertEqual(mode, expected, f"cache mode on {event} {ref}")
                 _, _, exported, _ = run_compile_cache_fixture(source, mode)
                 self.assertEqual(exported.get("SCCACHE_GHA_RW_MODE"), expected)
@@ -403,9 +414,15 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_journey_build_policy_rejects_profile_leaks_and_split_targets(self):
         release = (WORKFLOW.parent / "release-package.yml").read_text()
         mutations = (
-            SOURCE.replace('CARGO_PROFILE_RELEASE_LTO: "false"', 'CARGO_PROFILE_RELEASE_LTO: "true"', 1),
-            SOURCE.replace('CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"', 1),
+            SOURCE.replace('CARGO_PROFILE_RELEASE_LTO=false', 'CARGO_PROFILE_RELEASE_LTO=true', 1),
+            SOURCE.replace('CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1', 1),
             SOURCE.replace('source-home-linux-target', 'separate-target', 1),
+            SOURCE.replace("if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')",
+                           "if: github.event_name == 'push'", 1),
+            SOURCE.replace('name: require fresh Linux build artifacts\n',
+                           'name: require fresh Linux build artifacts\n        if: false\n', 1),
+            SOURCE.replace('name: require fresh Mac build intermediates\n',
+                           'name: require fresh Mac build intermediates\n        if: false\n', 1),
             SOURCE.replace('test ! -L "$directory"', 'true', 1),
             SOURCE.replace('journey artifacts start fresh.\n          cache-targets: false',
                            'journey artifacts start fresh.\n          cache-targets: true', 1),
@@ -443,18 +460,42 @@ class ReleasePolicyTests(unittest.TestCase):
                 script = root / "scripts/package-release-binaries.sh"
                 script.parent.mkdir()
                 script.write_bytes((WORKFLOW.parents[2] / "scripts/package-release-binaries.sh").read_bytes())
+                shims = root / "shims"
+                shims.mkdir()
+                cargo = shims / "cargo"
+                cargo.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''\
+                    import json, pathlib, sys
+                    assert sys.argv[1:6] == ['metadata', '--locked', '--offline', '--no-deps', '--format-version']
+                    manifest = pathlib.Path(sys.argv[sys.argv.index('--manifest-path') + 1])
+                    name = 'elastos' if manifest.parent.name == 'elastos' else 'custody-provider'
+                    print(json.dumps({'workspace_members': ['member'], 'packages': [
+                        {'id': 'member', 'targets': [{'name': name, 'kind': ['bin']},
+                                                    {'name': 'unused.rlib', 'kind': ['lib']}]},
+                        {'id': 'dependency', 'targets': [{'name': 'dependency-tool', 'kind': ['bin']}]}]}))
+                    '''))
+                cargo.chmod(0o755)
+                capsule = root / 'capsules/custody-provider'
+                capsule.mkdir(parents=True)
+                (capsule / 'Cargo.lock').touch()
                 target = root / "shared"
                 env = dict(os.environ)
                 env["COPYFILE_DISABLE"] = "1"
+                env["PATH"] = str(shims) + os.pathsep + env["PATH"]
                 env.pop("CARGO_TARGET_DIR", None)
                 if shared:
                     env["CARGO_TARGET_DIR"] = str(target)
                 outputs = target / "release" if shared else root / "elastos/target/release"
                 outputs.mkdir(parents=True)
-                for name in ("elastos", "custody-provider", "unused.rlib"):
+                for name in ("elastos", "unused.rlib", "dependency-tool", "browser-local-exit",
+                             "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge"):
                     path = outputs / name
                     path.write_bytes(name.encode())
                     path.chmod(0o755)
+                capsule_outputs = outputs if shared else capsule / "target/release"
+                capsule_outputs.mkdir(parents=True, exist_ok=True)
+                provider = capsule_outputs / "custody-provider"
+                provider.write_bytes(b"custody-provider")
+                provider.chmod(0o755)
                 if shared:
                     stale = root / "elastos/target/release/stale"
                     stale.parent.mkdir(parents=True)
@@ -537,7 +578,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(evaluate(field(JOBS["release"], "if"), context), publish)
                 context["env.CI_USE_CACHE"] = str(use_cache).lower()
                 save = evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)
-                self.assertEqual(save, event == "merge_group" or (event == "push" and ref in SAVING_REFS))
+                self.assertEqual(save, event == "push" and ref in SAVING_REFS)
                 context["env.CI_SAVE_CACHE"] = str(save).lower()
                 context.update(NO_CACHE_HIT)
                 for should_run in (True, False):
@@ -645,6 +686,11 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("prepare-ci-disk", mac_steps[capacity])
         self.assertEqual(build + 1, generate)
         self.assertIn("build-ci-hop", mac_steps[build])
+        self.assertIn("assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'", mac_steps[build])
+        self.assertIn("'initially_absent': True", mac_steps[build])
+        self.assertIn("assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'", mac_steps[build])
+        self.assertIn("assert target == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-target'", mac_steps[build])
+        self.assertIn("'target_directory': str(target)", mac_steps[build])
         self.assertIn('--runtime "$CARGO_TARGET_DIR/release/elastos"', mac_steps[build])
         setup = mac_steps[names.index("name: source-home into isolated MAC_TEST_HOME")]
         self.assertIn('echo "ELASTOS_RELEASE_VERSION=$ELASTOS_RELEASE_VERSION" >> "$GITHUB_ENV"', setup)

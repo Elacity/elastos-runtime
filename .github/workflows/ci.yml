@@ -30,9 +30,9 @@ env:
   CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
-  # Merge-queue builds and develop/main pushes warm shared caches. PR runs
-  # read them so trusted builds own cache writes within the 10 GB repo cap.
-  CI_SAVE_CACHE: ${{ github.event_name == 'merge_group' || (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')) }}
+  # Develop/main pushes warm shared caches. PR and merge-queue runs read
+  # them so reusable branch refs own cache writes within the 10 GB repo cap.
+  CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -484,11 +484,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: [source-gate, engine-llama-arm64]
-    # Journey builds keep the shipped profiles except for LTO/codegen units.
-    # release-package.yml builds the shipped binaries with their full profiles.
     env:
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-linux-target
       CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-linux-build
     strategy:
@@ -501,6 +497,12 @@ jobs:
           - os: ubuntu-22.04-arm
             check_name: ubuntu-24.04-arm
     steps:
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
@@ -617,14 +619,16 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 90
     needs: source-gate
-    # Journey builds keep the shipped profiles except for LTO/codegen units.
-    # release-package.yml builds the shipped binaries with their full profiles.
     env:
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_TARGET_DIR: ${{ runner.temp }}/source-home-macos-target
       CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/source-home-macos-build
     steps:
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
