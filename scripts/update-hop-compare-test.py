@@ -1711,6 +1711,22 @@ class CliFixtureTests(unittest.TestCase):
             observer.cli_initial_home(manager, self.manifest, home)
         manager.spawn.assert_not_called()
 
+    def test_published_home_needs_its_own_disk_reserve_before_it_starts(self):
+        # The published release starts Home without its update controller below 15% free;
+        # the journey refuses plainly instead of waiting for a controller that never comes.
+        home, _, _, _, _, _, _ = self.initial_home_fixture()
+        manifest = {**self.manifest, "previous": {}}
+        binary = (home / ".local/bin/elastos").stat().st_size
+        for free, refused in ((150 * 1024**2, True), (150 * 1024**2 + binary, False)):
+            with self.subTest(free=free):
+                manager = SimpleNamespace(roots={}, spawn=unittest.mock.Mock(side_effect=RuntimeError("spawned")))
+                with patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=1000 * 1024**2, free=free)), \
+                     patch.object(observer, "cli_port_released"), \
+                     self.assertRaisesRegex(Exception, "below the published release's 15% reserve" if refused else "spawned"):
+                    observer.cli_initial_home(manager, manifest, home)
+                self.assertEqual(manager.spawn.called, not refused)
+        self.assertEqual(observer.cli_published_reserve(1001), 151)
+
     def test_initial_home_failure_paths_stop_owner_and_retain_refusals(self):
         home, directory, _, status, identities, _, _ = self.initial_home_fixture()
         coords_path = directory / "gateway-runtime-coords.json"

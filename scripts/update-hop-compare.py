@@ -1064,7 +1064,11 @@ def cli_prepare_ci_disk():
         need(proc.returncode == 0, "allowlisted hosted tool reclaim failed")
         return int(size.split()[0]) * 1024
 
-    receipt = cli_reclaim_xcode(applications, protected, 20 * 1024**3,
+    # The pinned published release (0.8.0-alpha.6) still keeps 15% of the volume free: below
+    # it, its Home starts without the update controller ("Free disk space before updating")
+    # and the journey cannot run. Drop this when the pin moves to a fixed-reserve release.
+    growth = 20 * 1024**3 + cli_published_reserve(shutil.disk_usage(checkout).total)
+    receipt = cli_reclaim_xcode(applications, protected, growth,
                                 lambda: shutil.disk_usage(checkout), remove)
     receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
     try:
@@ -1522,6 +1526,12 @@ CLI_PREVIOUS_PIN = Path(__file__).with_name("update-hop-previous-release.json")
 CLI_PREVIOUS_ORIGIN = "https://elastos.elacitylabs.com"
 # The Home profile the journey installs, plus custody, which a release lists outside it (#238).
 CLI_PREVIOUS_COMPONENTS = (*CLI_SETUP_COMPONENTS, "custody-provider")
+
+
+def cli_published_reserve(total):
+    """Bytes the pinned published release keeps free before it creates its update controller:
+    15% of the volume (install_transaction.rs RESERVE_PERCENT at its source commit)."""
+    return -(-total * 15 // 100)
 
 
 def cli_next_version(version):
@@ -2711,6 +2721,11 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
          and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700, "initial Home opener differs")
     env["PATH"] = str(opener.parent) + ":" + env["PATH"]
     processes.roots[str(opener)] = {binding["sha256"]}
+    if "previous" in manifest:
+        disk = shutil.disk_usage(directory)
+        need(disk.free >= cli_published_reserve(disk.total) + (home_path / ".local/bin/elastos").stat().st_size,
+             "runner free disk " + str(disk.free) + " of " + str(disk.total) + " is below the published release's 15% "
+             "reserve, so its Home would start without the update controller")
     process, proof, failure, cleanup_failure, exit_code, identities = None, None, None, None, None, []
     evidence = {} if evidence is None else evidence
     binary = home_path / ".local/bin/elastos"
