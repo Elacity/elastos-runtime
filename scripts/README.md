@@ -131,7 +131,6 @@ when their manifests change. An untracked, unignored workspace lock path stops
 the gate before resolution creates source dirt. The gate logs each resolved
 lock's SHA-256 with its candidate receipt. Cold caches can fetch dependencies
 during metadata resolution; the following package clean uses `--locked --offline`.
-The source and shared-build volumes each need at least 15% free space for this gate.
 
 If the cause of your last failed Mac install, update, or Home startup step is
 unclear, reproduce that exact step locally before the next push. Hold the same

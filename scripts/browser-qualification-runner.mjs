@@ -90,7 +90,6 @@ export async function liveCandidate(plan, frozen) {
 }
 export function diskAvailable(path) {
   const s = statfsSync(path, { bigint: true });
-  requireEvidence(s.blocks > 0n && s.bavail * 10n >= s.blocks, "disk_below_ten_percent");
   requireEvidence(s.bavail * s.bsize >= BigInt(MAX_EVIDENCE), "evidence_disk_bound");
 }
 export function controlStatus(socketPath) {

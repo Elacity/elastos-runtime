@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -23,10 +22,6 @@ PRIVATE_BUILD_DIR = False
 
 
 def run(args, cwd, capture=False, lease=None):
-    if lease and args[0] == "cargo":
-        disk_reserve(cwd)
-        build = Path(os.environ["CARGO_BUILD_BUILD_DIR"])
-        disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
     print("+ " + shlex.join(str(arg) for arg in args), flush=True)
     environment = os.environ.copy()
     if args[0] == "cargo":
@@ -131,12 +126,6 @@ def current_develop(root, commit):
         raise GateError("merge current origin/develop before checking and pushing; the hook keeps HEAD fixed")
     print("base-rule=disjoint-clean-merge base=" + base, flush=True)
     return develop
-
-
-def disk_reserve(path):
-    disk = shutil.disk_usage(path)
-    if disk.free * 100 < disk.total * 15:
-        raise GateError("restore the 15% disk reserve before local Cargo checks")
 
 
 def acquire_lease(common, candidate):
@@ -567,8 +556,6 @@ def main():
     PRIVATE_BUILD_DIR = build_dir != shared and build_dir.is_relative_to(root.resolve())
     print("build-dir={} clean={}".format(build_dir, "skip-private" if PRIVATE_BUILD_DIR else "shared"),
           flush=True)
-    disk_reserve(root)
-    disk_reserve(next(path for path in (build_dir, *build_dir.parents) if path.exists()))
     with acquire_lease(common, candidate) as lease:
         paths = paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", develop + "...HEAD")
         gates(root, paths, lease)

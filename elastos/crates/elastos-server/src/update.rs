@@ -481,7 +481,7 @@ async fn verify_candidate_before_migration(
         .binary_path()
         .parent()
         .context("installed Runtime parent missing")?;
-    crate::install_transaction::require_controller_disk_reserve(
+    crate::install_transaction::require_controller_update_space(
         parent,
         bytes.len() as u64 + 64 * 1024,
     )?;

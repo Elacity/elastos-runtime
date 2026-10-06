@@ -65,10 +65,12 @@ class CiCapacityTests(unittest.TestCase):
             path.rmdir()
         def measure():
             return SimpleNamespace(total=1000, free=100 + 100 * len(removed))
-        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100, measure, remove)
+        # Reclaim stops as soon as the planned growth fits the free bytes.
+        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 300, measure, remove)
         self.assertEqual(removed, ["Xcode_15.0.1.app", "Xcode_15.1.app"])
+        self.assertEqual(receipt["status"], "ready")
         self.assertEqual(receipt["free_bytes_after"], 300)
-        self.assertEqual(receipt["planned_growth_bytes"], 100)
+        self.assertEqual(receipt["planned_growth_bytes"], 300)
         self.assertTrue(self.active.is_dir() and self.override.is_dir())
         self.assertTrue((self.apps / "Xcode_15.2.app").exists())
 
@@ -81,7 +83,7 @@ class CiCapacityTests(unittest.TestCase):
         def remove(path):
             removed.append(path.name)
             path.rmdir()
-        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 100,
+        receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 101,
                                              lambda: SimpleNamespace(total=1000, free=100), remove)
         self.assertEqual(receipt["status"], "unavailable")
         self.assertEqual(receipt["free_bytes_before"], 100)
@@ -123,7 +125,7 @@ class CiCapacityTests(unittest.TestCase):
 
     def receipt(self):
         return {"status": "unavailable", "retained": [self.active.name, self.override.name], "removed": [],
-                "free_bytes_before": 100, "free_bytes_after": 100, "total_bytes": 1000, "planned_growth_bytes": 100}
+                "free_bytes_before": 100, "free_bytes_after": 100, "total_bytes": 1000, "planned_growth_bytes": 101}
 
     def test_android_reclaim_uses_exact_sdk_and_preserves_apple_tools_and_siblings(self):
         runner_home, sdk = self.android()
@@ -2041,7 +2043,7 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual((destination / "elastos-old").read_bytes(), original)
         self.assertFalse((destination / "elastos-new").exists())
 
-    def test_hop_builder_low_reserve_refuses_before_commands_or_mutation(self):
+    def test_hop_builder_low_space_refuses_before_commands_or_mutation(self):
         runtime = self.root / "built-runtime"
         original = b"retained old Runtime bytes"
         runtime.write_bytes(original)
@@ -2049,10 +2051,10 @@ class CliFixtureTests(unittest.TestCase):
         paths = set(self.root.iterdir())
         destination = self.root / "build-inputs"
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
-             patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=18 * 1024**3)), \
+             patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=4 * 1024**3 - 1)), \
              patch.object(observer.subprocess, "check_output") as git, patch.object(observer.CliProcesses, "command") as command, \
              patch.object(observer.CliProcesses, "cleanup") as cleanup, patch.object(observer.shutil, "copyfile") as copy, \
-             patch.object(observer.Path, "mkdir") as mkdir, self.assertRaisesRegex(ValueError, "hop rebuild would breach the disk reserve"):
+             patch.object(observer.Path, "mkdir") as mkdir, self.assertRaisesRegex(ValueError, "hop rebuild needs more free disk space"):
             observer.cli_build_hop(destination, runtime)
         for action in (git, command, cleanup, copy, mkdir):
             action.assert_not_called()

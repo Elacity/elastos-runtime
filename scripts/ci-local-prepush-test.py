@@ -992,13 +992,6 @@ class PrepushTests(unittest.TestCase):
                                 input=self.push_line(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_disk_reserve_refuses_before_builds(self):
-        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 86, 14)):
-            with self.assertRaisesRegex(GATE.GateError, "15% disk reserve"):
-                GATE.disk_reserve(self.root)
-        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 85, 15)):
-            GATE.disk_reserve(self.root)
-
     def test_interrupt_settles_owned_cargo_and_releases_lease(self):
         child_file = self.tmp / "child.pid"
         process = subprocess.Popen([str(SCRIPT)], cwd=self.root,
@@ -1123,11 +1116,6 @@ class PrepushTests(unittest.TestCase):
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=7)
-
-
-def shutil_usage(total, used, free):
-    from collections import namedtuple
-    return namedtuple("Usage", "total used free")(total, used, free)
 
 
 if __name__ == "__main__":
