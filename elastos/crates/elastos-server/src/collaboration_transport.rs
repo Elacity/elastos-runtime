@@ -68,40 +68,61 @@ impl CollaborationTransportDriver {
         &self,
         now: u64,
     ) -> anyhow::Result<CollaborationIncomingOnceOutcome> {
-        let batch = self.network.peek().await?;
-        let mut summary = CollaborationIncomingOnceSummary {
-            carrier_rejected_frames: batch.rejected_frames(),
-            ..CollaborationIncomingOnceSummary::default()
-        };
+        let mut summary = CollaborationIncomingOnceSummary::default();
 
+        // Frames this Home refused under a per-sender limit come first. Their
+        // senders may never resend them, so this Home owns the retry.
+        let mut held = self.core.take_held_frames(now).into_iter();
+        while let Some(frame) = held.next() {
+            if !self.ingest_frame(frame.frame(), now, &mut summary).await {
+                self.core
+                    .restore_held_frames(std::iter::once(frame).chain(held).collect());
+                return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
+            }
+        }
+
+        let batch = self.network.peek().await?;
+        summary.carrier_rejected_frames = batch.rejected_frames();
         for envelope in batch.envelopes() {
-            match self.core.ingest_transport_frame(envelope, now) {
-                Err(_) => {
-                    return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
-                }
-                Ok(CollaborationTransportIngestion::Rejected(_)) => {
-                    summary.deterministic_rejections += 1;
-                }
-                Ok(CollaborationTransportIngestion::RemoteAcceptance(_)) => {
-                    summary.remote_acceptances += 1;
-                }
-                Ok(CollaborationTransportIngestion::Incoming(accepted)) => {
-                    summary.incoming_acceptances += 1;
-                    match self.network.send(accepted.acceptance_receipt_bytes()).await {
-                        Ok(CollaborationCarrierSendOutcome::RemoteBroadcast { .. }) => {
-                            summary.acceptance_receipt_broadcasts += 1;
-                        }
-                        Ok(CollaborationCarrierSendOutcome::LocalOnlyBuffered) | Err(_) => {
-                            return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
-                        }
-                    }
-                }
+            if !self.ingest_frame(envelope, now, &mut summary).await {
+                return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
             }
         }
 
         match self.network.ack(&batch).await {
             Ok(()) => Ok(CollaborationIncomingOnceOutcome::Acknowledged(summary)),
             Err(_) => Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary)),
+        }
+    }
+
+    /// Ingests one frame and sends its receipt. Returns false when the cycle
+    /// must stop and retry this frame later.
+    async fn ingest_frame(
+        &self,
+        frame: &[u8],
+        now: u64,
+        summary: &mut CollaborationIncomingOnceSummary,
+    ) -> bool {
+        match self.core.ingest_transport_frame(frame, now) {
+            Err(_) => false,
+            Ok(CollaborationTransportIngestion::Rejected(_)) => {
+                summary.deterministic_rejections += 1;
+                true
+            }
+            Ok(CollaborationTransportIngestion::RemoteAcceptance(_)) => {
+                summary.remote_acceptances += 1;
+                true
+            }
+            Ok(CollaborationTransportIngestion::Incoming(accepted)) => {
+                summary.incoming_acceptances += 1;
+                match self.network.send(accepted.acceptance_receipt_bytes()).await {
+                    Ok(CollaborationCarrierSendOutcome::RemoteBroadcast { .. }) => {
+                        summary.acceptance_receipt_broadcasts += 1;
+                        true
+                    }
+                    Ok(CollaborationCarrierSendOutcome::LocalOnlyBuffered) | Err(_) => false,
+                }
+            }
         }
     }
 }
@@ -700,6 +721,211 @@ mod tests {
         let ops = request_ops(&carrier);
         assert_eq!(ops.iter().filter(|op| *op == "gossip_ack").count(), 1);
         assert!(!ops.iter().any(|op| op == "gossip_recv"));
+    }
+
+    fn project_pending(core: &CollaborationCore) {
+        for handoff in core.pending_product_handoffs().unwrap() {
+            core.acknowledge_product_handoff(
+                handoff.authorized_message().message().envelope_sha256(),
+            )
+            .unwrap();
+        }
+    }
+
+    fn pending_contains(core: &CollaborationCore, envelope: &[u8]) -> bool {
+        let hash = collaboration_message_envelope_sha256(envelope);
+        core.pending_product_handoffs()
+            .unwrap()
+            .iter()
+            .any(|handoff| handoff.authorized_message().message().envelope_sha256() == hash)
+    }
+
+    fn summary(rejected: usize, accepted: usize) -> CollaborationIncomingOnceOutcome {
+        CollaborationIncomingOnceOutcome::Acknowledged(CollaborationIncomingOnceSummary {
+            deterministic_rejections: rejected,
+            incoming_acceptances: accepted,
+            acceptance_receipt_broadcasts: accepted,
+            ..CollaborationIncomingOnceSummary::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn held_message_lands_without_the_sender_resending_it() {
+        let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (sender, _) = generate_keypair();
+        // A delayed worker sees nine honest messages in one batch.
+        let envelopes: Vec<Vec<u8>> = (0..=backlog)
+            .map(|index| remote_message(&fixture, sender.clone(), &format!("m{index}")).1)
+            .collect();
+        let frames = envelopes
+            .iter()
+            .map(|envelope| frame(&transport_frame(&sender, envelope)))
+            .collect::<Vec<_>>();
+        let carrier = FakeCarrier::new();
+        let driver = fixture.driver(core.clone(), carrier.clone()).await;
+        let mut replies = vec![peek(0, frames.len() as u64, frames)];
+        replies.extend((0..backlog).map(|_| send_remote()));
+        replies.push(ack(0, envelopes.len() as u64, true));
+        // Another Home accepted the last message, so its sender never resends
+        // it: the next batch is empty.
+        replies.extend([send_remote(), peek(9, 9, Vec::new()), ack(9, 9, false)]);
+        carrier.push(replies);
+
+        assert_eq!(
+            driver.process_incoming_once(NOW).await.unwrap(),
+            summary(1, backlog)
+        );
+        assert!(!pending_contains(&core, envelopes.last().unwrap()));
+        project_pending(&core);
+        assert_eq!(
+            driver.process_incoming_once(NOW + 5).await.unwrap(),
+            summary(0, 1)
+        );
+        assert!(pending_contains(&core, envelopes.last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn honest_message_keeps_its_place_when_flooders_fill_the_held_queue() {
+        let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let fixture = Fixture::new();
+        let held_bound = 16;
+        let core = Arc::new(
+            Arc::into_inner(fixture.core())
+                .unwrap()
+                .with_held_frame_bound_for_test(held_bound),
+        );
+        // Two flooding Profiles fill their backlogs and the Home's held queue
+        // (10 + 6 frames). Chat never drains them.
+        let mut flood = Vec::new();
+        for (flooder, extra) in [("a", 10), ("b", 6)] {
+            let (key, _) = generate_keypair();
+            for index in 0..backlog + extra {
+                let (_, envelope) =
+                    remote_message(&fixture, key.clone(), &format!("flood {flooder}/{index}"));
+                flood.push(frame(&transport_frame(&key, &envelope)));
+            }
+        }
+        let (honest, _) = generate_keypair();
+        let honest_envelopes: Vec<Vec<u8>> = (0..=backlog)
+            .map(|index| remote_message(&fixture, honest.clone(), &format!("honest {index}")).1)
+            .collect();
+        let honest_frames: Vec<_> = honest_envelopes
+            .iter()
+            .map(|envelope| frame(&transport_frame(&honest, envelope)))
+            .collect();
+
+        let carrier = FakeCarrier::new();
+        let driver = fixture.driver(core.clone(), carrier.clone()).await;
+        let flood_end = flood.len() as u64;
+        let honest_end = flood_end + honest_frames.len() as u64;
+        carrier.push([peek(0, flood_end, flood)]);
+        carrier.push((0..2 * backlog).map(|_| send_remote()));
+        carrier.push([ack(0, flood_end, true)]);
+        carrier.push([peek(flood_end, honest_end, honest_frames)]);
+        carrier.push((0..backlog).map(|_| send_remote()));
+        carrier.push([ack(flood_end, honest_end, true)]);
+        // The sender never resends the ninth message.
+        carrier.push([
+            send_remote(),
+            peek(honest_end, honest_end, Vec::new()),
+            ack(honest_end, honest_end, false),
+        ]);
+
+        assert_eq!(
+            driver.process_incoming_once(NOW).await.unwrap(),
+            summary(held_bound, 2 * backlog)
+        );
+        let held = core.take_held_frames(NOW);
+        assert_eq!(held.len(), held_bound);
+        core.restore_held_frames(held);
+        // The ninth honest message takes a slot from the largest holder.
+        assert_eq!(
+            driver.process_incoming_once(NOW).await.unwrap(),
+            summary(held_bound + 1, backlog)
+        );
+
+        // Chat shows the honest messages only; the flooders' stay waiting.
+        let honest_hashes: Vec<String> = honest_envelopes
+            .iter()
+            .map(|envelope| collaboration_message_envelope_sha256(envelope))
+            .collect();
+        for handoff in core.pending_product_handoffs().unwrap() {
+            let hash = handoff.authorized_message().message().envelope_sha256();
+            if honest_hashes.iter().any(|honest| honest == hash) {
+                core.acknowledge_product_handoff(hash).unwrap();
+            }
+        }
+        assert_eq!(
+            driver.process_incoming_once(NOW + 5).await.unwrap(),
+            summary(held_bound - 1, 1)
+        );
+        assert!(pending_contains(&core, honest_envelopes.last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn flooding_sender_is_held_back_without_holding_back_other_senders() {
+        use crate::collaboration_rate_limit::{
+            COMMUNITY_RATE_WINDOW_SECS, COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
+        };
+        let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (flooder, _) = generate_keypair();
+        let flood: Vec<Vec<u8>> = (0..=COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW)
+            .map(|index| {
+                let (_, envelope) =
+                    remote_message(&fixture, flooder.clone(), &format!("flood {index}"));
+                transport_frame(&flooder, &envelope)
+            })
+            .collect();
+        let (other_key, _) = generate_keypair();
+        let (_, other) = remote_message(&fixture, other_key.clone(), "other");
+
+        // One batch, no Chat projection between frames, as in production.
+        let carrier = FakeCarrier::new();
+        let driver = fixture.driver(core.clone(), carrier.clone()).await;
+        let mut frames: Vec<_> = flood.iter().map(|bytes| frame(bytes)).collect();
+        frames.push(frame(&transport_frame(&other_key, &other)));
+        let end = frames.len() as u64;
+        let mut replies = vec![peek(0, end, frames)];
+        replies.extend((0..=backlog).map(|_| send_remote()));
+        replies.push(ack(0, end, true));
+        // Next cycle: the held frames fit up to the receive limit.
+        let within_limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW - backlog;
+        replies.extend((0..within_limit).map(|_| send_remote()));
+        replies.extend([peek(end, end, Vec::new()), ack(end, end, false)]);
+        // Once the window slides, the last one lands.
+        replies.extend([
+            send_remote(),
+            peek(end, end, Vec::new()),
+            ack(end, end, false),
+        ]);
+        carrier.push(replies);
+
+        let held = flood.len() - backlog;
+        assert_eq!(
+            driver.process_incoming_once(NOW).await.unwrap(),
+            summary(held, backlog + 1)
+        );
+        assert!(pending_contains(&core, &other));
+        project_pending(&core);
+        assert_eq!(
+            driver.process_incoming_once(NOW + 1).await.unwrap(),
+            summary(held - within_limit, within_limit)
+        );
+        project_pending(&core);
+        assert_eq!(
+            driver
+                .process_incoming_once(NOW + COMMUNITY_RATE_WINDOW_SECS)
+                .await
+                .unwrap(),
+            summary(0, 1)
+        );
+        assert!(core
+            .take_held_frames(NOW + COMMUNITY_RATE_WINDOW_SECS)
+            .is_empty());
     }
 
     #[tokio::test]

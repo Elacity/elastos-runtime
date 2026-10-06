@@ -1799,6 +1799,16 @@ fn upload_offset_from_headers(headers: &HeaderMap) -> anyhow::Result<u64> {
 }
 
 pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
+    if let Some(limited) =
+        err.downcast_ref::<crate::collaboration_rate_limit::CommunitySendRateLimited>()
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", limited.retry_after_secs.to_string())],
+            limited.to_string(),
+        )
+            .into_response();
+    }
     let profile_required = gateway_home_system::profile_required_message(&err);
     let text = profile_required
         .map(str::to_string)
