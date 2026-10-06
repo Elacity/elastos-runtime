@@ -11,7 +11,7 @@
   ],
   "patched_files": {
     "setup.cfg": "c89b97fd2389dd478554c45c698c030b6aed6a8ecc92257b27ee53653a1e3a5e",
-    "src/selkies_gstreamer/gstwebrtc_app.py": "3f17ebaa8f01215788247696f25f8348cc846088f44b5f0d6e063bde3aeafc94"
+    "src/selkies_gstreamer/gstwebrtc_app.py": "18bb6c7285365fb7fabd5d778341b45226a9254f4d31c06cb565ebdc39d00e6c"
   },
   "files": {
     "upstream/LICENSE": {
@@ -191,7 +191,7 @@
       "origin": "ElastOS build patch"
     },
     "patches/elastos-media.patch": {
-      "sha256": "c9eceda61bc50e4b17c797721fb11e92af4ba69b87050a53bfdddbac2e334032",
+      "sha256": "ee47149a1dead5b5e8046babe7d6cec0f58ff704c01d8881d61ee961963f5c4b",
       "origin": "ElastOS build patch"
     },
     "licenses/Vuetify-MIT.txt": {
@@ -203,11 +203,6 @@
       "sha256": "17fb24bc303763f3fe1911ee24e5225c7ad59f0e3a5d8123e9b730c100a306a6",
       "upstream_url": "https://raw.githubusercontent.com/vuejs/vue/v2.7.16/LICENSE",
       "origin": "Unmodified upstream license/notice text fetched by the operator on 2026-10-05"
-    },
-    "licenses/Apache-2.0.txt": {
-      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
-      "origin": "Standard license text; original notices remain in upstream source and font name tables",
-      "upstream_url": "http://www.apache.org/licenses/LICENSE-2.0"
     },
     "licenses/Vue-spinner-MIT.txt": {
       "sha256": "3c189d6839788748a90d94c39466d18759001f045d0522db2f0df2c4f30cb8d1",
@@ -292,8 +287,8 @@
       "webrtc_input.py": "3b035597e03408d432cab51c68fa6124205bea5504d862de7e236e5e17695d66",
       "webrtc_signalling.py": "fd47be9c4619716680afaf05290f85eb0e186caffa5c2dc1e6355578f9f2f7c4"
     },
-    "gstwebrtc_app": "The media patch reproduces the current rootfs builder byte for byte. The recovered file additionally contains the existing optional audio-queue diagnostic. Applying scripts/build/browser-audio-queue-diagnostic.py to the prepared file reproduces all recovered bytes (+195/-9 against upstream). The builder intentionally keeps that optional diagnostic separate.",
-    "diagnostic_source_sha256": "a26fd4613573719bb20b2d082484a9e0ef8dc3c0b7ba36559c439b76812e97c8",
+    "gstwebrtc_app": "The prepared media differs from the pre-vendoring rootfs builder only by the Elacity modification notice near the license header. The recovered file additionally contains the optional audio-queue diagnostic. Applying scripts/build/browser-audio-queue-diagnostic.py to the prepared file reproduces the historical recovered bytes with that same notice inserted. Historical recovery SHA-256 identities remain unchanged; the builder keeps the optional diagnostic separate.",
+    "diagnostic_source_sha256": "de72c566f61d4355f532b0d9782cda3d8492dda787fce5fde5d1a551c4baf438",
     "web_summary": "22 of 27 files match pinned upstream bytes; index.html and sw.js have only upstream release cache substitutions; app.js has that substitution and older upstream TURN path spelling; webrtc.js has an older upstream typo; 50x.html is from the nginx base image. No recovered web difference requires an ElastOS patch. The 26 vendored web files are unmodified at the pinned commit, including already-minified upstream libraries.",
     "web_files": [
       {
@@ -444,7 +439,8 @@
     "package_identity_patch": "Replicates upstream release packaging name/version substitution for selkies 1.6.1. Uses the recovered python-xlib requirement instead of the old fork URL. Dependencies install separately; the local Selkies wheel uses --no-index --no-deps --no-build-isolation.",
     "web_cache": "Replicates upstream install.sh cache substitutions with the full source commit instead of a wall-clock timestamp. This changes the PWA cache identity deterministically.",
     "guest_source": "/usr/share/doc/selkies/source retains pristine upstream source, licenses, patches and this manifest.",
-    "checksum_scope": "files contains SHA-256 for every vendored source, patch and license file. This provenance.json is the review-controlled manifest and is excluded from its own file list."
+    "checksum_scope": "files contains SHA-256 for every vendored source, patch and license file. This provenance.json is the review-controlled manifest and is excluded from its own file list.",
+    "modification_notice": "#\n# Modified by Elacity for ElastOS: enforce ICE policy and adapt split audio/video pipelines."
   },
   "licenses": [
     {
@@ -494,8 +490,8 @@
     {
       "component": "Incorporated Google source and six Roboto fonts",
       "license": "Apache-2.0",
-      "text": "licenses/Apache-2.0.txt",
-      "upstream_url": "http://www.apache.org/licenses/LICENSE-2.0",
+      "text": "licenses/Material-Icons-Apache-2.0.txt",
+      "upstream_url": "https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE",
       "notice_source": "Original source headers and each Roboto font name table; see fonts for exact fields."
     },
     {
@@ -658,7 +654,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmEU9vAw.ttf": {
@@ -681,7 +677,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmSU5vAw.ttf": {
@@ -704,7 +700,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmWUlvAw.ttf": {
@@ -727,7 +723,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/KFOlCnqEu92Fr1MmYUtvAw.ttf": {
@@ -750,7 +746,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/KFOmCnqEu92Fr1Me5Q.ttf": {
@@ -773,7 +769,7 @@
         ]
       },
       "license": "Apache-2.0",
-      "license_text": "licenses/Apache-2.0.txt",
+      "license_text": "licenses/Material-Icons-Apache-2.0.txt",
       "license_basis": "font name ID 14 states the Apache-2.0 URL"
     },
     "upstream/addons/gst-web/src/css/font/flUhRq6tzZclQEJ-Vdg-IuiaDsNZ.ttf": {
@@ -853,5 +849,10 @@
       ]
     }
   },
-  "license_provenance_limits": "The SDP and vue-spinner runtime license texts are snapshots of upstream default branches, with SHA-256 identities. Their version ranges come from operator-recorded package.json evidence at the parent version tags. Ranges do not identify the exact resolved dependency versions in the minified bundles; version fields remain null. The shipped minified bytes remain pinned to the Selkies source commit and file SHA-256 records."
+  "license_provenance_limits": "The SDP and vue-spinner runtime license texts are snapshots of upstream default branches, with SHA-256 identities. Their version ranges come from operator-recorded package.json evidence at the parent version tags. Ranges do not identify the exact resolved dependency versions in the minified bundles; version fields remain null. The shipped minified bytes remain pinned to the Selkies source commit and file SHA-256 records.",
+  "diagnostic_results": {
+    "audio_queue_sha256": "8dfe87c499cc890e03f7c963cbff8fa65bd6ed0e1d9f425e94fcd459d6f38689",
+    "webrtc_send_sha256": "38dcdf03ed7f558ecc552ac227605b920a4ca30a798f7d81b2f8b4c5b81cfd53",
+    "webrtc_send_diagnostic_source_sha256": "ba4d38566e1a52745bb79890be6e6019bf2c833d1737931abbac7fd73877adbf"
+  }
 }

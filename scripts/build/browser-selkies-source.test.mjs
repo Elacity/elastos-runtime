@@ -43,7 +43,8 @@ test('offline provenance check and patches pass; prepared media bytes match the 
     const result = run(root, out);
     assert.equal(result.status, 0, result.stderr);
     const media = readFileSync(join(out, 'src/selkies_gstreamer/gstwebrtc_app.py'));
-    assert.equal(digest(media), '3f17ebaa8f01215788247696f25f8348cc846088f44b5f0d6e063bde3aeafc94');
+    assert.match(media.toString(), /# Modified by Elacity for ElastOS: enforce ICE policy and adapt split audio\/video pipelines\./);
+    assert.equal(digest(media), '18bb6c7285365fb7fabd5d778341b45226a9254f4d31c06cb565ebdc39d00e6c');
     const manifest = JSON.parse(readFileSync(join(root, 'provenance.json')));
     const web = readFileSync(join(out, 'gst-web/index.html'), 'utf8');
     assert.ok(web.includes(`?ts=${manifest.upstream_commit}`));

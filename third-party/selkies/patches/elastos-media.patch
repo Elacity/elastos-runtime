@@ -1,6 +1,15 @@
 --- a/src/selkies_gstreamer/gstwebrtc_app.py
 +++ b/src/selkies_gstreamer/gstwebrtc_app.py
-@@ -84,6 +84,7 @@
+@@ -18,6 +18,8 @@
+ #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ #   See the License for the specific language governing permissions and
+ #   limitations under the License.
++#
++# Modified by Elacity for ElastOS: enforce ICE policy and adapt split audio/video pipelines.
+ 
+ import asyncio
+ import base64
+@@ -84,6 +86,7 @@
          self.webrtcbin = None
          self.data_channel = None
          self.rtpgccbwe = None
@@ -8,7 +17,7 @@
          self.congestion_control = congestion_control
          self.encoder = encoder
          self.gpu_id = gpu_id
-@@ -166,6 +167,16 @@
+@@ -166,6 +169,16 @@
  
          # Set default jitterbuffer latency to the minimum possible
          self.webrtcbin.set_property("latency", 0)
@@ -25,7 +34,7 @@
  
          # Connect signal handlers
          if self.congestion_control and not audio_only:
-@@ -190,6 +201,9 @@
+@@ -190,6 +203,9 @@
                      self.webrtcbin.set_property("turn-server", turn_server)
                  else:
                      self.webrtcbin.emit("add-turn-server", turn_server)
@@ -35,7 +44,7 @@
  
          # Add element to the pipeline.
          self.pipeline.add(self.webrtcbin)
-@@ -1005,7 +1019,8 @@
+@@ -1005,7 +1021,8 @@
          """
  
          # Create element for receiving audio from pulseaudio.
@@ -45,7 +54,7 @@
  
          # Let the audio source provide the global clock.
          # This is important when trying to keep the audio and video
-@@ -1032,7 +1047,7 @@
+@@ -1032,7 +1049,7 @@
  
          # Encode the raw PulseAudio stream to the Opus format which is
          # the default packetized streaming format for the web
@@ -54,7 +63,7 @@
  
          # Low-latency and high-quality configurations
          opusenc.set_property("audio-type", "restricted-lowdelay")
-@@ -1050,19 +1065,20 @@
+@@ -1050,19 +1067,20 @@
          # Set audio bitrate
          # This can be dynamically changed using set_audio_bitrate()
          opusenc.set_property("bitrate", self.audio_bitrate)
@@ -80,7 +89,7 @@
  
          # Make the queue leaky in the downstream direction, drop packets if the queue is behind.
          rtpopuspay_queue.set_property("leaky", "downstream")
-@@ -1104,6 +1120,8 @@
+@@ -1104,6 +1122,8 @@
          pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
  
          for pipeline_element in pipeline_elements:
@@ -89,7 +98,7 @@
              self.pipeline.add(pipeline_element)
  
          # Link the pipeline elements and raise exception of linking fails
-@@ -1345,7 +1363,9 @@
+@@ -1345,7 +1365,9 @@
                  self.rtpgccbwe.set_property("min-bitrate", max(100000 + fec_bitrate, int(self.video_bitrate * 1000 * 0.1 + fec_bitrate)))
                  self.rtpgccbwe.set_property("max-bitrate", int(self.video_bitrate * 1000 + fec_bitrate))
                  self.rtpgccbwe.set_property("estimated-bitrate", int(self.video_bitrate * 1000 + fec_bitrate))
@@ -100,7 +109,7 @@
              element.set_property("bitrate", bitrate)
  
              logger.info("audio bitrate set to: %d" % bitrate)
-@@ -1648,7 +1668,7 @@
+@@ -1648,7 +1670,7 @@
              mlineindex {integer} -- ice candidate mlineindex
              candidate {string} -- ice candidate string
          """
@@ -109,7 +118,7 @@
          loop = asyncio.new_event_loop()
          loop.run_until_complete(self.on_ice(mlineindex, candidate))
  
-@@ -1711,6 +1731,9 @@
+@@ -1711,6 +1733,9 @@
                  'on-message-string', lambda _, msg: self.on_data_message(msg))
  
          logger.info("{} pipeline started".format("audio" if audio_only else "video"))
