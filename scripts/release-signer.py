@@ -51,6 +51,9 @@ BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MAX_JSON = 2 * 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 CHANNELS = {"stable", "canary", "jetson-test"}
+# Manifest pins that name one release file by the raw CID of its exact bytes.
+PINNED_RELEASE_FILES = (("model_catalog", "model-catalog.json", "model catalog"),
+                        ("collaboration_network", "collaboration-network-release-v1.json", "Community network"))
 STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID", "IPNS_NAME"}
 
 
@@ -552,14 +555,16 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
                     for child in value:
                         component_refs(child)
             component_refs(component)
-            catalog = component.get("model_catalog")
-            if catalog is not None:
-                require(type(catalog) is dict and type(catalog.get("head_cid")) is str, "model catalog pin refused")
-                record = records.get("model-catalog.json")
-                require(type(record) is dict, "model catalog snapshot required")
-                catalog_bytes = regular_bytes(snapshot_root / "model-catalog.json", MAX_JSON)
-                require(catalog["head_cid"] == raw_cid(catalog_bytes), "model catalog head differs from snapshot")
-                admit_ref(record["cid"], record["sha256"], record["size"], "model-catalog.json")
+            for field, name, subject in PINNED_RELEASE_FILES:
+                pin = component.get(field)
+                if pin is None:
+                    continue
+                require(type(pin) is dict and type(pin.get("head_cid")) is str, f"{subject} pin refused")
+                record = records.get(name)
+                require(type(record) is dict, f"{subject} snapshot required")
+                require(pin["head_cid"] == raw_cid(regular_bytes(snapshot_root / name, MAX_JSON)),
+                        f"{subject} head differs from snapshot")
+                admit_ref(record["cid"], record["sha256"], record["size"], name)
     require(advertised == approved_refs, "unbound artifact in approved snapshot")
     head = manifest["head"]
     require(type(head) is dict and set(head) == {"updated_at", "prev_head_cid"}

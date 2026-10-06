@@ -25,6 +25,9 @@ import tempfile
 SCRIPT_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = SCRIPT_ROOT.parent
 SCHEMA = "elastos.release-platform-input/v1"
+RELEASE_NETWORK_FILE = "collaboration-network-release-v1.json"
+# Publication imports a pinned raw block up to this size.
+MAX_RELEASE_NETWORK_BYTES = 2 * 1024 * 1024
 PLATFORMS = {
     "x86_64-linux": ("linux-amd64", "x86_64-unknown-linux-musl", 62),
     "aarch64-linux": ("linux-arm64", "aarch64-unknown-linux-musl", 183),
@@ -80,6 +83,25 @@ def admit_model_catalog_artifact(manifest, artifact_root, referenced):
     if actual != pin["head_cid"]:
         raise ValueError(f"model-catalog.json head {actual} does not match pin {pin['head_cid']}")
     referenced.add("model-catalog.json")
+
+
+def admit_collaboration_network_artifact(manifest, template, artifact_root, referenced):
+    """Admit the release copy of the source-pinned Community network."""
+    pin = manifest.get("collaboration_network")
+    if pin != template.get("collaboration_network"):
+        raise ValueError("prepared collaboration_network pin differs from source template")
+    if pin is None:
+        return
+    if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
+        raise ValueError("collaboration_network.head_cid is required")
+    with regular_file(artifact_root, RELEASE_NETWORK_FILE).open("rb") as network:
+        data = network.read(MAX_RELEASE_NETWORK_BYTES + 1)
+    if len(data) > MAX_RELEASE_NETWORK_BYTES:
+        raise ValueError("Community network artifact exceeds its publication bound")
+    actual = catalog_head_cid(data)
+    if actual != pin["head_cid"]:
+        raise ValueError(f"{RELEASE_NETWORK_FILE} head {actual} does not match pin {pin['head_cid']}")
+    referenced.add(RELEASE_NETWORK_FILE)
 
 
 def file_record(path):
@@ -498,6 +520,7 @@ def check_contents(root, platform, omissions):
     actual = {str(path.relative_to(root / "artifacts"))
               for path in (root / "artifacts").rglob("*") if not path.is_dir() or path.is_symlink()}
     admit_model_catalog_artifact(manifest, root / "artifacts", referenced)
+    admit_collaboration_network_artifact(manifest, template, root / "artifacts", referenced)
     if actual != referenced:
         raise ValueError(f"artifact inventory mismatch: {sorted(actual ^ referenced)}")
     return manifest, template
@@ -909,9 +932,9 @@ def merged_input_components(values, receipts):
         if actual != expected:
             raise ValueError(f"input manifest changed after admission: {platform}")
         manifest = json.loads(manifest_bytes)
-        contract = {"model_catalog": manifest.get("model_catalog")}
+        contract = {name: manifest.get(name) for name in ("model_catalog", "collaboration_network")}
         if model_contract is not None and contract != model_contract:
-            raise ValueError("platform model catalogue pins differ")
+            raise ValueError("platform model catalogue or Community network pins differ")
         model_contract = contract
         for name, value in contract.items():
             if value is None:

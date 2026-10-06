@@ -98,6 +98,16 @@ fixes the exact configuration, network and signer set. Setup then checks the
 configuration with the same validator Runtime startup uses. Runtime startup
 itself still reads only `collaboration-network-v1.json`.
 
+The release delivers that file the same way it delivers `model-catalog.json`.
+Release staging and the custodian signer bind it to the pin, and release
+publication admits it only when its bytes match the pin and pass the startup
+validator. Installed setup fetches it by name from the trusted source over
+Carrier. Update fetches it by its pinned CID with the Runtime and
+`components.json`, before the new Runtime replaces the old one, and installs it
+as the last update step; a refusal restores the previous release files. A Home
+that stays isolated fetches nothing. An offline update hop refuses a changed
+pin, like other support changes.
+
 Setup and update apply the release network to the data root:
 
 - A new Home receives `collaboration-network-v1.json` from the release copy

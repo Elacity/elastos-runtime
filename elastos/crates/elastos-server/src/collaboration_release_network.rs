@@ -128,51 +128,117 @@ pub fn verify_release_network_bytes(
     Ok(())
 }
 
-/// Installs or advances the release network in `data_dir`.
+/// What a Home needs from the release network before any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseNetworkPlan<'a> {
+    /// The Home keeps its collaboration state and needs no release bytes.
+    Skip(ReleaseNetworkOutcome),
+    /// The Home needs the pinned release configuration.
+    Install(&'a CollaborationNetworkPin),
+}
+
+/// Decides whether this Home takes the release network.
+pub fn plan_release_network<'a>(
+    data_dir: &Path,
+    pin: Option<&'a CollaborationNetworkPin>,
+) -> ReleaseNetworkPlan<'a> {
+    let Some(pin) = pin else {
+        return ReleaseNetworkPlan::Skip(ReleaseNetworkOutcome::NotPinned);
+    };
+    if std::env::var_os(SOURCE_HOME_COLLABORATION_MODE_ENV).is_some() {
+        return ReleaseNetworkPlan::Skip(ReleaseNetworkOutcome::SourceHomeManaged);
+    }
+    if is_isolated(data_dir) {
+        return ReleaseNetworkPlan::Skip(ReleaseNetworkOutcome::Isolated);
+    }
+    ReleaseNetworkPlan::Install(pin)
+}
+
+/// Fetches and verifies the release configuration this Home needs.
 ///
-/// `release_copy` is the verified release file beside `components.json`.
+/// Signed setup and update call this with their other release downloads,
+/// before they write anything. A Home that needs no release bytes fetches
+/// nothing.
+pub async fn fetch_release_network<F, Fut>(
+    data_dir: &Path,
+    pin: Option<&CollaborationNetworkPin>,
+    fetch: F,
+) -> anyhow::Result<Option<Vec<u8>>>
+where
+    F: FnOnce(&CollaborationNetworkPin) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let ReleaseNetworkPlan::Install(pin) = plan_release_network(data_dir, pin) else {
+        return Ok(None);
+    };
+    let bytes = fetch(pin)
+        .await
+        .context("could not fetch the release collaboration network configuration")?;
+    verify_release_network_bytes(pin, &bytes)?;
+    tracing::debug!(
+        network_id = %pin.expected_network_id,
+        bytes = bytes.len(),
+        "verified release collaboration network"
+    );
+    Ok(Some(bytes))
+}
+
+/// Installs or advances the release network from bytes fetched earlier by
+/// [`fetch_release_network`].
+pub fn install_fetched_release_network(
+    data_dir: &Path,
+    pin: Option<&CollaborationNetworkPin>,
+    fetched: Option<&[u8]>,
+) -> anyhow::Result<ReleaseNetworkOutcome> {
+    match plan_release_network(data_dir, pin) {
+        ReleaseNetworkPlan::Skip(outcome) => Ok(outcome),
+        ReleaseNetworkPlan::Install(pin) => {
+            let release = fetched.context(
+                "the release pins a collaboration network but its configuration was not fetched",
+            )?;
+            apply_release_network(data_dir, pin, release)
+        }
+    }
+}
+
+/// Installs or advances the release network from the release copy beside a
+/// local `components.json`.
 pub fn install_release_network(
     data_dir: &Path,
     pin: Option<&CollaborationNetworkPin>,
     release_copy: &Path,
 ) -> anyhow::Result<ReleaseNetworkOutcome> {
-    let Some(pin) = pin else {
-        return Ok(ReleaseNetworkOutcome::NotPinned);
+    let fetched = match plan_release_network(data_dir, pin) {
+        ReleaseNetworkPlan::Install(_) => Some(fs::read(release_copy).with_context(|| {
+            format!(
+                "the release pins a collaboration network but {} is missing; use the complete signed release, or run `elastos setup --isolated` to keep this Home out of Community",
+                release_copy.display()
+            )
+        })?),
+        ReleaseNetworkPlan::Skip(_) => None,
     };
-    if std::env::var_os(SOURCE_HOME_COLLABORATION_MODE_ENV).is_some() {
-        return Ok(ReleaseNetworkOutcome::SourceHomeManaged);
-    }
-    install_release_network_unmanaged(data_dir, pin, release_copy)
+    install_fetched_release_network(data_dir, pin, fetched.as_deref())
 }
 
-fn install_release_network_unmanaged(
+fn apply_release_network(
     data_dir: &Path,
     pin: &CollaborationNetworkPin,
-    release_copy: &Path,
+    release: &[u8],
 ) -> anyhow::Result<ReleaseNetworkOutcome> {
-    if is_isolated(data_dir) {
-        return Ok(ReleaseNetworkOutcome::Isolated);
-    }
-    let release = fs::read(release_copy).with_context(|| {
-        format!(
-            "the release pins a collaboration network but {} is missing",
-            release_copy.display()
-        )
-    })?;
-    verify_release_network_bytes(pin, &release)?;
+    verify_release_network_bytes(pin, release)?;
     let network_id = pin.expected_network_id.clone();
     let dest = data_dir.join(COLLABORATION_STARTUP_CONFIG_FILE);
     if fs::symlink_metadata(&dest).is_err() {
         fs::create_dir_all(data_dir)?;
-        create_owner_only_file(&dest, &release, "collaboration network configuration")?;
+        create_owner_only_file(&dest, release, "collaboration network configuration")?;
         return Ok(ReleaseNetworkOutcome::Joined { network_id });
     }
     let existing = read_collaboration_startup_config_candidate(&dest)?;
     if existing == release {
         return Ok(ReleaseNetworkOutcome::Unchanged { network_id });
     }
-    if release_extends_existing(&existing, &release)? {
-        replace_owner_only_file(data_dir, &dest, &release)?;
+    if release_extends_existing(&existing, release)? {
+        replace_owner_only_file(data_dir, &dest, release)?;
         return Ok(ReleaseNetworkOutcome::Advanced { network_id });
     }
     Ok(ReleaseNetworkOutcome::KeptExisting)
@@ -322,7 +388,7 @@ pub(crate) mod tests {
         let data = private_data_dir();
         let pin = pin_for(&chain[0]);
 
-        let outcome = install_release_network_unmanaged(data.path(), &pin, &release_path).unwrap();
+        let outcome = install_release_network(data.path(), Some(&pin), &release_path).unwrap();
 
         assert_eq!(
             outcome,
@@ -345,7 +411,7 @@ pub(crate) mod tests {
             .unwrap()
             .contains("elastos setup --isolated"));
         assert_eq!(
-            install_release_network_unmanaged(data.path(), &pin, &release_path).unwrap(),
+            install_release_network(data.path(), Some(&pin), &release_path).unwrap(),
             ReleaseNetworkOutcome::Unchanged {
                 network_id: pin.expected_network_id
             },
@@ -361,8 +427,7 @@ pub(crate) mod tests {
         choose_isolated(data.path()).unwrap();
 
         let outcome =
-            install_release_network_unmanaged(data.path(), &pin_for(&chain[0]), &release_path)
-                .unwrap();
+            install_release_network(data.path(), Some(&pin_for(&chain[0])), &release_path).unwrap();
 
         assert_eq!(outcome, ReleaseNetworkOutcome::Isolated);
         assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
@@ -373,7 +438,7 @@ pub(crate) mod tests {
         let (_signer, chain) = signed_profile_chain_config(1);
         let (_release, release_path) = release_dir_with(&chain[0]);
         let data = private_data_dir();
-        install_release_network_unmanaged(data.path(), &pin_for(&chain[0]), &release_path).unwrap();
+        install_release_network(data.path(), Some(&pin_for(&chain[0])), &release_path).unwrap();
 
         let err = choose_isolated(data.path()).unwrap_err().to_string();
 
@@ -389,7 +454,7 @@ pub(crate) mod tests {
         let mut pin = pin_for(&chain[0]);
         pin.head_cid = crate::setup::catalog_head_cid(b"other").unwrap();
 
-        let err = install_release_network_unmanaged(data.path(), &pin, &release_path)
+        let err = install_release_network(data.path(), Some(&pin), &release_path)
             .unwrap_err()
             .to_string();
 
@@ -420,12 +485,11 @@ pub(crate) mod tests {
         let (_signer, chain) = signed_profile_chain_config(2);
         let data = private_data_dir();
         let (_first, first_path) = release_dir_with(&chain[0]);
-        install_release_network_unmanaged(data.path(), &pin_for(&chain[0]), &first_path).unwrap();
+        install_release_network(data.path(), Some(&pin_for(&chain[0])), &first_path).unwrap();
         let (_second, second_path) = release_dir_with(&chain[1]);
 
         let outcome =
-            install_release_network_unmanaged(data.path(), &pin_for(&chain[1]), &second_path)
-                .unwrap();
+            install_release_network(data.path(), Some(&pin_for(&chain[1])), &second_path).unwrap();
 
         assert!(matches!(outcome, ReleaseNetworkOutcome::Advanced { .. }));
         let dest = data.path().join(COLLABORATION_STARTUP_CONFIG_FILE);
@@ -441,9 +505,9 @@ pub(crate) mod tests {
         create_owner_only_file(&dest, &operator_chain[0], "operator configuration").unwrap();
         let (_release, release_path) = release_dir_with(&release_chain[0]);
 
-        let outcome = install_release_network_unmanaged(
+        let outcome = install_release_network(
             data.path(),
-            &pin_for(&release_chain[0]),
+            Some(&pin_for(&release_chain[0])),
             &release_path,
         )
         .unwrap();
@@ -458,10 +522,73 @@ pub(crate) mod tests {
         let data = private_data_dir();
         let missing = data.path().join(RELEASE_COLLABORATION_NETWORK_FILE);
 
-        let err = install_release_network_unmanaged(data.path(), &pin_for(&chain[0]), &missing)
+        let err = install_release_network(data.path(), Some(&pin_for(&chain[0])), &missing)
             .unwrap_err()
             .to_string();
 
         assert!(err.contains("is missing"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_home_that_needs_no_release_bytes_fetches_nothing() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let pin = pin_for(&chain[0]);
+        let data = private_data_dir();
+        let refuse = |_: &CollaborationNetworkPin| async {
+            anyhow::bail!("this Home fetches no release network")
+        };
+
+        assert_eq!(
+            fetch_release_network(data.path(), None, refuse)
+                .await
+                .unwrap(),
+            None
+        );
+        choose_isolated(data.path()).unwrap();
+        assert_eq!(
+            fetch_release_network(data.path(), Some(&pin), refuse)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            install_fetched_release_network(data.path(), Some(&pin), None).unwrap(),
+            ReleaseNetworkOutcome::Isolated
+        );
+    }
+
+    #[tokio::test]
+    async fn fetched_bytes_must_match_the_pin_before_install() {
+        let (_signer, chain) = signed_profile_chain_config(1);
+        let (_other, other) = signed_profile_chain_config(1);
+        let pin = pin_for(&chain[0]);
+        let data = private_data_dir();
+
+        let fetched = fetch_release_network(data.path(), Some(&pin), |pin| {
+            let head_cid = pin.head_cid.clone();
+            let bytes = chain[0].clone();
+            async move {
+                assert_eq!(head_cid, crate::setup::catalog_head_cid(&bytes).unwrap());
+                Ok(bytes)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fetched.as_deref(), Some(chain[0].as_slice()));
+
+        let err = fetch_release_network(data.path(), Some(&pin), |_| {
+            let bytes = other[0].clone();
+            async move { Ok(bytes) }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match the pinned"), "{err}");
+
+        let err = install_fetched_release_network(data.path(), Some(&pin), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was not fetched"), "{err}");
+        assert!(fs::symlink_metadata(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).is_err());
     }
 }
