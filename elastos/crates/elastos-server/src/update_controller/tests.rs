@@ -3367,3 +3367,218 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         owner.controller.stop_child().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn system_update_fetches_the_pinned_network_before_stop_and_joins_after_activation() {
+    let config_file = crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE;
+    for outcome in [
+        "joined",
+        "tampered",
+        "isolated",
+        "join fails",
+        "candidate fails",
+    ] {
+        let fixture = PrivateFixture::new();
+        fs::create_dir(fixture.data.join("bin")).unwrap();
+        fixture.file(
+            &fixture.data.join("bin/fixture-provider"),
+            b"old support",
+            0o755,
+        );
+        let manifest = |bytes: &[u8]| {
+            json!({
+                "schema":"elastos.components/v1", "profiles":{}, "capsules":{},
+                "external":{"fixture-provider":{"install_path":"bin/fixture-provider", "platforms":{
+                    (crate::setup::detect_platform()): {"cid":raw_cid(bytes), "checksum":format!("sha256:{}", digest(bytes)), "size":bytes.len()}
+                }}}
+            })
+        };
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let network = chain[0].clone();
+        let parsed: Value = serde_json::from_slice(&network).unwrap();
+        let network_cid = crate::setup::catalog_head_cid(&network).unwrap();
+        let mut value = manifest(b"new support");
+        value["collaboration_network"] = json!({
+            "head_cid": network_cid,
+            "expected_network_id": parsed["expected_network_id"],
+            "trusted_profile_signer_dids": parsed["trusted_profile_signer_dids"],
+        });
+        let old_components = serde_json::to_vec(&manifest(b"old support")).unwrap();
+        let components = serde_json::to_vec(&value).unwrap();
+        fixture.publish_installed_release_with_components(&old_components);
+        publish_retained_receipt(&fixture);
+        if outcome == "isolated" {
+            crate::collaboration_release_network::choose_isolated(&fixture.data).unwrap();
+        }
+        if outcome == "join fails" {
+            // Nothing can be joined where a directory holds the config path.
+            fs::create_dir(fixture.data.join(config_file)).unwrap();
+        }
+        let binary = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n".as_slice();
+        let descriptor =
+            |bytes: &[u8]| json!({"cid":raw_cid(bytes),"sha256":digest(bytes),"size":bytes.len()});
+        let release = signed(
+            json!({
+                "schema":"elastos.release/v1","version":"0.7.1","channel":"stable",
+                "platforms":{(crate::update::detect_release_platform()):{"binary":descriptor(binary),"components":descriptor(&components)}}
+            }),
+            "elastos.release.v1",
+        );
+        let head = signed(
+            json!({
+                "schema":"elastos.release.head/v1","version":"0.7.1","channel":"stable",
+                "latest_release_cid":raw_cid(&release),"release_sha256":digest(&release)
+            }),
+            "elastos.release.head.v1",
+        );
+        let (_, mut request, _) = choice_fixture();
+        request.head_cid = raw_cid(&head);
+        request.release_cid = raw_cid(&release);
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = child::OwnedChild::spawn(&mut command).unwrap();
+        let pid = child.pid();
+        let birth = process_start(pid).unwrap();
+        let mut owner = StagingRestartOwner {
+            controller: Controller {
+                receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+                directory: fixture.directory.clone(),
+                child: Some(child),
+                request: Some(request.clone()),
+                previous_binary_sha256: digest(b"signed fixture Runtime"),
+                previous_version: "0.7.0".into(),
+                generation: "a".repeat(32),
+                host_ready: true,
+                carrier: None,
+                carrier_close: None,
+            },
+            host: Some(
+                crate::host_lock::acquire_host_process_lock(&fixture.data, "home", "fixture")
+                    .unwrap(),
+            ),
+            stops: 0,
+            starts: 0,
+            fail_candidate: outcome == "candidate fails",
+            candidate_support: PathBuf::from("bin/fixture-provider"),
+        };
+        owner
+            .controller
+            .publish("staging", "Checking the signed update.")
+            .unwrap();
+        let served_network = if outcome == "tampered" {
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1).1[0].clone()
+        } else {
+            network.clone()
+        };
+        let items = std::collections::BTreeMap::from([
+            (request.head_cid.clone(), head),
+            (request.release_cid.clone(), release),
+            (raw_cid(binary), binary.to_vec()),
+            (raw_cid(&components), components),
+            (raw_cid(b"new support"), b"new support".to_vec()),
+            (network_cid.clone(), served_network),
+        ]);
+        let network_fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = network_fetches.clone();
+        let data = fixture.data.clone();
+        let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+            let bytes = items.get(&cid).cloned();
+            let network_fetch = cid == network_cid;
+            let observed = observed.clone();
+            let birth = birth.clone();
+            let data = data.clone();
+            Box::pin(async move {
+                if network_fetch {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The network comes with the other downloads, while the
+                    // current Home still runs on the current release.
+                    assert!(!child::generation_gone(pid, &birth).unwrap());
+                    assert_eq!(
+                        fs::read(data.join("bin/fixture-provider")).unwrap(),
+                        b"old support"
+                    );
+                }
+                bytes.ok_or_else(|| anyhow::anyhow!("content {cid} is not published"))
+            })
+        });
+        let result = crate::update::run_restarting_update(
+            &fixture.data,
+            &fetch,
+            request.head_cid,
+            &mut owner,
+        )
+        .await;
+        owner.controller.publish_apply_result(&result).unwrap();
+        let status = status(&fixture.data).unwrap().unwrap();
+        let joined_network = || fs::read(fixture.data.join(config_file)).ok();
+        match outcome {
+            "joined" => {
+                result.unwrap();
+                assert_eq!((owner.stops, owner.starts), (1, 1));
+                assert_eq!(status.phase, "updated");
+                assert_eq!(joined_network(), Some(network.clone()));
+                assert_eq!(
+                    fs::metadata(fixture.data.join(config_file))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            "isolated" => {
+                result.unwrap();
+                assert_eq!(network_fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(joined_network(), None);
+            }
+            "tampered" => {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("does not match the pinned"), "{error}");
+                assert_eq!((owner.stops, owner.starts), (0, 0));
+                assert_eq!(status.phase, "failed");
+                assert!(status.message.contains("unchanged"));
+                assert_eq!(joined_network(), None);
+                assert_eq!(
+                    fs::read(&fixture.binary).unwrap(),
+                    b"signed fixture Runtime"
+                );
+            }
+            "join fails" => {
+                assert!(result.is_err());
+                assert_eq!((owner.stops, owner.starts), (2, 1));
+                assert_eq!(status.phase, "restored");
+                assert!(fixture.data.join(config_file).is_dir());
+            }
+            "candidate fails" => {
+                assert!(result.is_err());
+                assert_eq!((owner.stops, owner.starts), (2, 2));
+                assert_eq!(status.phase, "restored");
+                // The previous release comes back; the joined network stays.
+                assert_eq!(joined_network(), Some(network.clone()));
+            }
+            _ => unreachable!(),
+        }
+        if outcome != "tampered" && outcome != "isolated" {
+            assert_eq!(network_fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        if ["join fails", "candidate fails"].contains(&outcome) {
+            assert!(owner.controller.child.is_some(), "previous Home is running");
+            assert_eq!(
+                fs::read(&fixture.binary).unwrap(),
+                b"signed fixture Runtime"
+            );
+            assert_eq!(
+                fs::read(fixture.data.join("components.json")).unwrap(),
+                old_components
+            );
+        }
+        assert!(
+            !InstallTransaction::has_pending_recovery(&fixture.binary),
+            "{outcome}"
+        );
+        assert!(!fixture.data.join(".elastos.update-support").exists());
+        owner.host.take();
+        owner.controller.stop_child().await.unwrap();
+    }
+}

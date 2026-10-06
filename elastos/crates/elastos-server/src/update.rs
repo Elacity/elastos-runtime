@@ -1182,6 +1182,28 @@ async fn fetch_release_network_for_update(
     .await
 }
 
+/// The CLI update and Home's System update join the release-pinned network.
+/// The offline hop without a restart owner admits only an unchanged pin.
+fn joins_release_network(apply_mode: ApplyMode, has_restart_owner: bool) -> bool {
+    apply_mode == ApplyMode::Normal || has_restart_owner
+}
+
+/// Joins or advances the release-pinned Community network from bytes fetched
+/// before Home stopped or the binary changed.
+fn join_release_network(
+    data_dir: &Path,
+    manifest: &crate::setup::ComponentsManifest,
+    fetched: Option<&[u8]>,
+) -> anyhow::Result<crate::collaboration_release_network::ReleaseNetworkOutcome> {
+    let outcome = crate::collaboration_release_network::install_fetched_release_network(
+        data_dir,
+        manifest.collaboration_network.as_ref(),
+        fetched,
+    )?;
+    tracing::info!(?outcome, "release collaboration network applied");
+    Ok(outcome)
+}
+
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -1495,16 +1517,19 @@ async fn run_upgrade_with_restart(
     let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
     crate::setup::admit_release_components(&manifest, &component_platform)?;
 
-    if apply_mode == ApplyMode::Normal {
-        // 9b. Fetch and verify the release-pinned Community network before the
-        // binary changes. The offline hop admits only an unchanged pin.
-        let release_network =
-            fetch_release_network_for_update(data_dir, &manifest, fetch_fn, ordered_gateways)
-                .await?;
-        if release_network.is_some() {
-            println!("  Community network verified (pinned CID ✓)");
-        }
+    // 9b. Fetch and verify the release-pinned Community network while Home
+    // still runs and before the binary changes.
+    let joins_network = joins_release_network(apply_mode, restart_owner.is_some());
+    let release_network = if joins_network {
+        fetch_release_network_for_update(data_dir, &manifest, fetch_fn, ordered_gateways).await?
+    } else {
+        None
+    };
+    if release_network.is_some() {
+        println!("  Community network verified (pinned CID ✓)");
+    }
 
+    if apply_mode == ApplyMode::Normal {
         // 10. Atomic replace binary
         let bin_path = if source.install_path.is_empty() {
             default_install_path()
@@ -1644,11 +1669,7 @@ async fn run_upgrade_with_restart(
 
             // 13. Join or advance the release-pinned Community network last, so
             // an earlier refusal leaves the Home's network unchanged.
-            let outcome = crate::collaboration_release_network::install_fetched_release_network(
-                data_dir,
-                manifest.collaboration_network.as_ref(),
-                release_network.as_deref(),
-            )?;
+            let outcome = join_release_network(data_dir, &manifest, release_network.as_deref())?;
             if let Some(line) = outcome.summary_line() {
                 println!("  {line}");
             }
@@ -1829,19 +1850,30 @@ async fn run_upgrade_with_restart(
             data_dir, "update", "offline",
         )?);
     }
-    let activation = transaction.commit_checked(|| {
-        if support_snapshot(
-            data_dir,
-            &old_components,
-            &comp_data,
-            &component_platform,
-            &transaction.excluded_paths(),
-        )? != support
-        {
-            anyhow::bail!("installed support changed during activation");
-        }
-        Ok(())
-    });
+    let activation = transaction
+        .commit_checked(|| {
+            if support_snapshot(
+                data_dir,
+                &old_components,
+                &comp_data,
+                &component_platform,
+                &transaction.excluded_paths(),
+            )? != support
+            {
+                anyhow::bail!("installed support changed during activation");
+            }
+            Ok(())
+        })
+        .and_then(|()| {
+            // Join after activation while the offline fence holds. A release that
+            // is rolled back later keeps the joined network, as the CLI update
+            // does: Runtime never drops an accepted network.
+            if joins_network {
+                join_release_network(data_dir, &manifest, release_network.as_deref()).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
     if let Some(owner) = restart_owner.as_mut() {
         drop(offline);
         let candidate = match activation {

@@ -102,11 +102,15 @@ The release delivers that file the same way it delivers `model-catalog.json`.
 Release staging and the custodian signer bind it to the pin, and release
 publication admits it only when its bytes match the pin and pass the startup
 validator. Installed setup fetches it by name from the trusted source over
-Carrier. Update fetches it by its pinned CID with the Runtime and
-`components.json`, before the new Runtime replaces the old one, and installs it
-as the last update step; a refusal restores the previous release files. A Home
-that stays isolated fetches nothing. An offline update hop refuses a changed
-pin, like other support changes.
+Carrier. `elastos update` and Home's System update both fetch it by its pinned
+CID with the Runtime and `components.json`, while Home still runs and before the
+new Runtime replaces the old one. `elastos update` installs it as its last
+update step; System update installs it right after activation, before Home
+restarts. A refusal before or during that step restores the previous release
+files. A release rolled back after the network was joined keeps the network,
+because Runtime never drops an accepted network. A Home that stays isolated
+fetches nothing. An offline update hop refuses a changed pin, like other support
+changes.
 
 Setup and update apply the release network to the data root:
 
