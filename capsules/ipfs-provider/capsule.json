@@ -5,10 +5,8 @@
   "description": "IPFS operations via managed Kubo daemon",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "ipfs-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "requires": [
     { "name": "kubo", "kind": "external" }

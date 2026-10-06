@@ -5,10 +5,8 @@
   "description": "Localhost provider - secure access to local machine resources",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "localhost-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "localhost://*",
   "authority": {

@@ -5,10 +5,8 @@
   "description": "Internal Browser Engine Adapter contract for attaching real browser engines to Runtime stream sessions",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "browser-engine-adapter",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "elastos://browser-engine/*",
   "authority": {

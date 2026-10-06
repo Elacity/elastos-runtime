@@ -5,10 +5,8 @@
   "description": "Dynamic WebSpace resolver for localhost://WebSpaces/<moniker>/...",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "webspace-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "localhost://WebSpaces/*",
   "authority": {

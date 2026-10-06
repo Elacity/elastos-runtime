@@ -447,7 +447,7 @@ impl CapsuleManifest {
         if self.window_policy.is_some()
             && (!matches!(self.role, CapsuleRole::App | CapsuleRole::Viewer)
                 || !matches!(
-                    (&self.capsule_type, &self.execution),
+                    (&self.execution_type(), &self.execution),
                     (
                         CapsuleType::WebProjection,
                         Some(CapsuleExecution::WebProjection)
@@ -683,6 +683,37 @@ impl CapsuleManifest {
             || self.bus_contract.as_deref() == Some(ELASTOS_RUNTIME_PROJECTION_V1_CONTRACT)
     }
 
+    /// Actual Runtime boundary, independent of legacy on-wire type labels.
+    /// Keep the original fields unchanged for signatures and older update clients.
+    pub fn execution_type(&self) -> CapsuleType {
+        if self.is_runtime_projection() {
+            return CapsuleType::WebProjection;
+        }
+        if self.role == CapsuleRole::Provider
+            && matches!(self.capsule_type, CapsuleType::Wasm | CapsuleType::MicroVM)
+            && !self.is_component_capsule()
+        {
+            return CapsuleType::NativeProvider;
+        }
+        if self.role == CapsuleRole::Shell
+            && self.name == "shell"
+            && self.capsule_type == CapsuleType::MicroVM
+            && self.entrypoint == "rootfs.ext4"
+        {
+            return CapsuleType::NativeHost;
+        }
+        self.capsule_type.clone()
+    }
+
+    pub fn effective_execution(&self) -> Option<CapsuleExecution> {
+        match self.execution_type() {
+            CapsuleType::WebProjection => Some(CapsuleExecution::WebProjection),
+            CapsuleType::NativeProvider => Some(CapsuleExecution::NativeProvider),
+            CapsuleType::NativeHost => Some(CapsuleExecution::NativeHost),
+            _ => self.execution.clone(),
+        }
+    }
+
     fn validate_interfaces(&self) -> Result<(), String> {
         let mut interface_ids = BTreeSet::new();
         for interface in &self.interfaces {
@@ -769,8 +800,14 @@ impl CapsuleManifest {
             }
         }
         if self.capsule_type == CapsuleType::WebProjection || self.is_runtime_projection() {
-            if self.capsule_type != CapsuleType::WebProjection {
-                return Err("web projection capsules must use type=web-projection".to_string());
+            if !matches!(
+                self.capsule_type,
+                CapsuleType::Wasm | CapsuleType::WebProjection
+            ) {
+                return Err(
+                    "web projection capsules must use type=wasm (legacy) or web-projection"
+                        .to_string(),
+                );
             }
             if !matches!(
                 self.role,
@@ -1568,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn first_party_manifests_state_actual_execution() {
+    fn first_party_manifests_keep_legacy_wire_types_and_report_actual_execution() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let mut checked = 0;
         for directory in [root.join("capsules"), root.join("elastos/capsules")] {
@@ -1584,7 +1621,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
                 if manifest.is_runtime_projection() {
                     assert_eq!(
-                        manifest.capsule_type,
+                        manifest.execution_type(),
                         CapsuleType::WebProjection,
                         "{}",
                         path.display()
@@ -1592,17 +1629,56 @@ mod tests {
                 }
                 if manifest.role == CapsuleRole::Provider {
                     assert_eq!(
-                        manifest.capsule_type,
+                        manifest.execution_type(),
                         CapsuleType::NativeProvider,
                         "{}",
                         path.display()
                     );
-                    assert_eq!(manifest.entrypoint, manifest.name, "{}", path.display());
+                    assert_eq!(
+                        manifest.capsule_type,
+                        CapsuleType::MicroVM,
+                        "{}",
+                        path.display()
+                    );
+                    assert!(manifest.execution.is_none(), "{}", path.display());
+                    assert!(manifest.runtime_abi.is_none(), "{}", path.display());
                 }
                 checked += 1;
             }
         }
         assert!(checked >= 40, "first-party manifest coverage was lost");
+    }
+
+    #[test]
+    fn manifest_accepts_old_and_new_provider_formats() {
+        let old: CapsuleManifest = serde_json::from_str(include_str!(
+            "../../../../capsules/model-provider/capsule.json"
+        ))
+        .unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.capsule_type, CapsuleType::MicroVM);
+        assert_eq!(old.execution_type(), CapsuleType::NativeProvider);
+        let mut new = old.clone();
+        new.capsule_type = CapsuleType::NativeProvider;
+        new.execution = Some(CapsuleExecution::NativeProvider);
+        new.runtime_abi = Some(CapsuleRuntimeAbi::ProviderStdioV1);
+        new.entrypoint = new.name.clone();
+        let new: CapsuleManifest =
+            serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        new.validate().unwrap();
+        assert_eq!(old.execution_type(), new.execution_type());
+        assert_eq!(old.effective_execution(), new.effective_execution());
+    }
+
+    #[test]
+    fn manifest_accepts_old_and_new_projection_types() {
+        let mut manifest: CapsuleManifest =
+            serde_json::from_str(include_str!("../../../../capsules/home/capsule.json")).unwrap();
+        assert_eq!(manifest.capsule_type, CapsuleType::Wasm);
+        manifest.validate().unwrap();
+        assert_eq!(manifest.execution_type(), CapsuleType::WebProjection);
+        manifest.capsule_type = CapsuleType::WebProjection;
+        manifest.validate().unwrap();
     }
 
     #[test]
@@ -1612,7 +1688,6 @@ mod tests {
         ))
         .unwrap();
         for (field, invalid) in [
-            ("type", serde_json::json!("wasm")),
             ("type", serde_json::json!("microvm")),
             ("type", serde_json::json!("native-provider")),
             ("role", serde_json::json!("provider")),
@@ -1673,8 +1748,12 @@ mod tests {
 
     #[test]
     fn native_host_metadata_is_limited_to_existing_shell_helper() {
-        let base: serde_json::Value =
+        let mut base: serde_json::Value =
             serde_json::from_str(include_str!("../../../capsules/shell/capsule.json")).unwrap();
+        base["type"] = serde_json::json!("native-host");
+        base["execution"] = serde_json::json!("native-host");
+        base["runtime_abi"] = serde_json::json!("native-host");
+        base["entrypoint"] = serde_json::json!("shell");
         serde_json::from_value::<CapsuleManifest>(base.clone())
             .unwrap()
             .validate()

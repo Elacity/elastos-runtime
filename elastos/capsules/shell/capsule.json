@@ -5,10 +5,8 @@
   "description": "ElastOS shell - orchestrates capability grants and capsule lifecycle",
   "author": "elastos",
   "role": "shell",
-  "type": "native-host",
-  "runtime_abi": "native-host",
-  "execution": "native-host",
-  "entrypoint": "shell",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "resources": {
     "memory_mb": 64,
     "gpu": false

@@ -5,10 +5,8 @@
   "description": "Runtime-only block graph export/import contract for content repair",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "content-block-graph-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "elastos://block-graph/*",
   "authority": {

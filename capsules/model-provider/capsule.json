@@ -5,10 +5,8 @@
   "description": "Model service provider for typed offers and durable runs behind Runtime authorization",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "model-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "elastos://model/*",
   "authority": {

@@ -5,10 +5,8 @@
   "description": "Typed chain provider for production Elastos, Base, and Bitcoin operations",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "chain-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "elastos://chain/*",
   "authority": {

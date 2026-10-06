@@ -49,11 +49,13 @@ All notable changes to the public ElastOS Runtime repository.
 
 ### Changed
 
-- Execution descriptors use `web-projection` for browser code and `native-provider`
-  for native providers. Legacy manifests that combine `type: wasm` with
-  `execution: web-projection` fail validation and need corrected metadata.
-  Third-party executable admission remains gated by publisher, package approval
-  and revocation checks.
+- Runtime and validators accept legacy execution labels and the honest
+  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
+  manifests retain the legacy values so older Runtimes can complete an update.
+  Switch shipped manifests to the honest values in the next release, once every
+  supported Runtime accepts them. Runtime audits and Home display actual
+  execution boundaries during this transition. Third-party executable admission
+  remains gated by publisher, package approval and revocation checks.
 
 ## [0.7.1] - 2026-09-30
 

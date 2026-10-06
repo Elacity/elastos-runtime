@@ -525,7 +525,9 @@ for name, component in sorted((components.get("external") or {}).items()):
     if capsule_dir is None:
         continue
     manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
-    if (manifest.get("role"), manifest.get("type"), manifest.get("execution"), manifest.get("runtime_abi"), manifest.get("entrypoint")) != ("provider", "native-provider", "native-provider", "elastos.provider-stdio/v1", name):
+    honest = (manifest.get("type"), manifest.get("execution"), manifest.get("runtime_abi"), manifest.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+    legacy = manifest.get("type") in ("wasm", "microvm") and manifest.get("execution") is None and manifest.get("runtime_abi") is None and manifest.get("entrypoint") == "rootfs.ext4"
+    if manifest.get("role") != "provider" or not (honest or legacy):
         raise SystemExit(f"{name} capsule manifest must describe native-provider execution")
     icon_dir = str(manifest.get("icon") or "").strip().strip("/")
     if not icon_dir:
@@ -660,7 +662,7 @@ stage_wasm_capsule() {
     capsule_type=$(capsule_manifest_field "$capsule_name" "type")
     execution=$(capsule_manifest_field "$capsule_name" "execution")
     if [[ "$runtime_abi" == "elastos.component/v1" && ( "$capsule_type" != "wasm" || "$execution" != "component" ) ]] ||
-       [[ "$runtime_abi" == "elastos.runtime-projection/v1" && ( "$capsule_type" != "web-projection" || "$execution" != "web-projection" ) ]]; then
+       [[ "$runtime_abi" == "elastos.runtime-projection/v1" && ( ( "$capsule_type" != "wasm" && "$capsule_type" != "web-projection" ) || "$execution" != "web-projection" ) ]]; then
         die "${capsule_name} type contradicts its execution ABI"
     fi
 

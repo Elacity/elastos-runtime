@@ -5,10 +5,8 @@
   "description": "Runtime decrypt/render boundary for protected-content sessions",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "decrypt-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "provides": "elastos://decrypt/*",
   "authority": {
     "reason": "Validates protected-content decrypt/render session requests and keeps raw CEKs, raw plaintext, filesystem authority, key-backend SDKs, KMS credentials, chain RPC, and wallet RPC out of app capsules.",

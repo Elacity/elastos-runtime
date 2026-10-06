@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unicodedata
@@ -248,8 +249,12 @@ printf '%s\\n' "$result"
             capsule = root / "source"
             (capsule / "browser").mkdir(parents=True)
             (capsule / "browser/index.html").write_text("<title>Home</title>")
+            # Use this test's interpreter rather than the macOS developer-tool launcher.
+            tools = root / "tools"
+            tools.mkdir()
+            (tools / "python3").symlink_to(sys.executable)
             (capsule / "capsule.json").write_text(json.dumps({
-                "type": "web-projection", "entrypoint": "browser/index.html",
+                "type": "wasm", "entrypoint": "browser/index.html",
                 "execution": "web-projection",
                 "runtime_abi": "elastos.runtime-projection/v1",
             }))
@@ -261,8 +266,8 @@ ipfs_add() { touch "$TEST_UPLOAD"; echo unexpected-upload; }
 archive=$(build_packaged_capsule_archive aarch64-darwin home)
 record_direct_asset '{}' home "$archive" capsules/home home.tar.gz home > "$TMPDIR/app.json"
 record_provider_capsule_metadata_asset '{}' provider "$archive" capsules/provider provider.tar.gz provider > "$TMPDIR/provider.json"
-'''], env={**os.environ, "TMPDIR": str(root), "TEST_SOURCE": str(capsule),
-           "TEST_UPLOAD": str(root / "uploaded")}, capture_output=True, text=True)
+'''], env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+           "TMPDIR": str(root), "TEST_SOURCE": str(capsule), "TEST_UPLOAD": str(root / "uploaded")}, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
             self.assertFalse((root / "uploaded").exists(), "packaging called IPFS")

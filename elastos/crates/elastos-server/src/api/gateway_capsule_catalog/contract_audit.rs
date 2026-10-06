@@ -406,9 +406,9 @@ async fn audit_manifest(
     CapsuleContractSummary {
         name: manifest.name.clone(),
         role: manifest.role.clone(),
-        capsule_type: manifest.capsule_type.clone(),
+        capsule_type: manifest.execution_type(),
         runtime_abi: manifest.runtime_abi.clone(),
-        execution: manifest.execution.clone(),
+        execution: manifest.effective_execution(),
         installed,
         launch_state: if !installed {
             "not-installed"
@@ -644,7 +644,7 @@ fn changed_top_level_fields(
 }
 
 fn host_process_boundary(manifest: &CapsuleManifest) -> &'static str {
-    match manifest.capsule_type {
+    match manifest.execution_type() {
         CapsuleType::NativeProvider => "native-provider-process",
         CapsuleType::NativeHost => "native-host-process",
         _ if manifest.permissions.host_process => "runtime-owned-host-process",
@@ -653,7 +653,7 @@ fn host_process_boundary(manifest: &CapsuleManifest) -> &'static str {
 }
 
 fn execution_boundary(manifest: &CapsuleManifest) -> &'static str {
-    match manifest.execution {
+    match manifest.effective_execution() {
         Some(CapsuleExecution::Component) => "component",
         Some(CapsuleExecution::WebProjection) => "web-projection",
         Some(CapsuleExecution::NativeProvider) => "native-provider-process",
@@ -962,21 +962,30 @@ mod tests {
     }
 
     #[test]
-    fn audit_refuses_native_provider_mislabeled_as_microvm() {
-        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+    fn audit_reports_legacy_provider_labels_as_native_processes() {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../../capsules/model-provider/capsule.json"
         ))
         .unwrap();
-        value["type"] = serde_json::json!("microvm");
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("capsule.json");
-        std::fs::write(&path, value.to_string()).unwrap();
-        let mut issues = Vec::new();
-        assert!(load_manifest(&path, "model-provider", &mut issues).is_none());
-        assert!(issues
-            .iter()
-            .any(|issue| issue.code == "invalid_manifest"
-                && issue.detail.contains("native-provider")));
+        for (capsule_type, execution) in [
+            ("wasm", serde_json::Value::Null),
+            ("microvm", serde_json::Value::Null),
+            ("microvm", serde_json::json!("microvm")),
+        ] {
+            // Legacy labels are accepted for update compatibility, not isolation proof.
+            let mut value = base.clone();
+            value["type"] = serde_json::json!(capsule_type);
+            value["execution"] = execution;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("capsule.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            let mut issues = Vec::new();
+            let (manifest, _) = load_manifest(&path, "model-provider", &mut issues).unwrap();
+            assert!(issues.is_empty());
+            assert_eq!(execution_boundary(&manifest), "native-provider-process");
+            assert_eq!(host_process_boundary(&manifest), "native-provider-process");
+            assert_eq!(manifest.execution_type(), CapsuleType::NativeProvider);
+        }
     }
 
     #[test]

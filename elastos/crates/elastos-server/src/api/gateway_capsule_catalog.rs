@@ -1693,7 +1693,7 @@ mod tests {
                 "description": "Marketplace test capsule",
                 "author": "elastos",
                 "role": "app",
-                "type": "web-projection",
+                "type": "wasm",
                 "runtime_abi": "elastos.runtime-projection/v1",
                 "bus_contract": "elastos.runtime-projection/v1",
                 "execution": "web-projection",

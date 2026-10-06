@@ -159,7 +159,7 @@ impl Runtime {
                 .map(|provider| provider.clone() as Arc<dyn ComputeProvider>);
         }
         if matches!(
-            manifest.capsule_type,
+            manifest.execution_type(),
             CapsuleType::Wasm
                 | CapsuleType::WebProjection
                 | CapsuleType::NativeProvider
@@ -738,6 +738,8 @@ mod tests {
         for source in [
             include_str!("../../../../templates/capsules/web-app/capsule.json"),
             include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
+            include_str!("../../../../capsules/model-provider/capsule.json"),
+            include_str!("../../../../capsules/home/capsule.json"),
             include_str!("../../../capsules/shell/capsule.json"),
         ] {
             let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();

@@ -5,10 +5,8 @@
   "description": "Runtime protected-content boundary for rights-gated open requests",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "drm-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "provides": "elastos://drm/*",
   "authority": {
     "reason": "Owns protected-content open requests and keeps raw CEKs, key-backend adapters, wallet authority, chain RPC, IPFS, and Elacity APIs out of app capsules.",

@@ -78,7 +78,7 @@ export function validateCapsule(manifest, label = manifest?.name) {
   }
   if (manifest.type === "web-projection" || manifest.execution === "web-projection"
       || manifest.runtime_abi === "elastos.runtime-projection/v1" || manifest.bus_contract === "elastos.runtime-projection/v1") {
-    same(manifest.type, "web-projection", `${label}: projection type`);
+    assert(["wasm", "web-projection"].includes(manifest.type), `${label}: projection type`);
     same(manifest.execution, "web-projection", `${label}: projection execution`);
     assert(["app", "viewer", "shell"].includes(manifest.role), `${label}: projection role`);
     same(manifest.runtime_abi, "elastos.runtime-projection/v1", `${label}: projection ABI`);

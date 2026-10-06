@@ -5,10 +5,8 @@
   "description": "Runtime Browser/Net boundary for exit-mediated web connectivity",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "net-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "icon": "icons",
   "provides": "elastos://net/*",
   "authority": {

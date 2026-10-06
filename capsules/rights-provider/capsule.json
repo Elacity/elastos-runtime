@@ -5,10 +5,8 @@
   "description": "Runtime rights boundary for protected-content access checks",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "rights-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "provides": "elastos://rights/*",
   "authority": {
     "reason": "Answers typed protected-content rights questions without exposing contract SDKs, chain RPC, wallet RPC, key-backend SDKs, raw CEKs, or provider credentials to app capsules.",

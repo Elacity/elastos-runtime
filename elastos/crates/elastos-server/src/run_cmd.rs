@@ -32,7 +32,7 @@ pub async fn run_capsule(
     let manifest = load_valid_manifest_if_present(&capsule_dir).await?;
 
     if let Some(ref manifest) = manifest {
-        match manifest.capsule_type {
+        match manifest.execution_type() {
             elastos_common::CapsuleType::WebProjection => {
                 anyhow::bail!("Web projection '{}' opens through Home", manifest.name);
             }
@@ -326,6 +326,14 @@ mod tests {
             (
                 include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
                 "trusted Runtime components",
+            ),
+            (
+                include_str!("../../../../capsules/model-provider/capsule.json"),
+                "trusted Runtime components",
+            ),
+            (
+                include_str!("../../../../capsules/home/capsule.json"),
+                "opens through Home",
             ),
             (
                 include_str!("../../../capsules/shell/capsule.json"),

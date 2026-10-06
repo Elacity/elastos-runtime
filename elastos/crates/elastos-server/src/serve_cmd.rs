@@ -70,7 +70,7 @@ pub async fn run_serve(
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
             if matches!(
-                manifest.capsule_type,
+                manifest.execution_type(),
                 elastos_common::CapsuleType::WebProjection
                     | elastos_common::CapsuleType::NativeProvider
                     | elastos_common::CapsuleType::NativeHost

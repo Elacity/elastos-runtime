@@ -5,10 +5,8 @@
   "description": "Runtime key-release boundary for protected-content decrypt sessions",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "key-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "provides": "elastos://key/*",
   "authority": {
     "reason": "Validates protected-content key-release requests and owns PQ-hybrid dKMS backend authority without exposing raw CEKs, KMS node credentials, chain RPC, or wallet RPC to app capsules.",

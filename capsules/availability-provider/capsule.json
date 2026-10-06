@@ -5,10 +5,8 @@
   "description": "Configured SmartWeb content availability adapter",
   "author": "elastos",
   "role": "provider",
-  "type": "native-provider",
-  "runtime_abi": "elastos.provider-stdio/v1",
-  "execution": "native-provider",
-  "entrypoint": "availability-provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
   "provides": "elastos://availability/*",
   "authority": {
     "reason": "Replicates or verifies published CIDs with configured SmartWeb availability targets without exposing Elacity, IPFS Cluster, or supernode APIs to app capsules.",

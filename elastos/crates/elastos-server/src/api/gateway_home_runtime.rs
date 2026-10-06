@@ -446,7 +446,7 @@ pub(super) async fn launch_runtime_backed_home_target(
         return None;
     }
     if matches!(
-        manifest.capsule_type,
+        manifest.execution_type(),
         CapsuleType::NativeProvider | CapsuleType::NativeHost
     ) {
         return Some(GatewayRuntimeLaunchOutcome {

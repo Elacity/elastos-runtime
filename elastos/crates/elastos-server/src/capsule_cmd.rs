@@ -254,7 +254,7 @@ pub async fn run_capsule(
         .ok_or_else(|| anyhow!("ensure-capsule response missing path for '{}'", name))?;
     let manifest = load_capsule_manifest(&capsule_dir, &name)?;
     if matches!(
-        manifest.capsule_type,
+        manifest.execution_type(),
         elastos_common::CapsuleType::WebProjection
             | elastos_common::CapsuleType::NativeProvider
             | elastos_common::CapsuleType::NativeHost
