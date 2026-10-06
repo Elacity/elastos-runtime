@@ -460,7 +460,7 @@ candidate that fails YouTube may still be useful research, but it is not the
 default product browser.
 
 Record each bake-off result with its artifact identity in a dated evidence
-record. Current accepted and rejected results belong in [state.md](../state.md).
+record. Current accepted and rejected results belong in the owning GitHub issue.
 
 The display contract fixes the guest compositor, capture and page raster at
 1920x1080 with DPR 1. Home uses contained viewer scaling and decoded-video input

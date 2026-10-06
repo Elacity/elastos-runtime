@@ -83,6 +83,7 @@ jobs:
           python3 scripts/media-tools-build-test.py
           python3 scripts/verify-linux-arm64-package-test.py
           python3 scripts/update-hop-compare-test.py
+          python3 .github/scripts/release-mac-capacity-test.py
           python3 scripts/install-bootstrap-test.py
 
   test-behaviour:
@@ -673,6 +674,10 @@ jobs:
             install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
           done
           export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
+          # The update hop signs this build as the installed release, and a signed release
+          # version is X.Y.Z or X.Y.Z-{alpha|beta|rc}.N, never the default "-dev".
+          export ELASTOS_RELEASE_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path elastos/Cargo.toml \
+            | python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "elastos-server"))')"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"

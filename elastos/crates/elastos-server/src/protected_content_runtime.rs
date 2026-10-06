@@ -235,23 +235,6 @@ const MAX_RUNTIME_VIEWER_RECORD_BYTES: u64 = 64 * 1024;
 const PROTECT_PROVIDER_PROCESS_ID: &str = "protected-content-protect";
 const MEDIA_PROVIDER_PROCESS_ID: &str = "media-provider";
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-const PROTECT_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
-const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
-const CUSTODY_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
-const PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION: &str =
-    match option_env!("ELASTOS_RELEASE_VERSION") {
-        Some(version) => version,
-        None => "0.1.0-dev",
-    };
 const PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 const PROTECT_PROVIDER_OPERATIONS: &[&str] = &[
@@ -1327,9 +1310,6 @@ fn require_protect_provider_status(status: &Value) -> anyhow::Result<()> {
     if data.get("provider").and_then(Value::as_str) != Some(PROTECT_PROVIDER_PROCESS_ID) {
         anyhow::bail!("protect provider status has an unsupported identity");
     }
-    if data.get("version").and_then(Value::as_str) != Some(PROTECT_PROVIDER_VERSION) {
-        anyhow::bail!("protect provider status has an unsupported version");
-    }
     if data.get("configured").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("protect provider is not configured");
     }
@@ -1338,7 +1318,7 @@ fn require_protect_provider_status(status: &Value) -> anyhow::Result<()> {
         || data.get("response_schema").and_then(Value::as_str)
             != Some(PROTECT_PROVIDER_RESPONSE_SCHEMA_V1)
     {
-        anyhow::bail!("protect provider status has unsupported schemas");
+        anyhow::bail!("protect provider status has unsupported protocol schemas");
     }
     require_exact_provider_operations(data, PROTECT_PROVIDER_OPERATIONS, "protect provider")
 }
@@ -1362,9 +1342,6 @@ pub fn require_media_provider_status(status: &Value) -> anyhow::Result<()> {
     {
         anyhow::bail!("media-provider status has an unsupported protocol version");
     }
-    if data.get("version").and_then(Value::as_str) != Some(MEDIA_PROVIDER_VERSION) {
-        anyhow::bail!("media-provider status has an unsupported version");
-    }
     if data.get("configured").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("media-provider is not configured");
     }
@@ -1387,9 +1364,6 @@ fn require_inactive_custody_provider_status(status: &Value) -> anyhow::Result<()
     if data.get("provider").and_then(Value::as_str) != Some(CUSTODY_PROVIDER_ID) {
         anyhow::bail!("inactive custody provider status has an unsupported identity");
     }
-    if data.get("version").and_then(Value::as_str) != Some(CUSTODY_PROVIDER_VERSION) {
-        anyhow::bail!("inactive custody provider status has an unsupported version");
-    }
     if data.get("configured").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("inactive custody provider is not configured");
     }
@@ -1398,7 +1372,7 @@ fn require_inactive_custody_provider_status(status: &Value) -> anyhow::Result<()
         || data.get("response_schema").and_then(Value::as_str)
             != Some(CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1)
     {
-        anyhow::bail!("inactive custody provider status has unsupported schemas");
+        anyhow::bail!("inactive custody provider status has unsupported protocol schemas");
     }
     require_exact_provider_operations(
         data,
@@ -1426,17 +1400,12 @@ fn require_protected_content_decrypt_provider_status(status: &Value) -> anyhow::
     if data.get("configured").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("protected-content decrypt provider is not configured");
     }
-    if data.get("version").and_then(Value::as_str)
-        != Some(PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION)
-    {
-        anyhow::bail!("protected-content decrypt provider status has an unsupported version");
-    }
     if data.get("request_schema").and_then(Value::as_str)
         != Some(DECRYPT_PROVIDER_REQUEST_SCHEMA_V1)
         || data.get("response_schema").and_then(Value::as_str)
             != Some(DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1)
     {
-        anyhow::bail!("protected-content decrypt provider status has unsupported schemas");
+        anyhow::bail!("protected-content decrypt provider status has unsupported protocol schemas");
     }
     require_exact_provider_operations(
         data,
@@ -1470,6 +1439,15 @@ fn require_exact_provider_status_data<'a>(
             .any(|field| !data.contains_key(*field))
     {
         anyhow::bail!("{label} status has an unsupported shape");
+    }
+    // Release versions identify builds; protocol versions and schemas define compatibility.
+    if data
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(|version| semver::Version::parse(version).ok())
+        .is_none()
+    {
+        anyhow::bail!("{label} status has an invalid release version");
     }
     Ok(data)
 }

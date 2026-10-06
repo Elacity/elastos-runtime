@@ -5,8 +5,7 @@
 manifest fields and supported combinations.
 
 For system context, see the [repository README](../README.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md). [state.md](../state.md) records verified
-implementation status, and [TASKS.md](../TASKS.md) records open work.
+[ARCHITECTURE.md](ARCHITECTURE.md). [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own status, acceptance and proof.
 
 ## Core model
 
@@ -66,8 +65,8 @@ reply alone does not establish working sandbox support.
 
 The [shared state contract](STORAGE_AND_ACCESS.md#shared-application-state)
 defines checkpoints and handoff when execution and durable storage are on
-different nodes. Current accepted placements remain in state.md and the release
-plan; broad placement support is a target, not a claim of hardware qualification.
+different nodes. [Release acceptance](https://github.com/Elacity/elastos-runtime/issues/93) owns placement evidence;
+broad placement support is a target, not a claim of hardware qualification.
 
 ## Isolation boundary
 
@@ -105,7 +104,7 @@ adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
 The Component fixture and authoring template test this contract. Product App
-migration requires its own evidence, recorded in [state.md](../state.md).
+migration requires its own [isolation evidence](https://github.com/Elacity/elastos-runtime/issues/173).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,

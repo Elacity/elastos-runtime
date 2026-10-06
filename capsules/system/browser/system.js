@@ -3754,7 +3754,7 @@ function renderRuntimeUpdate(update) {
     runtimeUpdateReconnects = 0;
   }
   const choice = runtimeUpdatePending?.intent || runtimeUpdate;
-  const inProgress = runtimeUpdatePending || ["staging", "restarting"].includes(phase);
+  const inProgress = runtimeUpdatePending || ["staging", "downloading", "verifying", "restarting"].includes(phase);
   setTextFields("update-current-version", readText(choice?.current_version) || readText(controller?.current_version));
   setTextFields("update-new-version", readText(choice?.new_version) || readText(controller?.new_version));
   const publisher = readText(runtimeUpdatePending?.publisher || runtimeUpdate?.publisher);
@@ -3778,12 +3778,14 @@ function renderRuntimeUpdate(update) {
     showRuntimeUpdateStatus(runtimeUpdateBusy && !runtimeUpdatePending.stepUpToken
       ? "Verify your passkey to start the update."
       : progress === "restarting" ? "Home is restarting. Reconnecting…"
+        : ["downloading", "verifying"].includes(progress) ? readText(controller?.message)
+          || "Preparing the update. Home restarts when the update is ready."
         : progress === "staging" ? "Checking the signed update. Keep Home open."
           : progress === "queued" ? "The update is queued. Keep Home open."
             : "Checking the update with Home. Keep Home open.");
-  } else if (["staging", "restarting"].includes(phase)) {
+  } else if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
     showRuntimeUpdateStatus(phase === "restarting"
-      ? "Home is restarting. Reconnecting…" : "Checking the signed update. Keep Home open.");
+      ? "Home is restarting. Reconnecting…" : readText(controller?.message) || "Checking the signed update. Keep Home open.");
   } else if (["updated", "restored", "failed"].includes(phase)) {
     showRuntimeUpdateStatus(readText(controller.message) || "Check the update status again.");
   } else {
@@ -3798,7 +3800,7 @@ function runtimeUpdateProgressPhase() {
   const phase = readText(runtimeUpdate?.controller?.phase);
   if (!runtimeUpdatePending) return phase;
   if (runtimeUpdate?.controller?.id === runtimeUpdatePending.intent.request_id
-    && ["staging", "restarting"].includes(phase)) {
+    && ["staging", "downloading", "verifying", "restarting"].includes(phase)) {
     runtimeUpdatePending.dispatched = true;
     runtimeUpdatePending.phase = phase;
   }
@@ -3839,6 +3841,11 @@ async function pollRuntimeUpdate() {
   try {
     await refreshSystemSummary();
     runtimeUpdateReconnects = 0;
+    const controller = runtimeUpdate?.controller;
+    if (runtimeUpdatePending && controller?.id === runtimeUpdatePending.intent.request_id
+      && ["staging", "downloading", "verifying"].includes(readText(controller.phase))) {
+      runtimeUpdatePending.polls = 0;
+    }
   } catch (error) {
     if (!runtimeUpdateActive) return;
     if (error.status === 401 || error.status === 403) {
@@ -3905,9 +3912,14 @@ async function onRuntimeUpdateApply() {
     if (runtimeUpdatePending !== pending) return;
     if (!pending.stepUpToken || (error.status >= 400 && error.status < 500)) {
       runtimeUpdatePending = null;
-      feedback = error.status === 401 || error.status === 403
-        ? "Sign in as the Home owner to start the update."
-        : "The update could not start. Check the update and try again.";
+      feedback = !pending.stepUpToken && (error.name === "NotAllowedError"
+        || /cancelled|canceled|timed out or was not allowed/i.test(readText(error.message)))
+        ? "You cancelled the update. Home is unchanged."
+        : error.status === 424
+          ? "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+        : error.status === 401 || error.status === 403
+          ? "Sign in as the Home owner to start the update."
+          : "The update could not start: the release was refused or verification failed. Select Update again.";
     } else {
       feedback = runtimeUpdateProgressPhase() === "restarting"
         ? "Home is restarting. Reconnecting…"

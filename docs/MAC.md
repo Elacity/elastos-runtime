@@ -28,7 +28,7 @@ development.
 
 Then get the repo and build/install the source-home runtime into an isolated
 Mac test home. Replace `upstream/RELEASE-dev` below with the development ref
-listed in [state.md](../state.md):
+named in the owning GitHub issue:
 
 ```bash
 mkdir -p "$HOME/Code"

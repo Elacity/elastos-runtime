@@ -11,9 +11,7 @@ artifacts. A public download version has a separate verification record.
 
 | Record | Owns |
 | --- | --- |
-| Approved release plan linked from TASKS.md | User outcomes, required acceptance and scope decisions |
-| TASKS.md on the active work branch | Goal status, dependencies, owner and next work |
-| state.md | Current source, installed and public evidence, with its date |
+| [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) | Scope, acceptance, status, dependencies, owner and proof |
 | Journey audit workbook | User journeys, regression expectations and findings |
 | Private current checkpoint and receipts | Worktree/target coordinates, resource owners, exact commands and raw proof |
 | Notion overview | Accepted milestone summaries and links to reviewed source |

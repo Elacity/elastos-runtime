@@ -16,6 +16,7 @@ pub fn run_version(current_version: &str) {
     println!("ElastOS Runtime v{}", current_version);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_update_command(
     check: bool,
     head_cid: Option<String>,
@@ -23,6 +24,7 @@ pub async fn run_update_command(
     gateways: Vec<String>,
     yes: bool,
     rollback_to: Option<String>,
+    force: bool,
     current_version: &'static str,
 ) -> anyhow::Result<()> {
     let data_dir = crate::sources::default_data_dir();
@@ -34,6 +36,7 @@ pub async fn run_update_command(
         gateways,
         yes,
         rollback_to,
+        force,
         current_version,
     )
     .await
@@ -48,6 +51,7 @@ async fn run_update_command_for_data_dir(
     gateways: Vec<String>,
     yes: bool,
     rollback_to: Option<String>,
+    force: bool,
     current_version: &'static str,
 ) -> anyhow::Result<()> {
     if !check {
@@ -113,7 +117,7 @@ async fn run_update_command_for_data_dir(
     });
 
     let effective_head_cid = rollback_to.clone().or(head_cid);
-    let force = rollback_to.is_some();
+    let rollback = rollback_to.is_some();
     let result = update::run_update_for_data_dir(
         data_dir,
         &fetch_fn,
@@ -124,6 +128,7 @@ async fn run_update_command_for_data_dir(
         gateways,
         current_version,
         yes,
+        rollback,
         force,
     )
     .await;
@@ -148,6 +153,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Reply {
         SameVersion,
+        OlderForce,
+        ExplicitRollback,
         WrongSignature,
         ContentFailure,
         SilentDiscovery,
@@ -172,6 +179,55 @@ mod tests {
         cid::Cid::new_v1(0x55, hash).to_string()
     }
 
+    #[tokio::test]
+    async fn update_command_force_passes_invalid_installed_version_gate() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": ["did:key:fixture"],
+            "channel": "stable", "installed_version": "invalid"
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(fixture.path(), &sources).unwrap();
+        for force in [false, true] {
+            let error = run_update_command_for_data_dir(
+                fixture.path(),
+                true,
+                None,
+                true,
+                Vec::new(),
+                true,
+                None,
+                force,
+                "0.7.1",
+            )
+            .await
+            .unwrap_err();
+            if force {
+                assert!(
+                    error.to_string().contains("Could not discover updates."),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("elastos update --force"),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_command_force_refuses_older_signed_release() {
+        update_cleanup_case(Reply::OlderForce).await;
+    }
+
+    #[tokio::test]
+    async fn update_command_rollback_without_force_allows_older_signed_release() {
+        update_cleanup_case(Reply::ExplicitRollback).await;
+    }
+
     async fn update_cleanup_case(reply: Reply) {
         let release = signed_envelope(
             serde_json::json!({
@@ -193,6 +249,12 @@ mod tests {
             head = serde_json::to_vec(&envelope).unwrap();
         }
         let head_cid = raw_cid(&head);
+        let rollback_to = matches!(reply, Reply::ExplicitRollback).then(|| head_cid.clone());
+        let installed_version = if matches!(reply, Reply::OlderForce | Reply::ExplicitRollback) {
+            "0.7.2"
+        } else {
+            "0.7.1"
+        };
         let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .alpns(vec![b"elastos/carrier/1".to_vec()])
             .bind()
@@ -217,7 +279,7 @@ mod tests {
         );
         let source: TrustedSource = serde_json::from_value(serde_json::json!({
             "name": "fixture", "publisher_dids": [signer], "channel": "stable",
-            "installed_version": "0.7.1", "publisher_node_id": server.id().to_string(),
+            "installed_version": installed_version, "publisher_node_id": server.id().to_string(),
             "connect_ticket": ticket
         }))
         .unwrap();
@@ -298,7 +360,8 @@ mod tests {
                 false,
                 Vec::new(),
                 true,
-                None,
+                rollback_to,
+                matches!(reply, Reply::OlderForce),
                 "0.7.1",
             ),
         )
@@ -326,6 +389,17 @@ mod tests {
             Reply::SameVersion => {
                 result.unwrap();
                 vec!["release_head", "content_fetch", "content_fetch"]
+            }
+            Reply::OlderForce => {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("older than installed release 0.7.2"));
+                vec!["release_head", "content_fetch", "content_fetch"]
+            }
+            Reply::ExplicitRollback => {
+                result.unwrap();
+                vec!["content_fetch", "content_fetch"]
             }
             Reply::WrongSignature => {
                 assert!(result
@@ -449,6 +523,7 @@ mod tests {
             Vec::new(),
             true,
             None,
+            false,
             "0.7.0",
         )
         .await

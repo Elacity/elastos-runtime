@@ -24,7 +24,7 @@ check("facts identify source and dated evidence", () => {
   assert.match(facts.reviewed_at, /^\d{4}-\d{2}-\d{2}$/);
   assert.match(facts.candidate.base_ref, /^upstream\/.+-dev$/);
   assert.match(facts.candidate.base_commit, /^[a-f0-9]{40}$/);
-  assert.ok(facts.candidate.evidence.includes(`/${facts.candidate.base_commit}/state.md`));
+  assert.ok(facts.candidate.evidence.includes(`/${facts.candidate.base_commit}/`));
   assert.match(facts.public_observation.observed_at, /^\d{4}-\d{2}-\d{2}$/);
   for (const key of ["release_head_sha256", "release_sha256", "installer_sha256"]) assert.match(facts.public_observation[key], /^[a-f0-9]{64}$/);
   assert.deepEqual(facts.public_observation.evidence, ["/release-head.json", "/release.json", "/install.sh"]);

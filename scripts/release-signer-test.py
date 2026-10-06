@@ -141,6 +141,56 @@ class SignerTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
         self.assertEqual(len([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"]), 2)
 
+    def test_bounded_changes_are_preserved_in_signed_release(self):
+        for changes in ([], ["é" * 250], ["change"] * 32,
+                        ["x" * 500] * 16 + ["x" * 192]):
+            with self.subTest(changes=changes):
+                self.manifest["release"]["changes"] = changes
+                self.approve_manifest()
+                publication = dict(S.sign_publication(self.prepare(), FakeBackend()))
+                release = S.parse_json(publication["release.json"])
+                self.assertEqual(release["payload"]["changes"], changes)
+                for path in self.snapshot.iterdir():
+                    path.unlink()
+
+    def test_changes_outside_runtime_bounds_are_refused(self):
+        for changes in (None, "change", {}, [1], [True], [None], [""], ["   "],
+                        ["x" * 501], ["é" * 251], ["change"] * 33,
+                        ["x" * 500] * 16 + ["x" * 193],
+                        *(["before" + chr(code) + "after"] for code in (0, 9, 10, 31, 127, 159))):
+            with self.subTest(changes=changes):
+                self.manifest["release"]["changes"] = changes
+                self.approve_manifest()
+                with self.assertRaisesRegex(ValueError, "changes"):
+                    self.prepare()
+                for path in self.snapshot.iterdir():
+                    path.unlink()
+
+    def test_changes_keep_other_release_fields_strict(self):
+        self.manifest["release"]["changes"] = ["A change"]
+        self.manifest["release"]["extra"] = "refuse"
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "release fields refused"):
+            self.prepare()
+        for path in self.snapshot.iterdir():
+            path.unlink()
+        del self.manifest["release"]["extra"]
+        del self.manifest["release"]["installer_sha256"]
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "release fields refused"):
+            self.prepare()
+
+    def test_signer_accepts_all_three_release_platforms(self):
+        platform = self.manifest["release"]["platforms"]["x86_64-linux"]
+        self.manifest["release"]["platforms"] = {
+            name: copy.deepcopy(platform)
+            for name in ("aarch64-darwin", "x86_64-linux", "aarch64-linux")
+        }
+        self.approve_manifest()
+        prepared = self.prepare()
+        self.assertEqual(set(S.parse_json(prepared.release)["platforms"]),
+                         {"aarch64-darwin", "x86_64-linux", "aarch64-linux"})
+
     def test_annotated_tag_and_identical_main_are_supported(self):
         prefix = f"/repos/{S.REPOSITORY}"
         self.policy["tag_oid"] = TAG

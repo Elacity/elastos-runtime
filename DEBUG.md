@@ -8,8 +8,7 @@ work log.
 1. Reproduce the failure with a concrete command, URL, or user journey.
 2. Write the smallest falsifiable hypothesis.
 3. Run one experiment that can prove or disprove that hypothesis.
-4. Record durable findings in the issue, PR, commit message, `state.md`,
-   `TASKS.md`, or the relevant `docs/` file after verification.
+4. Record verified findings in the owning GitHub issue.
 
 ## Verification
 
@@ -25,10 +24,9 @@ work log.
 
 ## Where Notes Belong
 
-- Temporary debugging notes belong in the active issue, review thread, or an
-  untracked local note.
-- Release truth belongs in `state.md`, `TASKS.md`, `elastos/CHANGELOG.md`, or a
-  receipt under the documented proof path.
+- Debugging findings and proof belong in the owning GitHub issue. Use
+  [#89](https://github.com/Elacity/elastos-runtime/issues/89) for install and update.
+- Release history belongs in `elastos/CHANGELOG.md`.
 - Durable architecture guidance belongs in `docs/`.
 - Stable local-debugging invariants belong here.
 
@@ -106,11 +104,6 @@ from provider grants until a reviewed grant-management API exists.
 Capability tokens belong in the Runtime/provider envelope. Provider JSON bodies
 must not carry duplicate token fields unless a provider explicitly validates
 that field as part of a reviewed protocol.
-
-## Active Work Logs
-
-Do not add running debug notes or host transcripts to this file. Promote only
-stable invariants here after the relevant code and tests are updated.
 
 ## Browser Address Navigation Invariant
 

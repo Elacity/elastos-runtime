@@ -226,6 +226,13 @@ where
     if source.installed_version.is_empty() || source.publisher_dids.is_empty() {
         return None;
     }
+    if crate::update::installed_release_version(&source.installed_version).is_err() {
+        return Some(serde_json::json!({
+            "configured":true, "checking":false, "available":false, "can_apply":false,
+            "current_version":source.installed_version,
+            "message":crate::update::InvalidInstalledVersion.to_string(),
+        }));
+    }
     let key = UpdateCheckKey {
         data_dir: data_dir.into(),
         source_policy_sha256: source_policy_sha256(&config)?,
@@ -317,11 +324,25 @@ pub(super) async fn system_update_apply(
     let result = system_update_apply_inner(&state, &launch, &input).await;
     match result {
         Ok(response) => Json(response).into_response(),
-        Err(_) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"The update could not start. Check the update again and approve the current choice."})),
-        ).into_response(),
+        Err(error) => system_update_failure(&error),
     }
+}
+
+pub(super) fn system_update_failure(error: &anyhow::Error) -> Response {
+    let (status, message) = if error.is::<crate::update::UpdateSourceUnavailable>() {
+        (StatusCode::FAILED_DEPENDENCY, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.")
+    } else if error.is::<crate::update::InvalidInstalledVersion>() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":crate::update::InvalidInstalledVersion.to_string(),
+            })),
+        )
+            .into_response();
+    } else {
+        (StatusCode::CONFLICT, "The update could not start: the release was refused or verification failed. Select Update again.")
+    };
+    (status, Json(serde_json::json!({"error":message}))).into_response()
 }
 
 async fn system_update_apply_inner(
@@ -329,6 +350,10 @@ async fn system_update_apply_inner(
     launch: &RequiredHomeLaunchToken,
     input: &SystemUpdateApplyRequest,
 ) -> anyhow::Result<serde_json::Value> {
+    let sources = crate::sources::load_trusted_sources(&state.data_dir)?;
+    if let Some(source) = sources.default_source() {
+        crate::update::installed_release_version(&source.installed_version)?;
+    }
     let request = input.request()?;
     let intent = input.intent();
     let effect = consume_prepared_passkey_step_up_effect(

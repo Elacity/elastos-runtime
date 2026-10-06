@@ -12,7 +12,7 @@ bootstrap configuration, while Profile and Runtime checks own person, contact
 and message authority.
 
 Current implementation and installed acceptance are recorded in
-[state.md](../state.md). Current J6 work belongs in [TASKS.md](../TASKS.md);
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues), with current J6 work;
 later collaboration work belongs in [deferred work](DEFERRED_WORK.md).
 
 ## Goal

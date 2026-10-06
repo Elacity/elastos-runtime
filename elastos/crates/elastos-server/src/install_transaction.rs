@@ -1,5 +1,5 @@
 //! Installed release-file transaction. Journal schemas bind their fixed destinations.
-//! Installer adoption of this lock is a separate release-owner integration.
+//! Updates stage all five release files; the installer leaves components to setup.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +15,9 @@ use elastos_common::localhost::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod support;
+pub(crate) use support::validate_support_path;
 
 const INSTALL_LOCK: &str = ".elastos.install.lock";
 const JOURNAL: &str = ".elastos.update-journal.json";
@@ -63,6 +66,15 @@ impl ReleaseFile {
             Self::ReleaseManifest => "release_manifest",
         }
     }
+
+    /// Installer transactions omit components, which Runtime setup installs.
+    fn complete_set(ids: impl Iterator<Item = Self>) -> bool {
+        let mut count = 0;
+        let ids = ids.inspect(|_| count += 1).collect::<BTreeSet<_>>();
+        ids.len() == count
+            && (ids.len() == Self::ALL.len()
+                || ids.len() == Self::ALL.len() - 1 && !ids.contains(&Self::Components))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -96,6 +108,8 @@ struct Journal {
     entries: Vec<Entry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restart: Option<RestartRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    support: Vec<support::Entry>,
 }
 
 /// A restart controller keeps this record and the verified rollback until Home is ready.
@@ -106,6 +120,10 @@ pub(crate) struct RestartPlan {
     pub controller_sha256: String,
     pub launch_plan_sha256: String,
     pub support_sha256: String,
+    // An older installed controller writes plans without this field; the
+    // candidate it starts must still read that journal.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub support_paths: BTreeSet<PathBuf>,
     pub previous_version: String,
     pub candidate_version: String,
     pub previous_binary_sha256: String,
@@ -530,6 +548,15 @@ impl InstallTransaction {
             paths.insert(parent.join(STAGE));
             paths.insert(parent.join(ROLLBACK));
         }
+        paths.insert(self.data_dir.join(support::SCRATCH));
+        if let Ok(Some(journal)) = self.read_journal() {
+            paths.extend(
+                journal
+                    .support
+                    .iter()
+                    .map(|entry| self.data_dir.join(&entry.path)),
+            );
+        }
         paths
     }
 
@@ -588,6 +615,7 @@ impl InstallTransaction {
         // restoration. Partial writes have distinct names and only staging owns them.
         self.validate_scratch(&journal)?;
         if journal.phase == Phase::Staging {
+            support::require_original(self, &journal.support)?;
             for entry in &journal.entries {
                 self.require_state(
                     entry.id,
@@ -639,6 +667,7 @@ impl InstallTransaction {
                     )?;
                 }
             }
+            support::validate_restore(self, &journal.support)?;
             journal.phase = Phase::Recovering;
             if let Some(restart) = &mut journal.restart {
                 restart.phase = RestartPhase::Restoring;
@@ -647,6 +676,7 @@ impl InstallTransaction {
                 restart.process_start = None;
             }
             self.write_journal(&journal)?;
+            support::restore(self, &journal.support)?;
             for entry in &journal.entries {
                 let current = file_state(&self.destinations[&entry.id])?;
                 if state_matches(
@@ -728,11 +758,8 @@ impl InstallTransaction {
             bail!("Legacy recovery must finish before preparing a new installed release.");
         }
         self.require_empty_scratch()?;
-        if files.len() != ReleaseFile::ALL.len()
-            || files.iter().map(|item| item.0).collect::<BTreeSet<_>>()
-                != ReleaseFile::ALL.into_iter().collect()
-        {
-            bail!("release transaction requires exactly five release files");
+        if !ReleaseFile::complete_set(files.iter().map(|item| item.0)) {
+            bail!("release transaction requires the complete release file set");
         }
         let mut entries = Vec::new();
         let mut allocations = BTreeMap::new();
@@ -773,6 +800,7 @@ impl InstallTransaction {
             phase: Phase::Staging,
             entries,
             restart: None,
+            support: Vec::new(),
         };
         self.write_journal(&journal)?;
         let result = (|| {
@@ -823,6 +851,31 @@ impl InstallTransaction {
             self.write_journal(&journal)
         })();
         self.restore_on_error(result)
+    }
+
+    pub(crate) fn prepare_support(&self, paths: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+        support::prepare(self, paths)
+    }
+
+    pub(crate) fn verify_support(&self, previous: bool) -> anyhow::Result<()> {
+        let journal = self.read_journal()?.context("release journal missing")?;
+        support::require_installed(self, &journal.support, previous)
+    }
+
+    pub(crate) fn abort_pre_activation_restart(&self) -> anyhow::Result<()> {
+        let mut journal = self.read_journal()?.context("release journal missing")?;
+        anyhow::ensure!(
+            journal.phase == Phase::Prepared
+                && journal
+                    .restart
+                    .as_ref()
+                    .is_some_and(|restart| restart.phase == RestartPhase::CandidatePending),
+            "activation already has recovery ownership"
+        );
+        journal.restart = None;
+        journal.schema = "elastos.install-transaction/v3".into();
+        self.write_journal(&journal)?;
+        self.abort()
     }
 
     pub(crate) fn abort(&self) -> anyhow::Result<()> {
@@ -1004,6 +1057,7 @@ impl InstallTransaction {
                 },
             )?;
         }
+        support::require_installed(self, &journal.support, previous)?;
         self.cleanup(&journal)
     }
 
@@ -1031,7 +1085,11 @@ impl InstallTransaction {
         self.write_journal(&journal)?;
         let result = (|| {
             for id in [ReleaseFile::RuntimeBinary, ReleaseFile::Components] {
-                let entry = journal.entries.iter().find(|entry| entry.id == id).unwrap();
+                let entry = journal
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .context("support activation requires all five release files")?;
                 fs::rename(self.scratch(id, STAGE), &self.destinations[&id])?;
                 sync_directory(self.destinations[&id].parent().unwrap())?;
                 self.require_state(id, Some(&entry.staged_sha256), Some(entry.staged_mode))?;
@@ -1083,6 +1141,7 @@ impl InstallTransaction {
                 require_hash(&self.scratch(entry.id, ROLLBACK), original)?;
             }
         }
+        support::require_original(self, &journal.support)?;
         let result = (|| {
             journal.phase = Phase::Committing;
             self.write_journal(&journal)?;
@@ -1109,6 +1168,7 @@ impl InstallTransaction {
                     Some(entry.staged_mode),
                 )?;
             }
+            support::activate(self, &journal.support)?;
             after_activation()?;
             journal.phase = Phase::Committed;
             self.write_journal(&journal)
@@ -1176,16 +1236,11 @@ impl InstallTransaction {
                 .transaction_id
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit())
-            || journal.entries.len() != ReleaseFile::ALL.len()
-            || journal
-                .entries
-                .iter()
-                .map(|entry| entry.id)
-                .collect::<BTreeSet<_>>()
-                != ReleaseFile::ALL.into_iter().collect()
+            || !ReleaseFile::complete_set(journal.entries.iter().map(|entry| entry.id))
         {
             bail!("installation journal identity is incompatible with this writer");
         }
+        support::validate_entries(self, &journal.support)?;
         validate_restart_record(&journal)?;
         for entry in &journal.entries {
             if !valid_hash(&entry.staged_sha256)
@@ -1250,6 +1305,7 @@ impl InstallTransaction {
     }
 
     fn validate_scratch(&self, journal: &Journal) -> anyhow::Result<()> {
+        support::validate_scratch(self, journal)?;
         for parent in self.parents() {
             self.check_parent(&parent, false)?;
             for directory in [STAGE, ROLLBACK] {
@@ -1295,6 +1351,7 @@ impl InstallTransaction {
     fn cleanup(&self, journal: &Journal) -> anyhow::Result<()> {
         // Validate the whole scratch set before deleting even its first file.
         self.validate_scratch(journal)?;
+        support::cleanup(self, journal)?;
         for parent in self.parents() {
             for directory in [STAGE, ROLLBACK] {
                 let path = parent.join(directory);
@@ -1636,10 +1693,16 @@ pub(crate) fn refuse_pending_home_start(data_dir: &Path, binary: &Path) -> anyho
 }
 
 fn pending_home_recovery_hint(journal: &Journal) -> &'static str {
-    if journal.restart.is_none() {
-        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
-    } else {
+    if journal.restart.is_some() {
         "Home restart recovery is pending. Start the retained update controller with its receipt."
+    } else if journal
+        .entries
+        .iter()
+        .all(|entry| entry.id != ReleaseFile::Components)
+    {
+        "An interrupted installation requires recovery. Run install.sh again before starting Home."
+    } else {
+        "An interrupted command-line update requires recovery. Run `elastos update` again before starting Home."
     }
 }
 

@@ -1397,12 +1397,6 @@
           "cid": "Qmeb1qaqfMiri7G123FWmMz6qt74xhPjAgAJEy8ZSrFKh7",
           "checksum": "sha256:eccb4f318ba37309af5fae01bc610b76033707ec8149002d26675aed66d8578b",
           "install_path": "bin/vmlinux"
-        },
-        "linux-arm64": {
-          "strategy": "local-copy",
-          "source": "/boot/Image",
-          "note": "Upstream crosvm aarch64 test kernel is broken on GICv3-only hosts (Jetson). Uses host kernel instead.",
-          "install_path": "bin/vmlinux"
         }
       }
     },

@@ -81,6 +81,8 @@ class PlatformInputTest(unittest.TestCase):
         source_root = self.root / "source"
         source_root.mkdir()
         self.write_json(source_root / "components.json", self.template)
+        (source_root / "elastos").mkdir()
+        (source_root / "elastos/CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         source = json.loads((next(iter(self.bundles.values())) / "platform-input.json").read_text())["source"]
         for context in (patch.object(inputs, "SOURCE_ROOT", source_root),
                         patch.object(inputs, "source_identity", return_value=source)):
@@ -1049,8 +1051,78 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         options.update(overrides)
         return inputs.signing_input(fixture.stage, fixture.cids_path, fixture.stamps_path, **options)
 
+    def test_unsigned_handoff_takes_wrapped_changes_from_unreleased_changelog(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Added\n\n"
+            "- Home shows signed\n  change notes.\n\n### Fixed\n"
+            "- Updates retain café text.\n\n## [0.7.0] - 2026-01-01\n- Older change.\n")
+        manifest = self.prepare_signing_fixture(fixture)
+        self.assertEqual(manifest["release"]["changes"],
+                         ["Home shows signed change notes.", "Updates retain café text."])
+
+    def test_unsigned_handoff_prefers_matching_version_changelog(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "## Unreleased\n- Future change.\n\n## [0.7.1] - 2026-01-01\n"
+            "Release introduction.\n\n### Fixed\n- This release.\n\n"
+            "## [0.7.0]\n- Older change.\n")
+        manifest = self.prepare_signing_fixture(fixture)
+        self.assertEqual(manifest["release"]["changes"], ["This release."])
+
+    def test_unsigned_handoff_excludes_non_change_subsections(self):
+        fixture = self.signing_fixture()
+        notes = "## [0.7.1]\n- Direct change.\n"
+        for heading in ("Known limits", "Notes", "Known limitations", "Deferred"):
+            notes += f"\n### {heading}\n- " + "x" * 501 + "\n  continued limit.\n"
+        headings = ("Added", "Changed", "Fixed", "Removed", "Security", "Added (release tooling)")
+        for heading in headings:
+            notes += f"\n### {heading}\n- {heading} change.\n  Continued.\n"
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(notes)
+        self.assertEqual(self.prepare_signing_fixture(fixture)["release"]["changes"],
+                         ["Direct change."] + [f"{heading} change. Continued." for heading in headings])
+
+    def test_changelog_refuses_long_bullet_with_location(self):
+        fixture = self.signing_fixture()
+        for section in ("Unreleased", "0.7.1"):
+            for bullet in ("x" * 501, "é" * 249 + "\n  éé"):
+                with self.subTest(section=section, bullet=bullet):
+                    (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+                        f"## [{section}]\n### Known limits\n- Ignored limit.\n"
+                        "### Fixed\n- " + "é" * 250 + "\n- " + bullet + "\n")
+                    message = (r"elastos/CHANGELOG\.md \[" + section
+                               + r"\] bullet 3: release changes exceed the 500-byte bound")
+                    with self.assertRaisesRegex(ValueError, message):
+                        inputs.changelog_changes("0.7.1")
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.prepare_signing_fixture(fixture)
+                    self.assertFalse(fixture.output.exists())
+
+    def test_real_unreleased_changelog_fits_release_bounds(self):
+        with patch.object(inputs, "SOURCE_ROOT", Path(__file__).resolve().parent.parent):
+            changes = inputs.changelog_changes("Unreleased")
+        signer.check_release_changes(changes)
+
+    def test_unsigned_handoff_omits_changes_without_matching_notes(self):
+        fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text("## [0.7.0]\n- Older change.\n")
+        self.assertNotIn("changes", self.prepare_signing_fixture(fixture)["release"])
+
+    def test_unsigned_handoff_refuses_changelog_outside_runtime_bounds(self):
+        fixture = self.signing_fixture()
+        for notes in (["é" * 251], ["change"] * 33, ["x" * 500] * 17,
+                      ["before\x7fafter"], [""]):
+            with self.subTest(notes=notes):
+                (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+                    "## [Unreleased]\n" + "\n".join("- " + note for note in notes) + "\n")
+                with self.assertRaisesRegex(ValueError, "changes"):
+                    self.prepare_signing_fixture(fixture)
+                self.assertFalse(fixture.output.exists())
+
     def test_unsigned_mac_canary_handoff_binds_exact_files_installer_and_source(self):
         fixture = self.signing_fixture()
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "## [Unreleased]\n- System shows signed change notes.\n")
         manifest = self.prepare_signing_fixture(fixture)
         rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
         self.assertIn(b'HEAD_CID=""', rendered)
@@ -1058,6 +1130,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.assertEqual((manifest["version"], manifest["channel"]), ("0.7.1", "canary"))
         self.assertEqual(manifest["installer"], {"blob_oid": fixture.blob_oid, "stamps": fixture.stamps})
         self.assertEqual(manifest["release"]["source"], manifest["source"])
+        self.assertEqual(manifest["release"]["changes"], ["System shows signed change notes."])
         self.assertEqual(manifest["release"]["installer_sha256"], signer.sha256(rendered))
         self.assertEqual(manifest["release"]["released_at"], manifest["head"]["updated_at"])
         self.assertEqual(set(manifest["release"]["platforms"]), {fixture.platform})

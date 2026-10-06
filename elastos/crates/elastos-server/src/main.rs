@@ -534,6 +534,23 @@ enum Commands {
         backup_dir: PathBuf,
     },
 
+    /// Admit and install the installer's verified release through the shared writer
+    #[command(name = "install-release", hide = true)]
+    InstallRelease {
+        /// Runtime data root of this installation
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Installed Runtime binary path
+        #[arg(long)]
+        binary: PathBuf,
+        /// Verified candidate Runtime, trusted sources, release head and release
+        #[arg(long, num_args = 4, value_names = ["RUNTIME", "SOURCES", "HEAD", "RELEASE"])]
+        candidate: Vec<PathBuf>,
+        /// Admit only; change nothing
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Show runtime version
     Version,
 
@@ -562,6 +579,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Repair an invalid installed version with a verified same or newer release
+        #[arg(long)]
+        force: bool,
     },
 
     /// Check for and install runtime updates
@@ -589,6 +610,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Repair an invalid installed version with a verified same or newer release
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1586,6 +1611,23 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
 
+        Commands::InstallRelease {
+            data_dir,
+            binary,
+            candidate,
+            check,
+        } => {
+            let [runtime, sources, head, release] = candidate.as_slice() else {
+                anyhow::bail!("install-release requires four candidate files");
+            };
+            elastos_server::update::install_release(
+                &data_dir,
+                &binary,
+                [runtime, sources, head, release].map(PathBuf::as_path),
+                check,
+            )?;
+        }
+
         Commands::Version => {
             release_cmd::run_version(ELASTOS_VERSION);
         }
@@ -1597,6 +1639,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         }
         | Commands::Upgrade {
             check,
@@ -1605,6 +1648,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         } => {
             release_cmd::run_update_command(
                 check,
@@ -1613,6 +1657,7 @@ async fn main() -> anyhow::Result<()> {
                 gateways,
                 yes,
                 rollback_to,
+                force,
                 ELASTOS_VERSION,
             )
             .await?;
@@ -2275,6 +2320,39 @@ mod tests {
     use clap::Parser;
     use sha2::Digest;
     use std::fs;
+
+    #[test]
+    fn update_cli_accepts_force_only_when_requested() {
+        for command in ["update", "upgrade"] {
+            for requested in [false, true] {
+                let mut args = vec!["elastos", command];
+                if requested {
+                    args.push("--force");
+                }
+                let cli = super::Cli::try_parse_from(args).unwrap();
+                let Some(
+                    super::Commands::Update { force, .. } | super::Commands::Upgrade { force, .. },
+                ) = cli.command
+                else {
+                    panic!("expected update command");
+                };
+                assert_eq!(force, requested);
+            }
+        }
+        let error = super::Cli::try_parse_from([
+            "elastos",
+            "node",
+            "update",
+            "--peer",
+            "did:key:fixture",
+            "--apply",
+            "--yes",
+            "--force",
+        ])
+        .err()
+        .expect("operator update accepted --force");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 
     #[test]
     fn source_add_cli_keeps_omitted_channel_distinct_from_explicit_stable() {

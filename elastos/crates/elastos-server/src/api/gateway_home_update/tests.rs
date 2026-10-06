@@ -1,6 +1,7 @@
 use super::super::gateway_home_update::{
     check_matches_source, choice_matches, system_runtime_update_summary_with_cache,
-    SystemUpdateApplyRequest, UpdateCheckCache, UpdateCheckKey, UpdateCheckSnapshot,
+    system_update_failure, SystemUpdateApplyRequest, UpdateCheckCache, UpdateCheckKey,
+    UpdateCheckSnapshot,
 };
 use super::home_system::{home_test_get_json, home_test_post_json};
 use super::*;
@@ -268,6 +269,56 @@ fn system_update_completed_offer_is_bound_to_captured_source_fields_and_signers(
     assert!(check_matches_source(&source, &check));
     source.channel.clear();
     assert!(check_matches_source(&source, &check));
+}
+
+#[tokio::test]
+async fn system_update_summary_refuses_invalid_installed_version_with_local_repair_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let context = HomeLaunchTokenContext {
+        principal_id: owner.principal_id,
+        session_id: owner.session_id,
+        proof_binding_id: Some(owner.proof_binding_id),
+        grant_id: owner.grant_id,
+    };
+    configure_update_summary(dir.path());
+    let mut sources = crate::sources::load_trusted_sources(dir.path()).unwrap();
+    sources.sources[0].installed_version = "broken".into();
+    crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+    let cache = tokio::sync::Mutex::new(UpdateCheckCache::default());
+    let summary =
+        system_runtime_update_summary_with_cache(dir.path(), &context, &cache, |_, _, _| {
+            unexpected_check()
+        })
+        .await
+        .unwrap();
+    assert_eq!(summary["available"], false);
+    assert_eq!(summary["can_apply"], false);
+    assert!(summary["message"]
+        .as_str()
+        .unwrap()
+        .contains("elastos update --force"));
+    assert_update_stays_unqueued(dir.path());
+    let intent = update_intent();
+    let approval = step_up_token_for_app_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &owner.system_token,
+        UPDATE_APPLY_OPERATION,
+        &intent,
+    );
+    let mut body = intent;
+    body["step_up_token"] = json!(approval);
+    let app = gateway_router(state);
+    let (status, response) =
+        home_test_post_json(&app, UPDATE_APPLY_ROUTE, &owner.system_token, "null", body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("elastos update --force"));
+    assert_update_stays_unqueued(dir.path());
 }
 
 #[tokio::test]
@@ -706,6 +757,8 @@ fn system_update_post_rejects_hidden_authority_fields() {
         "admin",
         "owner",
         "auto_confirm",
+        "force",
+        "repair_invalid_version",
         "recovered",
         "effect_id",
         "request_sha256",
@@ -829,5 +882,38 @@ async fn system_update_exact_retry_recovers_both_queue_write_boundaries() {
         if dispatched == "completed" {
             assert!(!controller.join("request.json").exists());
         }
+    }
+}
+
+#[tokio::test]
+async fn system_update_failures_explain_the_cause_without_private_error_details() {
+    for (error, expected_status, expected_cause) in [
+        (
+            anyhow::Error::from(crate::update::UpdateSourceUnavailable)
+                .context("private source endpoint"),
+            StatusCode::FAILED_DEPENDENCY,
+            "Connect to the internet and select Update again.",
+        ),
+        (
+            anyhow::Error::from(crate::update::InvalidInstalledVersion)
+                .context("private source detail"),
+            StatusCode::CONFLICT,
+            "elastos update --force",
+        ),
+        (
+            anyhow::anyhow!("private verification detail"),
+            StatusCode::CONFLICT,
+            "release was refused or verification failed",
+        ),
+    ] {
+        let response = system_update_failure(&error);
+        assert_eq!(response.status(), expected_status);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = value["error"].as_str().unwrap();
+        assert!(message.contains(expected_cause));
+        assert!(!message.contains("private"));
     }
 }

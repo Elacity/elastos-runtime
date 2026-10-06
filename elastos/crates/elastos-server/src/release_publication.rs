@@ -203,6 +203,13 @@ impl Publication {
             if component.get("schema").and_then(Value::as_str) != Some("elastos.components/v1") {
                 continue;
             }
+            if let Some(platform) = name
+                .strip_prefix("components-")
+                .and_then(|name| name.strip_suffix(".json"))
+            {
+                let manifest = serde_json::from_value(component.clone())?;
+                crate::setup::admit_release_components(&manifest, platform)?;
+            }
             component_refs(&component, &artifact_directory, &names, &mut artifacts)?;
             if let Some(catalog) = component.get("model_catalog") {
                 let cid = text(catalog, "head_cid")?;
@@ -1037,7 +1044,7 @@ mod tests {
             support_ref["checksum"] = json!(format!("sha256:{}", digest(support)));
             support_ref.as_object_mut().unwrap().remove("sha256");
             let components = serde_json::to_vec(&json!({
-                "schema":"elastos.components/v1", "capsules":{},
+                "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
                 "external":{"home":{"platforms":{"*":support_ref}}},
                 "model_catalog":{"head_cid":raw_cid(catalog),"publisher_dids":[did]}
             }))
@@ -1416,6 +1423,34 @@ mod tests {
         )
         .unwrap();
         assert!(fixture.open().is_err());
+    }
+
+    #[test]
+    fn publication_component_admission_refuses_optional_checksum_and_development_strategy() {
+        for info in [
+            json!({}),
+            json!({"strategy":"source-build"}),
+            json!({"strategy":"local-copy"}),
+        ] {
+            let mut fixture = PublicPublicationFixture::new();
+            let path = fixture.input.join("components-aarch64-darwin.json");
+            let mut components: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            components["external"]["optional"] = json!({"platforms":{"*":info}});
+            let bytes = serde_json::to_vec(&components).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            fixture.release["platforms"]["aarch64-darwin"]["components"] = descriptor(&bytes);
+            fixture.write_signed();
+            let error = fixture
+                .open()
+                .err()
+                .expect("invalid release component admitted");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("checksum") || message.contains("strategy"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
