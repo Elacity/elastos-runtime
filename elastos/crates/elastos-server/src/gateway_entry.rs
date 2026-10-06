@@ -17,7 +17,10 @@ pub async fn run_gateway(
 pub async fn run_browser_home() -> anyhow::Result<()> {
     elastos_server::update_controller::enter_browser_home()?;
     elastos_server::gateway_cmd::run_gateway_direct_with_ready(
-        "localhost:8090".to_string(),
+        format!(
+            "localhost:{}",
+            elastos_server::update_controller::BROWSER_HOME_PORT
+        ),
         false,
         None,
         None,
