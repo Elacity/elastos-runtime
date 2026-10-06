@@ -1,11 +1,14 @@
 {
  "_doc": [
   "Non-Rust and cross-package inputs of build units, read by scripts/build-key.py.",
+  "Every path package in a unit's closure is keyed as a whole tree (sources, manifests, build.rs,",
+  "tests, capsule.json, icons, locks); the compiler's dep-info adds the files it read elsewhere.",
   "packages.<crate>: repository files (or directories) the crate reads from outside its own directory",
-  "  (include_str!/include_bytes!, bindgen wit paths). The compiler's dep-info proves each of these;",
-  "  an undeclared cross-package read yields no key (miss) until it is listed here.",
+  "  (include_str!/include_bytes!, bindgen wit paths). An undeclared cross-package read yields no key",
+  "  (miss) until it is listed here.",
   "units.<package>/<kind>: inputs the compiler cannot see, hashed into that unit's key:",
-  "  paths (files or directories, repository-relative) and env (variable names)."
+  "  paths (files or directories, repository-relative) and env (variable names).",
+  "The map's own blob id is part of every key."
  ],
  "packages": {
   "elastos-common": [
@@ -24,10 +27,5 @@
    "elastos/wit/elastos-bus-v1.wit"
   ]
  },
- "units": {
-  "chain-provider/bin": {
-   "paths": ["capsules/chain-provider/capsule.json", "capsules/chain-provider/icons"],
-   "env": []
-  }
- }
+ "units": {}
 }
