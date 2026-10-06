@@ -50,10 +50,11 @@ impl SignedGatewayPublication {
         support_ref["release_path"] = json!("home.tar.gz");
         support_ref["checksum"] = json!(format!("sha256:{}", gateway_fixture_digest(support)));
         support_ref.as_object_mut().unwrap().remove("sha256");
-        let components =
-            serde_json::to_vec(&json!({"schema":"elastos.components/v1","capsules":{},
-            "external":{"home":{"platforms":{"*":support_ref}}}}))
-            .unwrap();
+        let components = serde_json::to_vec(
+            &json!({"schema":"elastos.components/v1","capsules":{},"profiles":{},
+            "external":{"home":{"platforms":{"*":support_ref}}}}),
+        )
+        .unwrap();
         let release = gateway_fixture_envelope(
             &key,
             "elastos.release.v1",

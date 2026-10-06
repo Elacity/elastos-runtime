@@ -43,8 +43,10 @@ def requires_checksum(info):
     return any(non_empty(info.get(field)) for field in FETCH_FIELDS)
 
 
-def checksum_error(name, platform, info):
-    if not requires_checksum(info):
+def checksum_error(name, platform, info, release=False):
+    if release and info.get("strategy") not in (None, "prebuilt"):
+        return f"{name} {platform}: development or unsupported release strategy {info.get('strategy')!r}"
+    if not release and not requires_checksum(info):
         return None
     checksum = info.get("checksum")
     artifact = next(
@@ -53,7 +55,7 @@ def checksum_error(name, platform, info):
     )
     if not non_empty(checksum):
         return f"{name} {platform} {artifact}: missing checksum"
-    if not CHECKSUM_RE.match(checksum):
+    if not CHECKSUM_RE.fullmatch(checksum):
         return f"{name} {platform} {artifact}: unsupported checksum format {checksum!r}"
     return None
 
@@ -201,6 +203,9 @@ def audit_release_artifacts(data, platforms, artifact_root):
             for label, entry in entries:
                 _, info = resolve_platform_info(entry, platform)
                 if info is not None:
+                    error = checksum_error(label, platform, info, release=True)
+                    if error:
+                        errors.append(error)
                     if non_empty(info.get("url")) and not non_empty(info.get("release_path")):
                         errors.append(f"{label} {platform}: URL-only dependency requires a release artifact")
                     elif "release_path" in info:
@@ -490,6 +495,18 @@ def run_self_test():
             },
         }
     }
+
+    for info, accepted in [
+        ({"checksum": f"sha256:{good_hash}"}, True),
+        ({"checksum": f"sha512:{good_hash_512}", "strategy": "prebuilt"}, True),
+        ({}, False),
+        ({"checksum": "sha256:bad"}, False),
+        ({"checksum": f"sha256:{good_hash}\n"}, False),
+        ({"checksum": f"sha256:{good_hash}", "strategy": "source-build"}, False),
+        ({"checksum": f"sha256:{good_hash}", "strategy": "local-copy"}, False),
+    ]:
+        if (checksum_error("fixture", "*", info, release=True) is None) != accepted:
+            raise AssertionError(info)
 
     current_platform_errors = audit_manifest(manifest, ["linux-amd64"])
     if current_platform_errors != [

@@ -3006,6 +3006,10 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         "binary verify",
         "support fetch",
         "support verify",
+        "missing checksum",
+        "development strategy",
+        "optional missing checksum",
+        "metadata development strategy",
         "updated",
         "app fetch",
         "app verify",
@@ -3067,7 +3071,9 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         if outcome.starts_with("optional") {
             let optional = json!({
                 "install_path":"libexec/optional/v2/runner",
-                "platforms":{(crate::setup::detect_platform()):{"cid":raw_cid(b"optional support")}}
+                "platforms":{(crate::setup::detect_platform()):{
+                    "cid":raw_cid(b"optional support"), "checksum":format!("sha256:{}", digest(b"optional support"))
+                }}
             });
             if outcome == "optional moved restored" {
                 old_value["external"]["optional"] = optional.clone();
@@ -3110,6 +3116,21 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         value["capsules"]["fixture-app"] = json!({
             "cid":raw_cid(&app), "sha256":digest(&app), "size":app.len()
         });
+        if outcome == "missing checksum" {
+            value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
+                .as_object_mut()
+                .unwrap()
+                .remove("checksum");
+        } else if outcome == "development strategy" {
+            value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
+                ["strategy"] = json!("source-build");
+        } else if outcome == "optional missing checksum" {
+            value["external"]["optional"] = json!({"platforms":{"*":{"cid":raw_cid(b"optional")}}});
+        } else if outcome == "metadata development strategy" {
+            value["external"]["fixture-provider"]["capsule_metadata"] = json!({
+                "platforms":{"*":{"strategy":"local-copy", "checksum":format!("sha256:{}", digest(b"metadata"))}}
+            });
+        }
         let old_components = serde_json::to_vec(&old_value).unwrap();
         let components = serde_json::to_vec(&value).unwrap();
         fixture.publish_installed_release_with_components(&old_components);
@@ -3181,6 +3202,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         let release_cid = request.release_cid.clone();
         let components_cid = raw_cid(&components);
         let app_cid = raw_cid(&app);
+        let original_sources = fs::read(fixture.data.join("sources.json")).unwrap();
         let items = std::collections::BTreeMap::from([
             (request.head_cid.clone(), head),
             (request.release_cid.clone(), release),
@@ -3190,6 +3212,19 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             (app_cid.clone(), app),
         ]);
         let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+            if [
+                "missing checksum",
+                "development strategy",
+                "optional missing checksum",
+                "metadata development strategy",
+            ]
+            .contains(&outcome)
+            {
+                assert!(
+                    cid != support_cid && cid != app_cid,
+                    "support fetched before manifest admission: {outcome}"
+                );
+            }
             let bytes = items.get(&cid).unwrap().clone();
             let data = data.clone();
             let original_binary = original_binary.clone();
@@ -3293,6 +3328,10 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             assert_eq!(owner.controller.child.as_ref().unwrap().pid(), pid);
             assert_eq!(status.phase, "failed");
             assert!(status.message.contains("unchanged"));
+            assert_eq!(
+                fs::read(fixture.data.join("sources.json")).unwrap(),
+                original_sources
+            );
             if outcome.ends_with("fetch") {
                 assert!(status
                     .message

@@ -678,6 +678,9 @@ try:
         raise ValueError("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata")
     if hashlib.sha256(release_bytes).hexdigest() != expected:
         raise ValueError("Release envelope differs from the signed head")
+    core = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    if not re.fullmatch(core + r"(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?", str(head.get("version", ""))):
+        raise ValueError("Invalid signed release version; expected X.Y.Z or X.Y.Z-{alpha|beta|rc}.N")
     for field in ("version", "channel"):
         value = head.get(field)
         if not isinstance(value, str) or not value or release.get(field) != value:
