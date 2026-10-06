@@ -4459,6 +4459,33 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn extracted_bundle_checksum_receipt_matches_only_the_same_sha256_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let reason = |expected: String| {
+            let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+                "extract_path": "bundle", "checksum": expected
+            }))
+            .unwrap();
+            extracted_bundle_cache_stale_reason(tmp.path(), &info)
+        };
+        let stale = Some("extracted bundle checksum metadata missing or stale".to_string());
+
+        assert_eq!(reason(format!("sha256:{digest}")), stale, "receipt missing");
+        // Registry capsule installs record the bare digest of the same archive.
+        fs::write(tmp.path().join(CACHED_ARTIFACT_SHA_FILE), format!("{digest}\n")).unwrap();
+        assert_eq!(reason(format!("sha256:{digest}")), None);
+        assert_eq!(reason(format!("sha256:{}", "b".repeat(64))), stale);
+        assert_eq!(reason(format!("sha512:{digest}")), stale);
+        fs::write(
+            tmp.path().join(CACHED_ARTIFACT_SHA_FILE),
+            format!("sha256:{digest}\n"),
+        )
+        .unwrap();
+        assert_eq!(reason(format!("sha512:{digest}")), stale);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn model_confinement_predeclares_only_current_pinned_engine_bundle() {
