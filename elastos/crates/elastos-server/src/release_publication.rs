@@ -964,13 +964,7 @@ fn reject_ancestor(parent: &File, root: &File) -> Result<()> {
     }
 }
 fn space_fits(capacity: u128, available: u128, reserved: u128) -> bool {
-    capacity > 0
-        && available <= capacity
-        && available
-            .checked_sub(reserved)
-            .and_then(|n| n.checked_mul(100))
-            .map(|n| n >= capacity.saturating_mul(15))
-            .unwrap_or(false)
+    capacity > 0 && available <= capacity && reserved <= available
 }
 fn available_space(parent: &File, total: u64, count: usize) -> Result<()> {
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -987,7 +981,7 @@ fn available_space(parent: &File, total: u64, count: usize) -> Result<()> {
             u128::from(stats.f_bavail) * unit,
             reserved
         ),
-        "snapshot would cross 15 percent free-space floor"
+        "snapshot needs more free space than the volume has"
     );
     Ok(())
 }
@@ -1586,11 +1580,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reservation_keeps_fifteen_percent_free() {
+    fn snapshot_reservation_must_fit_available_bytes() {
         assert!(space_fits(1000, 200, 50));
-        assert!(!space_fits(1000, 200, 51));
-        assert!(!space_fits(1000, 140, 0));
+        assert!(space_fits(1000, 200, 200));
         assert!(!space_fits(1000, 200, 201));
+        // Volume size alone never refuses a snapshot that fits.
+        assert!(space_fits(1 << 50, 10, 10));
+        assert!(!space_fits(1000, 1001, 0));
         assert!(!space_fits(0, 0, 0));
     }
 }

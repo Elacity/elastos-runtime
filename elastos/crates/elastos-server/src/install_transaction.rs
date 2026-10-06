@@ -25,18 +25,6 @@ const JOURNAL_TMP: &str = ".elastos.update-journal.tmp";
 const STAGE: &str = ".elastos.update-stage";
 const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
-const RESERVE_PERCENT: u128 = 15;
-
-#[derive(Debug)]
-pub(crate) struct DiskReserveError;
-
-impl std::fmt::Display for DiskReserveError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("update would cross the 15% disk reserve; previous release preserved")
-    }
-}
-
-impl std::error::Error for DiskReserveError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -828,7 +816,7 @@ impl InstallTransaction {
                             break;
                         }
                         let (total, available) = disk_space(backup.parent().unwrap())?;
-                        require_disk_reserve(total, available, count as u128)?;
+                        require_update_space(total, available, count as u128)?;
                         output.write_all(&buffer[..count])?;
                     }
                     output.sync_all()?;
@@ -1384,7 +1372,7 @@ impl InstallTransaction {
             volume.2 += u128::from(bytes);
         }
         for (total, available, needed) in volumes.values() {
-            require_disk_reserve(*total, *available, *needed)?;
+            require_update_space(*total, *available, *needed)?;
         }
         Ok(())
     }
@@ -1446,7 +1434,7 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let mut file = open_new(path, mode)?;
     for chunk in bytes.chunks(64 * 1024) {
         let (total, available) = disk_space(path.parent().unwrap())?;
-        require_disk_reserve(total, available, chunk.len() as u128)?;
+        require_update_space(total, available, chunk.len() as u128)?;
         file.write_all(chunk)?;
     }
     file.sync_all()?;
@@ -1783,17 +1771,31 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
     ))
 }
 
-fn require_disk_reserve(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
-    let reserve = (total * RESERVE_PERCENT).div_ceil(100);
-    if total == 0 || available < reserve || needed > available.saturating_sub(reserve) {
-        return Err(DiskReserveError.into());
-    }
-    Ok(())
+/// Update staging, support staging, the update controller and the installer's
+/// `install-release` writer all admit their bytes through this one check.
+fn require_update_space(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
+    // A volume that reports no size has nothing to admit.
+    let available = if total == 0 { 0 } else { available };
+    Ok(elastos_common::require_free_space(available, needed)?)
 }
 
-pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyhow::Result<()> {
+pub(crate) fn require_controller_update_space(path: &Path, needed: u64) -> anyhow::Result<()> {
     let (total, available) = disk_space(path)?;
-    require_disk_reserve(total, available, u128::from(needed))
+    require_update_space(total, available, u128::from(needed))
+}
+
+/// Device and available bytes of the volume holding `path` or its nearest
+/// existing ancestor. A volume that reports no size has nothing available.
+pub(crate) fn volume_space(path: &Path) -> anyhow::Result<(u64, u128)> {
+    let mut volume = path;
+    while !volume.exists() {
+        volume = volume.parent().context("disk parent missing")?;
+    }
+    let (total, available) = disk_space(volume)?;
+    Ok((
+        fs::metadata(volume)?.dev(),
+        if total == 0 { 0 } else { available },
+    ))
 }
 
 /// Waits between attempts to start a binary that was just written. On Linux a
@@ -3128,10 +3130,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn disk_floor_counts_projected_peak_and_accepts_exact_reserve() {
-        assert!(require_disk_reserve(1000, 149, 0).is_err());
-        assert!(require_disk_reserve(1000, 200, 51).is_err());
-        assert!(require_disk_reserve(1000, 200, 50).is_ok());
-        assert!(require_disk_reserve(0, 200, 0).is_err());
+    fn update_and_installer_writes_keep_the_shared_free_space_reserve() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let needed = 300 * 1024 * 1024;
+        // Exactly needed + reserve is admitted; one byte less is refused.
+        assert!(require_update_space(1 << 40, needed + reserve, needed).is_ok());
+        let refused = require_update_space(1 << 40, needed + reserve - 1, needed).unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<elastos_common::NotEnoughFreeSpace>(),
+            Some(&elastos_common::NotEnoughFreeSpace { needed })
+        );
+        // Volume size alone never refuses; a volume reporting no size admits nothing.
+        assert!(require_update_space(1 << 50, needed + reserve, needed).is_ok());
+        assert!(require_update_space(0, needed + reserve, needed).is_err());
     }
 }

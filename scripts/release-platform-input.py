@@ -741,8 +741,8 @@ def copy_support(args):
             raise ValueError("support receipt changed during admission")
         usage = shutil.disk_usage(root)
         required = sum(item["size"] for item in records.values()) + len(receipt_bytes)
-        if (usage.free - required) * 100 < usage.total * 15:
-            raise ValueError("support reuse requires 15% free after its copy")
+        if usage.free < required:
+            raise ValueError("support reuse needs free space for its copy")
         for name, expected in [*records.items(), ("platform-input.json", receipt_record)]:
             target = "support-input.json" if name == "platform-input.json" else name
             input_fd = support_file_descriptor(source_fd, name, os.O_RDONLY | os.O_NONBLOCK)
@@ -965,8 +965,8 @@ def stage_inputs(values, version, output, preview_platform=None):
     parent = output.parent.resolve()
     parent.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(parent)
-    if (usage.free - sum(record["size"] for record in files.values())) * 100 < usage.total * 15:
-        raise ValueError("publication staging requires at least 15% free after its copy")
+    if usage.free < sum(record["size"] for record in files.values()):
+        raise ValueError("publication staging needs free space for its copy")
     with tempfile.TemporaryDirectory(prefix=".platform-import-", dir=parent) as temporary:
         stage = Path(temporary) / "input"
         artifacts = stage / "artifacts"
@@ -1172,7 +1172,7 @@ def signing_input(stage, cids_path, stamps_path, channel, output,
     signer.require(not destination.is_relative_to(stage.resolve()), "signing input output must be outside staging")
     usage = shutil.disk_usage(parent)
     total = sum(info["size"] for info in files.values()) + len(manifest_bytes)
-    signer.require((usage.free - total) * 100 >= usage.total * 15, "signing input requires 15 percent free after its copy")
+    signer.require(usage.free >= total, "signing input needs free space for its copy")
     with tempfile.TemporaryDirectory(prefix=".signing-input-", dir=parent) as temporary:
         prepared = Path(temporary) / "input"
         prepared.mkdir(mode=0o700)

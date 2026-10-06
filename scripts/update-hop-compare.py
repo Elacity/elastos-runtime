@@ -265,7 +265,6 @@ def inspect(config):
     need(root.is_absolute() and root.is_dir(), "prepared stable fixture root required")
     need(not any(part in ("tmp", "private", "target") for part in root.parts), "use a stable task-owned fixture root")
     need(root.resolve() == root, "fixture root must use its physical path")
-    need(shutil.disk_usage(root).free / shutil.disk_usage(root).total >= 0.1, "free disk is below 10%")
     need(config["old"]["version"] != config["new"]["version"], "same-version input cannot test an update hop")
     need(config["old"]["binary_sha256"] != config["new"]["binary_sha256"], "update requires different binaries")
     for binding in (config["source"], config["old"]["source"], config["new"]["source"]):
@@ -312,7 +311,7 @@ def inspect(config):
     fixture_components(paths["components"])
     disk = shutil.disk_usage(root)
     growth = 2 * sum(paths[key].stat().st_size for key in ("binary", "components"))
-    need((disk.free - growth) / disk.total >= 0.1, "two update copies would breach the 10% disk reserve")
+    need(disk.free >= growth, "two update copies need more free disk space than the volume has")
     head, release = read(paths["head"]), read(paths["release"])
     for envelope in (head, release):
         need(envelope["payload"]["version"] == config["new"]["version"], "publication version differs")
@@ -901,7 +900,7 @@ def cli_admit(config, local_rehearsal=None):
          "native CI rehearsal requires the signed model catalogue fixture")
     disk = shutil.disk_usage(root)
     growth = 8 * sum(value["bytes"] for value in manifest["files"].values())
-    need((disk.free - growth) / disk.total >= 0.15, "fixture copies would breach the 15% disk reserve")
+    need(disk.free >= growth, "fixture copies need more free disk space than the volume has")
     return manifest
 
 
@@ -950,7 +949,7 @@ def cli_reclaim_xcode(applications, protected, growth, measure, remove):
     disk = measure()
     before = disk.free
     for name in CI_XCODE_APPS:
-        if (disk.free - growth) / disk.total >= .15:
+        if disk.free >= growth:
             break
         path = applications / name
         if not path.exists() or path.is_symlink() or path in protected:
@@ -960,7 +959,7 @@ def cli_reclaim_xcode(applications, protected, growth, measure, remove):
         need(not path.exists() and all(retained.is_dir() for retained in protected), "Xcode reclaim or preservation failed")
         disk = measure()
         removed.append({"app": name, "allocated_bytes": allocated, "free_bytes_after": disk.free})
-    return {"status": "ready" if (disk.free - growth) / disk.total >= .15 else "unavailable",
+    return {"status": "ready" if disk.free >= growth else "unavailable",
             "retained": sorted(path.name for path in protected), "removed": removed,
             "free_bytes_before": before, "free_bytes_after": disk.free, "total_bytes": disk.total, "planned_growth_bytes": growth}
 
@@ -980,14 +979,14 @@ def cli_reclaim_android(runner_home, runner_uid, receipt, measure, remove):
              and path.stat().st_uid == runner_uid and path.is_relative_to(runner_home),
              "Android SDK ancestry or owner differs")
     before = measure()
-    if (before.free - receipt["planned_growth_bytes"]) / before.total >= .15:
+    if before.free >= receipt["planned_growth_bytes"]:
         receipt.update(status="ready", free_bytes_after=before.free, total_bytes=before.total)
         return receipt
     allocated = remove(sdk)
     need(not sdk.exists() and runner_home.is_dir() and (runner_home / "Library/Android").is_dir(), "Android SDK reclaim exceeded its owned directory")
     disk = measure()
     receipt["removed"].append({"tool": "runner Android SDK", "allocated_bytes": allocated, "free_bytes_before": before.free, "free_bytes_after": disk.free})
-    receipt.update(status="ready" if (disk.free - receipt["planned_growth_bytes"]) / disk.total >= .15 else "unavailable",
+    receipt.update(status="ready" if disk.free >= receipt["planned_growth_bytes"] else "unavailable",
                    free_bytes_after=disk.free, total_bytes=disk.total)
     return receipt
 
@@ -1071,7 +1070,7 @@ def cli_build_hop(root, runtime, local_rehearsal=None):
          and not any(part in ("tmp", "private", "target") for part in root.parts), "fresh stable build root required")
     need(runtime.is_file() and not runtime.is_symlink(), "built Runtime input is unavailable")
     disk = shutil.disk_usage(root.parent)
-    need((disk.free - 4 * 1024**3) / disk.total >= .15, "hop rebuild would breach the disk reserve")
+    need(disk.free >= 4 * 1024**3, "hop rebuild needs more free disk space than the volume has")
     need(not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(), "hop build requires a clean admitted source")
     root.mkdir(mode=0o700)
     source = local_source or {key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
@@ -1466,7 +1465,7 @@ def cli_generate_hop(root, runtime, next_runtime, build_receipt, support_home, l
     growth = 12 * (2 * runtime.stat().st_size + next_runtime.stat().st_size + sum((support_home / ("bin/" + name)).stat().st_size
                                                    for name in CLI_NATIVE_SETUP) + sum(path.stat().st_size for path in home_paths)
                    + sum(len(raw) for raw, _ in metadata_files.values()) + (len(metadata_raw) if metadata_info else 0))
-    need((disk.free - growth) / disk.total >= .15, "refusal generation would breach the disk reserve")
+    need(disk.free >= growth, "refusal generation needs more free disk space than the volume has")
     root.mkdir(mode=0o700)
     scratch = root / "generator"
     scratch.mkdir(mode=0o700)
