@@ -320,12 +320,14 @@ jobs:
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
-      - name: test own-workspace capsules
+      - name: lint and test own-workspace capsules
         run: |
           set -uo pipefail
           failed=0
           for lock in capsules/*/Cargo.lock; do
               capsule="$(dirname "$lock")"
+              echo "== linting $capsule =="
+              (cd "$capsule" && cargo clippy --all-targets -- -D warnings) || failed=1
               echo "== testing $capsule =="
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done

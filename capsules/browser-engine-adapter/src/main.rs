@@ -2470,16 +2470,11 @@ enum AdapterKind {
     ContractProof,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AdapterNetworkMode {
+    #[default]
     RuntimeNetOnly,
-}
-
-impl Default for AdapterNetworkMode {
-    fn default() -> Self {
-        Self::RuntimeNetOnly
-    }
 }
 
 #[derive(Debug, Deserialize)]
