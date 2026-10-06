@@ -3964,6 +3964,7 @@ mod tests {
                             previous_binary_sha256: hex::encode(sha2::Sha256::digest(
                                 std::fs::read(&binary).unwrap(),
                             )),
+                            support_paths: Default::default(),
                         })
                         .unwrap();
                 } else {
