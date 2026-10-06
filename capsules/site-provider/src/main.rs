@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::Router;
 use serde::{Deserialize, Serialize};
@@ -274,7 +274,7 @@ fn status_json(
     .unwrap_or_else(|_| serde_json::json!({ "running": running }))
 }
 
-fn validate_site_root(site_root: &PathBuf) -> Result<(), String> {
+fn validate_site_root(site_root: &Path) -> Result<(), String> {
     if !site_root.exists() {
         return Err(format!("site root does not exist: {}", site_root.display()));
     }

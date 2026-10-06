@@ -3693,9 +3693,7 @@ fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
 
 fn commit_direct_selection(state: &mut AppState, conversation_id: &str) -> Option<SelectionGuard> {
     let clean_id = conversation_id.trim();
-    if selected_conversation(&state.direct.conversations, clean_id).is_none() {
-        return None;
-    }
+    selected_conversation(&state.direct.conversations, clean_id)?;
     if state.direct.selected_conversation_id.as_deref() != Some(clean_id) {
         bump_selection_generation(state);
         state.direct.selected_conversation_id = Some(clean_id.to_string());
