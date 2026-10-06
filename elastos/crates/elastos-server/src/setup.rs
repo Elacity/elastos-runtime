@@ -7364,8 +7364,10 @@ pub(crate) mod tests {
         }
     }
 
-    async fn carrier_component_download_fixture(
+    pub(crate) async fn carrier_component_download_fixture(
         data_dir: &Path,
+        release_path: &'static str,
+        bytes: Vec<u8>,
     ) -> (iroh::Endpoint, tokio::task::JoinHandle<()>, PlatformInfo) {
         use tokio::io::AsyncBufReadExt;
 
@@ -7395,15 +7397,14 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let bytes = b"carrier fixture";
-        let digest = sha2::Sha256::digest(bytes);
+        let digest = sha2::Sha256::digest(&bytes);
         let cid = cid::Cid::new_v1(
             0x55,
             cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
         );
         let info: PlatformInfo = serde_json::from_value(serde_json::json!({
             "url": "http://127.0.0.1:9/unused",
-            "release_path": "artifact",
+            "release_path": release_path,
             "cid": cid.to_string(),
             "checksum": format!("sha256:{digest:x}")
         }))
@@ -7419,12 +7420,12 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
-                "artifact"
+                release_path
             );
             send.write_all(&(bytes.len() as u64).to_be_bytes())
                 .await
                 .unwrap();
-            send.write_all(bytes).await.unwrap();
+            send.write_all(&bytes).await.unwrap();
             send.finish().unwrap();
             connection.closed().await;
         });
@@ -7434,7 +7435,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn download_component_accepts_release_path_and_cid_over_carrier() {
         let tmp = tempfile::tempdir().unwrap();
-        let (server, serving, info) = carrier_component_download_fixture(tmp.path()).await;
+        let (server, serving, info) =
+            carrier_component_download_fixture(tmp.path(), "artifact", b"carrier fixture".to_vec())
+                .await;
         let dest = tmp.path().join("bin/kubo");
         let result = download_component(
             tmp.path(),
@@ -7456,7 +7459,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn download_component_rejects_cid_checksum_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let (server, serving, mut info) = carrier_component_download_fixture(tmp.path()).await;
+        let (server, serving, mut info) =
+            carrier_component_download_fixture(tmp.path(), "artifact", b"carrier fixture".to_vec())
+                .await;
         info.checksum = Some(format!(
             "sha256:{:x}",
             sha2::Sha256::digest(b"different component")
