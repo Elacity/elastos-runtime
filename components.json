@@ -1371,35 +1371,6 @@
         }
       }
     },
-    "crosvm": {
-      "install_path": "bin/crosvm",
-      "description": "crosvm VM monitor required for capsule microVM execution",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "QmU9LGXBWbar3cvPmBCennB5RgJs1GQehMNwZhKZBPdxgP",
-          "checksum": "sha256:f18567c730a01dc296cfb72e6dd650dedc28249387200ae29fa7e939d4b6b5a4",
-          "size": 13730576,
-          "install_path": "bin/crosvm"
-        },
-        "linux-arm64": {
-          "cid": "QmYUMQzCftCbKnuN1MKvqfPjXN2UnYFpxCy8bGBfAKqqV5",
-          "checksum": "sha256:5a5cac01177b85dca09cf230289ed92516f9e4d94788e91f1852fcc24b92b41b",
-          "size": 9301632,
-          "install_path": "bin/crosvm"
-        }
-      }
-    },
-    "vmlinux": {
-      "install_path": "bin/vmlinux",
-      "description": "ElastOS guest kernel (6.1.59, CONFIG_VIRTIO_CONSOLE=y) for crosvm capsule boot",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "Qmeb1qaqfMiri7G123FWmMz6qt74xhPjAgAJEy8ZSrFKh7",
-          "checksum": "sha256:eccb4f318ba37309af5fae01bc610b76033707ec8149002d26675aed66d8578b",
-          "install_path": "bin/vmlinux"
-        }
-      }
-    },
     "kubo": {
       "platforms": {
         "linux-amd64": {
@@ -1466,13 +1437,6 @@
     }
   },
   "profiles": {
-    "minimal": {
-      "description": "Runtime VM prerequisites only",
-      "components": [
-        "crosvm",
-        "vmlinux"
-      ]
-    },
     "home": {
       "description": "Managed Home",
       "components": [
@@ -1746,8 +1710,6 @@
         "inbox",
         "assistant",
         "model-provider",
-        "crosvm",
-        "vmlinux",
         "kubo",
         "cloudflared",
         "llama-server"

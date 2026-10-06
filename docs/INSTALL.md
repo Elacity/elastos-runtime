@@ -147,8 +147,8 @@ curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
 Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
-The default Home profile omits `crosvm` and `vmlinux`. Use an explicit profile
-or source-home provisioning for microVM and Browser VM work.
+Setup does not install `crosvm` or a guest kernel. Use source-home provisioning
+or `scripts/setup-crosvm.sh` for microVM and Browser VM work.
 
 The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
 maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof

@@ -157,7 +157,7 @@ for (const [label, changes, extraEnv] of [
   });
 }
 
-test('seed reconstructs all platform files and shared support from checked artifacts', t => {
+test('seed reconstructs all platform files and copies every other signed file from the Mac', t => {
   const f = fixture(t);
   assert.equal(f.prepare().status, 0);
   const signed = join(f.root, 'signed');
@@ -170,16 +170,20 @@ test('seed reconstructs all platform files and shared support from checked artif
     cpSync(join(f.root, p, 'inputs/N/artifacts', `elastos-${p}`), join(signed, `elastos-${p}`));
   }
   cpSync(join(f.root, 'aarch64-darwin/inputs/N/artifacts/shared.tar.gz'), join(signed, 'shared.tar.gz'));
+  // A signed file no native input carries.
+  writeFileSync(join(signed, 'mac-only.bin'), 'mac only');
   const result = run('bash', [f.script, 'seed', '1.2.3', signed], { env: f.env });
   run('bash', ['-n'], { input: result.stdout });
   const stage = join(f.root, 'stage/1.2.3');
   mkdirSync(join(stage, 'signed'), { recursive: true });
-  for (const name of ['install.sh', 'release.json', 'release-head.json', ...platforms.map(p => `components-${p}.json`)]) {
-    cpSync(join(signed, name), join(stage, 'signed', name));
-  }
+  // Copy exactly what the printed Mac scp line names.
+  const copied = result.stdout.match(/^scp (.+) \S+:\S+\/signed\/$/m)[1].split(' ');
+  for (const file of copied) cpSync(file, join(stage, 'signed', file.split('/').at(-1)));
+  assert.ok(copied.every(file => !/elastos-|shared/.test(file)), 'native artifacts come from the run');
   cpSync(join(f.root, 'work/1.2.3/signed.SHA256SUMS'), join(stage, 'signed.SHA256SUMS'));
   // Run only artifact reconstruction. Service and publication commands stay printed.
   const reconstruction = result.stdout.split('# On the seed as the service user,')[1].split('export ELASTOS_DATA_DIR=')[0];
   run('bash', ['-c', '#' + reconstruction], { env: { ...f.env, GH_TOKEN: 'fixture' } });
   for (const p of platforms) assert.equal(readFileSync(join(stage, 'signed', `elastos-${p}`), 'utf8'), `${p}-1.2.3`);
+  assert.equal(readFileSync(join(stage, 'signed/mac-only.bin'), 'utf8'), 'mac only');
 });

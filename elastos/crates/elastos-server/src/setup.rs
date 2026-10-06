@@ -465,18 +465,6 @@ async fn run_with_data_dir(
                     note,
                     source.display()
                 );
-                // Actionable guidance for the most common local-copy case: vmlinux on aarch64.
-                if name == "vmlinux" {
-                    println!("       MicroVM capsules will not work without a guest kernel.");
-                    println!(
-                        "       On Jetson/aarch64, ensure {} exists (the host kernel).",
-                        source.display()
-                    );
-                    println!(
-                        "       On other aarch64 hosts, copy a compatible kernel to {}.",
-                        source.display()
-                    );
-                }
                 skipped_count += 1;
                 continue;
             }
@@ -2550,7 +2538,7 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     print_profile_section(
         "Advanced profiles:",
         manifest,
-        &["minimal", "public-gateway", "agent-local-ai", "full"],
+        &["public-gateway", "agent-local-ai", "full"],
     );
 
     let listed = [
@@ -2558,7 +2546,6 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
         "demo",
         "blockchain",
         "operator",
-        "minimal",
         "public-gateway",
         "agent-local-ai",
         "full",
@@ -6674,14 +6661,17 @@ pub(crate) mod tests {
             admit_release_components(&manifest, platform)
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }
-        for profile in ["minimal", "full"] {
-            let selected = resolve_components(&manifest, Some(profile), &[], &[]).unwrap();
-            assert!(selected.iter().any(|name| name == "vmlinux"));
+        // The signer binds every pinned component to a release file, so no
+        // descriptor may name bytes only by CID.
+        for (name, component) in &manifest.external {
+            for (platform, info) in &component.platforms {
+                assert!(
+                    info.cid.as_deref().is_none_or(str::is_empty)
+                        || info.release_path.as_deref().is_some_and(|p| !p.is_empty()),
+                    "{name} {platform}: CID-only descriptor cannot be signed"
+                );
+            }
         }
-        let kernel = &manifest.external["vmlinux"];
-        assert!(resolve_platform_info(kernel, "linux-arm64").is_none());
-        assert!(resolve_platform_info(kernel, "aarch64-linux").is_none());
-        assert!(resolve_platform_info(kernel, "linux-amd64").is_some());
     }
 
     #[test]

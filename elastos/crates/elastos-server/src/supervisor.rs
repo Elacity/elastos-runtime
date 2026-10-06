@@ -981,8 +981,8 @@ impl Supervisor {
         }
         self.crosvm_config.validate().map_err(|e| {
             anyhow::anyhow!(
-                "VM prerequisites missing: {}. Run `elastos setup --with crosvm --with vmlinux` \
-                 and ensure files exist under ~/.local/share/elastos/bin/",
+                "VM prerequisites missing: {}. Install crosvm and a guest kernel under \
+                 ~/.local/share/elastos/bin/ (scripts/setup-crosvm.sh)",
                 e
             )
         })?;

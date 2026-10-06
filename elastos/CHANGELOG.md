@@ -12,6 +12,11 @@ All notable changes to the public ElastOS Runtime repository.
   `fetch-model.sh` and their tests. Models return later as a separate signed
   publication.
 
+- Setup no longer offers `crosvm` or a guest kernel, and the `minimal` profile is
+  gone. Their pinned bytes were unavailable, and a release cannot sign a
+  component that is not a release file. Release preparation now refuses any
+  component pinned only by CID, before signing.
+
 ### Fixed
 
 - Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and

@@ -988,6 +988,18 @@ def stage_inputs(values, version, output, preview_platform=None):
     return record
 
 
+def cid_only_descriptors(value, path="components"):
+    """Descriptors naming bytes by CID without a release file; the signer refuses them."""
+    if isinstance(value, dict):
+        if "cid" in value and not (isinstance(value.get("release_path"), str) and value["release_path"]):
+            yield path
+        for key, child in value.items():
+            yield from cid_only_descriptors(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from cid_only_descriptors(child, f"{path}[{index}]")
+
+
 def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     record = json.loads(regular_file(stage, "assembly.json").read_text())
     source = record["source"]
@@ -1010,6 +1022,8 @@ def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     if file_record(components) != record["components"]:
         raise ValueError("staged components changed after admission")
     manifest = json.loads(components.read_text())
+    for path in cid_only_descriptors(manifest):
+        raise ValueError(f"{path}: CID has no release file")
     for platform in record["platforms"]:
         setup = PLATFORMS[platform][0]
         check_binary(regular_file(stage / "artifacts", f"elastos-{platform}"), platform)

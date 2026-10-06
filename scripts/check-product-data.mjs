@@ -269,9 +269,7 @@ export function validateComponents(components, manifests) {
     assert(object(component.platforms) && Object.keys(component.platforms).length > 0, `${name}: release platforms`);
     for (const [platform, metadata] of Object.entries(component.platforms)) {
       assert(object(metadata), `${name}: ${platform} metadata`);
-      if (["crosvm", "vmlinux", "cloudflared"].includes(name)) {
-        assert(text(metadata.release_path) || text(metadata.url) || text(metadata.cid) || (metadata.strategy === "local-copy" && text(metadata.source)), `${name}: ${platform} artifact source`);
-      } else present(metadata.release_path, `${name}: ${platform} release path`);
+      present(metadata.release_path, `${name}: ${platform} release path`);
       const installPath = metadata.install_path ?? component.install_path;
       present(installPath, `${name}: ${platform} install path`);
       for (const path of [metadata.release_path, installPath, metadata.extract_path].filter((value) => value !== undefined)) safePath(path, `${name}: ${platform} artifact`);
