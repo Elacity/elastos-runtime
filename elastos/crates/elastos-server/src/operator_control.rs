@@ -495,20 +495,20 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
         ),
     )
     .await
-    .context("trusted source Carrier connection timed out")?
+    .context(crate::update::UpdateSourceUnavailable)?
     .with_context(|| {
         format!(
             "Carrier connection to trusted source '{}' failed. Remote operator update check stays Carrier-only.",
             source.name
         )
-    })?;
+    }).context(crate::update::UpdateSourceUnavailable)?;
     let session = OperatorCarrierSession::new(client);
     let result = tokio::time::timeout(
         OPERATOR_UPDATE_CHECK_TIMEOUT,
         gather_update_check_with_client(&session.client, &source),
     )
     .await
-    .context("signed update check timed out")
+    .context(crate::update::UpdateSourceUnavailable)
     .and_then(|result| result);
     let drained = session.finish().await;
     result.and_then(|check| drained.map(|()| check))
@@ -541,7 +541,10 @@ async fn gather_update_check_with_client(
     )?;
     let release_cid = bounded_release_text(&head["payload"], "latest_release_cid", 128)?;
     cid::Cid::try_from(release_cid).context("signed release head CID is invalid")?;
-    let release_bytes = client.fetch_content(release_cid, None).await?;
+    let release_bytes = client
+        .fetch_content(release_cid, None)
+        .await
+        .context(crate::update::UpdateSourceUnavailable)?;
     verified_update_check(source, &discovered, &release_bytes)
 }
 

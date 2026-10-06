@@ -598,3 +598,64 @@ test("System startup and recovery stay ready while the background Carrier check 
       "shell", "accounts", "recovery", "chains", "catalogue"]);
   }
 });
+
+test("System shows matching download and verification progress while Home stays connected", async () => {
+  const f = updateFixture();
+  await f.context.onRuntimeUpdateApply();
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  for (const [phase, message] of [
+    ["downloading", "Downloading the update (88 MB). Home restarts when the update is ready."],
+    ["verifying", "Verifying the update. Home restarts when the update is ready."],
+  ]) {
+    f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase, message } });
+    assert.equal(f.status.textContent, message);
+    assert.equal(f.context.runtimeUpdatePending.phase, phase);
+    assert.equal(f.button.disabled, true);
+    const reopened = updateFixture();
+    reopened.context.renderRuntimeUpdate({ ...reopened.offer, controller: { id, phase, message } });
+    assert.equal(reopened.status.textContent, message);
+    assert.equal(reopened.button.disabled, true);
+  }
+  const message = "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.";
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "failed", message } });
+  assert.equal(f.status.textContent, message);
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.button.disabled, false);
+});
+
+test("System cancellation explains the unchanged Home and keeps private errors out of update copy", async () => {
+  for (const error of [Object.assign(new Error("private detail"), { name: "NotAllowedError" }),
+    new Error("Passkey verification was cancelled."), new Error("The operation timed out or was not allowed.")]) {
+    const f = updateFixture({ requestPasskeyStepUp: async () => { throw error; } });
+    await f.context.onRuntimeUpdateApply();
+    assert.equal(f.status.textContent, "You cancelled the update. Home is unchanged.");
+    assert.equal(f.posts.length, 0);
+    assert.equal(f.button.disabled, false);
+  }
+  const f = updateFixture({ requestPasskeyStepUp: async () => { throw new Error("private signing path"); } });
+  await f.context.onRuntimeUpdateApply();
+  assert.match(f.status.textContent, /verification failed/);
+  assert(!f.status.textContent.includes("private"));
+});
+
+test("System reports an unreachable update source before queueing and allows a new choice", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = async () => { const error = new Error("private source endpoint"); error.status = 424; throw error; };
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.status.textContent, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.");
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.approvals.length, 1);
+});
+
+test("a slow update keeps polling while Home reports the approved download", async () => {
+  const f = updateFixture();
+  await f.context.onRuntimeUpdateApply();
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  const message = "Downloading the update (88 MB). Home restarts when the update is ready.";
+  f.context.refreshSystemSummary = async () => f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "downloading", message } });
+  for (let poll = 0; poll < 100; poll += 1) await f.context.pollRuntimeUpdate();
+  assert.equal(f.status.textContent, message);
+  assert.equal(f.context.runtimeUpdatePending.polls, 0);
+  assert.equal(f.button.disabled, true);
+});
