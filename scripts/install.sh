@@ -828,6 +828,7 @@ fi
 
 echo ""
 echo -e "${BOLD}ElastOS Installer${NC}"
+info "Maintainer DID: ${MAINTAINER_DID}"
 echo ""
 
 # ── Fetch + verify release head ──────────────────────────────────────

@@ -226,24 +226,37 @@ Replace `CID` and `GATEWAY_URL` with the source values.
 
 ## Compare and change the release signer
 
-Compare an announced release DID with the staged root DID in the repository
-[README](../README.md#install-from-the-publisher) before installing or changing
-a source. The source owner can re-trust an existing source explicitly:
+The maintainer release DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
+installer's `Maintainer DID:` line with the complete DID in the repository
+[README](../README.md#install-from-the-publisher).
 
-```sh
-elastos source add --name EXISTING_SOURCE --publisher NEW_DID
+An existing Home with the old source pin refuses a release signed by the new
+maintainer. On the Runtimes that still trust the old key, `elastos update`
+reports one line:
+
+```text
+Error: Signer DID mismatch: trusted set = ["<old DID>"], got did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
 ```
 
-Runtime asks for the complete new DID. Entering another value cancels the
-change. This step keeps the source's channel, install path, Carrier ticket and
-gateways. After confirmation, Runtime accepts release signatures from the new
-DID and refuses signatures from the former DID.
+Newer Runtimes add a second line: `This release is signed by a new publisher
+key. Run the publisher's install.sh to trust it; this installation was not
+changed.`
 
-An existing Home that keeps its old source pin refuses a release signed by the
-new maintainer. Its `elastos update` error names the signer mismatch and says to
-run the publisher's `install.sh`. That run is an explicit re-trust: it pins the
-new DID, installs the release and keeps identity, accounts and user files. Until
-then the Home trusts the old key and remains exposed if a copy of that key exists.
+The trusted set shows your Home's current DID. To re-trust once, run the
+publisher's installer over the existing installation, using the same command
+as a fresh install:
+
+```sh
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+```
+
+The installer trusts the new DID, installs the release and keeps your existing
+identity, accounts and user files. Later updates accept release signatures from
+the new DID and refuse signatures from the former DID. Homes that already trust
+this DID can use normal updates.
+Until you re-trust, Home still trusts the old key and remains exposed if a copy
+of that key exists.
 
 ## Installed files
 
