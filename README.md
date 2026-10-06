@@ -4,13 +4,15 @@ ElastOS is a local-first runtime for Apps and services. Runtime checks the
 authority of each caller before allowing an effect. People sign in to Home
 with passkeys.
 
-For released versions, supported installation targets and known limitations,
-see [state.md](state.md). A source checkout and a published installation have
-separate artifact identities and verification records.
-
 ## Install from the publisher
 
 The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
+
+The staged release root DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Before a staged
+install, compare this DID with the `MAINTAINER_DID` value in the frozen installer.
+Promotion to the live installer requires staged install and update acceptance
+and operator approval.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
@@ -73,13 +75,14 @@ admission is a separate, node-local verification decision. See the
 
 ## Status and verification
 
-Use [state.md](state.md) as the authority for current behavior and known gaps.
-It distinguishes implemented behavior from source-only paths and unverified
-product claims. Browser source and proof tooling alone do not establish
-complete Browser product support.
+Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for current
+behavior, known gaps and proof. [Install and update #89](https://github.com/Elacity/elastos-runtime/issues/89)
+owns installed release acceptance. A source checkout and a published install
+have separate artifact identities; source checks alone do not prove installed
+product or Browser support.
 
-Use [TASKS.md](TASKS.md) for open work, [ROADMAP.md](ROADMAP.md) for future
-direction, and [elastos/CHANGELOG.md](elastos/CHANGELOG.md) for release history.
+[ROADMAP.md](ROADMAP.md) links planned work;
+[elastos/CHANGELOG.md](elastos/CHANGELOG.md) records release history.
 
 For command ownership across Home and operator lanes, see the [command
 matrix](docs/COMMAND_MATRIX.md).
@@ -98,7 +101,6 @@ elastos-runtime/
 
 - [Getting started](docs/GETTING_STARTED.md): install, build, and create a capsule
 - [Documentation map](docs/README.md): complete guide and contract index
-- [State](state.md): verified behavior and known gaps
 - [Principles](PRINCIPLES.md): decision constraints
 - [Architecture](docs/ARCHITECTURE.md): trust and responsibility boundaries
 - [Capsule authoring](docs/CAPSULE_AUTHORING.md): supported Component and web-projection paths

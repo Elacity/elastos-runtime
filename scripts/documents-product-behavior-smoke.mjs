@@ -9,7 +9,8 @@ function assert(condition, message) {
   }
 }
 
-const source = readFileSync(resolve("capsules/documents/browser/index.html"), "utf8");
+const source = readFileSync(resolve("capsules/documents/browser/index.html"), "utf8") +
+  readFileSync(resolve("capsules/documents/browser/documents.js"), "utf8");
 
 const announceMatch = source.match(/function announceHomeChrome\(\) \{([\s\S]*?)\n\}/);
 const syncManifestMatch = source.match(/function syncHomeMenuManifest\(\) \{([\s\S]*?)\n\}/);

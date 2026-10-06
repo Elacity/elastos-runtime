@@ -8,7 +8,7 @@ source "$SOURCE_ROOT/scripts/publish-release.sh"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/prepare-release-platform.sh --version X.Y.Z --output DIR
+Usage: scripts/prepare-release-platform.sh --version X.Y.Z --output DIR [--reuse-support M1_DIR]
 
 Build local release inputs on Linux x86_64/ARM64 or macOS ARM64 from a clean
 checkout. DIR must be absent. Use a directory outside the checkout, or one
@@ -16,16 +16,27 @@ whose temporary sibling is ignored by Git. CARGO_TARGET_DIR selects the native
 build cache; otherwise Cargo resolves it. CARGO_BUILD_JOBS defaults to 4 (max 4).
 The output contains artifacts/, draft components.json and platform-input.json.
 Generic provider microVM rootfs and Browser substrate acceptance are separate.
+Fresh Linux ARM64 support requires ELASTOS_LLAMA_ARM64_BUNDLE to name the reviewed b10516
+archive. The archive is verified against its build recipe before any build.
+Use --reuse-support to build a new Runtime while keeping the exact support,
+capsules, catalogue and component template from a qualified native input.
+The input must use this platform and a different version. Its bytes and template
+are verified before Cargo runs; the output records their original receipt.
 EOF
 }
 
 VERSION=""
 OUTPUT=""
+REUSE_SUPPORT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version|--output)
+        --version|--output|--reuse-support)
             [[ $# -ge 2 && -n "$2" ]] || die "Missing value for $1"
-            if [[ "$1" == --version ]]; then VERSION="$2"; else OUTPUT="$2"; fi
+            case "$1" in
+                --version) VERSION="$2" ;;
+                --output) OUTPUT="$2" ;;
+                --reuse-support) REUSE_SUPPORT="$2" ;;
+            esac
             shift 2
             ;;
         --help|-h) usage; exit 0 ;;
@@ -39,9 +50,20 @@ done
 scripts/check-versioning.sh "$VERSION"
 OUTPUT=$(python3 - "$CALLER_DIR" "$OUTPUT" <<'PY'
 import os, sys
+from pathlib import Path
+path = Path(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
+# Canonicalize existing parent aliases while keeping the final output entry
+# intact for the existing-directory and dangling-symlink refusal below.
+print(path.parent.resolve() / path.name)
+PY
+)
+if [[ -n "$REUSE_SUPPORT" ]]; then
+    REUSE_SUPPORT=$(python3 - "$CALLER_DIR" "$REUSE_SUPPORT" <<'PY'
+import os, sys
 print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
 PY
 )
+fi
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || die "Output already exists: $OUTPUT"
 SOURCE_COMMIT=$(git rev-parse HEAD)
 SOURCE_TREE=$(git rev-parse 'HEAD^{tree}')
@@ -53,6 +75,20 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64; TARGET=aarch64-apple-darwin ;;
     *) die "Native preparation supports Linux x86_64/ARM64 and macOS ARM64" ;;
 esac
+if [[ -z "$REUSE_SUPPORT" && "$SETUP_PLATFORM" == linux-arm64 ]]; then
+    [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || die "ELASTOS_LLAMA_ARM64_BUNDLE is required for Linux ARM64"
+    python3 - "$ELASTOS_LLAMA_ARM64_BUNDLE" <<'PY'
+import hashlib, json, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+recipes = json.loads(pathlib.Path("scripts/release-upstream-recipes.json").read_text())["recipes"]
+info = next(item["source"] for item in recipes if item["component"] == "llama-server" and item["platform"] == "linux-arm64")
+if not source.is_file() or source.is_symlink() or source.stat().st_size > info["max_bytes"]:
+    raise SystemExit("ARM64 llama-server bundle is missing or has the wrong size")
+digest = hashlib.sha256(source.read_bytes()).hexdigest()
+if "sha256:" + digest != info["checksum"]:
+    raise SystemExit("ARM64 llama-server bundle checksum differs from components.json")
+PY
+fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 case "$CARGO_BUILD_JOBS" in 1|2|3|4) ;; *) die "CARGO_BUILD_JOBS must be between 1 and 4" ;; esac
 
@@ -67,7 +103,19 @@ TMPDIR="$WORK_DIR/build"
 mkdir -p "$STAGING/artifacts" "$TMPDIR"
 [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || die "Temporary output must be outside the checkout or ignored by Git"
 
-# Resolve exact/alias/* platform support through the existing integrity checker.
+# Reuse qualified bytes or resolve native support through the integrity checker.
+REUSE_SUPPORT_ARGS=()
+if [[ -n "$REUSE_SUPPORT" ]]; then
+    python3 scripts/release-platform-input.py copy-support \
+        --input "$REUSE_SUPPORT" --root "$STAGING" --platform "$PLATFORM" --version "$VERSION"
+    python3 - "$STAGING/support-input.json" "$WORK_DIR/omissions.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+pathlib.Path(sys.argv[2]).write_text(json.dumps(receipt["omitted_platform_components"]) + "\n")
+PY
+    SUPPORT_BINARY_ASSETS=()
+    REUSE_SUPPORT_ARGS=(--reuse-support)
+else
 python3 - "$SETUP_PLATFORM" "$WORK_DIR" "${SUPPORT_BINARY_ASSETS[@]}" <<'PY'
 import importlib.util, json, pathlib, sys
 spec = importlib.util.spec_from_file_location("integrity", "scripts/components-release-integrity-check.py")
@@ -88,10 +136,15 @@ for name in omitted:
 PY
 SUPPORT_BINARY_ASSETS=()
 while IFS= read -r name; do SUPPORT_BINARY_ASSETS+=("$name"); done < "$WORK_DIR/native-assets.txt"
+fi
 
 # locate-project reads workspace ownership without resolving or generating locks.
 missing_locks=()
-for name in elastos home-cli "${SUPPORT_BINARY_ASSETS[@]}"; do
+LOCK_COMPONENTS=(elastos)
+if [[ -z "$REUSE_SUPPORT" ]]; then
+    LOCK_COMPONENTS+=(home-cli ${SUPPORT_BINARY_ASSETS[@]+"${SUPPORT_BINARY_ASSETS[@]}"})
+fi
+for name in "${LOCK_COMPONENTS[@]}"; do
     if [[ "$name" == elastos ]]; then
         capsule_dir=elastos
     else
@@ -129,8 +182,8 @@ for value in sys.argv[1:]:
     while not path.exists():
         path = path.parent
     usage = shutil.disk_usage(path)
-    if usage.free * 10 < usage.total:
-        raise SystemExit(f"At least 10% free space is required on the volume for {value}")
+    if usage.free * 100 < usage.total * 15:
+        raise SystemExit(f"At least 15% free space is required on the volume for {value}")
 PY
 export CARGO_TARGET_DIR ELASTOS_RELEASE_VERSION="$VERSION"
 rustup target list --installed | grep -Fxq "$TARGET" || die "Required Rust target is not installed: $TARGET"
@@ -156,12 +209,15 @@ if [[ "$PLATFORM" == *-linux ]]; then
 fi
 assert_runtime_binary_embeds_release_version "$RUNTIME" "$PLATFORM" "$VERSION"
 cp "$RUNTIME" "$STAGING/artifacts/elastos-$PLATFORM"
+if [[ -z "$REUSE_SUPPORT" ]]; then
 NATIVE_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$BUILD_TARGET")
 APP_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
 PROVIDER_METADATA=$(build_platform_independent_provider_capsule_metadata_assets)
+UPSTREAM_ASSETS=$(build_upstream_direct_assets "$PLATFORM" "$SETUP_PLATFORM")
 DIRECT_ASSETS=$(merge_direct_assets "$(merge_direct_assets "$NATIVE_ASSETS" "$APP_ASSETS")" "$PROVIDER_METADATA")
+DIRECT_ASSETS=$(merge_direct_assets "$DIRECT_ASSETS" "$UPSTREAM_ASSETS")
 generate_components_json '{}' "$DIRECT_ASSETS" > "$WORK_DIR/components-merged.json"
-printf '%s\n' "$NATIVE_ASSETS" "$APP_ASSETS" "$PROVIDER_METADATA" | jq -s '.' > "$WORK_DIR/direct-assets.json"
+printf '%s\n' "$NATIVE_ASSETS" "$APP_ASSETS" "$PROVIDER_METADATA" "$UPSTREAM_ASSETS" | jq -s '.' > "$WORK_DIR/direct-assets.json"
 
 # Replace each built descriptor, including universal provider metadata, as a unit.
 # A recursive template merge must not retain an old CID or URL for new bytes.
@@ -176,24 +232,35 @@ for direct in json.loads((work / "direct-assets.json").read_text()):
             if "release_path" in info and "cid" not in info:
                 target["platforms"][key] = info
         metadata = component.get("capsule_metadata", {})
+        if metadata:
+            target_metadata = target.setdefault("capsule_metadata", {"platforms": {}})
+            target_metadata.update({key: value for key, value in metadata.items() if key != "platforms"})
         for key, info in metadata.get("platforms", {}).items():
             if "release_path" in info and "cid" not in info:
-                target["capsule_metadata"]["platforms"][key] = info
+                target_metadata.setdefault("platforms", {})[key] = info
 pathlib.Path(sys.argv[2]).write_text(json.dumps(draft, indent=2) + "\n")
 PY
 for asset in "$TMPDIR/supported-assets-$PLATFORM"/* \
     "$TMPDIR/supported-assets-universal"/* \
-    "$TMPDIR/supported-provider-contracts-universal"/*; do
+    "$TMPDIR/supported-provider-contracts-universal"/* \
+    "$TMPDIR/supported-upstream-assets-$PLATFORM"/*.tar.gz; do
     [[ -f "$asset" ]] || continue
-    cp "$asset" "$STAGING/artifacts/"
+    [[ ! -L "$asset" ]] || die "Prepared artifact must be a regular owned file: $asset"
+    destination="$STAGING/artifacts/$(basename "$asset")"
+    [[ ! -e "$destination" && ! -L "$destination" ]] || die "Prepared artifact names must be distinct"
+    # Build output and stage share a volume; avoid copying the payloads.
+    mv "$asset" "$destination"
 done
+cp "$TMPDIR/supported-upstream-assets-$PLATFORM/upstream-input.json" "$STAGING/upstream-input.json"
+cp scripts/release-upstream-recipes.json "$STAGING/upstream-recipes.json"
 if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
     cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
+fi
 fi
 python3 scripts/release-platform-input.py record \
     --root "$STAGING" --version "$VERSION" --platform "$PLATFORM" --target "$TARGET" \
     --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
-    --omissions-json "$WORK_DIR/omissions.json"
+    --omissions-json "$WORK_DIR/omissions.json" ${REUSE_SUPPORT_ARGS[@]+"${REUSE_SUPPORT_ARGS[@]}"}
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || die "Output appeared during preparation: $OUTPUT"
 mv "$STAGING" "$OUTPUT"
 info "Prepared local native release inputs: $OUTPUT"

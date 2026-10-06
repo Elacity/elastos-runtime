@@ -17,9 +17,8 @@ as the supported authoring contract, not as evidence of product adoption.
 
 The commands in this guide create capsule source packages. A source package is
 an authoring and build input, not a complete signed Digital Capsule. Source
-packages may omit `signature` during local development; [state.md](../state.md)
-records the current first-party signing gap. The source-home setup copies these
-packages into its local data home, and local development may launch them. Their
+packages may omit `signature` during local development. The source-home setup
+copies these packages into its local data home, and local development may launch them. Their
 presence or successful launch does not prove signed distribution, portable
 installation, or Runtime admission on another node. A distributable Digital
 Capsule requires a complete signed artifact. Each Runtime decides separately

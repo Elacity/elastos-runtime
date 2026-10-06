@@ -14,9 +14,8 @@ later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts
-have separate identities. [state.md](../state.md) records whether exact
-publication-parity evidence has been accepted. The normal Home path does not
-need a separate `elastos serve` process.
+have separate identities. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
 
 The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox.
@@ -157,4 +156,3 @@ managed Home lane. See the command matrix for these paths:
 - [Repository README](../README.md)
 - [Architecture](ARCHITECTURE.md)
 - [Glossary](GLOSSARY.md)
-- [State](../state.md)

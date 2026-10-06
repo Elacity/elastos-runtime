@@ -169,6 +169,52 @@ elastos update --check
 `elastos update` discovers newer signed releases through the trusted source
 created during install.
 
+Runtime consumes the verified signed pair in `installation/release-head.json`
+and `installation/release.json` within its data directory. Publisher owns its
+separate publication files. For an older installation, Runtime migrates the
+signed pair after it verifies the trusted source, binary, components and installed
+support under the installation lock. An interrupted transaction completes its
+original recovery before that migration. If the saved pair requires repair,
+keep the files in place and follow Runtime's operator repair step.
+
+Running `install.sh` again uses the same installation lock and journal. Before it
+stops Runtime, it restores an interrupted install and refuses an older release,
+another channel, a pending Home update, a second writer and an installed Runtime
+without a readable `sources.json`. Until an interrupted install is restored,
+Home does not start and asks you to run `install.sh` again.
+
+### Recover an interrupted update
+
+If Runtime reports an interrupted command-line update, run `elastos update`
+again before starting Home. Runtime owns the saved transaction and verifies its
+files before recovery. Keep the installation files and data in place.
+
+A Home with an installed update controller keeps its controller Runtime and
+private receipt in the data directory. If restart recovery requires that
+controller, set `ELASTOS_RECOVERY_DATA` to the data directory shown in the local
+message and run:
+
+```bash
+"${ELASTOS_RECOVERY_DATA}/update-controller/runtime" __update-controller \
+  --receipt "${ELASTOS_RECOVERY_DATA}/update-controller/receipt.json"
+```
+
+The controller verifies its signed Runtime, retained launch settings and saved
+release before it starts Home. Keep this terminal open. Initial startup has a
+120-second limit; update and rollback startup have a 30-second limit. A startup
+failure names the private `update-controller/runtime.log` file to inspect
+before trying again. The receipt keeps Home paths, locale, desktop opener settings and Runtime launch
+bindings. It also retains the configured Wallet price API key, which Wallet reads
+from the environment. Other provider and Browser settings stay in their installed
+private configuration files. Keep the receipt's owner-only permissions and
+share only a safe error summary.
+
+Home reuses a verified controller when its signed Runtime already matches.
+If a new controller cannot fit, ordinary Home can open with Home update controls
+unavailable.
+Free disk space before updating. An interrupted update or uncertain controller
+ownership keeps its recovery step.
+
 These overrides are for operators:
 
 ```bash
@@ -177,6 +223,27 @@ elastos update --no-p2p --gateway GATEWAY_URL
 ```
 
 Replace `CID` and `GATEWAY_URL` with the source values.
+
+## Compare and change the release signer
+
+Compare an announced release DID with the staged root DID in the repository
+[README](../README.md#install-from-the-publisher) before installing or changing
+a source. The source owner can re-trust an existing source explicitly:
+
+```sh
+elastos source add --name EXISTING_SOURCE --publisher NEW_DID
+```
+
+Runtime asks for the complete new DID. Entering another value cancels the
+change. This step keeps the source's channel, install path, Carrier ticket and
+gateways. After confirmation, Runtime accepts release signatures from the new
+DID and refuses signatures from the former DID.
+
+An existing Home that keeps its old source pin refuses a release signed by the
+new maintainer. Its `elastos update` error names the signer mismatch and says to
+run the publisher's `install.sh`. That run is an explicit re-trust: it pins the
+new DID, installs the release and keeps identity, accounts and user files. Until
+then the Home trusts the old key and remains exposed if a copy of that key exists.
 
 ## Installed files
 
@@ -192,8 +259,8 @@ The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [state.md](../state.md) records
-whether exact public-manifest parity evidence has been accepted.
+from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+owns exact public-manifest parity evidence.
 
 ## Capability policy
 

@@ -51,6 +51,9 @@ authoritative boundary.
 `protocol: "elastos-shell-protocol"` over `transport: "http-json"` with
 `transport_scope: "local_runtime_adapter"`.
 
+The gateway checks the caller's signed launch before it serves this descriptor.
+The descriptor keeps each operation's existing authority gate.
+
 `POST /api/esp/initialize` accepts:
 
 ```json
@@ -224,6 +227,6 @@ Required handoff gate:
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 (cd elastos && cargo fmt --all -- --check)
 ```

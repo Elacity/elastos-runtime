@@ -267,14 +267,8 @@ async fn passkey_step_up_begin_inner(
         anyhow::bail!("original passkey credential is unavailable");
     }
     let mut options = manager.begin_authentication(&ceremony_id, &rp.id)?;
-    options
-        .public_key
-        .allow_credentials
-        .retain(|credential| credential.id == pending.credential_id);
-    if options.public_key.allow_credentials.len() != 1 {
-        manager.cancel_challenge(&ceremony_id);
-        anyhow::bail!("original passkey credential is unavailable");
-    }
+    // The original launch and stored credential are already checked above.
+    // Anonymous begin options keep IDs private; step-up selects this binding.
     options.public_key.allow_credentials = vec![CredentialDescriptor {
         type_: "public-key".to_string(),
         id: pending.credential_id.clone(),
@@ -396,7 +390,7 @@ pub(in crate::api) fn consume_passkey_step_up_token(
         max_age_secs,
         operation,
         request,
-        false,
+        (false, |_| Ok(())),
     )
     .map(|_| ())
 }
@@ -416,7 +410,28 @@ pub(in crate::api) fn consume_or_recover_passkey_step_up_effect(
         max_age_secs,
         operation,
         request,
-        true,
+        (true, |_| Ok(())),
+    )
+}
+
+/// Reserve the exact consumer intent after validation and before consuming approval.
+pub(in crate::api) fn consume_prepared_passkey_step_up_effect(
+    data_dir: &Path,
+    token: &str,
+    launch: &RequiredHomeLaunchToken,
+    max_age_secs: u64,
+    operation: &str,
+    request: &serde_json::Value,
+    prepare: impl FnOnce(&PasskeyStepUpEffectIdentity) -> anyhow::Result<()>,
+) -> anyhow::Result<PasskeyStepUpEffectIdentity> {
+    consume_passkey_step_up_for_effect(
+        data_dir,
+        token,
+        launch,
+        max_age_secs,
+        operation,
+        request,
+        (true, prepare),
     )
 }
 
@@ -427,8 +442,12 @@ fn consume_passkey_step_up_for_effect(
     max_age_secs: u64,
     operation: &str,
     request: &serde_json::Value,
-    allow_exact_recovery: bool,
+    recovery_preparation: (
+        bool,
+        impl FnOnce(&PasskeyStepUpEffectIdentity) -> anyhow::Result<()>,
+    ),
 ) -> anyhow::Result<PasskeyStepUpEffectIdentity> {
+    let (allow_exact_recovery, prepare) = recovery_preparation;
     let operation = validate_step_up_operation(operation)?;
     let request_sha256 = canonical_request_sha256(request)?;
     let token = token.trim();
@@ -504,15 +523,23 @@ fn consume_passkey_step_up_for_effect(
             && existing.request_sha256 == marker.request_sha256
             && existing.expires_at == marker.expires_at
         {
-            return Ok(PasskeyStepUpEffectIdentity {
+            let effect = PasskeyStepUpEffectIdentity {
                 step_up_id: existing.step_up_id,
                 request_sha256: existing.request_sha256,
                 recovered: true,
-            });
+            };
+            prepare(&effect)?;
+            return Ok(effect);
         }
         anyhow::bail!("passkey step-up token has already been used");
     }
     prepare_consumed_capacity(data_dir, now)?;
+    let effect = PasskeyStepUpEffectIdentity {
+        step_up_id: marker.step_up_id.clone(),
+        request_sha256: marker.request_sha256.clone(),
+        recovered: false,
+    };
+    prepare(&effect)?;
     persist_new_json(
         &path,
         &marker,
@@ -529,11 +556,7 @@ fn consume_passkey_step_up_for_effect(
             err
         }
     })?;
-    Ok(PasskeyStepUpEffectIdentity {
-        step_up_id: marker.step_up_id,
-        request_sha256: marker.request_sha256,
-        recovered: false,
-    })
+    Ok(effect)
 }
 
 #[cfg(test)]
@@ -1517,6 +1540,27 @@ mod tests {
     #[tokio::test]
     async fn begin_limits_authentication_to_original_passkey_and_cancel_is_one_shot() {
         let fixture = fixture();
+        let mut store = IdentityStore::new(fixture.data_dir.path()).unwrap();
+        store.load().unwrap();
+        store.add_credential(StoredCredential {
+            credential_id: "other-account-credential".to_string(),
+            public_key: "other-account-public-key".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+        store.save().unwrap();
+        {
+            let manager = fixture.state.identity_manager().unwrap();
+            let mut manager = manager.lock().await;
+            let anonymous = manager
+                .begin_authentication("anonymous-login", "localhost")
+                .unwrap();
+            assert!(anonymous.public_key.allow_credentials.is_empty());
+            let encoded = serde_json::to_string(&anonymous).unwrap();
+            assert!(!encoded.contains(&fixture.credential_id));
+            assert!(!encoded.contains("other-account-credential"));
+            assert!(manager.cancel_challenge("anonymous-login"));
+        }
         let begin = passkey_step_up_begin_inner(
             &fixture.state,
             &fixture.host_headers,
@@ -1782,6 +1826,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(replay.to_string().contains("already been used"));
+    }
+
+    #[test]
+    fn prepared_effect_validates_before_reserving_and_consumes_after_reservation() {
+        let fixture = fixture();
+        let request = serde_json::json!({ "request_id": "prepared-action" });
+        let token = issue_passkey_step_up_token_for_test(
+            fixture.data_dir.path(),
+            &fixture.app_token,
+            INBOX_CAPSULE_ID,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+        let changed = serde_json::json!({ "request_id": "different-action" });
+        let mut reserved = false;
+        assert!(consume_prepared_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &changed,
+            |_| {
+                reserved = true;
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!reserved, "substituted intent reached consumer reservation");
+        let failed = consume_prepared_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+            |effect| {
+                assert!(!effect.recovered);
+                assert!(!consumed_path(fixture.data_dir.path(), &effect.step_up_id)?.exists());
+                anyhow::bail!("simulated private reservation failure")
+            },
+        );
+        assert!(failed.is_err());
+        let consumed = consume_prepared_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+            |effect| {
+                assert!(!effect.recovered);
+                assert!(!consumed_path(fixture.data_dir.path(), &effect.step_up_id)?.exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!consumed.recovered);
+        let recovered = consume_prepared_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+            |effect| {
+                assert!(effect.recovered);
+                assert!(consumed_path(fixture.data_dir.path(), &effect.step_up_id)?.exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.step_up_id, consumed.step_up_id);
+        assert!(recovered.recovered);
     }
 
     #[test]

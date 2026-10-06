@@ -85,10 +85,17 @@
             </div>
           </div>
         </div>
+        <button id="home-older-key-action" class="home-unlock-button home-unlock-older-key" type="button" hidden>Use an older security key</button>
         <div class="home-unlock-card" role="dialog" aria-modal="true" aria-labelledby="home-unlock-title" aria-describedby="home-unlock-copy">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
           <h1 id="home-unlock-title">Sign in</h1>
           <p id="home-unlock-copy">Use your passkey to unlock your data, apps and desktop.</p>
+          <div id="home-passkey-hint-panel" hidden>
+            <label for="home-passkey-hint">Private security-key hint</label>
+            <input id="home-passkey-hint" aria-label="Private security-key hint" class="home-unlock-input" type="password" maxlength="1800" autocomplete="off" spellcheck="false" aria-describedby="home-passkey-hint-help" />
+            <p id="home-passkey-hint-help">Paste the JSON hint from your Home operator. Home clears this field after each attempt.</p>
+            <button id="home-passkey-hint-cancel" class="home-unlock-button home-unlock-button-secondary" type="button">Back to sign in</button>
+          </div>
           <fieldset id="home-enrollment-choice" hidden>
             <legend>Set up your identity</legend>
             <label for="home-enrollment-create"><input id="home-enrollment-create" type="radio" name="home-enrollment-purpose" value="create" aria-label="Create account" checked /> Create account</label>
@@ -157,6 +164,6 @@
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260802a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-update-20261003a"></script>
   </body>
 </html>

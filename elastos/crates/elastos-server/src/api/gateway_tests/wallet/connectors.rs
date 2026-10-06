@@ -120,6 +120,20 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
 
     let cases = [
         (
+            "foreign origin",
+            authority.home_token.clone(),
+            "https://evil.example",
+            WALLET_METAMASK_CAPSULE_ID,
+            valid_connector_token.clone(),
+        ),
+        (
+            "foreign loopback port",
+            authority.home_token.clone(),
+            "http://localhost:18080",
+            WALLET_METAMASK_CAPSULE_ID,
+            valid_connector_token.clone(),
+        ),
+        (
             "wrong origin",
             authority.home_token.clone(),
             "null",
@@ -129,77 +143,77 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
         (
             "wrong Home token authority",
             mismatched_home_token,
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             valid_connector_token.clone(),
         ),
         (
             "wrong principal",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_principal,
         ),
         (
             "wrong session",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_session,
         ),
         (
             "wrong proof binding",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_proof_binding,
         ),
         (
             "wrong grant",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_grant,
         ),
         (
             "wrong selected resource",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_selected_resource,
         ),
         (
             "wrong executable actor",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             wrong_executable_actor,
         ),
         (
             "direct connector token",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             direct_connector_token,
         ),
         (
             "wrong connector",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_UNISAT_CAPSULE_ID,
             valid_connector_token.clone(),
         ),
         (
             "WalletConnect is not an injected connector",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_WALLETCONNECT_CAPSULE_ID,
             walletconnect_token,
         ),
         (
             "invalid connector token",
             authority.home_token.clone(),
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             WALLET_METAMASK_CAPSULE_ID,
             "not-a-launch-token".to_string(),
         ),
@@ -209,7 +223,7 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
         let response = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.elacitylabs.com", origin)
+                test_browser_request("localhost:61180", origin)
                     .method("POST")
                     .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                     .header(CONTENT_TYPE, "application/json")
@@ -246,8 +260,8 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
             .clone()
             .oneshot(
                 test_browser_request(
-                    "elastos.elacitylabs.com",
-                    "https://elastos.elacitylabs.com",
+                    "localhost:61180",
+                    "http://localhost:61180",
                 )
                 .method("POST")
                 .uri(
@@ -266,7 +280,7 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
     let oversized_request_id = "x".repeat(257);
     let response = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/home/wallet-connector/approvals/{oversized_request_id}/handoff"
@@ -911,7 +925,7 @@ async fn test_metamask_connector_approves_external_wallet_request_with_handoff()
 
     let approved = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/handoff")
                 .header("x-elastos-home-token", authority.home_token)
@@ -1019,7 +1033,7 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
     let approved = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/handoff")
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -1041,8 +1055,8 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
     let completed = app
         .oneshot(
             test_browser_request(
-                "elastos.elacitylabs.com",
-                "https://elastos.elacitylabs.com",
+                "localhost:61180",
+                "http://localhost:61180",
             )
                 .method("POST")
                 .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/complete")

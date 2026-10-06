@@ -2,7 +2,7 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-20260802a";
+} from "./shell-core.js?v=home-update-20261003a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockFace = document.querySelector(".home-unlock-face");
@@ -15,6 +15,10 @@ const unlockPerson = document.querySelector("#home-unlock-person");
 const unlockPersonName = document.querySelector("#home-unlock-person-name");
 const unlockMonogram = document.querySelector("#home-unlock-monogram");
 const unlockPrimary = document.querySelector("#home-unlock-primary");
+const olderKeyAction = document.querySelector("#home-older-key-action");
+const passkeyHintPanel = document.querySelector("#home-passkey-hint-panel");
+const passkeyHintInput = document.querySelector("#home-passkey-hint");
+const passkeyHintCancel = document.querySelector("#home-passkey-hint-cancel");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
 const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
@@ -38,6 +42,7 @@ let recoveryTerminalToken = "";
 const PENDING_REGISTRATION_KEY = "elastos.home.pending-registration/v1";
 const PENDING_REGISTRATION_MS = 12 * 60 * 60 * 1000;
 const MAX_PENDING_REGISTRATION_CHARS = 65536;
+const SESSION_REFRESH_TIMEOUT_MS = 10_000;
 let pendingRegistration = null;
 let pendingRegistrationInvalid = false;
 let enrollmentPurpose = "create";
@@ -58,6 +63,7 @@ export function isHomeAuthError(error) {
 }
 
 export async function showHomeUnlock(onUnlocked, options = {}) {
+  clearPasskeyHint();
   unlockCallback = typeof onUnlocked === "function" ? onUnlocked : null;
   unlockPresentation = options && options.presentation === "prompt" ? "prompt" : "modal";
   unlockPersonLabel = readUnlockPersonLabel(options && options.personName);
@@ -117,6 +123,7 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
+  clearPasskeyHint();
   clearRecoverySelection();
   recoverySession = null;
   recoveryTerminalToken = "";
@@ -147,6 +154,7 @@ export function hideHomeUnlock() {
 export function bindHomeUnlock() {
   recoveryFile?.addEventListener("change", selectRecoveryKit);
   window.addEventListener("pagehide", () => {
+    clearPasskeyHint();
     clearRecoverySelection();
     recoverySession = null;
     recoveryTerminalToken = "";
@@ -171,12 +179,28 @@ export function bindHomeUnlock() {
       setUnlockStatus("Home cannot clear setup retry data. Check browser storage and try again.", "error");
     }
   });
+  olderKeyAction?.addEventListener("click", () => {
+    if (busy) return;
+    clearPasskeyHint();
+    unlockMode = "older_key";
+    renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
+    setUnlockStatus("Paste the private hint from your Home operator, then use your security key.", "muted");
+    passkeyHintInput?.focus();
+  });
+  passkeyHintCancel?.addEventListener("click", () => {
+    if (busy) return;
+    clearPasskeyHint();
+    unlockMode = guestRegistrationAvailable ? "signin_guest_enabled" : "signin";
+    renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
+    setUnlockStatus("Choose your passkey.", "muted");
+    unlockPerson?.focus();
+  });
   const startUnlock = () => {
     if (["create", "create_guest", "resume_owner", "resume_registration"].includes(unlockMode)) {
       runPasskeyCreate().catch(reportUnlockError);
       return;
     }
-    runPasskeySignIn().catch(reportUnlockError);
+    runPasskeySignIn(unlockMode === "older_key").catch(reportUnlockError);
   };
   unlockPrimary?.addEventListener("click", startUnlock);
   unlockPerson?.addEventListener("click", startUnlock);
@@ -203,18 +227,30 @@ export function bindHomeUnlock() {
   });
 }
 
-export function refreshHomeSession() {
+export function refreshHomeSession({ signal } = {}) {
   if (!sessionRefreshInFlight) {
-    sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", { method: "POST" })
+    const controller = signal ? null : new AbortController();
+    const deadline = controller ? window.setTimeout(() => {
+      const error = new Error("Home session refresh timed out.");
+      error.name = "TimeoutError";
+      controller.abort(error);
+    }, SESSION_REFRESH_TIMEOUT_MS) : null;
+    sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", {
+      method: "POST",
+      signal: signal || controller.signal,
+    })
       .then((response) => {
         setHomeAuthorityToken(response?.home_token);
         return response;
       })
       .catch((error) => {
-        clearHomeAuthorityToken();
+        if (isHomeAuthError(error)) {
+          clearHomeAuthorityToken();
+        }
         throw error;
       })
       .finally(() => {
+        window.clearTimeout(deadline);
         sessionRefreshInFlight = null;
       });
   }
@@ -296,6 +332,8 @@ export async function requestPasskeyStepUp(appToken, operation, request) {
 }
 
 function renderUnlockChecking() {
+  if (olderKeyAction) olderKeyAction.hidden = true;
+  if (passkeyHintPanel) passkeyHintPanel.hidden = true;
   if (unlockTitle) {
     unlockTitle.textContent = "Sign in";
   }
@@ -325,17 +363,22 @@ function renderUnlockChecking() {
 }
 
 function renderUnlockMode({ registered, guestRegistrationEnabled }) {
+  const usingOlderKey = unlockMode === "older_key";
   const resumingOwner = unlockMode === "resume_owner";
   const resumingRegistration = unlockMode === "resume_registration";
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create" || resumingOwner;
   const canCreate = (creatingAdmin || creatingGuest) && !resumingOwner;
-  const showFace = registered && !creatingGuest && !resumingOwner && !resumingRegistration && unlockMode !== "unsupported";
+  const showFace = registered && !usingOlderKey && !creatingGuest && !resumingOwner && !resumingRegistration && unlockMode !== "unsupported";
+  if (olderKeyAction) olderKeyAction.hidden = !showFace;
+  if (passkeyHintPanel) passkeyHintPanel.hidden = !usingOlderKey;
   if (unlockTitle) {
-    unlockTitle.textContent = resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = usingOlderKey ? "Use an older security key" : resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
-    if (resumingOwner) {
+    if (usingOlderKey) {
+      unlockCopy.textContent = "Your Home operator can supply a private hint with elastos identity passkey-hint. Use the key already linked to your account.";
+    } else if (resumingOwner) {
       unlockCopy.textContent = "Finish the passkey setup already verified by this Home.";
     } else if (creatingGuest) {
       unlockCopy.textContent = "Use a passkey to create your own guest account.";
@@ -346,13 +389,14 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     }
   }
   if (unlockPrimary) {
-    unlockPrimary.textContent = resumingOwner ? "Resume Home setup" : creatingGuest
+    unlockPrimary.textContent = usingOlderKey ? "Use security key" : resumingOwner ? "Resume Home setup" : creatingGuest
       ? "Create guest passkey"
       : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
   }
   if (unlockSecondary) {
     unlockSecondary.hidden = !registered || !guestRegistrationEnabled && !resumingRegistration;
+    if (usingOlderKey) unlockSecondary.hidden = true;
     unlockSecondary.textContent = creatingGuest || resumingRegistration ? "Back to sign in" : "Create guest account";
   }
   if (unlockPanel) {
@@ -726,7 +770,36 @@ async function runPasskeyCreate() {
   }
 }
 
-async function runPasskeySignIn() {
+function clearPasskeyHint() {
+  if (passkeyHintInput) passkeyHintInput.value = "";
+}
+
+function readPasskeyHint() {
+  const text = String(passkeyHintInput?.value || "");
+  clearPasskeyHint();
+  if (!text || text.length > 1800) throw new Error("Use a valid private security-key hint from your Home operator.");
+  let hint;
+  try { hint = JSON.parse(text); }
+  catch (_) { throw new Error("Use a valid private security-key hint from your Home operator."); }
+  const rp = hint?.rp_id;
+  const id = hint?.credential_id;
+  if (!exactKeys(hint, ["schema", "credential_id", "rp_id"])
+    || hint.schema !== "elastos.passkey.hint/v1"
+    || typeof id !== "string" || !/^[A-Za-z0-9_-]{1,1366}$/.test(id)
+    || typeof rp !== "string" || !rp || rp.length > 253
+    || !rp.split(".").every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+    throw new Error("Use a valid private security-key hint from your Home operator.");
+  }
+  let decoded;
+  try { decoded = base64UrlToBuffer(id); }
+  catch (_) { throw new Error("Use a valid private security-key hint from your Home operator."); }
+  if (!decoded.byteLength || decoded.byteLength > 1024 || bufferToBase64Url(decoded) !== id) {
+    throw new Error("Use a valid private security-key hint from your Home operator.");
+  }
+  return { rpId: rp, id: decoded };
+}
+
+async function runPasskeySignIn(useHint = false) {
   if (busy || !window.PublicKeyCredential) {
     return;
   }
@@ -734,8 +807,18 @@ async function runPasskeySignIn() {
   setButtonsDisabled(true);
   setUnlockStatus("Choose your passkey.", "muted");
   try {
+    const hint = useHint ? readPasskeyHint() : null;
     const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
-    const credential = await navigator.credentials.get(toRequestOptions(begin.options));
+    const request = toRequestOptions(begin.options);
+    if (hint) {
+      const host = window.location.hostname;
+      if (request.publicKey.rpId !== hint.rpId
+        || !(host === hint.rpId || host?.endsWith(`.${hint.rpId}`))) {
+        throw new Error("Use the private security-key hint for this Home.");
+      }
+      request.publicKey.allowCredentials = [{ type: "public-key", id: hint.id }];
+    }
+    const credential = await navigator.credentials.get(request);
     if (!credential) {
       throw new Error("Passkey sign-in was cancelled.");
     }
@@ -748,7 +831,15 @@ async function runPasskeySignIn() {
     });
     setHomeAuthorityToken(response?.home_token);
     await unlockComplete(response);
+  } catch (error) {
+    if (useHint) {
+      throw new Error(isPasskeyNotSelected(error)
+        ? "Security-key sign-in was cancelled. Paste the hint again to retry."
+        : "Security-key sign-in failed. Check the hint and key, then try again.");
+    }
+    throw error;
   } finally {
+    clearPasskeyHint();
     busy = false;
     setButtonsDisabled(false);
   }
@@ -792,6 +883,9 @@ function setButtonsDisabled(disabled) {
   if (unlockSecondary) {
     unlockSecondary.disabled = disabled;
   }
+  if (olderKeyAction) olderKeyAction.disabled = disabled;
+  if (passkeyHintCancel) passkeyHintCancel.disabled = disabled;
+  if (passkeyHintInput) passkeyHintInput.disabled = disabled;
   if (enrollmentDismiss) enrollmentDismiss.disabled = disabled;
 }
 

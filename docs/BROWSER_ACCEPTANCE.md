@@ -2,8 +2,7 @@
 
 This document defines the work needed for a stable Browser experience for people
 and agents. It gives implementation instructions and acceptance criteria. The
-checkboxes in [TASKS.md](../TASKS.md#browser-maturity-workstream) are the canonical
-work status. These criteria are proposed release requirements, not claims that
+owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) hold the work status. These criteria are proposed release requirements, not claims that
 the current product meets them.
 
 ## Product contract
@@ -43,8 +42,8 @@ one successful remote session does not prove package portability.
 
 ## Execution order
 
-B01-B16 define release acceptance areas. The current J4 handoff lives in
-[TASKS.md](../TASKS.md#now); dated checkpoints remain in the recorded audits.
+B01-B16 define release acceptance areas. The current J4 work lives in its
+GitHub issue; dated checkpoints remain in the recorded audits.
 The accepted B01 contract and bounded B04 ownership prerequisites unblock their
 consumers while device and operator qualification remain open. Run local
 installation/usability, operator capability

@@ -25,6 +25,8 @@ mod model_provider_config;
 pub mod model_provider_egress;
 #[cfg(unix)]
 mod model_provider_egress_decision;
+#[cfg(target_os = "macos")]
+pub use model_provider_config::model_provider_engine_bundle;
 pub(crate) use model_provider_config::{
     ai_provider_status, any_hosted_model_shared, approval_lens_has_selection,
     hosted_model_offer_hint, hosted_model_share_cards, load_model_provider_operator_offers,

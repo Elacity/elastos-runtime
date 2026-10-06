@@ -1,5 +1,9 @@
 //! Browser-host adapter for runtime proof-bound authentication.
 
+#[path = "auth_passkey_limits.rs"]
+mod passkey_limits;
+pub(in crate::api) use passkey_limits::admit_passkey_begin;
+
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
@@ -1062,6 +1066,19 @@ pub fn migrate_configured_principal_roots_offline(
     crate::auth::migrate_declared_principal_roots_offline(data_dir, backup_dir, || {
         configured_principal_root_upgrade_declarations(data_dir)
     })
+}
+
+pub(crate) fn migrate_configured_principal_roots_for_update(
+    data_dir: &std::path::Path,
+    backup_dir: &std::path::Path,
+    activation: &crate::install_transaction::SupportActivation<'_>,
+) -> anyhow::Result<crate::auth::PrincipalRootUpgradeReceiptV1> {
+    crate::auth::migrate_declared_principal_roots_for_update(
+        data_dir,
+        backup_dir,
+        || configured_principal_root_upgrade_declarations(data_dir),
+        activation,
+    )
 }
 
 fn configured_principal_root_upgrade_declarations(
@@ -4172,6 +4189,14 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
 }
 
 pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
+    if err.is::<elastos_identity::webauthn::CeremonyCapacityExceeded>() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "60")],
+            "Passkey sign-in is busy. Try again shortly.",
+        )
+            .into_response();
+    }
     let text = err.to_string();
     let status = if err.is::<PasskeyRegistrationDenied>()
         || err.is::<crate::auth::OwnerEnrollmentDenied>()
@@ -4345,6 +4370,215 @@ mod tests {
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         }
+    }
+
+    #[tokio::test]
+    async fn passkey_begin_flood_keeps_credentials_private_and_guest_completion_available() {
+        use axum::body::{to_bytes, Body, Bytes};
+        use axum::http::Request;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        async fn admission(
+            State(state): State<GatewayState>,
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> Response {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|peer| peer.0);
+            if let Err(response) = admit_passkey_begin(&state.data_dir, peer, request.uri().path())
+            {
+                return *response;
+            }
+            next.run(request).await
+        }
+
+        let root = local_profile_fixture_root();
+        let state = test_gateway_state(root.path());
+        for credential in [test_credential(), test_credential_2()] {
+            store_test_credential(root.path(), credential.clone());
+            seed_test_passkey_principal(
+                &state,
+                &credential,
+                "https://home.example",
+                crate::auth::RuntimePrincipalRole::Admin,
+            );
+        }
+        crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/api/auth/passkey/register/begin",
+                post(passkey_register_begin),
+            )
+            .route(
+                "/api/auth/passkey/register/complete",
+                post(passkey_register_complete),
+            )
+            .route(
+                "/api/auth/passkey/authenticate/begin",
+                post(passkey_authenticate_begin),
+            )
+            .route(
+                "/api/auth/passkey/authenticate/complete",
+                post(passkey_authenticate_complete),
+            )
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                admission,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::max(96 * 1024));
+        let make_request = |path: &str, peer: &str, cookie: &str, body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("host", "home.example")
+                .header("origin", "https://home.example")
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+                .body(body)
+                .unwrap()
+        };
+        let intent = json!({"purpose": "create", "public_name": "Guest"});
+        let begin = app
+            .clone()
+            .oneshot(make_request(
+                "/api/auth/passkey/register/begin",
+                "192.0.2.2:1234",
+                "",
+                Body::from(json!({"intent": intent}).to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(begin.status(), StatusCode::OK);
+        let cookie = begin.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let begin: Value =
+            serde_json::from_slice(&to_bytes(begin.into_body(), 96 * 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            begin["options"]["publicKey"]["authenticatorSelection"]["residentKey"],
+            "required"
+        );
+        assert!(begin["options"]["publicKey"]
+            .get("excludeCredentials")
+            .is_none());
+
+        for path in [
+            "/api/auth/passkey/register/begin",
+            "/api/auth/passkey/authenticate/begin",
+        ] {
+            for attempt in 0..12 {
+                let mut request = make_request(
+                    path,
+                    "192.0.2.1:1234",
+                    "",
+                    Body::from(json!({"intent": intent}).to_string()),
+                );
+                // Changing an untrusted forwarded address cannot select a quota.
+                request.headers_mut().insert(
+                    "x-forwarded-for",
+                    format!("198.51.100.{attempt}").parse().unwrap(),
+                );
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if attempt < 4 {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                );
+                let bytes = to_bytes(response.into_body(), 96 * 1024).await.unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                for credential in [test_credential(), test_credential_2()] {
+                    assert!(!text.contains(&credential.credential_id));
+                }
+                if path.ends_with("authenticate/begin") && attempt < 4 {
+                    let body: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(body["options"]["publicKey"]["allowCredentials"], json!([]));
+                }
+            }
+        }
+
+        let read = Arc::new(AtomicUsize::new(0));
+        let body_read = read.clone();
+        let body = Body::from_stream(futures_lite::stream::unfold(
+            100 * 1024 * 1024usize,
+            move |remaining| {
+                let read = body_read.clone();
+                async move {
+                    if remaining == 0 {
+                        return None;
+                    }
+                    let count = remaining.min(64 * 1024);
+                    read.fetch_add(count, Ordering::Relaxed);
+                    Some((
+                        Ok::<_, std::io::Error>(Bytes::from(vec![b' '; count])),
+                        remaining - count,
+                    ))
+                }
+            },
+        ));
+        let refused = app
+            .clone()
+            .oneshot(make_request(
+                "/api/auth/passkey/register/begin",
+                "192.0.2.1:1234",
+                "",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            0,
+            "admission polled a refused request body"
+        );
+
+        let attestation = crate::auth::passkey_attestation_with_id_for_test(
+            begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+            "home.example",
+            "https://home.example",
+            b"rate-limit-guest",
+        );
+        let completion = app.oneshot(make_request(
+            "/api/auth/passkey/register/complete", "192.0.2.2:1234", &cookie,
+            Body::from(json!({"ceremony_id": begin["ceremony_id"], "intent": intent, "response": attestation}).to_string()),
+        )).await.unwrap();
+        assert_eq!(completion.status(), StatusCode::OK);
+        let completed: Value =
+            serde_json::from_slice(&to_bytes(completion.into_body(), 96 * 1024).await.unwrap())
+                .unwrap();
+        assert!(!completed["home_token"].as_str().unwrap().is_empty());
+        assert!(!completed["session_id"].as_str().unwrap().is_empty());
+        let auth = crate::auth::load_auth_state(root.path()).unwrap();
+        assert!(auth
+            .principals
+            .iter()
+            .any(
+                |principal| principal.principal_id == completed["principal_id"]
+                    && principal.role == crate::auth::RuntimePrincipalRole::Guest
+            ));
+    }
+
+    #[test]
+    fn challenge_capacity_returns_retryable_http_response() {
+        let error = anyhow::Error::new(elastos_identity::webauthn::CeremonyCapacityExceeded)
+            .context("begin refused");
+        let response = auth_error_response(error);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "60");
     }
 
     async fn did_recovery_test_gateway_state(

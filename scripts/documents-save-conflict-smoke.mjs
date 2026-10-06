@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const source = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const functionSource = (name) => {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert.ok(start >= 0, `missing ${name}`);

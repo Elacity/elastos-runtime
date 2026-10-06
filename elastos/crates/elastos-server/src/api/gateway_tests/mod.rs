@@ -37,6 +37,23 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 
+// One-shot fixtures simulate the Host header supplied by their loopback HTTP
+// transport. Boundary tests use the router directly to test missing headers.
+fn gateway_router(state: GatewayState) -> Router {
+    gateway_router_with_api_url(state, "http://localhost:61180".to_string()).layer(
+        axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                if !request.headers().contains_key(HOST) {
+                    request
+                        .headers_mut()
+                        .insert(HOST, HeaderValue::from_static("localhost:61180"));
+                }
+                next.run(request).await
+            },
+        ),
+    )
+}
+
 // Real CIDs that pass cid crate validation
 const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
@@ -860,8 +877,10 @@ mod assistant_workspace_v2;
 mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
+mod content_sandbox;
 mod documents;
 mod esp;
+mod frontdoor;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod gba;
@@ -880,3 +899,6 @@ mod remote_model;
 mod room;
 mod site_publication;
 mod wallet;
+
+#[path = "../gateway_home_update/tests.rs"]
+mod home_update;

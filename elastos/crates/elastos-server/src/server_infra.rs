@@ -17,6 +17,7 @@ use elastos_server::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
 use elastos_server::binaries;
+use elastos_server::carrier::configured_carrier_bind_addr;
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
@@ -64,11 +65,6 @@ const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
 #[cfg(test)]
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-#[cfg(test)]
-const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -432,11 +428,15 @@ async fn register_media_provider(
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(true).await
+    setup_server_infrastructure_impl(true, elastos_server::ipfs::IpfsHostRole::User).await
 }
 
 pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(false).await
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::User).await
+}
+
+pub(crate) async fn setup_gateway_infrastructure() -> anyhow::Result<ServerInfrastructure> {
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::Gateway).await
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +473,21 @@ pub(crate) async fn register_ipfs_provider_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     binary_path: &Path,
 ) -> anyhow::Result<()> {
-    let bridge = provider::ProviderBridge::spawn(binary_path, Default::default())
+    register_ipfs_provider_plane_with_role(
+        provider_registry,
+        binary_path,
+        elastos_server::ipfs::IpfsHostRole::User,
+    )
+    .await
+}
+
+async fn register_ipfs_provider_plane_with_role(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    role: elastos_server::ipfs::IpfsHostRole,
+) -> anyhow::Result<()> {
+    let config = elastos_server::ipfs::ipfs_provider_config(role);
+    let bridge = provider::ProviderBridge::spawn(binary_path, config)
         .await
         .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -621,29 +635,9 @@ async fn serve_capability_store(
         .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
 }
 
-/// A configured listener is an operator-owned address; it must survive restarts
-/// and fail closed rather than silently selecting an ephemeral replacement.
-fn configured_carrier_bind_addr(data_dir: &Path) -> anyhow::Result<Option<std::net::SocketAddr>> {
-    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
-    };
-    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
-    table
-        .get("carrier_bind_addr")
-        .map(|value| {
-            value
-                .as_str()
-                .context("carrier_bind_addr must be a socket address string")?
-                .parse()
-                .context("Invalid carrier_bind_addr")
-        })
-        .transpose()
-}
-
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
+    ipfs_role: elastos_server::ipfs::IpfsHostRole,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
@@ -1012,10 +1006,13 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match register_ipfs_provider_plane(&provider_registry, &path).await {
-            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
-            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
-        },
+        Ok(Some(path)) => {
+            match register_ipfs_provider_plane_with_role(&provider_registry, &path, ipfs_role).await
+            {
+                Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
+                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+            }
+        }
         Ok(None) => {
             tracing::warn!(
                 "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
@@ -1030,12 +1027,26 @@ async fn setup_server_infrastructure_impl(
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((mut model_config, worker)) => {
                     #[cfg(target_os = "macos")]
-                    let bridge_result =
-                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
-                            .await
-                            .map(|(bridge, sockets, vacant, config, listener)| {
+                    let bridge_result = async {
+                        let root = Path::new(&model_config.base_path);
+                        let bundle = api::model_provider_engine_bundle(root).map_err(|_| {
+                            provider::bridge::BridgeError::InitFailed(
+                                "model engine confinement unavailable".into(),
+                            )
+                        })?;
+                        provider::ProviderBridge::spawn_confined_model_with_engine_bundle(
+                            &path,
+                            model_config.clone(),
+                            bundle.as_deref(),
+                        )
+                        .await
+                        .map(
+                            |(bridge, sockets, vacant, config, listener)| {
                                 (bridge, Some((sockets, vacant)), config, Some(listener))
-                            });
+                            },
+                        )
+                    }
+                    .await;
                     #[cfg(target_os = "linux")]
                     let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
                         &path,
@@ -2205,7 +2216,7 @@ mod tests {
             "data": {
                 "provider": MEDIA_PROVIDER_ID,
                 "protocol_version": MEDIA_PROVIDER_PROTOCOL_VERSION,
-                "version": MEDIA_PROVIDER_VERSION,
+                "version": "0.7.2-alpha.5",
                 "configured": true,
                 "supported_operations": ["status", "prepare"],
             }
@@ -2794,7 +2805,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_provider_startup_registers_only_the_runtime_media_route() {
+    async fn media_provider_startup_accepts_another_release_and_registers_only_the_runtime_media_route(
+    ) {
         let registry = provider::ProviderRegistry::new();
         let (bridge, provider) = test_provider_bridge(media_provider_status(), Duration::ZERO);
 

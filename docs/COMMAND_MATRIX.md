@@ -55,6 +55,29 @@ target.
 | Updates | `elastos update`, `elastos upgrade` | `upgrade` dispatches to the same update handler. Discovery may use Carrier or explicit gateways, but no local runtime is required. |
 | Offline principal-root maintenance | hidden `elastos principal-root-migrate`, hidden `elastos principal-root-upgrade` | Operates on an explicit data directory. The Runtime must be offline and the command requires explicit backup inputs. |
 
+The host operator controls web terminal access with
+`elastos config set developer_mode true` and
+`elastos config set developer_mode false`. Runtime stores this boolean in
+`config.toml` in its data folder. The default is off. Home and apps use Runtime
+routes and app storage roots; the host CLI owns this setting. The existing
+`dev_mode` setting controls capsule signature checks separately.
+
+Runtime refuses all web terminal routes with HTTP 403 while developer mode is
+off or guest registration is enabled. This includes signed-in owners. A refused
+start request creates no host process. The next request uses the current
+setting. Runtime checks existing web terminal sessions each second and closes
+them when the policy refuses access. It also checks the policy before each
+input message. Home CLI shows a refusal with host operator guidance and a
+Return to Desktop button. The host CLI `elastos home` remains available.
+
+The host operator sets accepted public gateway authorities with
+`elastos config set gateway_allowed_hosts '["home.example.com"]'`, then restarts
+the gateway. Each authority includes its port when it uses a non-default port.
+The gateway also accepts its configured bind authority and exact-port loopback
+aliases. A public publisher can expose the Carrier ticket and node ID with
+`elastos config set gateway_public_publisher_bootstrap true`; its publisher
+bootstrap omits the Runtime DID. The default bootstrap requires caller authority.
+
 ## Trust, content, and publishing
 
 | Command family | Class | Included behavior |
@@ -64,7 +87,7 @@ target.
 | `elastos verify` | Self-contained | Verifies a local capsule signature. With `--cid`, it fetches and verifies provenance through the content provider. |
 | `elastos sign-payload` | Self-contained | Reads bytes from stdin and writes a domain-separated Ed25519 signature and signer DID as JSON. |
 | `elastos publish <path>` | Self-contained | Validates the manifest, checks that the resolved entrypoint path exists, then publishes through the content provider. A microVM uses the explicitly installed local `ipfs-provider`. [Capsule authoring](CAPSULE_AUTHORING.md#publish-with-the-right-gate) owns the exact validation limits. |
-| `elastos publish-release` | Self-contained | Runs the signed release pipeline. Dry-run and preflight modes do not publish. Public URL options may start their own gateway and tunnel step. |
+| `elastos publish-release` | Self-contained | Prepares unsigned native inputs or imports a frozen signed set against an operator-approved public DID. The separate custodian tool owns signing. Dry-run and preflight modes keep publication unchanged. |
 | `elastos share <path>` | Self-contained | Publishes a file or directory, provenance, and a signed channel head unless disabled by flags. |
 | `elastos share <path> --public` | Self-contained | Adds an immediate tunnel and remains active until interrupted. It is not a Runtime host. |
 | `elastos content publish-object`, `elastos content repair-worker`, `elastos content status` | Self-contained | Each command starts the installed content and IPFS provider path directly. |

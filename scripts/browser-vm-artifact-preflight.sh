@@ -526,6 +526,7 @@ if mode == "--host-readiness":
     # This operation is read-only. It admits the local host's immutable image
     # set; control-socket presence is independent of artifact identity.
     reason = None
+    message = None
     import platform as host_platform
     host_id = {("Darwin", "arm64"): "darwin-arm64", ("Linux", "x86_64"): "linux-amd64",
                ("Linux", "aarch64"): "linux-arm64", ("Linux", "arm64"): "linux-arm64"}.get(
@@ -554,10 +555,16 @@ if mode == "--host-readiness":
                     reason = ("preparation_required" if host.get("reason") == "preparation_required"
                               else "host_unsupported")
             elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
+                network = subprocess.run(["python3", str(pathlib.Path(data_dir) / "scripts/browser-vm-linux-network.py"), "check"],
+                                         capture_output=True, text=True, timeout=5)
+                if network.returncode:
+                    reason = "preparation_required"
+                    message = network.stderr.strip()
                 import fcntl
-                with open("/dev/kvm", "r+b", buffering=0) as kvm:
-                    if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
-                        reason = "host_unsupported"
+                if reason is None:
+                    with open("/dev/kvm", "r+b", buffering=0) as kvm:
+                        if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
+                            reason = "host_unsupported"
             elif reason is None:
                 reason = "host_unsupported"
         except (ValueError, subprocess.SubprocessError, AttributeError):
@@ -565,6 +572,8 @@ if mode == "--host-readiness":
         except OSError:
             reason = "host_unsupported"
     readiness = {"state": "unavailable", "reason": reason} if reason else {"state": "ready"}
+    if message:
+        print(message, file=sys.stderr)
     print(json.dumps({"schema": "elastos.browser.engine-readiness/v1", "readiness": readiness}))
     sys.exit(0)
 

@@ -10,21 +10,17 @@
 #
 #   ./scripts/install.sh --head-cid QmXyz...
 #   ./scripts/install.sh --head-cid QmXyz... --maintainer-did did:key:z6Mk...
-#   ./scripts/install.sh --head-cid QmXyz... --allow-unsigned
 #   ./scripts/install.sh --help
 #
 # Required (one of):
 #   ELASTOS_HEAD_CID env var   or   --head-cid <CID>
 #   ELASTOS_MAINTAINER_DID env var   or   --maintainer-did <did:key:...>
-#   (or --allow-unsigned to skip sig check)
 #
 # Trust anchors can be provided via env vars or CLI flags. In the canonical
 # bootstrap flow, they should already be stamped into install.sh.
 #
-# Downloads the signed Runtime, components.json, and the pinned model catalog:
-#   1. elastos binary → ~/.local/bin/elastos
-#   2. components.json → the platform's ElastOS application-data directory
-#   3. model-catalog.json → the same data directory, when components.json pins one
+# Downloads the signed release head, release envelope, and Runtime binary.
+# Runtime setup fetches component metadata and the pinned model catalog over Carrier.
 #
 # After bootstrap, setup installs the Home profile and opens browser Home.
 # Use --install-only for automated provisioning or other profiles.
@@ -34,13 +30,12 @@
 #   2. Verify Ed25519 signature against pinned MAINTAINER_DID
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
-#   5. Download binary + components.json, verify SHA-256
-#   6. Download the pinned model catalog when components.json names one, verify its head
-#   7. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
-#   8. Save trusted-source Carrier metadata for later `setup` and `update`
+#   5. Download the Runtime binary and verify SHA-256
+#   6. Runtime's installation writer admits and installs the Runtime, the verified
+#      envelopes and the stamped Carrier source in one journaled transaction
+#   7. Runtime setup fetches signed metadata and installs Home over Carrier
 #
-# Fails closed if trust anchors or signature verification fail, unless the
-# operator explicitly selects --allow-unsigned.
+# Fails closed if trust anchors or signature verification fail.
 #
 # Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
@@ -134,19 +129,17 @@ show_help() {
     echo "  --gateway URL        IPFS gateway base URL (repeatable, operator/debug bootstrap)"
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
     echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
-    echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/model-catalog.json  Signed model catalog, when pinned"
-    echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
+    echo "  Verified release metadata and the trusted Carrier source in the Runtime data directory"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
-    echo "  Setup installs the Home profile, then opens Home in your browser."
+    echo "  Runtime setup fetches signed metadata and Home components over Carrier."
+    echo "  Setup then opens Home in your browser."
     echo "  Keep the terminal open while using Home; Ctrl+C stops it."
     echo "  Without an interactive terminal, the installer prints the launch command."
     echo ""
@@ -211,53 +204,6 @@ validate_explicit_source_bootstrap_pair() {
     if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" != true ]] ||
        [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" != true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
         die "trusted-source Carrier bootstrap overrides are atomic; set both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID, or neither"
-    fi
-}
-
-refresh_source_bootstrap_from_publisher() {
-    [[ -n "$PUBLISHER_GATEWAY" ]] || return 0
-    if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
-        return 0
-    fi
-
-    local bootstrap_url parsed
-    bootstrap_url="${PUBLISHER_GATEWAY%/}/.well-known/elastos/carrier-bootstrap.json?role=publisher"
-    if ! parsed=$(curl -fsSL --max-time 10 "$bootstrap_url" | python3 -c '
-import json
-import sys
-
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-
-if data.get("schema") != "elastos.carrier.bootstrap/v1":
-    raise SystemExit(1)
-if data.get("role") != "publisher":
-    raise SystemExit(1)
-ticket = (data.get("ticket") or "").strip()
-node_id = (data.get("node_id") or "").strip()
-if not ticket or not node_id:
-    raise SystemExit(1)
-print(ticket)
-print(node_id)
-'); then
-        warn "Could not refresh trusted-source Carrier bootstrap from ${bootstrap_url}; using stamped source route"
-        return 0
-    fi
-
-    local refreshed=() line
-    while IFS= read -r line; do
-        refreshed+=("$line")
-    done <<<"$parsed"
-    if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
-        SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
-    fi
-    if [[ "${PUBLISHER_NODE_ID_EXPLICIT}" != true ]]; then
-        PUBLISHER_NODE_ID="${refreshed[1]:-}"
-    fi
-    if [[ -n "$SOURCE_CONNECT_TICKET" && -n "$PUBLISHER_NODE_ID" ]]; then
-        info "Refreshed trusted-source Carrier bootstrap from publisher gateway"
     fi
 }
 
@@ -566,11 +512,6 @@ verify_signature() {
     local domain="$2"
     local expected_did="$3"
 
-    if [[ "$ALLOW_UNSIGNED" = true ]]; then
-        warn "Skipping signature verification (--allow-unsigned)"
-        return 0
-    fi
-
     if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
 # RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
 # https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1
@@ -737,6 +678,9 @@ try:
         raise ValueError("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata")
     if hashlib.sha256(release_bytes).hexdigest() != expected:
         raise ValueError("Release envelope differs from the signed head")
+    core = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    if not re.fullmatch(core + r"(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?", str(head.get("version", ""))):
+        raise ValueError("Invalid signed release version; expected X.Y.Z or X.Y.Z-{alpha|beta|rc}.N")
     for field in ("version", "channel"):
         value = head.get(field)
         if not isinstance(value, str) or not value or release.get(field) != value:
@@ -777,7 +721,6 @@ if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
     return 0
 fi
 
-ALLOW_UNSIGNED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
@@ -802,7 +745,6 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
-        --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
             INSTALL_DIR="$2"; shift 2 ;;
@@ -847,8 +789,8 @@ if [[ -z "$HEAD_CID" && -z "$PUBLISHER_GATEWAY" ]]; then
     die "No bootstrap publisher URL and no HEAD_CID. Either:\n  1. Set ELASTOS_PUBLISHER_GATEWAY env var, or\n  2. Set ELASTOS_HEAD_CID env var, or\n  3. Pass --head-cid <CID>."
 fi
 
-if [[ "$ALLOW_UNSIGNED" != true && -z "$MAINTAINER_DID" ]]; then
-    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>.\n  For unsigned install: pass --allow-unsigned"
+if [[ -z "$MAINTAINER_DID" ]]; then
+    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
 fi
 
 # ── Preflight ─────────────────────────────────────────────────────────
@@ -923,8 +865,6 @@ validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
 
 BINARY_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
 BINARY_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
-COMPONENTS_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['cid']")
-COMPONENTS_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['sha256']")
 
 if [[ -z "$BINARY_CID" ]]; then
     AVAILABLE=$(json_get "${TMPDIR}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
@@ -959,130 +899,38 @@ fi
 info "Verifying binary SHA-256..."
 sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
-# ── Download + verify components.json ────────────────────────────────
-
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Downloading components.json from bootstrap publisher URL"
-    curl -fsSL --max-time 30 -o "${TMPDIR}/components.json" "${PG}/artifacts/components-${PLATFORM}.json" \
-        || die "Failed to download components from ${PG}/artifacts/components-${PLATFORM}.json"
-else
-    info "Downloading components.json by CID: ${COMPONENTS_CID} (bootstrap mode)"
-    ipfs_fetch "$COMPONENTS_CID" "${TMPDIR}/components.json"
-fi
-
-info "Verifying components.json SHA-256..."
-sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
-
-# ── Download + verify the pinned model catalog ───────────────────────
-# The verified components.json names the catalog head. Every advertised file
-# is staged and verified here; nothing running or installed changes before.
-
-CATALOG_HEAD=$(json_get "${TMPDIR}/components.json" '(d.get("model_catalog") or {}).get("head_cid")')
-if [[ -n "$CATALOG_HEAD" ]]; then
-    if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-        info "Downloading model catalog from bootstrap publisher URL"
-        curl -fsSL --max-time 30 -o "${TMPDIR}/model-catalog.json" "${PG}/artifacts/model-catalog.json" \
-            || die "Failed to download model catalog from ${PG}/artifacts/model-catalog.json; the current installation was preserved"
-    else
-        info "Downloading model catalog by CID: ${CATALOG_HEAD} (bootstrap mode)"
-        ipfs_fetch "$CATALOG_HEAD" "${TMPDIR}/model-catalog.json"
-    fi
-    info "Verifying model catalog head ${CATALOG_HEAD}..."
-    CATALOG_HEAD="$CATALOG_HEAD" python3 - "${TMPDIR}/model-catalog.json" <<'PY' \
-        || die "Downloaded model catalog does not match the pin in components.json; the current installation was preserved"
-import base64
-import hashlib
-import os
-import pathlib
-import sys
-
-data = pathlib.Path(sys.argv[1]).read_bytes()
-expected = os.environ["CATALOG_HEAD"]
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != expected:
-    raise SystemExit(f"model catalog head {head} does not match pin {expected}")
-PY
-fi
-
-# ── Install (2 files) ────────────────────────────────────────────────
+# ── Admit the verified release with the shared installation writer ──
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
-info "Stopping verified Runtime processes for this installation before its protected-root check..."
-installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
-    || die "Close this installation's Runtime and retry; its existing files were preserved"
-info "Open Home again after installation to reconnect."
-
-info "Installing binary to ${INSTALL_DIR}/elastos..."
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
 mkdir -p "$INSTALL_DIR"
-TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
-cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
-chmod +x "${TMP_INSTALL_BIN}"
-
-# The staged executable must run and report the release version before it
-# replaces the current binary. A refusal removes only this staged copy.
-STAGED_VERSION_STATUS=0
-STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>&1)" || STAGED_VERSION_STATUS=$?
-if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
-    rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}"
-fi
-if ! printf '%s' "${STAGED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; then
-    rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}"
-fi
-mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
 
-# Evict stale cached capsules when components.json changes (CID mismatch).
-# This forces the supervisor to re-download updated capsule binaries on demand.
-OLD_COMPONENTS="${DATA_DIR}/components.json"
-if [[ -f "$OLD_COMPONENTS" ]]; then
-    CHANGED_CAPSULES=$(python3 - "$OLD_COMPONENTS" "${TMPDIR}/components.json" <<'PY'
-import json, sys
-try:
-    old = json.load(open(sys.argv[1]))
-    new = json.load(open(sys.argv[2]))
-    for name, entry in new.get("capsules", {}).items():
-        old_entry = old.get("capsules", {}).get(name, {})
-        if old_entry.get("cid") != entry.get("cid"):
-            print(name)
-except Exception:
-    pass
-PY
-    )
-    CAPSULE_CACHE="${DATA_DIR}/capsules"
-    for cname in $CHANGED_CAPSULES; do
-        if [[ -d "${CAPSULE_CACHE}/${cname}" ]]; then
-            info "Evicting stale capsule cache: ${cname}"
-            rm -rf "${CAPSULE_CACHE}/${cname}"
-        fi
-    done
+TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
+trap 'rm -rf "$TMPDIR" "$TMP_INSTALL_BIN"' EXIT
+cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
+chmod +x "${TMP_INSTALL_BIN}"
+
+# The staged executable must report the exact release version on stdout with
+# empty stderr before it can write this installation.
+STAGED_VERSION_STATUS=0
+STAGED_VERSION_STDERR_PATH="${TMPDIR}/elastos-version.stderr"
+STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
+STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
+if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
+    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
+fi
+if [[ "${STAGED_VERSION_OUTPUT}" != "elastos ${RELEASE_VERSION}" || -s "${STAGED_VERSION_STDERR_PATH}" ]]; then
+    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
 
-info "Installing components.json to ${DATA_DIR}/..."
-cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
-
-if [[ -n "$CATALOG_HEAD" ]]; then
-    info "Installing signed model catalog ${CATALOG_HEAD} to ${DATA_DIR}/..."
-    (umask 077; cp "${TMPDIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json")
-    chmod 600 "${DATA_DIR}/model-catalog.json"
-fi
-
-PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
-info "Verifying and upgrading configured protected roots while Runtime is stopped..."
-"${INSTALL_DIR}/elastos" principal-root-upgrade \
-    --data-dir "${DATA_DIR}" \
-    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
-
-# ── Save Carrier contact + release metadata for `elastos upgrade` ────
-
-refresh_source_bootstrap_from_publisher
+# ── Carrier contact + release metadata for `elastos upgrade` ─────────
 
 SIGNER_DID=$(json_get "${TMPDIR}/release-head.json" 'd["signer_did"]')
 
-SOURCES_PATH="${DATA_DIR}/sources.json"
+SOURCES_PATH="${TMPDIR}/sources.json"
 PUBLISHER_HASH=$(SIGNER_DID="${SIGNER_DID}" python3 - <<'PY'
 import hashlib
 import os
@@ -1143,13 +991,31 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
     json.dump(sources, f, indent=2)
     f.write("\n")
 PY
-info "Saved trusted source config to ${DATA_DIR}/sources.json"
 
-PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
-mkdir -p "${PUBLISHER_ROOT}"
-cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
-info "Saved publisher metadata for future upgrades"
+# The writer refuses an older release, another channel, a pending Home
+# update and a concurrent writer before this installer stops Runtime.
+INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
+    --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
+    "${TMPDIR}/release-head.json" "${TMPDIR}/release.json")
+"${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
+
+info "Stopping verified Runtime processes for this installation before its protected-root check..."
+installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
+info "Open Home again after installation to reconnect."
+
+# One journaled transaction replaces the Runtime, trusted sources and the
+# verified release pair; an interrupted run restores the previous set.
+info "Installing binary to ${INSTALL_DIR}/elastos..."
+"${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+
+PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+info "Verifying and upgrading configured protected roots while Runtime is stopped..."
+"${INSTALL_DIR}/elastos" principal-root-upgrade \
+    --data-dir "${DATA_DIR}" \
+    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
+info "Saved trusted source config to ${DATA_DIR}/sources.json"
+info "Saved verified release inputs for Runtime setup and updates"
 
 # ── Complete installation ─────────────────────────────────────────────
 

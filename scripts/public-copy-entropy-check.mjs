@@ -261,8 +261,10 @@ assert(
   "Services restored provider implementation copy",
 );
 
-const inbox = read("capsules/inbox/browser/index.html");
-const documents = read("capsules/documents/browser/index.html");
+const inbox = read("capsules/inbox/browser/index.html") +
+  read("capsules/inbox/browser/inbox.js");
+const documents = read("capsules/documents/browser/index.html") +
+  read("capsules/documents/browser/documents.js");
 const walletCreate = read("capsules/wallet/browser/wallet-create-account-flow.js");
 const walletSend = read("capsules/wallet/browser/wallet-send-flow.js");
 const walletRender = read("capsules/wallet/browser/wallet-render.js");

@@ -4,6 +4,40 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Removed
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. Removed the model CAR retention and import path from release
+  preparation, signing and publication, `model-package-handoff.py`,
+  `fetch-model.sh` and their tests. Models return later as a separate signed
+  publication.
+
+### Fixed
+
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
+
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths, including
+  entries with a CID. Explicit CID-only operator gateways verify checksums before
+  replacing installed bytes.
+
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer. It then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed manifest
+  bytes stay unchanged.
+
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output, and unexpected version
+  output preserve the previous installation.
+
+### Added
+
+- An internal offline update foundation stages and verifies release files with
+  unchanged support assets, an installation lock and journal, and restoration
+  after failed or interrupted activation. The default CLI update flow is preserved.
+  Home restart ownership and integration remain a follow-up.
+
 ## [0.7.1] - 2026-09-30
 
 Monthly developer release of the 0.7.1 work line. It is a source snapshot for

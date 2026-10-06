@@ -13,7 +13,7 @@ pub(in crate::api) mod preparation;
 const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
-const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 8;
 
 pub(crate) struct VerifiedModelCatalogEntry {
@@ -50,7 +50,11 @@ struct ModelCatalogEntry {
     object_manifest: Value,
 }
 
-fn read_model_catalog_file(data_dir: &Path, name: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_model_catalog_file(
+    data_dir: &Path,
+    name: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
     let root = std::fs::symlink_metadata(data_dir)?;
     if !root.is_dir() || root.file_type().is_symlink() {
         anyhow::bail!("model catalog requires a real data directory");
@@ -111,7 +115,7 @@ pub(crate) fn model_catalog_entries(
     verify_model_catalog(&trust, &bytes, now).map(Some)
 }
 
-fn verify_model_catalog(
+pub(crate) fn verify_model_catalog(
     trust: &crate::setup::ModelCatalogConfig,
     bytes: &[u8],
     now: u64,
@@ -829,37 +833,5 @@ pub(crate) mod tests {
             active_capsule_names(data_dir.path()).unwrap(),
             BTreeSet::from(["object-provider".to_string()])
         );
-    }
-
-    #[test]
-    fn checkout_permanent_catalog_matches_components_pin() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let components: crate::setup::ComponentsManifest =
-            serde_json::from_slice(&std::fs::read(root.join("components.json")).unwrap()).unwrap();
-        let trust = components
-            .model_catalog
-            .expect("matching install pins a signed model catalog");
-        let bytes = std::fs::read(root.join(MODEL_CATALOG_FILE)).unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let entries = verify_model_catalog(&trust, &bytes, now).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[0].cid,
-            "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi"
-        );
-        assert_eq!(entries[0].manifest.name, "qwen3-5-9b-q4-k-m-local");
-        assert_eq!(
-            entries[1].cid,
-            "bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y"
-        );
-        assert_eq!(entries[1].manifest.name, "smollm2-135m-instruct-q8-0-local");
-        assert_eq!(
-            entries[0].publisher_did,
-            "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
-        );
-        assert_eq!(entries[1].publisher_did, entries[0].publisher_did);
     }
 }

@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import process from "node:process";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   sha256File,
@@ -291,8 +295,6 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
       architectureOk,
       [
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
-        "ROADMAP.md",
-        "TASKS.md",
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-runbook.mjs",
       ],
@@ -317,7 +319,8 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
         "capsules/browser/browser/browser-input-surface.js",
         "capsules/browser/browser/browser-remote-display.js",
         "scripts/browser-display-mode-smoke.mjs",
-        "scripts/browser-entropy-check.mjs",
+        "scripts/browser-native-operator-config.mjs",
+        "scripts/browser-native-target-preflight.sh",
         "docs/BROWSER_CAPSULE.md",
         "scripts/browser-kasm-control-service.mjs",
       ],
@@ -328,8 +331,6 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
       "Keep the plan and implementation gates current after each Browser iteration.",
       architectureOk && criterionOk(criteria, "native_media_preflight_gate"),
       [
-        "TASKS.md",
-        "ROADMAP.md",
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
         "scripts/browser-provider-runbook.mjs",
         "scripts/browser-objective-audit.mjs",
@@ -348,18 +349,27 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const tasks = readRepo("TASKS.md");
-  const roadmap = readRepo("ROADMAP.md");
   const browserDocs = readRepo("docs/BROWSER_CAPSULE.md");
   const bakeoffDocs = readRepo("docs/BROWSER_PROVIDER_BAKEOFF.md");
-  const planningSurface = [tasks, roadmap, browserDocs, bakeoffDocs].join("\n");
   const supervisor = readRepo("elastos/tools/browser-engine-supervisor/src/main.rs");
   const nativeConfig = readRepo("scripts/browser-native-operator-config.mjs");
   const nativePreflightScript = readRepo("scripts/browser-native-target-preflight.sh");
   const decisionReport = readRepo("scripts/browser-provider-decision-report.mjs");
   const decisionReportSmoke = readRepo("scripts/browser-provider-decision-report-smoke.sh");
   const runbook = readRepo("scripts/browser-provider-runbook.mjs");
-  const entropy = readRepo("scripts/browser-entropy-check.mjs");
+  const configFixture = fs.mkdtempSync(join(tmpdir(), "browser-objective-config-"));
+  let nativeMediaDefaultsOff = false;
+  try {
+    const config = JSON.parse(execFileSync(process.execPath, [
+      fileURLToPath(new URL("scripts/browser-native-operator-config.mjs", repoRoot)),
+      "--out-dir", configFixture, "--browser-program", "/fixture/browser",
+      "--supervisor-bin", "/fixture/supervisor", "--proxy-engine-bin", "/fixture/proxy",
+    ], { encoding: "utf8" }));
+    const adapter = JSON.parse(fs.readFileSync(join(configFixture, "browser-engine-adapter.json"), "utf8"));
+    const supervisor = JSON.parse(adapter.adapters[0].supervisor.env.ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG);
+    nativeMediaDefaultsOff = config.native_audio_declared === false && config.native_video_declared === false &&
+      supervisor.display_capabilities.audio === false && supervisor.display_capabilities.video === false;
+  } finally { fs.rmSync(configFixture, { recursive: true, force: true }); }
   const browserUi = [
     readRepo("capsules/browser/browser/browser.js"),
     readRepo("capsules/browser/browser/browser-input-surface.js"),
@@ -383,29 +393,22 @@ function main() {
       "Browser work uses one Browser/Net/Exit ABI instead of one-off host iframes or fallback display paths.",
       browserDocs.includes("Browser UI capsule") &&
         bakeoffDocs.includes("Runtime Browser open route") &&
-        bakeoffDocs.includes("No candidate gets a new Browser ABI") &&
-        tasks.includes("one Browser/Net/Exit ABI"),
-      ["docs/BROWSER_CAPSULE.md", "docs/BROWSER_PROVIDER_BAKEOFF.md", "TASKS.md"],
+        bakeoffDocs.includes("No candidate gets a new Browser ABI"),
+      ["docs/BROWSER_CAPSULE.md", "docs/BROWSER_PROVIDER_BAKEOFF.md"],
       "Document the one Browser/Net/Exit ABI and reject candidate-specific Browser ABIs.",
     ),
     criterion(
       "selkies_is_baseline_not_product",
       "Selkies/Docker is treated as backend packaging and baseline proof, not the final browser answer.",
-      bakeoffDocs.includes("Selkies remains the self-hosted baseline/proof") &&
-        roadmap.includes("not the final product") &&
-        (planningSurface.includes("Selkies is the current self-hosted baseline") ||
-          planningSurface.includes("Selkies as the current self-hosted baseline")) &&
-        planningSurface.includes("not the acceptance answer"),
-      ["docs/BROWSER_PROVIDER_BAKEOFF.md", "ROADMAP.md", "TASKS.md"],
-      "Make Selkies baseline-only language explicit in docs/tasks.",
+      bakeoffDocs.includes("Selkies remains the self-hosted baseline/proof"),
+      ["docs/BROWSER_PROVIDER_BAKEOFF.md"],
+      "Make Selkies baseline-only language explicit in the bake-off docs.",
     ),
     criterion(
       "native_product_path_defined",
       "Native/local adapter is the product-performance path for low latency and real audio/video surfaces.",
-      bakeoffDocs.includes("performance path is native/local first") &&
-        roadmap.includes("native/local browser adapters for lowest-latency") &&
-        planningSurface.includes("native Chromium/CEF-style adapter"),
-      ["docs/BROWSER_PROVIDER_BAKEOFF.md", "ROADMAP.md", "TASKS.md"],
+      bakeoffDocs.includes("performance path is native/local first"),
+      ["docs/BROWSER_PROVIDER_BAKEOFF.md"],
       "Record native/local browser adapter as the product-performance path.",
     ),
     criterion(
@@ -433,12 +436,10 @@ function main() {
         decisionReport.includes("provision_kasm_workspaces_first") &&
         runbook.includes("## Next Action") &&
         runbook.includes("nextActionBlock") &&
-        planningSurface.includes("structured `next_action`") &&
         bakeoffDocs.includes("structured `next_action`"),
       [
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-runbook.mjs",
-        "TASKS.md",
         "docs/BROWSER_PROVIDER_BAKEOFF.md",
       ],
       "Make the decision report emit a structured next_action and render it in the runbook before candidate-specific commands.",
@@ -451,16 +452,10 @@ function main() {
         decisionReport.includes("separate provider instance") &&
         decisionReport.includes("provision_kasm_workspaces_first") &&
         decisionReportSmoke.includes("busy_selkies_next_action_exercised") &&
-        decisionReportSmoke.includes("must not recommend more Selkies tuning") &&
-        planningSurface.includes("Freeze new Browser provider implementation") &&
-        planningSurface.includes("do not spend more branch time tuning Selkies as the product path") &&
-        roadmap.includes("Browser work should stop") &&
-        roadmap.includes("contract/gate layer"),
+        decisionReportSmoke.includes("must not recommend more Selkies tuning"),
       [
         "scripts/browser-provider-decision-report.mjs",
         "scripts/browser-provider-decision-report-smoke.sh",
-        "TASKS.md",
-        "ROADMAP.md",
       ],
       "Make this host's stop condition explicit: do not keep tuning the running Selkies baseline when product proof requires an operator-owned hosted candidate or a native target with compositor/audio/network isolation.",
     ),
@@ -473,13 +468,12 @@ function main() {
         nativeConfig.includes("nativeVideo: false") &&
         nativeConfig.includes("--native-audio") &&
         nativeConfig.includes("--native-video") &&
-        entropy.includes("Native Browser namespace/proxy smokes must not pretend fake browser processes prove native audio or video"),
+        nativeMediaDefaultsOff,
       [
         "elastos/tools/browser-engine-supervisor/src/main.rs",
         "scripts/browser-native-operator-config.mjs",
-        "scripts/browser-entropy-check.mjs",
       ],
-      "Default native media off and enforce this in entropy checks.",
+      "Keep generated native media declarations off until the operator provides capabilities; product media needs accepted target evidence.",
     ),
     criterion(
       "native_media_preflight_gate",
@@ -557,7 +551,7 @@ function main() {
     objective: {
       source: "thread goal",
       restatement:
-        "Determine the best Browser architecture path, implement fail-closed provider gates, enable/prove audio through the chosen product provider, and verify with entropy/alignment/manual UX evidence.",
+        "Determine the best Browser architecture path, implement fail-closed provider gates, enable/prove audio through the chosen product provider, and verify with behaviour tests, target artifacts, and manual UX evidence.",
     },
     prompt_to_artifact_checklist: promptToArtifactChecklist({
       criteria,
