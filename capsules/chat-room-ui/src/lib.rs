@@ -1531,8 +1531,12 @@ impl App {
                     let app = Rc::clone(&runtime_events_app);
                     spawn_local(async move {
                         // New direct messages and new contacts change the
-                        // conversation list as well as the open thread.
-                        let _ = app.refresh_direct_conversations().await;
+                        // conversation list as well as the open thread. The
+                        // poll below renders only when the open thread
+                        // changed, so a list change renders here.
+                        if matches!(app.refresh_direct_conversations().await, Ok(true)) {
+                            let _ = app.render();
+                        }
                         app.poll_and_render_once().await;
                     });
                 }));
