@@ -240,6 +240,7 @@ fn configure_update_summary(data_dir: &std::path::Path) {
                 .unwrap(),
             host_pid: Some(std::process::id()),
             generation: "a".repeat(32),
+            refused_release: None,
         })
         .unwrap(),
     )
@@ -418,6 +419,73 @@ async fn system_update_summary_stays_fast_while_check_is_pending_and_keeps_queue
         .unwrap();
     assert_eq!(queued["available"], true);
     assert_eq!(queued["can_apply"], false);
+}
+
+#[tokio::test]
+async fn system_update_summary_never_reoffers_a_refused_release_but_offers_a_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let _state = test_state(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let context = HomeLaunchTokenContext {
+        principal_id: owner.principal_id,
+        session_id: owner.session_id,
+        proof_binding_id: Some(owner.proof_binding_id),
+        grant_id: owner.grant_id,
+    };
+    configure_update_summary(dir.path());
+    let status_path = dir.path().join("update-controller/status.json");
+    let mut status: crate::update_controller::UpdateStatus =
+        serde_json::from_slice(&std::fs::read(&status_path).unwrap()).unwrap();
+    status.phase = "failed".into();
+    status.message = crate::update_controller::REFUSED_MESSAGE.into();
+    status.refused_release = Some(crate::update_controller::RefusedRelease {
+        head_cid: TEST_CIDV1.into(),
+        release_cid: TEST_CIDV0.into(),
+    });
+    std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let summary = |offer: crate::operator_control::OperatorUpdateCheck| {
+        let context = &context;
+        let path = dir.path();
+        async move {
+            let cache = tokio::sync::Mutex::new(UpdateCheckCache::default());
+            let mut offer = Some(offer);
+            loop {
+                let next = offer.take();
+                let summary = system_runtime_update_summary_with_cache(
+                    path,
+                    context,
+                    &cache,
+                    |_, _, _| async move { next },
+                )
+                .await
+                .unwrap();
+                if summary["checking"] == false {
+                    break summary;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    let mut republished_head = cached_offer();
+    republished_head.head_cid = Some("republished-head".into());
+    for refused in [cached_offer(), republished_head] {
+        let same = summary(refused).await;
+        assert_eq!(same["available"], false);
+        assert_eq!(same["can_apply"], false);
+        assert_eq!(same["message"], crate::update_controller::REFUSED_MESSAGE);
+        assert_eq!(
+            same["controller"]["message"],
+            crate::update_controller::REFUSED_MESSAGE
+        );
+    }
+    let mut next = cached_offer();
+    next.latest_version = "0.7.2".into();
+    next.head_cid = Some("next-head".into());
+    next.release_cid = Some("next-release".into());
+    let offered = summary(next).await;
+    assert_eq!(offered["available"], true);
+    assert_eq!(offered["can_apply"], true);
+    assert_eq!(offered["head_cid"], "next-head");
 }
 
 #[tokio::test]
@@ -845,6 +913,7 @@ async fn system_update_exact_retry_recovers_both_queue_write_boundaries() {
                     .unwrap(),
                     host_pid: Some(std::process::id()),
                     generation: "a".repeat(32),
+                    refused_release: None,
                 })
                 .unwrap(),
             )

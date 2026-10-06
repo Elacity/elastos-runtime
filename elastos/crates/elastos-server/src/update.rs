@@ -854,6 +854,29 @@ impl std::fmt::Display for UpdateSourceUnavailable {
 }
 impl std::error::Error for UpdateSourceUnavailable {}
 
+/// The signed release itself was refused (signature, content identity, binding,
+/// version order or admission). Retrying the same release can never succeed.
+#[derive(Debug)]
+pub(crate) struct ReleaseRefused(anyhow::Error);
+impl std::fmt::Display for ReleaseRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.0)
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+impl std::error::Error for ReleaseRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.chain().nth(1)
+    }
+}
+
+pub(crate) fn refused<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    result.map_err(|error| ReleaseRefused(error).into())
+}
+
 pub(crate) fn download_message(size: Option<u64>) -> String {
     let size = size
         .map(|bytes| format!(" ({})", format_bytes(bytes as usize)))
@@ -1090,15 +1113,20 @@ async fn run_update_with_restart(
         fetch_fn(head_cid, ordered_gateways.clone()).await?
     };
     if let Some(cid) = resolved_head_cid.as_deref() {
-        verify_release_metadata_cid(cid, &head_bytes)?;
+        refused(verify_release_metadata_cid(cid, &head_bytes))?;
     }
 
     // 4. Verify signature
-    let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)
-        .map_err(new_publisher_key_hint)?;
+    let head = refused(
+        verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)
+            .map_err(new_publisher_key_hint),
+    )?;
 
     let head_version = head["payload"]["version"].as_str().unwrap_or("unknown");
-    verify_source_channel(&source, head["payload"]["channel"].as_str().unwrap_or(""))?;
+    refused(verify_source_channel(
+        &source,
+        head["payload"]["channel"].as_str().unwrap_or(""),
+    ))?;
     let release_cid = head["payload"]["latest_release_cid"].as_str().unwrap_or("");
     let release_object_cid = optional_release_object_cid(&head)?;
 
@@ -1238,7 +1266,9 @@ async fn run_upgrade_with_restart(
 ) -> anyhow::Result<()> {
     // Admit the exact signed publication before check-only/version success or artifacts.
     if release_cid.is_empty() {
-        anyhow::bail!("Release head has no latest_release_cid");
+        return refused(Err(anyhow::anyhow!(
+            "Release head has no latest_release_cid"
+        )));
     }
     println!(
         "  Fetching release: {}...",
@@ -1255,18 +1285,23 @@ async fn run_upgrade_with_restart(
     };
     // Gateway bytes are bound by verify_release_binding; release_sha256 must stay mandatory.
     if working_gateway.is_none() {
-        verify_release_metadata_cid(release_cid, &release_bytes)?;
+        refused(verify_release_metadata_cid(release_cid, &release_bytes))?;
     }
 
     // Verify the chosen envelope, then its binding to the already verified head.
-    let (release, signer_did) = verify_release_envelope_against_dids(
-        &release_bytes,
-        "elastos.release.v1",
-        &source.publisher_dids,
-    )
-    .map_err(new_publisher_key_hint)?;
-    verify_release_binding(head, &release_bytes, &release)?;
-    verify_source_channel(source, head["payload"]["channel"].as_str().unwrap_or(""))?;
+    let (release, signer_did) = refused(
+        verify_release_envelope_against_dids(
+            &release_bytes,
+            "elastos.release.v1",
+            &source.publisher_dids,
+        )
+        .map_err(new_publisher_key_hint),
+    )?;
+    refused(verify_release_binding(head, &release_bytes, &release))?;
+    refused(verify_source_channel(
+        source,
+        head["payload"]["channel"].as_str().unwrap_or(""),
+    ))?;
     println!("  Release signer: {}", signer_did);
 
     // 5. Compare versions
@@ -1309,9 +1344,9 @@ async fn run_upgrade_with_restart(
             return Ok(());
         }
         Ordering::Less if !force => {
-            anyhow::bail!(
+            return refused(Err(anyhow::anyhow!(
                 "Signed release {version} is older than installed release {installed_version}; use an explicit rollback command if intended"
-            );
+            )));
         }
         _ => {}
     }
@@ -1412,11 +1447,11 @@ async fn run_upgrade_with_restart(
         let hash = sha2::Sha256::digest(&binary_data);
         let actual = hex::encode(hash);
         if actual != binary_sha256 {
-            anyhow::bail!(
+            return refused(Err(anyhow::anyhow!(
                 "Binary SHA-256 mismatch!\n  Expected: {}\n  Got:      {}",
                 binary_sha256,
                 actual
-            );
+            )));
         }
     }
     println!("  Binary verified (SHA-256 ✓)");
@@ -1457,26 +1492,30 @@ async fn run_upgrade_with_restart(
         let hash = sha2::Sha256::digest(&comp_data);
         let actual = hex::encode(hash);
         if actual != comp_sha256 {
-            anyhow::bail!(
+            return refused(Err(anyhow::anyhow!(
                 "Components SHA-256 mismatch!\n  Expected: {}\n  Got:      {}",
                 comp_sha256,
                 actual
-            );
+            )));
         }
     }
     println!("  Components verified (SHA-256 ✓)");
-    crate::installed_release::admit_descriptor(
-        binary_info,
-        binary_sha256,
-        binary_data.len() as u64,
-    )?;
-    crate::installed_release::admit_descriptor(comp_info, comp_sha256, comp_data.len() as u64)?;
-    anyhow::ensure!(
-        comp_data.len() <= 4 * 1024 * 1024,
-        "Installed components exceed their byte bound"
-    );
-    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
-    crate::setup::admit_release_components(&manifest, &component_platform)?;
+    let admitted = (|| {
+        crate::installed_release::admit_descriptor(
+            binary_info,
+            binary_sha256,
+            binary_data.len() as u64,
+        )?;
+        crate::installed_release::admit_descriptor(comp_info, comp_sha256, comp_data.len() as u64)?;
+        anyhow::ensure!(
+            comp_data.len() <= 4 * 1024 * 1024,
+            "Installed components exceed their byte bound"
+        );
+        let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
+        crate::setup::admit_release_components(&manifest, &component_platform)?;
+        Ok(())
+    })();
+    refused(admitted)?;
 
     if apply_mode == ApplyMode::Normal {
         // 10. Atomic replace binary

@@ -2160,6 +2160,7 @@ fn publish_owner_queue_status(
             controller_start: process_start(std::process::id()).unwrap(),
             host_pid: Some(std::process::id()),
             generation: "d".repeat(32),
+            refused_release: None,
         },
     )
     .unwrap();
@@ -3342,6 +3343,33 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 assert!(status
                     .message
                     .contains("Connect to the internet and select Update again."));
+                assert_eq!(status.refused_release, None, "{outcome}");
+            }
+            if [
+                "head verify",
+                "release verify",
+                "components verify",
+                "binary verify",
+            ]
+            .contains(&outcome)
+            {
+                let request = owner.controller.request.as_ref().unwrap();
+                assert_eq!(status.message, REFUSED_MESSAGE, "{outcome}");
+                assert_eq!(
+                    status.refused_release,
+                    Some(RefusedRelease {
+                        head_cid: request.head_cid.clone(),
+                        release_cid: request.release_cid.clone(),
+                    }),
+                    "{outcome}"
+                );
+                let refused = status.refused_release.clone();
+                owner.controller.publish("ready", "Home is ready.").unwrap();
+                let later = super::status(&fixture.data).unwrap().unwrap();
+                assert_eq!(
+                    later.refused_release, refused,
+                    "refusal survives later phases"
+                );
             }
             assert_eq!(
                 fs::read(&fixture.binary).unwrap(),
@@ -3366,4 +3394,55 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         owner.host.take();
         owner.controller.stop_child().await.unwrap();
     }
+}
+
+#[test]
+fn apply_failures_are_classified_only_from_typed_evidence() {
+    for (error, expected) in [
+        (
+            anyhow::Error::from(crate::update::UpdateSourceUnavailable).context("private endpoint"),
+            ApplyFailure::SourceUnavailable,
+        ),
+        (
+            anyhow::Error::from(crate::install_transaction::DiskReserveError),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            crate::update::refused::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!")))
+                .unwrap_err()
+                .context("staging"),
+            ApplyFailure::Refused,
+        ),
+        (
+            anyhow::anyhow!("Binary SHA-256 mismatch!"),
+            ApplyFailure::Unknown,
+        ),
+        (anyhow::anyhow!("unexpected"), ApplyFailure::Unknown),
+    ] {
+        assert_eq!(classify_apply_failure(&error), expected, "{error:#}");
+    }
+    let refused =
+        crate::update::refused::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!"))).unwrap_err();
+    assert_eq!(refused.to_string(), "Binary SHA-256 mismatch!");
+    for failure in [
+        ApplyFailure::SourceUnavailable,
+        ApplyFailure::NotEnoughSpace,
+        ApplyFailure::Unknown,
+    ] {
+        assert!(failure
+            .message()
+            .to_lowercase()
+            .contains("select update again."));
+        assert!(!failure.message().contains("refused"));
+    }
+    assert!(ApplyFailure::NotEnoughSpace
+        .message()
+        .contains("free disk space"));
+    assert!(!REFUSED_MESSAGE
+        .to_lowercase()
+        .contains("select update again"));
 }

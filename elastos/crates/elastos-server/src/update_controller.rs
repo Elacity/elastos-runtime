@@ -195,6 +195,20 @@ pub struct UpdateRequest {
     pub release_cid: String,
 }
 
+/// The exact signed release a controller refused; retrying it can never succeed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedRelease {
+    pub head_cid: String,
+    pub release_cid: String,
+}
+
+impl RefusedRelease {
+    pub fn matches(&self, head_cid: Option<&str>, release_cid: Option<&str>) -> bool {
+        head_cid == Some(self.head_cid.as_str()) || release_cid == Some(self.release_cid.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateStatus {
@@ -207,6 +221,9 @@ pub struct UpdateStatus {
     pub controller_start: String,
     pub host_pid: Option<u32>,
     pub generation: String,
+    /// Kept across later phases so System never offers this exact release again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_release: Option<RefusedRelease>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -912,6 +929,24 @@ impl Controller {
     }
 
     fn publish(&self, phase: &str, message: &str) -> Result<()> {
+        // A refusal binds the exact release, so it survives later phases until an update lands.
+        let path = self.directory.join(STATUS);
+        let refused_release = if phase == "updated" || !path_present(&path)? {
+            None
+        } else {
+            read_private_json::<UpdateStatus>(&path)
+                .ok()
+                .and_then(|status| status.refused_release)
+        };
+        self.write_status(phase, message, refused_release)
+    }
+
+    fn write_status(
+        &self,
+        phase: &str,
+        message: &str,
+        refused_release: Option<RefusedRelease>,
+    ) -> Result<()> {
         let source = installed_source(&self.receipt.data_dir)?;
         write_private(
             &self.directory.join(STATUS),
@@ -929,6 +964,7 @@ impl Controller {
                     .context("controller identity unavailable")?,
                 host_pid: self.child.as_ref().map(|child| child.pid()),
                 generation: self.generation.clone(),
+                refused_release,
             },
         )
     }
@@ -945,16 +981,18 @@ impl Controller {
                 )
             })
         {
-            let message = if result
-                .as_ref()
-                .unwrap_err()
-                .is::<crate::update::UpdateSourceUnavailable>()
-            {
-                "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
-            } else {
-                "Update verification failed or the release was refused. Your current version is unchanged. Select Update again."
-            };
-            self.publish("failed", message)
+            let error = result.as_ref().unwrap_err();
+            match classify_apply_failure(error) {
+                ApplyFailure::Refused => self.write_status(
+                    "failed",
+                    REFUSED_MESSAGE,
+                    self.request.as_ref().map(|request| RefusedRelease {
+                        head_cid: request.head_cid.clone(),
+                        release_cid: request.release_cid.clone(),
+                    }),
+                ),
+                failure => self.publish("failed", failure.message()),
+            }
         } else if self.host_ready && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
         {
             self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")
@@ -1053,7 +1091,7 @@ impl Controller {
                 }
                 .context(crate::update::UpdateSourceUnavailable)?;
                 if cid == choice.head_cid {
-                    verify_update_choice(&bytes, &choice, &trusted)?;
+                    crate::update::refused(verify_update_choice(&bytes, &choice, &trusted))?;
                 }
                 Ok(bytes)
             })
@@ -1393,6 +1431,43 @@ fn controller_file_digest(path: &Path) -> Result<Option<String>> {
         digest.update(&buffer[..length]);
     }
     Ok(Some(hex::encode(digest.finalize())))
+}
+
+pub(crate) const REFUSED_MESSAGE: &str = "This update was refused because it does not match what the publisher signed. Your current version is unchanged.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyFailure {
+    SourceUnavailable,
+    NotEnoughSpace,
+    Refused,
+    Unknown,
+}
+
+impl ApplyFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::SourceUnavailable => "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.",
+            Self::NotEnoughSpace => "There is not enough free disk space for this update. Your current version is unchanged. Free some space and select Update again.",
+            Self::Refused => REFUSED_MESSAGE,
+            Self::Unknown => "The update could not be completed. Your current version is unchanged. Select Update again.",
+        }
+    }
+}
+
+/// Only typed evidence classifies a failure; anything else stays retryable.
+fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
+    if error.is::<crate::update::UpdateSourceUnavailable>() {
+        ApplyFailure::SourceUnavailable
+    } else if controller_space_error(error) {
+        ApplyFailure::NotEnoughSpace
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::update::ReleaseRefused>())
+    {
+        ApplyFailure::Refused
+    } else {
+        ApplyFailure::Unknown
+    }
 }
 
 fn controller_space_error(error: &anyhow::Error) -> bool {
