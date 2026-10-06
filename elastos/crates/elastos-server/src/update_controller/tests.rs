@@ -3342,6 +3342,52 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 assert!(status
                     .message
                     .contains("Connect to the internet and select Update again."));
+                assert!(!fixture.directory.join(REFUSED).exists(), "{outcome}");
+            }
+            if [
+                "head verify",
+                "release verify",
+                "components verify",
+                "binary verify",
+            ]
+            .contains(&outcome)
+            {
+                // Fetched bytes that differ from the signed digest may be transport damage.
+                assert_eq!(
+                    status.message,
+                    ApplyFailure::DownloadMismatch.message(),
+                    "{outcome}"
+                );
+                assert!(!fixture.directory.join(REFUSED).exists(), "{outcome}");
+            }
+            if outcome == "head verify" {
+                // A publisher-statement refusal binds the exact release; others stay offered.
+                let first = owner.controller.request.clone().unwrap();
+                let signature = || {
+                    crate::update::refused::<()>(Err(anyhow::anyhow!(
+                        "Signed envelope signature verification failed"
+                    )))
+                };
+                owner.controller.publish("staging", "Checking.").unwrap();
+                owner.controller.publish_apply_result(&signature()).unwrap();
+                let refused = super::status(&fixture.data).unwrap().unwrap();
+                assert_eq!(refused.message, REFUSED_MESSAGE);
+                let mut second = first.clone();
+                second.head_cid = "second-head".into();
+                second.release_cid = "second-release".into();
+                owner.controller.request = Some(second.clone());
+                owner.controller.publish("staging", "Checking.").unwrap();
+                owner.controller.publish_apply_result(&signature()).unwrap();
+                for request in [&first, &second] {
+                    assert!(release_refused(&fixture.data, &request.head_cid, "other").unwrap());
+                    assert!(release_refused(&fixture.data, "other", &request.release_cid).unwrap());
+                }
+                assert!(!release_refused(&fixture.data, "next-head", "next-release").unwrap());
+                // Installing a release clears only that release's refusal.
+                owner.controller.publish_apply_result(&Ok(())).unwrap();
+                assert!(!release_refused(&fixture.data, &second.head_cid, "other").unwrap());
+                assert!(release_refused(&fixture.data, &first.head_cid, "other").unwrap());
+                owner.controller.request = Some(first);
             }
             assert_eq!(
                 fs::read(&fixture.binary).unwrap(),
@@ -3366,4 +3412,107 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         owner.host.take();
         owner.controller.stop_child().await.unwrap();
     }
+}
+
+#[test]
+fn apply_failures_are_classified_only_from_typed_evidence() {
+    for (error, expected) in [
+        (
+            anyhow::Error::from(crate::update::UpdateSourceUnavailable).context("private endpoint"),
+            ApplyFailure::SourceUnavailable,
+        ),
+        (
+            anyhow::Error::from(crate::install_transaction::UpdateSpaceError),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            crate::update::mismatched::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!")))
+                .unwrap_err()
+                .context("staging"),
+            ApplyFailure::DownloadMismatch,
+        ),
+        (
+            crate::update::refused::<()>(Err(anyhow::anyhow!(
+                "Signed envelope signature verification failed"
+            )))
+            .unwrap_err()
+            .context("staging"),
+            ApplyFailure::Refused,
+        ),
+        (
+            anyhow::anyhow!("Binary SHA-256 mismatch!"),
+            ApplyFailure::Unknown,
+        ),
+        (anyhow::anyhow!("unexpected"), ApplyFailure::Unknown),
+    ] {
+        assert_eq!(classify_apply_failure(&error), expected, "{error:#}");
+    }
+    let refused =
+        crate::update::refused::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!"))).unwrap_err();
+    assert_eq!(refused.to_string(), "Binary SHA-256 mismatch!");
+    for failure in [
+        ApplyFailure::SourceUnavailable,
+        ApplyFailure::NotEnoughSpace,
+        ApplyFailure::DownloadMismatch,
+        ApplyFailure::Unknown,
+    ] {
+        assert!(failure
+            .message()
+            .to_lowercase()
+            .contains("select update again."));
+        assert!(!failure.message().contains("refused"));
+    }
+    assert!(ApplyFailure::NotEnoughSpace
+        .message()
+        .contains("free disk space"));
+    assert!(!REFUSED_MESSAGE
+        .to_lowercase()
+        .contains("select update again"));
+}
+
+#[test]
+fn refused_releases_live_outside_status_and_keep_the_latest_eight() {
+    let fixture = PrivateFixture::new();
+    // The status format older controllers wrote and read stays exactly the same.
+    let older: UpdateStatus = serde_json::from_value(serde_json::json!({
+        "id": null, "phase": "failed", "current_version": "0.7.0", "new_version": null,
+        "message": "older controller", "controller_pid": 1, "controller_start": "s",
+        "host_pid": null, "generation": "",
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&older)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .len(),
+        9
+    );
+    let request = |n: usize| UpdateRequest {
+        id: "a".repeat(32),
+        source_name: "s".into(),
+        channel: "stable".into(),
+        publisher_did: "did".into(),
+        current_version: "0.7.0".into(),
+        new_version: "0.7.1".into(),
+        head_cid: format!("head-{n}"),
+        release_cid: format!("release-{n}"),
+    };
+    for n in 0..10 {
+        record_refused_release(&fixture.directory, &request(n)).unwrap();
+    }
+    record_refused_release(&fixture.directory, &request(9)).unwrap();
+    let kept = read_refused_releases(&fixture.directory).unwrap();
+    assert_eq!(kept.len(), MAX_REFUSED);
+    assert_eq!(kept.first().unwrap().head_cid, "head-2");
+    assert_eq!(kept.last().unwrap().head_cid, "head-9");
+    assert!(!release_refused(&fixture.data, "head-1", "release-1").unwrap());
+    assert!(release_refused(&fixture.data, "head-2", "x").unwrap());
+    forget_refused_release(&fixture.directory, &request(5)).unwrap();
+    assert!(!release_refused(&fixture.data, "head-5", "release-5").unwrap());
+    assert!(release_refused(&fixture.data, "head-6", "release-6").unwrap());
 }
