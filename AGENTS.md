@@ -25,7 +25,7 @@ are the only place for work status, acceptance criteria and proof.
   local limit. Continue reviews, source work or other light checks in parallel.
 - Comment on GitHub only for a decision, a result with its link, a blocker or a review verdict.
   Keep comments to at most 3 lines: no narration, hashes, receipts or agent-to-agent coordination.
-  Put status in the issue checklist.
+  The checklist states what must be true; the Acceptance record below is the only place for current status and evidence.
 - Do not create briefings, plans, gists or notes files.
   Move useful open work from dated audits to its issue.
 - Keep seed security details, credentials and private operator data out of
@@ -50,8 +50,6 @@ The owning issue keeps one record, edited in place, with these six items:
 - Installed release evidence.
 - Remaining gate.
 - Next owner.
-
-Comments stay short links to results.
 
 ## User-Facing Communication
 

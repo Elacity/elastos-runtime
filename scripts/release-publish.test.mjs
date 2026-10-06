@@ -15,10 +15,6 @@ const ciRun = { id: 456, html_url: 'https://github.com/Elacity/elastos-runtime/a
   head_sha: commit, head_branch: 'develop', event: 'push', path: '.github/workflows/ci.yml',
   status: 'completed', conclusion: 'success' };
 const requiredJobs = ['test-elastos', 'source-home-macos'];
-const pathWorkflow = readFileSync(join(source, '../.github/workflows/ci.yml'), 'utf8');
-const skippedCustody = { name: 'custody-harness-smoke', status: 'completed', conclusion: 'skipped' };
-const changesJob = { id: 789, name: 'changes', status: 'completed', conclusion: 'success',
-  steps: [{ name: 'detect custody/carrier-relevant changes', status: 'completed', conclusion: 'success' }] };
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 
 function run(command, args, options = {}) {
@@ -83,11 +79,6 @@ if (command === 'gh') {
     payload = { workflow_runs: c.ciRuns };
   } else if (endpoint.endsWith('/branches/develop/protection')) payload = { required_status_checks: { contexts: c.requiredJobs } };
   else if (endpoint.includes('/runs/456/jobs?')) payload = { jobs: c.ciJobs };
-  else if (endpoint.includes('/contents/.github/workflows/ci.yml?ref=' + c.commit)) payload = { content: Buffer.from(c.ciWorkflow || '').toString('base64') };
-  else if (endpoint.endsWith('/jobs/789/logs')) {
-    if (!args.includes('--allow-escape-sequences')) process.exit(95);
-    console.log(c.filterLog || ''); process.exit(0);
-  }
   if (payload) {
     if (!args.includes('--jq')) { console.log(JSON.stringify(payload)); process.exit(0); }
     const result = require('node:child_process').spawnSync('jq', ['-r', args[args.indexOf('--jq') + 1]], { input: JSON.stringify(payload), encoding: 'utf8' });
@@ -145,51 +136,6 @@ fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { comm
         { encoding: 'utf8', env: { ...env, ...extraEnv } });
     },
     args() { return JSON.parse(readFileSync(env.ARGUMENT_LOG)); } };
-}
-
-test('prepare records a required skip proved by the source workflow path filter', t => {
-  const f = fixture(t, { requiredJobs: [...requiredJobs, 'custody-harness-smoke'],
-    ciJobs: [...requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), skippedCustody, changesJob],
-    ciWorkflow: pathWorkflow, filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false' });
-  const result = f.prepare();
-  assert.equal(result.status, 0, result.stderr);
-  const record = JSON.parse(readFileSync(join(f.root, 'work/1.2.3/run.json')));
-  assert.deepEqual(record.ci_skipped, [{ name: 'custody-harness-smoke', reason: 'path filter: custody unchanged' }]);
-  assert.match(result.stdout, /custody-harness-smoke: path filter: custody unchanged/);
-  const signer = join(f.root, 'signer.py');
-  const key = join(f.root, 'fixture-key');
-  writeFileSync(signer, '# fixture signer');
-  writeFileSync(key, 'fixture key');
-  const policy = run('bash', [f.script, 'policy', '1.2.3', signer, key, run('which', ['openssl']).stdout.trim()], { env: f.env });
-  assert.match(policy.stdout, /custody-harness-smoke: path filter: custody unchanged/);
-  const signed = join(f.root, 'signed');
-  mkdirSync(signed);
-  writeFileSync(join(signed, 'release-head.json'), JSON.stringify({ signer_did: 'did:fixture' }));
-  const seed = run('bash', [f.script, 'seed', '1.2.3', signed], { env: f.env });
-  assert.match(seed.stdout, /custody-harness-smoke: path filter: custody unchanged/);
-});
-
-for (const [label, delta] of [
-  ['changed custody paths', { filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = true' }],
-  ['missing filter result', { filterLog: '' }],
-  ['ambiguous filter results', { filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false\n2026-10-06T12:00:01.000Z ##[group]Filter custody = true' }],
-  ['event-only condition', { ciWorkflow: pathWorkflow.replace("needs.changes.outputs.custody == 'true'", "github.event_name == 'pull_request'") }],
-  ['another skip condition', { ciWorkflow: pathWorkflow.replace("needs.changes.outputs.custody == 'true'", "needs.changes.outputs.custody == 'true' && false") }],
-  ['wrong output binding', { ciWorkflow: pathWorkflow.replace('steps.filter.outputs.custody', 'steps.other.outputs.custody') }],
-  ['cancelled required job', { smokeJob: { ...skippedCustody, conclusion: 'cancelled' }, error: /custody-harness-smoke: cancelled/ }],
-  ['failed required job', { smokeJob: { ...skippedCustody, conclusion: 'failure' }, error: /custody-harness-smoke: failure/ }],
-  ['failed filter job', { filterJob: { ...changesJob, conclusion: 'failure' } }],
-  ['failed filter step', { filterJob: { ...changesJob, steps: [{ name: 'detect custody/carrier-relevant changes', status: 'completed', conclusion: 'skipped' }] } }],
-]) {
-  test(`prepare refuses custody skip with ${label}`, t => {
-    const f = fixture(t, { requiredJobs: [...requiredJobs, 'custody-harness-smoke'],
-      ciJobs: [...requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), delta.smokeJob || skippedCustody, delta.filterJob || changesJob],
-      ciWorkflow: pathWorkflow, filterLog: '2026-10-06T12:00:00.000Z ##[group]Filter custody = false', ...delta });
-    const result = f.prepare();
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, delta.error || /custody-harness-smoke: skipped/);
-    assert.throws(() => f.args(), { code: 'ENOENT' });
-  });
 }
 
 for (const selected of [[], ['aarch64-darwin', 'x86_64-linux'], ['aarch64-darwin']]) {
