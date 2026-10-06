@@ -41,6 +41,11 @@ const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
+// The installed-release CI journey: System must say "up to date", then show
+// the next signed version once the fixture publishes it (scripts/update-hop-compare.py).
+const SYSTEM_UPDATE_DIR = process.env.HOME_VIRTUAL_AUTH_UPDATE_DIR || "";
+const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = ""] =
+  (process.env.HOME_VIRTUAL_AUTH_UPDATE_VERSIONS || "").split(" ");
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
@@ -4375,7 +4380,95 @@ async function launchSystem(page, homeToken, passkey) {
   const recoveryExport = CHECK_RECOVERY_EXPORT
     ? await checkSystemRecoveryExport(page, systemFrame, passkey)
     : null;
-  return { ...system, recoveryExport };
+  const systemUpdate = SYSTEM_UPDATE_DIR ? await checkSystemUpdate(page, passkey) : null;
+  return { ...system, recoveryExport, systemUpdate };
+}
+
+async function checkSystemUpdate(page, passkey) {
+  assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW, "System update check needs the current and next version");
+  let shownFrame = null;
+  // Home may remount System after a restart; always read the live System window.
+  const read = async () => {
+    const frame = capsuleFrameForTarget(page, "system");
+    if (!frame) return { frame: false };
+    try {
+      if (frame !== shownFrame) {
+        // Show the update row for the screenshots; the checks read the DOM either way.
+        await frame.locator('button[data-settings="about"]').evaluate((button) => button.click());
+        shownFrame = frame;
+      }
+      return await frame.evaluate(() => {
+        const field = (name) => document.querySelector(`[data-field="${name}"]`);
+        const text = (node) => node?.textContent?.trim() || "";
+        const apply = document.querySelector("#runtime-update-apply");
+        return {
+          frame: true,
+          shown: document.querySelector("#runtime-update")?.hidden === false,
+          status: text(document.querySelector("#runtime-update-status")),
+          offer: field("update-offer")?.hidden === false,
+          can_apply: Boolean(apply && !apply.hidden && !apply.disabled),
+          current_version: text(field("update-current-version")),
+          new_version: text(field("update-new-version")),
+          changes: field("update-changes")?.hidden === false ? text(field("update-changes")) : "",
+          installed_version: text(field("source-installed-version")),
+          // Set before an approval: true while the same System window stays open.
+          same_window: window.__elastosUpdateWindowMarker === true,
+        };
+      });
+    } catch (error) {
+      return { frame: false, error: String(error.message || error).slice(0, 200) };
+    }
+  };
+  // System polls every 5 s, Runtime caches a Carrier check for 30 s, and an
+  // approved update restarts Home.
+  const reach = async (name, predicate, message) => {
+    const deadline = Date.now() + 150_000;
+    let state = await read();
+    while (!predicate(state) && Date.now() < deadline) {
+      await delay(1_000);
+      state = await read();
+    }
+    await page.screenshot({ path: join(SYSTEM_UPDATE_DIR, `${name}.png`) }).catch(() => {});
+    assert(predicate(state), `${message}: ${JSON.stringify(state)}`, state);
+    // The fixture runner publishes the next fixture when it sees this file.
+    writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    return state;
+  };
+  // The fixture signs each release with the change note "Fixture <publication>",
+  // so System can tell the tampered offer from the real next version.
+  const offered = (publication) => (state) => state.shown && state.offer && state.can_apply
+    && state.current_version === SYSTEM_UPDATE_CURRENT && state.new_version === SYSTEM_UPDATE_NEW
+    && state.changes === `Fixture ${publication}`;
+  const approve = async () => {
+    const frame = capsuleFrameForTarget(page, "system");
+    await frame.evaluate(() => { window.__elastosUpdateWindowMarker = true; });
+    // Home asks the virtual authenticator for the owner's step-up proof.
+    await frame.locator("#runtime-update-apply").evaluate((button) => button.click());
+  };
+  const upToDate = await reach("up-to-date", (state) => state.shown && !state.offer
+    && state.status === "Home is up to date." && state.installed_version === SYSTEM_UPDATE_CURRENT,
+  "System did not report Home up to date");
+  const tampered = await reach("tampered-offer", offered("tampered-binary"), "System did not offer the tampered fixture");
+  await approve();
+  // What the person sees after a refusal: the same System window, the current version, a
+  // new message, and Update usable again. update-hop-compare.py checks that the
+  // controller recorded the failure and that the same Home process kept running.
+  const refused = await reach("refused", (state) => state.shown && state.same_window
+    && state.installed_version === SYSTEM_UPDATE_CURRENT && state.can_apply
+    && state.status !== "" && state.status !== tampered.status,
+  "System did not show the refusal on the current version in the same window");
+  const next = await reach("next-offer", offered("new"), "System did not offer the next signed version");
+  await approve();
+  const updated = await reach("updated", (state) => state.shown && !state.offer
+    && state.status === "Home is up to date." && state.installed_version === SYSTEM_UPDATE_NEW,
+  "System did not reconnect on the next version");
+  // Home reconnected by itself: no navigation, and the same account is signed in.
+  await waitForSignedHome(page, 60_000);
+  const refreshed = await refreshCurrentHomeToken(page);
+  assert(refreshed.ok && refreshed.homeToken, "Home session did not survive the update", { status: refreshed.status });
+  const after = await currentPasskey(page, refreshed.homeToken);
+  assert(after?.proof_binding_id === passkey.proof_binding_id, "Home changed account across the update");
+  return { up_to_date: upToDate, tampered, refused, next, updated, same_account: true };
 }
 
 async function readRecoveryExportDownload(download, expected) {
@@ -5469,6 +5562,7 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 }
 
 async function main() {
+  assert(!SYSTEM_UPDATE_DIR || CHECK_SYSTEM, "The System update check requires the System check");
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
   assert(!BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || BROWSER_CONTROLLED_TURN_TEST_HOME,
@@ -5630,6 +5724,7 @@ async function main() {
       recovery_export_checked: Boolean(system?.recoveryExport),
       recovery_export: system?.recoveryExport ?? null,
       system_fields: system?.fields || null,
+      system_update: system?.systemUpdate ?? null,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),
