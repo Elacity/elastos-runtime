@@ -317,131 +317,45 @@ function runSync(command, args, { ignoreFailure = false, timeout = 30000 } = {})
   return result;
 }
 
-function sudoIp(args, options = {}) {
-  if (process.getuid?.() === 0) {
-    return runSync("ip", args, options);
+function linuxNetworkCommand(scriptPath, action) {
+  const scriptsDir = path.basename(path.dirname(scriptPath)) === "bin"
+    ? path.join(path.dirname(scriptPath), "../scripts") : path.dirname(scriptPath);
+  return { command: "python3", args: [path.join(scriptsDir, "browser-vm-linux-network.py"), action] };
+}
+
+function requireLinuxNetwork(scriptPath) {
+  const { command, args } = linuxNetworkCommand(scriptPath, "check");
+  const result = runSync(command, args, { ignoreFailure: true });
+  if (result.error || result.status !== 0) {
+    throw new Error(result.stderr?.trim() || `Browser network setup is required. As root, run: python3 ${args[0]} setup --user ${os.userInfo().username}`);
   }
-  return runSync("sudo", ["-n", "ip", ...args], options);
 }
 
-function sudoIptables(args, options = {}) {
-  const iptables = process.env.ELASTOS_BROWSER_VM_IPTABLES_BIN || "iptables";
-  if (process.getuid?.() === 0) {
-    return runSync(iptables, args, options);
-  }
-  return runSync("sudo", ["-n", iptables, ...args], options);
+async function acquireLinuxNetwork(scriptPath) {
+  requireLinuxNetwork(scriptPath);
+  const { command, args } = linuxNetworkCommand(scriptPath, "lease");
+  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+  // Hold the lease until the VM and media processes have stopped.
+  cleanupFns.push(() => child.stdin.end());
+  return new Promise((resolve, reject) => {
+    let output = "", errors = "", settled = false;
+    child.stderr.on("data", (chunk) => { errors += chunk; });
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (settled || !output.includes("\n")) return;
+      try {
+        const network = JSON.parse(output.trim());
+        settled = true;
+        resolve(network);
+      } catch (error) { reject(error); }
+    });
+    child.once("error", reject);
+    child.once("exit", () => {
+      if (!settled) reject(new Error(errors.trim() || "Browser network lease ended before allocation"));
+      else if (!exiting) cleanupAndExit(null);
+    });
+  });
 }
-
-function privateNetworkForSuffix(suffix) {
-  const digest = crypto.createHash("sha256").update(suffix).digest();
-  const third = 200 + (digest[0] % 40);
-  const base = (digest[1] % 50) * 4;
-  const turnPort = 41000 + (((digest[6] << 8) | digest[7]) % 4096);
-  return {
-    hostIp: `192.168.${third}.${base + 1}`,
-    guestIp: `192.168.${third}.${base + 2}`,
-    prefix: 30,
-    turnPort,
-    tapName: `ebv${digest.toString("hex").slice(0, 10)}`,
-    mac: `02:eb:${digest[2].toString(16).padStart(2, "0")}:${digest[3].toString(16).padStart(2, "0")}:${digest[4].toString(16).padStart(2, "0")}:${digest[5].toString(16).padStart(2, "0")}`,
-  };
-}
-
-function prepareTap(network) {
-  sudoIp(["link", "del", network.tapName], { ignoreFailure: true });
-  sudoIp(["tuntap", "add", "dev", network.tapName, "mode", "tap", "user", os.userInfo().username]);
-  cleanupFns.push(() => sudoIp(["link", "del", network.tapName], { ignoreFailure: true }));
-  sudoIp(["addr", "add", `${network.hostIp}/${network.prefix}`, "dev", network.tapName]);
-  sudoIp(["link", "set", network.tapName, "up"]);
-}
-
-function prepareFirewall(network, { mediaPorts = [], mediaPortRanges = [] } = {}) {
-  const acceptRule = [
-    "INPUT",
-    "-i",
-    network.tapName,
-    "-s",
-    network.guestIp,
-    "-d",
-    network.hostIp,
-    "-p",
-    "tcp",
-    "--dport",
-    "19091",
-    "-j",
-    "ACCEPT",
-  ];
-  const establishedRule = [
-    "INPUT",
-    "-i",
-    network.tapName,
-    "-m",
-    "conntrack",
-    "--ctstate",
-    "ESTABLISHED,RELATED",
-    "-j",
-    "ACCEPT",
-  ];
-  const dropRule = ["INPUT", "-i", network.tapName, "-j", "DROP"];
-  sudoIptables(["-I", ...dropRule]);
-  cleanupFns.push(() => sudoIptables(["-D", ...dropRule], { ignoreFailure: true }));
-  sudoIptables(["-I", ...acceptRule]);
-  cleanupFns.push(() => sudoIptables(["-D", ...acceptRule], { ignoreFailure: true }));
-  for (const port of mediaPorts) {
-    for (const protocol of ["tcp", "udp"]) {
-      const mediaRule = [
-        "INPUT",
-        "-i",
-        network.tapName,
-        "-s",
-        network.guestIp,
-        "-d",
-        network.hostIp,
-        "-p",
-        protocol,
-        "--dport",
-        String(port),
-        "-j",
-        "ACCEPT",
-      ];
-      sudoIptables(["-I", ...mediaRule]);
-      cleanupFns.push(() => sudoIptables(["-D", ...mediaRule], { ignoreFailure: true }));
-    }
-  }
-  for (const range of mediaPortRanges) {
-    for (const protocol of ["tcp", "udp"]) {
-      const mediaRule = [
-        "INPUT",
-        "-i",
-        network.tapName,
-        "-s",
-        network.guestIp,
-        "-d",
-        network.hostIp,
-        "-p",
-        protocol,
-        "--dport",
-        `${range.min}:${range.max}`,
-        "-j",
-        "ACCEPT",
-      ];
-      sudoIptables(["-I", ...mediaRule]);
-      cleanupFns.push(() => sudoIptables(["-D", ...mediaRule], { ignoreFailure: true }));
-    }
-  }
-  sudoIptables(["-I", ...establishedRule]);
-  cleanupFns.push(() => sudoIptables(["-D", ...establishedRule], { ignoreFailure: true }));
-}
-
-function assertFirewallToolAvailable() {
-  const iptables = process.env.ELASTOS_BROWSER_VM_IPTABLES_BIN || "iptables";
-  if (process.getuid?.() === 0) {
-    runSync(iptables, ["--version"]);
-    return;
-  }
-  runSync("sudo", ["-n", iptables, "--version"]);
-}
-
 
 function listen(server, ...args) {
   return new Promise((resolve, reject) => {
@@ -512,8 +426,7 @@ function turnserverBin() {
     requireFile(configured, TURNSERVER_BIN_ENV);
     return configured;
   }
-  const result = runSync("sh", ["-lc", "command -v turnserver"], { ignoreFailure: true });
-  return result.status === 0 && result.stdout.trim() ? result.stdout.trim() : "turnserver";
+  return "turnserver";
 }
 
 function tcpListenerVisible(host, port) {
@@ -617,6 +530,7 @@ function spawnTracked(command, args, options = {}) {
   const child = spawn(command, args, options);
   children.add(child);
   child.once("exit", () => children.delete(child));
+  child.once("error", () => children.delete(child));
   return child;
 }
 
@@ -1130,11 +1044,6 @@ async function cleanupAndExit(signal = null) {
       child.kill("SIGTERM");
     } catch {}
   }
-  for (const cleanup of cleanupFns.reverse()) {
-    try {
-      cleanup();
-    } catch {}
-  }
   if (globalThis.__elastosBrowserVmSessionDir) {
     discardLaunchRootfs(path.join(globalThis.__elastosBrowserVmSessionDir, "rootfs.ext4"));
   }
@@ -1143,14 +1052,16 @@ async function cleanupAndExit(signal = null) {
       fs.rmSync(globalThis.__elastosBrowserVmSessionDir || "", { recursive: true, force: true });
     } catch {}
   }
-  setTimeout(() => {
-    for (const child of Array.from(children)) {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    }
-    process.exit(launchSucceeded ? 0 : 1);
-  }, 500);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  await Promise.all(Array.from(children).map((child) => new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", resolve);
+    try { child.kill("SIGKILL"); } catch { resolve(); }
+  })));
+  for (const cleanup of cleanupFns.reverse()) {
+    try { cleanup(); } catch {}
+  }
+  process.exit(launchSucceeded ? 0 : 1);
 }
 
 async function main() {
@@ -1173,24 +1084,25 @@ async function main() {
   requireFile(kernel, "Browser VM kernel");
   requireFile(initrd, "Browser VM initrd");
   requireFile(crosvm, "crosvm");
-  requireFile("/dev/kvm", "/dev/kvm");
-  requireFile("/dev/net/tun", "/dev/net/tun");
-  assertFirewallToolAvailable();
-
-  const network = privateNetworkForSuffix(suffix);
+  const network = await acquireLinuxNetwork(scriptPath);
   const iceConfig = vmIceEnv(network);
   const mediaPorts = turnServerPorts(iceConfig, network);
   const turn = sessionTurnServer(iceConfig, network);
+  if (!turn) {
+    throw new Error("Linux Browser requires session-local TURN at turn:{host_ip}:{turn_port} with ICE username and credential.");
+  }
   const mediaPortRanges = turn ? [turn.relay] : [];
+  if (mediaPorts.some((port) => port !== network.turnPort) ||
+      (turn && (turn.relay.min !== 49152 || turn.relay.max !== 49215))) {
+    throw new Error("Linux Browser setup permits local TURN on {turn_port} and relay ports 49152-49215. Use these ports in the Browser ICE configuration.");
+  }
   const controlSocketPath = path.join(sessionDir, "control.sock");
   validateAbsolutePath(controlSocketPath, "control socket path");
   const launchRootfs = path.join(sessionDir, "rootfs.ext4");
 
   logPhase(`session dir ${sessionDir}`);
   logPhase(`preparing launch rootfs from ${rootfs} to ${launchRootfs}`);
-  prepareTap(network);
   await startSessionTurnServer({ network, sessionDir, turn });
-  prepareFirewall(network, { mediaPorts, mediaPortRanges });
   if (mediaPorts.length > 0) {
     logPhase(`allowed guest access to host media relay ports ${mediaPorts.join(",")}`);
   }
