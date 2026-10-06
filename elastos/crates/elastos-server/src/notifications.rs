@@ -164,6 +164,7 @@ enum NotificationEventDisposition {
 }
 
 pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     let existing_ids = store
@@ -367,6 +368,7 @@ pub fn upsert_direct_message_notification(
     sender_display_name: &str,
     now: u64,
 ) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let id = direct_message_notification_id(conversation_id);
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
@@ -534,6 +536,7 @@ pub fn upsert_external_http_request(
     approve_action_id: &str,
     created_at: u64,
 ) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let id = external_http_request_notification_id(request_id);
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
@@ -617,6 +620,7 @@ pub fn mark_acted_for_action(
     viewer: Option<&str>,
     action_id: &str,
 ) -> anyhow::Result<usize> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -661,6 +665,7 @@ pub fn mark_acted_for_action(
 }
 
 pub fn mark_read(data_dir: &Path, viewer: Option<&str>, id: &str) -> anyhow::Result<bool> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -682,6 +687,7 @@ pub fn mark_read(data_dir: &Path, viewer: Option<&str>, id: &str) -> anyhow::Res
 }
 
 pub fn dismiss(data_dir: &Path, viewer: Option<&str>, id: &str) -> anyhow::Result<bool> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -733,6 +739,17 @@ fn notifications_root_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .context("failed to resolve notifications root")
 }
 
+/// Serializes every read-modify-write of the shared store, so one account's
+/// write never replaces another's fresh entry with an older snapshot. Held by
+/// each public writer; internal helpers such as [`record_event`] run under it.
+fn lock_store(data_dir: &Path) -> anyhow::Result<crate::collaboration_core::ExclusiveFileLock> {
+    let root = notifications_root_dir(data_dir)?;
+    fs::create_dir_all(&root)?;
+    crate::collaboration_core::ExclusiveFileLock::acquire(&root.join(".notifications.lock"))
+        .context("failed to lock the notification store")
+}
+
+/// Runs under the caller's [`lock_store`].
 fn record_event(data_dir: &Path, event: NotificationEventRecord) -> anyhow::Result<()> {
     let path = notification_events_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationEventStore>(&path)?;
@@ -870,6 +887,44 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(owned_summary(tmp.path(), BOB).unread_count, 1);
+    }
+
+    #[test]
+    fn concurrent_writes_from_many_accounts_keep_every_alert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = 12;
+        let per_account = 5;
+        std::thread::scope(|scope| {
+            for account in 0..accounts {
+                let data = tmp.path();
+                scope.spawn(move || {
+                    let owner = format!("did:key:z6MkAccount{account}");
+                    for index in 0..per_account {
+                        upsert_direct_message_notification(
+                            data,
+                            &owner,
+                            &format!("direct:{account}-{index}"),
+                            "Peer",
+                            now_ts(),
+                        )
+                        .unwrap();
+                        // Reads and clears by another account race the writes.
+                        mark_read(data, Some(&owner), "room-access-request:none").unwrap();
+                    }
+                });
+            }
+        });
+        for account in 0..accounts {
+            assert_eq!(
+                unread_direct_message_conversations(
+                    tmp.path(),
+                    &format!("did:key:z6MkAccount{account}")
+                )
+                .unwrap()
+                .len(),
+                per_account
+            );
+        }
     }
 
     #[test]
