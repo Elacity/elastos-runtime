@@ -512,13 +512,18 @@ mod tests {
                 if shutdown_clone.load(Ordering::Relaxed) {
                     return;
                 }
+                let request = read_request(&mut stream);
+                // Another test's wake-up connect can reach this reused
+                // ephemeral port; only a request takes a scripted response.
+                if request.is_empty() {
+                    continue;
+                }
                 let Some(action) = actions.next() else {
                     if shutdown_clone.load(Ordering::Relaxed) {
                         return;
                     }
                     panic!("unexpected test server request");
                 };
-                let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
                 request_active_clone.store(true, Ordering::SeqCst);
                 write_response(&mut stream, &action);

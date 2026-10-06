@@ -1422,12 +1422,14 @@ mod tests {
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
         let body = br#"{"object":"list","data":[{"id":"wrong-model"}]}"#;
-        write!(
+        // The readiness probe may give up first. Keep serving until stopped:
+        // a dead listener frees its port for another test's server, which the
+        // test's stop connect would then reach.
+        let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
-        .unwrap();
-        stream.write_all(body).unwrap();
+        .and_then(|()| stream.write_all(body));
     }
 }
