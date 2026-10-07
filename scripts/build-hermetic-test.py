@@ -626,6 +626,39 @@ class HermeticTests(unittest.TestCase):
             HERMETIC.seal_sysroot(copy, "sha256:test")
             self.assertEqual(os.lstat(probe).st_mtime_ns, epoch_ns)
 
+    def test_digest_records_cannot_be_forged(self):
+        # Astra round 8: a symlink target carrying a fake record must not collide with two real entries.
+        epoch_ns = HERMETIC.SOURCE_DATE_EPOCH * 1_000_000_000
+        forged = Path(self.scratch.name) / "forged"
+        honest = Path(self.scratch.name) / "honest"
+        forged.mkdir()
+        honest.mkdir()
+        os.symlink("x\nL b %d -> y" % epoch_ns, forged / "a")
+        os.symlink("x", honest / "a")
+        os.symlink("y", honest / "b")
+        for tree in (forged, honest):
+            HERMETIC.canonicalize(tree)
+        self.assertNotEqual(HERMETIC.tree_digest(forged, strict=True), HERMETIC.tree_digest(honest, strict=True))
+        # names and targets with quotes, newlines, JSON syntax and (where the filesystem allows) non-UTF-8 bytes
+        odd = Path(self.scratch.name) / "odd"
+        odd.mkdir()
+        (odd / 'a"b,["c').write_text("1")
+        (odd / "line\nbreak").write_text("2")
+        try:
+            os.symlink(b"\xff\xfe-target", os.fsencode(str(odd / "link")))
+            (odd / os.fsdecode(b"\xff-name")).write_text("3")
+        except (OSError, UnicodeError):
+            pass
+        HERMETIC.canonicalize(odd)
+        first = HERMETIC.tree_digest(odd, strict=True)
+        self.assertEqual(first, HERMETIC.tree_digest(odd, strict=True))
+        os.rename(odd / 'a"b,["c', odd / 'a"b,["d')
+        HERMETIC.canonicalize(odd)
+        self.assertNotEqual(first, HERMETIC.tree_digest(odd, strict=True))
+        self.assertEqual(HERMETIC.record_digest([["a", "b"]]), HERMETIC.record_digest([["a", "b"]]))
+        self.assertNotEqual(HERMETIC.record_digest([["a", "b"]]), HERMETIC.record_digest([["a"], ["b"]]))
+        self.assertNotEqual(HERMETIC.record_digest([["ab"]]), HERMETIC.record_digest([["a", "b"]]))
+
     def test_c_toolchain_cpu_flags_are_refused(self):
         for name, value in (("CFLAGS", "-O2 -march=native"), ("CXXFLAGS", "-mcpu=native"),
                             ("CPPFLAGS", "-march=x86-64-v3"), ("TARGET_CFLAGS", "-mtune=native")):

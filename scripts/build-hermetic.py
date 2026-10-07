@@ -128,16 +128,27 @@ def canonicalize(root):
         os.utime(directory, stamp, follow_symlinks=False)
 
 
+def record_digest(records):
+    """sha256 over records, each a JSON array of typed fields, length-prefixed: no field can forge a boundary."""
+    digest = hashlib.sha256()
+    for record in records:
+        data = json.dumps(record, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+def raw(name):
+    """Exact bytes of a path component or symlink target, hex-encoded (non-UTF-8 names stay distinct)."""
+    return os.fsencode(name).hex()
+
+
 def tree_digest(root, skip=(), strict=False):
     """Digest of a tree as mounted: every directory (incl. empty) with mode and mtime_ns, every symlink
     with mtime_ns and target, every regular file with mode, size, mtime_ns and sha256.
     strict=True also refuses any entry whose mtime_ns is not exactly SOURCE_DATE_EPOCH."""
     root = str(root)
-    digest = hashlib.sha256()
     canonical_ns = SOURCE_DATE_EPOCH * 1_000_000_000
-
-    def note(line):
-        digest.update(line.encode("utf-8", "surrogateescape") + b"\n")
+    records = []
 
     def stamp(entry, info):
         if strict and info.st_mtime_ns != canonical_ns:
@@ -149,7 +160,7 @@ def tree_digest(root, skip=(), strict=False):
         rel = os.path.relpath(directory, root)
         info = os.lstat(directory)
         # The root's own mtime changes whenever a seal is written next to its content.
-        note("D %s %o %s" % (rel, stat.S_IMODE(info.st_mode), "-" if rel == "." else stamp(rel, info)))
+        records.append(["D", raw(rel), stat.S_IMODE(info.st_mode), None if rel == "." else stamp(rel, info)])
         for name in sorted(filenames + [d for d in dirnames if os.path.islink(os.path.join(directory, d))]):
             path = os.path.join(directory, name)
             entry = os.path.relpath(path, root)
@@ -157,13 +168,13 @@ def tree_digest(root, skip=(), strict=False):
                 continue
             info = os.lstat(path)
             if stat.S_ISLNK(info.st_mode):
-                note("L %s %d -> %s" % (entry, stamp(entry, info), os.readlink(path)))
+                records.append(["L", raw(entry), stamp(entry, info), raw(os.readlink(path))])
             elif stat.S_ISREG(info.st_mode):
-                note("F %s %o %d %d %s" % (entry, stat.S_IMODE(info.st_mode), info.st_size, stamp(entry, info),
-                                           sha256_path(path)))
+                records.append(["F", raw(entry), stat.S_IMODE(info.st_mode), info.st_size, stamp(entry, info),
+                                sha256_path(path)])
             else:
-                note("S %s %o" % (entry, info.st_mode))
-    return digest.hexdigest()
+                records.append(["S", raw(entry), info.st_mode])
+    return record_digest(records)
 
 
 def copy_tree(source, target, ignore=None):
@@ -584,8 +595,8 @@ def host_cpu():
     if not fields:
         return platform.processor() or None
     flags = fields.get("flags") or fields.get("Features") or ""
-    return "%s stepping %s flags %s" % (fields.get("model name") or fields.get("CPU part") or "?",
-                                         fields.get("stepping", "?"), hashlib.sha256(flags.encode()).hexdigest()[:12])
+    return json.dumps([fields.get("model name") or fields.get("CPU part") or "?", fields.get("stepping", "?"),
+                       hashlib.sha256(flags.encode("utf-8", "surrogateescape")).hexdigest()[:12]])
 
 
 # ---- sandboxes ---------------------------------------------------------------
@@ -850,7 +861,7 @@ def produce(options, environ):
     document = producer.document(plan, stage, digests, sandbox)
     key = hashlib.sha256(BK.canonical(document).encode("utf-8")).hexdigest()
     receipt = {"key": key, "commit": producer.commit, "unit": document["unit"], "document": document,
-               "run": "%s-%d-%s" % (platform.node(), os.getpid(), time.time_ns()),
+               "run": json.dumps([platform.node(), os.getpid(), time.time_ns()]),
                "host": {"cpu": host_cpu(), "platform": platform.platform()},
                "staging_seconds": round(staging_seconds, 1), "sysroot_verify_seconds": round(producer.sysroot_seconds, 1),
                "cpu_detection": cpu_detection(plan.build_scripts), "reusable": None}

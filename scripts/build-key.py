@@ -181,7 +181,9 @@ def parse_dep_info(path):
 
 
 def canonical(document):
-    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    """Unambiguous JSON: sorted keys, no whitespace, ASCII-escaped so lone surrogates from non-UTF-8
+    environment values or names are encoded exactly instead of failing or colliding."""
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
 # ---- input discovery -------------------------------------------------------
