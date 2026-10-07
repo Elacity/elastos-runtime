@@ -1325,7 +1325,7 @@ impl ProviderState {
         if object_parts.is_empty() {
             return Err("WebSpace mutation requires a child object path".to_string());
         }
-        if object_parts.iter().any(|part| *part == "_meta.json") {
+        if object_parts.contains(&"_meta.json") {
             return Err(
                 "WebSpace metadata files are provider-owned and cannot be mutated".to_string(),
             );
@@ -1590,11 +1590,7 @@ impl ProviderState {
             .iter()
             .map(|handle| handle.moniker.as_str())
             .collect::<Vec<_>>();
-        let includes_moniker = |moniker: &str| {
-            included_monikers
-                .iter()
-                .any(|candidate| *candidate == moniker)
-        };
+        let includes_moniker = |moniker: &str| included_monikers.contains(&moniker);
         let mounts = filtered
             .iter()
             .map(|handle| self.health_for_handle(handle))
@@ -1765,6 +1761,7 @@ impl ProviderState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_adapter(
         &mut self,
         resolver: String,
@@ -2033,6 +2030,7 @@ impl ProviderState {
         Ok(removed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_mount(
         &mut self,
         moniker: String,
@@ -3692,16 +3690,13 @@ fn list_for(state: &ProviderState, resolved: &ResolvedPath) -> Result<Vec<DirEnt
         ResolvedPath::Handle { handle } => {
             let mut entries = vec![meta_dir_entry(handle)];
 
-            match handle.handle_uri.as_str() {
-                "localhost://WebSpaces/Elastos" => {
-                    for child in ["content", "peer", "did"] {
-                        entries.push(dir_entry_from_handle(
-                            child,
-                            resolve_elastos_handle(&[child])?,
-                        ));
-                    }
+            if handle.handle_uri == "localhost://WebSpaces/Elastos" {
+                for child in ["content", "peer", "did"] {
+                    entries.push(dir_entry_from_handle(
+                        child,
+                        resolve_elastos_handle(&[child])?,
+                    ));
                 }
-                _ => {}
             }
 
             if let Some(record) = state.mount_by_moniker(&handle.moniker) {

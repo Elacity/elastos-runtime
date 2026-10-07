@@ -801,7 +801,7 @@ fn normalize_segment_indexes(segments_dir: &Path) -> Result<(), ()> {
     if indexes
         .iter()
         .enumerate()
-        .any(|(offset, actual)| *actual != first.checked_add(offset).unwrap_or(usize::MAX))
+        .any(|(offset, actual)| *actual != first.saturating_add(offset))
     {
         return Err(());
     }

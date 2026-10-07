@@ -199,7 +199,7 @@ fn source_config(binary: &Path) -> crate::sources::TrustedSourcesConfig {
 }
 
 fn publish_retained_receipt(fixture: &PrivateFixture) {
-    let expected = digest(b"signed fixture Runtime");
+    let expected = digest(&fs::read(&fixture.binary).unwrap());
     copy_controller(&fixture.binary, &fixture.controller(), &expected).unwrap();
     let launch = LaunchPlan {
         args: vec![BASE64.encode(b"home"), BASE64.encode(b"--browser")],
@@ -1001,7 +1001,8 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
         "http://127.0.0.1:8090/home/",
         "http://[::1]:8090/home/",
     ] {
-        assert_eq!(approved_home_url(value).unwrap().as_str(), value);
+        assert_eq!(approved_home_url(value, 8090).unwrap().as_str(), value);
+        assert!(approved_home_url(value, 8091).is_err(), "{value}");
     }
     for value in [
         "https://localhost:8090/home/",
@@ -1019,7 +1020,7 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
         "http://example.test:8090/home/",
         "http://localhost:8090/home/%2e%2e/",
     ] {
-        assert!(approved_home_url(value).is_err(), "{value}");
+        assert!(approved_home_url(value, 8090).is_err(), "{value}");
     }
 }
 
@@ -1095,7 +1096,8 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     let fixture = PrivateFixture::new();
-    let listener = tokio::net::TcpListener::bind("[::1]:8090").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let fetched = Arc::new(AtomicUsize::new(0));
     let observed = fetched.clone();
     let health_observed = fetched.clone();
@@ -1139,7 +1141,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let generation = "a".repeat(32);
     let binary_hash = digest(b"fixture owned gateway binary");
     let mut coords = json!({
-        "api_url":"http://[::1]:8090", "home_url":"http://[::1]:8090/home/",
+        "api_url":format!("http://[::1]:{port}"), "home_url":format!("http://[::1]:{port}/home/"),
         "attach_secret":"fixture-attach-secret", "runtime_kind":"gateway",
         "pid":pid, "generation":generation, "binary_sha256":binary_hash,
     });
@@ -1160,6 +1162,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let ready = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1170,6 +1173,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_document = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1182,6 +1186,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_generation = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1199,6 +1204,7 @@ async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_by
     let wrong_host_lock = prove_ready(
         &client,
         &fixture.data,
+        port,
         pid,
         &generation,
         "0.7.0",
@@ -1359,7 +1365,7 @@ fn first_start_enospc_rechecks_a_journal_created_during_bootstrap() {
 }
 
 #[test]
-fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
+fn verified_current_controller_reuses_its_inode_without_a_free_space_check() {
     let fixture = PrivateFixture::new();
     publish_retained_receipt(&fixture);
     let _lease = acquire_lease(&fixture.directory).unwrap();
@@ -1373,7 +1379,7 @@ fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
         &fixture.directory,
         &fixture.binary,
         &expected,
-        |_, _| panic!("same-hash reuse requested disk reserve")
+        |_, _| panic!("same-hash reuse requested a free-space check")
     )
     .unwrap());
     let after = fs::metadata(fixture.controller()).unwrap();
@@ -1384,7 +1390,7 @@ fn verified_current_controller_reuses_its_inode_without_a_disk_reserve_check() {
 #[test]
 fn first_controller_low_space_keeps_ordinary_home_available_without_creating_a_controller() {
     for error in [
-        anyhow::Error::from(crate::install_transaction::DiskReserveError),
+        anyhow::Error::from(elastos_common::NotEnoughFreeSpace { needed: 1 }),
         anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
     ] {
         let fixture = PrivateFixture::new();
@@ -1471,7 +1477,7 @@ fn low_space_cannot_hide_unsafe_controller_state_or_foreign_errors() {
                 &fixture.directory,
                 &fixture.binary,
                 &digest(b"signed fixture Runtime"),
-                |_, _| Err(crate::install_transaction::DiskReserveError.into())
+                |_, _| Err(elastos_common::NotEnoughFreeSpace { needed: 1 }.into())
             )
             .is_err(),
             "{state}"
@@ -1701,6 +1707,7 @@ fn consumed_request_completion_preserves_a_different_request_identity() {
         child: None,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
         request: Some(choice.clone()),
         previous_binary_sha256: String::new(),
         previous_version: String::new(),
@@ -1790,6 +1797,7 @@ async fn pre_restart_reconciliation_retires_only_consumed_request_after_both_loc
         child: None,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
         request: None,
         previous_binary_sha256: String::new(),
         previous_version: String::new(),
@@ -1924,6 +1932,7 @@ async fn cancelled_carrier_close_await_keeps_the_same_task_until_cleanup_complet
         child: None,
         carrier: None,
         carrier_close: Some(task),
+        test_readiness: None,
         request: None,
         previous_binary_sha256: String::new(),
         previous_version: String::new(),
@@ -2543,6 +2552,7 @@ async fn recovery_with_an_owned_ready_child_publishes_its_terminal_result() {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
     };
     // A failed readiness proof retains recovery rather than publishing success.
     assert!(controller.complete_reconciliation().await.is_err());
@@ -2609,13 +2619,19 @@ async fn initial_home_readiness_has_a_finite_budget_beyond_the_restart_limit() {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
     };
 
     let binary_hash = digest(b"signed fixture Runtime");
     for restarting in [false, true] {
         let started = tokio::time::Instant::now();
         let message = {
-            let proof = controller.wait_ready(&generation, "0.7.0", &binary_hash, restarting);
+            let proof = controller.wait_ready(
+                &generation,
+                "0.7.0",
+                &binary_hash,
+                readiness_budget(restarting),
+            );
             tokio::pin!(proof);
             if !restarting {
                 tokio::select! {
@@ -2667,6 +2683,7 @@ async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_install
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
     };
     // The signed fixture bytes have no native executable format.
     let message = controller.start_initial().await.unwrap_err().to_string();
@@ -2698,6 +2715,453 @@ async fn initial_home_loader_failure_names_the_private_log_and_keeps_the_install
     for (path, entry) in before {
         assert_eq!(after.get(&path), Some(&entry), "{}", path.display());
     }
+}
+
+// Observe claims and cleanup while every stop, spawn and readiness proof uses Controller.
+struct RealRestartOwner {
+    controller: Controller,
+    starts: Vec<RestartPhase>,
+    stops: usize,
+    candidate_process: Option<(u32, Option<String>)>,
+    candidate_exit: Option<std::process::ExitStatus>,
+    candidate_phase: Option<RestartPhase>,
+}
+
+impl crate::update::RestartOwner for RealRestartOwner {
+    fn progress(&self, phase: &str, message: &str) -> Result<()> {
+        self.controller.publish(phase, message)
+    }
+
+    fn plan(&self, support: String, previous: &str, candidate: &str) -> Result<RestartPlan> {
+        crate::update::RestartOwner::plan(&self.controller, support, previous, candidate)
+    }
+
+    fn stop<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        self.stops += 1;
+        // The write occurs after staging and before the candidate's failure.
+        if self.stops == 1 {
+            fs::write(
+                self.controller.receipt.data_dir.join("owner-data"),
+                b"new owner data",
+            )
+            .unwrap();
+        }
+        crate::update::RestartOwner::stop(&mut self.controller)
+    }
+
+    fn start<'a>(
+        &'a mut self,
+        transaction: &'a InstallTransaction,
+        record: RestartRecord,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let candidate = record.phase == RestartPhase::CandidateStartClaimed;
+            self.starts.push(record.phase);
+            let result =
+                crate::update::RestartOwner::start(&mut self.controller, transaction, record).await;
+            if candidate {
+                let recorded = transaction.restart_record()?;
+                self.candidate_phase = Some(recorded.phase);
+                self.candidate_exit = self
+                    .controller
+                    .child
+                    .as_ref()
+                    .map(|child| child.observed_exit())
+                    .transpose()?
+                    .flatten();
+                self.candidate_process = self.controller.child.as_ref().map(|child| {
+                    let pid = child.pid();
+                    (pid, process_start(pid).or(recorded.process_start))
+                });
+            }
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn real_controller_loader_failure_restores_previous_home_once() {
+    real_controller_restart_failure("loader").await;
+}
+
+#[tokio::test]
+async fn real_controller_crash_before_readiness_restores_previous_home_once() {
+    real_controller_restart_failure("crash").await;
+}
+
+#[tokio::test]
+async fn real_controller_hung_start_restores_previous_home_once() {
+    real_controller_restart_failure("hung").await;
+}
+
+async fn real_controller_restart_failure(failure: &str) {
+    let fixture = PrivateFixture::new();
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let previous = format!(
+        "#!/bin/sh\nexec {} --exact {} --ignored --nocapture\n",
+        quote(std::env::current_exe().unwrap().to_str().unwrap()),
+        quote(&format!(
+            "{}::restart_home_fixture",
+            module_path!().split_once("::").unwrap().1
+        )),
+    );
+    fs::write(&fixture.binary, previous.as_bytes()).unwrap();
+    let home = fixture.data.join("capsules/home");
+    fs::create_dir_all(home.join("browser")).unwrap();
+    fixture.file(
+        &home.join("capsule.json"),
+        &serde_json::to_vec(&json!({
+            "schema":"elastos.capsule/v1", "name":"home", "version":"0.1.0",
+            "description":"Restart fixture", "author":"fixture",
+            "role":"app", "type":"data", "entrypoint":"browser/index.html"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(
+        &home.join("browser/index.html"),
+        b"previous Home document",
+        0o600,
+    );
+    fs::create_dir(fixture.data.join("bin")).unwrap();
+    fixture.file(
+        &fixture.data.join("bin/fixture-provider"),
+        b"old support",
+        0o755,
+    );
+    let components = |support: &[u8]| {
+        serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
+        "external":{
+            "home":{"install_path":"capsules/home", "platforms":{}},
+            "fixture-provider":{"install_path":"bin/fixture-provider", "platforms":{
+                (crate::setup::detect_platform()):{
+                    "cid":raw_cid(support), "checksum":format!("sha256:{}", digest(support)), "size":support.len()
+                }
+            }}
+        }
+    })).unwrap()
+    };
+    fixture.publish_installed_release_with_components(&components(b"old support"));
+    publish_retained_receipt(&fixture);
+
+    let interpreter = fixture.data.join("candidate-interpreter");
+    let candidate = if failure == "loader" {
+        // A real interpreter admits --version, then disappears before the Home exec.
+        // Signed candidate bytes remain unchanged throughout activation and rollback.
+        symlink("/bin/sh", &interpreter).unwrap();
+        format!(
+            "#!{}\n/bin/rm {}\nprintf 'elastos 0.7.1\\n'\n",
+            interpreter.display(),
+            quote(interpreter.to_str().unwrap())
+        )
+    } else {
+        format!("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'elastos 0.7.1\\n'; exit 0; fi\nprintf 'candidate\\n' >> candidate-starts\n{}\n",
+            if failure == "crash" { "exit 7" } else { "exec /bin/sleep 60" })
+    };
+    let candidate_components = components(b"new support");
+    let descriptor =
+        |bytes: &[u8]| json!({"cid":raw_cid(bytes),"sha256":digest(bytes),"size":bytes.len()});
+    let release = signed(
+        json!({
+            "schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable",
+            "platforms":{(crate::update::detect_release_platform()):{
+                "binary":descriptor(candidate.as_bytes()), "components":descriptor(&candidate_components)
+            }}
+        }),
+        "elastos.release.v1",
+    );
+    let head = signed(
+        json!({
+            "schema":"elastos.release.head/v1", "version":"0.7.1", "channel":"stable",
+            "latest_release_cid":raw_cid(&release), "release_sha256":digest(&release)
+        }),
+        "elastos.release.head.v1",
+    );
+    let (_, mut request, _) = choice_fixture();
+    request.head_cid = raw_cid(&head);
+    request.release_cid = raw_cid(&release);
+    let items = std::collections::BTreeMap::from([
+        (raw_cid(&head), head),
+        (raw_cid(&release), release),
+        (raw_cid(candidate.as_bytes()), candidate.into_bytes()),
+        (raw_cid(&candidate_components), candidate_components),
+        (raw_cid(b"new support"), b"new support".to_vec()),
+    ]);
+    let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+        let bytes = items
+            .get(&cid)
+            .unwrap_or_else(|| panic!("unexpected fetch: {cid}"))
+            .clone();
+        Box::pin(async move { Ok(bytes) })
+    });
+    let mut owner = RealRestartOwner {
+        controller: Controller {
+            receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+            directory: fixture.directory.clone(),
+            child: None,
+            request: None,
+            previous_binary_sha256: digest(previous.as_bytes()),
+            previous_version: "0.7.0".into(),
+            generation: String::new(),
+            host_ready: false,
+            carrier: None,
+            carrier_close: None,
+            test_readiness: Some(Duration::from_secs(3)),
+        },
+        starts: Vec::new(),
+        stops: 0,
+        candidate_process: None,
+        candidate_exit: None,
+        candidate_phase: None,
+    };
+    owner.controller.start_initial().await.unwrap();
+    owner.controller.request = Some(request.clone());
+    write_private(&fixture.directory.join(ACTIVE_REQUEST), &request).unwrap();
+    let old_paths = [
+        fixture.binary.clone(),
+        fixture.data.join("components.json"),
+        fixture.data.join("sources.json"),
+        installation_release_head_path(&fixture.data),
+        installation_release_manifest_path(&fixture.data),
+        fixture.data.join("bin/fixture-provider"),
+        home.join("capsule.json"),
+        home.join("browser/index.html"),
+    ];
+    let old = old_paths.map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    let result =
+        crate::update::run_restarting_update(&fixture.data, &fetch, request.head_cid, &mut owner)
+            .await;
+    owner.controller.publish_apply_result(&result).unwrap();
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("previous release restored and Home restarted; user data preserved"),
+        "{error}"
+    );
+    match failure {
+        "loader" => {
+            assert!(error.contains("spawn owned update child"), "{error}");
+            assert!(owner.candidate_process.is_none());
+            assert_eq!(
+                owner.candidate_phase,
+                Some(RestartPhase::CandidateStartClaimed)
+            );
+            assert!(!interpreter.exists());
+        }
+        "crash" => {
+            assert!(error.contains("Home exited"), "{error}");
+            assert_eq!(owner.candidate_exit.unwrap().code(), Some(7));
+            assert!(matches!(
+                owner.candidate_phase,
+                Some(RestartPhase::CandidateStartClaimed | RestartPhase::CandidateRunning)
+            ));
+        }
+        "hung" => {
+            assert!(
+                error.contains("Home did not become ready within 3 seconds"),
+                "{error}"
+            );
+            assert!(owner.candidate_exit.is_none());
+            assert_eq!(owner.candidate_phase, Some(RestartPhase::CandidateRunning));
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        owner.starts,
+        [
+            RestartPhase::CandidateStartClaimed,
+            RestartPhase::PreviousStartClaimed
+        ]
+    );
+    assert_eq!(owner.stops, 2);
+    assert!(owner.controller.host_ready);
+    let restored_pid = owner.controller.child.as_ref().unwrap().pid();
+    let restored_birth = process_start(restored_pid).unwrap();
+    assert!(owner
+        .controller
+        .child
+        .as_ref()
+        .unwrap()
+        .observed_exit()
+        .unwrap()
+        .is_none());
+    let projected = status(&fixture.data).unwrap().unwrap();
+    assert_eq!(projected.phase, "restored");
+    assert_eq!(projected.current_version, "0.7.0");
+    assert_eq!(projected.host_pid, Some(restored_pid));
+    assert_eq!(
+        projected.message,
+        "The update could not start. Your previous release is ready. Check the update again."
+    );
+    assert_eq!(
+        fs::read(fixture.data.join("previous-starts")).unwrap(),
+        b"start\n"
+    );
+    assert_eq!(
+        fs::read(fixture.data.join("previous-ready")).unwrap(),
+        b"ready\n"
+    );
+    if failure != "loader" {
+        assert_eq!(
+            fs::read(fixture.data.join("candidate-starts")).unwrap(),
+            b"candidate\n"
+        );
+    }
+    if let Some((pid, birth)) = &owner.candidate_process {
+        if let Some(birth) = birth {
+            assert!(child::generation_gone(*pid, birth).unwrap());
+        }
+        assert_eq!(
+            child::observe_exit(*pid).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(child::group_descendants(*pid).unwrap().is_empty());
+    }
+    for (path, bytes) in old {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+    }
+    assert_eq!(
+        fs::read(fixture.data.join("owner-data")).unwrap(),
+        b"new owner data"
+    );
+    for parent in [&fixture.data, &fixture.data.join("installation")] {
+        for name in [
+            ".elastos.update-journal.json",
+            ".elastos.update-journal.tmp",
+            ".elastos.update-stage",
+            ".elastos.update-rollback",
+            ".elastos.update-support",
+        ] {
+            assert!(
+                !parent.join(name).exists(),
+                "{}",
+                parent.join(name).display()
+            );
+        }
+    }
+    assert!(!InstallTransaction::has_pending_recovery(&fixture.binary));
+    // Repeated controller reconciliation retains the ready Home and consumes no new start.
+    for _ in 0..2 {
+        owner.controller.reconcile_pending().await.unwrap();
+        owner.controller.complete_reconciliation().await.unwrap();
+        assert_eq!(owner.controller.child.as_ref().unwrap().pid(), restored_pid);
+        assert_eq!(status(&fixture.data).unwrap().unwrap().phase, "restored");
+        assert!(!fixture.directory.join(ACTIVE_REQUEST).exists());
+        assert_eq!(
+            fs::read(fixture.data.join("previous-starts")).unwrap(),
+            b"start\n"
+        );
+    }
+    owner.controller.stop_child().await.unwrap();
+    assert!(child::generation_gone(restored_pid, &restored_birth).unwrap());
+    assert!(crate::host_lock::active_host_process(&fixture.data)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "real child Home for controller restart failure tests"]
+async fn restart_home_fixture() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    let data = std::env::current_dir().unwrap();
+    let generation = std::env::var("ELASTOS_UPDATE_GENERATION").unwrap();
+    let restarting = std::env::var("ELASTOS_UPDATE_RESTART").unwrap() == "1";
+    let mut term =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    child::watch_parent().unwrap();
+    crate::install_transaction::authorize_host_start(&data, &data.join("installed-runtime"))
+        .unwrap();
+    // The signed shell wrapper execs this test harness. Hold the real host lock using
+    // the wrapper's admitted identity and this child's PID, rather than current_exe.
+    let mut host_lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(data.join("host-process.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(host_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    host_lock.set_len(0).unwrap();
+    serde_json::to_writer(
+        &mut host_lock,
+        &json!({
+            "pid":std::process::id(), "generation":generation, "role":"gateway"
+        }),
+    )
+    .unwrap();
+    host_lock.sync_all().unwrap();
+    if restarting {
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(data.join("previous-starts"))
+            .unwrap()
+            .write_all(b"start\n")
+            .unwrap();
+    }
+    // A private ephemeral port, away from the operator's Home, reported to the controller.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert_ne!(port, BROWSER_HOME_PORT);
+    write_private(&data.join("readiness-port"), &port).unwrap();
+    let coords_path = crate::runtime_control::gateway_runtime_coord_path(&data);
+    write_private(&coords_path, &json!({
+        "api_url":format!("http://127.0.0.1:{port}"), "home_url":format!("http://127.0.0.1:{port}/home/"),
+        "attach_secret":"restart-fixture-secret", "runtime_kind":"gateway",
+        "pid":std::process::id(), "generation":generation,
+        "binary_sha256":digest(&fs::read(data.join("installed-runtime")).unwrap())
+    })).unwrap();
+    let document = fs::read(data.join("capsules/home/browser/index.html")).unwrap();
+    let router = Router::new()
+        .route(
+            "/api/health",
+            get(|| async { Json(json!({"version":"0.7.0"})) }),
+        )
+        .route(
+            "/api/auth/attach",
+            post(|Json(input): Json<Value>| async move {
+                assert_eq!(input["secret"], "restart-fixture-secret");
+                Json(json!({"token":"restart-fixture-token"}))
+            }),
+        )
+        .route(
+            "/home/",
+            get(move || {
+                let document = document.clone();
+                let data = data.clone();
+                async move {
+                    if restarting {
+                        OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(data.join("previous-ready"))
+                            .unwrap()
+                            .write_all(b"ready\n")
+                            .unwrap();
+                    }
+                    document
+                }
+            }),
+        );
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            term.recv().await;
+        })
+        .await
+        .unwrap();
+    // Runtime retires its coordinates before releasing the host process lock.
+    fs::remove_file(coords_path).unwrap();
 }
 
 #[test]
@@ -2758,7 +3222,7 @@ fn migration_space_refusal_reuses_only_the_exact_current_signed_controller() {
             &fixture.binary,
             &source,
             &fixture.directory,
-            Err(crate::install_transaction::DiskReserveError.into()),
+            Err(elastos_common::NotEnoughFreeSpace { needed: 1 }.into()),
         );
         assert_eq!(result.is_ok(), case == "current", "{case}");
         assert_eq!(fixture.snapshot(), before, "{case}");
@@ -2812,6 +3276,7 @@ async fn stopped_home_with_unreconciled_child_record_reports_failure_and_retains
         host_ready: true,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
     };
     let stopped = controller.stop_child().await;
     assert!(stopped.is_err());
@@ -2968,6 +3433,7 @@ async fn staged_support_skips_linux_only_home_component_on_darwin() {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        test_readiness: None,
     };
     let components = serde_json::to_vec(&json!({
         "schema":"elastos.components/v1", "capsules":{},
@@ -3176,6 +3642,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 host_ready: true,
                 carrier: None,
                 carrier_close: None,
+                test_readiness: None,
             },
             host: Some(
                 crate::host_lock::acquire_host_process_lock(&fixture.data, "home", "fixture")
@@ -3336,6 +3803,52 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 assert!(status
                     .message
                     .contains("Connect to the internet and select Update again."));
+                assert!(!fixture.directory.join(REFUSED).exists(), "{outcome}");
+            }
+            if [
+                "head verify",
+                "release verify",
+                "components verify",
+                "binary verify",
+            ]
+            .contains(&outcome)
+            {
+                // Fetched bytes that differ from the signed digest may be transport damage.
+                assert_eq!(
+                    status.message,
+                    ApplyFailure::DownloadMismatch.message(),
+                    "{outcome}"
+                );
+                assert!(!fixture.directory.join(REFUSED).exists(), "{outcome}");
+            }
+            if outcome == "head verify" {
+                // A publisher-statement refusal binds the exact release; others stay offered.
+                let first = owner.controller.request.clone().unwrap();
+                let signature = || {
+                    crate::update::refused::<()>(Err(anyhow::anyhow!(
+                        "Signed envelope signature verification failed"
+                    )))
+                };
+                owner.controller.publish("staging", "Checking.").unwrap();
+                owner.controller.publish_apply_result(&signature()).unwrap();
+                let refused = super::status(&fixture.data).unwrap().unwrap();
+                assert_eq!(refused.message, REFUSED_MESSAGE);
+                let mut second = first.clone();
+                second.head_cid = "second-head".into();
+                second.release_cid = "second-release".into();
+                owner.controller.request = Some(second.clone());
+                owner.controller.publish("staging", "Checking.").unwrap();
+                owner.controller.publish_apply_result(&signature()).unwrap();
+                for request in [&first, &second] {
+                    assert!(release_refused(&fixture.data, &request.head_cid, "other").unwrap());
+                    assert!(release_refused(&fixture.data, "other", &request.release_cid).unwrap());
+                }
+                assert!(!release_refused(&fixture.data, "next-head", "next-release").unwrap());
+                // Installing a release clears only that release's refusal.
+                owner.controller.publish_apply_result(&Ok(())).unwrap();
+                assert!(!release_refused(&fixture.data, &second.head_cid, "other").unwrap());
+                assert!(release_refused(&fixture.data, &first.head_cid, "other").unwrap());
+                owner.controller.request = Some(first);
             }
             assert_eq!(
                 fs::read(&fixture.binary).unwrap(),
@@ -3360,4 +3873,107 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         owner.host.take();
         owner.controller.stop_child().await.unwrap();
     }
+}
+
+#[test]
+fn apply_failures_are_classified_only_from_typed_evidence() {
+    for (error, expected) in [
+        (
+            anyhow::Error::from(crate::update::UpdateSourceUnavailable).context("private endpoint"),
+            ApplyFailure::SourceUnavailable,
+        ),
+        (
+            anyhow::Error::from(elastos_common::NotEnoughFreeSpace { needed: 1 }),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            ApplyFailure::NotEnoughSpace,
+        ),
+        (
+            crate::update::mismatched::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!")))
+                .unwrap_err()
+                .context("staging"),
+            ApplyFailure::DownloadMismatch,
+        ),
+        (
+            crate::update::refused::<()>(Err(anyhow::anyhow!(
+                "Signed envelope signature verification failed"
+            )))
+            .unwrap_err()
+            .context("staging"),
+            ApplyFailure::Refused,
+        ),
+        (
+            anyhow::anyhow!("Binary SHA-256 mismatch!"),
+            ApplyFailure::Unknown,
+        ),
+        (anyhow::anyhow!("unexpected"), ApplyFailure::Unknown),
+    ] {
+        assert_eq!(classify_apply_failure(&error), expected, "{error:#}");
+    }
+    let refused =
+        crate::update::refused::<()>(Err(anyhow::anyhow!("Binary SHA-256 mismatch!"))).unwrap_err();
+    assert_eq!(refused.to_string(), "Binary SHA-256 mismatch!");
+    for failure in [
+        ApplyFailure::SourceUnavailable,
+        ApplyFailure::NotEnoughSpace,
+        ApplyFailure::DownloadMismatch,
+        ApplyFailure::Unknown,
+    ] {
+        assert!(failure
+            .message()
+            .to_lowercase()
+            .contains("select update again."));
+        assert!(!failure.message().contains("refused"));
+    }
+    assert!(ApplyFailure::NotEnoughSpace
+        .message()
+        .contains("free disk space"));
+    assert!(!REFUSED_MESSAGE
+        .to_lowercase()
+        .contains("select update again"));
+}
+
+#[test]
+fn refused_releases_live_outside_status_and_keep_the_latest_eight() {
+    let fixture = PrivateFixture::new();
+    // The status format older controllers wrote and read stays exactly the same.
+    let older: UpdateStatus = serde_json::from_value(serde_json::json!({
+        "id": null, "phase": "failed", "current_version": "0.7.0", "new_version": null,
+        "message": "older controller", "controller_pid": 1, "controller_start": "s",
+        "host_pid": null, "generation": "",
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&older)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .len(),
+        9
+    );
+    let request = |n: usize| UpdateRequest {
+        id: "a".repeat(32),
+        source_name: "s".into(),
+        channel: "stable".into(),
+        publisher_did: "did".into(),
+        current_version: "0.7.0".into(),
+        new_version: "0.7.1".into(),
+        head_cid: format!("head-{n}"),
+        release_cid: format!("release-{n}"),
+    };
+    for n in 0..10 {
+        record_refused_release(&fixture.directory, &request(n)).unwrap();
+    }
+    record_refused_release(&fixture.directory, &request(9)).unwrap();
+    let kept = read_refused_releases(&fixture.directory).unwrap();
+    assert_eq!(kept.len(), MAX_REFUSED);
+    assert_eq!(kept.first().unwrap().head_cid, "head-2");
+    assert_eq!(kept.last().unwrap().head_cid, "head-9");
+    assert!(!release_refused(&fixture.data, "head-1", "release-1").unwrap());
+    assert!(release_refused(&fixture.data, "head-2", "x").unwrap());
+    forget_refused_release(&fixture.directory, &request(5)).unwrap();
+    assert!(!release_refused(&fixture.data, "head-5", "release-5").unwrap());
+    assert!(release_refused(&fixture.data, "head-6", "release-6").unwrap());
 }

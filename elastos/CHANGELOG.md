@@ -31,12 +31,48 @@ All notable changes to the public ElastOS Runtime repository.
   version probe. Failed launches, timeouts, excess output, and unexpected version
   output preserve the previous installation.
 
+- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
+  Each step now requires that its own bytes fit in the free space. Update
+  staging, the installer, model and content downloads and Browser image
+  preparation also keep one shared 2 GiB reserve, so a disk is never filled to
+  zero, and refuse with "not enough free space: this needs N GB plus 2 GB kept
+  free". An update that does not fit keeps the previous release. Source-home
+  setup keeps its 16 GiB minimum and the media tools build its 4 GiB minimum.
+
 ### Added
 
 - An internal offline update foundation stages and verifies release files with
   unchanged support assets, an installation lock and journal, and restoration
   after failed or interrupted activation. The default CLI update flow is preserved.
   Home restart ownership and integration remain a follow-up.
+
+## [0.8.0-alpha.7]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+**On 0.8.0-alpha.6, System cannot install this update.** Run `elastos update`
+in Terminal once. Later updates work from System again.
+
+### Changed
+
+- Home keeps running while an update downloads and checks the whole new version.
+  Home restarts only once, at the end.
+- If an update cannot be used, your current version stays and System says why.
+- ElastOS now installs on Linux (x86-64) and NVIDIA Jetson with the same
+  install.sh command as on Mac.
+- Updates and installs keep 2 GB of free space on top of what they write. This
+  one rule replaces the old percentage checks.
+- The installer shows numbered steps. When its output goes to a file or another
+  program, it prints plain text.
+
+### Fixed
+
+- After an update, protected media could stop opening. It opens again.
+
+### Removed
+
+- Local AI models are no longer part of the release, so Home shows no models for
+  now. They will return as a separate signed download.
 
 ## [0.7.1] - 2026-09-30
 

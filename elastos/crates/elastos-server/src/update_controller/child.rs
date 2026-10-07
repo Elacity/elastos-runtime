@@ -55,7 +55,8 @@ impl OwnedChild {
                 Ok(())
             });
         }
-        let child = command.spawn().context("spawn owned update child")?;
+        let child = crate::install_transaction::retry_text_file_busy(|| command.spawn())
+            .context("spawn owned update child")?;
         let pid = child.id().expect("newly spawned child has a process ID");
         drop(reader);
         Ok(Self {

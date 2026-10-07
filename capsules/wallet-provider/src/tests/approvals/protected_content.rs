@@ -80,7 +80,7 @@ impl RightsRequestFixture {
             committee_authorization_seed: 0x26,
             policy_content_seed: 0x27,
             profile: ProfileIdentityV1::from_did_key(
-                "did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj",
+                "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z",
             )
             .unwrap(),
             session_seed: 0x66,

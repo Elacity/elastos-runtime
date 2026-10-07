@@ -25,18 +25,6 @@ const JOURNAL_TMP: &str = ".elastos.update-journal.tmp";
 const STAGE: &str = ".elastos.update-stage";
 const ROLLBACK: &str = ".elastos.update-rollback";
 const MAX_JOURNAL: u64 = 16 * 1024;
-const RESERVE_PERCENT: u128 = 15;
-
-#[derive(Debug)]
-pub(crate) struct DiskReserveError;
-
-impl std::fmt::Display for DiskReserveError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("update would cross the 15% disk reserve; previous release preserved")
-    }
-}
-
-impl std::error::Error for DiskReserveError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -828,7 +816,7 @@ impl InstallTransaction {
                             break;
                         }
                         let (total, available) = disk_space(backup.parent().unwrap())?;
-                        require_disk_reserve(total, available, count as u128)?;
+                        require_update_space(total, available, count as u128)?;
                         output.write_all(&buffer[..count])?;
                     }
                     output.sync_all()?;
@@ -1384,7 +1372,7 @@ impl InstallTransaction {
             volume.2 += u128::from(bytes);
         }
         for (total, available, needed) in volumes.values() {
-            require_disk_reserve(*total, *available, *needed)?;
+            require_update_space(*total, *available, *needed)?;
         }
         Ok(())
     }
@@ -1446,7 +1434,7 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let mut file = open_new(path, mode)?;
     for chunk in bytes.chunks(64 * 1024) {
         let (total, available) = disk_space(path.parent().unwrap())?;
-        require_disk_reserve(total, available, chunk.len() as u128)?;
+        require_update_space(total, available, chunk.len() as u128)?;
         file.write_all(chunk)?;
     }
     file.sync_all()?;
@@ -1770,6 +1758,10 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
+    #[cfg(test)]
+    if let Some(space) = tests::injected_disk_space(path) {
+        return Ok(space);
+    }
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1783,17 +1775,81 @@ fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
     ))
 }
 
-fn require_disk_reserve(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
-    let reserve = (total * RESERVE_PERCENT).div_ceil(100);
-    if total == 0 || available < reserve || needed > available.saturating_sub(reserve) {
-        return Err(DiskReserveError.into());
-    }
-    Ok(())
+/// Update staging, support staging, the update controller and the installer's
+/// `install-release` writer all admit their bytes through this one check.
+fn require_update_space(total: u128, available: u128, needed: u128) -> anyhow::Result<()> {
+    // A volume that reports no size has nothing to admit.
+    let available = if total == 0 { 0 } else { available };
+    Ok(elastos_common::require_free_space(available, needed)?)
 }
 
-pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyhow::Result<()> {
+pub(crate) fn require_controller_update_space(path: &Path, needed: u64) -> anyhow::Result<()> {
     let (total, available) = disk_space(path)?;
-    require_disk_reserve(total, available, u128::from(needed))
+    require_update_space(total, available, u128::from(needed))
+}
+
+/// Device and available bytes of the volume holding `path` or its nearest
+/// existing ancestor. A volume that reports no size has nothing available.
+pub(crate) fn volume_space(path: &Path) -> anyhow::Result<(u64, u128)> {
+    let mut volume = path;
+    while !volume.exists() {
+        volume = volume.parent().context("disk parent missing")?;
+    }
+    let (total, available) = disk_space(volume)?;
+    Ok((
+        fs::metadata(volume)?.dev(),
+        if total == 0 { 0 } else { available },
+    ))
+}
+
+/// Waits between attempts to start a binary that was just written. On Linux a
+/// concurrent fork can briefly inherit the closed writer descriptor, so exec
+/// reports ETXTBSY until that child execs. Only that error is retried (<2 s).
+const TEXT_FILE_BUSY_WAITS_MS: [u64; 9] = [20, 40, 80, 160, 200, 200, 200, 200, 200];
+
+fn text_file_busy(error: &std::io::Error) -> bool {
+    let busy = error.raw_os_error() == Some(libc::ETXTBSY);
+    #[cfg(test)]
+    if busy {
+        TEXT_FILE_BUSY_SEEN.with(|seen| seen.set(seen.get() + 1));
+    }
+    busy
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ETXTBSY results observed on this thread, so tests prove the retry ran.
+    pub(crate) static TEXT_FILE_BUSY_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Blocking form for synchronous callers; see [`TEXT_FILE_BUSY_WAITS_MS`].
+pub(crate) fn retry_text_file_busy<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for wait in TEXT_FILE_BUSY_WAITS_MS {
+        match attempt() {
+            Err(error) if text_file_busy(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(wait))
+            }
+            result => return result,
+        }
+    }
+    attempt()
+}
+
+/// Non-blocking form for async callers; see [`TEXT_FILE_BUSY_WAITS_MS`].
+pub(crate) async fn retry_text_file_busy_async<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for wait in TEXT_FILE_BUSY_WAITS_MS {
+        match attempt() {
+            Err(error) if text_file_busy(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await
+            }
+            result => return result,
+        }
+    }
+    attempt()
 }
 
 #[cfg(test)]
@@ -1801,9 +1857,95 @@ pub(crate) fn require_controller_disk_reserve(path: &Path, needed: u64) -> anyho
 mod restart_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    struct LowDisk {
+        parent: PathBuf,
+        allowed_checks: usize,
+        available: u128,
+        partial: PathBuf,
+        observed_prefix: Option<u64>,
+    }
+
+    thread_local! {
+        static LOW_DISK: std::cell::RefCell<Option<LowDisk>> = const { std::cell::RefCell::new(None) };
+    }
+
+    // Each injection belongs to one test thread and is cleared even on panic.
+    struct LowDiskGuard;
+
+    impl Drop for LowDiskGuard {
+        fn drop(&mut self) {
+            LOW_DISK.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn injected_disk_space(path: &Path) -> Option<(u128, u128)> {
+        LOW_DISK.with(|state| {
+            let mut state = state.borrow_mut();
+            let failure = state.as_mut()?;
+            if path != failure.parent {
+                return None;
+            }
+            if failure.allowed_checks > 0 {
+                failure.allowed_checks -= 1;
+                return None;
+            }
+            failure.observed_prefix = fs::metadata(&failure.partial).ok().map(|file| file.len());
+            Some((1 << 40, failure.available))
+        })
+    }
+
+    /// Writes a version script and holds a writable descriptor to it for 100 ms;
+    /// Linux refuses exec meanwhile, like a fork that inherited our writer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn briefly_busy_binary(
+        dir: &Path,
+        version: &str,
+    ) -> (PathBuf, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("elastos");
+        let mut writer = fs::File::create(&bin).unwrap();
+        write!(writer, "#!/bin/sh\necho 'elastos {version}'\n").unwrap();
+        writer.sync_all().unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        (bin, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_binary_start_retries_while_writer_descriptor_is_briefly_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, release) = briefly_busy_binary(dir.path(), "0.1.0");
+        let output =
+            retry_text_file_busy(|| std::process::Command::new(&bin).arg("--version").output());
+        release.join().unwrap();
+        assert!(
+            TEXT_FILE_BUSY_SEEN.get() >= 1,
+            "exec must have reported ETXTBSY"
+        );
+        assert_eq!(output.unwrap().stdout, b"elastos 0.1.0\n");
+    }
+
+    #[tokio::test]
+    async fn fresh_binary_start_fails_immediately_for_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = || std::process::Command::new(dir.path().join("missing")).output();
+        let started = std::time::Instant::now();
+        let sync = retry_text_file_busy(missing).unwrap_err();
+        let async_ = retry_text_file_busy_async(missing).await.unwrap_err();
+        assert_eq!(TEXT_FILE_BUSY_SEEN.get(), 0);
+        assert_eq!(sync.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(async_.kind(), std::io::ErrorKind::NotFound);
+        assert!(started.elapsed() < std::time::Duration::from_millis(40));
+    }
 
     fn previous(id: ReleaseFile) -> Vec<u8> {
         if id == ReleaseFile::RuntimeBinary {
@@ -3029,10 +3171,119 @@ mod tests {
     }
 
     #[test]
-    fn disk_floor_counts_projected_peak_and_accepts_exact_reserve() {
-        assert!(require_disk_reserve(1000, 149, 0).is_err());
-        assert!(require_disk_reserve(1000, 200, 51).is_err());
-        assert!(require_disk_reserve(1000, 200, 50).is_ok());
-        assert!(require_disk_reserve(0, 200, 0).is_err());
+    fn low_disk_during_staging_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(None);
+    }
+
+    #[test]
+    fn low_disk_during_backup_copy_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(Some(ROLLBACK));
+    }
+
+    #[test]
+    fn low_disk_during_chunk_write_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(Some(STAGE));
+    }
+
+    fn assert_low_disk_recovers(directory: Option<&str>) {
+        let fixture = Fixture::new();
+        let writer = fixture.writer();
+        fixture.old_files(&writer, false);
+        // Both streams need a second chunk, so refusal follows a real partial write.
+        let mut old_binary = previous(ReleaseFile::RuntimeBinary);
+        old_binary.push(b'#');
+        old_binary.resize(64 * 1024 + 17, b'x');
+        fs::write(&writer.binary, &old_binary).unwrap();
+        let mut new_binary = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n#".to_vec();
+        new_binary.resize(64 * 1024 + 17, b'y');
+        let mut next = candidate();
+        next[0].1 = &new_binary;
+        let needed = if directory.is_some() {
+            17
+        } else {
+            // Aggregate admission includes every staged file, backup and journal allowance.
+            64 * 1024
+                + next
+                    .iter()
+                    .map(|(id, bytes)| {
+                        bytes.len() as u128
+                            + u128::from(fs::metadata(&writer.destinations[id]).unwrap().len())
+                    })
+                    .sum::<u128>()
+        };
+        let parent = directory.map_or_else(
+            || writer.binary.parent().unwrap().to_path_buf(),
+            |directory| {
+                writer
+                    .scratch(ReleaseFile::RuntimeBinary, directory)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            },
+        );
+        let partial = writer.partial(ReleaseFile::RuntimeBinary, directory.unwrap_or(STAGE));
+        let before = fixture.snapshot();
+        LOW_DISK.with(|state| {
+            assert!(state.borrow().is_none());
+            *state.borrow_mut() = Some(LowDisk {
+                parent,
+                allowed_checks: usize::from(directory.is_some()),
+                available: u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES) + needed - 1,
+                partial,
+                observed_prefix: None,
+            });
+        });
+        let injection = LowDiskGuard;
+        let error = writer.prepare(&next).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<elastos_common::NotEnoughFreeSpace>(),
+            Some(&elastos_common::NotEnoughFreeSpace { needed }),
+            "{error:#}"
+        );
+        LOW_DISK.with(|state| {
+            assert_eq!(
+                state.borrow().as_ref().unwrap().observed_prefix,
+                directory.map(|_| 64 * 1024),
+            );
+        });
+        assert_eq!(fixture.snapshot(), before);
+        drop((injection, writer));
+
+        // A distinct writer acquires the shared lock and runs the update recovery path.
+        let resumed = fixture.writer();
+        resumed.recover().unwrap();
+        resumed.prepare(&next).unwrap();
+        resumed.commit_checked(|| Ok(())).unwrap();
+        for (id, bytes) in next {
+            assert_eq!(fs::read(&resumed.destinations[&id]).unwrap(), bytes);
+        }
+        let version = std::process::Command::new(&fixture.binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert_eq!(version.stdout, b"elastos 0.7.1\n");
+        assert_eq!(
+            fs::read(fixture.data.join("owner-data")).unwrap(),
+            b"data written by owner"
+        );
+        assert!(!InstallTransaction::has_pending_recovery(&fixture.binary));
+        resumed.require_empty_scratch().unwrap();
+    }
+
+    #[test]
+    fn update_and_installer_writes_keep_the_shared_free_space_reserve() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let needed = 300 * 1024 * 1024;
+        // Exactly needed + reserve is admitted; one byte less is refused.
+        assert!(require_update_space(1 << 40, needed + reserve, needed).is_ok());
+        let refused = require_update_space(1 << 40, needed + reserve - 1, needed).unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<elastos_common::NotEnoughFreeSpace>(),
+            Some(&elastos_common::NotEnoughFreeSpace { needed })
+        );
+        // Volume size alone never refuses; a volume reporting no size admits nothing.
+        assert!(require_update_space(1 << 50, needed + reserve, needed).is_ok());
+        assert!(require_update_space(0, needed + reserve, needed).is_err());
     }
 }

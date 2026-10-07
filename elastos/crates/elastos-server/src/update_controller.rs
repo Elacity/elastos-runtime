@@ -32,6 +32,9 @@ const RECEIPT: &str = "receipt.json";
 const STATUS: &str = "status.json";
 const REQUEST: &str = "request.json";
 const ACTIVE_REQUEST: &str = "active-request.json";
+const REFUSED: &str = "refused-releases.json";
+const REFUSED_SCHEMA: &str = "elastos.update-controller.refused-releases/v1";
+const MAX_REFUSED: usize = 8;
 const LEASE_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_LEASE";
 const HOST_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_HOST";
 const MAX_PRIVATE_JSON: u64 = 256 * 1024;
@@ -193,6 +196,81 @@ pub struct UpdateRequest {
     pub new_version: String,
     pub head_cid: String,
     pub release_cid: String,
+}
+
+/// The exact signed release a controller refused; retrying it can never succeed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedRelease {
+    pub head_cid: String,
+    pub release_cid: String,
+}
+
+impl RefusedRelease {
+    fn matches(&self, head_cid: &str, release_cid: &str) -> bool {
+        head_cid == self.head_cid || release_cid == self.release_cid
+    }
+}
+
+/// Kept beside status.json so older controllers never see an unknown status field.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusedReleases {
+    schema: String,
+    releases: Vec<RefusedRelease>,
+}
+
+fn read_refused_releases(directory: &Path) -> Result<Vec<RefusedRelease>> {
+    let path = directory.join(REFUSED);
+    if !path_present(&path)? {
+        return Ok(Vec::new());
+    }
+    let file: RefusedReleases = read_private_json(&path)?;
+    anyhow::ensure!(
+        file.schema == REFUSED_SCHEMA && file.releases.len() <= MAX_REFUSED,
+        "Refused release record is invalid."
+    );
+    Ok(file.releases)
+}
+
+fn write_refused_releases(directory: &Path, releases: Vec<RefusedRelease>) -> Result<()> {
+    write_private(
+        &directory.join(REFUSED),
+        &RefusedReleases {
+            schema: REFUSED_SCHEMA.into(),
+            releases,
+        },
+    )
+}
+
+pub(crate) fn record_refused_release(directory: &Path, request: &UpdateRequest) -> Result<()> {
+    let refused = RefusedRelease {
+        head_cid: request.head_cid.clone(),
+        release_cid: request.release_cid.clone(),
+    };
+    let mut releases = read_refused_releases(directory)?;
+    releases.retain(|release| release != &refused);
+    releases.push(refused);
+    let excess = releases.len().saturating_sub(MAX_REFUSED);
+    releases.drain(..excess);
+    write_refused_releases(directory, releases)
+}
+
+fn forget_refused_release(directory: &Path, request: &UpdateRequest) -> Result<()> {
+    let mut releases = read_refused_releases(directory)?;
+    let before = releases.len();
+    releases.retain(|release| !release.matches(&request.head_cid, &request.release_cid));
+    if releases.len() == before {
+        return Ok(());
+    }
+    write_refused_releases(directory, releases)
+}
+
+/// Whether this Home's controller refused the exact release named by either CID.
+pub fn release_refused(data_dir: &Path, head_cid: &str, release_cid: &str) -> Result<bool> {
+    Ok(read_refused_releases(&data_dir.join(DIRECTORY))?
+        .iter()
+        .any(|release| release.matches(head_cid, release_cid)))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -521,7 +599,7 @@ pub fn enter_browser_home() -> Result<()> {
     };
     let controller = directory.join("runtime");
     if !prepare_controller(&directory, &binary, &expected, |path, needed| {
-        crate::install_transaction::require_controller_disk_reserve(path, needed)
+        crate::install_transaction::require_controller_update_space(path, needed)
     })? {
         eprintln!("Home will open. Free disk space before updating.");
         return Ok(());
@@ -552,11 +630,14 @@ pub fn enter_browser_home() -> Result<()> {
     if inherited < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let error = std::process::Command::new(controller)
+    let mut command = std::process::Command::new(controller);
+    command
         .args(["__update-controller", "--receipt"])
         .arg(path)
-        .env(LEASE_ENV, inherited.to_string())
-        .exec();
+        .env(LEASE_ENV, inherited.to_string());
+    // exec returns only on failure; retry the controller copy we just wrote.
+    let error = crate::install_transaction::retry_text_file_busy(|| Err::<(), _>(command.exec()))
+        .unwrap_err();
     unsafe {
         libc::close(inherited);
     }
@@ -583,6 +664,8 @@ pub async fn run(receipt_path: PathBuf) -> Result<()> {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        #[cfg(test)]
+        test_readiness: None,
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -714,6 +797,10 @@ struct Controller {
     host_ready: bool,
     carrier: Option<Arc<crate::carrier::CarrierClient>>,
     carrier_close: Option<tokio::task::JoinHandle<()>>,
+    /// Test fixture: the claimed candidate's readiness budget. The fixture Home binds an
+    /// ephemeral port and reports it in `readiness-port`.
+    #[cfg(test)]
+    test_readiness: Option<Duration>,
 }
 
 impl Controller {
@@ -787,8 +874,13 @@ impl Controller {
         let generation = hex::encode(rand::random::<[u8; 16]>());
         async {
             self.spawn(&generation, false)?;
-            self.wait_ready(&generation, &source.installed_version, &expected, false)
-                .await
+            self.wait_ready(
+                &generation,
+                &source.installed_version,
+                &expected,
+                readiness_budget(false),
+            )
+            .await
         }
         .await
         .with_context(|| {
@@ -798,7 +890,7 @@ impl Controller {
             )
         })?;
         self.publish_ready_result()?;
-        println!("Home: http://localhost:8090/home/");
+        println!("Home: http://localhost:{BROWSER_HOME_PORT}/home/");
         println!("Keep this terminal open. Press Ctrl+C to stop Home.");
         Ok(())
     }
@@ -825,7 +917,7 @@ impl Controller {
         generation: &str,
         version: &str,
         binary_sha256: &str,
-        restarting: bool,
+        budget: Duration,
     ) -> Result<()> {
         let home_sha256 = home_digest(&self.receipt.data_dir)?;
         let child = self.child.as_ref().context("controller host missing")?;
@@ -836,7 +928,6 @@ impl Controller {
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let budget = readiness_budget(restarting);
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             if child.observed_exit()?.is_some() {
@@ -845,12 +936,23 @@ impl Controller {
             if process_start(pid).as_deref() != Some(start.as_str()) {
                 bail!("Home process generation changed.");
             }
+            let home_port = BROWSER_HOME_PORT;
+            // The fixture Home reports its port once it has bound the listener.
+            #[cfg(test)]
+            let home_port = match self.test_readiness {
+                Some(_) => std::fs::read_to_string(self.receipt.data_dir.join("readiness-port"))
+                    .ok()
+                    .and_then(|port| port.trim().parse().ok())
+                    .unwrap_or(0),
+                None => home_port,
+            };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if tokio::time::timeout(
                 remaining,
                 prove_ready(
                     &client,
                     &self.receipt.data_dir,
+                    home_port,
                     pid,
                     generation,
                     version,
@@ -931,6 +1033,9 @@ impl Controller {
 
     fn publish_apply_result(&self, result: &Result<()>) -> Result<()> {
         if result.is_ok() {
+            if let Some(request) = self.request.as_ref() {
+                forget_refused_release(&self.directory, request)?;
+            }
             self.publish("updated", "Home is up to date.")
         } else if self.host_ready
             && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
@@ -941,16 +1046,13 @@ impl Controller {
                 )
             })
         {
-            let message = if result
-                .as_ref()
-                .unwrap_err()
-                .is::<crate::update::UpdateSourceUnavailable>()
-            {
-                "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
-            } else {
-                "Update verification failed or the release was refused. Your current version is unchanged. Select Update again."
-            };
-            self.publish("failed", message)
+            let failure = classify_apply_failure(result.as_ref().unwrap_err());
+            if failure == ApplyFailure::Refused {
+                if let Some(request) = self.request.as_ref() {
+                    record_refused_release(&self.directory, request)?;
+                }
+            }
+            self.publish("failed", failure.message())
         } else if self.host_ready && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
         {
             self.publish("restored", "The update could not start. Your previous release is ready. Check the update again.")
@@ -1049,7 +1151,7 @@ impl Controller {
                 }
                 .context(crate::update::UpdateSourceUnavailable)?;
                 if cid == choice.head_cid {
-                    verify_update_choice(&bytes, &choice, &trusted)?;
+                    crate::update::refused(verify_update_choice(&bytes, &choice, &trusted))?;
                 }
                 Ok(bytes)
             })
@@ -1237,7 +1339,11 @@ impl crate::update::RestartOwner for Controller {
                 pid,
                 process_start(pid).context("Home exited during start")?,
             )?;
-            self.wait_ready(&record.generation, version, &expected, true)
+            let budget = readiness_budget(true);
+            // Tests shorten only the candidate start; the previous Home keeps its budget.
+            #[cfg(test)]
+            let budget = self.test_readiness.filter(|_| !previous).unwrap_or(budget);
+            self.wait_ready(&record.generation, version, &expected, budget)
                 .await?;
             Ok(())
         })
@@ -1391,9 +1497,53 @@ fn controller_file_digest(path: &Path) -> Result<Option<String>> {
     Ok(Some(hex::encode(digest.finalize())))
 }
 
+pub(crate) const REFUSED_MESSAGE: &str = "This update was refused because the publisher's signed release is not valid for this Home. Your current version is unchanged.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyFailure {
+    SourceUnavailable,
+    NotEnoughSpace,
+    DownloadMismatch,
+    Refused,
+    Unknown,
+}
+
+impl ApplyFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::SourceUnavailable => "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.",
+            Self::NotEnoughSpace => "There is not enough free disk space for this update. Your current version is unchanged. Free some space and select Update again.",
+            Self::DownloadMismatch => "The downloaded update did not match what the publisher signed. Your current version is unchanged. Select Update again.",
+            Self::Refused => REFUSED_MESSAGE,
+            Self::Unknown => "The update could not be completed. Your current version is unchanged. Select Update again.",
+        }
+    }
+}
+
+/// Only typed evidence classifies a failure; anything else stays retryable.
+fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
+    if error.is::<crate::update::UpdateSourceUnavailable>() {
+        ApplyFailure::SourceUnavailable
+    } else if controller_space_error(error) {
+        ApplyFailure::NotEnoughSpace
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::update::DownloadMismatch>())
+    {
+        ApplyFailure::DownloadMismatch
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::update::ReleaseRefused>())
+    {
+        ApplyFailure::Refused
+    } else {
+        ApplyFailure::Unknown
+    }
+}
+
 fn controller_space_error(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<crate::install_transaction::DiskReserveError>()
+        .downcast_ref::<elastos_common::NotEnoughFreeSpace>()
         .is_some()
         || error
             .downcast_ref::<std::io::Error>()
@@ -1405,7 +1555,7 @@ fn prepare_controller(
     directory: &Path,
     binary: &Path,
     expected: &str,
-    reserve: impl FnOnce(&Path, u64) -> Result<()>,
+    require_space: impl FnOnce(&Path, u64) -> Result<()>,
 ) -> Result<bool> {
     crate::install_transaction::refuse_pending_home_start(directory.parent().unwrap(), binary)?;
     let controller = directory.join("runtime");
@@ -1433,7 +1583,7 @@ fn prepare_controller(
         // Also repairs a crash after current signed bytes replaced an older receipt's bytes.
         return Ok(true);
     }
-    let result = reserve(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
+    let result = require_space(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
         .and_then(|()| copy_controller(binary, &controller, expected));
     match result {
         Ok(()) => Ok(true),
@@ -1609,7 +1759,7 @@ fn copy_controller(binary: &Path, controller: &Path, expected: &str) -> Result<(
             if count == 0 {
                 break;
             }
-            crate::install_transaction::require_controller_disk_reserve(
+            crate::install_transaction::require_controller_update_space(
                 controller.parent().unwrap(),
                 count as u64,
             )?;
@@ -1771,14 +1921,14 @@ async fn response_bytes(response: reqwest::Response, limit: usize) -> Result<Vec
     Ok(bytes)
 }
 
-fn approved_home_url(value: &str) -> Result<url::Url> {
+/// The browser Home always listens here; `home --browser` binds this port.
+pub const BROWSER_HOME_PORT: u16 = 8090;
+
+fn approved_home_url(value: &str, port: u16) -> Result<url::Url> {
     anyhow::ensure!(
-        matches!(
-            value,
-            "http://localhost:8090/home/"
-                | "http://127.0.0.1:8090/home/"
-                | "http://[::1]:8090/home/"
-        ),
+        ["localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .any(|host| value == format!("http://{host}:{port}/home/")),
         "Home listener has not reported an approved readiness URL"
     );
     Ok(url::Url::parse(value)?)
@@ -1788,6 +1938,7 @@ fn approved_home_url(value: &str) -> Result<url::Url> {
 async fn prove_ready(
     client: &reqwest::Client,
     data_dir: &Path,
+    home_port: u16,
     pid: u32,
     generation: &str,
     version: &str,
@@ -1815,7 +1966,7 @@ async fn prove_ready(
             && metadata["role"] == "gateway",
         "Home host lock differs from the claimed generation"
     );
-    let home_url = approved_home_url(&coords.home_url)?;
+    let home_url = approved_home_url(&coords.home_url, home_port)?;
     let base = crate::local_http::LoopbackHttpBaseUrl::parse(&coords.api_url)?;
     let health: serde_json::Value = serde_json::from_slice(
         &response_bytes(client.get(base.join("/api/health")?).send().await?, 4096).await?,

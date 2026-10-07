@@ -52,6 +52,20 @@ async function engineReadiness(config) {
   }
   const dataDir = process.env.ELASTOS_BROWSER_VM_DATA_DIR;
   if (!dataDir || !path.isAbsolute(dataDir)) return unavailable("preparation_required");
+  const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
+  if (linux) {
+    // Device access and the root-owned pool can change while images stay fixed.
+    // Check live state before returning a cached image-readiness result.
+    try {
+      execFileSync("python3", [path.join(dataDir, "scripts/browser-vm-linux-network.py"), "check"],
+        { timeout: 5000, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      // Keep private host paths in the local operator log. Engine readiness
+      // has a strict state/reason contract.
+      process.stderr.write(`${error.stderr?.toString().trim() || "Linux Browser network check failed"}\n`);
+      return unavailable("preparation_required");
+    }
+  }
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
   const identity = readinessArtifactIdentity(dataDir, config.launcher_program);
   if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;

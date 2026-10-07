@@ -85,12 +85,19 @@ function controller(t, { linux = false, delayed = false } = {}) {
     f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
     delete f.env[turnKey];
   }
-  const probes = [], stats = [];
-  const context = vm.createContext({ path, process: { env: f.env, platform: linux ? "linux" : "darwin" },
+  const probes = [], stats = [], networkChecks = [], messages = [];
+  const context = vm.createContext({ path, process: { env: f.env, platform: linux ? "linux" : "darwin",
+    stderr: { write: message => messages.push(message) } },
     fs: { statSync(file, options) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
     } },
+    execFileSync(command, args) {
+      assert.equal(command, "python3");
+      assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
+      networkChecks.push(args);
+      if (f.env.fixtureNetworkMissing) throw { stderr: Buffer.from("As root, run: python3 /fixture/browser-vm-linux-network.py setup --user fixture") };
+    },
     execFile(script, args, options, done) {
       assert.equal(script, path.join(f.root, "scripts/browser-vm-artifact-preflight.sh"));
       assert.equal(args.join(), "--host-readiness");
@@ -101,7 +108,7 @@ function controller(t, { linux = false, delayed = false } = {}) {
     },
   });
   const api = vm.runInContext(`${readiness}\n({engineReadiness})`, context);
-  return { ...f, probes, stats,
+  return { ...f, probes, stats, networkChecks, messages,
     read: async (launcher = f.launcher) => JSON.parse(JSON.stringify(await api.engineReadiness({ launcher_program: launcher }))),
   };
 }
@@ -168,8 +175,21 @@ test("Linux readiness retains KVM/crosvm identity and does not require VZ TURN",
   c.env[turnKey] = path.join(c.root, "absent");
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 1);
+  assert.equal(c.networkChecks.length, 2);
   assert.ok(c.stats.includes("/dev/kvm"));
   assert.ok(c.stats.includes(path.join(c.root, "bin/crosvm")));
+});
+
+test("Linux cached image readiness refuses missing network setup with its repair command", async t => {
+  const c = controller(t, { linux: true });
+  assert.deepEqual(await c.read(), ready);
+  c.env.fixtureNetworkMissing = "1";
+  const result = await c.read();
+  assert.equal(result.readiness.state, "unavailable");
+  assert.equal(result.readiness.reason, "preparation_required");
+  assert.match(c.messages[0], /As root, run: python3 .* setup --user fixture/);
+  assert.deepEqual(result, unavailable(), "host repair paths stay outside the strict Engine contract");
+  assert.equal(c.probes.length, 1);
 });
 
 test("remote VZ readiness remains unsupported without a local probe", async t => {

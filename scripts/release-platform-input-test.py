@@ -82,7 +82,7 @@ class PlatformInputTest(unittest.TestCase):
         source_root.mkdir()
         self.write_json(source_root / "components.json", self.template)
         (source_root / "elastos").mkdir()
-        (source_root / "elastos/CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+        (source_root / "elastos/CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n\n## [0.7.1]\n")
         source = json.loads((next(iter(self.bundles.values())) / "platform-input.json").read_text())["source"]
         for context in (patch.object(inputs, "SOURCE_ROOT", source_root),
                         patch.object(inputs, "source_identity", return_value=source)):
@@ -203,8 +203,8 @@ class PlatformInputTest(unittest.TestCase):
 
     def test_support_reuse_refuses_nested_origin_and_low_disk(self):
         args = self.reuse_fixture()
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
-                self.assertRaisesRegex(ValueError, "15% free"):
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
+                self.assertRaisesRegex(ValueError, "needs free space for its copy"):
             inputs.copy_support(args)
         self.assertEqual(list(args.root.iterdir()), [])
         inputs.copy_support(args)
@@ -1051,10 +1051,11 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         options.update(overrides)
         return inputs.signing_input(fixture.stage, fixture.cids_path, fixture.stamps_path, **options)
 
-    def test_unsigned_handoff_takes_wrapped_changes_from_unreleased_changelog(self):
+    def test_unsigned_handoff_takes_wrapped_changes_from_its_own_version_section(self):
         fixture = self.signing_fixture()
         (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
-            "# Changelog\n\n## [Unreleased]\n\n### Added\n\n"
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Developer detail.\n\n"
+            "## [0.7.1]\n\n### Added\n\n"
             "- Home shows signed\n  change notes.\n\n### Fixed\n"
             "- Updates retain café text.\n\n## [0.7.0] - 2026-01-01\n- Older change.\n")
         manifest = self.prepare_signing_fixture(fixture)
@@ -1084,29 +1085,25 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
 
     def test_changelog_refuses_long_bullet_with_location(self):
         fixture = self.signing_fixture()
-        for section in ("Unreleased", "0.7.1"):
-            for bullet in ("x" * 501, "é" * 249 + "\n  éé"):
-                with self.subTest(section=section, bullet=bullet):
-                    (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
-                        f"## [{section}]\n### Known limits\n- Ignored limit.\n"
-                        "### Fixed\n- " + "é" * 250 + "\n- " + bullet + "\n")
-                    message = (r"elastos/CHANGELOG\.md \[" + section
-                               + r"\] bullet 3: release changes exceed the 500-byte bound")
-                    with self.assertRaisesRegex(ValueError, message):
-                        inputs.changelog_changes("0.7.1")
-                    with self.assertRaisesRegex(ValueError, message):
-                        self.prepare_signing_fixture(fixture)
-                    self.assertFalse(fixture.output.exists())
+        for bullet in ("x" * 501, "é" * 249 + "\n  éé"):
+            with self.subTest(bullet=bullet):
+                (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+                    "## [0.7.1]\n### Known limits\n- Ignored limit.\n"
+                    "### Fixed\n- " + "é" * 250 + "\n- " + bullet + "\n")
+                message = r"elastos/CHANGELOG\.md \[0\.7\.1\] bullet 3: release changes exceed the 500-byte bound"
+                with self.assertRaisesRegex(ValueError, message):
+                    inputs.changelog_changes("0.7.1")
+                with self.assertRaisesRegex(ValueError, message):
+                    self.prepare_signing_fixture(fixture)
+                self.assertFalse(fixture.output.exists())
 
-    def test_real_unreleased_changelog_fits_release_bounds(self):
-        with patch.object(inputs, "SOURCE_ROOT", Path(__file__).resolve().parent.parent):
-            changes = inputs.changelog_changes("Unreleased")
-        signer.check_release_changes(changes)
-
-    def test_unsigned_handoff_omits_changes_without_matching_notes(self):
+    def test_unsigned_handoff_refuses_release_without_its_own_notes(self):
         fixture = self.signing_fixture()
-        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text("## [0.7.0]\n- Older change.\n")
-        self.assertNotIn("changes", self.prepare_signing_fixture(fixture)["release"])
+        (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
+            "## [Unreleased]\n- Developer detail.\n\n## [0.7.0]\n- Older change.\n")
+        with self.assertRaisesRegex(ValueError, r"no \[0\.7\.1\] section"):
+            self.prepare_signing_fixture(fixture)
+        self.assertFalse(fixture.output.exists())
 
     def test_unsigned_handoff_refuses_changelog_outside_runtime_bounds(self):
         fixture = self.signing_fixture()
@@ -1114,7 +1111,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
                       ["before\x7fafter"], [""]):
             with self.subTest(notes=notes):
                 (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
-                    "## [Unreleased]\n" + "\n".join("- " + note for note in notes) + "\n")
+                    "## [0.7.1]\n" + "\n".join("- " + note for note in notes) + "\n")
                 with self.assertRaisesRegex(ValueError, "changes"):
                     self.prepare_signing_fixture(fixture)
                 self.assertFalse(fixture.output.exists())
@@ -1122,7 +1119,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
     def test_unsigned_mac_canary_handoff_binds_exact_files_installer_and_source(self):
         fixture = self.signing_fixture()
         (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").write_text(
-            "## [Unreleased]\n- System shows signed change notes.\n")
+            "## [0.7.1]\n- System shows signed change notes.\n")
         manifest = self.prepare_signing_fixture(fixture)
         rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
         self.assertIn(b'HEAD_CID=""', rendered)
@@ -1237,12 +1234,12 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.assertFalse(fixture.output.exists())
         self.assertEqual((fixture.stage / "components.json").read_bytes(), admitted)
 
-    def test_unsigned_stage_refuses_15_percent_floor_before_any_copy(self):
+    def test_unsigned_stage_refuses_copy_that_does_not_fit_before_any_copy(self):
         output = self.root / "low-disk-stage"
         platform = "aarch64-darwin"
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=14_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk stage copied")):
-            with self.assertRaisesRegex(ValueError, "15%"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 inputs.stage_inputs([f"{platform}={self.bundles[platform]}"], "0.7.1", output,
                                     preview_platform=platform)
         self.assertFalse(output.exists())
@@ -1382,9 +1379,9 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
         fixture = self.signing_fixture()
         with self.assertRaisesRegex(ValueError, "preview requires canary"):
             self.prepare_signing_fixture(fixture, channel="stable")
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk input copied")):
-            with self.assertRaisesRegex(ValueError, "15 percent"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 self.prepare_signing_fixture(fixture)
         self.assertFalse(fixture.output.exists())
         self.assertFalse(list(self.root.glob(".signing-input-*")))
