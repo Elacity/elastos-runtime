@@ -3,6 +3,8 @@
 #[path = "../src/test_support.rs"]
 mod test_support;
 
+use test_support::FIXTURE_EVENT_TIMEOUT;
+
 use elastos_model_contract::{model_input_hash, RUNTIME_CREATE_BINDING_SCHEMA};
 use serde_json::{json, Value};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -14,7 +16,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PROCESS_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 struct ProviderProcess {
@@ -80,7 +81,7 @@ impl ProviderProcess {
         serde_json::to_writer(&mut *stdin, &request).unwrap();
         stdin.write_all(b"\n").unwrap();
         stdin.flush().unwrap();
-        self.responses.recv_timeout(PROCESS_DEADLINE).unwrap()
+        self.responses.recv_timeout(FIXTURE_EVENT_TIMEOUT).unwrap()
     }
 
     fn hard_kill(&mut self) {
@@ -153,7 +154,7 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
                 "threads": 1,
                 "batch_threads": 1,
                 "gpu_layers": 0,
-                "health_timeout_ms": 2000,
+                "health_timeout_ms": FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
                 "shutdown_timeout_ms": 250,
                 "enable_thinking": false
             }
@@ -209,7 +210,7 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
 }
 
 fn wait_for_event(path: &Path, prefix: &str) {
-    let deadline = Instant::now() + PROCESS_DEADLINE;
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
     while !event_lines(path)
         .iter()
         .any(|line| line.starts_with(prefix))
@@ -251,7 +252,7 @@ fn process_exists(pid: libc::pid_t) -> bool {
 }
 
 fn wait_for_child_exit(child: &mut Child) -> Option<ExitStatus> {
-    let deadline = Instant::now() + PROCESS_DEADLINE;
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
     loop {
         match child.try_wait().unwrap() {
             Some(status) => return Some(status),
@@ -262,7 +263,7 @@ fn wait_for_child_exit(child: &mut Child) -> Option<ExitStatus> {
 }
 
 fn wait_for_process_exit(pid: libc::pid_t) -> bool {
-    let deadline = Instant::now() + PROCESS_DEADLINE;
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
     while process_exists(pid) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -307,7 +308,7 @@ fn normal_provider_shutdown_reaps_local_llama_engine() {
     );
     let (stderr, overflow) = provider
         .stderr
-        .recv_timeout(PROCESS_DEADLINE)
+        .recv_timeout(FIXTURE_EVENT_TIMEOUT)
         .unwrap()
         .unwrap();
     assert!(!overflow, "provider stderr exceeded fixture limit");
