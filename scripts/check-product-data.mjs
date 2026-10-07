@@ -225,7 +225,7 @@ export function parsePublishData(shellSource, rustSource) {
   };
   const lists = {
     shellDefault: shell("DEFAULT_CAPSULES"), shellRequired: shell("REQUIRED_SUPPORTED_CAPSULES"),
-    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustRequired: rust("REQUIRED_SUPPORTED_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
+    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
   };
   for (const [name, values] of Object.entries(lists)) {
     assert(values.length > 0 && values.every((value) => typeof value === "string" && /^[a-z0-9][a-z0-9-]*$/.test(value)), `${name}: invalid publish capsule data`);
@@ -237,10 +237,8 @@ export function parsePublishData(shellSource, rustSource) {
 export function validatePublishData(components, manifests, lists) {
   const installedHome = components.profiles.home.components.filter((name) => Object.hasOwn(manifests, name)).sort();
   for (const name of ["shellDefault", "rustHome"]) same([...lists[name]].sort(), installedHome, `${name}: published capsules must match the Home profile`);
-  for (const name of ["shellRequired", "rustRequired"]) {
-    for (const capsule of installedHome) assert(lists[name].includes(capsule), `${name}: missing Home capsule ${capsule}`);
-  }
-  same([...lists.shellRequired].sort(), [...lists.rustRequired].sort(), "Shell and Rust supported publish capsules must match");
+  for (const capsule of installedHome) assert(lists.shellRequired.includes(capsule), `shellRequired: missing Home capsule ${capsule}`);
+  same([...lists.shellRequired].sort(), [...lists.rustHome].sort(), "Shell and Rust supported publish capsules must match");
   for (const [name, values] of Object.entries(lists)) {
     unique(values, `${name}: publish capsules`);
     for (const capsule of values) assert(Object.hasOwn(manifests, capsule) && !obsolete.includes(capsule), `${name}: unknown or retired publish capsule ${capsule}`);

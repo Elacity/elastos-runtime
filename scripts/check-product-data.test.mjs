@@ -34,14 +34,13 @@ for (const [name, mutate, message] of [
   ["missing shell default capsule", (_components, lists) => lists.shellDefault = lists.shellDefault.filter((name) => name !== "home-gui"), /shellDefault: published capsules/],
   ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "services"), /rustHome: published capsules/],
   ["missing shell required capsule", (_components, lists) => lists.shellRequired = lists.shellRequired.filter((name) => name !== "wallet-provider"), /shellRequired: missing Home capsule wallet-provider/],
-  ["missing Rust required capsule", (_components, lists) => lists.rustRequired = lists.rustRequired.filter((name) => name !== "documents"), /rustRequired: missing Home capsule documents/],
   ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("gba-emulator"), /shellDefault: published capsules/],
   ["missing demo publication", (_components, lists) => lists.rustDemo = lists.rustDemo.filter((name) => name !== "gba-emulator"), /missing demo capsule/],
   ["Home capsule in demo additions", (_components, lists) => lists.rustDemo.push("home"), /belongs in the demo profile/],
   ["uninstalled demo publication", (value) => value.profiles.demo.components = value.profiles.demo.components.filter((name) => name !== "tunnel-provider"), /belongs in the demo profile/],
   ["Home installation without publication parity", (value) => value.profiles.home.components = value.profiles.home.components.filter((name) => name !== "assistant"), /published capsules/],
   ["different supported capsule sets", (_components, lists) => lists.shellRequired.push("key-provider"), /supported publish capsules must match/],
-  ["unknown supported capsule", (_components, lists) => { lists.shellRequired.push("unknown"); lists.rustRequired.push("unknown"); }, /unknown or retired publish capsule/],
+  ["unknown publish capsule", (_components, lists) => lists.rustDemo.push("unknown"), /unknown or retired publish capsule/],
 ]) {
   test(`publication data refuse ${name}`, () => {
     const value = clone(components), lists = clone(publish);
@@ -62,7 +61,6 @@ for (const [name, shell, rust, message] of [
   ["shell default", shellPublish.replace(/(DEFAULT_CAPSULES=\([\s\S]*?)\n    home-gui\n/, "$1\n"), rustPublish, /shellDefault: published capsules/],
   ["shell required", shellPublish.replace(/(REQUIRED_SUPPORTED_CAPSULES=\([\s\S]*?)\n    wallet-provider\n/, "$1\n"), rustPublish, /shellRequired: missing Home capsule/],
   ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "services",/, "$1"), /rustHome: published capsules/],
-  ["Rust required", shellPublish, rustPublish.replace(/(const REQUIRED_SUPPORTED_PUBLISH_CAPSULES:[\s\S]*?)\n    "documents",/, "$1"), /rustRequired: missing Home capsule/],
   ["Rust demo", shellPublish, rustPublish.replace('"gba-emulator", "gba-ucity", "tunnel-provider"', '"gba-ucity", "tunnel-provider"'), /missing demo capsule/],
 ]) {
   test(`changed ${name} declared publication data is refused`, () => {

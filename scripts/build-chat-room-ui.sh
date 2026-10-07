@@ -9,7 +9,18 @@ STAMP_FILE="${UI_DIR}/.chat_room_ui_source.sha256"
 TARGET_JS="${OUT_DIR}/chat_room_ui.js"
 TARGET_BINDGEN_WASM="${OUT_DIR}/chat_room_ui_bg.wasm"
 
-cargo build --locked --manifest-path "${UI_DIR}/Cargo.toml" --target wasm32-unknown-unknown --release
+# Remap builder-specific paths so the wasm is byte-identical across machines
+# and checkout locations (panic/debug strings otherwise embed absolute paths).
+CARGO_HOME_DIR="${CARGO_HOME:-${HOME}/.cargo}"
+SYSROOT="$(rustc --print sysroot)"
+REMAP_FLAGS=(
+    "--remap-path-prefix=${ROOT}=/elastos-runtime"
+    "--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
+    "--remap-path-prefix=${SYSROOT}=/rustc-sysroot"
+)
+ENCODED_FLAGS="$(printf '%s\x1f' "${REMAP_FLAGS[@]}")"
+CARGO_ENCODED_RUSTFLAGS="${ENCODED_FLAGS%$'\x1f'}" RUSTFLAGS='' \
+    cargo build --locked --manifest-path "${UI_DIR}/Cargo.toml" --target wasm32-unknown-unknown --release
 
 SOURCE_HASH="$(sha256sum "${TARGET_WASM}" | awk '{print $1}')"
 if [[ -f "${STAMP_FILE}" ]] \

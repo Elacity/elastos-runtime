@@ -307,6 +307,12 @@ capsules, provider config, and `components.json`.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
+- Before a PASS is carried to a new head (merge, rebase, push), confirm that the
+  reviewed commit is an ancestor of that head and diff the reviewed paths
+  between the two. Any lost change voids the PASS. Give each review finding a
+  disposition tied to the published head: fixed in `<sha>` with test `<name>`,
+  moved to #N, or rejected because `<reason>`. Report author checks,
+  independent review and installed acceptance separately.
 - Keep release history in `elastos/CHANGELOG.md` and product instructions in
   the relevant documentation.
 - Keep product documentation release-neutral. Use version numbers only for

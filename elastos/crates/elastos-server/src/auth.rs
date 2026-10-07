@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::host_lock::FileLock;
+
 const AUTH_STATE_SCHEMA: &str = "elastos.auth.state/v1";
 pub(crate) const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const AUTH_STATE_ROOT: &str = "ElastOS/System/Auth";
@@ -3144,12 +3146,12 @@ fn open_audit_chain_activation_lock(data_dir: &Path) -> anyhow::Result<File> {
     open_regular_lock_file(&path, "audit activation")
 }
 
-fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    file.lock().context("failed to lock auth state")
+fn lock_auth_state_file(file: File) -> anyhow::Result<FileLock> {
+    FileLock::exclusive(file).context("failed to lock auth state")
 }
 
-fn unlock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    file.unlock().context("failed to unlock auth state")
+fn unlock_auth_state_file(lock: FileLock) -> anyhow::Result<()> {
+    lock.release().context("failed to unlock auth state")
 }
 
 fn mutate_auth_state<T>(
@@ -3159,21 +3161,13 @@ fn mutate_auth_state<T>(
     let _guard = auth_state_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
-    let lock_file = open_auth_state_lock(data_dir)?;
-    lock_auth_state_file(&lock_file)?;
-    let result = (|| {
-        let mut state = load_auth_state(data_dir)?;
-        ensure_audit_chain_state(data_dir, &mut state)?;
-        let value = mutation(&mut state)?;
-        save_auth_state(data_dir, &state)?;
-        Ok(value)
-    })();
-    let unlock = unlock_auth_state_file(&lock_file);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    }
+    let lock = lock_auth_state_file(open_auth_state_lock(data_dir)?)?;
+    let mut state = load_auth_state(data_dir)?;
+    ensure_audit_chain_state(data_dir, &mut state)?;
+    let value = mutation(&mut state)?;
+    save_auth_state(data_dir, &state)?;
+    unlock_auth_state_file(lock)?;
+    Ok(value)
 }
 
 pub fn load_or_create_recovery_archive_key(data_dir: &Path) -> anyhow::Result<[u8; 32]> {
@@ -3280,15 +3274,10 @@ fn with_audit_chain_activation_lock<T>(
     let _guard = audit_chain_activation_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("audit activation lock poisoned"))?;
-    let lock_file = open_audit_chain_activation_lock(data_dir)?;
-    lock_auth_state_file(&lock_file)?;
-    let result = operation();
-    let unlock = unlock_auth_state_file(&lock_file);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    }
+    let lock = lock_auth_state_file(open_audit_chain_activation_lock(data_dir)?)?;
+    let value = operation()?;
+    unlock_auth_state_file(lock)?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -7337,25 +7326,22 @@ mod tests {
             return;
         };
         let file = File::options().read(true).write(true).open(path).unwrap();
+        let probe = FileLock::try_exclusive(file);
         if std::env::var_os("ELASTOS_AUTH_LOCK_TEST_HELD").is_some() {
-            assert!(matches!(
-                file.try_lock(),
-                Err(std::fs::TryLockError::WouldBlock)
-            ));
+            assert_eq!(probe.unwrap_err().kind(), ErrorKind::WouldBlock);
         } else {
-            file.try_lock().unwrap();
-            unlock_auth_state_file(&file).unwrap();
+            probe.unwrap();
         }
     }
 
     #[test]
     fn auth_state_lock_excludes_another_process_and_releases() {
         let root = tempfile::tempdir().unwrap();
-        let file = open_auth_state_lock(root.path()).unwrap();
-        lock_auth_state_file(&file).unwrap();
+        let mut lock =
+            Some(lock_auth_state_file(open_auth_state_lock(root.path()).unwrap()).unwrap());
         for held in [true, false] {
             if !held {
-                unlock_auth_state_file(&file).unwrap();
+                unlock_auth_state_file(lock.take().unwrap()).unwrap();
             }
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child

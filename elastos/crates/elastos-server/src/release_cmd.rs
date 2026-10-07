@@ -493,8 +493,7 @@ mod tests {
             std::fs::write(destination, if index < 2 { next } else { old }).unwrap();
             std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode)).unwrap();
             let rollback = parent.join(".elastos.update-rollback").join(id);
-            std::fs::write(&rollback, old).unwrap();
-            std::fs::set_permissions(&rollback, std::fs::Permissions::from_mode(mode)).unwrap();
+            crate::test_support::write_from_child(&rollback, old, mode);
             if index >= 2 {
                 let stage = parent.join(".elastos.update-stage").join(id);
                 std::fs::write(&stage, next).unwrap();
