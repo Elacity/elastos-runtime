@@ -126,6 +126,14 @@ if (typedFailure && launch.transport_authority) {
       vm_absent: terminal && process.env.TYPED_TRANSPORT_PARTIAL !== "1",
     },
   };
+  const partialAbsence = process.env.TYPED_TRANSPORT_PARTIAL_ABSENCE;
+  if (partialAbsence) {
+    if (!Object.hasOwn(settlement.absence, partialAbsence)) {
+      throw new Error("unknown partial absence fixture");
+    }
+    settlement.absence.vm_absent = true;
+    settlement.absence[partialAbsence] = false;
+  }
   const errorForm = process.env.TYPED_TRANSPORT_ERROR_FORM;
   const typedError = {
     schema: "elastos.browser.engine.launch-error/v1",
@@ -1469,6 +1477,11 @@ if (process.env.PHASE === "binding-equality") {
   const errorForm = process.env.EXPECTED_ERROR_FORM;
   const failed = await requestRaw("POST", "/pages", openBody(streamId));
   const settlement = failed.body.launch_settlement_result;
+  if (process.env.EXPECTED_PARTIAL_ABSENCE &&
+      (settlement?.absence?.vm_absent !== true ||
+       settlement.absence[process.env.EXPECTED_PARTIAL_ABSENCE] !== false)) {
+    throw new Error("partial absence fixture lost its unproved effect");
+  }
   if (["nested", "envelope"].includes(errorForm)) {
     if (
       failed.body.code !== "profile_recovery_required" ||
@@ -2205,6 +2218,32 @@ NODE
   fi
 done
 unset TYPED_TRANSPORT_FAILURE
+
+for unproved_absence in child_absent control_socket_absent route_absent turn_listener_absent turn_relay_ports_absent ordinary_stream_bridge_absent media_stream_bridge_absent; do
+  partial_socket="$tmp_dir/partial-${unproved_absence}.sock"
+  partial_journal="${partial_socket}.launch-reconciliations.json"
+  TYPED_TRANSPORT_FAILURE="cleanup_pending" \
+  TYPED_TRANSPORT_PARTIAL_ABSENCE="$unproved_absence" \
+    start_service "$partial_socket" "" "partial-${unproved_absence}-service"
+  CONTROL_SOCKET="$partial_socket" \
+  STREAM_ID="stream:partial-${unproved_absence}" \
+  JOURNAL_PATH="$partial_journal" \
+  PHASE="typed-transport-failure" \
+  EXPECTED_SETTLEMENT="cleanup_pending" \
+  EXPECTED_PARTIAL_ABSENCE="$unproved_absence" \
+  TRANSPORT=1 \
+    "$node_bin" "$client"
+  stop_service
+  start_service "$partial_socket" "" "partial-${unproved_absence}-restart-service"
+  CONTROL_SOCKET="$partial_socket" \
+  STREAM_ID="stream:partial-${unproved_absence}" \
+  JOURNAL_PATH="$partial_journal" \
+  PHASE="verify-typed-restart" \
+  EXPECTED_SETTLEMENT="cleanup_pending" \
+  TRANSPORT=1 \
+    "$node_bin" "$client"
+  stop_service
+done
 
 for error_form in nested nested-extra envelope envelope-extra envelope-invalid envelope-missing; do
   error_socket="$tmp_dir/error-${error_form}-control.sock"

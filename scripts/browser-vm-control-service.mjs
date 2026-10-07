@@ -1948,39 +1948,9 @@ async function settleDispatchedTransportLaunchWithoutBinding(
       if (native.state === LAUNCH_SETTLEMENT_TERMINAL) {
         return record;
       }
-      const liveEffectsGone =
-        !fs.existsSync(paths.owner_path) &&
-        !fs.existsSync(paths.session_dir) &&
-        !fs.existsSync(paths.control_socket_path);
-      const nativeAbsent =
-        native.absence?.vm_absent === true &&
-        native.absence?.session_directory_absent === true &&
-        native.absence?.supervisor_child_absent === true;
-      if (liveEffectsGone && nativeAbsent) {
-        recordLaunchReconciliation(
-          launchReconciliationStore,
-          launch,
-          LAUNCH_SETTLEMENT_TERMINAL,
-          {
-            effects: { page_acquired: false, vm_acquired: false },
-            launch_settlement_result: {
-              ...native,
-              state: LAUNCH_SETTLEMENT_TERMINAL,
-              absence: Object.fromEntries(
-                VZ_LAUNCH_ABSENCE_KEYS.map((key) => [key, true]),
-              ),
-            },
-          },
-        );
-        return (
-          launchReconciliationStore.records.get(
-            launchReconciliationKey(
-              launch.lifecycle_generation,
-              launch.stream_id,
-            ),
-          ) || record
-        );
-      }
+      // Missing local paths cannot establish child, TURN, port or bridge
+      // absence. Preserve the exact partial receipt until its owner supplies
+      // complete cleanup evidence.
     } catch {
       return record;
     }

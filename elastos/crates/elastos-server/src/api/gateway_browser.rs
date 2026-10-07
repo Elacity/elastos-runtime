@@ -2813,27 +2813,7 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
         .await
         .map_err(|_| "Browser stream cleanup timed out".to_string())
         .and_then(|result| result);
-        let already_absent = matches!(
-            (&engine_result, &stream_result),
-            (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-        );
-        let ingress_released = if already_absent {
-            match release_absent_engine_viewer_ingress(state, &cleanup).await {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(
-                        page_id = %cleanup.page_id,
-                        error = %err,
-                        "Browser already-absent close could not retire its viewer ingress"
-                    );
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released)
-        {
+        if engine_result.is_ok() && stream_result.is_ok() {
             if let Err(err) = commit_browser_terminal_cleanup(
                 state,
                 &cleanup,
@@ -2964,26 +2944,7 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             release_browser_stream_cleanup_claim(&state.data_dir, cleanup).await;
         }
     }
-    let already_absent = matches!(
-        (&engine_result, &stream_result),
-        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-    );
-    let ingress_released = if already_absent {
-        match release_absent_engine_viewer_ingress(state, &engine_cleanup).await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    page_id = %engine_cleanup.page_id,
-                    error = %err,
-                    "Browser already-absent stale close could not retire its viewer ingress"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released) {
+    if engine_result.is_ok() && stream_result.is_ok() {
         if let Err(err) = commit_browser_terminal_cleanup(
             state,
             &engine_cleanup,
@@ -3011,21 +2972,6 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             "Browser stale page engine cleanup failed"
         );
     }
-}
-
-fn browser_engine_close_is_already_absent(message: &str) -> bool {
-    message.contains("indeterminate after service restart: exact owned launcher unavailable")
-        || message.contains("Engine retained owner unavailable")
-}
-
-async fn release_absent_engine_viewer_ingress(
-    state: &GatewayState,
-    cleanup: &BrowserEngineCleanup,
-) -> Result<(), String> {
-    let Some(authority) = cleanup.transport_authority.as_ref() else {
-        return Ok(());
-    };
-    gateway_browser_remote::close_transport_listener(state, authority).await
 }
 
 async fn attempt_browser_engine_cleanup(
@@ -4039,28 +3985,7 @@ pub(super) async fn browser_app_page_close(
     } else {
         close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
     };
-    let already_absent = matches!(
-        (&engine_result, &stream_result),
-        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-    );
-    let ingress_released = if already_absent {
-        match release_absent_engine_viewer_ingress(&state, &engine_cleanup).await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    page_id = %engine_cleanup.page_id,
-                    error = %err,
-                    "Browser already-absent close could not retire its viewer ingress"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    let terminal = if (engine_result.is_ok() && stream_result.is_ok())
-        || (already_absent && ingress_released)
-    {
+    let terminal = if engine_result.is_ok() && stream_result.is_ok() {
         commit_browser_terminal_cleanup(
             &state,
             &engine_cleanup,
@@ -4088,15 +4013,6 @@ pub(super) async fn browser_app_page_close(
             &receipt,
         ))
         .into_response(),
-        Err(_) if already_absent && ingress_released => {
-            Json(browser_public_already_absent_close_receipt(
-                &page_id,
-                &cleanup_id,
-                cleanup_browser_instance,
-                None,
-            ))
-            .into_response()
-        }
         Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
     }
 }

@@ -3230,6 +3230,8 @@ enum MockBrowserEngineCloseFailure {
     AlreadyClosed,
     RestartFailClosed,
     RetainedOwnerUnavailable,
+    MismatchedTerminalBinding,
+    IncompleteTerminalReceipt,
 }
 
 struct MockRetryingBrowserEngineProvider {
@@ -4344,6 +4346,16 @@ impl Provider for MockRetryingBrowserEngineProvider {
                         "code": "engine_close_indeterminate",
                         "message": "Engine retained owner unavailable"
                     })),
+                    MockBrowserEngineCloseFailure::MismatchedTerminalBinding => {
+                        let mut response = mock_browser_terminal_cleanup_response(request);
+                        response["data"]["binding"]["generation"] = json!("generation:mismatched");
+                        Ok(response)
+                    }
+                    MockBrowserEngineCloseFailure::IncompleteTerminalReceipt => {
+                        let mut response = mock_browser_terminal_cleanup_response(request);
+                        response["data"]["effects"]["vm_absent"] = json!(false);
+                        Ok(response)
+                    }
                 };
             }
             let response = <MockBrowserEngineProvider as Provider>::send_raw(
