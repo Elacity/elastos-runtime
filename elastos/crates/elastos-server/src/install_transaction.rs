@@ -1364,11 +1364,25 @@ impl InstallTransaction {
 
 fn check_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        bail!("installation directory is unsafe: {}", path.display());
+    if !metadata.is_dir() {
+        bail!(
+            "installation directory is unsafe: {} is not a directory",
+            path.display()
+        );
+    }
+    // The repair command must paste into a shell for any path.
+    let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "installation directory is unsafe: {} is group- or world-writable; fix with: chmod go-w {quoted}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -2635,6 +2649,24 @@ pub(crate) mod tests {
             assert_eq!(fs::metadata(parent).unwrap().mode() & 0o777, mode);
         }
         assert_eq!(fs::read(file).unwrap(), b"data written by owner");
+    }
+
+    #[test]
+    fn unsafe_directory_refusal_prints_a_working_repair_command() {
+        let fixture = Fixture::new();
+        let dir = fixture._root.path().join("it's a \"bin\" $dir");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let error = InstallationGuard::acquire(&dir).err().unwrap().to_string();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
+        let command = error.split_once("fix with: ").expect(&error).1;
+        let status = std::process::Command::new("sh")
+            .args(["-c", command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
+        assert!(InstallationGuard::acquire(&dir).is_ok());
     }
 
     #[test]
