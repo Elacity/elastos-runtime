@@ -664,6 +664,8 @@ pub async fn run(receipt_path: PathBuf) -> Result<()> {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        #[cfg(test)]
+        test_readiness: None,
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -795,6 +797,10 @@ struct Controller {
     host_ready: bool,
     carrier: Option<Arc<crate::carrier::CarrierClient>>,
     carrier_close: Option<tokio::task::JoinHandle<()>>,
+    /// Test fixture: the claimed candidate's readiness budget. The fixture Home binds an
+    /// ephemeral port and reports it in `readiness-port`.
+    #[cfg(test)]
+    test_readiness: Option<Duration>,
 }
 
 impl Controller {
@@ -868,8 +874,13 @@ impl Controller {
         let generation = hex::encode(rand::random::<[u8; 16]>());
         async {
             self.spawn(&generation, false)?;
-            self.wait_ready(&generation, &source.installed_version, &expected, false)
-                .await
+            self.wait_ready(
+                &generation,
+                &source.installed_version,
+                &expected,
+                readiness_budget(false),
+            )
+            .await
         }
         .await
         .with_context(|| {
@@ -906,7 +917,7 @@ impl Controller {
         generation: &str,
         version: &str,
         binary_sha256: &str,
-        restarting: bool,
+        budget: Duration,
     ) -> Result<()> {
         let home_sha256 = home_digest(&self.receipt.data_dir)?;
         let child = self.child.as_ref().context("controller host missing")?;
@@ -917,7 +928,6 @@ impl Controller {
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let budget = readiness_budget(restarting);
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             if child.observed_exit()?.is_some() {
@@ -926,13 +936,23 @@ impl Controller {
             if process_start(pid).as_deref() != Some(start.as_str()) {
                 bail!("Home process generation changed.");
             }
+            let home_port = BROWSER_HOME_PORT;
+            // The fixture Home reports its port once it has bound the listener.
+            #[cfg(test)]
+            let home_port = match self.test_readiness {
+                Some(_) => std::fs::read_to_string(self.receipt.data_dir.join("readiness-port"))
+                    .ok()
+                    .and_then(|port| port.trim().parse().ok())
+                    .unwrap_or(0),
+                None => home_port,
+            };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if tokio::time::timeout(
                 remaining,
                 prove_ready(
                     &client,
                     &self.receipt.data_dir,
-                    BROWSER_HOME_PORT,
+                    home_port,
                     pid,
                     generation,
                     version,
@@ -1319,7 +1339,11 @@ impl crate::update::RestartOwner for Controller {
                 pid,
                 process_start(pid).context("Home exited during start")?,
             )?;
-            self.wait_ready(&record.generation, version, &expected, true)
+            let budget = readiness_budget(true);
+            // Tests shorten only the candidate start; the previous Home keeps its budget.
+            #[cfg(test)]
+            let budget = self.test_readiness.filter(|_| !previous).unwrap_or(budget);
+            self.wait_ready(&record.generation, version, &expected, budget)
                 .await?;
             Ok(())
         })
