@@ -62,17 +62,23 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Added
 
-- Chat is installed on every Home, so its icon is there from the start.
-- ElastOS installs and updates on Linux (x86-64) and NVIDIA Jetson with the same
-  install.sh command as on Mac.
+- Chat is part of Home. New installs have it, and updating from System adds it.
+- This is the first release published for Linux (x86-64) and NVIDIA Jetson. They
+  install with the same install.sh command as on Mac.
 
 ### Changed
 
 - From alpha.7 on, you update through System, also when a release changes its
-  support files.
+  support files. On 0.8.0-alpha.6, System cannot install this update: run
+  `elastos update` in Terminal once.
+- Updates and installs keep 2 GB of free space on top of what they write. This
+  one rule replaces the old percentage checks.
+- The installer shows numbered steps. When its output goes to a file or another
+  program, it prints plain text.
 - Providers no longer carry the release number, so from the next release an
   update downloads only the parts that changed.
-- The install guide (docs/INSTALL.md) explains how to undo an update.
+- To be able to undo an update, run `elastos source show` first and keep the
+  Head CID. `elastos update --rollback-to <that CID>` goes back to it.
 - MicroVM capsules are not available in this release.
 
 ### Fixed
@@ -97,10 +103,6 @@ in Terminal once. Later updates work from System again.
 - If an update cannot be used, your current version stays and System says why.
 - ElastOS now installs on Linux (x86-64) and NVIDIA Jetson with the same
   install.sh command as on Mac.
-- Updates and installs keep 2 GB of free space on top of what they write. This
-  one rule replaces the old percentage checks.
-- The installer shows numbered steps. When its output goes to a file or another
-  program, it prints plain text.
 
 ### Fixed
 
