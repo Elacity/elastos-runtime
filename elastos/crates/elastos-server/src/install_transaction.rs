@@ -1976,16 +1976,15 @@ pub(crate) mod tests {
                 }
                 let path = &writer.destinations[&id];
                 writer.check_parent(path.parent().unwrap(), true).unwrap();
-                write_new(
+                crate::test_support::write_from_child(
                     path,
-                    &previous(id),
+                    previous(id),
                     if id == ReleaseFile::RuntimeBinary {
                         0o755
                     } else {
                         0o600
                     },
-                )
-                .unwrap();
+                );
             }
         }
 
