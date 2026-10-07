@@ -591,9 +591,9 @@ pub enum SourceCommand {
 mod tests {
     use super::*;
 
-    // Public DIDs and a pre-signed envelope from install-bootstrap-test.py.
+    // RFC 8032 public DID and a disposable pre-signed envelope from install-bootstrap-test.py.
     // These tests use public verification data only.
-    const OLD_DID: &str = "did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj";
+    const OLD_DID: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
     const NEW_DID: &str = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z";
 
     fn discovery_uri(publisher: &str, channel: &str) -> String {

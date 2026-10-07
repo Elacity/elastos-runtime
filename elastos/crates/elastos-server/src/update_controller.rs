@@ -297,7 +297,25 @@ struct OwnerActionReceipt {
     queued: bool,
 }
 
-fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, File)> {
+struct OwnerActionGuard(File);
+
+impl Drop for OwnerActionGuard {
+    fn drop(&mut self) {
+        // A command spawned meanwhile by another thread can retain this
+        // description until its CLOEXEC fd closes at exec. The guard's scope
+        // owns the lock, so release it before closing our fd.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+impl AsRawFd for OwnerActionGuard {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, OwnerActionGuard)> {
     let data_dir = fs::canonicalize(data_dir)?;
     let directory = controller_directory(&data_dir)?;
     let lock = OpenOptions::new()
@@ -313,7 +331,7 @@ fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, File)> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "Another Home owner action is in progress."
     );
-    Ok((directory, lock))
+    Ok((directory, OwnerActionGuard(lock)))
 }
 
 fn check_owner_effect(
@@ -599,7 +617,7 @@ pub fn enter_browser_home() -> Result<()> {
     };
     let controller = directory.join("runtime");
     if !prepare_controller(&directory, &binary, &expected, |path, needed| {
-        crate::install_transaction::require_controller_disk_reserve(path, needed)
+        crate::install_transaction::require_controller_update_space(path, needed)
     })? {
         eprintln!("Home will open. Free disk space before updating.");
         return Ok(());
@@ -664,6 +682,8 @@ pub async fn run(receipt_path: PathBuf) -> Result<()> {
         host_ready: false,
         carrier: None,
         carrier_close: None,
+        #[cfg(test)]
+        test_readiness: None,
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -795,6 +815,10 @@ struct Controller {
     host_ready: bool,
     carrier: Option<Arc<crate::carrier::CarrierClient>>,
     carrier_close: Option<tokio::task::JoinHandle<()>>,
+    /// Test fixture: the claimed candidate's readiness budget. The fixture Home binds an
+    /// ephemeral port and reports it in `readiness-port`.
+    #[cfg(test)]
+    test_readiness: Option<Duration>,
 }
 
 impl Controller {
@@ -868,8 +892,13 @@ impl Controller {
         let generation = hex::encode(rand::random::<[u8; 16]>());
         async {
             self.spawn(&generation, false)?;
-            self.wait_ready(&generation, &source.installed_version, &expected, false)
-                .await
+            self.wait_ready(
+                &generation,
+                &source.installed_version,
+                &expected,
+                readiness_budget(false),
+            )
+            .await
         }
         .await
         .with_context(|| {
@@ -906,7 +935,7 @@ impl Controller {
         generation: &str,
         version: &str,
         binary_sha256: &str,
-        restarting: bool,
+        budget: Duration,
     ) -> Result<()> {
         let home_sha256 = home_digest(&self.receipt.data_dir)?;
         let child = self.child.as_ref().context("controller host missing")?;
@@ -917,7 +946,6 @@ impl Controller {
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let budget = readiness_budget(restarting);
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             if child.observed_exit()?.is_some() {
@@ -926,13 +954,23 @@ impl Controller {
             if process_start(pid).as_deref() != Some(start.as_str()) {
                 bail!("Home process generation changed.");
             }
+            let home_port = BROWSER_HOME_PORT;
+            // The fixture Home reports its port once it has bound the listener.
+            #[cfg(test)]
+            let home_port = match self.test_readiness {
+                Some(_) => std::fs::read_to_string(self.receipt.data_dir.join("readiness-port"))
+                    .ok()
+                    .and_then(|port| port.trim().parse().ok())
+                    .unwrap_or(0),
+                None => home_port,
+            };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if tokio::time::timeout(
                 remaining,
                 prove_ready(
                     &client,
                     &self.receipt.data_dir,
-                    BROWSER_HOME_PORT,
+                    home_port,
                     pid,
                     generation,
                     version,
@@ -1319,7 +1357,11 @@ impl crate::update::RestartOwner for Controller {
                 pid,
                 process_start(pid).context("Home exited during start")?,
             )?;
-            self.wait_ready(&record.generation, version, &expected, true)
+            let budget = readiness_budget(true);
+            // Tests shorten only the candidate start; the previous Home keeps its budget.
+            #[cfg(test)]
+            let budget = self.test_readiness.filter(|_| !previous).unwrap_or(budget);
+            self.wait_ready(&record.generation, version, &expected, budget)
                 .await?;
             Ok(())
         })
@@ -1519,7 +1561,7 @@ fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
 
 fn controller_space_error(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<crate::install_transaction::DiskReserveError>()
+        .downcast_ref::<elastos_common::NotEnoughFreeSpace>()
         .is_some()
         || error
             .downcast_ref::<std::io::Error>()
@@ -1531,7 +1573,7 @@ fn prepare_controller(
     directory: &Path,
     binary: &Path,
     expected: &str,
-    reserve: impl FnOnce(&Path, u64) -> Result<()>,
+    require_space: impl FnOnce(&Path, u64) -> Result<()>,
 ) -> Result<bool> {
     crate::install_transaction::refuse_pending_home_start(directory.parent().unwrap(), binary)?;
     let controller = directory.join("runtime");
@@ -1559,7 +1601,7 @@ fn prepare_controller(
         // Also repairs a crash after current signed bytes replaced an older receipt's bytes.
         return Ok(true);
     }
-    let result = reserve(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
+    let result = require_space(directory, fs::metadata(binary)?.len() + MAX_PRIVATE_JSON)
         .and_then(|()| copy_controller(binary, &controller, expected));
     match result {
         Ok(()) => Ok(true),
@@ -1735,7 +1777,7 @@ fn copy_controller(binary: &Path, controller: &Path, expected: &str) -> Result<(
             if count == 0 {
                 break;
             }
-            crate::install_transaction::require_controller_disk_reserve(
+            crate::install_transaction::require_controller_update_space(
                 controller.parent().unwrap(),
                 count as u64,
             )?;

@@ -549,13 +549,14 @@ export_release_publication "$1" "$2/release-head.json" "$2/release.json" "$2/ins
             publication_fixture(prepared, salt=b" next")
             required = sum(path.stat().st_size for path in prepared.rglob("*") if path.is_file())
             required += (publisher / "release-head.json").stat().st_size
-            for free in (14_000_000, 15_000_000, 15_000_000 + required - 1):
+            # Staging only has to fit: one byte short refuses, an exact fit passes.
+            for free in (0, required // 2, required - 1):
                 with self.subTest(free=free):
                     result = self.run_publication_export(prepared, publisher, disk_free=free)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("15% free-space floor", result.stderr)
+                    self.assertIn("needs more free space than the volume has", result.stderr)
                     self.assertEqual(snapshot(publisher), before)
-            result = self.run_publication_export(prepared, publisher, disk_free=15_000_000 + required)
+            result = self.run_publication_export(prepared, publisher, disk_free=required)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_publication_export_promotes_exact_advertised_set_head_last(self):

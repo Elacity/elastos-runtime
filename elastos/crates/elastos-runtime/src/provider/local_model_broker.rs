@@ -311,25 +311,45 @@ mod tests {
 
     #[tokio::test]
     async fn only_owned_engine_and_exact_route_are_forwarded() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        // Bounds a hang only; every wait below ends on an explicit event.
+        const HANG_GUARD: Duration = Duration::from_secs(30);
         let dir = tempfile::tempdir().unwrap();
         let broker = dir.path().join("broker.sock");
         let engine = dir.path().join("engine.sock");
+        // The engine reads each whole request (head and Content-Length body)
+        // before answering: the broker writes a request in several writes and
+        // fails the exchange if the engine closes before taking all of them.
+        // It reports readiness only once it is listening.
         let mut child = tokio::process::Command::new("/usr/bin/python3")
             .arg("-c")
-            .arg(r"import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(2)
+            .arg(r"import socket,sys
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(2); print('ready', flush=True)
 for _ in range(2):
- c,_=s.accept(); request=c.recv(4096); body=b'ok' if request.startswith(b'GET /v1/models ') else b'counted' if request.startswith(b'POST /v1/chat/completions/input_tokens ') else b'wrong'; c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body); c.close()")
+ c,_=s.accept(); f=c.makefile('rb'); request=f.readline(); length=0
+ while True:
+  line=f.readline()
+  if line in (b'\r\n', b''): break
+  if line.lower().startswith(b'content-length:'): length=int(line.split(b':', 1)[1])
+ f.read(length)
+ body=b'ok' if request.startswith(b'GET /v1/models ') else b'counted' if request.startswith(b'POST /v1/chat/completions/input_tokens ') else b'wrong'
+ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body); f.close(); c.close()")
             .arg(&engine)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !engine.exists() {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let mut ready = String::new();
+        tokio::time::timeout(
+            HANG_GUARD,
+            tokio::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, "ready\n");
         let task = start(
             broker.to_str().unwrap(),
             engine,
@@ -354,7 +374,7 @@ for _ in range(2):
             .unwrap();
         allowed.shutdown().await.unwrap();
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), allowed.read_to_end(&mut response))
+        tokio::time::timeout(HANG_GUARD, allowed.read_to_end(&mut response))
             .await
             .unwrap()
             .unwrap();
@@ -368,7 +388,7 @@ for _ in range(2):
             .unwrap();
         count.shutdown().await.unwrap();
         let mut counted = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), count.read_to_end(&mut counted))
+        tokio::time::timeout(HANG_GUARD, count.read_to_end(&mut counted))
             .await
             .unwrap()
             .unwrap();

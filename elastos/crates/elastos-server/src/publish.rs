@@ -36,13 +36,13 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "marketplace",
     "archive-manager",
     "inbox",
+    "chat-room",
     "assistant",
     "elacity-player",
     "model-provider",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
-const DEMO_PUBLISH_CAPSULES: &[&str] =
-    &["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"];
+const DEMO_PUBLISH_CAPSULES: &[&str] = &["gba-emulator", "gba-ucity", "tunnel-provider"];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
@@ -73,6 +73,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "marketplace",
     "archive-manager",
     "inbox",
+    "chat-room",
     "assistant",
     "elacity-player",
     "model-provider",
@@ -787,7 +788,7 @@ impl PublicationProvider {
         data_dir: &Path,
         repo_bytes: u64,
         local_bytes: u64,
-    ) -> anyhow::Result<(u64, elastos_server::local_http::LoopbackHttpBaseUrl)> {
+    ) -> anyhow::Result<elastos_server::local_http::LoopbackHttpBaseUrl> {
         // The private provider probe validates the actual API repository, its
         // pinned datastore layout and all datastore volumes. Bind that probe
         // to the selected Runtime repository before using its free-space data.
@@ -828,7 +829,7 @@ impl PublicationProvider {
             .await?;
         let local = storage_observation(data_dir)?;
         let selected = storage_observation(&repo)?;
-        let floor = validate_publication_capacity(
+        validate_publication_capacity(
             &observation["data"],
             probe_bytes,
             selected,
@@ -836,7 +837,7 @@ impl PublicationProvider {
             repo_bytes,
             local_bytes,
         )?;
-        Ok((floor, base))
+        Ok(base)
     }
 
     async fn finish(&mut self) -> anyhow::Result<()> {
@@ -953,7 +954,7 @@ fn validate_publication_capacity(
     local: StorageObservation,
     repo_bytes: u64,
     local_bytes: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<()> {
     let fields = value
         .as_object()
         .context("Publication capacity response required")?;
@@ -977,7 +978,6 @@ fn validate_publication_capacity(
         "Publication capacity differs from the selected Runtime repository"
     );
     let repo_free = free.min(repo.free);
-    let floor = u64::try_from(u128::from(repo.capacity).saturating_mul(15).div_ceil(100))?;
     let shared = repo.volume == local.volume;
     anyhow::ensure!(
         !shared || repo.capacity == local.capacity,
@@ -985,20 +985,18 @@ fn validate_publication_capacity(
     );
     let required = u128::from(repo_bytes) + if shared { u128::from(local_bytes) } else { 0 };
     anyhow::ensure!(
-        u128::from(repo_free.min(if shared { local.free } else { repo_free }))
-            >= u128::from(floor) + required,
-        "Publication writes would cross the 15 percent free-space floor"
+        u128::from(repo_free.min(if shared { local.free } else { repo_free })) >= required,
+        "Publication writes need more free space than the volume has"
     );
     if !shared {
-        let local_floor = u128::from(local.capacity).saturating_mul(15).div_ceil(100);
         anyhow::ensure!(
             local.capacity > 0
                 && local.free <= local.capacity
-                && u128::from(local.free) >= local_floor + u128::from(local_bytes),
-            "Publication local copies would cross the 15 percent free-space floor"
+                && u128::from(local.free) >= u128::from(local_bytes),
+            "Publication local copies need more free space than the volume has"
         );
     }
-    Ok(floor)
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
@@ -2482,7 +2480,7 @@ mod tests {
         assert!(selected.contains(&"wallet-provider".to_string()));
         assert!(selected.contains(&"ipfs-provider".to_string()));
         assert!(!selected.contains(&"custody-provider".to_string()));
-        assert!(!selected.contains(&"chat-room".to_string()));
+        assert!(selected.contains(&"chat-room".to_string()));
         assert!(!selected.contains(&"gba-emulator".to_string()));
     }
 
@@ -2725,19 +2723,25 @@ finally:
         let repo = super::StorageObservation {
             volume: 7,
             capacity: 1000,
-            free: 350,
+            free: 299,
         };
-        let value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
-        // Each 150-byte write would fit on its own, but their combined peak
-        // would leave only 50 bytes on the same volume, below the 15% floor.
+        let value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":299,"required_bytes":150});
+        // Each 150-byte write would fit on its own, but their combined
+        // 300-byte peak on the same volume exceeds its 299 available bytes.
         assert!(super::validate_publication_capacity(&value, 150, repo, repo, 150, 150).is_err());
+        let exact = super::StorageObservation { free: 300, ..repo };
+        let exact_value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":300,"required_bytes":150});
+        assert!(
+            super::validate_publication_capacity(&exact_value, 150, exact, exact, 150, 150).is_ok()
+        );
         let other = super::StorageObservation {
             volume: 8,
             capacity: 1000,
-            free: 350,
+            free: 299,
         };
         assert!(super::validate_publication_capacity(&value, 150, repo, other, 150, 150).is_ok());
-        let wrong = serde_json::json!({"volume_id":8,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
+        assert!(super::validate_publication_capacity(&value, 150, repo, other, 150, 300).is_err());
+        let wrong = serde_json::json!({"volume_id":8,"capacity_bytes":1000,"available_bytes":299,"required_bytes":150});
         assert!(super::validate_publication_capacity(&wrong, 150, repo, other, 150, 150).is_err());
     }
 
@@ -3081,7 +3085,7 @@ finally:
     #[test]
     fn saved_public_pin_changes_require_approval_and_exact_confirmation() {
         let old = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
-        let new = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
+        let new = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("publish-state.json");
         let state = PublishState {

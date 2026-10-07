@@ -283,11 +283,46 @@ class PrepushTests(unittest.TestCase):
     def test_changed_source_head_and_remote_base_fail_final_check(self):
         for extra, message in (({"PREPUSH_DIRTY": "1"}, "working tree changes"),
                                ({"PREPUSH_HEAD": "1"}, "HEAD changed during checks"),
-                               ({"PREPUSH_ADVANCE": str(self.origin)}, "merge current origin/develop")):
+                               ({"PREPUSH_ADVANCE": str(self.origin)}, "develop changed during checks")):
             with self.subTest(extra=extra):
                 original = self.git("rev-parse", "HEAD")
                 self.assert_stopped(self.invoke(extra=extra), message)
                 self.git("reset", "--hard", original)
+
+    def advance_develop(self, files):
+        self.git("switch", "-q", "develop")
+        for path, text in files.items():
+            self.write(path, text)
+        self.commit()
+        self.git("push", "-q", "origin", "develop")
+        self.git("switch", "-q", "fix/fixture")
+
+    def test_stale_base_with_clean_disjoint_merge_is_accepted(self):
+        self.advance_develop({"README.md": "develop moved\n"})
+        candidate = self.git("rev-parse", "HEAD")
+        result = self.invoke(self.push_line())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("base-rule=disjoint-clean-merge", result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), candidate)
+
+    def test_stale_base_with_shared_file_or_conflict_is_refused(self):
+        # An identical edit merges cleanly but still overlaps; a file/directory
+        # collision conflicts although the changed path names differ.
+        for files, branch in (({"elastos/crates/server/src/release_cmd.rs": "// changed module\n",
+                                "README.md": "develop moved\n"}, {}),
+                              ({"notes": "file\n"}, {"notes/a.md": "directory\n"})):
+            with self.subTest(files=files):
+                original, develop = self.git("rev-parse", "HEAD"), self.git("rev-parse", "develop")
+                self.log.unlink(missing_ok=True)
+                for path, text in branch.items():
+                    self.write(path, text)
+                    self.commit()
+                self.advance_develop(files)
+                self.assert_stopped(self.invoke(), "merge current origin/develop")
+                self.assertEqual(self.commands(), [])
+                self.git("reset", "-q", "--hard", original)
+                self.git("branch", "-f", "develop", develop)
+                self.git("push", "-q", "-f", "origin", "develop")
 
     def test_zero_and_ignored_tests_fail_and_first_cargo_failure_stops(self):
         for extra, message in (({"PREPUSH_NO_TESTS": "1"}, "zero unit tests"),
@@ -667,6 +702,18 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(self.invoke(extra={"CARGO_BUILD_BUILD_DIR": "../shared"}).returncode, 0)
         self.assertTrue(all(c["build_dir"] == str(self.tmp / "shared") for c in self.commands()))
 
+    def test_repository_clean_runs_only_for_a_shared_build_dir(self):
+        for extra, cleaned in (({}, True),
+                               ({"CARGO_BUILD_BUILD_DIR": str(self.tmp / "shared")}, True),
+                               ({"CARGO_BUILD_BUILD_DIR": str(self.root / "target/private")}, False)):
+            with self.subTest(extra=extra):
+                self.log.unlink(missing_ok=True)
+                result = self.invoke(extra=extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                cargo = [c["args"][0] for c in self.commands() if c["tool"] == "cargo"]
+                self.assertIn("check", cargo)
+                self.assertEqual("clean" in cargo, cleaned)
+
     def test_repository_clean_covers_all_members_and_forward_path_dependencies(self):
         self.write("capsules/chain-provider/src/main.rs", "// changed\n")
         self.commit()
@@ -945,13 +992,6 @@ class PrepushTests(unittest.TestCase):
                                 input=self.push_line(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_disk_reserve_refuses_before_builds(self):
-        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 86, 14)):
-            with self.assertRaisesRegex(GATE.GateError, "15% disk reserve"):
-                GATE.disk_reserve(self.root)
-        with mock.patch.object(GATE.shutil, "disk_usage", return_value=shutil_usage(100, 85, 15)):
-            GATE.disk_reserve(self.root)
-
     def test_interrupt_settles_owned_cargo_and_releases_lease(self):
         child_file = self.tmp / "child.pid"
         process = subprocess.Popen([str(SCRIPT)], cwd=self.root,
@@ -1076,11 +1116,6 @@ class PrepushTests(unittest.TestCase):
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=7)
-
-
-def shutil_usage(total, used, free):
-    from collections import namedtuple
-    return namedtuple("Usage", "total used free")(total, used, free)
 
 
 if __name__ == "__main__":

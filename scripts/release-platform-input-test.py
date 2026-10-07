@@ -203,8 +203,8 @@ class PlatformInputTest(unittest.TestCase):
 
     def test_support_reuse_refuses_nested_origin_and_low_disk(self):
         args = self.reuse_fixture()
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
-                self.assertRaisesRegex(ValueError, "15% free"):
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
+                self.assertRaisesRegex(ValueError, "needs free space for its copy"):
             inputs.copy_support(args)
         self.assertEqual(list(args.root.iterdir()), [])
         inputs.copy_support(args)
@@ -360,6 +360,25 @@ class PlatformInputTest(unittest.TestCase):
             self.assertTrue(descriptor["cid"].startswith("bafy"))
             self.assertEqual(descriptor["size"], 64)
         self.assertNotIn("cid", merged["external"]["home"]["platforms"]["*"])
+
+    def test_input_staging_refuses_checksummed_cid_without_release_file(self):
+        # The signer requires release_path on checksum-bearing CID descriptors; prepare fails first.
+        pinned = {"cid": "QmPinned", "checksum": "sha256:" + "a" * 64, "install_path": "bin/vm"}
+        self.template["external"]["vm"] = {"platforms": {"linux-amd64": pinned}}
+        self.write_json(self.root / "source/components.json", self.template)
+        for root in self.bundles.values():
+            for name in ("components.json", "components-template.json"):
+                manifest = json.loads((root / name).read_text())
+                manifest["external"]["vm"] = copy.deepcopy(self.template["external"]["vm"])
+                self.write_json(root / name, manifest)
+            self.refresh(root)
+        stage = self.root / "publication"
+        with self.assertRaisesRegex(ValueError, r"external\.vm\.platforms\.linux-amd64: checksummed CID has no release file"):
+            inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertFalse(stage.exists())
+        # Like the signer, CID+sha256+size bound to snapshot bytes needs no release file.
+        bound = {"cid": "QmSnapshot", "sha256": "a" * 64, "size": 1}
+        self.assertEqual(list(inputs.unbound_checksum_descriptors({"external": {"x": bound}})), [])
 
     def test_input_staging_rejects_version_existing_output_and_changed_bytes(self):
         stage = self.root / "publication"
@@ -1234,12 +1253,12 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.assertFalse(fixture.output.exists())
         self.assertEqual((fixture.stage / "components.json").read_bytes(), admitted)
 
-    def test_unsigned_stage_refuses_15_percent_floor_before_any_copy(self):
+    def test_unsigned_stage_refuses_copy_that_does_not_fit_before_any_copy(self):
         output = self.root / "low-disk-stage"
         platform = "aarch64-darwin"
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=14_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk stage copied")):
-            with self.assertRaisesRegex(ValueError, "15%"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 inputs.stage_inputs([f"{platform}={self.bundles[platform]}"], "0.7.1", output,
                                     preview_platform=platform)
         self.assertFalse(output.exists())
@@ -1379,9 +1398,9 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
         fixture = self.signing_fixture()
         with self.assertRaisesRegex(ValueError, "preview requires canary"):
             self.prepare_signing_fixture(fixture, channel="stable")
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=15_000)), \
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100_000, free=1)), \
                 patch.object(inputs.shutil, "copyfile", side_effect=AssertionError("low-disk input copied")):
-            with self.assertRaisesRegex(ValueError, "15 percent"):
+            with self.assertRaisesRegex(ValueError, "needs free space for its copy"):
                 self.prepare_signing_fixture(fixture)
         self.assertFalse(fixture.output.exists())
         self.assertFalse(list(self.root.glob(".signing-input-*")))

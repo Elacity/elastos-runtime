@@ -413,8 +413,8 @@ class SignerTests(unittest.TestCase):
                 self.prepare()
             self.assertEqual(list(self.snapshot.iterdir()), [])
             self.policy[quota] = original
-        with mock.patch.object(S.shutil, "disk_usage", return_value=SimpleNamespace(total=1000, free=150)):
-            with self.assertRaisesRegex(ValueError, "15 percent"):
+        with mock.patch.object(S.shutil, "disk_usage", return_value=SimpleNamespace(total=1000, free=1)):
+            with self.assertRaisesRegex(ValueError, "needs more free space than the volume has"):
                 self.prepare()
         self.assertEqual(list(self.snapshot.iterdir()), [])
 

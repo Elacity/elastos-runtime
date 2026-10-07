@@ -50,7 +50,7 @@ def native_bindings():
 
 
 def enough(disk, growth):
-    return (disk.free - growth) * 100 >= disk.total * 15
+    return disk.free >= growth
 
 
 def run_capacity(record, growth, prepare, measure, bindings=native_bindings,
@@ -67,7 +67,7 @@ def run_capacity(record, growth, prepare, measure, bindings=native_bindings,
                         for key in ('free_bytes_after', 'total_bytes'))
                 and str(error) == f"hosted Mac capacity unavailable: free={receipt['free_bytes_after']} "
                     f"total={receipt['total_bytes']} planned_growth={growth}"
-                and (receipt['free_bytes_after'] - growth) * 100 < receipt['total_bytes'] * 15
+                and receipt['free_bytes_after'] < growth
                 and not enough(measure(), growth)):
             raise
         help_text = query(['/usr/bin/xcrun', 'simctl', 'help', 'runtime'])
@@ -87,7 +87,7 @@ def run_capacity(record, growth, prepare, measure, bindings=native_bindings,
         record['recheck'] = prepare()
     record['native_after'] = bindings()
     need(record['native_after'] == record['native_before'], 'Native build inputs changed')
-    need(enough(measure(), growth), 'Capacity below planned growth and 15% reserve')
+    need(enough(measure(), growth), 'Capacity below planned growth')
     record['status'] = 'ready'
 
 
@@ -118,7 +118,7 @@ def main():
         finally:
             capacity.cli_reclaim_xcode = original
     record = {'status': 'unavailable', 'source_commit': os.environ['SOURCE_COMMIT'],
-              'source_tree': os.environ['SOURCE_TREE'], 'planned_growth_bytes': growth, 'reserve_percent': 15}
+              'source_tree': os.environ['SOURCE_TREE'], 'planned_growth_bytes': growth}
     try:
         run_capacity(record, growth, prepare, lambda: shutil.disk_usage(root))
     finally:

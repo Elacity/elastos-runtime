@@ -206,7 +206,7 @@ const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
   "browser-engine-adapter", "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "browser-local-exit",
   "webspace-provider", "object-provider", "wallet-provider", "model-provider",
-  "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox",
+  "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
 const obsolete = ["chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
@@ -245,7 +245,7 @@ export function validatePublishData(components, manifests, lists) {
     unique(values, `${name}: publish capsules`);
     for (const capsule of values) assert(Object.hasOwn(manifests, capsule) && !obsolete.includes(capsule), `${name}: unknown or retired publish capsule ${capsule}`);
   }
-  for (const capsule of ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
+  for (const capsule of ["gba-emulator", "gba-ucity", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
   for (const capsule of lists.rustDemo) assert(components.profiles.demo.components.includes(capsule) && !installedHome.includes(capsule), `rustDemo: ${capsule} belongs in the demo profile`);
 }
 
@@ -270,7 +270,7 @@ export function validateComponents(components, manifests) {
   }
   for (const [profile, required] of [
     ["home", homeCore],
-    ["demo", [...homeCore, "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "chat-room", "cloudflared", "gba-emulator", "gba-ucity"]],
+    ["demo", [...homeCore, "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared", "gba-emulator", "gba-ucity"]],
     ["blockchain", ["shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", ...protectedProviders]],
   ]) {
     const list = components.profiles[profile]?.components ?? [];
@@ -285,12 +285,12 @@ export function validateComponents(components, manifests) {
   for (const name of ["gba-emulator", "gba-ucity"]) assert(!home.includes(name) && components.profiles.demo.components.includes(name), `${name}: demo profile placement`);
   same(Object.entries(components.profiles).filter(([, profile]) => profile.components.includes("custody-provider")).map(([name]) => name).sort(), ["blockchain", "full"], "Custody profile placement");
   for (const [name, component] of Object.entries(components.external)) {
-    assert(object(component.platforms) && Object.keys(component.platforms).length > 0, `${name}: release platforms`);
+    // microVM pieces publish no platform until signed, artifact-backed bytes exist.
+    const unreleased = ["crosvm", "vmlinux"].includes(name);
+    assert(object(component.platforms) && (unreleased || Object.keys(component.platforms).length > 0), `${name}: release platforms`);
     for (const [platform, metadata] of Object.entries(component.platforms)) {
       assert(object(metadata), `${name}: ${platform} metadata`);
-      if (["crosvm", "vmlinux", "cloudflared"].includes(name)) {
-        assert(text(metadata.release_path) || text(metadata.url) || text(metadata.cid) || (metadata.strategy === "local-copy" && text(metadata.source)), `${name}: ${platform} artifact source`);
-      } else present(metadata.release_path, `${name}: ${platform} release path`);
+      present(metadata.release_path, `${name}: ${platform} release path`);
       const installPath = metadata.install_path ?? component.install_path;
       present(installPath, `${name}: ${platform} install path`);
       for (const path of [metadata.release_path, installPath, metadata.extract_path].filter((value) => value !== undefined)) safePath(path, `${name}: ${platform} artifact`);

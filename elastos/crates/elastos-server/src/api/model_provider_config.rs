@@ -1227,8 +1227,8 @@ pub(super) fn archive_hosted_egress_decision(
         );
         let volume = unsafe { volume.assume_init() };
         anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
-            "hosted egress history disk reserve reached"
+            u128::from(volume.f_bavail) * u128::from(volume.f_frsize) >= bytes.len() as u128,
+            "not enough free space for the hosted egress history entry"
         );
     }
     let stage = directory.join(format!(

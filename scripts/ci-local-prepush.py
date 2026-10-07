@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -19,13 +18,10 @@ class GateError(Exception):
 
 INTERRUPTS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 GIT_LOCAL_ENV_VARS = ()
+PRIVATE_BUILD_DIR = False
 
 
 def run(args, cwd, capture=False, lease=None):
-    if lease and args[0] == "cargo":
-        disk_reserve(cwd)
-        build = Path(os.environ["CARGO_BUILD_BUILD_DIR"])
-        disk_reserve(next(path for path in (build, *build.parents) if path.exists()))
     print("+ " + shlex.join(str(arg) for arg in args), flush=True)
     environment = os.environ.copy()
     if args[0] == "cargo":
@@ -115,15 +111,21 @@ def push_candidate(lines, candidate):
 def current_develop(root, commit):
     git(root, "fetch", "--no-tags", "origin", "+refs/heads/develop:refs/remotes/origin/develop")
     develop = git(root, "rev-parse", "refs/remotes/origin/develop")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", develop, commit], cwd=root).returncode:
+    if not subprocess.run(["git", "merge-base", "--is-ancestor", develop, commit], cwd=root).returncode:
+        print("base-rule=contains-develop", flush=True)
+        return develop
+    # An older base is safe when the merge is clean and develop changed none
+    # of the candidate's files since the merge base; PR CI tests the merge.
+    merges = subprocess.run(["git", "merge-tree", "--write-tree", "--quiet", develop, commit],
+                            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = subprocess.run(["git", "merge-base", develop, commit], cwd=root,
+                          capture_output=True, text=True).stdout.strip()
+    if merges.returncode or not base or set(
+            paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", base, commit)).intersection(
+            paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", base, develop)):
         raise GateError("merge current origin/develop before checking and pushing; the hook keeps HEAD fixed")
+    print("base-rule=disjoint-clean-merge base=" + base, flush=True)
     return develop
-
-
-def disk_reserve(path):
-    disk = shutil.disk_usage(path)
-    if disk.free * 100 < disk.total * 15:
-        raise GateError("restore the 15% disk reserve before local Cargo checks")
 
 
 def acquire_lease(common, candidate):
@@ -155,6 +157,8 @@ def metadata(root, manifest, lease):
 def clean_repository_packages(root, workspace, lease, release=False):
     # A shared build dir can treat older worktree sources as fresh. Refresh
     # every resolved repository package while retaining distinct artifacts.
+    if PRIVATE_BUILD_DIR:
+        return
     lock = workspace / "Cargo.lock"
     relative_lock = lock.relative_to(root).as_posix()
     tracked = bool(paths_from_git(root, "ls-files", "-z", "--", relative_lock))
@@ -523,7 +527,7 @@ def interrupted(signum, frame):
 
 
 def main():
-    global GIT_LOCAL_ENV_VARS
+    global GIT_LOCAL_ENV_VARS, PRIVATE_BUILD_DIR
     if len(sys.argv) not in {1, 3}:
         raise GateError("use this gate directly, or pass Git's remote name and URL")
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
@@ -543,11 +547,15 @@ def main():
     print("Operator gate: reproduce an unclear failed Mac install/update/Home step locally; "
           "review a large diff with Opus before long Mac CI.", flush=True)
     common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    os.environ.setdefault("CARGO_BUILD_BUILD_DIR", str(common.parent / "target-build"))
+    shared = (common.parent / "target-build").resolve()
+    os.environ.setdefault("CARGO_BUILD_BUILD_DIR", str(shared))
     build_dir = Path(os.environ["CARGO_BUILD_BUILD_DIR"]).expanduser().resolve()
     os.environ["CARGO_BUILD_BUILD_DIR"] = str(build_dir)
-    disk_reserve(root)
-    disk_reserve(next(path for path in (build_dir, *build_dir.parents) if path.exists()))
+    # Only this worktree compiles into a private build dir, so its fingerprints
+    # already track these sources; the shared default needs the package clean.
+    PRIVATE_BUILD_DIR = build_dir != shared and build_dir.is_relative_to(root.resolve())
+    print("build-dir={} clean={}".format(build_dir, "skip-private" if PRIVATE_BUILD_DIR else "shared"),
+          flush=True)
     with acquire_lease(common, candidate) as lease:
         paths = paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", develop + "...HEAD")
         gates(root, paths, lease)

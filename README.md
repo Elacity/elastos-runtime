@@ -42,18 +42,30 @@ journeys tested on that device.
 
 The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
 
-The staged release root DID is
-`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Before a staged
-install, compare this DID with the `MAINTAINER_DID` value in the frozen installer.
-Promotion to the live installer requires staged install and update acceptance
-and operator approval.
+The maintainer release DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
+installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
+
+The maintainer changed the release signing key because the previous key was
+stored on the public server.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-The installer installs Runtime, sets up the Home profile, and opens Home. Its release acceptance evidence lives in GitHub issues.
-Keep the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
+For an existing Home, re-trust the maintainer once by running the same installer
+over the old installation:
+
+```bash
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+```
+
+The installer trusts the new DID, installs the release and keeps your existing
+identity, accounts and user files. Homes that already trust this DID can use
+normal updates. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
+
+The installer installs Runtime, sets up the Home profile, and opens Home. Its
+release acceptance evidence lives in GitHub issues. Keep the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
 later run `elastos` from a new shell. You do not need a separate `elastos serve`
 process for this path. Home is the user-facing front door to the managed
 Runtime.
