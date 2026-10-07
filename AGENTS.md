@@ -25,8 +25,8 @@ are the only place for work status, acceptance criteria and proof.
   local limit. Continue reviews, source work or other light checks in parallel.
 - Comment on GitHub only for a decision, a result with its link, a blocker or a review verdict.
   Keep comments to at most 3 lines: no narration, hashes, receipts or agent-to-agent coordination.
-  Put status in the issue checklist.
-- Keep one work record. Do not create briefings, plans, gists or notes files.
+  The checklist states what must be true; the Acceptance record below is the only place for current status and evidence.
+- Do not create briefings, plans, gists or notes files.
   Move useful open work from dated audits to its issue.
 - Keep seed security details, credentials and private operator data out of
   public issues, PRs and logs. Give the public issue only a safe summary and
@@ -39,6 +39,17 @@ are the only place for work status, acceptance criteria and proof.
   installed product works.
 - Durable product instructions, licences, test fixtures and artifact provenance
   stay with their code or package. They do not carry a second work queue.
+
+### Acceptance record
+
+The owning issue keeps one record, edited in place, with these six items:
+
+- Candidate: PR head and tested merge SHA, or one release source.
+- Exercised checks and the reason for each skipped check.
+- Review links with the reviewed SHA.
+- Installed release evidence.
+- Remaining gate.
+- Next owner.
 
 ## User-Facing Communication
 
@@ -190,9 +201,9 @@ them creates a cleanup obligation; "temporary" is not a lifecycle.
   condition, and must be removed when that gate closes. Do not recursively copy
   a live data root without an explicit size estimate and exclusion list for
   existing backups, VM images, caches, identity state, and user data.
-- Maintain at least 10% free space on development and staging volumes. If free
-  space falls below that threshold, stop creating worktrees, builds, VM images,
-  and backups until the ledger is reconciled and safe reclaim has completed.
+- Before creating a worktree, build, VM image or backup, check that its bytes
+  plus 2 GiB fit in the volume's free space (the product's own rule). If they do
+  not, stop until the ledger is reconciled and safe reclaim has completed.
 - Before handoff, rerun the branch/worktree inventory, check every touched
   worktree for dirt, report local/remote divergence, and update the local
   ledger. Do not describe a cleanup as complete while an unexplained ref,
@@ -249,10 +260,11 @@ git diff --stat <upstream>...HEAD
 git rev-list --left-right --count <upstream>...HEAD
 ```
 
-Before each push, fetch and merge current `origin/develop`, then check the
-clean candidate with `just ci-local-prepush`. The committed pre-push hook
-checks the exact pushed HEAD and refuses a stale base. It runs formatting,
-workspace/all-targets checks, Clippy for touched crates, and their unit targets.
+Before each push, commit the candidate and check it with
+`just ci-local-prepush`. The committed pre-push hook checks the exact pushed
+HEAD and refuses a base that conflicts or shares changed files with develop.
+It runs formatting, workspace/all-targets checks, Clippy for touched crates, and
+their unit targets.
 Use the [local pre-push procedure](scripts/README.md#local-pre-push-gate) to
 activate the hook and share the local heavy-build lease across worktrees.
 Reproduce an unclear failed Mac install, update, or Home startup step locally

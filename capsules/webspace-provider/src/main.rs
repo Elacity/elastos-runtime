@@ -7,10 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
 use serde::{Deserialize, Serialize};
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SUPPORTED_OPS: &[&str] = &[
     "init",

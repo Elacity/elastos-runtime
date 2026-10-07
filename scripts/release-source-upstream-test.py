@@ -286,7 +286,8 @@ class SourceUpstreamTests(unittest.TestCase):
         prerequisite.write_bytes(b'inert localhost fixture')
         consumer = source.split('PUBLISHER_DATA_DIR="${DATA_DIR}"', 1)[1].split('\nSOURCES_PATH=', 1)[0]
         consumer = 'PUBLISHER_DATA_DIR="${DATA_DIR}"' + consumer
-        result = subprocess.run(['bash', '-c', 'set -euo pipefail\numask 077\n' + consumer],
+        binary_path = 'cargo_release_binary() {' + source.split('cargo_release_binary() {', 1)[1].split('\n}', 1)[0] + '\n}\n'
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\numask 077\n' + binary_path + consumer],
             env={**os.environ, 'DATA_DIR': str(self.data), 'TEST_ROOT': str(self.root),
                  'REPO_ROOT': str(self.root)}, capture_output=True, text=True)
         self.assert_ok(result)

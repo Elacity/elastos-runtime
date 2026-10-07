@@ -361,6 +361,25 @@ class PlatformInputTest(unittest.TestCase):
             self.assertEqual(descriptor["size"], 64)
         self.assertNotIn("cid", merged["external"]["home"]["platforms"]["*"])
 
+    def test_input_staging_refuses_checksummed_cid_without_release_file(self):
+        # The signer requires release_path on checksum-bearing CID descriptors; prepare fails first.
+        pinned = {"cid": "QmPinned", "checksum": "sha256:" + "a" * 64, "install_path": "bin/vm"}
+        self.template["external"]["vm"] = {"platforms": {"linux-amd64": pinned}}
+        self.write_json(self.root / "source/components.json", self.template)
+        for root in self.bundles.values():
+            for name in ("components.json", "components-template.json"):
+                manifest = json.loads((root / name).read_text())
+                manifest["external"]["vm"] = copy.deepcopy(self.template["external"]["vm"])
+                self.write_json(root / name, manifest)
+            self.refresh(root)
+        stage = self.root / "publication"
+        with self.assertRaisesRegex(ValueError, r"external\.vm\.platforms\.linux-amd64: checksummed CID has no release file"):
+            inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertFalse(stage.exists())
+        # Like the signer, CID+sha256+size bound to snapshot bytes needs no release file.
+        bound = {"cid": "QmSnapshot", "sha256": "a" * 64, "size": 1}
+        self.assertEqual(list(inputs.unbound_checksum_descriptors({"external": {"x": bound}})), [])
+
     def test_input_staging_rejects_version_existing_output_and_changed_bytes(self):
         stage = self.root / "publication"
         with self.assertRaisesRegex(ValueError, "requested release"):
