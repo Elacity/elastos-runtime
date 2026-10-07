@@ -545,6 +545,15 @@ for name, component in manifest.get("external", {}).items():
         raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
     if runtime.get("execution") != "native-provider":
         raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "capsules" / name / "capsule.json"
+    if not capsule_path.is_file():
+        capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "elastos" / "capsules" / name / "capsule.json"
+    if capsule_path.is_file():
+        capsule = json.loads(capsule_path.read_text())
+        honest = (capsule.get("type"), capsule.get("execution"), capsule.get("runtime_abi"), capsule.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+        legacy = capsule.get("type") in ("wasm", "microvm") and capsule.get("execution") is None and capsule.get("runtime_abi") is None and capsule.get("entrypoint") == "rootfs.ext4"
+        if capsule.get("role") != "provider" or not (honest or legacy):
+            raise SystemExit(f"{name} capsule metadata must describe its native provider execution")
     provides = runtime.get("provides")
     if not isinstance(provides, str) or not provides:
         raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
@@ -763,7 +772,12 @@ import pathlib
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(manifest.get("runtime_abi", ""))
+abi = manifest.get("runtime_abi", "")
+if abi == "elastos.runtime-projection/v1" and (manifest.get("type") not in ("wasm", "web-projection") or manifest.get("execution") != "web-projection"):
+    raise SystemExit(f"{sys.argv[1]} projection execution requires type=wasm (legacy) or web-projection")
+if abi == "elastos.component/v1" and (manifest.get("type"), manifest.get("execution")) != ("wasm", "component"):
+    raise SystemExit(f"{sys.argv[1]} component execution requires type=wasm")
+print(abi)
 PY
 }
 

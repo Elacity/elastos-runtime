@@ -4,6 +4,44 @@
 
 If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
 
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The seed operator can read hosted data, wallet keys and recovery material.
+Passkeys control sign-in; stored data and keys remain accessible to the Runtime
+account and root while Home is locked. Protection against hosted operators and
+root, and against other software or OS users while a self-hosted Home is locked,
+is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+An unlocked self-hosted Home trusts its owner and their host software. Recovery
+from a stolen device or profile key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
+
+## Stored keys and recovery
+
+Keys are stored next to the data they protect. Full data-home backups include
+all keys. Protect those backups and your Recovery Kit as secrets. Encryption
+with keys stored on the same host leaves those secrets accessible to its
+operator. Use hosted accounts only for public demos; keep wallets, private data
+and recovery material on your own device until hosted protection passes its
+acceptance gate. Independent review and installed proof remain security gates.
+
 ## Open Findings
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
@@ -47,7 +85,7 @@ the Carrier integration task is tracked in [deferred work](docs/DEFERRED_WORK.md
 
 ## Resolved Findings
 
-These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
+These findings are resolved in source but remain listed as security history because they shaped the runtime contract.
 
 ### I/O bridge parse-size check
 
@@ -61,13 +99,11 @@ not close the read-time framing gap above.
 
 ## Architecture
 
-The runtime enforces a capability-based security model:
-
-- **Capsules** run sandboxed (WASM or microVM) with zero ambient authority
-- **Capability tokens** are Ed25519-signed by the runtime and validated on every resource access
-- **12-point token validation** covers version, signature, issuer, caller, action, resource, epoch, revocation, timing, use-count, and classification
-- **Audit events** are emitted at every security-critical operation
-- **Carrier** authenticates transport endpoints. Runtime verifies product
-  identity and signed message authority before exposing typed app projections.
+Runtime validates signed capability tokens against the caller, action,
+resource, epoch, revocation and token constraints. It checks principal and
+session authority separately. Carrier authenticates transport endpoints;
+Runtime verifies product identity and signed message authority before exposing
+typed app projections. These checks complement the current browser boundary
+and do not establish provider process confinement or a separate Home authority.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full trust model.
