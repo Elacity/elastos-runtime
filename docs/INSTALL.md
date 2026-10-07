@@ -183,6 +183,29 @@ another channel, a pending Home update, a second writer and an installed Runtime
 without a readable `sources.json`. Until an interrupted install is restored,
 Home does not start and asks you to run `install.sh` again.
 
+### Undo an update
+
+Use Undo if an update causes a problem and you need the previous release. Before
+an update, run `elastos source show` and save the full `Head CID:` value. That
+command shows the current head; after the update, it shows the new head. If it
+shows `unknown`, get the previous signed head CID from the publisher.
+
+To restore the previous release, run:
+
+```bash
+elastos update --rollback-to <previous head CID>
+```
+
+Replace `<previous head CID>` with the saved CID. A plain update to an older
+release is refused. Undo keeps your identity, accounts, and user data, including
+data written after the update.
+
+For a legacy Home, the first update to a new publisher key uses the installer's
+re-trust step. After that step, Undo accepts only heads signed by the current
+trusted key. A head signed by the former key is refused and the installation
+stays unchanged. Ask the publisher for a previous release signed by the current
+key if you need to recover across that first update.
+
 ### Recover an interrupted update
 
 If Runtime reports an interrupted command-line update, run `elastos update`

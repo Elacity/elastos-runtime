@@ -1758,6 +1758,10 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 fn disk_space(path: &Path) -> anyhow::Result<(u128, u128)> {
+    #[cfg(test)]
+    if let Some(space) = tests::injected_disk_space(path) {
+        return Ok(space);
+    }
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1856,6 +1860,43 @@ mod restart_tests;
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    struct LowDisk {
+        parent: PathBuf,
+        allowed_checks: usize,
+        available: u128,
+        partial: PathBuf,
+        observed_prefix: Option<u64>,
+    }
+
+    thread_local! {
+        static LOW_DISK: std::cell::RefCell<Option<LowDisk>> = const { std::cell::RefCell::new(None) };
+    }
+
+    // Each injection belongs to one test thread and is cleared even on panic.
+    struct LowDiskGuard;
+
+    impl Drop for LowDiskGuard {
+        fn drop(&mut self) {
+            LOW_DISK.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn injected_disk_space(path: &Path) -> Option<(u128, u128)> {
+        LOW_DISK.with(|state| {
+            let mut state = state.borrow_mut();
+            let failure = state.as_mut()?;
+            if path != failure.parent {
+                return None;
+            }
+            if failure.allowed_checks > 0 {
+                failure.allowed_checks -= 1;
+                return None;
+            }
+            failure.observed_prefix = fs::metadata(&failure.partial).ok().map(|file| file.len());
+            Some((1 << 40, failure.available))
+        })
+    }
 
     /// Writes a version script and holds a writable descriptor to it for 100 ms;
     /// Linux refuses exec meanwhile, like a fork that inherited our writer.
@@ -3127,6 +3168,107 @@ pub(crate) mod tests {
             .unwrap_err();
         fixture.assert_previous(&writer, false);
         assert_eq!(fs::metadata(&writer.binary).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn low_disk_during_staging_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(None);
+    }
+
+    #[test]
+    fn low_disk_during_backup_copy_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(Some(ROLLBACK));
+    }
+
+    #[test]
+    fn low_disk_during_chunk_write_preserves_live_install_and_next_update_completes() {
+        assert_low_disk_recovers(Some(STAGE));
+    }
+
+    fn assert_low_disk_recovers(directory: Option<&str>) {
+        let fixture = Fixture::new();
+        let writer = fixture.writer();
+        fixture.old_files(&writer, false);
+        // Both streams need a second chunk, so refusal follows a real partial write.
+        let mut old_binary = previous(ReleaseFile::RuntimeBinary);
+        old_binary.push(b'#');
+        old_binary.resize(64 * 1024 + 17, b'x');
+        fs::write(&writer.binary, &old_binary).unwrap();
+        let mut new_binary = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n#".to_vec();
+        new_binary.resize(64 * 1024 + 17, b'y');
+        let mut next = candidate();
+        next[0].1 = &new_binary;
+        let needed = if directory.is_some() {
+            17
+        } else {
+            // Aggregate admission includes every staged file, backup and journal allowance.
+            64 * 1024
+                + next
+                    .iter()
+                    .map(|(id, bytes)| {
+                        bytes.len() as u128
+                            + u128::from(fs::metadata(&writer.destinations[id]).unwrap().len())
+                    })
+                    .sum::<u128>()
+        };
+        let parent = directory.map_or_else(
+            || writer.binary.parent().unwrap().to_path_buf(),
+            |directory| {
+                writer
+                    .scratch(ReleaseFile::RuntimeBinary, directory)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            },
+        );
+        let partial = writer.partial(ReleaseFile::RuntimeBinary, directory.unwrap_or(STAGE));
+        let before = fixture.snapshot();
+        LOW_DISK.with(|state| {
+            assert!(state.borrow().is_none());
+            *state.borrow_mut() = Some(LowDisk {
+                parent,
+                allowed_checks: usize::from(directory.is_some()),
+                available: u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES) + needed - 1,
+                partial,
+                observed_prefix: None,
+            });
+        });
+        let injection = LowDiskGuard;
+        let error = writer.prepare(&next).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<elastos_common::NotEnoughFreeSpace>(),
+            Some(&elastos_common::NotEnoughFreeSpace { needed }),
+            "{error:#}"
+        );
+        LOW_DISK.with(|state| {
+            assert_eq!(
+                state.borrow().as_ref().unwrap().observed_prefix,
+                directory.map(|_| 64 * 1024),
+            );
+        });
+        assert_eq!(fixture.snapshot(), before);
+        drop((injection, writer));
+
+        // A distinct writer acquires the shared lock and runs the update recovery path.
+        let resumed = fixture.writer();
+        resumed.recover().unwrap();
+        resumed.prepare(&next).unwrap();
+        resumed.commit_checked(|| Ok(())).unwrap();
+        for (id, bytes) in next {
+            assert_eq!(fs::read(&resumed.destinations[&id]).unwrap(), bytes);
+        }
+        let version = std::process::Command::new(&fixture.binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert_eq!(version.stdout, b"elastos 0.7.1\n");
+        assert_eq!(
+            fs::read(fixture.data.join("owner-data")).unwrap(),
+            b"data written by owner"
+        );
+        assert!(!InstallTransaction::has_pending_recovery(&fixture.binary));
+        resumed.require_empty_scratch().unwrap();
     }
 
     #[test]

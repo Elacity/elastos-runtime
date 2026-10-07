@@ -2107,7 +2107,10 @@ fn extracted_bundle_cache_stale_reason(
             .ok()
             .map(|value| value.trim().to_string())
             .unwrap_or_default();
-        if cached_sha != expected_checksum {
+        // Registry capsule installs record the bare hex digest; platform checksums carry the
+        // `sha256:` prefix. Both name the same verified archive.
+        let bare = |value: &str| value.strip_prefix("sha256:").unwrap_or(value).to_string();
+        if bare(&cached_sha) != bare(expected_checksum) {
             return Some("extracted bundle checksum metadata missing or stale".to_string());
         }
     }
@@ -2151,42 +2154,10 @@ fn component_install_state(
                 return InstallState::Missing;
             }
             if candidate.is_dir() {
-                if let Some(platform_info) = platform_info {
-                    if platform_info.extract_path.is_some() {
-                        if let Some(expected_cid) = platform_info
-                            .cid
-                            .as_deref()
-                            .filter(|value| !value.is_empty())
-                        {
-                            let cached_cid = fs::read_to_string(candidate.join(CACHED_CID_FILE))
-                                .ok()
-                                .map(|value| value.trim().to_string())
-                                .unwrap_or_default();
-                            if cached_cid != expected_cid {
-                                return InstallState::Stale(
-                                    "extracted bundle CID metadata missing or stale".to_string(),
-                                );
-                            }
-                        }
-
-                        if let Some(expected_sha) = platform_info
-                            .checksum
-                            .as_deref()
-                            .filter(|value| !value.is_empty())
-                        {
-                            let cached_sha =
-                                fs::read_to_string(candidate.join(CACHED_ARTIFACT_SHA_FILE))
-                                    .ok()
-                                    .map(|value| value.trim().to_string())
-                                    .unwrap_or_default();
-                            if cached_sha != expected_sha {
-                                return InstallState::Stale(
-                                    "extracted bundle checksum metadata missing or stale"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
+                if let Some(reason) = platform_info
+                    .and_then(|info| extracted_bundle_cache_stale_reason(&candidate, info))
+                {
+                    return InstallState::Stale(reason);
                 }
                 return InstallState::Installed;
             }
@@ -4486,6 +4457,37 @@ pub(crate) mod tests {
             fs::read(data.join("bin/effect")).unwrap(),
             b"other component"
         );
+    }
+
+    #[test]
+    fn extracted_bundle_checksum_receipt_matches_only_the_same_sha256_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let reason = |expected: String| {
+            let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+                "extract_path": "bundle", "checksum": expected
+            }))
+            .unwrap();
+            extracted_bundle_cache_stale_reason(tmp.path(), &info)
+        };
+        let stale = Some("extracted bundle checksum metadata missing or stale".to_string());
+
+        assert_eq!(reason(format!("sha256:{digest}")), stale, "receipt missing");
+        // Registry capsule installs record the bare digest of the same archive.
+        fs::write(
+            tmp.path().join(CACHED_ARTIFACT_SHA_FILE),
+            format!("{digest}\n"),
+        )
+        .unwrap();
+        assert_eq!(reason(format!("sha256:{digest}")), None);
+        assert_eq!(reason(format!("sha256:{}", "b".repeat(64))), stale);
+        assert_eq!(reason(format!("sha512:{digest}")), stale);
+        fs::write(
+            tmp.path().join(CACHED_ARTIFACT_SHA_FILE),
+            format!("sha256:{digest}\n"),
+        )
+        .unwrap();
+        assert_eq!(reason(format!("sha512:{digest}")), stale);
     }
 
     #[cfg(target_os = "macos")]
@@ -7364,8 +7366,10 @@ pub(crate) mod tests {
         }
     }
 
-    async fn carrier_component_download_fixture(
+    pub(crate) async fn carrier_component_download_fixture(
         data_dir: &Path,
+        release_path: &'static str,
+        bytes: Vec<u8>,
     ) -> (iroh::Endpoint, tokio::task::JoinHandle<()>, PlatformInfo) {
         use tokio::io::AsyncBufReadExt;
 
@@ -7395,15 +7399,14 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let bytes = b"carrier fixture";
-        let digest = sha2::Sha256::digest(bytes);
+        let digest = sha2::Sha256::digest(&bytes);
         let cid = cid::Cid::new_v1(
             0x55,
             cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
         );
         let info: PlatformInfo = serde_json::from_value(serde_json::json!({
             "url": "http://127.0.0.1:9/unused",
-            "release_path": "artifact",
+            "release_path": release_path,
             "cid": cid.to_string(),
             "checksum": format!("sha256:{digest:x}")
         }))
@@ -7419,12 +7422,12 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
-                "artifact"
+                release_path
             );
             send.write_all(&(bytes.len() as u64).to_be_bytes())
                 .await
                 .unwrap();
-            send.write_all(bytes).await.unwrap();
+            send.write_all(&bytes).await.unwrap();
             send.finish().unwrap();
             connection.closed().await;
         });
@@ -7434,7 +7437,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn download_component_accepts_release_path_and_cid_over_carrier() {
         let tmp = tempfile::tempdir().unwrap();
-        let (server, serving, info) = carrier_component_download_fixture(tmp.path()).await;
+        let (server, serving, info) =
+            carrier_component_download_fixture(tmp.path(), "artifact", b"carrier fixture".to_vec())
+                .await;
         let dest = tmp.path().join("bin/kubo");
         let result = download_component(
             tmp.path(),
@@ -7456,7 +7461,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn download_component_rejects_cid_checksum_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let (server, serving, mut info) = carrier_component_download_fixture(tmp.path()).await;
+        let (server, serving, mut info) =
+            carrier_component_download_fixture(tmp.path(), "artifact", b"carrier fixture".to_vec())
+                .await;
         info.checksum = Some(format!(
             "sha256:{:x}",
             sha2::Sha256::digest(b"different component")
