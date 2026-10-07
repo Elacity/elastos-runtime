@@ -1534,9 +1534,13 @@ def cli_verify_setup_support(root, manifest, home_path):
         for name, expected in zip(CLI_HOME_CACHE, values):
             path = cli_path(directory, folder + "/" + name)
             info = path.lstat()
-            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
-                 and stat.S_IMODE(info.st_mode) == 0o600
-                 and path.read_text() == expected + "\n", "installed setup cache identity differs")
+            regular = (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                       and stat.S_IMODE(info.st_mode) == 0o600)
+            actual = path.read_text() if regular else None
+            if regular and name == ".elastos-artifact-sha256":
+                # Archive receipts are bare sha256 hex; Homes set up by earlier releases keep the prefix.
+                actual, expected = actual.removeprefix("sha256:"), expected.removeprefix("sha256:")
+            need(regular and actual == expected + "\n", "installed setup cache identity differs")
 
 
 # The cross-version hop starts from the newest published release. The pin names

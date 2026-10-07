@@ -1389,6 +1389,7 @@ class CliFixtureTests(unittest.TestCase):
                                  ("omit", "capsules/localhost-provider/icons/icon-256.png"),
                                  ("corrupt", "capsules/localhost-provider/.elastos-cid"),
                                  ("corrupt", "capsules/localhost-provider/.elastos-artifact-sha256"),
+                                 ("prefix", "capsules/localhost-provider/.elastos-cid"),
                                  ("mode", "capsules/localhost-provider/icons/icon-32.png")):
             with self.subTest(action=action, relative=relative):
                 code, calls, result = self.fake_run(setup_fault=(action, relative))
@@ -1398,6 +1399,12 @@ class CliFixtureTests(unittest.TestCase):
                 self.assertTrue(result["cleanup"]["passed"], result["cleanup"])
                 self.assertEqual((self.root / "results/homes/cli/.local/bin/elastos").read_bytes(), b"old")
                 shutil.rmtree(original_root / "results")
+
+    def test_setup_cache_accepts_legacy_prefixed_archive_receipt(self):
+        # Homes set up by earlier releases keep `sha256:`-prefixed archive receipts.
+        self.setup_fixture(metadata=True)
+        code, _, result = self.fake_run(setup_fault=("prefix", "capsules/localhost-provider/.elastos-artifact-sha256"))
+        self.assertEqual(code, 0, result)
 
     def test_prepare_preservation_copies_cannot_mask_setup_support(self):
         self.setup_fixture(metadata=True)
@@ -2386,7 +2393,7 @@ class CliFixtureTests(unittest.TestCase):
                             for folder, values in caches:
                                 for filename, value in zip(observer.CLI_HOME_CACHE, values):
                                     target = directory / folder / filename
-                                    target.write_text(value + "\n")
+                                    target.write_text(value.removeprefix("sha256:") + "\n")
                                     target.chmod(0o600)
                         if setup_fault:
                             action, relative = setup_fault
@@ -2395,6 +2402,8 @@ class CliFixtureTests(unittest.TestCase):
                                 target.unlink()
                             elif action == "mode":
                                 target.chmod(0o777)
+                            elif action == "prefix":
+                                target.write_text("sha256:" + target.read_text())
                             else:
                                 target.write_bytes(b"wrong setup output")
                 elif argv[0] == "/bin/bash" or args[0] == "update":

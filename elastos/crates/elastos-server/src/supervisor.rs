@@ -16,7 +16,10 @@ use tokio::sync::RwLock;
 
 use crate::carrier_service::CarrierServiceProvider;
 use crate::ownership;
-use crate::setup::{CapsuleEntry, ComponentsManifest};
+use crate::setup::{
+    read_artifact_sha256_receipt, write_artifact_sha256_receipt, CapsuleEntry, ComponentsManifest,
+    CACHED_ARTIFACT_SHA_FILE,
+};
 use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
@@ -27,7 +30,6 @@ use elastos_runtime::session::{SessionRegistry, SessionType};
 /// Carrier-managed control network.
 const VM_PROVIDER_PORT: u16 = 7000;
 const CACHED_CID_FILE: &str = ".elastos-cid";
-const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
 
 fn vm_provider_bridge_enabled() -> bool {
@@ -338,20 +340,18 @@ impl Supervisor {
             }
 
             if !entry.sha256.is_empty() {
-                let cached_sha =
-                    std::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                        .with_context(|| {
-                            format!(
-                                "carrier service '{}' missing cached capsule sha metadata at {}",
-                                name,
-                                capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
-                            )
-                        })?;
-                if cached_sha.trim() != entry.sha256 {
+                let cached_sha = read_artifact_sha256_receipt(capsule_dir).with_context(|| {
+                    format!(
+                        "carrier service '{}' missing cached capsule sha metadata at {}",
+                        name,
+                        capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
+                    )
+                })?;
+                if cached_sha != entry.sha256 {
                     bail!(
                         "carrier service '{}' cached sha mismatch: have {}, expected {}",
                         name,
-                        cached_sha.trim(),
+                        cached_sha,
                         entry.sha256
                     );
                 }
@@ -857,11 +857,7 @@ impl Supervisor {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
-            let cached_sha = tokio::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                .await
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
+            let cached_sha = read_artifact_sha256_receipt(&capsule_dir).unwrap_or_default();
 
             if cached_cid == entry.cid && (entry.sha256.is_empty() || cached_sha == entry.sha256) {
                 return Ok(capsule_dir);
@@ -941,13 +937,7 @@ impl Supervisor {
         archive.unpack(dest)?;
 
         tokio::fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", cid)).await?;
-        if !expected_sha256.is_empty() {
-            tokio::fs::write(
-                dest.join(CACHED_ARTIFACT_SHA_FILE),
-                format!("{}\n", expected_sha256),
-            )
-            .await?;
-        }
+        write_artifact_sha256_receipt(dest, expected_sha256)?;
         let _ = ownership::repair_path_recursive(dest);
 
         println!("  Extracted to {} (via content provider)", dest.display());
@@ -2298,7 +2288,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],
@@ -2343,7 +2333,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],

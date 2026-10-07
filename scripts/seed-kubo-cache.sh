@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='.kubo-package-', dir=cache) as temporar
     marker = capsule / '.elastos-artifact-sha256'
     if marker.exists() or marker.is_symlink():
         upstream.regular(marker)
-    marker.write_text(receipt['checksum'] + '\n')
+    marker.write_text(receipt['checksum'].removeprefix('sha256:') + '\n')
     marker.chmod(0o600)
     for record in (packages / (receipt['release_path'] + '.json'),
                    upstream.directory(data / 'receipts') / 'kubo-build.json'):
