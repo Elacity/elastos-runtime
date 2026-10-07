@@ -497,6 +497,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - name: verify compiler cache reuse and invalidation
+        if: env.RUSTC_WRAPPER == 'sccache'
+        run: python3 scripts/ci-rust-cache-smoke.py --output-json "$RUNNER_TEMP/source-home-cache-probe.json"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
@@ -580,6 +586,17 @@ jobs:
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
             elastos-runtime-*.receipt.json
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/source-home-sccache.json"
+          {
+            echo '### Rust compiler cache'
+            echo '```text'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -605,6 +622,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - name: verify compiler cache reuse and invalidation
+        if: env.RUSTC_WRAPPER == 'sccache'
+        run: python3 scripts/ci-rust-cache-smoke.py --output-json "$RUNNER_TEMP/source-home-cache-probe.json"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
@@ -810,6 +833,17 @@ jobs:
           path: |
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/source-home-sccache.json"
+          {
+            echo '### Rust compiler cache'
+            echo '```text'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

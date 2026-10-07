@@ -17,6 +17,8 @@ from unittest import mock
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 SOURCE = WORKFLOW.read_text()
+CACHE_ACTION = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
+LOCAL_CACHE_ACTION = "./.github/actions/rust-compile-cache"
 # Read the fixed job/step indentation used here; actionlint checks YAML syntax.
 def jobs(source):
     return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
@@ -26,6 +28,7 @@ def jobs(source):
 JOBS = jobs(SOURCE)
 CACHE_RE = re.compile(
     r"uses: (?:Swatinem/rust-cache|actions/cache(?:/restore|/save)?)@"
+    r"|uses: \./\.github/actions/rust-compile-cache\b"
     r"|^\s+cache(?:-from|-to)?:|type=gha", re.M)
 
 
@@ -41,13 +44,91 @@ def steps(job, workflow_jobs=JOBS):
 
 
 def evaluate(expression, context):
-    # eval accepts only this repository's own ci.yml expressions, never external input.
+    # Evaluate only this repository's workflow/action expressions, never external input.
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
     expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
-    return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
+    return eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith})
+
+
+def validate_action_pins(source, cache_action):
+    commits = {}
+    for index, block in enumerate((source, cache_action)):
+        uses = re.findall(r"(?m)^\s+(?:- )?uses: (\S+)(.*)$", block)
+        if not uses:
+            raise AssertionError("missing action pins")
+        for action, comment in uses:
+            if index == 0 and action == LOCAL_CACHE_ACTION:
+                continue
+            if not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", action):
+                raise AssertionError(f"unrecognized local action or mutable action: {action}")
+            if not re.fullmatch(r" # \S+", comment):
+                raise AssertionError(f"missing version comment: {action}")
+            commits.setdefault((action.split("@")[0], comment), set()).add(action.split("@")[1])
+    # One version comment names one commit, including nested external actions.
+    if any(len(value) > 1 for value in commits.values()):
+        raise AssertionError("action pin drifts under the same version label")
+
+
+def run_compile_cache_fixture(source, mode, download_status=0, server_status=0,
+                              platform=("Linux", "X64"), archive=None, checksum=None):
+    """Execute action shell control flow with local transport/server fixtures."""
+    action_steps = re.split(r"(?m)^    - ", source.split("  steps:\n", 1)[1])[1:]
+    install = textwrap.dedent(action_steps[0].split("      run: |\n", 1)[1])
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        shims = root / "shims"
+        shims.mkdir()
+        for name, body in {
+            "curl": 'printf "%s\\n" "$@" > "$DOWNLOAD_LOG"\nwhile [ "$1" != -o ]; do shift; done\nprintf fixture > "$2"\nexit "$DOWNLOAD_STATUS"\n',
+            "rustc": '[ "$*" = -vV ] || exit 99\nprintf "fixture rustc\\n"\n',
+            "tar": 'exit 0\n',
+            "sccache": '[ "$*" = --start-server ] || exit 99\necho started >> "$SERVER_LOG"\nexit "$SERVER_STATUS"\n',
+        }.items():
+            path = shims / name
+            path.write_text("#!/bin/bash\n" + body)
+            path.chmod(0o700)
+        # Hash compiler inputs for real; the corrupt-archive test checks real verification.
+        for name in ("sha256sum", "shasum"):
+            path = shims / name
+            path.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                import hashlib, os, pathlib, sys
+                if '-c' in sys.argv:
+                    pathlib.Path(os.environ['CHECKSUM_LOG']).write_bytes(sys.stdin.buffer.read())
+                else:
+                    print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + '  -')
+                """))
+            path.chmod(0o700)
+        env = {**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+               "RUNNER_OS": platform[0], "RUNNER_ARCH": platform[1], "RUNNER_TEMP": str(root),
+               "GITHUB_PATH": str(root / "path"), "GITHUB_ENV": str(root / "env"),
+               "CACHE_RW_MODE": mode,
+               "DOWNLOAD_STATUS": str(download_status), "SERVER_STATUS": str(server_status),
+               "SERVER_LOG": str(root / "server"), "DOWNLOAD_LOG": str(root / "download"),
+               "CHECKSUM_LOG": str(root / "checksum")}
+        env.pop("RUSTC_WRAPPER", None)
+        result = subprocess.run(["bash", "-e", "-c", install], env=env,
+                                capture_output=True, text=True, cwd=root, timeout=10)
+        if archive is not None:
+            assert result.returncode == 0, result.stderr
+            assert f"/v0.18.0/{archive}.tar.gz" in (root / "download").read_text()
+            assert (root / "checksum").read_text() == f"{checksum}  {root}/rust-compile-cache/{archive}.tar.gz\n"
+        def exports():
+            return dict(line.split("=", 1) for line in (root / "env").read_text().splitlines()) \
+                if (root / "env").exists() else {}
+        installed_exports = exports()
+        env.update(installed_exports)
+        for step in action_steps[1:]:
+            if "      run: |\n" not in step:
+                continue
+            if evaluate(field(step, "if"), {"steps.install.outcome":
+                                            "success" if result.returncode == 0 else "failure"}):
+                script = textwrap.dedent(step.split("      run: |\n", 1)[1])
+                subprocess.run(["bash", "-e", "-c", script], env=env, check=True,
+                               capture_output=True, text=True, timeout=10)
+        return result.returncode, installed_exports, exports(), (root / "server").exists()
 
 
 # event, workflow ref, ref type, checkout override, caches, publication
@@ -58,6 +139,7 @@ CASES = [
     ("push", "refs/tags/v0.7.1", "tag", "", False, True),
     ("push", "refs/tags/candidate", "tag", "", False, False),
     ("pull_request", "refs/pull/1/merge", "branch", "", True, False),
+    ("merge_group", "refs/heads/gh-readonly-queue/develop/pr-1", "branch", "", True, False),
     ("workflow_dispatch", "refs/heads/main", "branch", "", True, False),
     ("workflow_dispatch", "refs/tags/v0.7.1", "tag", "", False, False),
     ("workflow_dispatch", "refs/heads/main", "branch", "v0.7.1", False, False),
@@ -127,7 +209,7 @@ class ReleasePolicyTests(unittest.TestCase):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 13)
+        self.assertEqual(len(caches), 15)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -171,19 +253,113 @@ class ReleasePolicyTests(unittest.TestCase):
                     self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
     def test_every_action_is_pinned_to_one_commit_with_its_version(self):
-        uses = re.findall(r"(?m)^\s+(?:- )?uses: (\S+)(.*)$", SOURCE)
-        self.assertTrue(uses)
-        commits = {}
-        for action, comment in uses:
-            with self.subTest(action=action):
-                self.assertRegex(action, r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
-                self.assertRegex(comment, r"^ # \S+$")
-                commits.setdefault((action.split("@")[0], comment), set()).add(action.split("@")[1])
-        # One version comment names one commit, so a pin cannot drift under the same label.
-        self.assertEqual({key: len(value) for key, value in commits.items() if len(value) > 1}, {})
+        validate_action_pins(SOURCE, CACHE_ACTION.read_text())
+
+    def test_action_pins_reject_unknown_local_and_mutable_nested_actions(self):
+        action = CACHE_ACTION.read_text()
+        with self.assertRaisesRegex(AssertionError, "unrecognized local action"):
+            validate_action_pins(SOURCE.replace(LOCAL_CACHE_ACTION, "./.github/actions/unknown"), action)
+        nested = re.sub(r"(uses: actions/github-script)@[0-9a-f]{40}", r"\1@v7", action)
+        with self.assertRaisesRegex(AssertionError, "mutable action"):
+            validate_action_pins(SOURCE, nested)
+
+    def test_source_home_cache_action_and_modes_follow_actual_event_policy(self):
+        action = CACHE_ACTION.read_text()
+        expected_jobs = {"source-home-linux", "source-home-macos"}
+        self.assertEqual({job for job in JOBS if f"uses: {LOCAL_CACHE_ACTION}" in JOBS[job]}, expected_jobs)
+        for job in expected_jobs:
+            setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
+            self.assertLess(JOBS[job].index("uses: dtolnay/rust-toolchain@"), JOBS[job].index(setup))
+            self.assertLess(JOBS[job].index(setup), JOBS[job].index("scripts/setup-source-home.sh"))
+            statistics, = [step for step in steps(job) if step.startswith("name: Rust compile cache statistics\n")]
+            self.assertEqual(field(statistics, "if"), "always() && env.RUSTC_WRAPPER == 'sccache'")
+            self.assertIn("sccache --show-stats", statistics)
+            self.assertIn("sccache --show-stats --stats-format=json", statistics)
+
+        def verify(candidate):
+            expression = field(candidate, "CACHE_RW_MODE")
+            for event, ref, ref_type, override, cached, _ in CASES:
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override}
+                context["env.CI_USE_CACHE"] = str(evaluate(field(SOURCE, "CI_USE_CACHE"), context)).lower()
+                context["env.CI_SAVE_CACHE"] = str(evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)).lower()
+                mode = evaluate(expression, context)
+                expected = "READ_WRITE" if event == "push" and ref in SAVING_REFS else "READ_ONLY"
+                self.assertEqual(mode, expected, f"cache mode on {event} {ref} {override}")
+                for job in expected_jobs:
+                    setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
+                    self.assertEqual(evaluate(field(setup, "if"), context), cached, job)
+                if cached:
+                    _, _, exported, _ = run_compile_cache_fixture(candidate, mode)
+                    self.assertEqual(exported["SCCACHE_GHA_RW_MODE"], expected)
+                    self.assertEqual(exported["RUSTC_WRAPPER"], "sccache")
+                    self.assertEqual(exported["CARGO_INCREMENTAL"], "0")
+        verify(action)
+        forced_write = action.replace(field(action, "CACHE_RW_MODE"), "${{ 'READ_WRITE' }}", 1)
+        forced_write += "\n# " + field(action, "CACHE_RW_MODE") + "\n"
+        with self.assertRaises(AssertionError):
+            verify(forced_write)
+
+    def test_sccache_platform_pins_and_activation_failures(self):
+        action = CACHE_ACTION.read_text()
+        releases = (
+            (("Linux", "X64"), "x86_64-unknown-linux-musl",
+             "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"),
+            (("Linux", "ARM64"), "aarch64-unknown-linux-musl",
+             "2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a"),
+            (("macOS", "ARM64"), "aarch64-apple-darwin",
+             "308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e"),
+        )
+        self.assertEqual(field(action.split("    - name:", 2)[1], "continue-on-error"), "true")
+        for platform, target, checksum in releases:
+            with self.subTest(platform=platform):
+                _, installed, final, started = run_compile_cache_fixture(
+                    action, "READ_ONLY", platform=platform,
+                    archive=f"sccache-v0.18.0-{target}", checksum=checksum)
+                self.assertNotIn("RUSTC_WRAPPER", installed)
+                self.assertTrue(started)
+                self.assertEqual(final["RUSTC_WRAPPER"], "sccache")
+                for download, server in ((22, 0), (0, 1)):
+                    status, _, failed, attempted = run_compile_cache_fixture(
+                        action, "READ_ONLY", download, server, platform=platform)
+                    self.assertEqual(status == 0, download == 0)
+                    self.assertEqual(attempted, download == 0)
+                    self.assertNotIn("RUSTC_WRAPPER", failed)
+        status, _, exported, started = run_compile_cache_fixture(
+            action, "READ_ONLY", platform=("Windows", "X64"))
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("RUSTC_WRAPPER", exported)
+        self.assertFalse(started)
+
+    def test_sccache_corrupt_archive_refuses_extraction_and_activation(self):
+        source = CACHE_ACTION.read_text()
+        script = textwrap.dedent(source.split("      run: |\n", 1)[1].split("    - name:", 1)[0])
+        for platform in (("Linux", "X64"), ("Linux", "ARM64"), ("macOS", "ARM64")):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shims = root / "shims"
+                shims.mkdir()
+                for name, body in {
+                    "curl": '#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\nprintf corrupt > "$2"\n',
+                    "tar": '#!/bin/bash\ntouch "$RUNNER_TEMP/extracted"\n',
+                }.items():
+                    path = shims / name
+                    path.write_text(body)
+                    path.chmod(0o700)
+                result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                                        timeout=10, env={**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+                                                        "RUNNER_OS": platform[0], "RUNNER_ARCH": platform[1], "RUNNER_TEMP": str(root),
+                                                        "GITHUB_PATH": str(root / "path"), "GITHUB_ENV": str(root / "env"),
+                                                        "CACHE_RW_MODE": "READ_ONLY"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAILED", result.stdout)
+                self.assertFalse((root / "extracted").exists())
+                self.assertFalse((root / "path").exists())
+                self.assertFalse((root / "env").exists())
 
     def test_unguarded_cache_paths_are_rejected(self):
         additions = [
+            "      - uses: ./.github/actions/rust-compile-cache\n",
             "      - uses: actions/cache/restore@v4\n",
             "      - uses: actions/cache/save@v4\n",
             "      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n",
