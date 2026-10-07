@@ -1,60 +1,10 @@
 # Changelog
 
-All notable changes to the public ElastOS Runtime repository.
+All notable changes to the public ElastOS Runtime repository. System shows a
+release's Added, Changed, Fixed, Removed and Security bullets before you update;
+"Developer detail" is for developers and is not shown.
 
 ## [Unreleased]
-
-### Removed
-
-- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
-  published models. Removed the model CAR retention and import path from release
-  preparation, signing and publication, `model-package-handoff.py`,
-  `fetch-model.sh` and their tests. Models return later as a separate signed
-  publication.
-
-- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
-  report their own crate version in startup logs and status, so a new release
-  version is no longer a reason for provider bytes and checksums to change;
-  dependencies and the toolchain still can change them (#194).
-- This release publishes `crosvm` and the guest kernel for no platform, so
-  microVM capsules are not available in it; setup skips them and the supervisor
-  says so. Their pinned bytes were unavailable and could not be signed. Release
-  preparation now refuses a checksummed component CID without a release file,
-  before signing.
-
-### Fixed
-
-- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
-  refuses a larger declared size before reading the body.
-
-- Setup accepts passive content capsules from signed releases and checks provider
-  roles and icons. It refuses URL-only downloads and blank release paths, including
-  entries with a CID. Explicit CID-only operator gateways verify checksums before
-  replacing installed bytes.
-
-- Fresh setup admits the private signed release pair and binary under the
-  installation writer. It then fetches components and the model catalogue over
-  Carrier and verifies both before writing metadata or components. Signed manifest
-  bytes stay unchanged.
-
-- CLI updates check the candidate executable before installation with a bounded
-  version probe. Failed launches, timeouts, excess output, and unexpected version
-  output preserve the previous installation.
-
-- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
-  Each step now requires that its own bytes fit in the free space. Update
-  staging, the installer, model and content downloads and Browser image
-  preparation also keep one shared 2 GiB reserve, so a disk is never filled to
-  zero, and refuse with "not enough free space: this needs N GB plus 2 GB kept
-  free". An update that does not fit keeps the previous release. Source-home
-  setup keeps its 16 GiB minimum and the media tools build its 4 GiB minimum.
-
-### Added
-
-- An internal offline update foundation stages and verifies release files with
-  unchanged support assets, an installation lock and journal, and restoration
-  after failed or interrupted activation. The default CLI update flow is preserved.
-  Home restart ownership and integration remain a follow-up.
 
 ## [0.8.0-alpha.8]
 
@@ -89,6 +39,24 @@ Test-channel release. Signed releases show these notes in System before you upda
 - If an install into another folder is refused, nothing is left behind in that
   folder.
 
+### Developer detail
+
+- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
+- `crosvm` and the guest kernel are published for no platform, so microVM
+  capsules are not available; setup skips them and the supervisor says so. Their
+  pinned bytes were unavailable and could not be signed. Release preparation now
+  refuses a checksummed component CID without a release file, before signing.
+- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
+  Each step requires that its own bytes fit in the free space. Update staging,
+  the installer, model and content downloads and Browser image preparation also
+  keep one shared 2 GiB reserve and refuse with "not enough free space: this
+  needs N GB plus 2 GB kept free". An update that does not fit keeps the previous
+  release. Source-home setup keeps its 16 GiB minimum and the media tools build
+  its 4 GiB minimum.
+
 ## [0.8.0-alpha.7]
 
 Test-channel release. Signed releases show these notes in System before you update.
@@ -112,6 +80,29 @@ in Terminal once. Later updates work from System again.
 
 - Local AI models are no longer part of the release, so Home shows no models for
   now. They will return as a separate signed download.
+
+### Developer detail
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. The model CAR retention and import path,
+  `model-package-handoff.py`, `fetch-model.sh` and their tests are removed from
+  release preparation, signing and publication.
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths,
+  including entries with a CID. Explicit CID-only operator gateways verify
+  checksums before replacing installed bytes.
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer, then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed
+  manifest bytes stay unchanged.
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output and unexpected version
+  output preserve the previous installation.
+- An offline update foundation stages and verifies release files with unchanged
+  support assets, an installation lock and journal, and restoration after failed
+  or interrupted activation.
 
 ## [0.7.1] - 2026-09-30
 
