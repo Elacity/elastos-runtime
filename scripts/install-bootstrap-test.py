@@ -964,20 +964,34 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual((sandbox.home / name).stat().st_mode & 0o777, 0o755, name)
             self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
 
-    def test_existing_group_writable_install_dir_is_refused_with_fix_unchanged(self):
+    def test_existing_group_writable_install_dir_is_refused_before_download_with_working_fix(self):
         did, head, release = installable_fixture()
-        with InstallerSandbox(head, release, did) as sandbox:
-            bin_dir = sandbox.home / ".local/bin"
-            bin_dir.mkdir(parents=True)
-            bin_dir.chmod(0o775)
-            before = sandbox.home_state()
-            sandbox.respond("binary", RUNTIME_STUB)
-            result, _ = sandbox.run("--install-only")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"chmod go-w '{bin_dir}'", result.stderr)
-            self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
-            self.assertEqual(sandbox.home_state(), before)
-            self.assertEqual(sandbox.runtime_calls(), [])
+        for case in ("default", "alias", "alias/"):
+            with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
+                if case == "default":
+                    bin_dir, options = sandbox.home / ".local/bin", []
+                    bin_dir.mkdir(parents=True)
+                else:
+                    bin_dir = sandbox.home / "it's a \"bin\" $dir"
+                    bin_dir.mkdir()
+                    (sandbox.home / "alias").symlink_to(bin_dir)
+                    options = ["--install-dir", str(sandbox.home / case)]
+                bin_dir.chmod(0o775)
+                before = sandbox.home_state()
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only", *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.home_state(), before)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
+                self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+                command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+                self.assertTrue(command.startswith("chmod go-w "), command)
+                fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                       capture_output=True, text=True)
+                self.assertEqual(fixed.returncode, 0, fixed.stderr)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o755)
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()

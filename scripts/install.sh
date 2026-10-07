@@ -1026,6 +1026,26 @@ if [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
     fi
 fi
 
+# ── Admit the installation directories before any download or write ──
+
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
+
+# The installation writer refuses directories others can write. Check the real
+# directory, as the writer does after resolving symlinks; say how to fix it and
+# leave it unchanged.
+require_safe_existing_dir() {
+    local dir="$1" real
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" ]] || die "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    real="$(cd -P -- "$dir" && pwd -P)" || die "Cannot resolve installation directory: $(printf '%q' "$dir")"
+    [[ -O "$real" ]] || die "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+    if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
+        die "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+    fi
+}
+require_safe_existing_dir "$INSTALL_DIR"
+require_safe_existing_dir "$DATA_DIR"
+
 # ── Fetch + verify release head ──────────────────────────────────────
 
 step 2 "Verify the release"
@@ -1135,22 +1155,6 @@ info "Verifying binary SHA-256..."
 sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
 # ── Admit the verified release with the shared installation writer ──
-
-[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
-
-# The installation writer refuses directories others can write; say how to fix
-# an existing one before anything is staged, and leave it unchanged.
-require_safe_existing_dir() {
-    local dir="$1"
-    [[ -e "$dir" || -L "$dir" ]] || return 0
-    [[ -d "$dir" && ! -L "$dir" ]] || die "Unsafe installation directory: ${dir} is not a directory"
-    [[ -O "$dir" ]] || die "Unsafe installation directory: ${dir} is not owned by you; fix with: sudo chown \"\$(id -u)\" '${dir}'"
-    if [[ -n "$(find "$dir" -maxdepth 0 -perm -g+w -o -maxdepth 0 -perm -o+w)" ]]; then
-        die "Unsafe installation directory: ${dir} is group- or world-writable; fix with: chmod go-w '${dir}'"
-    fi
-}
-require_safe_existing_dir "$INSTALL_DIR"
-require_safe_existing_dir "$DATA_DIR"
 
 # Directories created here are 0755 whatever the caller's umask.
 (umask 022; mkdir -p "$INSTALL_DIR")
