@@ -2394,7 +2394,7 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     }
 
     let launch_rootfs = paths.session_dir.join("rootfs.ext4");
-    clone_or_copy_file(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
+    clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
         format!(
             "failed to prepare per-launch Browser VM rootfs {} from {}: {}",
             launch_rootfs.display(),
@@ -2640,7 +2640,7 @@ fn overlay_guest_webrtc_send_diagnostic(rootfs: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn clone_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2651,20 +2651,30 @@ fn clone_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> 
     }
 
     #[cfg(target_os = "macos")]
-    {
-        let clone_status = std::process::Command::new("/bin/cp")
+    let cloned = matches!(
+        std::process::Command::new("/bin/cp")
             .arg("-c")
             .arg(source)
             .arg(destination)
-            .status();
-        if matches!(clone_status, Ok(status) if status.success()) {
-            return Ok(());
-        }
-    }
+            .status(),
+        Ok(status) if status.success()
+    );
+    #[cfg(not(target_os = "macos"))]
+    let cloned = false;
 
-    fs::copy(source, destination)?;
-    let permissions = fs::metadata(source)?.permissions();
-    fs::set_permissions(destination, permissions)?;
+    if !cloned {
+        // A failed clone can leave a partial copy with the immutable seed mode.
+        // Recreate the owned destination before the fallback opens it for writes.
+        match fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::copy(source, destination)?;
+    }
+    // The seed can be immutable. Guest overlays and the writable VZ attachment
+    // own only this launch's copy, including when cp preserves the seed mode.
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -5671,6 +5681,32 @@ mod tests {
             error.contains("Browser VM control HTTP response timed out"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn per_launch_rootfs_from_read_only_seed_is_private_and_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = tmp.path().join("seed.ext4");
+        let launch = tmp.path().join("session/rootfs.ext4");
+        fs::write(&seed, b"immutable guest image").unwrap();
+        fs::set_permissions(&seed, fs::Permissions::from_mode(0o444)).unwrap();
+
+        clone_or_copy_writable_rootfs(&seed, &launch).unwrap();
+
+        assert_eq!(fs::metadata(&seed).unwrap().mode() & 0o777, 0o444);
+        assert_eq!(fs::metadata(&launch).unwrap().mode() & 0o777, 0o600);
+        assert_ne!(
+            fs::metadata(&seed).unwrap().ino(),
+            fs::metadata(&launch).unwrap().ino()
+        );
+        assert_eq!(fs::read(&launch).unwrap(), b"immutable guest image");
+        let mut disk = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&launch)
+            .unwrap();
+        disk.write_all(b"owned guest writes").unwrap();
+        assert_eq!(fs::read(&seed).unwrap(), b"immutable guest image");
     }
 
     #[test]
