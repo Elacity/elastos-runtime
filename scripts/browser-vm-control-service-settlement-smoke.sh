@@ -92,7 +92,7 @@ const typedFailure = process.env.TYPED_TRANSPORT_FAILURE;
 if (typedFailure && launch.transport_authority) {
   const acted = typedFailure !== "did_not_act";
   const terminal = typedFailure !== "cleanup_pending";
-  process.stderr.write(`${JSON.stringify({
+  const settlement = {
     schema: "elastos.browser.vz-launch-settlement/v1",
     state: typedFailure,
     message: `injected ${typedFailure}`,
@@ -125,7 +125,34 @@ if (typedFailure && launch.transport_authority) {
       session_directory_absent: true,
       vm_absent: terminal && process.env.TYPED_TRANSPORT_PARTIAL !== "1",
     },
-  })}\n`);
+  };
+  const errorForm = process.env.TYPED_TRANSPORT_ERROR_FORM;
+  const typedError = {
+    schema: "elastos.browser.engine.launch-error/v1",
+    code: "profile_recovery_required",
+    message: "Browser profile requires recovery before another session can start.",
+  };
+  let failure = settlement;
+  if (errorForm?.startsWith("nested")) {
+    settlement.message = JSON.stringify({
+      ...typedError,
+      ...(errorForm === "nested-extra" ? { unexpected: true } : {}),
+    });
+  } else if (errorForm?.startsWith("envelope")) {
+    failure = { ...typedError };
+    if (errorForm !== "envelope-missing") {
+      failure.launch_settlement_result = structuredClone(settlement);
+    }
+    if (errorForm === "envelope-extra") failure.unexpected = true;
+    if (errorForm === "envelope-invalid") {
+      failure.launch_settlement_result.absence.vm_absent = false;
+    }
+    if (["envelope-invalid", "envelope-missing"].includes(errorForm)) {
+      // A later incomplete envelope must not borrow this older valid proof.
+      process.stderr.write(`${JSON.stringify(settlement)}\n`);
+    }
+  }
+  process.stderr.write(`${JSON.stringify(failure)}\n`);
   process.exit(24);
 }
 if (process.env.LAUNCH_MARKER_PATH) {
@@ -392,6 +419,7 @@ start_service() {
   LAUNCH_MARKER_PATH="$launch_marker" \
   FAIL_TRANSPORT_LAUNCH="${FAIL_TRANSPORT_LAUNCH:-}" \
   TYPED_TRANSPORT_FAILURE="${TYPED_TRANSPORT_FAILURE:-}" \
+  TYPED_TRANSPORT_ERROR_FORM="${TYPED_TRANSPORT_ERROR_FORM:-}" \
   TYPED_TRANSPORT_AFTER_READY="${TYPED_TRANSPORT_AFTER_READY:-}" \
   TYPED_TRANSPORT_CHILD_ABSENT="${TYPED_TRANSPORT_CHILD_ABSENT:-}" \
   TYPED_TRANSPORT_DELAYED_PORTS="${TYPED_TRANSPORT_DELAYED_PORTS:-}" \
@@ -1438,8 +1466,26 @@ if (process.env.PHASE === "binding-equality") {
   }
 } else if (process.env.PHASE === "typed-transport-failure") {
   const expected = process.env.EXPECTED_SETTLEMENT;
+  const errorForm = process.env.EXPECTED_ERROR_FORM;
   const failed = await requestRaw("POST", "/pages", openBody(streamId));
   const settlement = failed.body.launch_settlement_result;
+  if (["nested", "envelope"].includes(errorForm)) {
+    if (
+      failed.body.code !== "profile_recovery_required" ||
+      failed.body.message !== "Browser profile requires recovery before another session can start."
+    ) throw new Error("validated profile failure lost its typed recovery message");
+  } else if (failed.body.code !== undefined) {
+    throw new Error("untyped native settlement acquired a typed recovery code");
+  }
+  if (errorForm?.startsWith("nested")) {
+    const message = JSON.parse(settlement?.message);
+    if (
+      message.code !== "profile_recovery_required" ||
+      (message.unexpected === true) !== (errorForm === "nested-extra")
+    ) throw new Error("native settlement message changed during typed projection");
+  } else if (settlement?.message !== `injected ${expected}`) {
+    throw new Error("untyped native settlement message changed");
+  }
   if (
     failed.status !== 400 ||
     settlement?.schema !==
@@ -1467,7 +1513,8 @@ if (process.env.PHASE === "binding-equality") {
     durable.launch_settlement_result?.effects?.vm !==
       (expected !== "did_not_act") ||
     durable.launch_settlement_result?.binding_hash !==
-      issuedTransportAuthority.binding_hash
+      issuedTransportAuthority.binding_hash ||
+    !isDeepStrictEqual(durable.launch_settlement_result, settlement)
   ) {
     throw new Error(
       `typed transport settlement was not durable: ${JSON.stringify(durable)}`,
@@ -1488,6 +1535,14 @@ if (process.env.PHASE === "binding-equality") {
     journal.includes(issuedTransportSecret.auth_secret)
   ) {
     throw new Error("typed transport settlement persisted a private secret");
+  }
+  if (expected === "terminal_post_effect_cleanup") {
+    const status = await request("GET", "/status");
+    if (
+      Object.values(settlement.absence).some(value => value !== true) ||
+      status.active_pages !== 0 || status.active_vms !== 0 ||
+      status.pending_launches !== 0 || status.pending_cleanup_pages !== 0
+    ) throw new Error("typed profile failure changed exact terminal cleanup");
   }
 } else if (process.env.PHASE === "verify-typed-restart") {
   const expected = process.env.EXPECTED_SETTLEMENT;
@@ -1537,7 +1592,8 @@ if (process.env.PHASE === "binding-equality") {
   }
 } else if (
   process.env.PHASE === "substituted-transport-failure" ||
-  process.env.PHASE === "partial-transport-failure"
+  process.env.PHASE === "partial-transport-failure" ||
+  process.env.PHASE === "typed-error-without-proof"
 ) {
   const failed = await requestRaw("POST", "/pages", openBody(streamId));
   if (
@@ -1556,6 +1612,13 @@ if (process.env.PHASE === "binding-equality") {
     throw new Error(
       `invalid transport settlement escaped cleanup ownership: ${JSON.stringify(durable)}`,
     );
+  }
+  if (process.env.PHASE === "typed-error-without-proof") {
+    const expectedCode = process.env.EXPECTED_ERROR_FORM === "envelope-missing"
+      ? "profile_recovery_required" : undefined;
+    if (failed.body.code !== expectedCode) {
+      throw new Error("invalid typed envelope was projected as a recovery error");
+    }
   }
 } else if (process.env.PHASE === "polluted-stdout-ready") {
   const page = await request("POST", "/pages", openBody(streamId));
@@ -2142,6 +2205,27 @@ NODE
   fi
 done
 unset TYPED_TRANSPORT_FAILURE
+
+for error_form in nested nested-extra envelope envelope-extra envelope-invalid envelope-missing; do
+  error_socket="$tmp_dir/error-${error_form}-control.sock"
+  error_journal="${error_socket}.launch-reconciliations.json"
+  TYPED_TRANSPORT_FAILURE="terminal_post_effect_cleanup" \
+  TYPED_TRANSPORT_ERROR_FORM="$error_form" \
+    start_service "$error_socket" "" "error-${error_form}-service"
+  error_phase="typed-transport-failure"
+  if [[ "$error_form" == envelope-* ]]; then error_phase="typed-error-without-proof"; fi
+  CONTROL_SOCKET="$error_socket" \
+  STREAM_ID="stream:error-${error_form}" \
+  JOURNAL_PATH="$error_journal" \
+  PHASE="$error_phase" \
+  EXPECTED_SETTLEMENT="terminal_post_effect_cleanup" \
+  EXPECTED_ERROR_FORM="$error_form" \
+  TRANSPORT=1 \
+    "$node_bin" "$client"
+  stop_service
+done
+unset TYPED_TRANSPORT_FAILURE
+unset TYPED_TRANSPORT_ERROR_FORM
 
 substituted_socket="$tmp_dir/substituted-transport-control.sock"
 substituted_journal="${substituted_socket}.launch-reconciliations.json"

@@ -993,7 +993,10 @@ async fn execute_browser_open(
             )
             .with_outcome(outcome));
         }
-        if matches!(code, "browser_capacity_unavailable" | "resources_in_use") {
+        if matches!(
+            code,
+            "browser_capacity_unavailable" | "resources_in_use" | "profile_recovery_required"
+        ) {
             let outcome = match exact_did_not_act {
                 Some(outcome) => outcome,
                 None => {

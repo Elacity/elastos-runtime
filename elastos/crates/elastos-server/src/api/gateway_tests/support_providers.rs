@@ -3941,6 +3941,20 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "launch_settlement_result": settlement,
                     }));
                 }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                ) && request["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("profile-recovery.invalid"))
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "profile_recovery_required",
+                        "message": "Browser profile setup was interrupted. Reset this profile to start again.",
+                    }));
+                }
                 if (matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::PendingThenTerminal

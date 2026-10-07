@@ -94,6 +94,14 @@ export function friendlyOpenError(error) {
         return "Browser Engine is unavailable. Choose an available approved Engine.";
     }
   }
+  if (
+    error?.payload?.code === "profile_recovery_required" &&
+    ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"].includes(outcome?.state) &&
+    outcome.effects.page_acquired === false &&
+    outcome.effects.vm_acquired === false
+  ) {
+    return "Browser profile setup was interrupted. In Settings, select Reset profile to start again. Reset clears this account's Browser data.";
+  }
   if (outcome?.state === "terminal_pre_effect_failure") {
     if (error.status === 403) {
       return "This page was blocked by your Exit Node settings.";

@@ -2809,10 +2809,42 @@ fn validate_profile_disk_path(path: &Path) -> Result<(), String> {
 }
 
 fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, String> {
+    let marker = format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{profile_key}");
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.nlink() != 1 {
                 return Err("Browser profile disk must be a regular file with one link".to_string());
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|error| format!("inspect Browser profile disk intent failed: {error}"))?;
+            let opened = file.metadata().map_err(|error| {
+                format!("inspect Browser profile disk metadata failed: {error}")
+            })?;
+            if !opened.is_file()
+                || opened.nlink() != 1
+                || opened.dev() != metadata.dev()
+                || opened.ino() != metadata.ino()
+            {
+                return Err("Browser profile disk identity changed during inspection".to_string());
+            }
+            let mut header = vec![0; marker.len()];
+            match file.read_exact(&mut header) {
+                Ok(()) if header == marker.as_bytes() => {
+                    return Err(json!({
+                        "schema": "elastos.browser.engine.launch-error/v1",
+                        "code": "profile_recovery_required",
+                        "message": "Browser profile initialization did not finish. Existing profile state is preserved. Reset profile requires explicit confirmation to clear its saved data.",
+                    })
+                    .to_string());
+                }
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
+                Err(error) => {
+                    return Err(format!("read Browser profile disk intent failed: {error}"));
+                }
             }
             // Existing bytes, including incomplete creation, never renew intent.
             return Ok(false);
@@ -2845,7 +2877,7 @@ fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, St
         )
     })?;
     // The guest consumes this marker before its sole authorized format attempt.
-    file.write_all(format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{profile_key}").as_bytes())
+    file.write_all(marker.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|err| format!("initialize Browser profile disk intent failed: {err}"))?;
     Ok(true)
@@ -5210,17 +5242,26 @@ mod tests {
         assert_eq!(header.as_slice(), marker);
         assert_eq!(fs::metadata(&disk_path).unwrap().mode() & 0o777, 0o600);
 
-        // Reattaching even a marked, unformatted disk never renews creation
-        // intent; stale boot arguments from the first attachment are removed.
-        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
-        assert!(!vm_config
-            .boot_args
-            .contains("elastos.browser_profile_initialize="));
+        // A retained, unformatted disk requires explicit recovery instead of
+        // another boot or renewed initialization authority.
+        let error = attach_browser_profile_disk(&mut vm_config, &request).unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["code"], "profile_recovery_required");
         File::open(&disk_path)
             .unwrap()
             .read_exact(&mut header)
             .unwrap();
         assert_eq!(header.as_slice(), marker);
+
+        // Simulate the guest's consumed marker and initialized ext4 header.
+        let mut initialized = vec![0; 2048];
+        initialized[1080..1082].copy_from_slice(&[0x53, 0xef]);
+        fs::write(&disk_path, &initialized).unwrap();
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert_eq!(fs::read(&disk_path).unwrap(), initialized);
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
 
         // A corrupt or signature-free existing profile must remain byte exact.
         fs::write(&disk_path, b"existing profile with unreadable filesystem").unwrap();
@@ -5279,7 +5320,54 @@ mod tests {
         assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
 
         drop(owner);
+        let error = prepare_browser_profile_disk(&request).unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["code"], "profile_recovery_required");
+        fs::write(&disk_path, b"initialized profile bytes").unwrap();
         assert!(!prepare_browser_profile_disk(&request).unwrap().initialize);
+    }
+
+    #[test]
+    fn retained_profile_initialization_marker_requires_recovery_and_preserves_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = tmp.path().join("profile.ext4");
+        let key = format!("profile-{}", "a".repeat(64));
+        let marker = format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{key}");
+        let mut bytes = vec![0; 8192];
+        bytes[..marker.len()].copy_from_slice(marker.as_bytes());
+        fs::write(&disk, &bytes).unwrap();
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(&disk).unwrap();
+
+        for _ in 0..2 {
+            let error = ensure_sparse_profile_disk(&disk, &key).unwrap_err();
+            let typed: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(typed["schema"], "elastos.browser.engine.launch-error/v1");
+            assert_eq!(typed["code"], "profile_recovery_required");
+            assert!(!error.contains(&key));
+            assert!(!error.contains(disk.to_string_lossy().as_ref()));
+            assert_eq!(fs::read(&disk).unwrap(), bytes);
+            let after = fs::metadata(&disk).unwrap();
+            assert_eq!(after.ino(), before.ino());
+            assert_eq!(after.len(), before.len());
+            assert_eq!(after.mode(), before.mode());
+        }
+
+        // Another profile's marker cannot renew this profile's creation intent.
+        assert!(!ensure_sparse_profile_disk(&disk, "profile-other").unwrap());
+        assert_eq!(fs::read(&disk).unwrap(), bytes);
+    }
+
+    #[test]
+    fn profile_initialization_rejects_hard_links_and_preserves_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing");
+        let disk = tmp.path().join("profile.ext4");
+        fs::write(&target, b"existing profile bytes").unwrap();
+        fs::hard_link(&target, &disk).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing profile bytes");
+        assert_eq!(fs::metadata(&disk).unwrap().nlink(), 2);
     }
 
     #[test]

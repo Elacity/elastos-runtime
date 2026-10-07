@@ -3154,6 +3154,71 @@ async fn test_exact_terminal_vz_settlement_releases_restart_reconciliation_oblig
 }
 
 #[tokio::test]
+async fn test_browser_profile_recovery_requires_exact_terminal_settlement() {
+    for (failure, terminal) in [
+        (
+            MockDispatchedBrowserLaunchFailure::TerminalVzSettlement,
+            true,
+        ),
+        (
+            MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_browser_vz_transport_test_config(dir.path());
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let (state, close_calls, reconciliation_calls) =
+            browser_engine_reconciliation_test_state(dir.path(), failure).await;
+        let app = gateway_router(state);
+
+        let response = app
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://profile-recovery.invalid/","reason":"profile recovery keeps exact cleanup authority","display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["schema"], "elastos.browser.open-error/v1");
+        assert_eq!(payload["code"], "profile_recovery_required");
+        assert_eq!(reconciliation_calls.count(), 1);
+        assert!(close_calls.snapshot().await.is_empty());
+        assert_eq!(browser_page_session_count(dir.path()).await, 0);
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(dir.path()).await,
+            usize::from(!terminal)
+        );
+        if terminal {
+            assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
+            assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
+            assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+            assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+            assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+        } else {
+            assert_eq!(payload["outcome"]["state"], "cleanup_pending");
+            assert_eq!(
+                payload["outcome"]["ownership"],
+                "launch_reconciliation_pending"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_mismatched_terminal_vz_settlement_retains_restart_reconciliation_ownership() {
     let dir = tempfile::tempdir().unwrap();
     write_browser_vz_transport_test_config(dir.path());

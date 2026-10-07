@@ -2610,28 +2610,57 @@ function runProgram(program, args, env, stdin, timeoutMs, signal) {
   });
 }
 
+function typedLauncherError(parsed) {
+  const hasSettlement = Object.hasOwn(parsed, "launch_settlement_result");
+  if (
+    !exactObjectKeys(parsed, [
+      "schema", "code", "message",
+      ...(hasSettlement ? ["launch_settlement_result"] : []),
+    ]) ||
+    parsed.schema !== "elastos.browser.engine.launch-error/v1" ||
+    typeof parsed.code !== "string" ||
+    typeof parsed.message !== "string"
+  ) {
+    throw new Error("Browser launcher returned an invalid typed launch error");
+  }
+  const error = codedError(parsed.code, parsed.message);
+  if (hasSettlement) {
+    error.vz_launch_settlement = validateVzLaunchSettlement(
+      parsed.launch_settlement_result,
+    );
+    error.launch_settlement = error.vz_launch_settlement.state;
+  }
+  return error;
+}
+
 function launcherError(message, stderr) {
   const detail = String(stderr || "").trim();
   if (!detail) return new Error(message);
   const bounded = detail.length > 8192 ? detail.slice(-8192) : detail;
   for (const line of bounded.split(/\r?\n/).reverse()) {
+    let parsed;
+    try { parsed = JSON.parse(line); } catch { continue; }
     try {
-      const parsed = JSON.parse(line);
-      if (
-        parsed?.schema === "elastos.browser.engine.launch-error/v1" &&
-        typeof parsed.code === "string" &&
-        typeof parsed.message === "string"
-      ) {
-        return codedError(parsed.code, parsed.message);
+      if (parsed?.schema === "elastos.browser.engine.launch-error/v1") {
+        return typedLauncherError(parsed);
       }
       if (parsed?.schema === VZ_LAUNCH_SETTLEMENT_SCHEMA) {
         const settlement = validateVzLaunchSettlement(parsed);
-        const error = new Error(settlement.message || message);
+        let error = new Error(settlement.message || message);
+        try {
+          const typed = JSON.parse(settlement.message);
+          if (exactObjectKeys(typed, ["schema", "code", "message"])) {
+            error = typedLauncherError(typed);
+          }
+        } catch {}
         error.vz_launch_settlement = settlement;
         error.launch_settlement = settlement.state;
         return error;
       }
-    } catch {}
+    } catch (error) {
+      // A rejected envelope cannot borrow proof from an older stderr line.
+      return error;
+    }
   }
   return new Error(`${message}: ${bounded}`);
 }
