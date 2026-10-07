@@ -318,6 +318,20 @@ pub(super) async fn browser_app_profile_reset(
     ) {
         return (StatusCode::CONFLICT, error.to_string()).into_response();
     }
+    let (disk_path, _) =
+        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
+            Ok(profile) => profile,
+            Err(err) => return gateway_provider_error_response("browser", err),
+        };
+    let reset_guard = match crate::api::browser_profile_reset::acquire_profile_reset(
+        state.data_dir.clone(),
+        disk_path,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(err) => return browser_profile_reset_error_response(err),
+    };
     if browser_principal_has_live_sessions(&state.data_dir, &context.principal_id).await {
         return (
             StatusCode::CONFLICT,
@@ -325,20 +339,9 @@ pub(super) async fn browser_app_profile_reset(
         )
             .into_response();
     }
-    let (disk_path, _) =
-        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
-            Ok(profile) => profile,
-            Err(err) => return gateway_provider_error_response("browser", err),
-        };
-    let removed = match tokio::fs::remove_file(&disk_path).await {
-        Ok(()) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => {
-            return gateway_provider_error_response(
-                "browser",
-                anyhow::anyhow!("Browser profile reset failed: {}", err),
-            )
-        }
+    let removed = match reset_guard.remove().await {
+        Ok(removed) => removed,
+        Err(err) => return browser_profile_reset_error_response(err),
     };
     Json(serde_json::json!({
         "schema": "elastos.browser.profile-reset/v1",
@@ -358,6 +361,20 @@ pub(super) async fn browser_app_profile_reset(
         "removed_profile_disk": removed,
     }))
     .into_response()
+}
+
+fn browser_profile_reset_error_response(
+    error: crate::api::browser_profile_reset::ProfileResetError,
+) -> Response {
+    use crate::api::browser_profile_reset::ProfileResetError;
+    match error {
+        ProfileResetError::Busy
+        | ProfileResetError::Unsafe(_)
+        | ProfileResetError::UnsupportedHost => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        error => gateway_provider_error_response("browser", anyhow::anyhow!(error)),
+    }
 }
 
 fn browser_profile_launch_descriptor(

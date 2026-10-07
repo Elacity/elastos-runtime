@@ -8,6 +8,7 @@
 pub mod auth_gateway;
 pub mod browser_capsules;
 pub mod browser_engine_protocol;
+mod browser_profile_reset;
 pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 // Runtime startup composition; this is not a capsule operation or HTTP route.
