@@ -288,10 +288,7 @@ impl TunnelProvider {
             return Ok(found);
         }
 
-        Err(
-            "cloudflared not found. Run: elastos setup --with cloudflared"
-                .to_string(),
-        )
+        Err("cloudflared not found. Run: elastos setup --with cloudflared".to_string())
     }
 }
 
