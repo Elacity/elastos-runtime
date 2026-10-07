@@ -145,7 +145,7 @@ pub(crate) struct RestartRecord {
 /// Writers resolve the parent once and use the same path for their destinations.
 /// The lock path stays in place after the guard releases the flock and closes its file.
 pub(crate) struct InstallationGuard {
-    _lock: File,
+    _lock: crate::host_lock::FileLock,
     binary_parent: PathBuf,
 }
 
@@ -165,16 +165,8 @@ impl InstallationGuard {
             .open(&lock_path)
             .context("open installation lock")?;
         check_file(&lock, &lock_path, true)?;
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&lock),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("another writer owns the installation lock");
-        }
+        let lock = crate::host_lock::FileLock::try_exclusive(lock)
+            .context("another writer owns the installation lock")?;
         Ok(Self {
             _lock: lock,
             binary_parent: binary_parent.to_path_buf(),
@@ -197,14 +189,6 @@ impl InstallationGuard {
             bail!("installed release writer lock identity changed");
         }
         Ok(())
-    }
-}
-
-impl Drop for InstallationGuard {
-    fn drop(&mut self) {
-        // A forked command can retain this description until its CLOEXEC fd closes.
-        // The guard's scope owns the lock, so release it before closing our fd.
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._lock), libc::LOCK_UN) };
     }
 }
 

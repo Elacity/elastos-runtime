@@ -68,8 +68,8 @@ impl Owner {
         Ok(())
     }
 
-    pub(crate) fn lock(&self) -> anyhow::Result<std::fs::File> {
-        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    pub(crate) fn lock(&self) -> anyhow::Result<crate::host_lock::FileLock> {
+        use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -77,15 +77,10 @@ impl Owner {
             .truncate(false)
             .mode(0o600)
             .open(self.data_dir.join("gateway-runtime-ownership.lock"))?;
-        anyhow::ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "lock gateway runtime ownership: {}",
-            std::io::Error::last_os_error()
-        );
-        Ok(file)
+        crate::host_lock::FileLock::exclusive(file).context("lock gateway runtime ownership")
     }
 
-    pub(crate) fn lock_start(&self) -> anyhow::Result<std::fs::File> {
+    pub(crate) fn lock_start(&self) -> anyhow::Result<crate::host_lock::FileLock> {
         let lock = self.lock()?;
         anyhow::ensure!(self.active(), "gateway owner stopped during runtime start");
         Ok(lock)
@@ -621,6 +616,22 @@ mod tests {
         )
         .unwrap();
         assert!(Owner::read_for_generation(temp.path(), owner.pid, "gateway-fixture").is_err());
+    }
+
+    #[test]
+    fn ended_ownership_lock_is_free_while_a_command_spawned_under_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (_published, owner) = fixture_owner(temp.path(), "gateway-fixture");
+        let lock = owner.lock().unwrap();
+        let path = temp.path().join("gateway-runtime-ownership.lock");
+        let _command = SpawnedWhileOpen::new(&path);
+        drop(lock);
+        assert!(
+            lock_is_free(&path),
+            "runtime starts must not wait for a command spawned under the last owner lock"
+        );
     }
 
     #[test]

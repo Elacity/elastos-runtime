@@ -1,23 +1,57 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
 use serde::{Deserialize, Serialize};
 
+/// An exclusive flock held for this guard's scope.
 #[derive(Debug)]
-pub struct HostProcessGuard {
-    _file: fs::File,
+pub struct FileLock(fs::File);
+
+impl FileLock {
+    /// Waits until this open file holds the exclusive lock.
+    pub(crate) fn exclusive(file: fs::File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    /// Takes the exclusive lock now or fails with `WouldBlock`.
+    pub(crate) fn try_exclusive(file: fs::File) -> std::io::Result<Self> {
+        Self::exclusive_within(file, Duration::ZERO)
+    }
+
+    /// Retries a busy lock until `wait` passes, then fails with `WouldBlock`.
+    pub(crate) fn exclusive_within(file: fs::File, wait: Duration) -> std::io::Result<Self> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 }
 
-impl Drop for HostProcessGuard {
+impl std::ops::Deref for FileLock {
+    type Target = fs::File;
+
+    fn deref(&self) -> &fs::File {
+        &self.0
+    }
+}
+
+impl Drop for FileLock {
     fn drop(&mut self) {
         // A command spawned meanwhile by another thread can retain this
         // description until its CLOEXEC fd closes at exec. The guard's scope
         // owns the lock, so release it before closing our fd.
-        let _ = unlock_flock(&self._file);
+        let _ = self.0.unlock();
     }
 }
 
@@ -41,7 +75,7 @@ pub fn acquire_host_process_lock(
     data_dir: &Path,
     role: &str,
     addr: &str,
-) -> anyhow::Result<HostProcessGuard> {
+) -> anyhow::Result<FileLock> {
     if !matches!(role, "update" | "update-recovery") {
         authorize_host_process_start(data_dir)?;
     }
@@ -51,7 +85,7 @@ pub fn acquire_host_process_lock(
 pub(crate) fn acquire_principal_root_update_lock(
     data_dir: &Path,
     activation: &crate::install_transaction::SupportActivation<'_>,
-) -> anyhow::Result<HostProcessGuard> {
+) -> anyhow::Result<FileLock> {
     activation.authorize_principal_root_migration(data_dir)?;
     acquire_host_process_lock_inner(data_dir, "principal-root-upgrade", "offline")
 }
@@ -60,10 +94,10 @@ fn acquire_host_process_lock_inner(
     data_dir: &Path,
     role: &str,
     addr: &str,
-) -> anyhow::Result<HostProcessGuard> {
+) -> anyhow::Result<FileLock> {
     fs::create_dir_all(data_dir)?;
     let lock_path = host_lock_path(data_dir);
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -71,10 +105,10 @@ fn acquire_host_process_lock_inner(
         .open(&lock_path)
         .with_context(|| format!("open host lock {}", lock_path.display()))?;
 
-    match try_flock_exclusive_nonblocking(&file) {
-        Ok(()) => {}
-        Err(err) if is_would_block(&err) => {
-            let holder = read_lock_metadata(&mut file);
+    let lock = match FileLock::try_exclusive(file) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            let holder = read_lock_metadata(&lock_path);
             let detail = holder
                 .map(|meta| format!("pid {}, role '{}', addr {}", meta.pid, meta.role, meta.addr))
                 .unwrap_or_else(|| "another ElastOS host process".to_string());
@@ -87,7 +121,7 @@ fn acquire_host_process_lock_inner(
             return Err(err)
                 .with_context(|| format!("lock host process file {}", lock_path.display()));
         }
-    }
+    };
 
     let meta = HostProcessMeta {
         pid: std::process::id(),
@@ -95,13 +129,14 @@ fn acquire_host_process_lock_inner(
         addr: addr.to_string(),
         generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
     };
+    let mut file: &fs::File = &lock;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     serde_json::to_writer_pretty(&mut file, &meta)?;
-    writeln!(&mut file)?;
+    writeln!(file)?;
     file.sync_data()?;
 
-    Ok(HostProcessGuard { _file: file })
+    Ok(lock)
 }
 
 pub fn authorize_host_process_start(data_dir: &Path) -> anyhow::Result<()> {
@@ -114,18 +149,17 @@ pub fn active_host_process(data_dir: &Path) -> anyhow::Result<Option<HostProcess
         return Ok(None);
     }
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("open host lock {}", lock_path.display()))?;
 
-    match try_flock_exclusive_nonblocking(&file) {
-        Ok(()) => {
-            unlock_flock(&file)?;
-            Ok(None)
+    match FileLock::try_exclusive(file) {
+        Ok(_free) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(read_lock_metadata(&lock_path).map(Into::into))
         }
-        Err(err) if is_would_block(&err) => Ok(read_lock_metadata(&mut file).map(Into::into)),
         Err(err) => Err(err).with_context(|| format!("inspect host lock {}", lock_path.display())),
     }
 }
@@ -134,51 +168,8 @@ fn host_lock_path(data_dir: &Path) -> PathBuf {
     data_dir.join("host-process.lock")
 }
 
-fn read_lock_metadata(file: &mut fs::File) -> Option<HostProcessMeta> {
-    file.seek(SeekFrom::Start(0)).ok()?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    serde_json::from_str(&buf).ok()
-}
-
-fn try_flock_exclusive_nonblocking(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(());
-        }
-        Err(std::io::Error::last_os_error().into())
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
-}
-
-fn unlock_flock(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        if rc == 0 {
-            return Ok(());
-        }
-        Err(std::io::Error::last_os_error().into())
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
-}
-
-fn is_would_block(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<std::io::Error>()
-        .map(|io| matches!(io.kind(), std::io::ErrorKind::WouldBlock))
-        .unwrap_or(false)
+fn read_lock_metadata(lock_path: &Path) -> Option<HostProcessMeta> {
+    serde_json::from_slice(&fs::read(lock_path).ok()?).ok()
 }
 
 impl From<HostProcessMeta> for HostProcessInfo {
@@ -408,6 +399,68 @@ impl BinarySnapshotReader for RealBinarySnapshotReader {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::os::fd::{FromRawFd as _, RawFd};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+
+    /// A command another thread spawns while this process has `path` open
+    /// shares each open description of it until exec closes its CLOEXEC
+    /// copies. This command keeps its copies across exec to hold that window
+    /// open until the value drops.
+    pub(crate) struct SpawnedWhileOpen(Child);
+
+    impl SpawnedWhileOpen {
+        pub(crate) fn new(path: &Path) -> Self {
+            let target = std::fs::metadata(path).unwrap();
+            let open: Vec<RawFd> = std::fs::read_dir("/dev/fd")
+                .unwrap()
+                .filter_map(|entry| {
+                    let fd: RawFd = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                    // Inspect without owning: the descriptor is never closed here.
+                    let open =
+                        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+                    let open = open.metadata().ok()?;
+                    (open.dev() == target.dev() && open.ino() == target.ino()).then_some(fd)
+                })
+                .collect();
+            assert!(!open.is_empty(), "{} is not open", path.display());
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    for &fd in &open {
+                        if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Self(command.spawn().unwrap())
+        }
+    }
+
+    impl Drop for SpawnedWhileOpen {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Whether another open description can take the exclusive lock on `path` now.
+    pub(crate) fn lock_is_free(path: &Path) -> bool {
+        super::FileLock::try_exclusive(std::fs::File::open(path).unwrap()).is_ok()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -485,42 +538,15 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn ended_host_lock_is_free_while_a_command_spawned_under_it_runs() {
-        use std::os::unix::process::CommandExt as _;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let host = acquire_host_process_lock(temp.path(), "update-recovery", "offline")
             .expect("first lock");
-        let lock = host._file.as_raw_fd();
-        // Another thread spawns a command while the host lock is held. A fork
-        // shares the lock's open description until exec closes its CLOEXEC
-        // copy; keeping the child's copy across exec holds that window open.
-        let mut child = std::thread::spawn(move || {
-            let mut command = std::process::Command::new("/bin/sleep");
-            command
-                .arg("30")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(lock, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            command.spawn().expect("spawn holder")
-        })
-        .join()
-        .expect("spawn thread");
+        let _command = test_support::SpawnedWhileOpen::new(&host_lock_path(temp.path()));
         drop(host);
-        let next = acquire_host_process_lock(temp.path(), "update-recovery", "offline");
-        let _ = child.kill();
-        let _ = child.wait();
-        next.expect("the next host must not wait for a command spawned under the last");
+        acquire_host_process_lock(temp.path(), "update-recovery", "offline")
+            .expect("the next host must not wait for a command spawned under the last");
     }
 
     #[test]

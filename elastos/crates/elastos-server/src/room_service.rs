@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Seek, SeekFrom};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +14,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use url::Url;
+
+use crate::host_lock::FileLock;
 
 const STATE_SCHEMA: &str = "elastos.room.state.v1";
 const ROOM_SLUG: &str = "chat-room";
@@ -4364,22 +4364,19 @@ fn with_locked_state<T>(
     let paths = storage_paths(data_dir)?;
     fs::create_dir_all(&paths.root_dir)?;
 
-    let mut lockfile = fs::OpenOptions::new()
+    let lockfile = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-
-    flock_exclusive(&lockfile)?;
+    let _lock = lock_state_file(lockfile)?;
 
     let mut state = load_state(&paths)?;
     prune_state(&paths, &mut state);
     let result = f(&paths, &mut state)?;
     save_state(&paths, &state)?;
-    unlock_file(&lockfile)?;
-    let _ = lockfile.seek(SeekFrom::Start(0));
     Ok(result)
 }
 
@@ -4403,16 +4400,10 @@ fn with_expired_read_state<T>(
                 .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))
         }
     };
-    if let Some(lockfile) = lockfile.as_ref() {
-        flock_exclusive(lockfile)?;
-    }
+    let _lock = lockfile.map(lock_state_file).transpose()?;
     let mut state = load_state(&paths)?;
     let _ = expire_state_in_place(&mut state);
-    let result = f(&state);
-    if let Some(lockfile) = lockfile.as_ref() {
-        unlock_file(lockfile)?;
-    }
-    result
+    f(&state)
 }
 
 fn with_read_state<T>(
@@ -4425,11 +4416,9 @@ fn with_read_state<T>(
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-    flock_exclusive(&lockfile)?;
+    let _lock = lock_state_file(lockfile)?;
     let state = load_state(&paths)?;
-    let result = f(&state);
-    unlock_file(&lockfile)?;
-    result
+    f(&state)
 }
 
 fn load_state(paths: &RoomPaths) -> anyhow::Result<RoomState> {
@@ -5171,24 +5160,8 @@ fn browser_access_status_label(status: &BrowserAccessStatus) -> &'static str {
     }
 }
 
-fn flock_exclusive(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    unsafe {
-        if libc::flock(file.as_raw_fd(), libc::LOCK_EX) != 0 {
-            anyhow::bail!("failed to lock group chat state")
-        }
-    }
-    Ok(())
-}
-
-fn unlock_file(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    unsafe {
-        if libc::flock(file.as_raw_fd(), libc::LOCK_UN) != 0 {
-            anyhow::bail!("failed to unlock group chat state")
-        }
-    }
-    Ok(())
+fn lock_state_file(file: fs::File) -> anyhow::Result<FileLock> {
+    FileLock::exclusive(file).context("failed to lock group chat state")
 }
 
 #[cfg(test)]
@@ -5515,6 +5488,24 @@ mod tests {
         assert!(paths.pair_requests_path.is_file());
         assert!(paths.sessions_path.is_file());
         assert!(paths.objects_path.is_file());
+    }
+
+    #[test]
+    fn refused_room_change_frees_its_lock_while_a_command_spawned_during_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = storage_paths(tmp.path()).unwrap().lock_path;
+        let mut command = None;
+        let refused = with_locked_state(tmp.path(), |_, _| -> anyhow::Result<()> {
+            command = Some(SpawnedWhileOpen::new(&lock_path));
+            anyhow::bail!("ElastOS user invites are disabled for this conversation")
+        });
+        assert!(refused.is_err());
+        assert!(
+            lock_is_free(&lock_path),
+            "the room must not stay locked by a command spawned during a refused change"
+        );
     }
 
     #[test]
