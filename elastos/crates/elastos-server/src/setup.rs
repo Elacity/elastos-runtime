@@ -2865,14 +2865,16 @@ struct SupportUpdate<'a> {
     metadata: bool,
 }
 
-/// The one decision every update path uses: support the new Home profile
-/// requires is installed when missing, and installed support is refreshed when
-/// its signed description changed. Components without this platform are skipped.
+/// The one decision every update path uses: on a Home installation, support the
+/// new Home profile requires is installed when missing; installed support is
+/// refreshed when its signed description changed. Components without this
+/// platform are skipped.
 fn plan_update_support<'a>(
     data_dir: &Path,
     old: &'a ComponentsManifest,
     new: &'a ComponentsManifest,
     platform: &str,
+    home: bool,
 ) -> Vec<SupportUpdate<'a>> {
     let mut plan = Vec::new();
     for (name, component) in &new.external {
@@ -2880,10 +2882,11 @@ fn plan_update_support<'a>(
             continue;
         };
         let old_component = old.external.get(name);
-        let required = new
-            .profiles
-            .get("home")
-            .is_some_and(|profile| profile.components.contains(name));
+        let required = home
+            && new
+                .profiles
+                .get("home")
+                .is_some_and(|profile| profile.components.contains(name));
         let installed = !matches!(
             component_install_state_for_name(
                 old,
@@ -2948,8 +2951,10 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
     let old_manifest: ComponentsManifest = serde_json::from_slice(old_bytes)?;
 
     let gateways = build_gateway_list(data_dir);
+    // An operator or bootstrap-only installation has no Home to complete.
+    let home = crate::api::browser_capsules::installed_home_document(data_dir).is_some();
     let mut refreshed = Vec::new();
-    for item in plan_update_support(data_dir, &old_manifest, &new_manifest, platform) {
+    for item in plan_update_support(data_dir, &old_manifest, &new_manifest, platform, home) {
         let SupportUpdate {
             name,
             component,
@@ -3033,7 +3038,8 @@ pub(crate) async fn stage_update_support(
     let new: ComponentsManifest = serde_json::from_slice(new_bytes)?;
     let stage = tempfile::tempdir_in(data_dir)?;
     let mut paths = std::collections::BTreeMap::new();
-    for item in plan_update_support(data_dir, &old, &new, platform) {
+    // System updates run from the installed Home.
+    for item in plan_update_support(data_dir, &old, &new, platform, true) {
         let SupportUpdate {
             name,
             component,
@@ -7813,7 +7819,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_update_installs_support_newly_required_by_home_profile() {
+    async fn terminal_update_installs_support_newly_required_by_home_profile_only_on_a_home() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let component = |name: &str, platform: &str| {
@@ -7835,6 +7841,7 @@ pub(crate) mod tests {
         });
         let new_manifest = serde_json::json!({
             "external": {
+                "home": {"install_path": "capsules/home", "platforms": {}},
                 "shell": shell,
                 "chat-room": component("chat-room", "linux-amd64"),
                 "optional-tool": component("optional-tool", "linux-amd64"),
@@ -7844,16 +7851,39 @@ pub(crate) mod tests {
             "profiles": {"home": {"components": ["shell", "chat-room", "other-platform"]}}
         });
 
-        let refreshed = refresh_installed_components_for_update(
-            data_dir,
-            Some(&serde_json::to_vec(&old_manifest).unwrap()),
-            &serde_json::to_vec(&new_manifest).unwrap(),
-            "linux-amd64",
-        )
-        .await
-        .unwrap();
+        let (old_bytes, new_bytes) = (
+            serde_json::to_vec(&old_manifest).unwrap(),
+            serde_json::to_vec(&new_manifest).unwrap(),
+        );
+        // The updater installs the new manifest bytes before support.
+        fs::write(data_dir.join("components.json"), &new_bytes).unwrap();
+        let update = || {
+            refresh_installed_components_for_update(
+                data_dir,
+                Some(&old_bytes),
+                &new_bytes,
+                "linux-amd64",
+            )
+        };
 
-        assert_eq!(refreshed, vec!["chat-room".to_string()]);
+        // An operator or bootstrap-only installation has no Home to complete.
+        assert!(update().await.unwrap().is_empty());
+        assert!(!data_dir.join("bin/chat-room").exists());
+
+        let home = data_dir.join("capsules/home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "name": "home", "version": "0.1.0",
+                "description": "Home fixture", "author": "fixture",
+                "role": "app", "type": "data", "entrypoint": "index.html"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(home.join("index.html"), b"Home").unwrap();
+        assert_eq!(update().await.unwrap(), vec!["chat-room".to_string()]);
         assert_eq!(
             fs::read(data_dir.join("bin/chat-room")).unwrap(),
             b"chat-room-binary"

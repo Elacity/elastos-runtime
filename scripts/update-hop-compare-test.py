@@ -2386,7 +2386,7 @@ class CliFixtureTests(unittest.TestCase):
                             for folder, values in caches:
                                 for filename, value in zip(observer.CLI_HOME_CACHE, values):
                                     target = directory / folder / filename
-                                    target.write_text(value + "\n")
+                                    target.write_text(value.removeprefix("sha256:") + "\n")
                                     target.chmod(0o600)
                         if setup_fault:
                             action, relative = setup_fault

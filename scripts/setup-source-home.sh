@@ -1299,7 +1299,9 @@ with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=cache) as tempora
             if name == '.elastos-engine.json' and base == bundle:
                 continue
             if name == '.elastos-artifact-sha256' and base == capsule:
-                if upstream.regular(path).read_text() != receipt['checksum'] + '\n':
+                # Homes set up by earlier releases keep `sha256:`-prefixed receipts.
+                if (upstream.regular(path).read_text().removeprefix('sha256:')
+                        != receipt['checksum'].removeprefix('sha256:') + '\n'):
                     raise SystemExit('Existing llama-server capsule receipt differs from its recipe')
                 continue
             if path.is_symlink() or (not path.is_dir() and name not in expected_files):
@@ -1321,7 +1323,7 @@ with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=cache) as tempora
     engine_receipt_path.chmod(0o400)
     capsule_marker = capsule / '.elastos-artifact-sha256'
     if not capsule_marker.exists():
-        capsule_marker.write_text(receipt['checksum'] + '\n')
+        capsule_marker.write_text(receipt['checksum'].removeprefix('sha256:') + '\n')
     capsule_marker.chmod(0o400)
     for base in (bundle, capsule):
         for directory in sorted((p for p in base.rglob('*') if p.is_dir()), reverse=True):
