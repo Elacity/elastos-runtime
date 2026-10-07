@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -73,7 +74,8 @@ def package(name, extra=""):
 
 FILES = {
     ".gitignore": "target/\n",
-    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing"]\nresolver = "2"\n',
+    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing", "stamping", "delegating"]\n'
+                     'resolver = "2"\n',
     "ws/app/Cargo.toml": package("app", textwrap.dedent("""\
         [dependencies]
         dep = { path = "../../dep" }
@@ -107,6 +109,26 @@ FILES = {
         }
         """),
     "ws/probing/src/main.rs": 'fn main() { println!("{}", env!("PROBE_FLAGS")); }\n',
+    # A build script that stamps a source file's mtime into the binary.
+    "ws/stamping/Cargo.toml": package("stamping", "build = \"build.rs\"\n"),
+    "ws/stamping/build.rs": textwrap.dedent("""\
+        fn main() {
+            let modified = std::fs::metadata("src/main.rs").unwrap().modified().unwrap();
+            let secs = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            println!("cargo:rustc-env=SRC_STAMP=zq7-stamp-{}", secs);
+        }
+        """),
+    "ws/stamping/src/main.rs": 'fn main() { println!("{}", env!("SRC_STAMP")); }\n',
+    # A build script whose CPU probe hides in a helper module the scan does not see.
+    "ws/delegating/Cargo.toml": package("delegating", "build = \"build.rs\"\n"),
+    "ws/delegating/build.rs": 'mod helper;\nfn main() { println!("cargo:rustc-env=DELEGATED={}", helper::probe()); }\n',
+    "ws/delegating/helper.rs": textwrap.dedent("""\
+        pub fn probe() -> usize {
+            let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+            info.lines().filter(|l| l.starts_with("flags")).count()
+        }
+        """),
+    "ws/delegating/src/main.rs": 'fn main() { println!("{}", env!("DELEGATED")); }\n',
     "pm/Cargo.toml": package("pm", "[lib]\nproc-macro = true\n"),
     # Round-2 bypass: aliased std::fs read at expansion time.
     "pm/src/lib.rs": textwrap.dedent("""\
@@ -220,14 +242,13 @@ class HermeticTests(unittest.TestCase):
         options = self.options(**kwargs)
         producer = HERMETIC.Producer(options, dict(self.env, **(env or {})))
         try:
-            work, plan = producer.prepare()
+            plan, stage, digests, _ = producer.prepare()
             out = Path(options.out) / "current"
             out.mkdir(parents=True)
-            sandbox = producer.sandbox(plan, work, out)
-            (work / "cargo").mkdir(exist_ok=True)
-            HERMETIC.stage_cargo_home(plan, producer.host_cargo, work / "cargo")
-            done = subprocess.run(sandbox.wrap(command(sandbox.paths)), cwd=str(plan.manifest.parent),
-                                  env=sandbox.environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            sandbox = producer.sandbox(stage, out)
+            done = subprocess.run(sandbox.wrap(command(sandbox.paths), producer.workdir(plan, sandbox)),
+                                  cwd=str(self.root), env=sandbox.environment(plan.allowlisted()), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(done.returncode, 0, done.stderr)
             return done.stdout
         finally:
@@ -246,14 +267,18 @@ class HermeticTests(unittest.TestCase):
         out = Path(receipt["out"]) / ("a" if index == 0 else "b")
         return next(out.glob("*/" + name)).read_bytes()
 
-    def test_double_build_is_reusable_and_keys_match(self):
+    def test_double_build_agrees_and_keys_match(self):
         key, receipt = self.produce(profile="release", diagnose=True)
         self.assertIsNotNone(key, receipt)
         self.assertEqual(self.final(receipt, 0), self.final(receipt, 1))
-        self.assertTrue(receipt["reusable"])
-        self.assertEqual(sorted(receipt["document"]["trees"]),
-                         ["dep", "plain", "pm", "ws/app", "ws/macro-user", "ws/other", "ws/probing", "ws/ticking"])
-        self.assertNotIn("generated", receipt["document"])
+        self.assertIsNone(receipt["reusable"])
+        self.assertIn("attest", receipt["reason"])
+        document = receipt["document"]
+        for name in ("src", "cargo"):
+            self.assertRegex(document[name], r"^[0-9a-f]{64}$")
+        self.assertRegex(document["toolchain"]["digest"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("trees", document)
+        self.assertNotIn("lock", document)
         again, _ = self.produce(profile="release", key_only=True)
         self.assertEqual(key, again)
 
@@ -261,6 +286,7 @@ class HermeticTests(unittest.TestCase):
         key, receipt = self.produce(package="ticking", profile="release")
         self.assertIsNotNone(key, receipt)
         self.assertFalse(receipt["reusable"])
+        self.assertIn("differ", receipt["reason"])
         self.assertNotEqual(self.final(receipt, 0), self.final(receipt, 1))
         self.assertIn(b"zq7-", self.binary(receipt, 0, "ticking"))
 
@@ -316,17 +342,24 @@ class HermeticTests(unittest.TestCase):
         self.assertIsNone(miss)
         self.assertIn("does not match Cargo.lock", reason)
 
-    def test_git_dependency_is_verified_at_locked_revision(self):
+    def test_git_dependency_is_staged_at_locked_revision(self):
         key, receipt = self.produce(single=True)
         self.assertIsNotNone(key, receipt)
-        self.assertTrue(any(BK.parse_package_id(p)[1] == "gitdep" for p in receipt["document"]["lock"]))
+        self.assertIn(b"4", self.binary(receipt))
+        listing = self.probe(lambda paths: ["cat", paths["cargo"] + "/git/checkouts/" + next(
+            p.name for p in Path(self.env["CARGO_HOME"]).glob("git/checkouts/gitdep-*")) + "/" + next(
+            p.name for p in Path(self.env["CARGO_HOME"]).glob("git/checkouts/gitdep-*/*")) + "/src/lib.rs"])
+        self.assertEqual(listing, GITDEP["src/lib.rs"])
+        # The host checkout is never staged (only git archive of the locked revision is), so a
+        # modified host checkout changes neither the key nor the bytes.
         checkout = next(Path(self.env["CARGO_HOME"]).glob("git/checkouts/gitdep-*/*/src/lib.rs"))
         original = checkout.read_text()
         checkout.write_text("pub fn h() -> u32 { 5 }\n")
         self.addCleanup(checkout.write_text, original)
-        miss, reason = self.produce(single=True)
-        self.assertIsNone(miss)
-        self.assertIn("is modified", reason)
+        same, receipt_same = self.produce(single=True)
+        self.assertEqual(key, same, receipt_same)
+        if LINUX:
+            self.assertEqual(self.final(receipt), self.final(receipt_same))
 
     @unittest.skipUnless(LINUX, "macOS cannot remount; its canonical paths are fixed host paths")
     def test_host_work_dir_does_not_change_bytes_or_key(self):
@@ -344,9 +377,10 @@ class HermeticTests(unittest.TestCase):
         self.assertNotEqual(sorted(inside), sorted(os.listdir("/etc")))
         key, receipt = self.produce(key_only=True)
         seal = json.loads((rootfs / HERMETIC.SYSROOT_SEAL).read_text())
-        self.assertEqual(receipt["document"]["sandbox"]["sysroot"], {"image": seal["image"], "digest": seal["digest"]})
+        self.assertEqual(receipt["document"]["sysroot"], {"image": seal["image"], "digest": seal["digest"]})
         marker = rootfs / "etc" / "zq7-marker"
         marker.write_text("drift")
+        self.addCleanup(HERMETIC.canonicalize, rootfs)  # restore /etc's mtime after the marker is gone
         self.addCleanup(marker.unlink)
         miss, reason = self.produce(key_only=True)
         self.assertIsNone(miss)
@@ -362,19 +396,22 @@ class HermeticTests(unittest.TestCase):
         env = {"RUSTUP_HOME": str(copy)}
         key, receipt = self.produce(key_only=True, env=env)
         self.assertIsNotNone(key, receipt)
-        self.assertEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(copy / "toolchains" / real.name))
-        self.assertEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(real))
+        plain, _ = self.produce(key_only=True)
+        self.assertEqual(key, plain, "a hard-link copy of the toolchain stages to the same bytes")
         listing = self.probe(lambda paths: ["sh", "-c", "ls -A %s && cat %s/../../zq7-marker 2>&1; true"
                                             % (paths["toolchain"], paths["toolchain"])], env=env)
         self.assertIn("bin", listing)
         self.assertNotIn("host rustup state", listing)
-        target = copy / "toolchains" / real.name / "lib" / "rustlib" / "components"
-        replace_file(target, target.read_bytes() + b"zq7\n")
+        bookkeeping = copy / "toolchains" / real.name / "lib" / "rustlib" / "components"
+        replace_file(bookkeeping, bookkeeping.read_bytes() + b"zq7\n")
+        same, _ = self.produce(key_only=True, env=env)
+        self.assertEqual(key, same, "rustup's install records are not staged")
+        target = copy / "toolchains" / real.name / "lib" / "rustlib" / "etc" / "rust_types.py"
+        replace_file(target, target.read_bytes() + b"# zq7\n")
         changed, receipt = self.produce(key_only=True, env=env)
         self.assertNotEqual(key, changed)
-        self.assertNotEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(real))
 
-    def test_registry_index_is_minimal_and_keyed_by_content(self):
+    def test_registry_index_is_generated_from_locked_lines_only(self):
         cargo_home = Path(self.env["CARGO_HOME"])
         arbitrary = cargo_home / "registry" / "index" / "arbitrary"
         arbitrary.mkdir(parents=True)
@@ -382,29 +419,39 @@ class HermeticTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, arbitrary)
         key, receipt = self.produce(key_only=True)
         self.assertIsNotNone(key, receipt)
-        index = receipt["document"]["index"]
         real = next(cargo_home.glob("registry/index/index.*"))
-        self.assertEqual(index["index"], real.name)
-        self.assertEqual(index["config"], HERMETIC.sha256_path(real / "config.json"))
-        self.assertEqual(sorted(n.split("@")[0] for n in index["entries"]), ["cfg-if", "either"])
         listing = self.probe(lambda paths: ["sh", "-c", "ls -A %s/registry/index && find %s/registry/index -type f"
-                                            % (paths["cargo"], paths["cargo"])])
+                                            " && cat %s/registry/index/*/.cache/cf/g-/cfg-if | tr '\\0' '\\n'"
+                                            % (paths["cargo"], paths["cargo"], paths["cargo"])])
         self.assertNotIn("arbitrary", listing)
-        self.assertEqual(sorted(Path(l).name for l in listing.split("\n") if "/" in l), ["cfg-if", "config.json", "either"])
+        self.assertEqual(sorted(Path(l).name for l in listing.split("\n") if l.startswith("/")),
+                         ["cfg-if", "config.json", "either"])
+        self.assertEqual(listing.count('"name":"cfg-if"'), 1, "the staged entry holds exactly the locked version")
         config = real / "config.json"
         original = config.read_bytes()
         config.write_bytes(original.replace(b"}", b", \"zq7\": 1}"))
         self.addCleanup(config.write_bytes, original)
         changed, _ = self.produce(key_only=True)
         self.assertNotEqual(key, changed)
+        config.write_bytes(original)
         entry = real / ".cache" / HERMETIC.index_cache_path("cfg-if")
         original_entry = entry.read_bytes()
-        line = HERMETIC.index_entry_line(entry, next(n.split("@")[1] for n in index["entries"] if n.startswith("cfg-if@")))
-        entry.write_bytes(original_entry.replace(line, line.replace(b'"cksum":"', b'"cksum":"0000')))
         self.addCleanup(entry.write_bytes, original_entry)
+        # Astra round 5: an unlocked version's entry changes; staged bytes and key must not.
+        parts = original_entry.split(b"\0")
+        fake = [b"9.9.9", b'{"name":"cfg-if","vers":"9.9.9","deps":[],"cksum":"00","features":{},"yanked":false}']
+        parts = parts[:-1] + fake + parts[-1:] if parts[-1] == b"" else parts + fake
+        entry.write_bytes(b"\0".join(parts))
+        same, receipt_same = self.produce(key_only=True)
+        self.assertEqual(key, same, receipt_same)
+        self.assertEqual(receipt["document"]["cargo"], receipt_same["document"]["cargo"])
+        entry.write_bytes(original_entry)
+        locked = next(v for v in listing.split("\n") if re.fullmatch(r"\d+\.\d+\.\d+", v))
+        line = HERMETIC.index_entry_line(entry, locked)
+        self.assertIsNotNone(line, locked)
+        entry.write_bytes(original_entry.replace(line, line.replace(b'"cksum":"', b'"cksum":"0000')))
         miss, reason = self.produce(key_only=True)
         self.assertIsNone(miss)
-        # cargo fetch --locked notices first; the staging check is the backstop
         self.assertTrue("checksum" in reason or "cksum" in reason, reason)
 
     @unittest.skipUnless(LINUX, "pinned sysroot images are a Linux producer feature")
@@ -415,14 +462,14 @@ class HermeticTests(unittest.TestCase):
         HERMETIC.seal_sysroot(copy, "sha256:test")
         key, receipt = self.produce(key_only=True, sysroot=str(copy))
         self.assertIsNotNone(key, receipt)
-        self.assertEqual(receipt["document"]["sandbox"]["sysroot"]["digest"],
+        self.assertEqual(receipt["document"]["sysroot"]["digest"],
                          json.loads((copy / HERMETIC.SYSROOT_SEAL).read_text())["digest"])
         probe = copy / "etc" / "passwd"
         replace_file(probe, b"zq7\n")
         HERMETIC.seal_sysroot(copy, "sha256:test")
         resealed, _ = self.produce(key_only=True, sysroot=str(copy))
         self.assertNotEqual(key, resealed)
-        os.chmod(probe, 0o600)
+        os.chmod(probe, 0o755)  # the executable bit survives canonicalization, so it is content
         miss, reason = self.produce(key_only=True, sysroot=str(copy))
         self.assertIsNone(miss)
         self.assertIn("drifted from its seal", reason)
@@ -461,6 +508,73 @@ class HermeticTests(unittest.TestCase):
         _, plain = self.produce(key_only=True)
         self.assertEqual(plain["cpu_detection"], [])
 
+    def fake_receipt(self, receipt, cpu, finals=None):
+        other = json.loads(json.dumps(receipt))
+        other["host"]["cpu"] = cpu
+        if finals is not None:
+            for build in other["builds"]:
+                build["final"] = finals
+        type(self).runs += 1
+        path = Path(self.scratch.name) / ("receipt-%d.json" % type(self).runs)
+        path.write_text(json.dumps(other))
+        return str(path)
+
+    def test_helper_module_cpu_probe_needs_a_second_host(self):
+        key, receipt = self.produce(package="delegating", profile="release")
+        self.assertIsNotNone(key, receipt)
+        self.assertEqual(receipt["cpu_detection"], [], "the scan cannot see helper.rs; attestation must")
+        self.assertIsNone(receipt["reusable"])
+        self.assertRegex(receipt["host"]["cpu"], r"\S")
+        mine = self.fake_receipt(receipt, receipt["host"]["cpu"])
+        same_cpu = self.fake_receipt(receipt, receipt["host"]["cpu"])
+        other_cpu = self.fake_receipt(receipt, "zq7 other cpu stepping 9 flags 000000000000")
+        differing = self.fake_receipt(receipt, "zq7 other cpu", finals={"release/delegating": "sha256:zq7"})
+        self.assertFalse(HERMETIC.attest([mine])[0])
+        verdict, reason = HERMETIC.attest([mine, same_cpu])
+        self.assertFalse(verdict)
+        self.assertIn("same CPU", reason)
+        verdict, reason = HERMETIC.attest([mine, differing])
+        self.assertFalse(verdict)
+        self.assertIn("differ", reason)
+        verdict, reason = HERMETIC.attest([mine, other_cpu])
+        self.assertTrue(verdict, reason)
+
+    def test_c_toolchain_cpu_flags_are_refused(self):
+        for name, value in (("CFLAGS", "-O2 -march=native"), ("CXXFLAGS", "-mcpu=native"),
+                            ("CPPFLAGS", "-march=x86-64-v3"), ("TARGET_CFLAGS", "-mtune=native")):
+            key, reason = self.produce(key_only=True, env={name: value})
+            self.assertIsNone(key, (name, value))
+            self.assertIn("host-CPU codegen flags are not allowed", reason)
+        key, receipt = self.produce(key_only=True, env={"CFLAGS": "-O2 -mtune=generic"})
+        self.assertIsNotNone(key, receipt)
+
+    def test_source_mtimes_are_canonical(self):
+        key, receipt = self.produce(package="stamping", single=True)
+        self.assertIsNotNone(key, receipt)
+        self.assertIn(b"zq7-stamp-%d" % HERMETIC.SOURCE_DATE_EPOCH, self.binary(receipt, 0, "stamping"))
+        self.git(self.root, "commit", "-q", "--amend", "--no-edit", "--date", "2001-02-03T04:05:06Z")
+        later, receipt_later = self.produce(package="stamping", single=True)
+        self.assertEqual(key, later)
+        self.assertIn(b"zq7-stamp-%d" % HERMETIC.SOURCE_DATE_EPOCH, self.binary(receipt_later, 0, "stamping"))
+        if LINUX:
+            self.assertEqual(self.final(receipt), self.final(receipt_later))
+
+    def test_git_dependency_has_no_git_dir_and_host_config_is_not_staged(self):
+        key, receipt = self.produce(key_only=True)
+        self.assertIsNotNone(key, receipt)
+        listing = self.probe(lambda paths: ["sh", "-c", "find %s/git/checkouts -name .git; ls -A %s/git/checkouts/*/*/;"
+                                            " git -C %s/git/db/* config --get-all remote.origin.url; true"
+                                            % (paths["cargo"], paths["cargo"], paths["cargo"])])
+        self.assertNotIn(".git", listing)
+        self.assertIn("Cargo.toml", listing)
+        self.assertNotIn(self.scratch.name, listing, "no host path leaks through the staged git database")
+        db_config = next(Path(self.env["CARGO_HOME"]).glob("git/db/gitdep-*/config"))
+        original = db_config.read_text()
+        db_config.write_text(original + "[zq7]\n\tmarker = true\n")
+        self.addCleanup(db_config.write_text, original)
+        same, _ = self.produce(key_only=True)
+        self.assertEqual(key, same)
+
     def test_existing_output_dir_is_refused(self):
         options = self.options(single=True)
         (Path(options.out) / "a").mkdir(parents=True)
@@ -492,7 +606,8 @@ class HermeticTests(unittest.TestCase):
         self.commit("declare pm edge")
         declared, receipt = self.produce(package="macro-user", single=True)
         self.assertIsNotNone(declared, receipt)
-        self.assertIn("assets/pm.txt", receipt["document"]["files"])
+        self.assertEqual(self.probe(lambda paths: ["cat", paths["src"] + "/assets/pm.txt"], package="macro-user"),
+                         "macro input\n")
         self.write("assets/pm.txt", "macro input changed\n")
         self.commit("change pm input")
         changed, _ = self.produce(package="macro-user", key_only=True)
@@ -546,24 +661,18 @@ class HermeticTests(unittest.TestCase):
 
     def test_edges_map_change_changes_key(self):
         before, receipt = self.produce(key_only=True)
-        self.assertEqual(receipt["document"]["edges"], BK.git_blob(self.root / "scripts/build-key-edges.json"))
         self.write("scripts/build-key-edges.json", json.dumps(
             {"packages": {"app": ["assets/a.txt"]}, "units": {"app/bin": {"paths": ["assets/pm.txt"]}}}))
         self.commit("add unit edge")
         after, receipt = self.produce(key_only=True)
         self.assertNotEqual(before, after)
-        self.assertIn("assets/pm.txt", receipt["document"]["files"])
+        self.assertEqual(self.probe(lambda paths: ["cat", paths["src"] + "/assets/pm.txt"]), "macro input\n")
 
-    def test_lock_slice_covers_closure_only_and_corrupt_lock_is_miss(self):
-        _, receipt = self.produce(key_only=True)
-        document = receipt["document"]
-        self.assertEqual(sorted(BK.parse_package_id(p)[1] for p in document["lock"]), ["cfg-if", "gitdep"])
-        self.assertNotIn("path:ws/other#0.1.0", document["closure"])
+    def test_corrupt_lock_is_miss(self):
         lock = self.root / "ws/Cargo.lock"
         blocks = lock.read_text().split("[[package]]")
         either = next(b for b in blocks if 'name = "either"' in b)
         checksum = either.split('checksum = "')[1].split('"')[0]
-        self.assertNotIn(checksum, BK.canonical(document))
         lock.write_text("[[package]]".join(b.replace(checksum, "0000" + checksum[4:]) for b in blocks))
         self.commit("corrupt unrelated lock entry")
         key, reason = self.produce(key_only=True)
@@ -576,16 +685,17 @@ class HermeticTests(unittest.TestCase):
         self.assertIsNone(key)
         self.assertIn("uncommitted changes", reason)
 
-    def test_test_unit_includes_dev_dependencies(self):
+    def test_test_unit_stages_dev_dependencies_only_for_test_units(self):
         manifest = self.root / "ws/app/Cargo.toml"
         self.write("ws/app/Cargo.toml", manifest.read_text() + '[dev-dependencies]\nother = { path = "../other" }\n')
         subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=str(self.root / "ws"), env=self.env, check=True)
         self.commit("dev dependency")
-        _, bin_receipt = self.produce(key_only=True)
-        _, test_receipt = self.produce(key_only=True, kind="test")
-        self.assertNotIn("path:ws/other#0.1.0", bin_receipt["document"]["closure"])
-        self.assertIn("path:ws/other#0.1.0", test_receipt["document"]["closure"])
-        self.assertIn("either", [BK.parse_package_id(p)[1] for p in test_receipt["document"]["lock"]])
+        bin_key, _ = self.produce(key_only=True)
+        test_key, _ = self.produce(key_only=True, kind="test")
+        self.assertNotEqual(bin_key, test_key)
+        crates = lambda paths: ["sh", "-c", "ls %s/registry/src/*/" % paths["cargo"]]
+        self.assertNotIn("either", self.probe(crates))
+        self.assertIn("either", self.probe(crates, kind="test"))
 
 
 if __name__ == "__main__":
