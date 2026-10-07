@@ -60,15 +60,20 @@ All notable changes to the public ElastOS Runtime repository.
 
 Test-channel release. Signed releases show these notes in System before you update.
 
+### Added
+
+- Chat is installed on every Home, so its icon is there from the start.
+- ElastOS installs and updates on Linux (x86-64) and NVIDIA Jetson with the same
+  install.sh command as on Mac.
+
 ### Changed
 
 - From alpha.7 on, you update through System, also when a release changes its
   support files.
-- Updates and installs now need 2 GB of free space. This one rule replaces the
-  old percentage checks.
-- The installer shows numbered steps. When its output goes to a file or another
-  program, it prints plain text without colours.
+- Providers no longer carry the release number, so from the next release an
+  update downloads only the parts that changed.
 - The install guide (docs/INSTALL.md) explains how to undo an update.
+- MicroVM capsules are not available in this release.
 
 ### Fixed
 
