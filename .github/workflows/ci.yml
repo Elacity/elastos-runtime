@@ -499,6 +499,12 @@ jobs:
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-linux-target" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-linux-build" >> "$GITHUB_ENV"
+          # Keep new entries locally while reading the shared trusted cache.
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/source-home-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
@@ -682,6 +688,11 @@ jobs:
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-macos-target" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-macos-build" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/source-home-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')

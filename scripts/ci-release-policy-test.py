@@ -506,6 +506,11 @@ class ReleasePolicyTests(unittest.TestCase):
                     env = {**os.environ, "RUNNER_TEMP": str(root), "GITHUB_ENV": str(root / "env")}
                     subprocess.run(["bash", "-e", "-c", exports], env=env, check=True)
                     env.update(dict(line.split("=", 1) for line in (root / "env").read_text().splitlines()))
+                    self.assertEqual(env["SCCACHE_MULTILEVEL_CHAIN"], "disk,gha")
+                    self.assertEqual(Path(env["SCCACHE_DIR"]), root / "source-home-sccache")
+                    self.assertEqual(env["SCCACHE_CACHE_SIZE"], "2G")
+                    self.assertEqual(env["SCCACHE_LOCAL_RW_MODE"], "READ_WRITE")
+                    self.assertEqual(env["SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"], "l0")
                     target, build = Path(env["CARGO_TARGET_DIR"]), Path(env["CARGO_BUILD_BUILD_DIR"])
                     self.assertEqual(target, root / (job + "-target"))
                     self.assertEqual(build, root / (job + "-build"))
@@ -745,6 +750,9 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual({job for job in JOBS if f"uses: {LOCAL_CACHE_ACTION}" in JOBS[job]},
                          UNIT_CACHE_JOBS | expected_jobs)
         for job in expected_jobs:
+            environment = JOBS[job].split("    steps:\n", 1)[0]
+            # The shared action owns remote permissions from the actual event policy.
+            self.assertNotIn("SCCACHE_GHA_RW_MODE:", environment)
             setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
             self.assertLess(JOBS[job].index("uses: dtolnay/rust-toolchain@"), JOBS[job].index(setup))
             self.assertLess(JOBS[job].index(setup), JOBS[job].index("scripts/setup-source-home.sh"))
