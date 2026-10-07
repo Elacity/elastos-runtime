@@ -195,7 +195,7 @@ policy() {
 seed() {
     [[ $# == 2 ]] || die "usage: seed VERSION SIGNED_DIR"
     need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
-    local version="$1" signed work run name did platform id digest stage
+    local version="$1" signed work run name did platform id digest stage file local_files=()
     signed=$(realpath "$2") work=$(work_dir "$version")
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
@@ -203,10 +203,15 @@ seed() {
     did=$(jq -er .signer_did "$signed/release-head.json")
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
+    # The seed takes native artifacts from the run; every other signed file is
+    # copied from this Mac, so the seed can serve the whole signed set.
+    for file in "$signed"/*; do
+        compgen -G "$work/inputs/*/$name/artifacts/${file##*/}" > /dev/null || local_files+=("$file")
+    done
     cat <<EOF
-# On this Mac: copy the signed manifests, installer and signed hash list.
+# On this Mac: copy every signed file the run does not carry, and the signed hash list.
 ssh $RELEASE_SEED 'install -d -m 700 $stage/signed'
-scp $signed/{install.sh,release.json,release-head.json,components-*.json} $RELEASE_SEED:$stage/signed/
+scp ${local_files[*]} $RELEASE_SEED:$stage/signed/
 scp $work/signed.SHA256SUMS $RELEASE_SEED:$stage/
 
 EOF

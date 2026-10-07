@@ -427,7 +427,10 @@ async fn run_with_data_dir(
         let platform_info = match platform_info {
             Some(info) => info,
             None => {
-                println!("[skip] {} — not available for {}", name, platform);
+                println!(
+                    "[skip] {} — not available for {} in this release",
+                    name, platform
+                );
                 skipped_count += 1;
                 continue;
             }
@@ -465,18 +468,6 @@ async fn run_with_data_dir(
                     note,
                     source.display()
                 );
-                // Actionable guidance for the most common local-copy case: vmlinux on aarch64.
-                if name == "vmlinux" {
-                    println!("       MicroVM capsules will not work without a guest kernel.");
-                    println!(
-                        "       On Jetson/aarch64, ensure {} exists (the host kernel).",
-                        source.display()
-                    );
-                    println!(
-                        "       On other aarch64 hosts, copy a compatible kernel to {}.",
-                        source.display()
-                    );
-                }
                 skipped_count += 1;
                 continue;
             }
@@ -4601,6 +4592,16 @@ pub(crate) mod tests {
             .any(|component| component == "archive-manager"));
         let selected = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
         assert!(selected.iter().any(|name| name == "model-provider"));
+        // Home lists only installed capsules; each Home profile installs its apps.
+        for profile_name in ["home", "agent-local-ai", "public-gateway", "demo", "full"] {
+            let selected = resolve_components(&manifest, Some(profile_name), &[], &[]).unwrap();
+            for app in ["chat-room", "people", "inbox"] {
+                assert!(
+                    selected.iter().any(|name| name == app),
+                    "{profile_name} must install {app}"
+                );
+            }
+        }
         assert!(
             !selected.iter().any(|name| name == "llama-server"
                 || manifest
@@ -6674,14 +6675,20 @@ pub(crate) mod tests {
             admit_release_components(&manifest, platform)
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }
+        // This release publishes the microVM pieces for no platform: the
+        // profiles that name them still resolve, setup skips them, and Home
+        // never selects them.
+        let home = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
+        for name in ["crosvm", "vmlinux"] {
+            assert!(!home.iter().any(|selected| selected == name));
+            for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
+                assert!(resolve_platform_info(&manifest.external[name], platform).is_none());
+            }
+        }
         for profile in ["minimal", "full"] {
             let selected = resolve_components(&manifest, Some(profile), &[], &[]).unwrap();
             assert!(selected.iter().any(|name| name == "vmlinux"));
         }
-        let kernel = &manifest.external["vmlinux"];
-        assert!(resolve_platform_info(kernel, "linux-arm64").is_none());
-        assert!(resolve_platform_info(kernel, "aarch64-linux").is_none());
-        assert!(resolve_platform_info(kernel, "linux-amd64").is_some());
     }
 
     #[test]

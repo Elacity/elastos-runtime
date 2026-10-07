@@ -16,6 +16,11 @@ All notable changes to the public ElastOS Runtime repository.
   report their own crate version in startup logs and status, so a new release
   version is no longer a reason for provider bytes and checksums to change;
   dependencies and the toolchain still can change them (#194).
+- This release publishes `crosvm` and the guest kernel for no platform, so
+  microVM capsules are not available in it; setup skips them and the supervisor
+  says so. Their pinned bytes were unavailable and could not be signed. Release
+  preparation now refuses a checksummed component CID without a release file,
+  before signing.
 
 ### Fixed
 
