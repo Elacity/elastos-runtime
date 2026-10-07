@@ -173,6 +173,7 @@ for capsule in \
     services \
     documents \
     elacity-player \
+    chat-room \
     inbox \
     library \
     marketplace \
@@ -237,6 +238,7 @@ MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
 ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
+CHAT_ROOM_CAPSULE_DIR="${REPO_ROOT}/capsules/chat-room" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
 WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
@@ -398,6 +400,7 @@ browser_capsules = {
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
     "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
+    "chat-room": pathlib.Path(os.environ["CHAT_ROOM_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
     "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
@@ -609,6 +612,8 @@ for installed in \
     "${DATA_DIR}/capsules/browser/browser/index.html" \
     "${DATA_DIR}/capsules/documents/browser/index.html" \
     "${DATA_DIR}/capsules/inbox/browser/index.html" \
+    "${DATA_DIR}/capsules/chat-room/browser/index.html" \
+    "${DATA_DIR}/capsules/chat-room/browser/chat_room_ui_bg.wasm" \
     "${DATA_DIR}/capsules/library/browser/index.html" \
     "${DATA_DIR}/capsules/library/browser/library.css" \
     "${DATA_DIR}/capsules/library/browser/src/app.js" \
