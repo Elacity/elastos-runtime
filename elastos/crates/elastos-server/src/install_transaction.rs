@@ -1380,11 +1380,25 @@ impl InstallTransaction {
 
 fn check_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        bail!("installation directory is unsafe: {}", path.display());
+    if !metadata.is_dir() {
+        bail!(
+            "installation directory is unsafe: {} is not a directory",
+            path.display()
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" '{}'",
+            path.display(),
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "installation directory is unsafe: {} is group- or world-writable; fix with: chmod go-w '{}'",
+            path.display(),
+            path.display()
+        );
     }
     Ok(())
 }
@@ -2647,7 +2661,11 @@ pub(crate) mod tests {
         assert!(InstallationGuard::acquire(&file).is_err());
         for mode in [0o770, 0o707] {
             fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
-            assert!(InstallationGuard::acquire(parent).is_err());
+            let error = InstallationGuard::acquire(parent).err().unwrap().to_string();
+            assert!(
+                error.contains(&format!("chmod go-w '{}'", parent.display())),
+                "{error}"
+            );
             assert!(!parent.join(INSTALL_LOCK).exists());
             assert_eq!(fs::metadata(parent).unwrap().mode() & 0o777, mode);
         }

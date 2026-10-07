@@ -1137,7 +1137,23 @@ sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 # ── Admit the verified release with the shared installation writer ──
 
 [[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
-mkdir -p "$INSTALL_DIR"
+
+# The installation writer refuses directories others can write; say how to fix
+# an existing one before anything is staged, and leave it unchanged.
+require_safe_existing_dir() {
+    local dir="$1"
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" && ! -L "$dir" ]] || die "Unsafe installation directory: ${dir} is not a directory"
+    [[ -O "$dir" ]] || die "Unsafe installation directory: ${dir} is not owned by you; fix with: sudo chown \"\$(id -u)\" '${dir}'"
+    if [[ -n "$(find "$dir" -maxdepth 0 -perm -g+w -o -maxdepth 0 -perm -o+w)" ]]; then
+        die "Unsafe installation directory: ${dir} is group- or world-writable; fix with: chmod go-w '${dir}'"
+    fi
+}
+require_safe_existing_dir "$INSTALL_DIR"
+require_safe_existing_dir "$DATA_DIR"
+
+# Directories created here are 0755 whatever the caller's umask.
+(umask 022; mkdir -p "$INSTALL_DIR")
 
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
