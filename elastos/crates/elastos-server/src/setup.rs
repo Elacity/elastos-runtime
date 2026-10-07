@@ -1578,15 +1578,44 @@ fn capsule_metadata_install_state_for_name(
     {
         return Some(InstallState::Stale(reason));
     }
-    let binds_executable = resolve_platform_info(component, platform)
-        .and_then(|info| archive_executable_in_capsule_metadata(info, platform_info))
-        .is_some();
-    if binds_executable && !install_root.join(CACHED_EXECUTABLE_SHA_FILE).is_file() {
+    if archive_executable_receipt_missing(data_dir, name, component, platform) {
         return Some(InstallState::Stale(
             "archive executable receipt missing".to_string(),
         ));
     }
     Some(InstallState::Installed)
+}
+
+/// Whether the capsule metadata of a single-file archive component lacks the
+/// executable record that setup binds when it extracts the verified archive.
+fn archive_executable_receipt_missing(
+    data_dir: &Path,
+    name: &str,
+    component: &Component,
+    platform: &str,
+) -> bool {
+    let Some(metadata) = component.capsule_metadata.as_ref() else {
+        return false;
+    };
+    let Some(metadata_info) = resolve_component_capsule_metadata_platform_info(metadata, platform)
+        .filter(|metadata_info| {
+            resolve_platform_info(component, platform)
+                .and_then(|info| archive_executable_in_capsule_metadata(info, metadata_info))
+                .is_some()
+        })
+    else {
+        return false;
+    };
+    let Some(install_path) =
+        resolve_component_capsule_metadata_install_path(metadata, Some(metadata_info))
+            .filter(|path| validate_capsule_component_install_path(name, path).is_ok())
+    else {
+        return false;
+    };
+    !data_dir
+        .join(install_path)
+        .join(CACHED_EXECUTABLE_SHA_FILE)
+        .is_file()
 }
 
 fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Option<String> {
@@ -3025,8 +3054,8 @@ struct SupportUpdate<'a> {
 
 /// The one decision every update path uses: on a Home installation, support the
 /// new Home profile requires is installed when missing; installed support is
-/// refreshed when its signed description changed. Components without this
-/// platform are skipped.
+/// refreshed when its signed description changed, and archive metadata once more
+/// when it lacks the executable record. Components without this platform are skipped.
 fn plan_update_support<'a>(
     data_dir: &Path,
     old: &'a ComponentsManifest,
@@ -3062,7 +3091,9 @@ fn plan_update_support<'a>(
             || component_signature(old_component, platform)
                 != component_signature(Some(component), platform);
         let metadata = component.capsule_metadata.is_some()
-            && (artifact || component_capsule_metadata_changed(old_component, component, platform));
+            && (artifact
+                || component_capsule_metadata_changed(old_component, component, platform)
+                || archive_executable_receipt_missing(data_dir, name, component, platform));
         if artifact || metadata {
             plan.push(SupportUpdate {
                 name,
@@ -6664,10 +6695,12 @@ pub(crate) mod tests {
         assert_eq!(result, checksum);
     }
 
+    /// A Home whose kubo was installed from one signed archive (binary and capsule
+    /// metadata) before setup bound the executable record.
     #[cfg(unix)]
-    #[test]
-    fn installed_archive_component_is_verified_by_its_bound_receipts() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+    fn archive_component_home_without_executable_record(
+    ) -> (tempfile::TempDir, PathBuf, Vec<u8>, ComponentsManifest) {
+        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("home");
@@ -6695,6 +6728,7 @@ pub(crate) mod tests {
         let bytes = fs::read(&archive).unwrap();
         let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
         let manifest = serde_json::json!({
+            "schema": "elastos.components/v1",
             "external": {"kubo": {
                 "platforms": {platform.clone(): {
                     "release_path": "kubo.tar.gz", "extract_path": "kubo/ipfs",
@@ -6702,7 +6736,7 @@ pub(crate) mod tests {
                 }},
                 "capsule_metadata": {"install_path": "capsules/kubo", "platforms": {platform.clone(): {
                     "release_path": "kubo.tar.gz", "extract_path": "kubo",
-                    "install_path": "capsules/kubo", "checksum": checksum.clone()
+                    "install_path": "capsules/kubo", "checksum": checksum
                 }}}
             }},
             "capsules": {},
@@ -6722,20 +6756,42 @@ pub(crate) mod tests {
             resolve_component_capsule_metadata_platform_info(metadata, &platform).unwrap();
         let binary = data_dir.join("bin/kubo");
         let capsule = data_dir.join("capsules/kubo");
-        let status = || verify_installed_component(&data_dir, "kubo", &binary);
-
-        // A fresh install: setup extracts the binary and the capsule metadata from
-        // the same verified archive, then binds the receipts.
         extract_from_tarball(&bytes, &binary, info).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         extract_from_tarball(&bytes, &capsule, metadata_info).unwrap();
         write_platform_cache_metadata(metadata_info, &capsule).unwrap();
-        // A Home installed before the executable receipt is refreshed by setup.
+        (tmp, data_dir, bytes, manifest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_archive_component_is_verified_by_its_bound_receipts() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        // These tests run `tar` from PATH, which another setup test clears under ENV_LOCK.
+        let _guard = ENV_LOCK.blocking_lock();
+        let (_tmp, data_dir, bytes, manifest) = archive_component_home_without_executable_record();
+        let platform = detect_platform();
+        let component = &manifest.external["kubo"];
+        let metadata_info = resolve_component_capsule_metadata_platform_info(
+            component.capsule_metadata.as_ref().unwrap(),
+            &platform,
+        )
+        .unwrap();
+        let checksum = metadata_info.checksum.clone().unwrap();
+        let binary = data_dir.join("bin/kubo");
+        let capsule = data_dir.join("capsules/kubo");
+        let status = || verify_installed_component(&data_dir, "kubo", &binary);
+
+        // Without the executable record setup refreshes the metadata.
         assert!(status().is_err());
         assert!(matches!(
             capsule_metadata_install_state_for_name(&data_dir, "kubo", component, &platform),
             Some(InstallState::Stale(_))
         ));
+        // A fresh install binds the record from the same verified archive.
+        extract_from_tarball(&bytes, &capsule, metadata_info).unwrap();
+        write_platform_cache_metadata(metadata_info, &capsule).unwrap();
         write_archive_executable_receipt(component, &platform, metadata_info, &capsule).unwrap();
         assert!(matches!(
             capsule_metadata_install_state_for_name(&data_dir, "kubo", component, &platform),
@@ -6761,6 +6817,80 @@ pub(crate) mod tests {
         assert!(status().is_err(), "symlinked binary");
         fs::remove_file(&binary).unwrap();
         assert!(status().is_err(), "missing binary");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_update_binds_a_missing_archive_executable_record_once() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct Owner;
+        impl crate::update::RestartOwner for Owner {
+            fn progress(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn plan(
+                &self,
+                _: String,
+                _: &str,
+                _: &str,
+            ) -> anyhow::Result<crate::install_transaction::RestartPlan> {
+                unreachable!("staging does not plan a restart")
+            }
+            fn start<'a>(
+                &'a mut self,
+                _: &'a crate::install_transaction::InstallTransaction,
+                _: crate::install_transaction::RestartRecord,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+                unreachable!("staging does not start a host")
+            }
+            fn stop<'a>(
+                &'a mut self,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+                unreachable!("staging does not stop a host")
+            }
+        }
+
+        let _guard = ENV_LOCK.lock().await;
+        let (_tmp, data_dir, bytes, manifest) = archive_component_home_without_executable_record();
+        let platform = detect_platform();
+        let binary = data_dir.join("bin/kubo");
+        let plan = |data_dir: &Path| {
+            plan_update_support(data_dir, &manifest, &manifest, &platform, true)
+                .into_iter()
+                .map(|item| (item.name.to_string(), item.artifact, item.metadata))
+                .collect::<Vec<_>>()
+        };
+        assert!(verify_installed_component(&data_dir, "kubo", &binary).is_err());
+        assert_eq!(plan(&data_dir), [("kubo".to_string(), false, true)]);
+
+        // The System update stages the metadata from the verified archive; the
+        // release transaction then publishes the staged tree.
+        let components = fs::read(data_dir.join("components.json")).unwrap();
+        let fetch: crate::update::FetchFn = Box::new(move |key, _| {
+            assert_eq!(key, "release-path:kubo.tar.gz");
+            let bytes = bytes.clone();
+            Box::pin(async move { Ok(bytes) })
+        });
+        let (_stage, paths) = stage_update_support(
+            &data_dir,
+            &components,
+            &components,
+            &platform,
+            &fetch,
+            &mut Owner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        let (relative, staged) = &paths[0];
+        assert_eq!(relative, Path::new("capsules/kubo"));
+        fs::remove_dir_all(data_dir.join(relative)).unwrap();
+        fs::rename(staged, data_dir.join(relative)).unwrap();
+
+        verify_installed_component(&data_dir, "kubo", &binary).unwrap();
+        assert!(plan(&data_dir).is_empty());
     }
 
     #[test]
