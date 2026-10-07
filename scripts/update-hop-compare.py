@@ -62,11 +62,11 @@ data layout, not the maintainer key. build.rs compiles this source twice: as new
 the release after old, and as next, the release after new; the build receipt
 binds sources, version environments, command and the binary hashes. Refusals claim
 next's version and are offered to an installed new release, so this source's
-update code refuses them. Through the pages, old's System refuses new (its support
-changed, a known limit of old: #246) and keeps Home; old's CLI `update` installs
-new; new's System refuses a tampered offer and applies next; data is written and
-the hop is undone with `update --rollback-to` after a plain update to old is
-refused. check-result is the CI verdict on result.json.
+update code refuses them. Through the pages, old's System installs new although its
+support changed (#246) and Home reconnects on it; new's System refuses a tampered
+offer and applies next; data is written and the hop is undone with
+`update --rollback-to` after a plain update to old is refused. check-result is the
+CI verdict on result.json.
 `selectors` uses m1-install/old and m2-discovery/new with the same refusal list.
 
 `holder.files` maps Home-relative destinations to inventoried public payload
@@ -1064,10 +1064,10 @@ def cli_prepare_ci_disk():
         need(proc.returncode == 0, "allowlisted hosted tool reclaim failed")
         return int(size.split()[0]) * 1024
 
-    # The pinned published release (0.8.0-alpha.6) still keeps 15% of the volume free: below
-    # it, its Home starts without the update controller ("Free disk space before updating")
-    # and the journey cannot run. Drop this when the pin moves to a fixed-reserve release.
-    growth = 20 * 1024**3 + cli_published_reserve(shutil.disk_usage(checkout).total)
+    # The pinned published release keeps CLI_PUBLISHED_RESERVE free before it creates its
+    # update controller: below it, its Home starts without one ("Free disk space before
+    # updating") and the journey cannot run.
+    growth = 20 * 1024**3 + CLI_PUBLISHED_RESERVE
     receipt = cli_reclaim_xcode(applications, protected, growth,
                                 lambda: shutil.disk_usage(checkout), remove)
     receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
@@ -1551,15 +1551,28 @@ CLI_PREVIOUS_ORIGIN = "https://elastos.elacitylabs.com"
 CLI_PREVIOUS_COMPONENTS = (*CLI_SETUP_COMPONENTS, "custody-provider")
 
 
-def cli_published_reserve(total):
-    """Bytes the pinned published release keeps free before it creates its update controller:
-    15% of the volume (install_transaction.rs RESERVE_PERCENT at its source commit)."""
-    return -(-total * 15 // 100)
+# The pinned published release creates its update controller only when the Runtime copy
+# fits with this fixed reserve kept free (elastos-common FREE_SPACE_RESERVE_BYTES; #234).
+CLI_PUBLISHED_RESERVE = 2 * 1024**3
+# From this release on, System installs a release whose support changed (#246); the
+# journey needs that of the pinned release.
+CLI_SYSTEM_INSTALLS_CHANGED_SUPPORT = "0.8.0-alpha.7"
+CLI_VERSION = r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?"
+
+
+def cli_version_order(version):
+    """Semantic version precedence: numeric core, a prerelease before its release, then the
+    prerelease fields (numeric before alphanumeric, a shorter prefix first)."""
+    match = re.fullmatch(CLI_VERSION, version)
+    need(match is not None, "release version is not a plain semantic version")
+    fields = [] if match[4] is None else match[4].split(".")
+    return ([int(value) for value in match.groups()[:3]], match[4] is None,
+            [(0, int(field), "") if field.isdigit() else (1, 0, field) for field in fields])
 
 
 def cli_next_version(version):
     """The next release: the last numeric prerelease field, else the patch, plus one."""
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?", version)
+    match = re.fullmatch(CLI_VERSION, version)
     need(match is not None, "release version is not a plain semantic version")
     if match[4] is None:
         return ".".join([match[1], match[2], str(int(match[3]) + 1)])
@@ -2301,7 +2314,7 @@ def cli_failure_diagnostics(processes, manifest, homes, stage):
     try:
         # Controller, Home start, System browser, Undo and apply output of this run.
         for path in sorted(processes.output.glob("*.std*")):
-            if re.search(r"home-start|home-system|^undo-|^cli-update|^m2-apply", path.name) and path.stat().st_size:
+            if re.search(r"home-start|home-system|^undo-|^m2-apply", path.name) and path.stat().st_size:
                 keep("output/" + path.name, lambda path=path: cli_tail(path, secrets))
         for home in homes:
             directory = home / CLI_DATA
@@ -2750,10 +2763,12 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
     env["PATH"] = str(opener.parent) + ":" + env["PATH"]
     processes.roots[str(opener)] = {binding["sha256"]}
     if "previous" in manifest:
+        # The published release copies its Runtime and a receipt of at most 256 KiB for its controller.
         disk = shutil.disk_usage(directory)
-        need(disk.free >= cli_published_reserve(disk.total) + (home_path / ".local/bin/elastos").stat().st_size,
-             "runner free disk " + str(disk.free) + " of " + str(disk.total) + " is below the published release's 15% "
-             "reserve, so its Home would start without the update controller")
+        needed = (home_path / ".local/bin/elastos").stat().st_size + 256 * 1024
+        need(disk.free >= needed + CLI_PUBLISHED_RESERVE,
+             "runner free disk " + str(disk.free) + " is below the published release's " + str(needed)
+             + " bytes plus its 2 GB reserve, so its Home would start without the update controller")
     process, proof, failure, cleanup_failure, exit_code, identities = None, None, None, None, None, []
     evidence = {} if evidence is None else evidence
     binary = home_path / ".local/bin/elastos"
@@ -2811,26 +2826,6 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         write(stages / ("restart-" + name + ".json"), {"version": manifest[release]["version"], "generation": ready["generation"]})
         return {key: ready[key] for key in ("generation", "controller_sha256", "authenticated_health")}
 
-    def update_with_cli(running_host):
-        """The supported path from the published release: stop Home (including the Home
-        process its System kept running), run its own `elastos update` over Carrier, start
-        Home on the new release."""
-        identities.append(running_host)
-        need(stop() == 0, "Home did not stop cleanly before the CLI update")
-        released()
-        need(cli_home_snapshot(manifest, home_path) == before, "Home stop changed the installation or user data")
-        reply = command("cli-update", ["update", "--yes"])
-        need(cli_success(processes, "cli-update", reply) and "Discovery: Carrier" in processes.text("cli-update"),
-             "the published release's CLI did not update to the new release; command exit " + str(reply["exit"])
-             + cli_ci_stderr_detail(processes, manifest, "cli-update", "CLI update"))
-        version = command("cli-update-version", ["--version"])
-        need(version["exit"] == 0 and processes.text("cli-update-version") == "elastos " + manifest["new"]["version"] + "\n",
-             "the CLI update did not install the new Runtime")
-        expect("new")
-        need(cli_home_snapshot(manifest, home_path) == before, "the CLI update changed user data or installed another release")
-        cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
-        return {"status": "passed", "update": reply, "readiness": restart("cli-update", "cli-update-home-start", "new")}
-
     def undo(browser):
         """Data written on the updated release survives an explicit CLI Undo; a plain update
         to the older release is refused; Home starts again on it with the same account."""
@@ -2872,8 +2867,8 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         proof = start("initial-home-start", "old")
         need(cli_home_snapshot(manifest, home_path) == before, "initial Home changed installed trust, identity or preserved data")
         if manifest["proof_kind"] == "real-runtime":
-            proof["system"], browser = cli_home_system_journey(processes, manifest, home_path, publish, update_with_cli)
-            identities.append(proof["system"]["host"])
+            proof["system"], browser = cli_home_system_journey(processes, manifest, home_path, publish, root)
+            identities.extend((proof["system"]["published_system"]["host"], proof["system"]["host"]))
             # The System update replaced the installed release; shutdown must keep exactly that.
             expect(CLI_SYSTEM_PHASE)
             cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
@@ -2913,12 +2908,12 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
     return proof
 
 
-def cli_home_system_journey(processes, manifest, home_path, publish, update_with_cli):
+def cli_home_system_journey(processes, manifest, home_path, publish, root):
     """Through the real pages, the supported update path from the published release:
-    create the first account and see Home up to date; the published release's System refuses
-    a release whose support changed (its known limit) and keeps Home; its CLI updates to
-    this source; this source's System refuses a tampered offer, applies the next release and
-    reconnects; the account stores a preference and the browser stays open for Undo."""
+    create the first account and see Home up to date; the published release's System installs
+    this source although its support changed and Home reconnects; this source's System
+    refuses a tampered offer, applies the next release and reconnects; the account stores a
+    preference and the browser stays open for Undo."""
     need(publish is not None, "installed System journey requires the fixture publisher")
     node = shutil.which("node")
     need(node is not None and "PLAYWRIGHT_BROWSERS_PATH" in os.environ, "installed System journey requires Node and Playwright")
@@ -2952,17 +2947,17 @@ def cli_home_system_journey(processes, manifest, home_path, publish, update_with
 
     reached("up-to-date", 240, "installed Home sign-up or up-to-date System state failed")
     warnings_before = cli_provider_warnings(home_path)
-    # The published release's System applies only releases with unchanged support (#246):
-    # it refuses this one, restores and keeps Home on its own release.
+    # The published release's System installs a release whose support changed (#246): it
+    # stages it while Home runs, restarts Home once and the page reconnects the same account.
     publish("new")
-    reached("frozen-refused", 330, "the published release's System did not refuse the changed-support release plainly")
-    frozen = cli_private_json(status_path)
-    frozen_host = cli_process_identity(frozen["host_pid"]) if frozen.get("host_pid") else None
-    need(frozen["phase"] == "restored" and installed("old") and frozen_host is not None
-         and cli_process_executable(frozen_host["pid"]) == str(binary),
-         "the published release's System did not keep Home on its release after refusing")
-    cli_update = update_with_cli(frozen_host)
-    reached("updated", 420, "Home did not reconnect the same account on the new release after the CLI update")
+    reached("updated", 480, "the published release's System did not install the release with changed support and reconnect the same account")
+    published = cli_private_json(status_path)
+    published_host = cli_process_identity(published["host_pid"]) if published.get("host_pid") else None
+    need(published["phase"] == "updated" and published["current_version"] == manifest["new"]["version"]
+         and installed("new") and published_host is not None
+         and cli_process_executable(published_host["pid"]) == str(binary),
+         "the published release's System did not restart Home on the new release")
+    cli_verify_setup_support(root, cli_support_view(manifest, "new"), home_path)
     # alpha.6: the updated Runtime refused the installed protected-content providers
     # while System said "up to date". check-result requires `new` to be empty.
     warnings_after = cli_provider_warnings(home_path)
@@ -2983,11 +2978,11 @@ def cli_home_system_journey(processes, manifest, home_path, publish, update_with
     need(status["phase"] == "updated" and status["current_version"] == manifest[CLI_SYSTEM_PHASE]["version"]
          and installed(CLI_SYSTEM_PHASE) and host is not None
          and cli_process_executable(host["pid"]) == str(binary), "controller did not restart Home on the next release")
-    stages = ("up-to-date", "frozen-offer", "frozen-refused", "updated", "tampered-offer", "refused",
+    stages = ("up-to-date", "new-offer", "updated", "tampered-offer", "refused",
               "next-offer", "next-updated", "post-update-item")
     return {"stages": {name: cli_json(output / (name + ".json")) for name in stages}, "host": host,
-            "frozen_support": {"phase": frozen["phase"], "version": manifest["old"]["version"], "kept_home": True},
-            "cli_update": cli_update,
+            "published_system": {"phase": published["phase"], "from": manifest["old"]["version"],
+                                 "to": published["current_version"], "host": published_host},
             "provider_warnings": {"before": warnings_before, "after": warnings_after,
                                   "new": sorted(set(warnings_after) - set(warnings_before))}}, browser
 
@@ -3304,8 +3299,8 @@ def cli_run(config, output, local_rehearsal=None):
 
 def cli_check_result(result):
     """The CI verdict on a run's result.json: the journey passed along the supported path
-    from the pinned published release (its System refused changed support, its CLI updated),
-    the update added no provider warnings, and the hop was undone explicitly."""
+    from the pinned published release (its System installed the release with changed
+    support), the update added no provider warnings, and the hop was undone explicitly."""
     need(result.get("schema") == "elastos.update-hop.result/v1" and result.get("status") == "passed",
          "update hop failed: " + str(result.get("failure", "status " + str(result.get("status")))))
     home = result["paths"]["m1-install"]["checks"]["initial-home"]
@@ -3314,9 +3309,13 @@ def cli_check_result(result):
     previous = result.get("previous_release")
     need(previous is not None and result["old"]["version"] == previous["version"],
          "the hop did not start from the pinned published release")
-    need(home["system"].get("frozen_support", {}).get("phase") == "restored"
-         and home["system"].get("cli_update", {}).get("status") == "passed",
-         "the published release did not refuse changed support in System and update with its CLI")
+    need(cli_version_order(previous["version"]) >= cli_version_order(CLI_SYSTEM_INSTALLS_CHANGED_SUPPORT),
+         "the pinned release " + previous["version"] + " cannot install changed support from System; pin "
+         + CLI_SYSTEM_INSTALLS_CHANGED_SUPPORT + " or later")
+    published = home["system"].get("published_system", {})
+    need(published.get("phase") == "updated" and published.get("from") == previous["version"]
+         and published.get("to") == result["new"]["version"],
+         "the published release's System did not install the release with changed support")
     undo = home.get("undo", {})
     need(undo.get("status") == "passed" and undo["version"] == previous["version"]
          and undo["refused_plain_update"]["exit"] != 0 and undo["rollback"]["exit"] == 0,
