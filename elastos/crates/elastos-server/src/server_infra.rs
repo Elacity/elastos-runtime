@@ -2429,16 +2429,15 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../scripts/browser-helper-parent-lifetime.test.py");
         let binary = temp.path().join("browser-provider.sh");
-        fs::write(
+        crate::test_support::write_from_child(
             &binary,
             format!(
                 "#!/bin/sh\nexec python3 '{}' --provider '{}'\n",
                 script.display(),
                 temp.path().display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let bridge =
             provider::ProviderBridge::spawn_with_owned_helpers(&binary, Default::default())
                 .await

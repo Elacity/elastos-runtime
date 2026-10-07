@@ -73,7 +73,7 @@ pub(super) struct ProfileResetGuard {
     #[cfg(unix)]
     profile_directory: File,
     #[cfg(unix)]
-    lock_file: File,
+    lock_file: crate::host_lock::FileLock,
     #[cfg(unix)]
     disk_identity: Option<FileIdentity>,
 }
@@ -143,14 +143,13 @@ impl ProfileResetGuard {
             0o600,
         )?;
         validate_opened_identity(&lock_file, &profile_directory, LOCK_LEAF)?;
-        if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+        let lock_file = crate::host_lock::FileLock::try_exclusive(lock_file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
                 ProfileResetError::Busy
             } else {
                 ProfileResetError::Io(error)
-            });
-        }
+            }
+        })?;
         let mut guard = Self {
             data_dir,
             root_directory,
@@ -250,13 +249,6 @@ impl ProfileResetGuard {
             proceed.recv().expect("removal barrier release");
         })
         .await
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ProfileResetGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
