@@ -172,7 +172,9 @@ def probe(args, report):
         tools[name] = os.path.abspath(found)
     with tempfile.TemporaryDirectory(prefix="ci-rust-cache-", dir="/tmp") as directory, read_only_gha(report) as gha_url:
         root = Path(directory)
+        report["fixture_dir"] = str(root)
         target = root / "target"
+        build = root / "build"
         uds = root / "server.sock"
         write_fixture(root)
         shutil.copyfile(Path(__file__).resolve().parents[1] / "rust-toolchain.toml",
@@ -191,7 +193,7 @@ def probe(args, report):
                    ACTIONS_RUNTIME_TOKEN="ci-cache-probe", NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
                    SCCACHE_NO_DAEMON="1",
                    SCCACHE_IDLE_TIMEOUT="60", CARGO_HOME=str(root / "cargo-home"),
-                   CARGO_TARGET_DIR=str(target), CARGO_INCREMENTAL="0",
+                    CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(build), CARGO_INCREMENTAL="0",
                    RUSTC=tools["rustc"], RUSTC_WRAPPER=tools["sccache"],
                    RUSTC_WORKSPACE_WRAPPER="", RUSTFLAGS="", CARGO_ENCODED_RUSTFLAGS="",
                    RUSTUP_TOOLCHAIN="1.91.0", ELASTOS_RELEASE_VERSION="probe-one")
@@ -233,10 +235,22 @@ def probe(args, report):
                           ("cold_b_shared_libraries", "b", 41, "probe-one", 2, 0),
                           ("source_change", "b", 42, "probe-one", 1, 1),
                           ("release_stamp_change", "b", 42, "probe-two", 1, 1),
-                          ("repeat_changed", "b", 42, "probe-two", 2, 0))
+                          ("repeat_changed", "b", 42, "probe-two", 2, 0),
+                          ("output_path_change", "b", 42, "probe-two", 0, 2),
+                          ("repeat_changed_output_path", "b", 42, "probe-two", 2, 0))
                 for name, package, value, stamp, hits, misses in stages:
-                    if target.exists():
-                        shutil.rmtree(target)
+                    for output in (target, build):
+                        if output.exists():
+                            shutil.rmtree(output)
+                    # sccache 0.18 hashes Cargo directory environment values.
+                    # Fresh contents at fixed paths can reuse dependencies.
+                    if name == "output_path_change":
+                        target = root / "changed-target"
+                        build = root / "changed-build"
+                    env["CARGO_TARGET_DIR"] = str(target)
+                    env["CARGO_BUILD_BUILD_DIR"] = str(build)
+                    if target.exists() or build.exists():
+                        raise RuntimeError(f"{name}: expected fresh build directories")
                     (root / "leaf/src/lib.rs").write_text(f"pub fn value() -> u32 {{ {value} }}\n")
                     env["ELASTOS_RELEASE_VERSION"] = stamp
                     check_server(server)
@@ -250,9 +264,10 @@ def probe(args, report):
                     after = stats(tools["sccache"], root, env)
                     check_server(server)
                     change = delta(before, after)
-                    hashes = library_hashes(target)
+                    hashes = library_hashes(build)
                     output = run([str(target / "release" / f"cache_probe_{package}")], root, env)
                     stage = dict(name=name, seconds=seconds, delta=change,
+                                 target_dir=str(target), build_dir=str(build),
                                  library_sha256=hashes, executable_output=output,
                                  stats_before=before, stats_after=after)
                     report["stages"].append(stage)
@@ -276,7 +291,7 @@ def probe(args, report):
                 report["cache_levels"] = [dict(zip(fields, (level[field] for field in fields)))
                                            for level in after["multi_level"]]
                 expected_levels = [dict(zip(fields, values)) for values in (
-                    ("L0 (disk)", 8, 4, 4, 0), ("L1 (ghac)", 0, 4, 0, 0))]
+                    ("L0 (disk)", 10, 6, 6, 0), ("L1 (ghac)", 0, 6, 0, 0))]
                 if report["cache_levels"] != expected_levels:
                     raise RuntimeError("expected writable disk reuse beside read-only GHA")
             finally:
@@ -309,6 +324,8 @@ def main():
         report["error"] = str(error)
     finally:
         signal.signal(signal.SIGTERM, previous_handler)
+        if "fixture_dir" in report:
+            report["temporary_fixture_removed"] = not Path(report["fixture_dir"]).exists()
     encoded = json.dumps(report, indent=2) + "\n"
     if args.output_json:
         args.output_json.write_text(encoded)
