@@ -2847,7 +2847,7 @@ async fn real_controller_restart_failure(failure: &str) {
             module_path!().split_once("::").unwrap().1
         )),
     );
-    fs::write(&fixture.binary, previous.as_bytes()).unwrap();
+    crate::test_support::write_from_child(&fixture.binary, &previous, 0o755);
     let home = fixture.data.join("capsules/home");
     fs::create_dir_all(home.join("browser")).unwrap();
     fixture.file(

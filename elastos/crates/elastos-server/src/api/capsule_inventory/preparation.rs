@@ -3470,7 +3470,7 @@ mod tests {
             let digest = format!("sha256:{:x}", Sha256::digest(bytes));
             let archive = format!("sha256:{}", "a".repeat(64));
             let platform = crate::setup::detect_platform();
-            std::fs::write(bundle.join("llama-server"), bytes).unwrap();
+            crate::test_support::write_from_child(&bundle.join("llama-server"), bytes, 0o500);
             std::fs::write(
                 bundle.join(".elastos-engine.json"),
                 serde_json::to_vec(&serde_json::json!({
@@ -3488,10 +3488,11 @@ mod tests {
                     }}
                 });
             });
-            for (name, mode) in [("llama-server", 0o500), (".elastos-engine.json", 0o400)] {
-                std::fs::set_permissions(bundle.join(name), std::fs::Permissions::from_mode(mode))
-                    .unwrap();
-            }
+            std::fs::set_permissions(
+                bundle.join(".elastos-engine.json"),
+                std::fs::Permissions::from_mode(0o400),
+            )
+            .unwrap();
             let mut parent = bundle.clone();
             for _ in Path::new(relative).components() {
                 let mode = std::fs::metadata(&parent).unwrap().permissions().mode();

@@ -2589,13 +2589,11 @@ mod tests {
         receipt: serde_json::Value,
         status: u8,
     ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let provider = root.join("fixture-provider");
         let body = format!(
             "#!/bin/sh\nIFS= read -r init || exit 94\nIFS= read -r operation || exit 95\nprintf '%s\\n' \"$init\" \"$operation\" > \"$0.requests\"\ncat <<'PUBLIC_FIXTURE_RECEIPT'\n{receipt}\nPUBLIC_FIXTURE_RECEIPT\nexit {status}\n"
         );
-        std::fs::write(&provider, body).unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&provider, body, 0o700);
         provider
     }
 
@@ -2610,7 +2608,6 @@ mod tests {
 
     #[cfg(unix)]
     fn provider_session_fixture(root: &Path, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let data = root.join("data");
         let artifacts = root.join("artifacts");
         std::fs::create_dir_all(data.join("ipfs-repo")).unwrap();
@@ -2654,8 +2651,7 @@ finally:
     worker.join()
     server.server_close()
 "#.replace("__MODE__", &serde_json::to_string(mode).unwrap());
-        std::fs::write(&provider, provider_program).unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&provider, provider_program, 0o700);
         (provider, data, artifacts)
     }
 

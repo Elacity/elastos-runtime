@@ -3723,8 +3723,7 @@ mod tests {
                     std::fs::Permissions::from_mode(0o755),
                 )
                 .unwrap();
-                std::fs::write(&binary, old_binary).unwrap();
-                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_from_child(&binary, old_binary, 0o755);
                 let old_components = b"{\"schema\":\"elastos.components/v1\",\"external\":{},\"profiles\":{},\"capsules\":{}}";
                 std::fs::write(data.join("components.json"), old_components).unwrap();
                 let did = crate::crypto::encode_signing_key_did(
@@ -4539,8 +4538,7 @@ mod tests {
             let data = fixture.path().join("data");
             let binary = fixture.path().join("bin/elastos");
             std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-            std::fs::write(&binary, runtime("0.7.0")).unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_from_child(&binary, runtime("0.7.0"), 0o755);
             let legacy = candidate(fixture.path(), &binary, "0.7.0", 7);
             for (path, bytes) in [
                 (

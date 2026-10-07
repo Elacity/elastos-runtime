@@ -2393,8 +2393,7 @@ mod tests {
             request_log.display(),
             status_response,
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log)
     }
 
@@ -2417,8 +2416,7 @@ mod tests {
             status_release.display(),
             media_provider_status(),
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log, status_signal, status_release)
     }
 
@@ -3517,15 +3515,14 @@ mod tests {
         );
         let script_path = tempdir.path().join("fake-model-provider.sh");
         let pid_path = tempdir.path().join("fake-model-provider.pid");
-        fs::write(
+        crate::test_support::write_from_child(
             &script_path,
             format!(
                 "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nprintf '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"invalid configuration\"}}\\n'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
                 pid_path.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
 
         let error = match provider::ProviderBridge::spawn(
             &script_path,
@@ -3953,14 +3950,13 @@ mod tests {
         let bin_dir = temp.path().join("mock-bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let path = bin_dir.join("ipfs-provider");
-        fs::write(
+        crate::test_support::write_from_child(
             &path,
             format!(
                 "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{{\"status\":\"ok\",\"data\":{{\"cid\":\"%s\"}}}}\\n' '{PROVIDER_HOST_TEST_CID}'\ndone\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         path
     }
 
