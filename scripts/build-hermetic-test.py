@@ -74,8 +74,8 @@ def package(name, extra=""):
 
 FILES = {
     ".gitignore": "target/\n",
-    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing", "stamping", "delegating"]\n'
-                     'resolver = "2"\n',
+    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing", "stamping", "delegating",'
+                     ' "linking"]\nresolver = "2"\n',
     "ws/app/Cargo.toml": package("app", textwrap.dedent("""\
         [dependencies]
         dep = { path = "../../dep" }
@@ -129,6 +129,16 @@ FILES = {
         }
         """),
     "ws/delegating/src/main.rs": 'fn main() { println!("{}", env!("DELEGATED")); }\n',
+    # A build script that stamps a symlink's own (lstat) mtime; link.rs -> src/main.rs is created in setUpClass.
+    "ws/linking/Cargo.toml": package("linking", "build = \"build.rs\"\n"),
+    "ws/linking/build.rs": textwrap.dedent("""\
+        fn main() {
+            let modified = std::fs::symlink_metadata("link.rs").unwrap().modified().unwrap();
+            let secs = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            println!("cargo:rustc-env=LINK_STAMP=zq7-link-{}", secs);
+        }
+        """),
+    "ws/linking/src/main.rs": 'fn main() { println!("{}", env!("LINK_STAMP")); }\n',
     "pm/Cargo.toml": package("pm", "[lib]\nproc-macro = true\n"),
     # Round-2 bypass: aliased std::fs read at expansion time.
     "pm/src/lib.rs": textwrap.dedent("""\
@@ -191,6 +201,7 @@ class HermeticTests(unittest.TestCase):
             path = cls.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content.replace("GITDEP_URL", "file://" + str(gitdep)).replace("GITDEP_REV", rev))
+        os.symlink("src/main.rs", cls.root / "ws" / "linking" / "link.rs")
         cls.git(cls.root, "init", "-q", "-b", "main", ".")
         subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=str(cls.root / "ws"), env=cls.env, check=True)
         cls.commit("fixture")
@@ -508,9 +519,10 @@ class HermeticTests(unittest.TestCase):
         _, plain = self.produce(key_only=True)
         self.assertEqual(plain["cpu_detection"], [])
 
-    def fake_receipt(self, receipt, cpu, finals=None):
+    def fake_receipt(self, receipt, cpu, finals=None, run=None):
         other = json.loads(json.dumps(receipt))
         other["host"]["cpu"] = cpu
+        other["run"] = run or "fake-%d" % (type(self).runs + 1)
         if finals is not None:
             for build in other["builds"]:
                 build["final"] = finals
@@ -538,6 +550,46 @@ class HermeticTests(unittest.TestCase):
         self.assertIn("differ", reason)
         verdict, reason = HERMETIC.attest([mine, other_cpu])
         self.assertTrue(verdict, reason)
+
+    def test_attest_rejects_duplicate_and_incomplete_receipts(self):
+        key, receipt = self.produce(package="delegating", profile="release")
+        self.assertIsNotNone(key, receipt)
+        mine = self.fake_receipt(receipt, receipt["host"]["cpu"], run=receipt["run"])
+        copy = Path(self.scratch.name) / "receipt-copy.json"
+        shutil.copyfile(mine, copy)
+        _, key_only = self.produce(package="delegating", profile="release", key_only=True)
+        other_cpu = "zq7 other cpu stepping 9 flags 000000000000"
+        key_only_b = self.fake_receipt(key_only, other_cpu)
+        _, single = self.produce(package="delegating", profile="release", single=True)
+        single_b = self.fake_receipt(single, other_cpu)
+        same_run_b = self.fake_receipt(receipt, other_cpu, run=receipt["run"])
+        complete_b = self.fake_receipt(receipt, other_cpu)
+        for receipts, expected in (([mine, str(copy), key_only_b], "duplicate receipt"),
+                                   ([mine, str(copy)], "duplicate receipt"),
+                                   ([mine, same_run_b], "duplicate receipt"),
+                                   ([mine, key_only_b], "not a complete double build"),
+                                   ([mine, single_b], "not a complete double build"),
+                                   ([key_only_b, complete_b], "not a complete double build"),
+                                   ([mine], "two hosts")):
+            verdict, reason = HERMETIC.attest(receipts)
+            self.assertFalse(verdict, (receipts, reason))
+            self.assertIn(expected, reason)
+        verdict, reason = HERMETIC.attest([mine, complete_b])
+        self.assertTrue(verdict, reason)
+
+    def test_symlink_mtimes_are_canonical(self):
+        key, receipt = self.produce(package="linking", single=True)
+        self.assertIsNotNone(key, receipt)
+        self.assertIn(b"zq7-link-%d" % HERMETIC.SOURCE_DATE_EPOCH, self.binary(receipt, 0, "linking"))
+        self.git(self.root, "commit", "-q", "--amend", "--no-edit", "--date", "2003-04-05T06:07:08Z")
+        later, receipt_later = self.produce(package="linking", single=True)
+        self.assertEqual(key, later)
+        self.assertIn(b"zq7-link-%d" % HERMETIC.SOURCE_DATE_EPOCH, self.binary(receipt_later, 0, "linking"))
+        if LINUX:
+            self.assertEqual(self.final(receipt), self.final(receipt_later))
+        listing = self.probe(lambda paths: ["sh", "-c", "stat -c %%Y %s/ws/linking/link.rs 2>/dev/null || "
+                                            "stat -f %%m %s/ws/linking/link.rs" % (paths["src"], paths["src"])])
+        self.assertEqual(listing.strip(), str(HERMETIC.SOURCE_DATE_EPOCH))
 
     def test_c_toolchain_cpu_flags_are_refused(self):
         for name, value in (("CFLAGS", "-O2 -march=native"), ("CXXFLAGS", "-mcpu=native"),

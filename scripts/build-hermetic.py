@@ -112,15 +112,13 @@ def sha256_path(path):
 # ---- canonical trees and digests -------------------------------------------
 
 def canonicalize(root):
-    """Make a staged tree host-independent: every mtime = SOURCE_DATE_EPOCH, directories 755, files 644
-    or 755 (only the executable bit survives, as in git); symlinks untouched."""
+    """Make a staged tree host-independent: every mtime (files, dirs, symlinks) = SOURCE_DATE_EPOCH,
+    directories 755, files 644 or 755 (only the executable bit survives, as in git)."""
     stamp = (SOURCE_DATE_EPOCH, SOURCE_DATE_EPOCH)
     for directory, dirnames, filenames in os.walk(str(root), topdown=False):
         for name in filenames + dirnames:
             path = os.path.join(directory, name)
             info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                continue
             if stat.S_ISDIR(info.st_mode):
                 os.chmod(path, 0o755)
             elif stat.S_ISREG(info.st_mode):
@@ -152,7 +150,7 @@ def tree_digest(root, skip=()):
                 continue
             info = os.lstat(path)
             if stat.S_ISLNK(info.st_mode):
-                note("L %s -> %s" % (entry, os.readlink(path)))
+                note("L %s %d -> %s" % (entry, int(info.st_mtime), os.readlink(path)))
             elif stat.S_ISREG(info.st_mode):
                 note("F %s %o %d %d %s" % (entry, stat.S_IMODE(info.st_mode), info.st_size, int(info.st_mtime),
                                            sha256_path(path)))
@@ -842,6 +840,7 @@ def produce(options, environ):
     document = producer.document(plan, stage, digests, sandbox)
     key = hashlib.sha256(BK.canonical(document).encode("utf-8")).hexdigest()
     receipt = {"key": key, "commit": producer.commit, "unit": document["unit"], "document": document,
+               "run": "%s-%d-%s" % (platform.node(), os.getpid(), time.time_ns()),
                "host": {"cpu": host_cpu(), "platform": platform.platform()},
                "staging_seconds": round(staging_seconds, 1), "sysroot_verify_seconds": round(producer.sysroot_seconds, 1),
                "cpu_detection": cpu_detection(plan.build_scripts), "reusable": None}
@@ -872,18 +871,35 @@ def produce(options, environ):
     return receipt, producer
 
 
+def complete_build(receipt):
+    """A receipt that proves one producer run: two builds whose final artifacts agree."""
+    builds = receipt.get("builds") or []
+    return (len(builds) == 2 and all(b.get("final") for b in builds) and builds[0]["final"] == builds[1]["final"]
+            and receipt.get("reusable") is not False)
+
+
 def attest(receipts):
-    """Two producers on different CPUs agreeing byte for byte make a unit reusable."""
-    loaded = [json.loads(Path(p).read_text()) for p in receipts]
-    keys = {r["key"] for r in loaded}
+    """Two complete producer runs on different CPUs agreeing byte for byte make a unit reusable."""
+    loaded = []
+    seen = set()
+    for path in receipts:
+        text = Path(path).read_bytes()
+        fingerprint = hashlib.sha256(text).hexdigest()
+        receipt = json.loads(text)
+        if fingerprint in seen or receipt.get("run") in {r.get("run") for r in loaded}:
+            return False, "duplicate receipt %s" % path
+        seen.add(fingerprint)
+        if not complete_build(receipt):
+            return False, "%s is not a complete double build (%s)" % (
+                path, receipt.get("reason") or "key-only or single build")
+        loaded.append(receipt)
     if len(loaded) < 2:
-        return False, "attestation needs receipts from two hosts"
+        return False, "attestation needs complete receipts from two hosts"
+    keys = {r["key"] for r in loaded}
     if len(keys) != 1:
         return False, "keys differ: " + ", ".join(sorted(k[:12] for k in keys))
-    if any(r.get("reusable") is False for r in loaded):
-        return False, "a producer refused reuse: " + "; ".join(r.get("reason", "") for r in loaded if r.get("reusable") is False)
-    finals = [b["final"] for r in loaded for b in r.get("builds", [])]
-    if len(finals) < 4 or any(f != finals[0] for f in finals):
+    finals = [b["final"] for r in loaded for b in r["builds"]]
+    if any(f != finals[0] for f in finals):
         return False, "final artifacts differ across %d builds" % len(finals)
     cpus = [r.get("host", {}).get("cpu") for r in loaded]
     if len(set(cpus)) < 2 or None in cpus:
