@@ -216,11 +216,11 @@ fn catalog_capsule_summary(
     } else {
         manifest.window_policy
     };
-    let capsule_type = manifest.capsule_type.clone();
+    let capsule_type = manifest.execution_type();
     let runtime_abi = manifest.runtime_abi.clone();
     let bus_contract = manifest.bus_contract.clone();
     let wit_world_sha256 = manifest.wit_world_sha256.clone();
-    let execution = manifest.execution.clone();
+    let execution = manifest.effective_execution();
     let declared_projections = manifest.projections.clone();
     let category = capsule_category(&role);
     // A content capsule with a bound viewer is launchable through that viewer.
@@ -672,6 +672,38 @@ fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, Capsu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_reports_actual_execution_for_legacy_wire_manifests() {
+        for (source, expected_type, expected_execution) in [
+            (
+                include_str!("../../../../../../capsules/model-provider/capsule.json"),
+                CapsuleType::NativeProvider,
+                CapsuleExecution::NativeProvider,
+            ),
+            (
+                include_str!("../../../../../../capsules/home/capsule.json"),
+                CapsuleType::WebProjection,
+                CapsuleExecution::WebProjection,
+            ),
+            (
+                include_str!("../../../../../capsules/shell/capsule.json"),
+                CapsuleType::NativeHost,
+                CapsuleExecution::NativeHost,
+            ),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let summary = catalog_capsule_summary(
+                manifest,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            assert_eq!(summary.capsule_type, expected_type);
+            assert_eq!(summary.execution, Some(expected_execution));
+        }
+    }
 
     #[test]
     fn model_catalog_projection_keeps_same_name_local_content_unprepared() {

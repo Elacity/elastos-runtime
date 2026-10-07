@@ -284,13 +284,6 @@ export async function fetchJson(url, init) {
   return response.json();
 }
 
-export async function mutateDesktopObject(op, payload = {}) {
-  return fetchJson("/api/apps/home/desktop/objects", {
-    method: "POST",
-    body: JSON.stringify({ op, ...payload }),
-  });
-}
-
 export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];

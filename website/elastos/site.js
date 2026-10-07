@@ -8,7 +8,7 @@ for (const tab of tabs) {
       item.tabIndex = item === tab ? 0 : -1;
     }
     panel.setAttribute('aria-labelledby', tab.id);
-    guide.href = `https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/${tab.id === 'mac-arm' ? 'MAC' : 'INSTALL'}.md`;
+    guide.href = `https://github.com/Elacity/elastos-runtime/tree/develop/docs/${tab.id === 'mac-arm' ? 'MAC' : 'INSTALL'}.md`;
   });
   tab.addEventListener('keydown', (event) => {
     const index = tabs.indexOf(tab);
@@ -20,7 +20,7 @@ for (const tab of tabs) {
   });
 }
 
-// Enable the control with the 0.7.1 installer deployment, after its served-byte proof.
+// Enable the control only after accepted release installation and served-byte proof.
 const copy = document.querySelector('#copy-install');
 copy.addEventListener('click', async () => {
   const status = document.querySelector('#copy-status');

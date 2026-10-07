@@ -101,6 +101,64 @@ for (const [name, mutate, message] of [
   });
 }
 
+for (const [name, field, invalid, message] of [
+  ["documents", "type", "microvm", /projection type/],
+  ["home-cli", "type", "native-provider", /projection type/],
+  ["home-gui", "type", "microvm", /projection type/],
+  ["browser", "execution", "component", /projection execution/],
+  ["documents", "execution", null, /projection execution/],
+  ["documents", "runtime_abi", "elastos.provider-stdio/v1", /projection ABI/],
+  ["documents", "microvm", {}, /projection.*metadata/],
+  ["chain-provider", "type", "microvm", /native provider type/],
+  ["chain-provider", "type", "wasm", /native provider type/],
+  ["chain-provider", "execution", "microvm", /native provider execution/],
+  ["chain-provider", "execution", null, /native provider execution/],
+  ["chain-provider", "runtime_abi", "elastos.component/v1", /native provider ABI/],
+  ["chain-provider", "microvm", {}, /native provider.*metadata/],
+  ["chain-provider", "bus_contract", "elastos.runtime-projection/v1", /projection type/],
+  ["shell", "type", "wasm", /native host type/],
+  ["shell", "execution", null, /native host execution/],
+  ["shell", "entrypoint", "arbitrary-program", /native host entrypoint/],
+]) {
+  test(`${name} refuses contradictory ${field}=${JSON.stringify(invalid)}`, () => {
+    const value = clone(manifests[name]);
+    if (value.role === "provider") Object.assign(value, {type: "native-provider", execution: "native-provider", runtime_abi: "elastos.provider-stdio/v1", entrypoint: value.name});
+    if (name === "shell") Object.assign(value, {type: "native-host", execution: "native-host", runtime_abi: "native-host", entrypoint: "shell"});
+    value[field] = invalid;
+    assert.throws(() => validateCapsule(value), message);
+  });
+}
+
+test("old and new provider and web projection formats validate during expansion", () => {
+  const old = clone(manifests["chain-provider"]);
+  assert.equal(old.type, "microvm");
+  assert.equal(old.execution, undefined);
+  assert.equal(old.runtime_abi, undefined);
+  validateCapsule(old);
+  validateCapsule({...old, type: "wasm"});
+  validateCapsule({...old, type: "native-provider", execution: "native-provider", runtime_abi: "elastos.provider-stdio/v1", entrypoint: old.name});
+  assert.equal(manifests.documents.type, "wasm");
+  validateCapsule(manifests.documents);
+  validateCapsule({...manifests.documents, type: "web-projection"});
+});
+
+test("shipped execution enums stay readable by released Runtimes", () => {
+  for (const manifest of Object.values(manifests)) {
+    assert.ok(["wasm", "microvm", "oci", "media", "data"].includes(manifest.type), manifest.name);
+    if (manifest.execution) assert.ok(["wasi-receipt", "wasi-app", "web-projection", "component", "microvm", "data"].includes(manifest.execution), manifest.name);
+    if (manifest.runtime_abi) assert.ok(["wasi-preview1", "elastos.runtime-projection/v1", "elastos.component/v1", "microvm-linux", "data"].includes(manifest.runtime_abi), manifest.name);
+  }
+});
+
+test("descriptive types require their execution metadata in both directions", () => {
+  for (const [name, message] of [["documents", /projection execution/], ["chain-provider", /native provider execution/], ["shell", /native host execution/]]) {
+    const value = clone(manifests[name]);
+    value.type = name === "chain-provider" ? "native-provider" : name === "shell" ? "native-host" : "web-projection";
+    for (const field of ["execution", "runtime_abi", "bus_contract"]) delete value[field];
+    assert.throws(() => validateCapsule(value), message);
+  }
+});
+
 for (const name of ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"]) {
   for (const platform of ["linux-amd64", "linux-arm64"]) {
     test(`${name} refuses missing ${platform} extraction metadata for a changed archive format`, () => {

@@ -24,6 +24,25 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   no longer fails with ETXTBSY.
 - Process-group scans skip processes that exit during the scan.
 
+### Isolation status
+
+- Apps use opaque browser frames and Runtime capability checks. Home retains
+  cross-app capability authority. Providers run as native processes; only the
+  model provider is partly confined. Stored keys and full backups remain
+  accessible to the host operator. A stolen device or profile key requires a
+  new identity. The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+  sets the remaining installed acceptance gates.
+
+### Changed
+
+- Runtime and validators accept legacy execution labels and the honest
+  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
+  manifests retain the legacy values so older Runtimes can complete an update.
+  Switch shipped manifests to the honest values in the next release, once every
+  supported Runtime accepts them. Runtime audits and Home display actual
+  execution boundaries during this transition. Third-party executable admission
+  remains gated by publisher, package approval and revocation checks.
+
 ## [0.8.0-alpha.8]
 
 Test-channel release. Signed releases show these notes in System before you update.
