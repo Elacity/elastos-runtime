@@ -36,13 +36,13 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "marketplace",
     "archive-manager",
     "inbox",
+    "chat-room",
     "assistant",
     "elacity-player",
     "model-provider",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
-const DEMO_PUBLISH_CAPSULES: &[&str] =
-    &["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"];
+const DEMO_PUBLISH_CAPSULES: &[&str] = &["gba-emulator", "gba-ucity", "tunnel-provider"];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
@@ -73,6 +73,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "marketplace",
     "archive-manager",
     "inbox",
+    "chat-room",
     "assistant",
     "elacity-player",
     "model-provider",
@@ -2479,7 +2480,7 @@ mod tests {
         assert!(selected.contains(&"wallet-provider".to_string()));
         assert!(selected.contains(&"ipfs-provider".to_string()));
         assert!(!selected.contains(&"custody-provider".to_string()));
-        assert!(!selected.contains(&"chat-room".to_string()));
+        assert!(selected.contains(&"chat-room".to_string()));
         assert!(!selected.contains(&"gba-emulator".to_string()));
     }
 

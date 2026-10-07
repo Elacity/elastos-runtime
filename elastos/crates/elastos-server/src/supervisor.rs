@@ -248,6 +248,25 @@ impl Supervisor {
             .unwrap_or_else(|| data_dir.join(default_relative))
     }
 
+    /// Why this release cannot run microVM capsules on `platform`, if it cannot.
+    fn microvm_unavailable(registry: &ComponentsManifest, platform: &str) -> Option<String> {
+        ["crosvm", "vmlinux"]
+            .into_iter()
+            .find(|name| {
+                registry
+                    .external
+                    .get(*name)
+                    .and_then(|component| crate::setup::resolve_platform_info(component, platform))
+                    .is_none()
+            })
+            .map(|name| {
+                format!(
+                    "microVM capsules are not available on {platform} in this release \
+                     ({name} is not published for it)"
+                )
+            })
+    }
+
     fn verify_host_artifact(&self, component: &str, path: &Path) -> Result<()> {
         let checksum =
             crate::setup::verify_installed_component_binary(&self.data_dir, component, path)
@@ -975,6 +994,11 @@ impl Supervisor {
                 .await;
         }
 
+        // VM path — the release must publish crosvm and a guest kernel for this platform
+        let platform = crate::setup::detect_platform();
+        if let Some(reason) = Self::microvm_unavailable(&self.registry, &platform) {
+            bail!("{reason}. Cannot launch capsule '{name}'.");
+        }
         // VM path — hard require KVM
         if !elastos_crosvm::is_supported() {
             bail!("/dev/kvm not available — crosvm requires KVM. Cannot launch capsule '{name}'.");
@@ -2219,6 +2243,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("refusing to launch capsule with unverified host artifact 'crosvm'"));
+    }
+
+    #[test]
+    fn test_microvm_unavailable_when_release_publishes_no_vm_platform() {
+        let manifest = |crosvm: serde_json::Value| -> ComponentsManifest {
+            serde_json::from_value(serde_json::json!({
+                "external": {
+                    "crosvm": {"install_path": "bin/crosvm", "platforms": crosvm},
+                    "vmlinux": {"install_path": "bin/vmlinux", "platforms": {
+                        "linux-amd64": {"release_path": "vmlinux-linux-amd64"}
+                    }}
+                },
+                "profiles": {}
+            }))
+            .unwrap()
+        };
+        let reason =
+            Supervisor::microvm_unavailable(&manifest(serde_json::json!({})), "linux-amd64")
+                .unwrap();
+        assert_eq!(
+            reason,
+            "microVM capsules are not available on linux-amd64 in this release \
+             (crosvm is not published for it)"
+        );
+        let published = manifest(serde_json::json!({
+            "linux-amd64": {"release_path": "crosvm-linux-amd64"}
+        }));
+        assert_eq!(
+            Supervisor::microvm_unavailable(&published, "linux-amd64"),
+            None
+        );
+        assert!(Supervisor::microvm_unavailable(&published, "linux-arm64")
+            .unwrap()
+            .contains("not available on linux-arm64"));
     }
 
     #[test]

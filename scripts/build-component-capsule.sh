@@ -87,18 +87,19 @@ export CARGO_INCREMENTAL=0
 export SOURCE_DATE_EPOCH=0
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$REMAP_FLAGS"
 
-CARGO_TARGET_DIR="$BUILD_ROOT/capsule" "$CARGO_BIN" build \
+CAPSULE_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_ROOT/capsule}"
+CARGO_TARGET_DIR="$CAPSULE_TARGET_DIR" "$CARGO_BIN" build \
     --locked \
     --manifest-path "$CARGO_MANIFEST" \
     --lib \
     --target "$TARGET" \
     --release
 
-CORE_WASM="$BUILD_ROOT/capsule/$TARGET/release/$TARGET_NAME.wasm"
+CORE_WASM="$CAPSULE_TARGET_DIR/$TARGET/release/$TARGET_NAME.wasm"
 [[ -f "$CORE_WASM" ]] || { echo "missing built core module $CORE_WASM" >&2; exit 1; }
 
 mkdir -p "$CAPSULE_DIR/$(dirname "$ENTRYPOINT")"
-CARGO_TARGET_DIR="$BUILD_ROOT/componentize" "$CARGO_BIN" run \
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_ROOT/componentize}" "$CARGO_BIN" run \
     --quiet \
     --locked \
     --manifest-path "$ROOT/elastos/tools/componentize/Cargo.toml" \

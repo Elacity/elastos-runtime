@@ -2159,6 +2159,7 @@ class CliFixtureTests(unittest.TestCase):
             elif label in ("build-next", "build-system"):
                 version = "0.8.0-alpha.7" if label == "build-next" else "0.8.0-alpha.8"
                 self.assertEqual(env["ELASTOS_RELEASE_VERSION"], version)
+                self.assertEqual(env, {**os.environ, "ELASTOS_RELEASE_VERSION": version})
                 self.assertEqual(timeout, 900)
                 runtime.write_bytes(header + (b"N+1" if label == "build-next" else b"N+2"))
             else:
@@ -2168,7 +2169,11 @@ class CliFixtureTests(unittest.TestCase):
             return {"exit": 0}
         def git(argv, **kwargs):
             return "" if argv[1] == "status" else "a" * 40 + "\n"
-        environment = {"CI": "true", "GITHUB_ACTIONS": "true"}
+        environment = {"CI": "true", "GITHUB_ACTIONS": "true",
+                       "CARGO_TARGET_DIR": str(self.root / "fresh-target"),
+                       "CARGO_BUILD_BUILD_DIR": str(self.root / "fresh-build"),
+                       "CARGO_PROFILE_RELEASE_LTO": "false", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+                       "RUSTFLAGS": "-D warnings", "ELASTOS_RELEASE_VERSION": "0.7.1"}
         if local_rehearsal is not None:
             environment.update(CI="", GITHUB_ACTIONS="", ELASTOS_CI_FIXTURE_REFERENCE="", ELASTOS_CI_FIXTURE_SCOPE="")
         with patch.dict(observer.os.environ, environment), patch.object(observer.sys, "platform", "darwin"), \

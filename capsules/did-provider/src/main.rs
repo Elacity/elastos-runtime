@@ -23,10 +23,7 @@ use zeroize::Zeroize;
 const NONCE_LEN: usize = 12;
 const DID_RECOVERY_PROOF_SCHEMA: &str = "elastos.did.recovery-proof/v1";
 const DID_RECOVERY_MAX_TTL_SECS: u64 = 15 * 60;
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // === Wire protocol types ===
 

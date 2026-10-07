@@ -297,7 +297,25 @@ struct OwnerActionReceipt {
     queued: bool,
 }
 
-fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, File)> {
+struct OwnerActionGuard(File);
+
+impl Drop for OwnerActionGuard {
+    fn drop(&mut self) {
+        // A command spawned meanwhile by another thread can retain this
+        // description until its CLOEXEC fd closes at exec. The guard's scope
+        // owns the lock, so release it before closing our fd.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+impl AsRawFd for OwnerActionGuard {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, OwnerActionGuard)> {
     let data_dir = fs::canonicalize(data_dir)?;
     let directory = controller_directory(&data_dir)?;
     let lock = OpenOptions::new()
@@ -313,7 +331,7 @@ fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, File)> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "Another Home owner action is in progress."
     );
-    Ok((directory, lock))
+    Ok((directory, OwnerActionGuard(lock)))
 }
 
 fn check_owner_effect(

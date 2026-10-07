@@ -12,6 +12,15 @@ pub struct HostProcessGuard {
     _file: fs::File,
 }
 
+impl Drop for HostProcessGuard {
+    fn drop(&mut self) {
+        // A command spawned meanwhile by another thread can retain this
+        // description until its CLOEXEC fd closes at exec. The guard's scope
+        // owns the lock, so release it before closing our fd.
+        let _ = unlock_flock(&self._file);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostProcessInfo {
     pub pid: u32,
@@ -474,6 +483,44 @@ mod tests {
                 .contains("another ElastOS host already owns"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ended_host_lock_is_free_while_a_command_spawned_under_it_runs() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = acquire_host_process_lock(temp.path(), "update-recovery", "offline")
+            .expect("first lock");
+        let lock = host._file.as_raw_fd();
+        // Another thread spawns a command while the host lock is held. A fork
+        // shares the lock's open description until exec closes its CLOEXEC
+        // copy; keeping the child's copy across exec holds that window open.
+        let mut child = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(lock, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().expect("spawn holder")
+        })
+        .join()
+        .expect("spawn thread");
+        drop(host);
+        let next = acquire_host_process_lock(temp.path(), "update-recovery", "offline");
+        let _ = child.kill();
+        let _ = child.wait();
+        next.expect("the next host must not wait for a command spawned under the last");
     }
 
     #[test]
