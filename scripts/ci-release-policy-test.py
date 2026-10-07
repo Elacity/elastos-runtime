@@ -70,7 +70,9 @@ CASES = [
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 NO_CACHE_HIT = {"steps.providers-cache.outputs.cache-hit": "false",
                 "steps.engine-cache.outputs.cache-hit": "false",
-                "steps.previous-release-cache.outputs.cache-hit": "false"}
+                "steps.previous-release-cache.outputs.cache-hit": "false",
+                "steps.kubo-cache.outputs.cache-hit": "false",
+                "steps.apt-prerequisites.outputs.changed": "true"}
 
 
 def validate_cache_guards(source):
@@ -123,11 +125,15 @@ def validate_jetson_package_lifecycle(source):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_every_ci_action_has_a_full_commit_pin(self):
+        for action, pin in re.findall(r'uses: ([\w/-]+)@([^\s]+)', SOURCE):
+            self.assertRegex(pin, r'^[0-9a-f]{40}$', action)
+
     def test_event_ref_matrix_controls_publication_and_every_cache_action(self):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 13)
+        self.assertEqual(len(caches), 18)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -142,13 +148,21 @@ class ReleasePolicyTests(unittest.TestCase):
                 context.update(NO_CACHE_HIT)
                 for should_run in (True, False):
                     context["steps.should-run.outputs.run"] = str(should_run).lower()
-                    for job, step in caches:
-                        expected = cached and (job != "custody-harness-smoke" or should_run)
-                        if "actions/cache/save@" in step:
-                            expected = expected and (event == "push" and ref == "refs/heads/develop"
-                                                     if job == "engine-llama-arm64" else save)
-                        self.assertEqual(evaluate(field(step, "if"), context), expected,
-                                         f"cache guard in {job}")
+                    for kubo_hit in ("true", "false"):
+                        context["steps.kubo-cache.outputs.cache-hit"] = kubo_hit
+                        for job, step in caches:
+                            for apt_changed in ("true", "false"):
+                                context["steps.apt-prerequisites.outputs.changed"] = apt_changed
+                                expected = cached and (job != "custody-harness-smoke" or should_run)
+                                if "actions/cache/save@" in step:
+                                    expected = expected and (event == "push" and ref == "refs/heads/develop"
+                                                             if job == "engine-llama-arm64" else save)
+                                    if step.startswith("name: save verified Kubo inputs\n"):
+                                        expected = expected and kubo_hit != "true"
+                                    if step.startswith("name: save Ubuntu prerequisite archives\n"):
+                                        expected = expected and apt_changed == "true"
+                                self.assertEqual(evaluate(field(step, "if"), context), expected,
+                                                 f"cache guard in {job} (Kubo hit={kubo_hit}, apt changed={apt_changed})")
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
@@ -167,7 +181,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 if "Swatinem/rust-cache@" in step:
                     self.assertEqual(field(step, "save-if"), "${{ env.CI_SAVE_CACHE == 'true' }}",
                                      f"rust-cache in {job} must save only from develop or main")
-                if "actions/cache@" in step and "kubo-cache" not in step:
+                if "actions/cache@" in step:
                     self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
     def test_every_action_is_pinned_to_one_commit_with_its_version(self):
@@ -427,7 +441,7 @@ class CustodyKuboDownloadTests(unittest.TestCase):
     def setUp(self):
         self.source = (WORKFLOW.parents[2] / "deploy/custody-host/Dockerfile").read_text()
         self.version = re.search(r"(?m)^ARG KUBO_VERSION=(\S+)$", self.source)[1]
-        self.script = self.source.split("ARG KUBO_VERSION=", 1)[1].split("RUN <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+        self.script = self.source.split("ARG KUBO_VERSION=", 1)[1].split("<<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
         self.pins = dict(re.findall(r'(amd64|arm64)\) kubo_sha256="([0-9a-f]{64})"', self.script))
         self.assertEqual(self.version, "v0.42.0")
         self.assertEqual(self.pins, {
@@ -508,7 +522,8 @@ class CustodyKuboDownloadTests(unittest.TestCase):
                             f"https://github.com/ipfs/kubo/releases/download/{self.version}/{tarball}"]
                     self.assertEqual([event["args"][-1] for event in events], urls[:len(events)])
                     for event in events:
-                        self.assertEqual(event["args"][:5], ["-fsSL", "--connect-timeout", "30", "--max-time", "300"])
+                        self.assertEqual(event["args"][:13], ["-fsSL", "--connect-timeout", "15", "--max-time", "90",
+                            "--retry", "2", "--retry-all-errors", "--retry-delay", "5", "--retry-max-time", "200", "-o"])
                     if primary == "failed":
                         self.assertFalse(events[1]["existing"], "failed primary bytes must be removed before fallback")
 
@@ -533,7 +548,6 @@ class CustodyKuboDownloadTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertIsNone(installed)
         self.assertFalse(stripped)
-
 
 if __name__ == "__main__":
     unittest.main()
