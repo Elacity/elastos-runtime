@@ -34,10 +34,7 @@ use protocol::*;
 use rpc::*;
 use validation::*;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const NODE_LIFECYCLE_CONTROL_REASON: &str =
     "node lifecycle control requires an operator-approved supervisor";
 const MAX_PROTECTED_CONTENT_RUNTIME_OPERATION_BYTES: usize = 16384;

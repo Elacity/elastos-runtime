@@ -12,6 +12,16 @@ All notable changes to the public ElastOS Runtime repository.
   `fetch-model.sh` and their tests. Models return later as a separate signed
   publication.
 
+- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
+- This release publishes `crosvm` and the guest kernel for no platform, so
+  microVM capsules are not available in it; setup skips them and the supervisor
+  says so. Their pinned bytes were unavailable and could not be signed. Release
+  preparation now refuses a checksummed component CID without a release file,
+  before signing.
+
 ### Fixed
 
 - Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
@@ -45,6 +55,33 @@ All notable changes to the public ElastOS Runtime repository.
   unchanged support assets, an installation lock and journal, and restoration
   after failed or interrupted activation. The default CLI update flow is preserved.
   Home restart ownership and integration remain a follow-up.
+
+## [0.8.0-alpha.8]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Chat is installed on every Home, so its icon is there from the start.
+- ElastOS installs and updates on Linux (x86-64) and NVIDIA Jetson with the same
+  install.sh command as on Mac.
+
+### Changed
+
+- From alpha.7 on, you update through System, also when a release changes its
+  support files.
+- Providers no longer carry the release number, so from the next release an
+  update downloads only the parts that changed.
+- The install guide (docs/INSTALL.md) explains how to undo an update.
+- MicroVM capsules are not available in this release.
+
+### Fixed
+
+- Opening Chat again works offline and no longer downloads it again.
+- An owner action no longer fails with "Another Home owner action is in
+  progress" after Home started another process.
+- If an install into another folder is refused, nothing is left behind in that
+  folder.
 
 ## [0.8.0-alpha.7]
 

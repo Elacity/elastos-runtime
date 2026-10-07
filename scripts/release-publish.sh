@@ -51,6 +51,40 @@ checked_artifact() {
     echo "${found% *} $commit"
 }
 
+# Bind the package source to a successful develop push and its required jobs.
+checked_ci() {
+    local commit="$1" ci required jobs refused
+    ci=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$commit&branch=develop&event=push&per_page=100" \
+        --paginate | jq -s "[.[].workflow_runs[] | select(.head_sha == \"$commit\"
+        and .path == \".github/workflows/ci.yml\" and .event == \"push\" and .head_branch == \"develop\"
+        and .status == \"completed\" and .conclusion == \"success\")] | sort_by(.id)
+        | last | if . == null then empty else {id, url: .html_url} end") || die "cannot read develop CI runs for $commit"
+    [[ -n "$ci" ]] || die "source $commit needs a completed successful develop push CI run"
+    required=$(gh api "repos/$REPO/branches/develop/protection" --jq .required_status_checks.contexts) \
+        || die "cannot read develop required jobs"
+    jobs=$(gh api "repos/$REPO/actions/runs/$(jq -r .id <<< "$ci")/jobs?filter=latest&per_page=100" \
+        --paginate | jq -s '[.[].jobs[] | {name, status, conclusion}]') || die "cannot read develop CI jobs"
+    refused=$(jq -nr --argjson required "$required" --argjson jobs "$jobs" '
+        $required[] as $name | [$jobs[] | select(.name == $name)] as $matches |
+        if ($matches | length) == 0 then "\($name): missing"
+        else $matches[] | select(.status != "completed" or .conclusion != "success") |
+            "\($name): \(.conclusion // .status)" end') || die "cannot check develop required jobs"
+    [[ -z "$refused" ]] || die "develop CI run $(jq -r .id <<< "$ci") required jobs refused: $refused"
+    echo "$ci"
+}
+
+# Print the same source and run identities at each operator handoff.
+publication_record() {
+    local work="$1" commit run ci_id ci_url
+    commit=$(jq -er .source.commit "$work/unsigned/signing-input.json")
+    run=$(jq -er .run "$work/run.json")
+    ci_id=$(jq -er .ci_run.id "$work/run.json")
+    ci_url=$(jq -er .ci_run.url "$work/run.json")
+    echo "# Source commit: $commit"
+    echo "# Package run: $run https://github.com/$REPO/actions/runs/$run"
+    echo "# Develop CI run: $ci_id $ci_url"
+}
+
 # Prints the seed-side preamble and get NAME ID DIGEST: download, check, unpack.
 seed_preamble() {
     cat <<EOF
@@ -66,7 +100,7 @@ work_dir() { printf '%s/%s\n' "$WORK_ROOT" "$1"; }
 
 prepare() {
     [[ $# -ge 2 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: prepare RUN_ID VERSION [PLATFORM ...]"
-    local run="$1" version="$2" work id digest name commit="" tree="" did state platform input artifact_commit pair=""
+    local run="$1" version="$2" work id digest name commit="" tree="" did state platform input artifact_commit pair="" ci_run
     shift 2
     local platforms=("$@") args=() seen=" "
     [[ ${#platforms[@]} -gt 0 ]] || platforms=(aarch64-darwin x86_64-linux aarch64-linux)
@@ -106,6 +140,8 @@ prepare() {
         args+=(--platform-input "$platform=$input/$name")
     done
     name="$pair"
+    ci_run=$(checked_ci "$commit")
+    echo "# Develop CI run: $(jq -r '[(.id | tostring), .url] | join(" ")' <<< "$ci_run")"
     [[ ${#platforms[@]} -gt 1 ]] || args+=(--preview-platform aarch64-darwin)
     git -C "$ROOT" fetch -q origin "$commit"
     git -C "$ROOT" worktree add -q --detach "$work/source" "$commit"
@@ -118,8 +154,8 @@ prepare() {
     did=$(curl -fsS --max-time 20 "$ORIGIN/release-head.json" | jq -er .signer_did)
     state="$RELEASE_SEED_DATA/ElastOS/SystemServices/Publisher/publish-state.json"
     scp -q "$RELEASE_SEED:$state" "$work/state/publish-state.json"
-    printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" \
-        '{run: $run, input: $name, platforms: [inputs]}' > "$work/run.json"
+    printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" --argjson ci_run "$ci_run" \
+        '{run: $run, ci_run: $ci_run, input: $name, platforms: [inputs]}' > "$work/run.json"
     (cd "$work/source" && env ELASTOS_DATA_DIR="$work/data" ELASTOS_PUBLISH_STATE_DIR="$work/state" \
         ELASTOS_IPFS_KUBO_PATH="$work/kubo/ipfs" \
         ELASTOS_SOURCE_CONNECT_TICKET="$(jq -er .ticket "$work/bootstrap.json")" \
@@ -135,6 +171,7 @@ policy() {
     local work input python signer key openssl develop
     work=$(work_dir "$1") input="$(work_dir "$1")/unsigned"
     [[ -f "$input/signing-input.json" ]] || die "prepare $1 first"
+    publication_record "$work"
     python=$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')
     signer=$(realpath "$2") key=$(realpath "$3") openssl=$(realpath "$4")
     [[ "$signer" == "$2" && "$key" == "$3" ]] || die "SIGNER and KEY must be canonical absolute paths"
@@ -158,17 +195,23 @@ policy() {
 seed() {
     [[ $# == 2 ]] || die "usage: seed VERSION SIGNED_DIR"
     need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
-    local version="$1" signed work run name did platform id digest stage
+    local version="$1" signed work run name did platform id digest stage file local_files=()
     signed=$(realpath "$2") work=$(work_dir "$version")
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
+    publication_record "$work"
     did=$(jq -er .signer_did "$signed/release-head.json")
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
+    # The seed takes native artifacts from the run; every other signed file is
+    # copied from this Mac, so the seed can serve the whole signed set.
+    for file in "$signed"/*; do
+        compgen -G "$work/inputs/*/$name/artifacts/${file##*/}" > /dev/null || local_files+=("$file")
+    done
     cat <<EOF
-# On this Mac: copy the signed manifests, installer and signed hash list.
+# On this Mac: copy every signed file the run does not carry, and the signed hash list.
 ssh $RELEASE_SEED 'install -d -m 700 $stage/signed'
-scp $signed/{install.sh,release.json,release-head.json,components-*.json} $RELEASE_SEED:$stage/signed/
+scp ${local_files[*]} $RELEASE_SEED:$stage/signed/
 scp $work/signed.SHA256SUMS $RELEASE_SEED:$stage/
 
 EOF

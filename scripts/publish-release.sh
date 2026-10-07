@@ -25,7 +25,7 @@ NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
-# Demo-only capsules such as chat-room and GBA are published by passing an
+# Demo-only capsules such as GBA are published by passing an
 # explicit --capsules list or through the Rust `demo` publish profile.
 # availability-provider, drm-provider, rights-provider, key-provider,
 # decrypt-provider, and tunnel-provider are supported direct command assets
@@ -60,6 +60,7 @@ DEFAULT_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    chat-room
     assistant
     elacity-player
     model-provider
@@ -94,6 +95,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    chat-room
     assistant
     elacity-player
     model-provider
