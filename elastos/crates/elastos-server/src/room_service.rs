@@ -4371,12 +4371,13 @@ fn with_locked_state<T>(
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-    let _lock = lock_state_file(lockfile)?;
+    let lock = lock_state_file(lockfile)?;
 
     let mut state = load_state(&paths)?;
     prune_state(&paths, &mut state);
     let result = f(&paths, &mut state)?;
     save_state(&paths, &state)?;
+    unlock_state_file(lock)?;
     Ok(result)
 }
 
@@ -4400,10 +4401,14 @@ fn with_expired_read_state<T>(
                 .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))
         }
     };
-    let _lock = lockfile.map(lock_state_file).transpose()?;
+    let lock = lockfile.map(lock_state_file).transpose()?;
     let mut state = load_state(&paths)?;
     let _ = expire_state_in_place(&mut state);
-    f(&state)
+    let result = f(&state);
+    if let Some(lock) = lock {
+        unlock_state_file(lock)?;
+    }
+    result
 }
 
 fn with_read_state<T>(
@@ -4416,9 +4421,11 @@ fn with_read_state<T>(
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-    let _lock = lock_state_file(lockfile)?;
+    let lock = lock_state_file(lockfile)?;
     let state = load_state(&paths)?;
-    f(&state)
+    let result = f(&state);
+    unlock_state_file(lock)?;
+    result
 }
 
 fn load_state(paths: &RoomPaths) -> anyhow::Result<RoomState> {
@@ -5162,6 +5169,10 @@ fn browser_access_status_label(status: &BrowserAccessStatus) -> &'static str {
 
 fn lock_state_file(file: fs::File) -> anyhow::Result<FileLock> {
     FileLock::exclusive(file).context("failed to lock group chat state")
+}
+
+fn unlock_state_file(lock: FileLock) -> anyhow::Result<()> {
+    lock.release().context("failed to unlock group chat state")
 }
 
 #[cfg(test)]

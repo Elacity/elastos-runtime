@@ -3150,6 +3150,10 @@ fn lock_auth_state_file(file: File) -> anyhow::Result<FileLock> {
     FileLock::exclusive(file).context("failed to lock auth state")
 }
 
+fn unlock_auth_state_file(lock: FileLock) -> anyhow::Result<()> {
+    lock.release().context("failed to unlock auth state")
+}
+
 fn mutate_auth_state<T>(
     data_dir: &Path,
     mutation: impl FnOnce(&mut AuthState) -> anyhow::Result<T>,
@@ -3157,11 +3161,12 @@ fn mutate_auth_state<T>(
     let _guard = auth_state_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
-    let _lock = lock_auth_state_file(open_auth_state_lock(data_dir)?)?;
+    let lock = lock_auth_state_file(open_auth_state_lock(data_dir)?)?;
     let mut state = load_auth_state(data_dir)?;
     ensure_audit_chain_state(data_dir, &mut state)?;
     let value = mutation(&mut state)?;
     save_auth_state(data_dir, &state)?;
+    unlock_auth_state_file(lock)?;
     Ok(value)
 }
 
@@ -3269,8 +3274,10 @@ fn with_audit_chain_activation_lock<T>(
     let _guard = audit_chain_activation_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("audit activation lock poisoned"))?;
-    let _lock = lock_auth_state_file(open_audit_chain_activation_lock(data_dir)?)?;
-    operation()
+    let lock = lock_auth_state_file(open_audit_chain_activation_lock(data_dir)?)?;
+    let value = operation()?;
+    unlock_auth_state_file(lock)?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -7334,7 +7341,7 @@ mod tests {
             Some(lock_auth_state_file(open_auth_state_lock(root.path()).unwrap()).unwrap());
         for held in [true, false] {
             if !held {
-                drop(lock.take());
+                unlock_auth_state_file(lock.take().unwrap()).unwrap();
             }
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child

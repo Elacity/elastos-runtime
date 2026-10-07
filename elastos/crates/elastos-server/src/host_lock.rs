@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 
 /// An exclusive flock held for this guard's scope.
 #[derive(Debug)]
-pub struct FileLock(fs::File);
+pub struct FileLock(Option<fs::File>);
 
 impl FileLock {
     /// Waits until this open file holds the exclusive lock.
     pub(crate) fn exclusive(file: fs::File) -> std::io::Result<Self> {
         file.lock()?;
-        Ok(Self(file))
+        Ok(Self(Some(file)))
     }
 
     /// Takes the exclusive lock now or fails with `WouldBlock`.
@@ -27,7 +27,7 @@ impl FileLock {
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self(file)),
+                Ok(()) => return Ok(Self(Some(file))),
                 Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     std::thread::sleep(remaining.min(Duration::from_millis(5)));
@@ -36,13 +36,18 @@ impl FileLock {
             }
         }
     }
+
+    /// Unlocks now and reports the result; dropping instead discards it.
+    pub(crate) fn release(mut self) -> std::io::Result<()> {
+        self.0.take().map_or(Ok(()), |file| file.unlock())
+    }
 }
 
 impl std::ops::Deref for FileLock {
     type Target = fs::File;
 
     fn deref(&self) -> &fs::File {
-        &self.0
+        self.0.as_ref().expect("only release takes the file")
     }
 }
 
@@ -51,7 +56,9 @@ impl Drop for FileLock {
         // A command spawned meanwhile by another thread can retain this
         // description until its CLOEXEC fd closes at exec. The guard's scope
         // owns the lock, so release it before closing our fd.
-        let _ = self.0.unlock();
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -156,7 +163,10 @@ pub fn active_host_process(data_dir: &Path) -> anyhow::Result<Option<HostProcess
         .with_context(|| format!("open host lock {}", lock_path.display()))?;
 
     match FileLock::try_exclusive(file) {
-        Ok(_free) => Ok(None),
+        Ok(free) => {
+            free.release()?;
+            Ok(None)
+        }
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             Ok(read_lock_metadata(&lock_path).map(Into::into))
         }
@@ -547,6 +557,17 @@ mod tests {
         drop(host);
         acquire_host_process_lock(temp.path(), "update-recovery", "offline")
             .expect("the next host must not wait for a command spawned under the last");
+    }
+
+    #[test]
+    fn released_lock_reports_ok_and_is_free_while_a_command_spawned_under_it_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("released.lock");
+        let lock = FileLock::try_exclusive(fs::File::create(&path).expect("lock file"))
+            .expect("first lock");
+        let _command = test_support::SpawnedWhileOpen::new(&path);
+        lock.release().expect("release reports its unlock");
+        assert!(test_support::lock_is_free(&path));
     }
 
     #[test]
