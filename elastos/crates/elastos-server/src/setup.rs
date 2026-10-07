@@ -20,6 +20,8 @@ mod local_model_engine_receipt;
 const DEFAULT_SETUP_PROFILE: &str = "home";
 const CACHED_CID_FILE: &str = ".elastos-cid";
 pub(crate) const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
+/// sha256 of a single-file archive component's executable, bound at extraction.
+const CACHED_EXECUTABLE_SHA_FILE: &str = ".elastos-executable-sha256";
 const PROVIDER_ICON_SIZES: [u16; 4] = [32, 64, 128, 256];
 
 // ── Manifest types ──────────────────────────────────────────────────
@@ -816,11 +818,20 @@ pub fn detect_platform() -> String {
     format!("{}-{}", os, arch)
 }
 
-pub fn verify_installed_component_binary(
+struct InstalledComponentEntry {
+    install_root: PathBuf,
+    manifest_path: PathBuf,
+    component: Component,
+    platform: String,
+    platform_info: PlatformInfo,
+    checksum: String,
+}
+
+fn installed_component_entry(
     data_dir: &Path,
     name: &str,
     path: &Path,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<InstalledComponentEntry> {
     let Some(install_root) = installed_component_root_for_path(data_dir, name, path) else {
         anyhow::bail!(
             "{} must resolve from an installed runtime path, got dev/override path {}",
@@ -839,16 +850,17 @@ pub fn verify_installed_component_binary(
             e
         )
     })?;
-    let manifest: ComponentsManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot verify installed component '{}' at {}: invalid {}: {}",
-            name,
-            path.display(),
-            manifest_path.display(),
-            e
-        )
-    })?;
-    let component = manifest.external.get(name).ok_or_else(|| {
+    let mut manifest: ComponentsManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot verify installed component '{}' at {}: invalid {}: {}",
+                name,
+                path.display(),
+                manifest_path.display(),
+                e
+            )
+        })?;
+    let component = manifest.external.remove(name).ok_or_else(|| {
         anyhow::anyhow!(
             "cannot verify installed component '{}' at {}: missing entry in {}",
             name,
@@ -857,17 +869,19 @@ pub fn verify_installed_component_binary(
         )
     })?;
     let platform = detect_platform();
-    let platform_info = resolve_platform_info(component, &platform).ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot verify installed component '{}' at {}: no platform entry for {}",
-            name,
-            path.display(),
-            platform
-        )
-    })?;
+    let platform_info = resolve_platform_info(&component, &platform)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot verify installed component '{}' at {}: no platform entry for {}",
+                name,
+                path.display(),
+                platform
+            )
+        })?;
     let checksum = platform_info
         .checksum
-        .as_deref()
+        .clone()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -878,49 +892,151 @@ pub fn verify_installed_component_binary(
                 manifest_path.display()
             )
         })?;
-    if platform_info.extract_path.is_some() {
-        // An archive's checksum names the signed archive, not the binary extracted from
-        // it: trust the install receipt of that archive, as the supervisor does.
-        let receipt_dir = install_root.join("capsules").join(name);
-        let receipt = read_artifact_sha256_receipt(&receipt_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "cannot verify installed component '{}': failed to read archive receipt in {}: {}",
-                name,
-                receipt_dir.display(),
-                e
-            )
-        })?;
-        if receipt != bare_sha256(checksum) {
-            anyhow::bail!(
-                "installed component '{}' archive receipt in {} differs from {}",
-                name,
-                receipt_dir.display(),
-                manifest_path.display()
-            );
-        }
-        let metadata = fs::metadata(path).ok().filter(fs::Metadata::is_file);
-        #[cfg(unix)]
-        let metadata = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.filter(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        };
-        if metadata.is_none() {
-            anyhow::bail!(
-                "installed component '{}' at {} is not an executable file",
-                name,
-                path.display()
-            );
-        }
-    } else if !file_matches_checksum(path, checksum)? {
+    Ok(InstalledComponentEntry {
+        install_root,
+        manifest_path,
+        component,
+        platform,
+        platform_info,
+        checksum,
+    })
+}
+
+/// Verify an installed binary whose bytes carry the signed checksum. A binary
+/// extracted from a signed archive is refused: its checksum names the archive.
+pub fn verify_installed_component_binary(
+    data_dir: &Path,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<String> {
+    let entry = installed_component_entry(data_dir, name, path)?;
+    verify_installed_component_bytes(name, path, &entry)?;
+    Ok(entry.checksum)
+}
+
+fn verify_installed_component_bytes(
+    name: &str,
+    path: &Path,
+    entry: &InstalledComponentEntry,
+) -> anyhow::Result<()> {
+    if entry.platform_info.extract_path.is_some() {
+        anyhow::bail!(
+            "installed component '{}' at {} is extracted from a signed archive, not a signed binary",
+            name,
+            path.display()
+        );
+    }
+    if !file_matches_checksum(path, &entry.checksum)? {
         anyhow::bail!(
             "installed component '{}' at {} failed checksum verification against {}",
             name,
             path.display(),
-            manifest_path.display()
+            entry.manifest_path.display()
         );
     }
+    Ok(())
+}
 
-    Ok(checksum.to_string())
+/// Whether an installed component is the signed release: a plain binary by its
+/// bytes, a binary extracted from a signed archive by the receipts bound when
+/// setup verified and extracted that archive into the component's capsule metadata.
+pub fn verify_installed_component(data_dir: &Path, name: &str, path: &Path) -> anyhow::Result<()> {
+    let entry = installed_component_entry(data_dir, name, path)?;
+    if entry.platform_info.extract_path.is_none() {
+        return verify_installed_component_bytes(name, path, &entry);
+    }
+    let metadata = entry.component.capsule_metadata.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("archive component '{name}' has no capsule metadata receipt")
+    })?;
+    let metadata_info = resolve_component_capsule_metadata_platform_info(metadata, &entry.platform)
+        .filter(|info| archive_executable_in_capsule_metadata(&entry.platform_info, info).is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "archive component '{name}' executable is not bound to its capsule metadata"
+            )
+        })?;
+    let relative = resolve_component_capsule_metadata_install_path(metadata, Some(metadata_info))
+        .ok_or_else(|| {
+        anyhow::anyhow!("archive component '{name}' metadata path is missing")
+    })?;
+    validate_capsule_component_install_path(name, relative)?;
+    let receipts = entry.install_root.join(relative);
+    anyhow::ensure!(
+        read_artifact_sha256_receipt(&receipts)? == bare_sha256(&entry.checksum),
+        "archive component '{name}' receipt differs from the signed archive checksum"
+    );
+    let executable_sha = fs::read_to_string(receipts.join(CACHED_EXECUTABLE_SHA_FILE))?;
+    let file = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        file.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    anyhow::ensure!(
+        file.file_type().is_file() && executable,
+        "archive component '{name}' at {} is not a regular executable file",
+        path.display()
+    );
+    anyhow::ensure!(
+        bare_sha256(&compute_sha256_checksum(path)?) == executable_sha.trim(),
+        "archive component '{name}' at {} differs from the executable extracted from its signed archive",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Where a single-file archive component's executable lies inside its capsule
+/// metadata, when setup extracts that metadata from the same signed archive.
+fn archive_executable_in_capsule_metadata(
+    component_info: &PlatformInfo,
+    metadata_info: &PlatformInfo,
+) -> Option<PathBuf> {
+    if component_info.binary_path.is_some() {
+        return None;
+    }
+    let checksum = component_info
+        .checksum
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    if metadata_info.checksum.as_deref().map(bare_sha256) != Some(bare_sha256(checksum)) {
+        return None;
+    }
+    let relative = Path::new(component_info.extract_path.as_deref()?)
+        .strip_prefix(metadata_info.extract_path.as_deref()?)
+        .ok()?;
+    let safe = relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    (safe && !relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
+/// Bind the executable a single-file archive component installs to the archive
+/// setup has just verified and extracted as the component's capsule metadata.
+fn write_archive_executable_receipt(
+    component: &Component,
+    platform: &str,
+    metadata_info: &PlatformInfo,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    let Some(relative) = resolve_platform_info(component, platform)
+        .and_then(|info| archive_executable_in_capsule_metadata(info, metadata_info))
+    else {
+        return Ok(());
+    };
+    let executable = dest.join(relative);
+    anyhow::ensure!(
+        fs::symlink_metadata(&executable)?.file_type().is_file(),
+        "archive executable {} is not a regular file",
+        executable.display()
+    );
+    let checksum = compute_sha256_checksum(&executable)?;
+    fs::write(
+        dest.join(CACHED_EXECUTABLE_SHA_FILE),
+        format!("{}\n", bare_sha256(&checksum)),
+    )?;
+    Ok(())
 }
 
 fn installed_component_root_for_path(data_dir: &Path, name: &str, path: &Path) -> Option<PathBuf> {
@@ -1174,6 +1290,7 @@ async fn ensure_component_capsule_metadata(
     )
     .await?;
     write_platform_cache_metadata(platform_info, &dest)?;
+    write_archive_executable_receipt(component, platform, platform_info, &dest)?;
     if let Some(reason) = installed_component_capsule_metadata_stale_reason(name, component, &dest)
     {
         anyhow::bail!("installed capsule metadata '{name}' failed validation: {reason}");
@@ -1460,6 +1577,14 @@ fn capsule_metadata_install_state_for_name(
         })
     {
         return Some(InstallState::Stale(reason));
+    }
+    let binds_executable = resolve_platform_info(component, platform)
+        .and_then(|info| archive_executable_in_capsule_metadata(info, platform_info))
+        .is_some();
+    if binds_executable && !install_root.join(CACHED_EXECUTABLE_SHA_FILE).is_file() {
+        return Some(InstallState::Stale(
+            "archive executable receipt missing".to_string(),
+        ));
     }
     Some(InstallState::Installed)
 }
@@ -3147,6 +3272,7 @@ pub(crate) async fn stage_update_support(
             }
             if metadata {
                 write_platform_cache_metadata(asset, &dest)?;
+                write_archive_executable_receipt(component, platform, asset, &dest)?;
                 anyhow::ensure!(
                     installed_component_capsule_metadata_stale_reason(name, component, &dest)
                         .is_none(),
@@ -6540,52 +6666,101 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_verify_installed_component_binary_uses_archive_receipt() {
-        use std::os::unix::fs::PermissionsExt;
+    fn installed_archive_component_is_verified_by_its_bound_receipts() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path();
+        let data_dir = tmp.path().join("home");
         let platform = detect_platform();
-        let install_path = data_dir.join("bin/kubo");
-        let capsule_dir = data_dir.join("capsules/kubo");
-        fs::create_dir_all(install_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(&capsule_dir).unwrap();
-        let checksum = format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(b"kubo-archive"))
-        );
+        let src = tmp.path().join("kubo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("ipfs"), b"extracted ipfs").unwrap();
         fs::write(
-            data_dir.join("components.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "external": {"kubo": {"platforms": {platform: {
-                    "release_path": "kubo.tar.gz", "extract_path": "kubo/ipfs",
-                    "install_path": "bin/kubo", "checksum": checksum.clone()
-                }}}},
-                "capsules": {},
-                "profiles": {}
+            src.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "name": "kubo", "version": "0.40.1",
+                "role": "content", "type": "data", "projections": ["content"],
+                "entrypoint": "ipfs"
             }))
             .unwrap(),
         )
         .unwrap();
-        // A fresh install: the extracted binary plus the receipt of the signed archive.
-        fs::write(&install_path, b"extracted ipfs").unwrap();
-        fs::set_permissions(&install_path, fs::Permissions::from_mode(0o755)).unwrap();
-        write_artifact_sha256_receipt(&capsule_dir, &checksum).unwrap();
-        assert_eq!(
-            verify_installed_component_binary(data_dir, "kubo", &install_path).unwrap(),
-            checksum
-        );
+        let archive = tmp.path().join("kubo.tar.gz");
+        let packed = Command::new("tar")
+            .args(["czf", archive.to_str().unwrap(), "-C"])
+            .args([tmp.path().to_str().unwrap(), "kubo"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let bytes = fs::read(&archive).unwrap();
+        let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
+        let manifest = serde_json::json!({
+            "external": {"kubo": {
+                "platforms": {platform.clone(): {
+                    "release_path": "kubo.tar.gz", "extract_path": "kubo/ipfs",
+                    "install_path": "bin/kubo", "checksum": checksum.clone()
+                }},
+                "capsule_metadata": {"install_path": "capsules/kubo", "platforms": {platform.clone(): {
+                    "release_path": "kubo.tar.gz", "extract_path": "kubo",
+                    "install_path": "capsules/kubo", "checksum": checksum.clone()
+                }}}
+            }},
+            "capsules": {},
+            "profiles": {}
+        });
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("components.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let manifest: ComponentsManifest = serde_json::from_value(manifest).unwrap();
+        let component = &manifest.external["kubo"];
+        let info = resolve_platform_info(component, &platform).unwrap();
+        let metadata = component.capsule_metadata.as_ref().unwrap();
+        let metadata_info =
+            resolve_component_capsule_metadata_platform_info(metadata, &platform).unwrap();
+        let binary = data_dir.join("bin/kubo");
+        let capsule = data_dir.join("capsules/kubo");
+        let status = || verify_installed_component(&data_dir, "kubo", &binary);
 
-        write_artifact_sha256_receipt(&capsule_dir, &"0".repeat(64)).unwrap();
-        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
-        fs::remove_file(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE)).unwrap();
-        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
+        // A fresh install: setup extracts the binary and the capsule metadata from
+        // the same verified archive, then binds the receipts.
+        extract_from_tarball(&bytes, &binary, info).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        extract_from_tarball(&bytes, &capsule, metadata_info).unwrap();
+        write_platform_cache_metadata(metadata_info, &capsule).unwrap();
+        // A Home installed before the executable receipt is refreshed by setup.
+        assert!(status().is_err());
+        assert!(matches!(
+            capsule_metadata_install_state_for_name(&data_dir, "kubo", component, &platform),
+            Some(InstallState::Stale(_))
+        ));
+        write_archive_executable_receipt(component, &platform, metadata_info, &capsule).unwrap();
+        assert!(matches!(
+            capsule_metadata_install_state_for_name(&data_dir, "kubo", component, &platform),
+            Some(InstallState::Installed)
+        ));
+        status().unwrap();
+        // Launch and admission callers keep refusing an archive-extracted binary.
+        assert!(verify_installed_component_binary(&data_dir, "kubo", &binary).is_err());
 
-        write_artifact_sha256_receipt(&capsule_dir, &checksum).unwrap();
-        fs::set_permissions(&install_path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
-        fs::remove_file(&install_path).unwrap();
-        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
+        fs::write(&binary, b"extracted ipfX").unwrap();
+        assert!(status().is_err(), "changed binary bytes");
+        fs::write(&binary, b"extracted ipfs").unwrap();
+        status().unwrap();
+
+        write_artifact_sha256_receipt(&capsule, &"0".repeat(64)).unwrap();
+        assert!(status().is_err(), "changed archive receipt");
+        write_artifact_sha256_receipt(&capsule, &checksum).unwrap();
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(status().is_err(), "non-executable binary");
+        fs::remove_file(&binary).unwrap();
+        symlink(capsule.join("ipfs"), &binary).unwrap();
+        assert!(status().is_err(), "symlinked binary");
+        fs::remove_file(&binary).unwrap();
+        assert!(status().is_err(), "missing binary");
     }
 
     #[test]
