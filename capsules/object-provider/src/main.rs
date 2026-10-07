@@ -8,10 +8,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const PROVIDER_ID: &str = "object-provider";
 

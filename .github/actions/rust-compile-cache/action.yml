@@ -1,0 +1,61 @@
+name: Rust compile cache
+description: Content-addressed Rust compile cache for test jobs
+runs:
+  using: composite
+  steps:
+    - name: install checksummed sccache
+      id: install
+      continue-on-error: true
+      shell: bash
+      env:
+        CACHE_RW_MODE: ${{ env.CI_SAVE_CACHE == 'true' && 'READ_WRITE' || 'READ_ONLY' }}
+      run: |
+        set -euo pipefail
+        checksum=(sha256sum)
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+          Linux/X64)
+            archive=sccache-v0.18.0-x86_64-unknown-linux-musl
+            digest=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+            ;;
+          Linux/ARM64)
+            archive=sccache-v0.18.0-aarch64-unknown-linux-musl
+            digest=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a
+            ;;
+          macOS/ARM64)
+            archive=sccache-v0.18.0-aarch64-apple-darwin
+            digest=308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e
+            checksum=(shasum -a 256)
+            ;;
+          *) exit 1 ;;
+        esac
+        directory="$RUNNER_TEMP/rust-compile-cache"
+        mkdir -p "$directory"
+        curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 \
+          "https://github.com/mozilla/sccache/releases/download/v0.18.0/$archive.tar.gz" \
+          -o "$directory/$archive.tar.gz"
+        echo "$digest  $directory/$archive.tar.gz" | "${checksum[@]}" -c -
+        tar -xzf "$directory/$archive.tar.gz" -C "$directory" "$archive/sccache"
+        # sccache hashes each compiler invocation; lock edits can reuse other crates.
+        compiler_key=$(rustc -vV | "${checksum[@]}" | cut -d ' ' -f 1)
+        echo "$directory/$archive" >> "$GITHUB_PATH"
+        {
+          echo "SCCACHE_GHA_ENABLED=on"
+          echo "SCCACHE_GHA_VERSION=$compiler_key"
+          echo "SCCACHE_GHA_RW_MODE=$CACHE_RW_MODE"
+        } >> "$GITHUB_ENV"
+    - name: expose Actions cache runtime to sccache
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: enable Rust compile cache when ready
+      if: steps.install.outcome == 'success'
+      shell: bash
+      run: |
+        if sccache --start-server; then
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> "$GITHUB_ENV"
+        fi

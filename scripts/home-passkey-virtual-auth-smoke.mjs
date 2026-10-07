@@ -41,10 +41,11 @@ const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
-// The installed-release CI journey: System must say "up to date", then show
-// the next signed version once the fixture publishes it (scripts/update-hop-compare.py).
+// The installed-release CI journey (scripts/update-hop-compare.py): the published release's
+// System refuses a release whose support changed; the runner updates it with its CLI; on the
+// new release System refuses a tampered offer and applies the next one; the runner undoes it.
 const SYSTEM_UPDATE_DIR = process.env.HOME_VIRTUAL_AUTH_UPDATE_DIR || "";
-const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = ""] =
+const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = "", SYSTEM_UPDATE_NEXT = ""] =
   (process.env.HOME_VIRTUAL_AUTH_UPDATE_VERSIONS || "").split(" ");
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
@@ -4385,7 +4386,8 @@ async function launchSystem(page, homeToken, passkey) {
 }
 
 async function checkSystemUpdate(page, passkey) {
-  assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW, "System update check needs the current and next version");
+  assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW && SYSTEM_UPDATE_NEXT,
+    "System update check needs the published, new and next version");
   let shownFrame = null;
   // Home may remount System after a restart; always read the live System window.
   const read = async () => {
@@ -4419,6 +4421,8 @@ async function checkSystemUpdate(page, passkey) {
       return { frame: false, error: String(error.message || error).slice(0, 200) };
     }
   };
+  const record = (name, value) =>
+    writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(value)}\n`, { mode: 0o600 });
   // System polls every 5 s, Runtime caches a Carrier check for 30 s, and an
   // approved update restarts Home.
   const reach = async (name, predicate, message) => {
@@ -4430,45 +4434,87 @@ async function checkSystemUpdate(page, passkey) {
     }
     await page.screenshot({ path: join(SYSTEM_UPDATE_DIR, `${name}.png`) }).catch(() => {});
     assert(predicate(state), `${message}: ${JSON.stringify(state)}`, state);
-    // The fixture runner publishes the next fixture when it sees this file.
-    writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    // The fixture runner takes its next step when it sees this file.
+    record(name, state);
     return state;
   };
   // The fixture signs each release with the change note "Fixture <publication>",
-  // so System can tell the tampered offer from the real next version.
-  const offered = (publication) => (state) => state.shown && state.offer && state.can_apply
-    && state.current_version === SYSTEM_UPDATE_CURRENT && state.new_version === SYSTEM_UPDATE_NEW
+  // so System can tell the offers apart.
+  const offered = (publication, current, next) => (state) => state.shown && state.offer && state.can_apply
+    && state.current_version === current && state.new_version === next
     && state.changes === `Fixture ${publication}`;
+  const upToDate = (version) => (state) => state.shown && !state.offer
+    && state.status === "Home is up to date." && state.installed_version === version;
   const approve = async () => {
     const frame = capsuleFrameForTarget(page, "system");
     await frame.evaluate(() => { window.__elastosUpdateWindowMarker = true; });
     // Home asks the virtual authenticator for the owner's step-up proof.
     await frame.locator("#runtime-update-apply").evaluate((button) => button.click());
   };
-  const upToDate = await reach("up-to-date", (state) => state.shown && !state.offer
-    && state.status === "Home is up to date." && state.installed_version === SYSTEM_UPDATE_CURRENT,
-  "System did not report Home up to date");
-  const tampered = await reach("tampered-offer", offered("tampered-binary"), "System did not offer the tampered fixture");
+  const sameAccount = async (message) => {
+    const refreshed = await refreshCurrentHomeToken(page);
+    assert(refreshed.ok && refreshed.homeToken, message, { status: refreshed.status });
+    const current = await currentPasskey(page, refreshed.homeToken);
+    assert(current?.proof_binding_id === passkey.proof_binding_id, "Home changed account: " + message);
+    return refreshed.homeToken;
+  };
+  // The runner stopped Home, changed the installed release and started Home again:
+  // open Home again, as a person does, and find the same account.
+  const reopen = async (name, message) => {
+    const deadline = Date.now() + 600_000;
+    while (!existsSync(join(SYSTEM_UPDATE_DIR, `restart-${name}.json`)) && Date.now() < deadline) await delay(1_000);
+    assert(existsSync(join(SYSTEM_UPDATE_DIR, `restart-${name}.json`)), `the runner did not restart Home after ${name}`);
+    let signed = false;
+    while (!signed && Date.now() < deadline) {
+      signed = await page.reload({ waitUntil: "domcontentloaded" })
+        .then(() => waitForSignedHome(page, 15_000)).then(() => true, () => false);
+    }
+    assert(signed, message);
+    return sameAccount(message);
+  };
+  const upToDateCurrent = await reach("up-to-date", upToDate(SYSTEM_UPDATE_CURRENT), "System did not report Home up to date");
+  // Known limit of the published release: its System applies only releases with unchanged
+  // support. It refuses this one plainly and keeps Home on the current version.
+  const frozenOffer = await reach("frozen-offer", offered("new", SYSTEM_UPDATE_CURRENT, SYSTEM_UPDATE_NEW),
+    "System did not offer the new release");
+  await approve();
+  const frozenRefused = await reach("frozen-refused", (state) => state.shown && state.can_apply
+    && state.installed_version === SYSTEM_UPDATE_CURRENT && state.status !== "" && state.status !== frozenOffer.status,
+  "System did not show the refusal on the current version");
+  // The supported path: the runner runs `elastos update` with the published release's CLI.
+  await reopen("cli-update", "Home did not sign in again after the CLI update");
+  await openDesktopAppWindow(page, "system");
+  const updated = await reach("updated", upToDate(SYSTEM_UPDATE_NEW), "System did not report the new release up to date");
+  const tampered = await reach("tampered-offer", offered("tampered-binary", SYSTEM_UPDATE_NEW, SYSTEM_UPDATE_NEXT),
+    "System did not offer the tampered fixture");
   await approve();
   // What the person sees after a refusal: the same System window, the current version, a
   // new message, and Update usable again. update-hop-compare.py checks that the
   // controller recorded the failure and that the same Home process kept running.
   const refused = await reach("refused", (state) => state.shown && state.same_window
-    && state.installed_version === SYSTEM_UPDATE_CURRENT && state.can_apply
+    && state.installed_version === SYSTEM_UPDATE_NEW && state.can_apply
     && state.status !== "" && state.status !== tampered.status,
   "System did not show the refusal on the current version in the same window");
-  const next = await reach("next-offer", offered("new"), "System did not offer the next signed version");
+  const nextOffer = await reach("next-offer", offered("next", SYSTEM_UPDATE_NEW, SYSTEM_UPDATE_NEXT),
+    "System did not offer the next signed version");
   await approve();
-  const updated = await reach("updated", (state) => state.shown && !state.offer
-    && state.status === "Home is up to date." && state.installed_version === SYSTEM_UPDATE_NEW,
-  "System did not reconnect on the next version");
+  const nextUpdated = await reach("next-updated", upToDate(SYSTEM_UPDATE_NEXT), "System did not reconnect on the next version");
   // Home reconnected by itself: no navigation, and the same account is signed in.
   await waitForSignedHome(page, 60_000);
-  const refreshed = await refreshCurrentHomeToken(page);
-  assert(refreshed.ok && refreshed.homeToken, "Home session did not survive the update", { status: refreshed.status });
-  const after = await currentPasskey(page, refreshed.homeToken);
-  assert(after?.proof_binding_id === passkey.proof_binding_id, "Home changed account across the update");
-  return { up_to_date: upToDate, tampered, refused, next, updated, same_account: true };
+  const token = await sameAccount("Home session did not survive the System update");
+  const stored = await browserApi(page, token, "/api/apps/home/appearance/preferences",
+    { method: "POST", body: { theme: "light" } });
+  assert(stored.ok && stored.body?.theme === "light", "Home did not store the account preference", stored);
+  record("post-update-item", { theme: stored.body.theme, revision: stored.body.revision });
+  // The runner undoes the update with `elastos update --rollback-to` and starts Home on the
+  // published release; the account and the preference stored after the update remain.
+  const after = await browserApi(page, await reopen("undo", "Home did not sign in again on the published release"),
+    "/api/apps/home/summary");
+  assert(after.ok && after.body?.appearance?.theme === "light", "Undo lost the account preference", after);
+  const undone = { theme: after.body.appearance.theme, revision: after.body.appearance.revision, same_account: true };
+  record("undone", undone);
+  return { up_to_date: upToDateCurrent, frozen_offer: frozenOffer, frozen_refused: frozenRefused, updated, tampered,
+    refused, next_offer: nextOffer, next_updated: nextUpdated, undone, same_account: true };
 }
 
 async function readRecoveryExportDownload(download, expected) {

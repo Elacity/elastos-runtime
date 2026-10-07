@@ -477,7 +477,8 @@ async fn wait_until_healthy(
     timeout: Duration,
 ) -> Result<(), LocalLlamaFault> {
     let client = health_client(endpoint.unix_socket.as_deref())?;
-    let deadline = Instant::now() + timeout;
+    // Tokio's clock, so tests can hold this deadline until a fixture engine has started.
+    let deadline = tokio::time::Instant::now() + timeout;
     let models_url = match endpoint.api_url.strip_suffix("/v1/chat/completions") {
         Some(base) => format!("{base}/v1/models"),
         None => return Err(LocalLlamaFault::Failed),
@@ -486,7 +487,7 @@ async fn wait_until_healthy(
         if !managed_child_is_running(child, guard_group) {
             return Err(LocalLlamaFault::Failed);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(LocalLlamaFault::Timeout);
         }
@@ -504,7 +505,7 @@ async fn wait_until_healthy(
         }
         sleep(
             deadline
-                .saturating_duration_since(Instant::now())
+                .saturating_duration_since(tokio::time::Instant::now())
                 .min(HEALTH_POLL_INTERVAL),
         )
         .await;
@@ -850,7 +851,10 @@ fn child_exited_without_reaping(_pid: libc::pid_t) -> std::io::Result<bool> {
 mod tests {
     use super::*;
     use crate::config::{LocalArtifactConfig, LocalLlamaSettings};
-    use crate::test_support::{sha256_file, temp_root_path, write_fake_llama_server};
+    use crate::test_support::{
+        sha256_file, temp_root_path, write_fake_llama_server, FIXTURE_EVENT_TIMEOUT,
+    };
+    use std::future::Future;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt as _;
@@ -890,8 +894,10 @@ mod tests {
                 threads: 1,
                 batch_threads: 1,
                 gpu_layers: 0,
-                health_timeout_ms: 2_000,
-                shutdown_timeout_ms: 250,
+                // Health and graceful exit end on the engine's own event; tests
+                // of the timeout paths set short windows explicitly.
+                health_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
+                shutdown_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
                 enable_thinking: false,
             },
             events,
@@ -907,7 +913,7 @@ mod tests {
     }
 
     fn wait_for_event(path: &std::path::Path, prefix: &str) {
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         while !event_lines(path)
             .iter()
             .any(|line| line.starts_with(prefix))
@@ -917,6 +923,50 @@ mod tests {
                 "missing fake engine event {prefix}"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn event_count(path: &std::path::Path, prefix: &str) -> usize {
+        event_lines(path)
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .count()
+    }
+
+    /// Runs `work` while the test, not Tokio, moves the paused clock: each step
+    /// waits until the fake engine has recorded `count` events starting with
+    /// `prefix`, then advances the clock past `by`. The runtime stays busy
+    /// meanwhile, so Tokio never auto-advances while a real engine process
+    /// starts or exits. Only the real-time hang guard is timed.
+    async fn with_engine_clock<T>(
+        work: impl Future<Output = T>,
+        events: &std::path::Path,
+        steps: &[(&str, usize, Duration)],
+    ) -> T {
+        // Tokio rounds timer deadlines up to its next millisecond tick.
+        const TIMER_TICK: Duration = Duration::from_millis(1);
+        let hang_guard = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
+        let drive = async {
+            for &(prefix, count, by) in steps {
+                while event_count(events, prefix) < count {
+                    assert!(
+                        StdInstant::now() < hang_guard,
+                        "missing fake engine event {prefix}; events {:?}",
+                        event_lines(events)
+                    );
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(by + TIMER_TICK).await;
+            }
+            loop {
+                assert!(StdInstant::now() < hang_guard, "engine work did not finish");
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = work => result,
+            _ = drive => unreachable!(),
         }
     }
 
@@ -1032,7 +1082,9 @@ mod tests {
             .await
             .unwrap();
         let pid = recorded_pid(&events);
-        let started = StdInstant::now();
+        // Measured on the paused Tokio clock, which moves only for timer waits.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
         {
             let mut owned = engines.engines.lock().await;
             owned.get_mut("offer").unwrap().shutdown_timeout = Duration::ZERO;
@@ -1045,6 +1097,7 @@ mod tests {
             assert!(retained.closing);
         }
         assert!(started.elapsed() < Duration::from_secs(1));
+        tokio::time::resume();
         assert!(engines.retains_artifacts().await);
         assert_eq!(
             engines.endpoint("offer", &engine, &model, &settings).await,
@@ -1078,7 +1131,7 @@ mod tests {
             .unwrap();
         let pid = recorded_pid(&events);
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         // Inject a real ECHILD wait failure by reaping outside Tokio's owner.
         // This is fault injection, not the production guard/group path.
         loop {
@@ -1176,7 +1229,7 @@ mod tests {
 
         let guard_exit = guard.kill().await; // Owned wait leaves child.id() == None.
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            FIXTURE_EVENT_TIMEOUT,
             finish_guard_shutdown(&mut guard, group, Duration::from_millis(100)),
         )
         .await;
@@ -1209,9 +1262,12 @@ mod tests {
             .unwrap();
         let pid = recorded_pid(&events);
         let owned = engines.engines.lock().await;
-        let started = StdInstant::now();
+        // Measured on the paused Tokio clock, which moves only for timer waits.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
         assert_eq!(engines.shutdown().await, Err(LocalLlamaFault::Timeout));
         assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::resume();
         assert_eq!(owned.get("offer").unwrap().child.id(), Some(pid as u32));
         drop(owned);
         engines.shutdown().await.unwrap();
@@ -1262,7 +1318,7 @@ mod tests {
 
         drop(engines);
 
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         while process_exists(pid) && StdInstant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1324,10 +1380,24 @@ mod tests {
         settings.health_timeout_ms = 300;
         settings.shutdown_timeout_ms = 100;
 
-        assert_eq!(
-            engines.endpoint("offer", &engine, &model, &settings).await,
-            Err(LocalLlamaFault::Timeout)
-        );
+        // The stale engine's readiness probe times out once its request hangs;
+        // the replacement's health times out only after it has started.
+        tokio::time::pause();
+        let replaced = with_engine_clock(
+            engines.endpoint("offer", &engine, &model, &settings),
+            &events,
+            &[
+                ("unresponsive", 1, HEALTH_REQUEST_TIMEOUT),
+                (
+                    "start:",
+                    2,
+                    Duration::from_millis(settings.health_timeout_ms),
+                ),
+            ],
+        )
+        .await;
+        tokio::time::resume();
+        assert_eq!(replaced, Err(LocalLlamaFault::Timeout));
 
         let pids: Vec<i32> = event_lines(&events)
             .into_iter()
@@ -1338,14 +1408,32 @@ mod tests {
         engines.shutdown().await.unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn health_timeout_forces_reap_when_child_ignores_termination() {
         let (engines, engine, model, mut settings, events) = fixture("timeout_ignore_term");
         settings.health_timeout_ms = 1_000;
         settings.shutdown_timeout_ms = 50;
 
+        // The engine ignores termination from its start record on: its health
+        // times out only then, and the forced reap follows the ignored signal.
         assert_eq!(
-            engines.endpoint("offer", &engine, &model, &settings).await,
+            with_engine_clock(
+                engines.endpoint("offer", &engine, &model, &settings),
+                &events,
+                &[
+                    (
+                        "start:",
+                        1,
+                        Duration::from_millis(settings.health_timeout_ms)
+                    ),
+                    (
+                        "term_ignored",
+                        1,
+                        Duration::from_millis(settings.shutdown_timeout_ms)
+                    ),
+                ],
+            )
+            .await,
             Err(LocalLlamaFault::Timeout)
         );
         let pid = recorded_pid(&events);
@@ -1422,12 +1510,14 @@ mod tests {
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
         let body = br#"{"object":"list","data":[{"id":"wrong-model"}]}"#;
-        write!(
+        // The readiness probe may give up first. Keep serving until stopped:
+        // a dead listener frees its port for another test's server, which the
+        // test's stop connect would then reach.
+        let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
-        .unwrap();
-        stream.write_all(body).unwrap();
+        .and_then(|()| stream.write_all(body));
     }
 }

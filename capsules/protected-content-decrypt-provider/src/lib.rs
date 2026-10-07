@@ -25,10 +25,7 @@ use sha2::{Digest as _, Sha256};
 mod support;
 
 pub const PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET: &str = "protected-content-decrypt";
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INIT_ERROR_CODE: &str = "invalid_config";
 const REQUEST_ERROR_CODE: &str = "invalid_request";
 const BACKEND_ERROR_CODE: &str = "backend_unavailable";

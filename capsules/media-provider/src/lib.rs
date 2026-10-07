@@ -14,10 +14,7 @@ use serde_json::{json, Value};
 
 const PROVIDER_ID: &str = "media-provider";
 const PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INIT_ERROR_CODE: &str = "invalid_config";
 const REQUEST_ERROR_CODE: &str = "invalid_request";
 const INTERNAL_ERROR_CODE: &str = "internal_error";
