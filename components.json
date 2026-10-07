@@ -1371,6 +1371,16 @@
         }
       }
     },
+    "crosvm": {
+      "install_path": "bin/crosvm",
+      "description": "crosvm VM monitor required for capsule microVM execution",
+      "platforms": {}
+    },
+    "vmlinux": {
+      "install_path": "bin/vmlinux",
+      "description": "ElastOS guest kernel (6.1.59, CONFIG_VIRTIO_CONSOLE=y) for crosvm capsule boot",
+      "platforms": {}
+    },
     "kubo": {
       "platforms": {
         "linux-amd64": {
@@ -1437,6 +1447,13 @@
     }
   },
   "profiles": {
+    "minimal": {
+      "description": "Runtime VM prerequisites only",
+      "components": [
+        "crosvm",
+        "vmlinux"
+      ]
+    },
     "home": {
       "description": "Managed Home",
       "components": [
@@ -1713,6 +1730,8 @@
         "inbox",
         "assistant",
         "model-provider",
+        "crosvm",
+        "vmlinux",
         "kubo",
         "cloudflared",
         "llama-server"

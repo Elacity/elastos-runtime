@@ -12,10 +12,11 @@ All notable changes to the public ElastOS Runtime repository.
   `fetch-model.sh` and their tests. Models return later as a separate signed
   publication.
 
-- Setup no longer offers `crosvm` or a guest kernel, and the `minimal` profile is
-  gone. Their pinned bytes were unavailable, and a release cannot sign a
-  component that is not a release file. Release preparation now refuses any
-  component pinned only by CID, before signing.
+- This release publishes `crosvm` and the guest kernel for no platform, so
+  microVM capsules are not available in it; setup skips them and the supervisor
+  says so. Their pinned bytes were unavailable and could not be signed. Release
+  preparation now refuses a checksummed component CID without a release file,
+  before signing.
 
 ### Fixed
 

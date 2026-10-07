@@ -427,7 +427,10 @@ async fn run_with_data_dir(
         let platform_info = match platform_info {
             Some(info) => info,
             None => {
-                println!("[skip] {} — not available for {}", name, platform);
+                println!(
+                    "[skip] {} — not available for {} in this release",
+                    name, platform
+                );
                 skipped_count += 1;
                 continue;
             }
@@ -2538,7 +2541,7 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     print_profile_section(
         "Advanced profiles:",
         manifest,
-        &["public-gateway", "agent-local-ai", "full"],
+        &["minimal", "public-gateway", "agent-local-ai", "full"],
     );
 
     let listed = [
@@ -2546,6 +2549,7 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
         "demo",
         "blockchain",
         "operator",
+        "minimal",
         "public-gateway",
         "agent-local-ai",
         "full",
@@ -6671,16 +6675,19 @@ pub(crate) mod tests {
             admit_release_components(&manifest, platform)
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }
-        // The signer binds every pinned component to a release file, so no
-        // descriptor may name bytes only by CID.
-        for (name, component) in &manifest.external {
-            for (platform, info) in &component.platforms {
-                assert!(
-                    info.cid.as_deref().is_none_or(str::is_empty)
-                        || info.release_path.as_deref().is_some_and(|p| !p.is_empty()),
-                    "{name} {platform}: CID-only descriptor cannot be signed"
-                );
+        // This release publishes the microVM pieces for no platform: the
+        // profiles that name them still resolve, setup skips them, and Home
+        // never selects them.
+        let home = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
+        for name in ["crosvm", "vmlinux"] {
+            assert!(!home.iter().any(|selected| selected == name));
+            for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
+                assert!(resolve_platform_info(&manifest.external[name], platform).is_none());
             }
+        }
+        for profile in ["minimal", "full"] {
+            let selected = resolve_components(&manifest, Some(profile), &[], &[]).unwrap();
+            assert!(selected.iter().any(|name| name == "vmlinux"));
         }
     }
 

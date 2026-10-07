@@ -266,7 +266,9 @@ export function validateComponents(components, manifests) {
   for (const name of ["gba-emulator", "gba-ucity"]) assert(!home.includes(name) && components.profiles.demo.components.includes(name), `${name}: demo profile placement`);
   same(Object.entries(components.profiles).filter(([, profile]) => profile.components.includes("custody-provider")).map(([name]) => name).sort(), ["blockchain", "full"], "Custody profile placement");
   for (const [name, component] of Object.entries(components.external)) {
-    assert(object(component.platforms) && Object.keys(component.platforms).length > 0, `${name}: release platforms`);
+    // microVM pieces publish no platform until signed, artifact-backed bytes exist.
+    const unreleased = ["crosvm", "vmlinux"].includes(name);
+    assert(object(component.platforms) && (unreleased || Object.keys(component.platforms).length > 0), `${name}: release platforms`);
     for (const [platform, metadata] of Object.entries(component.platforms)) {
       assert(object(metadata), `${name}: ${platform} metadata`);
       present(metadata.release_path, `${name}: ${platform} release path`);
