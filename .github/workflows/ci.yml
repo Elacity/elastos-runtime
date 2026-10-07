@@ -842,9 +842,9 @@ jobs:
             > "$CI_HOP_ROOT/generation.json"
       - name: prove installed Home account and System update with Carrier hop and refusals
         # Expected about 20 minutes. The Home journey's waits are capped at: sign-up 240 s,
-        # old System refusal 330 s, CLI update 300 s, 3 Home starts x 150 s, 3 reconnects
-        # x 420 s (CLI update, next release, Undo), tampered refusal 330 s, Undo commands
-        # 2 x 300 s: 59 minutes in the worst case, plus the CLI installs and refusals.
+        # the published release's System update 480 s, 2 Home starts x 150 s, 2 reconnects
+        # x 420 s (next release, Undo), tampered refusal 330 s, Undo commands 2 x 300 s:
+        # 47 minutes in the worst case, plus the CLI installs and refusals.
         timeout-minutes: 75
         env:
           ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal

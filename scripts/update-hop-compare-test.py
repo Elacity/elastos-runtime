@@ -1712,20 +1712,21 @@ class CliFixtureTests(unittest.TestCase):
         manager.spawn.assert_not_called()
 
     def test_published_home_needs_its_own_disk_reserve_before_it_starts(self):
-        # The published release starts Home without its update controller below 15% free;
-        # the journey refuses plainly instead of waiting for a controller that never comes.
+        # The published release starts Home without its update controller unless its Runtime
+        # copy and receipt fit with a fixed 2 GiB kept free, whatever the volume size; the
+        # journey refuses plainly instead of waiting for a controller that never comes.
         home, _, _, _, _, _, _ = self.initial_home_fixture()
         manifest = {**self.manifest, "previous": {}}
-        binary = (home / ".local/bin/elastos").stat().st_size
-        for free, refused in ((150 * 1024**2, True), (150 * 1024**2 + binary, False)):
-            with self.subTest(free=free):
-                manager = SimpleNamespace(roots={}, spawn=unittest.mock.Mock(side_effect=RuntimeError("spawned")))
-                with patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=1000 * 1024**2, free=free)), \
-                     patch.object(observer, "cli_port_released"), \
-                     self.assertRaisesRegex(Exception, "below the published release's 15% reserve" if refused else "spawned"):
-                    observer.cli_initial_home(manager, manifest, home)
-                self.assertEqual(manager.spawn.called, not refused)
-        self.assertEqual(observer.cli_published_reserve(1001), 151)
+        enough = (home / ".local/bin/elastos").stat().st_size + 256 * 1024 + 2 * 1024**3
+        for total in (8 * 1024**3, 1000 * 1024**3):
+            for free, refused in ((enough - 1, True), (enough, False)):
+                with self.subTest(total=total, free=free):
+                    manager = SimpleNamespace(roots={}, spawn=unittest.mock.Mock(side_effect=RuntimeError("spawned")))
+                    with patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=total, free=free)), \
+                         patch.object(observer, "cli_port_released"), \
+                         self.assertRaisesRegex(Exception, "plus its 2 GB reserve" if refused else "spawned"):
+                        observer.cli_initial_home(manager, manifest, home)
+                    self.assertEqual(manager.spawn.called, not refused)
 
     def test_initial_home_failure_paths_stop_owner_and_retain_refusals(self):
         home, directory, _, status, identities, _, _ = self.initial_home_fixture()
@@ -2104,26 +2105,47 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual([path.name for path in cache.iterdir()], [pin["release_sha256"]])
         self.assertEqual(reads, [release, "/ipfs/Qmbinary", "/ipfs/Qmbinary"])
 
-    def test_check_result_requires_the_published_start_no_new_provider_warnings_and_undo(self):
-        def result():
+    def test_check_result_requires_the_published_system_update_no_new_provider_warnings_and_undo(self):
+        def result(pinned="0.8.0-alpha.8"):
             return {"schema": "elastos.update-hop.result/v1", "status": "passed",
-                    "old": {"version": "0.8.0-alpha.6"}, "new": {"version": "0.8.0-alpha.7"},
-                    "previous_release": {"version": "0.8.0-alpha.6"},
+                    "old": {"version": pinned}, "new": {"version": "0.8.0-alpha.9"},
+                    "previous_release": {"version": pinned},
                     "paths": {"m1-install": {"checks": {"initial-home": {
-                        "system": {"provider_warnings": {"new": []}, "frozen_support": {"phase": "restored"},
-                                   "cli_update": {"status": "passed"}},
-                        "undo": {"status": "passed", "version": "0.8.0-alpha.6",
+                        "system": {"provider_warnings": {"new": []},
+                                   "published_system": {"phase": "updated", "from": pinned, "to": "0.8.0-alpha.9"}},
+                        "undo": {"status": "passed", "version": pinned,
                                  "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}}}}
-        self.assertEqual(observer.cli_check_result(result())["from"], "0.8.0-alpha.6")
+        self.assertEqual(observer.cli_check_result(result())["from"], "0.8.0-alpha.8")
+        # From 0.8.0-alpha.7 on, a published System installs changed support (#246), by version
+        # precedence rather than text; an older pin cannot pass the journey at all.
+        for pinned, installs in (("0.8.0-alpha.7", True), ("0.8.0-alpha.10", True), ("0.8.0", True),
+                                 ("0.8.0-alpha.6", False), ("0.7.9", False)):
+            with self.subTest(pinned=pinned):
+                if installs:
+                    self.assertEqual(observer.cli_check_result(result(pinned))["from"], pinned)
+                else:
+                    with self.assertRaisesRegex(ValueError, "cannot install changed support from System"):
+                        observer.cli_check_result(result(pinned))
         home = lambda value: value["paths"]["m1-install"]["checks"]["initial-home"]  # noqa: E731
+
+        # What alpha.6 recorded: its System refused changed support and kept Home, then its CLI
+        # updated. For an alpha.8 pin that is a failure, whether recorded that way or as a restore.
+        alpha6 = result()
+        home(alpha6)["system"].pop("published_system")
+        home(alpha6)["system"].update(frozen_support={"phase": "restored", "version": "0.8.0-alpha.8", "kept_home": True},
+                                      cli_update={"status": "passed"})
+        restored = result()
+        home(restored)["system"]["published_system"].update(phase="restored", to="0.8.0-alpha.8")
+        for value in (alpha6, restored):
+            with self.assertRaisesRegex(ValueError, "System did not install the release with changed support"):
+                observer.cli_check_result(value)
         faults = {"failed run": lambda value: value.update(status="failed", failure="System did not update"),
                   "new provider warning": lambda value: home(value)["system"]["provider_warnings"].update(new=["provider refused"]),
                   "same-build hop": lambda value: value.pop("previous_release"),
-                  "other old release": lambda value: value["old"].update(version="0.8.0-alpha.5"),
+                  "other old release": lambda value: value["old"].update(version="0.8.0-alpha.7"),
                   "no Undo": lambda value: home(value).pop("undo"),
-                  # alpha.6's System applying changed support would hide the known limit; record it.
-                  "published System applied changed support": lambda value: home(value)["system"]["frozen_support"].update(phase="updated"),
-                  "no CLI update from the published release": lambda value: home(value)["system"].pop("cli_update"),
+                  "published System installed another release": lambda value: home(value)["system"]["published_system"].update(to="0.8.0-alpha.10"),
+                  "Undo to another release": lambda value: home(value)["undo"].update(version="0.8.0-alpha.7"),
                   "plain downgrade applied": lambda value: home(value)["undo"]["refused_plain_update"].update(exit=0)}
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
