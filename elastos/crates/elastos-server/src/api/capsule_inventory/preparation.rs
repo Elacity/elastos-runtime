@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::api::gateway::HomeLaunchTokenContext;
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
+use crate::host_lock::FileLock;
 
 mod storage;
 use storage::Inventory;
@@ -1137,7 +1138,7 @@ async fn activate_admitted_model(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    worker: &std::fs::File,
+    worker: &FileLock,
 ) -> anyhow::Result<()> {
     let record = load_operation(data_dir, operation)?;
     if record.state != PreparationState::Admitted {
@@ -1601,7 +1602,7 @@ async fn prepare_capacity(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    _worker: &std::fs::File,
+    _worker: &FileLock,
 ) -> anyhow::Result<bool> {
     for _ in 0..=MAX_RECORDS {
         revalidate()?;
@@ -2644,7 +2645,7 @@ pub async fn append_admitted_model_startup_offers(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-) -> anyhow::Result<Option<std::fs::File>> {
+) -> anyhow::Result<Option<FileLock>> {
     // A Home without preparation inventory keeps its operator offers unchanged.
     match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2706,7 +2707,7 @@ pub async fn settle_pending_model_startup(
     data_dir: &Path,
     bridge: &elastos_runtime::provider::ProviderBridge,
     config: &elastos_runtime::provider::BridgeProviderConfig,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2768,7 +2769,7 @@ pub async fn settle_pending_model_startup(
 pub async fn complete_admitted_model_startup(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2816,7 +2817,7 @@ async fn append_admitted_model_offers_locked(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-    _worker: &std::fs::File,
+    _worker: &FileLock,
 ) -> anyhow::Result<()> {
     let snapshot = Inventory::open(data_dir, false)?.load()?;
     if !snapshot
@@ -5632,7 +5633,7 @@ mod tests {
                 };
                 let (result, ()) = tokio::join!(init, during_init);
                 assert_eq!(result.is_err(), busy);
-                // Startup's caller owns this File until the Init result is handled.
+                // Startup's caller owns this guard until the Init result is handled.
                 assert!(Inventory::open(root.path(), false)
                     .unwrap()
                     .worker_lock()
