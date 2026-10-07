@@ -1656,6 +1656,33 @@ function launchReconciliationRecordIsSafe(record) {
   );
 }
 
+function normalizeTerminalVzLaunchAcquisition(record) {
+  if (
+    record?.state !== LAUNCH_SETTLEMENT_TERMINAL ||
+    record.effects?.page_acquired !== false ||
+    record.cleanup_binding !== undefined ||
+    record.terminal_cleanup_receipt !== undefined ||
+    !launchReconciliationRecordIsSafe(record)
+  ) {
+    return record;
+  }
+  try {
+    const native = validateVzLaunchSettlementForLaunch(
+      record.launch_settlement_result,
+      record.launch,
+    );
+    if (native.state !== LAUNCH_SETTLEMENT_TERMINAL) return record;
+  } catch {
+    return record;
+  }
+  // Native effects are may-have-acted markers. Exact terminal absence proves
+  // this failed launch retained neither a page binding nor a VM acquisition.
+  return {
+    ...record,
+    effects: { ...record.effects, page_acquired: false, vm_acquired: false },
+  };
+}
+
 function durableLaunchReconciliationRecord(record) {
   const durable = {
     schema: record.schema,
@@ -1858,7 +1885,7 @@ function recordLaunchReconciliation(
   ) {
     next.profile_durability = current.profile_durability;
   }
-  launchReconciliations.set(key, next);
+  launchReconciliations.set(key, normalizeTerminalVzLaunchAcquisition(next));
   try {
     persistLaunchReconciliations(launchReconciliationStore);
   } catch (error) {
@@ -2067,11 +2094,14 @@ async function reconcileLaunch(launchReconciliationStore, activePages, body, shu
     record,
     shutdownTimeoutMs,
   );
+  // Project old terminal records for consumers without changing retained
+  // journal evidence or the in-memory record loaded from it.
+  const response = normalizeTerminalVzLaunchAcquisition(settled || record);
   return {
-    ...(settled || record),
+    ...response,
     responder_control_service: launchReconciliationStore.control_service,
-    ...((settled || record).launch?.transport_authority
-      ? { transport_authority: (settled || record).launch.transport_authority }
+    ...(response.launch?.transport_authority
+      ? { transport_authority: response.launch.transport_authority }
       : {}),
   };
 }
@@ -3330,8 +3360,7 @@ function recordProvenLaunchFailure(
               ? { page_acquired: null, vm_acquired: null }
             : {
                 page_acquired: false,
-                vm_acquired:
-                  error?.vz_launch_settlement?.effects?.vm ?? true,
+                vm_acquired: true,
               },
         ...(error?.vz_launch_settlement
           ? {
