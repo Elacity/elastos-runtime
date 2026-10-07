@@ -19,10 +19,7 @@ const GRAPH_ENCODING: &str = "base64-car";
 const DEFAULT_MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct CoordFile {

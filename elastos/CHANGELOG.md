@@ -12,6 +12,11 @@ All notable changes to the public ElastOS Runtime repository.
   `fetch-model.sh` and their tests. Models return later as a separate signed
   publication.
 
+- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
+
 ### Fixed
 
 - Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and

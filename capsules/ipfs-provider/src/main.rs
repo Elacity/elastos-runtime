@@ -105,10 +105,7 @@ fn deserialize_metadata_max<'de, D: serde::Deserializer<'de>>(
     u64::deserialize(deserializer).map(Some)
 }
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Protocol types ──────────────────────────────────────────────────
 
