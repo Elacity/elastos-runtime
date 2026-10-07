@@ -878,7 +878,40 @@ pub fn verify_installed_component_binary(
                 manifest_path.display()
             )
         })?;
-    if !file_matches_checksum(path, checksum)? {
+    if platform_info.extract_path.is_some() {
+        // An archive's checksum names the signed archive, not the binary extracted from
+        // it: trust the install receipt of that archive, as the supervisor does.
+        let receipt_dir = install_root.join("capsules").join(name);
+        let receipt = read_artifact_sha256_receipt(&receipt_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot verify installed component '{}': failed to read archive receipt in {}: {}",
+                name,
+                receipt_dir.display(),
+                e
+            )
+        })?;
+        if receipt != bare_sha256(checksum) {
+            anyhow::bail!(
+                "installed component '{}' archive receipt in {} differs from {}",
+                name,
+                receipt_dir.display(),
+                manifest_path.display()
+            );
+        }
+        let metadata = fs::metadata(path).ok().filter(fs::Metadata::is_file);
+        #[cfg(unix)]
+        let metadata = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.filter(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        };
+        if metadata.is_none() {
+            anyhow::bail!(
+                "installed component '{}' at {} is not an executable file",
+                name,
+                path.display()
+            );
+        }
+    } else if !file_matches_checksum(path, checksum)? {
         anyhow::bail!(
             "installed component '{}' at {} failed checksum verification against {}",
             name,
@@ -6503,6 +6536,56 @@ pub(crate) mod tests {
 
         let result = verify_installed_component_binary(data_dir, "shell", &install_path).unwrap();
         assert_eq!(result, checksum);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_installed_component_binary_uses_archive_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let platform = detect_platform();
+        let install_path = data_dir.join("bin/kubo");
+        let capsule_dir = data_dir.join("capsules/kubo");
+        fs::create_dir_all(install_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&capsule_dir).unwrap();
+        let checksum = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"kubo-archive"))
+        );
+        fs::write(
+            data_dir.join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {"kubo": {"platforms": {platform: {
+                    "release_path": "kubo.tar.gz", "extract_path": "kubo/ipfs",
+                    "install_path": "bin/kubo", "checksum": checksum.clone()
+                }}}},
+                "capsules": {},
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A fresh install: the extracted binary plus the receipt of the signed archive.
+        fs::write(&install_path, b"extracted ipfs").unwrap();
+        fs::set_permissions(&install_path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_artifact_sha256_receipt(&capsule_dir, &checksum).unwrap();
+        assert_eq!(
+            verify_installed_component_binary(data_dir, "kubo", &install_path).unwrap(),
+            checksum
+        );
+
+        write_artifact_sha256_receipt(&capsule_dir, &"0".repeat(64)).unwrap();
+        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
+        fs::remove_file(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE)).unwrap();
+        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
+
+        write_artifact_sha256_receipt(&capsule_dir, &checksum).unwrap();
+        fs::set_permissions(&install_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
+        fs::remove_file(&install_path).unwrap();
+        assert!(verify_installed_component_binary(data_dir, "kubo", &install_path).is_err());
     }
 
     #[test]
