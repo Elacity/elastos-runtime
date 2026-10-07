@@ -37,6 +37,31 @@ def fixture_environment():
     return environment
 
 
+def link_tree(source, target):
+    """Hard-link copy of a tree (same bytes, no space): a safe place to tamper with a toolchain or rootfs."""
+    for directory, dirnames, filenames in os.walk(source):
+        rel = os.path.relpath(directory, source)
+        dest = os.path.join(target, rel) if rel != "." else target
+        os.makedirs(dest, exist_ok=True)
+        os.chmod(dest, os.lstat(directory).st_mode & 0o7777)
+        for name in dirnames + filenames:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                os.symlink(os.readlink(path), os.path.join(dest, name))
+            elif os.path.isfile(path):
+                try:
+                    os.link(path, os.path.join(dest, name))
+                except OSError:  # another filesystem: copy instead
+                    shutil.copy2(path, os.path.join(dest, name))
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(directory, d))]
+
+
+def replace_file(path, content):
+    """Replace a (possibly hard-linked) file with new content without touching the original."""
+    os.unlink(path)
+    Path(path).write_bytes(content)
+
+
 def package(name, extra=""):
     return textwrap.dedent("""\
         [package]
@@ -48,7 +73,7 @@ def package(name, extra=""):
 
 FILES = {
     ".gitignore": "target/\n",
-    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking"]\nresolver = "2"\n',
+    "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing"]\nresolver = "2"\n',
     "ws/app/Cargo.toml": package("app", textwrap.dedent("""\
         [dependencies]
         dep = { path = "../../dep" }
@@ -73,6 +98,15 @@ FILES = {
         }
         """),
     "ws/ticking/src/main.rs": 'fn main() { println!("{}", env!("BUILD_STAMP")); }\n',
+    # A build script that reads host CPU facts: bytes may follow the producer's CPU.
+    "ws/probing/Cargo.toml": package("probing", "build = \"build.rs\"\n"),
+    "ws/probing/build.rs": textwrap.dedent("""\
+        fn main() {
+            let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+            println!("cargo:rustc-env=PROBE_FLAGS={}", info.lines().filter(|l| l.starts_with("flags")).count());
+        }
+        """),
+    "ws/probing/src/main.rs": 'fn main() { println!("{}", env!("PROBE_FLAGS")); }\n',
     "pm/Cargo.toml": package("pm", "[lib]\nproc-macro = true\n"),
     # Round-2 bypass: aliased std::fs read at expansion time.
     "pm/src/lib.rs": textwrap.dedent("""\
@@ -218,7 +252,7 @@ class HermeticTests(unittest.TestCase):
         self.assertEqual(self.final(receipt, 0), self.final(receipt, 1))
         self.assertTrue(receipt["reusable"])
         self.assertEqual(sorted(receipt["document"]["trees"]),
-                         ["dep", "plain", "pm", "ws/app", "ws/macro-user", "ws/other", "ws/ticking"])
+                         ["dep", "plain", "pm", "ws/app", "ws/macro-user", "ws/other", "ws/probing", "ws/ticking"])
         self.assertNotIn("generated", receipt["document"])
         again, _ = self.produce(profile="release", key_only=True)
         self.assertEqual(key, again)
@@ -309,14 +343,123 @@ class HermeticTests(unittest.TestCase):
         self.assertEqual(sorted(inside), sorted(os.listdir(rootfs / "etc")))
         self.assertNotEqual(sorted(inside), sorted(os.listdir("/etc")))
         key, receipt = self.produce(key_only=True)
-        self.assertEqual(receipt["document"]["sandbox"]["sysroot"],
-                         json.loads((rootfs / HERMETIC.SYSROOT_SEAL).read_text())["image"])
+        seal = json.loads((rootfs / HERMETIC.SYSROOT_SEAL).read_text())
+        self.assertEqual(receipt["document"]["sandbox"]["sysroot"], {"image": seal["image"], "digest": seal["digest"]})
         marker = rootfs / "etc" / "zq7-marker"
         marker.write_text("drift")
         self.addCleanup(marker.unlink)
         miss, reason = self.produce(key_only=True)
         self.assertIsNone(miss)
         self.assertIn("drifted from its seal", reason)
+
+    def test_toolchain_is_exposed_minimally_and_keyed_by_content(self):
+        real = Path(HERMETIC.sh(["rustc", "--print", "sysroot"], cwd=self.root / "ws", env=self.env).stdout.strip()).resolve()
+        rustup = Path(os.path.realpath(self.env.get("RUSTUP_HOME") or Path.home() / ".rustup"))
+        copy = Path(self.scratch.name) / "rustup-copy"
+        link_tree(real, copy / "toolchains" / real.name)
+        shutil.copyfile(rustup / "settings.toml", copy / "settings.toml")
+        (copy / "zq7-marker").write_text("host rustup state")
+        env = {"RUSTUP_HOME": str(copy)}
+        key, receipt = self.produce(key_only=True, env=env)
+        self.assertIsNotNone(key, receipt)
+        self.assertEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(copy / "toolchains" / real.name))
+        self.assertEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(real))
+        listing = self.probe(lambda paths: ["sh", "-c", "ls -A %s && cat %s/../../zq7-marker 2>&1; true"
+                                            % (paths["toolchain"], paths["toolchain"])], env=env)
+        self.assertIn("bin", listing)
+        self.assertNotIn("host rustup state", listing)
+        target = copy / "toolchains" / real.name / "lib" / "rustlib" / "components"
+        replace_file(target, target.read_bytes() + b"zq7\n")
+        changed, receipt = self.produce(key_only=True, env=env)
+        self.assertNotEqual(key, changed)
+        self.assertNotEqual(receipt["document"]["toolchain"]["digest"], HERMETIC.tree_digest(real))
+
+    def test_registry_index_is_minimal_and_keyed_by_content(self):
+        cargo_home = Path(self.env["CARGO_HOME"])
+        arbitrary = cargo_home / "registry" / "index" / "arbitrary"
+        arbitrary.mkdir(parents=True)
+        (arbitrary / "config.json").write_text('{"dl": "http://zq7.invalid"}')
+        self.addCleanup(shutil.rmtree, arbitrary)
+        key, receipt = self.produce(key_only=True)
+        self.assertIsNotNone(key, receipt)
+        index = receipt["document"]["index"]
+        real = next(cargo_home.glob("registry/index/index.*"))
+        self.assertEqual(index["index"], real.name)
+        self.assertEqual(index["config"], HERMETIC.sha256_path(real / "config.json"))
+        self.assertEqual(sorted(n.split("@")[0] for n in index["entries"]), ["cfg-if", "either"])
+        listing = self.probe(lambda paths: ["sh", "-c", "ls -A %s/registry/index && find %s/registry/index -type f"
+                                            % (paths["cargo"], paths["cargo"])])
+        self.assertNotIn("arbitrary", listing)
+        self.assertEqual(sorted(Path(l).name for l in listing.split("\n") if "/" in l), ["cfg-if", "config.json", "either"])
+        config = real / "config.json"
+        original = config.read_bytes()
+        config.write_bytes(original.replace(b"}", b", \"zq7\": 1}"))
+        self.addCleanup(config.write_bytes, original)
+        changed, _ = self.produce(key_only=True)
+        self.assertNotEqual(key, changed)
+        entry = real / ".cache" / HERMETIC.index_cache_path("cfg-if")
+        original_entry = entry.read_bytes()
+        line = HERMETIC.index_entry_line(entry, next(n.split("@")[1] for n in index["entries"] if n.startswith("cfg-if@")))
+        entry.write_bytes(original_entry.replace(line, line.replace(b'"cksum":"', b'"cksum":"0000')))
+        self.addCleanup(entry.write_bytes, original_entry)
+        miss, reason = self.produce(key_only=True)
+        self.assertIsNone(miss)
+        # cargo fetch --locked notices first; the staging check is the backstop
+        self.assertTrue("checksum" in reason or "cksum" in reason, reason)
+
+    @unittest.skipUnless(LINUX, "pinned sysroot images are a Linux producer feature")
+    def test_sysroot_key_follows_sealed_content(self):
+        copy = Path(self.scratch.name) / "sysroot-copy"
+        link_tree(Path(SYSROOT), copy)
+        (copy / HERMETIC.SYSROOT_SEAL).unlink()
+        HERMETIC.seal_sysroot(copy, "sha256:test")
+        key, receipt = self.produce(key_only=True, sysroot=str(copy))
+        self.assertIsNotNone(key, receipt)
+        self.assertEqual(receipt["document"]["sandbox"]["sysroot"]["digest"],
+                         json.loads((copy / HERMETIC.SYSROOT_SEAL).read_text())["digest"])
+        probe = copy / "etc" / "passwd"
+        replace_file(probe, b"zq7\n")
+        HERMETIC.seal_sysroot(copy, "sha256:test")
+        resealed, _ = self.produce(key_only=True, sysroot=str(copy))
+        self.assertNotEqual(key, resealed)
+        os.chmod(probe, 0o600)
+        miss, reason = self.produce(key_only=True, sysroot=str(copy))
+        self.assertIsNone(miss)
+        self.assertIn("drifted from its seal", reason)
+        HERMETIC.seal_sysroot(copy, "sha256:test")
+        remoded, _ = self.produce(key_only=True, sysroot=str(copy))
+        self.assertNotEqual(resealed, remoded)
+        (copy / "etc" / "zq7-empty").mkdir()
+        miss, reason = self.produce(key_only=True, sysroot=str(copy))
+        self.assertIn("drifted from its seal", reason)
+
+    def test_host_cpu_flags_are_refused_and_target_cfg_keyed(self):
+        for flags in ("-C target-cpu=native", "-Ctarget-feature=+avx2", "--codegen target-cpu=haswell"):
+            key, reason = self.produce(key_only=True, env={"RUSTFLAGS": flags})
+            self.assertIsNone(key, flags)
+            self.assertIn("host-CPU codegen flags are not allowed", reason)
+        self.write("ws/.cargo/config.toml", '[build]\nrustflags = ["-C", "target-cpu=native"]\n')
+        self.commit("native cpu in config")
+        key, reason = self.produce(key_only=True)
+        self.assertIsNone(key)
+        self.assertIn("target-cpu=native", reason)
+        self.git(self.root, "reset", "-q", "--hard", "HEAD~1")
+        key, receipt = self.produce(key_only=True)
+        self.assertIsNotNone(key, receipt)
+        cfg = receipt["document"]["target_cfg"]
+        self.assertTrue(any(line.startswith("target_arch=") for line in cfg), cfg)
+        self.assertTrue(any(line.startswith("target_feature=") for line in cfg), cfg)
+        if LINUX:
+            self.assertEqual(self.probe(lambda paths: ["cat", "/proc/cpuinfo"]), "processor\t: 0\nflags\t\t:\n")
+
+    def test_build_time_cpu_detection_is_not_reusable(self):
+        key, receipt = self.produce(package="probing", profile="release")
+        self.assertIsNotNone(key, receipt)
+        self.assertEqual(receipt["cpu_detection"], ["probing"])
+        self.assertFalse(receipt["reusable"])
+        self.assertEqual(self.final(receipt, 0), self.final(receipt, 1))
+        _, plain = self.produce(key_only=True)
+        self.assertEqual(plain["cpu_detection"], [])
 
     def test_existing_output_dir_is_refused(self):
         options = self.options(single=True)

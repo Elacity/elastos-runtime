@@ -5,50 +5,62 @@ The unit (package, kind bin|lib|test, target triple, profile, features,
 version layer) is built from a clean checkout of HEAD (git archive: no
 untracked or ignored file exists) inside a sandbox whose whole world is:
 
-  /build/src     the exposed part of the checkout, read-only: the path
-                 packages of the unit's workspace resolve, their declared
-                 edges (scripts/build-key-edges.json), workspace manifest,
-                 lock and .cargo configs, rust-toolchain.toml, and the root
-                 manifests of foreign workspaces that path dependencies
-                 inherit from
-  /build/cargo   a cargo home staged for this build only: the proxies, the
-                 index entries of the lock, the closure's .crate files each
-                 verified against its Cargo.lock sha256 and unpacked from
-                 that archive, git dependencies at their locked revision
-                 (clean checkouts verified with git)
-  /build/rustup  the rustup home, read-only (identified by rustc -vV)
-  /usr /etc ...  on Linux a pinned sysroot image (its id and tree digest are
-                 verified and keyed), never the host; on macOS the system
-                 and Xcode, identified by SDK/Xcode/clang versions
-  /build/out     the only writable output; must not exist beforehand
-  /build/home    a fresh empty HOME; /tmp a fresh tmpfs; no network
+  /build/src        the exposed part of the checkout, read-only: the path
+                    packages of the unit's workspace resolve, their declared
+                    edges (scripts/build-key-edges.json), workspace manifest,
+                    lock and .cargo configs, rust-toolchain.toml, and the
+                    root manifests of foreign workspaces that path
+                    dependencies inherit from
+  /build/cargo      a cargo home staged for this build only: the index
+                    config and the index entries of the lock's packages
+                    (each must carry the locked checksum), the closure's
+                    .crate files each verified against its Cargo.lock sha256
+                    and unpacked from that archive, git dependencies at their
+                    locked revision (clean checkouts verified with git)
+  /build/toolchain  only the pinned toolchain directory (rustc --print
+                    sysroot), read-only, keyed by a content digest of every
+                    file, mode and symlink
+  /usr /etc ...     on Linux a sealed rootfs of the pinned image, never the
+                    host: its content digest is verified every run and keyed;
+                    /proc/cpuinfo is masked. On macOS the system and Xcode,
+                    identified by SDK/Xcode/clang versions
+  /build/out        the only writable output; must not exist beforehand
+  /build/home       a fresh empty HOME; /tmp a fresh tmpfs; no network
 
 The environment is cleared to an allowlist whose names and values are key
-fields. Paths inside the sandbox are canonical, so CARGO_MANIFEST_DIR,
-OUT_DIR, file!() and panic locations never depend on where the host keeps
-its checkout. Anything else does not exist for the build: an undeclared
-read fails it (a miss) or cannot influence it.
+fields; -C target-cpu / -C target-feature anywhere (env or .cargo config)
+are refused unless allowlisted, and the effective target cfg (rustc --print
+cfg with the allowed flags) is keyed. Paths inside the sandbox are
+canonical, so CARGO_MANIFEST_DIR, OUT_DIR, file!() and panic locations
+never depend on where the host keeps its checkout. Anything else does not
+exist for the build: an undeclared read fails it (a miss) or cannot
+influence it.
 
 Key = sha256 of canonical JSON: git tree ids of every exposed path package,
 blob ids of the exposed root files and edges, the lock slice of the unit's
-closure with resolved features, the allowlisted environment, rustc/cargo
-identity, the edges map blob and the sandbox identity (canonical paths,
-sysroot image, exposed set). It needs no build (--key-only).
+closure with resolved features, the staged index content, the allowlisted
+environment, the toolchain digest, the target cfg, the edges map blob and
+the sandbox identity (canonical paths, sysroot digest, exposed set). It
+needs no build (--key-only).
 
 A producer builds twice in two fresh sandboxes; the unit is reusable only
-when both builds give byte-identical final artifacts. Both digests go into
-the receipt. Dep-info discovery stays available as a diagnostic
-(--diagnose). Exit 3 = miss.
+when both builds give byte-identical final artifacts and no build script in
+the closure reads host CPU facts (cpu_detection in the receipt). Both
+digests go into the receipt. Dep-info discovery stays available as a
+diagnostic (--diagnose). Exit 3 = miss.
 
-  build-hermetic.py seal-sysroot DIR --image sha256:...   record a sysroot
+  build-hermetic.py make-sysroot DIR     docker build/export/seal the image
+  build-hermetic.py seal-sysroot DIR --image ID
 """
 import argparse
 import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -68,7 +80,7 @@ ROOT_FILES = ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", ".cargo/config")
 REPO_FILES = (".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain")
 SYSROOT_SEAL = ".hermetic-sysroot.json"
 LINUX_PATHS = {"src": "/build/src", "out": "/build/out", "home": "/build/home", "cargo": "/build/cargo",
-               "rustup": "/build/rustup"}
+               "toolchain": "/build/toolchain"}
 DARWIN_WORK = "/private/tmp/elastos-hermetic"
 
 
@@ -79,14 +91,6 @@ def sh(args, cwd=None, env=None, check=True):
         raise Miss("%s failed (%d): %s" % (" ".join(map(str, args[:3])), done.returncode,
                                            done.stderr.strip()[-3000:]))
     return done
-
-
-def proxies():
-    """Directory of the cargo/rustc proxies on PATH (rustup's ~/.cargo/bin)."""
-    cargo = shutil.which("cargo")
-    if cargo is None:
-        raise Miss("cargo not found on PATH")
-    return Path(os.path.realpath(cargo)).parent
 
 
 def sha256_path(path):
@@ -190,7 +194,7 @@ def index_cache_path(name):
 class Plan:
     """Everything the sandbox exposes and the key covers."""
 
-    def __init__(self, unit, repo, commit, src, edges_rel, environ):
+    def __init__(self, unit, repo, commit, src, edges_rel, environ, host_cargo):
         self.unit = unit
         self.repo = repo
         self.commit = commit
@@ -240,17 +244,23 @@ class Plan:
         # The resolver validates the whole workspace lock offline: it needs
         # index entries for every registry package and the git database of
         # every git package; only the closure's .crate files are unpacked.
-        self.registry = {}
+        closure_crates = set()
+        self.build_scripts = {}   # package name -> build script source on the host
         for package_id in self.closure:
             package = packages[package_id]
             source = package["source"]
-            if source is None:
-                continue
-            if source.startswith("registry+"):
-                self.registry[package["name"] + "-" + package["version"]] = self.lock[normalized_id(package, src)]
-            elif not source.startswith("git+"):
+            if source is not None and not source.startswith(("registry+", "git+")):
                 raise Miss("unsupported package source %s" % package_id)
-        self.lock_names = sorted({e["name"] for e in entries if e.get("source", "").startswith("registry+")})
+            if source is not None and source.startswith("registry+"):
+                closure_crates.add(package["name"] + "-" + package["version"])
+            for target in package.get("targets", []):
+                if target.get("kind") == ["custom-build"] and source is None:
+                    self.build_scripts[package["name"]] = Path(target["src_path"])
+        self.registry_state = registry_state(entries, closure_crates, host_cargo)
+        for name_version, crate in self.registry_state["crates"].items():
+            build_script = host_cargo / "registry" / "src" / self.registry_state["index"] / name_version / "build.rs"
+            if build_script.is_file():
+                self.build_scripts[name_version] = build_script
         self.git = {}
         for entry in entries:
             source = entry.get("source", "")
@@ -258,6 +268,7 @@ class Plan:
                 if "#" not in source:
                     raise Miss("lock entry for %s has no resolved git revision" % entry.get("name"))
                 self.git["%s@%s" % (entry["name"], entry["version"])] = source.rsplit("#", 1)[1]
+        refuse_cpu_flags(self.allowlisted(), [src / rel for rel in self.files if ".cargo/" in rel])
 
     def exposed(self):
         """Repository-relative paths bound read-only into the sandbox."""
@@ -275,35 +286,124 @@ class Plan:
             values.setdefault(name, None)
         return values
 
-    def document(self, sandbox):
+    def document(self, sandbox, toolchain):
         trees = {rel: git_id(self.repo, self.commit, rel) for rel in sorted(self.trees)}
         files = {rel: git_id(self.repo, self.commit, rel) for rel in sorted(self.files | self.edge_paths)}
-        toolchain = {"rustc": sh(["rustc", "-vV"], cwd=self.manifest.parent, env=self.environ).stdout.strip(),
-                     "cargo": sh(["cargo", "-V"], cwd=self.manifest.parent, env=self.environ).stdout.strip()}
+        state = self.registry_state
+        index = {"index": state["index"], "config": state["config"][1] if state["config"] else None,
+                 "entries": state["lines"]}
         return {"version": VERSION, "unit": self.unit.describe(self.repo), "trees": trees, "files": files,
-                "closure": self.closure_ids, "lock": self.lock, "env": self.keyed_environment(),
-                "toolchain": toolchain, "edges": self.edges_blob, "sandbox": sandbox.identity()}
+                "closure": self.closure_ids, "lock": self.lock, "index": index, "env": self.keyed_environment(),
+                "toolchain": toolchain.identity(), "target_cfg": toolchain.target_cfg(self.unit, self.allowlisted()),
+                "edges": self.edges_blob, "sandbox": sandbox.identity()}
+
+
+# ---- CPU policy ------------------------------------------------------------
+
+CPU_FLAG = re.compile(r"(?:-C|--codegen)[\s=\"',]*(target-cpu|target-feature)=([^\s\"']+)")
+CPU_FLAGS_ALLOWED = ()   # explicit (flag, value) pairs that may enter a reusable build; none today
+CPU_DETECTION = re.compile(r"/proc/cpuinfo|is_x86_feature_detected|is_aarch64_feature_detected|__cpuid|"
+                           r"\bcpuid\s*\(|getauxval|sysctlbyname|raw_cpuid|march=native|mcpu=native|target-cpu=native")
+
+
+def refuse_cpu_flags(env, config_files):
+    """Host-CPU-dependent codegen flags make bytes depend on the producer; refuse them everywhere they can hide."""
+    sources = {name: value for name, value in env.items()}
+    for path in config_files:
+        try:
+            sources[str(path)] = path.read_text()
+        except OSError:
+            continue
+    for origin, text in sorted(sources.items()):
+        for flag, value in CPU_FLAG.findall(text or ""):
+            if (flag, value) not in CPU_FLAGS_ALLOWED:
+                raise Miss("%s sets -C %s=%s; host-CPU codegen flags are not allowed in hermetic builds" % (origin, flag, value))
+
+
+def rustflags_tokens(env):
+    if env.get("CARGO_ENCODED_RUSTFLAGS"):
+        return [t for t in env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if t]
+    for name in ("RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"):
+        if env.get(name):
+            return env[name].split()
+    return []
+
+
+def cpu_detection(build_scripts):
+    """Crates whose build script reads host CPU facts at build time: their bytes may follow the producer's CPU."""
+    found = []
+    for name, path in sorted(build_scripts.items()):
+        try:
+            text = re.sub(r"//[^\n]*", "", path.read_text(errors="replace"))
+        except OSError:
+            continue
+        if CPU_DETECTION.search(text):
+            found.append(name)
+    return found
 
 
 # ---- staged cargo home ----------------------------------------------------
 
-def stage_cargo_home(plan, host_cargo, staging):
-    """Copy only verified, closure-relevant registry and git state into a fresh cargo home."""
+def index_entry_line(entry, version):
+    """The index line of one version inside cargo's sparse-index cache file."""
+    parts = entry.read_bytes().split(b"\0")
+    # header: cache version, index version, last-updated; then (version, json) pairs
+    for i in range(4, len(parts) - 1, 2):
+        if parts[i] == version.encode():
+            return parts[i + 1]
+    return None
+
+
+def registry_state(lock_entries, closure_crates, host_cargo):
+    """Locate the host registry state the sandbox needs, verifying every piece against Cargo.lock.
+
+    Returns {"index": dir name, "config": (path, sha256), "entries": {name: path},
+             "lines": {name@version: sha256 of its index line}, "crates": {name-version: path}}."""
     registry = host_cargo / "registry"
-    indexes = sorted(p for p in (registry / "cache").glob("*") if p.is_dir()) if (registry / "cache").is_dir() else []
-    for name_version, checksum in sorted(plan.registry.items()):
-        found = [i for i in indexes if (i / (name_version + ".crate")).is_file()]
-        if not found:
-            raise Miss("%s.crate is not in the cargo cache; run cargo fetch" % name_version)
-        crate = found[0] / (name_version + ".crate")
-        actual = sha256_path(crate)
-        if actual != checksum:
-            raise Miss("%s.crate sha256 %s does not match Cargo.lock %s" % (name_version, actual, checksum))
-        index = found[0].name
-        cache_dir = staging / "registry" / "cache" / index
+    locked = [e for e in lock_entries if e.get("source", "").startswith("registry+")]
+    state = {"index": None, "config": None, "entries": {}, "lines": {}, "crates": {}}
+    if not locked:
+        return state
+    indexes = set()
+    for entry in locked:
+        name_version = "%s-%s" % (entry["name"], entry["version"])
+        found = sorted(p for p in (registry / "cache").glob("*/" + name_version + ".crate")) if (registry / "cache").is_dir() else []
+        if len(found) != 1:
+            raise Miss("%s.crate: %d copies in the cargo cache; run cargo fetch" % (name_version, len(found)))
+        indexes.add(found[0].parent.name)
+        if name_version in closure_crates:
+            actual = sha256_path(found[0])
+            if actual != entry.get("checksum"):
+                raise Miss("%s.crate sha256 %s does not match Cargo.lock %s" % (name_version, actual, entry.get("checksum")))
+            state["crates"][name_version] = found[0]
+    if len(indexes) != 1:
+        raise Miss("locked registry packages come from %d indexes; one is supported" % len(indexes))
+    state["index"] = indexes.pop()
+    host_index = registry / "index" / state["index"]
+    config = host_index / "config.json"
+    if not config.is_file():
+        raise Miss("registry index %s has no config.json" % state["index"])
+    state["config"] = (config, sha256_path(config))
+    for entry in locked:
+        cache = host_index / ".cache" / index_cache_path(entry["name"])
+        line = index_entry_line(cache, entry["version"]) if cache.is_file() else None
+        if line is None:
+            raise Miss("index entry for %s %s is missing; run cargo fetch" % (entry["name"], entry["version"]))
+        if ('"cksum":"%s"' % entry.get("checksum")).encode() not in line:
+            raise Miss("index entry for %s %s does not carry the Cargo.lock checksum" % (entry["name"], entry["version"]))
+        state["entries"][entry["name"]] = cache
+        state["lines"]["%s@%s" % (entry["name"], entry["version"])] = hashlib.sha256(line).hexdigest()
+    return state
+
+
+def stage_cargo_home(plan, host_cargo, staging):
+    """Copy only verified, lock-relevant registry and git state into a fresh cargo home."""
+    state = plan.registry_state
+    for name_version, crate in sorted(state["crates"].items()):
+        cache_dir = staging / "registry" / "cache" / state["index"]
         cache_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(crate, cache_dir / crate.name)
-        src_dir = staging / "registry" / "src" / index
+        src_dir = staging / "registry" / "src" / state["index"]
         src_dir.mkdir(parents=True, exist_ok=True)
         with tarfile.open(crate) as archive:
             for member in archive.getmembers():
@@ -313,19 +413,14 @@ def stage_cargo_home(plan, host_cargo, staging):
                     raise Miss("%s.crate contains a link or device %s" % (name_version, member.name))
             archive.extractall(src_dir)
         (src_dir / name_version / ".cargo-ok").write_text('{"v":1}')
-    for index in indexes:
-        host_index = registry / "index" / index.name
-        if not host_index.is_dir():
-            continue
-        staged_index = staging / "registry" / "index" / index.name
+    if state["index"]:
+        staged_index = staging / "registry" / "index" / state["index"]
         staged_index.mkdir(parents=True, exist_ok=True)
-        if (host_index / "config.json").is_file():
-            shutil.copyfile(host_index / "config.json", staged_index / "config.json")
-        for name in plan.lock_names:
-            entry = host_index / ".cache" / index_cache_path(name)
-            if entry.is_file():
-                (staged_index / ".cache" / index_cache_path(name)).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(entry, staged_index / ".cache" / index_cache_path(name))
+        shutil.copyfile(state["config"][0], staged_index / "config.json")
+        for name, entry in sorted(state["entries"].items()):
+            target = staged_index / ".cache" / index_cache_path(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(entry, target)
     for package_id, revision in sorted(plan.git.items()):
         stage_git_checkout(host_cargo, staging, package_id, revision)
 
@@ -349,28 +444,42 @@ def stage_git_checkout(host_cargo, staging, package_id, revision):
     raise Miss("no clean checkout of %s at %s in the cargo git cache; run cargo fetch" % (package_id, revision))
 
 
-# ---- sysroot ---------------------------------------------------------------
+# ---- content digests -------------------------------------------------------
 
-def sysroot_tree_digest(root):
-    """Content digest of a sysroot tree: paths, symlink targets, regular file bytes."""
+def tree_digest(root, skip=()):
+    """Content digest of a directory tree: every directory (incl. empty ones) with its mode,
+    every symlink with its target, every regular file with mode, size and sha256."""
+    root = str(root)
     digest = hashlib.sha256()
+
+    def note(line):
+        digest.update(line.encode("utf-8", "surrogateescape") + b"\n")
+
     for directory, dirnames, filenames in os.walk(root):
         dirnames.sort()
+        rel = os.path.relpath(directory, root)
+        if rel != ".":
+            note("D %s %o" % (rel, stat.S_IMODE(os.lstat(directory).st_mode)))
         for name in sorted(filenames + [d for d in dirnames if os.path.islink(os.path.join(directory, d))]):
             path = os.path.join(directory, name)
-            rel = os.path.relpath(path, root)
-            if rel == SYSROOT_SEAL:
+            entry = os.path.relpath(path, root)
+            if entry in skip:
                 continue
-            if os.path.islink(path):
-                digest.update(("L %s -> %s\n" % (rel, os.readlink(path))).encode("utf-8", "surrogateescape"))
-            elif os.path.isfile(path):
-                digest.update(("F %s %s\n" % (rel, sha256_path(path))).encode("utf-8", "surrogateescape"))
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
+                note("L %s -> %s" % (entry, os.readlink(path)))
+            elif stat.S_ISREG(info.st_mode):
+                note("F %s %o %d %s" % (entry, stat.S_IMODE(info.st_mode), info.st_size, sha256_path(path)))
+            else:
+                note("S %s %o" % (entry, info.st_mode))
     return digest.hexdigest()
 
 
+# ---- sysroot ---------------------------------------------------------------
+
 def seal_sysroot(directory, image):
     directory = Path(directory).resolve()
-    seal = {"image": image, "tree": sysroot_tree_digest(directory)}
+    seal = {"image": image, "digest": tree_digest(directory, skip=(SYSROOT_SEAL,))}
     (directory / SYSROOT_SEAL).write_text(json.dumps(seal, indent=1, sort_keys=True) + "\n")
     return seal
 
@@ -398,41 +507,67 @@ def make_sysroot(directory, dockerfile):
 
 
 def verified_sysroot(directory):
+    """The rootfs must match its seal's content digest; the digest (not the name) enters the key."""
     directory = Path(directory).resolve()
     try:
         seal = json.loads((directory / SYSROOT_SEAL).read_text())
     except (OSError, ValueError):
         raise Miss("%s is not a sealed sysroot (run seal-sysroot)" % directory)
     started = time.time()
-    actual = sysroot_tree_digest(directory)
-    if actual != seal.get("tree"):
-        raise Miss("sysroot %s drifted from its seal (%s != %s)" % (directory, actual[:12], str(seal.get("tree"))[:12]))
-    return directory, seal["image"], time.time() - started
+    actual = tree_digest(directory, skip=(SYSROOT_SEAL,))
+    if actual != seal.get("digest"):
+        raise Miss("sysroot %s drifted from its seal (%s != %s)" % (directory, actual[:12], str(seal.get("digest"))[:12]))
+    return directory, {"image": seal.get("image"), "digest": actual}, time.time() - started
 
 
 # ---- sandboxes -------------------------------------------------------------
+
+class Toolchain:
+    """The pinned toolchain directory (rustc --print sysroot), keyed by its full content."""
+
+    def __init__(self, workspace, environ):
+        self.directory = Path(os.path.realpath(sh(["rustc", "--print", "sysroot"], cwd=workspace, env=environ).stdout.strip()))
+        if not (self.directory / "bin" / "cargo").is_file() or not (self.directory / "bin" / "rustc").is_file():
+            raise Miss("toolchain %s has no bin/cargo and bin/rustc" % self.directory)
+        self.environ = environ
+        started = time.time()
+        self.digest = tree_digest(self.directory)
+        self.seconds = time.time() - started
+
+    def identity(self):
+        return {"name": self.directory.name, "digest": self.digest,
+                "rustc": sh([str(self.directory / "bin" / "rustc"), "-vV"], env=self.environ).stdout.strip(),
+                "cargo": sh([str(self.directory / "bin" / "cargo"), "-V"], env=self.environ).stdout.strip()}
+
+    def target_cfg(self, unit, env):
+        """Effective target configuration (arch, features, ...) the unit compiles with."""
+        args = [str(self.directory / "bin" / "rustc"), "--print", "cfg"]
+        if unit.target:
+            args += ["--target", unit.target]
+        args += rustflags_tokens(env)
+        return sorted(line for line in sh(args, env=self.environ).stdout.splitlines() if line.strip())
+
 
 class Bubblewrap:
     kind = "bwrap"
     SYSTEM = ("usr", "etc", "lib", "lib64", "bin", "sbin", "opt")
 
-    def __init__(self, plan, work, out, rustup_home, sysroot, image):
+    def __init__(self, plan, work, out, toolchain, sysroot):
         self.plan = plan
         self.work = work
         self.out = out
-        self.rustup_home = rustup_home
+        self.toolchain = toolchain
         self.sysroot = sysroot
-        self.image = image
         self.paths = dict(LINUX_PATHS)
 
     def identity(self):
-        return {"kind": self.kind, "paths": self.paths, "sysroot": self.image,
-                "toolchain": ["<rustup-home>", "<cargo-home>/bin"], "exposed": self.plan.exposed(),
-                "writable": ["<out>", "<home>", "/tmp"], "network": False}
+        return {"kind": self.kind, "paths": self.paths, "sysroot": self.sysroot[1],
+                "exposed": self.plan.exposed(), "writable": ["<out>", "<home>", "/tmp"], "network": False,
+                "cpuinfo": "masked"}
 
     def environment(self):
-        env = {"PATH": "/build/cargo/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/build/home", "TMPDIR": "/tmp",
-               "CARGO_HOME": "/build/cargo", "RUSTUP_HOME": "/build/rustup", "CARGO_TARGET_DIR": "/build/out",
+        env = {"PATH": "/build/toolchain/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/build/home", "TMPDIR": "/tmp",
+               "CARGO_HOME": "/build/cargo", "CARGO_TARGET_DIR": "/build/out",
                "CARGO_BUILD_BUILD_DIR": "/build/out/build", "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never"}
         env.update(self.plan.allowlisted())
         return env
@@ -442,18 +577,19 @@ class Bubblewrap:
 
     def wrap(self, command):
         src = self.plan.src
+        cpuinfo = self.work / "cpuinfo"
+        if not cpuinfo.is_file():
+            cpuinfo.write_text("processor\t: 0\nflags\t\t:\n")
         args = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--proc", "/proc", "--dev", "/dev",
-                "--tmpfs", "/tmp"]
+                "--tmpfs", "/tmp", "--ro-bind", str(cpuinfo), "/proc/cpuinfo"]
         for top in self.SYSTEM:
-            path = self.sysroot / top
+            path = self.sysroot[0] / top
             if os.path.islink(path):
                 args += ["--symlink", os.readlink(path), "/" + top]
             elif path.is_dir():
                 args += ["--ro-bind", str(path), "/" + top]
-        args += ["--ro-bind", str(self.rustup_home), "/build/rustup",
-                 "--bind", str(self.work / "cargo"), "/build/cargo",
-                 "--ro-bind", str(proxies()), "/build/cargo/bin",
-                 "--tmpfs", "/build/src"]
+        args += ["--ro-bind", str(self.toolchain.directory), "/build/toolchain",
+                 "--bind", str(self.work / "cargo"), "/build/cargo", "--tmpfs", "/build/src"]
         for rel in self.plan.exposed():
             args += ["--ro-bind", str(src / rel), "/build/src/" + rel]
         args += ["--bind", str(self.out), "/build/out", "--tmpfs", "/build/home",
@@ -467,23 +603,22 @@ class SandboxExec:
     SYSTEM = ("/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/db",
               "/private/var/select", "/Applications/Xcode.app", "/dev")
 
-    def __init__(self, plan, work, out, rustup_home, sysroot, image):
+    def __init__(self, plan, work, out, toolchain, sysroot):
         self.plan = plan
         self.work = work
         self.out = out
-        self.rustup_home = rustup_home
+        self.toolchain = toolchain
         self.paths = {"src": str(plan.src), "out": str(out), "home": str(work / "home"),
-                      "cargo": str(work / "cargo"), "rustup": str(rustup_home)}
+                      "cargo": str(work / "cargo"), "toolchain": str(toolchain.directory)}
 
     def identity(self):
         return {"kind": self.kind, "paths": self.paths, "sysroot": darwin_identity(),
-                "toolchain": ["<rustup-home>", "<proxies>"], "exposed": self.plan.exposed(),
-                "writable": ["<out>", "<home>"], "network": False}
+                "exposed": self.plan.exposed(), "writable": ["<out>", "<home>"], "network": False}
 
     def environment(self):
         home = self.work / "home"
-        env = {"PATH": "%s:/usr/bin:/bin" % proxies(), "HOME": str(home), "TMPDIR": str(self.work / "tmp"),
-               "CARGO_HOME": str(self.work / "cargo"), "RUSTUP_HOME": str(self.rustup_home),
+        env = {"PATH": "%s/bin:/usr/bin:/bin" % self.toolchain.directory, "HOME": str(home),
+               "TMPDIR": str(self.work / "tmp"), "CARGO_HOME": str(self.work / "cargo"),
                "CARGO_TARGET_DIR": str(self.out), "CARGO_BUILD_BUILD_DIR": str(self.out / "build"),
                "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never"}
         env.update(self.plan.allowlisted())
@@ -494,7 +629,7 @@ class SandboxExec:
 
     def profile(self):
         reads = [p for p in self.SYSTEM if os.path.exists(p)]
-        reads += [str(self.rustup_home), str(proxies()), str(self.work / "cargo"), str(self.out),
+        reads += [str(self.toolchain.directory), str(self.work / "cargo"), str(self.out),
                   str(self.work / "home"), str(self.work / "tmp")]
         reads += [str(self.plan.src / rel) for rel in self.plan.exposed()]
         ancestors = set()
@@ -547,16 +682,18 @@ class Producer:
         # Host-side cargo/rustc calls (fetch, metadata, -vV) must not let the
         # caller's HOME pick a different toolchain or cache.
         self.environ = dict(environ, RUSTUP_HOME=str(self.rustup_home), CARGO_HOME=str(self.host_cargo))
-        self.sysroot = self.image = None
+        self.sysroot = None
         self.sysroot_seconds = 0.0
         if sys.platform != "darwin":
             if not options.sysroot:
                 raise Miss("Linux hermetic builds need --sysroot <sealed image rootfs>")
-            self.sysroot, self.image, self.sysroot_seconds = verified_sysroot(options.sysroot)
+            directory, identity, self.sysroot_seconds = verified_sysroot(options.sysroot)
+            self.sysroot = (directory, identity)
             if not shutil.which("bwrap"):
                 raise Miss("bwrap (bubblewrap) not found")
         elif not shutil.which("sandbox-exec"):
             raise Miss("sandbox-exec not found")
+        self.toolchain = Toolchain(self.unit.manifest.parent, self.environ)
 
     def prepare(self):
         """Fresh checkout, staged cargo home and empty HOME for one build, always at the same paths."""
@@ -568,17 +705,17 @@ class Producer:
         # The only networked step: fill the host cargo cache for the lock.
         sh(["cargo", "fetch", "--locked", "--manifest-path", str(src / BK.relative(self.unit.manifest, self.repo))],
            env=self.environ)
-        plan = Plan(self.unit, self.repo, self.commit, src, self.options.edges, self.environ)
+        plan = Plan(self.unit, self.repo, self.commit, src, self.options.edges, self.environ, self.host_cargo)
         (work / "home").mkdir()
         (work / "tmp").mkdir()
         return work, plan
 
     def sandbox(self, plan, work, out):
         cls = SandboxExec if sys.platform == "darwin" else Bubblewrap
-        return cls(plan, work, out, self.rustup_home, self.sysroot, self.image)
+        return cls(plan, work, out, self.toolchain, self.sysroot)
 
     def key(self, plan, sandbox):
-        document = plan.document(sandbox)
+        document = plan.document(sandbox, self.toolchain)
         return hashlib.sha256(BK.canonical(document).encode("utf-8")).hexdigest(), document
 
     def build(self, plan, sandbox, out):
@@ -650,7 +787,7 @@ class Producer:
                         outside.add(rel)
                 elif name.startswith(paths["out"] + "/"):
                     generated += 1
-                elif not name.startswith((paths["cargo"] + "/", paths["rustup"] + "/")):
+                elif not name.startswith((paths["cargo"] + "/", paths["toolchain"] + "/")):
                     outside.add(name)
         print("diagnose: %d repository files read, %d generated, %d env names" % (len(reads), generated, len(env)))
         if outside:
@@ -668,7 +805,9 @@ def produce(options, environ):
     sandbox = producer.sandbox(plan, work, current)
     key, document = producer.key(plan, sandbox)
     receipt = {"key": key, "commit": producer.commit, "unit": document["unit"], "document": document,
-               "sysroot_verify_seconds": round(producer.sysroot_seconds, 1)}
+               "sysroot_verify_seconds": round(producer.sysroot_seconds, 1),
+               "toolchain_digest_seconds": round(producer.toolchain.seconds, 1),
+               "cpu_detection": cpu_detection(plan.build_scripts)}
     if options.key_only:
         return receipt, producer
     builds = [producer.build(plan, sandbox, current)]
@@ -683,7 +822,9 @@ def produce(options, environ):
             raise Miss("the second preparation keyed differently (%s != %s)" % (key_b[:12], key[:12]))
         builds.append(producer.build(plan_b, sandbox_b, current))
         current.rename(base_out / "b")
-        receipt["reusable"] = builds[0]["final"] == builds[1]["final"]
+        # Two identical builds on one host cannot prove independence from
+        # the host CPU; crates that read it at build time stay non-reusable.
+        receipt["reusable"] = builds[0]["final"] == builds[1]["final"] and not receipt["cpu_detection"]
     else:
         receipt["reusable"] = False
     receipt["builds"] = builds
@@ -723,7 +864,7 @@ def main(argv=None):
     options = parser.parse_args(argv)
     if options.command == "seal-sysroot":
         sealed = seal_sysroot(options.directory, options.image)
-        print("sealed %s image=%s tree=%s" % (options.directory, sealed["image"], sealed["tree"]))
+        print("sealed %s image=%s digest=%s" % (options.directory, sealed["image"], sealed["digest"]))
         return 0
     if options.command == "make-sysroot":
         try:
@@ -731,7 +872,7 @@ def main(argv=None):
         except Miss as miss:
             print("make-sysroot failed: %s" % miss)
             return 1
-        print("sysroot %s image=%s tree=%s" % (options.directory, sealed["image"], sealed["tree"]))
+        print("sysroot %s image=%s digest=%s" % (options.directory, sealed["image"], sealed["digest"]))
         return 0
     if not (options.manifest_path and options.package and options.kind):
         parser.error("--manifest-path, --package and --kind are required")
@@ -748,8 +889,9 @@ def main(argv=None):
             print(summary)
         else:
             builds = receipt["builds"]
-            print(summary + " reusable=%s seconds=%s" % (
-                receipt["reusable"], "+".join("%.0f" % b["seconds"] for b in builds)))
+            print(summary + " reusable=%s seconds=%s%s" % (
+                receipt["reusable"], "+".join("%.0f" % b["seconds"] for b in builds),
+                " cpu-detection=" + ",".join(receipt["cpu_detection"]) if receipt["cpu_detection"] else ""))
             for index, build in enumerate(builds):
                 for rel, digest in sorted(build["final"].items()):
                     print("build %d %s %s" % (index + 1, digest, rel))
