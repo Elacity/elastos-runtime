@@ -12,14 +12,16 @@ on:
     branches: [main, develop]
     tags: ["v*"]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,9 +30,8 @@ env:
   CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
-  # Only merged code on develop or main saves caches. PR runs restore them but
-  # never save, so one PR cannot evict every other PR's cache (10 GB repo cap)
-  # or write a cache that later runs trust.
+  # Only develop/main pushes write shared caches (Rust, apt, Kubo,
+  # BuildKit). PR and merge-queue runs only read them.
   CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
@@ -48,6 +49,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: rustfmt
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
@@ -68,6 +72,7 @@ jobs:
       - name: release artifact source proofs
         run: |
           python3 scripts/ci-release-policy-test.py
+          python3 scripts/ci-download-cache-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
@@ -77,6 +82,9 @@ jobs:
           python3 scripts/update-hop-compare-test.py
           python3 .github/scripts/release-mac-capacity-test.py
           python3 scripts/install-bootstrap-test.py
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-behaviour:
     name: test-behaviour
@@ -186,19 +194,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: clippy
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
         working-directory: elastos
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-elastos:
     name: test-elastos
@@ -210,43 +224,22 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
-      # The three provider workspaces are release-built from cold on every
-      # run otherwise; with the cache restored, cargo only re-fingerprints
-      # the workspace members and reuses every dependency artifact.
-      - name: restore provider build artifacts
-        id: providers-cache
-        if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            providers-bd-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
           cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
-      - name: save provider build artifacts
-        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo test
         working-directory: elastos
         env:
@@ -288,6 +281,9 @@ jobs:
         env:
           ELASTOS_PLAYWRIGHT_MODULE: ${{ runner.temp }}/content-sandbox-browser/node_modules/playwright/index.mjs
         run: cargo test -p elastos-server content_sandbox_browser -- --ignored --nocapture
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-capsules:
     name: test-capsules
@@ -301,16 +297,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
-          # Registry/index cache only. The capsule build artifacts (about
-          # 2.3 GB) are not cached: this job finishes well inside the
-          # source-home critical path, and the develop caches that set wall
-          # time must fit the 10 GB repository cap.
+          # Registry/index cache only; sccache owns compilation reuse.
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
@@ -359,22 +356,25 @@ jobs:
           done
           total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/capsules-test-list.txt")
           echo "Capsules listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
   # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
   # owns all the logic (throwaway client identity, throwaway compose
   # project, receipt assertions, full teardown); this job is thin glue over
-  # it. Gated to workflow_dispatch and PRs that actually touch the harness
+  # it. Trusted develop/main pushes warm the shared image cache. Runs also for
+  # every merge group, workflow_dispatch, and PRs that touch the harness
   # image, the proof driver, or the protected-content/carrier crates it
-  # exercises -- NOT every push, since the image build + 3-node bring-up
-  # add real wall time.
+  # exercises.
   custody-harness-smoke:
     name: custody-harness-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: source-gate
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'))
     # The top-level `permissions: contents: read` above zeroes every other
     # scope for every job; dorny/paths-filter resolves a pull_request's
     # changed files via the GitHub API (this job's checkout is fetch-depth 1,
@@ -417,7 +417,7 @@ jobs:
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
       - id: should-run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ env.CI_SAVE_CACHE }}" = "true" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -441,12 +441,17 @@ jobs:
       # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
       # own `docker compose up -d --build` expects it -- that later build
       # then hits this same local layer cache instead of rebuilding cold.
+      # The verified Kubo layer precedes COPY, so source changes reuse it.
       - name: pre-build custody-host image (GHA layer cache)
         if: steps.should-run.outputs.run == 'true'
         run: |
           cache_args=()
           if [[ "${CI_USE_CACHE}" == "true" ]]; then
-            cache_args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+            cache_args+=(--cache-from type=gha)
+          fi
+          # Only trusted saving runs write; merge-queue and PR scopes are unreadable elsewhere.
+          if [[ "${CI_SAVE_CACHE}" == "true" ]]; then
+            cache_args+=(--cache-to type=gha,mode=max)
           fi
           docker buildx build \
             -f deploy/custody-host/Dockerfile \
@@ -478,6 +483,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: [source-gate, engine-llama-arm64]
+    env:
+      CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
     strategy:
       fail-fast: false
       matrix:
@@ -488,6 +495,16 @@ jobs:
           - os: ubuntu-22.04-arm
             check_name: ubuntu-24.04-arm
     steps:
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-linux-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-linux-build" >> "$GITHUB_ENV"
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
@@ -507,21 +524,69 @@ jobs:
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
-      # A stalled mirror once held this step until the 90-minute job limit.
-      - name: install host prerequisites
-        timeout-minutes: 15
+      - name: require fresh Linux build artifacts
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          set -euo pipefail
+          # Reuse this job's fresh source only, including across capsule workspaces.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
+      - name: prepare apt archive cache permissions
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 /var/cache/apt/archives
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+      - name: restore Ubuntu prerequisite archives
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
+          restore-keys: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-
+      - name: install host prerequisites
+        id: apt-prerequisites
+        timeout-minutes: 13
+        run: bash scripts/ci-apt-prerequisites.sh
+      - name: save Ubuntu prerequisite archives
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.apt-prerequisites.outputs.changed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
+      - name: bind Kubo cache to its pin
+        id: kubo-pin
+        run: |
+          platform=linux-amd64
+          if [[ "${{ runner.arch }}" == ARM64 ]]; then platform=linux-arm64; fi
+          echo "KUBO_PLATFORM=$platform" >> "$GITHUB_ENV"
+          echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
+          python3 scripts/ci-kubo-cache.py key "$platform" "$RUNNER_TEMP/kubo-cache"
+      - name: restore verified Kubo inputs
+        id: kubo-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
+      - name: verify or download Kubo inputs
+        timeout-minutes: 10
+        run: python3 scripts/ci-kubo-cache.py fetch "$KUBO_PLATFORM" "$KUBO_CACHE_DIR"
+      - name: save verified Kubo inputs
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -613,6 +678,16 @@ jobs:
     timeout-minutes: 150
     needs: source-gate
     steps:
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-macos-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-macos-build" >> "$GITHUB_ENV"
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
@@ -632,9 +707,9 @@ jobs:
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ runner.os }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: reserve hosted Mac build and fixture capacity
         timeout-minutes: 10
@@ -642,24 +717,35 @@ jobs:
       - name: require fresh Mac build intermediates
         run: |
           set -euo pipefail
-          # Cargo 1.91 stores fingerprints here. Start outside the restored
-          # cache, then share intermediates across this source tree's N/N+1.
-          directory="$RUNNER_TEMP/source-home-macos-build"
-          test ! -e "$directory"
-          test ! -L "$directory"
-          mkdir -m 700 "$directory"
-          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          # Keep outputs and Cargo 1.91 fingerprints outside restored caches.
+          # Reuse this job's fresh source across capsules and version builds.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
           echo "CI_MAC_BUILD_DIR_FRESH=true" >> "$GITHUB_ENV"
-      # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
-      # macOS runners, and setup's downloader makes a single 600s attempt.
-      # Cache the verified release tarball and pre-seed bin/kubo so setup
-      # skips the download entirely (ELACITY-2308).
-      - name: cache kubo release
+      - name: bind Kubo cache to its pin
+        id: kubo-pin
+        run: |
+          echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
+          python3 scripts/ci-kubo-cache.py key darwin-arm64 "$RUNNER_TEMP/kubo-cache"
+      - name: restore verified Kubo inputs
+        id: kubo-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ runner.temp }}/kubo-cache
-          key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('components.json') }}
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
+      - name: verify or download Kubo inputs
+        timeout-minutes: 10
+        run: python3 scripts/ci-kubo-cache.py fetch darwin-arm64 "$KUBO_CACHE_DIR"
+      - name: save verified Kubo inputs
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
       - name: seed kubo into the test HOME
         run: |
           set -euo pipefail
@@ -698,6 +784,7 @@ jobs:
           # version is X.Y.Z or X.Y.Z-{alpha|beta|rc}.N, never the default "-dev".
           export ELASTOS_RELEASE_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path elastos/Cargo.toml \
             | python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "elastos-server"))')"
+          echo "ELASTOS_RELEASE_VERSION=$ELASTOS_RELEASE_VERSION" >> "$GITHUB_ENV"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -747,7 +834,7 @@ jobs:
           mkdir -p "$CI_HOP_ROOT"
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
-            --runtime "$PWD/elastos/target/release/elastos" --previous "$RUNNER_TEMP/previous-release"
+            --runtime "$CARGO_TARGET_DIR/release/elastos" --previous "$RUNNER_TEMP/previous-release"
           python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
           import json, os, pathlib, sys
           path = pathlib.Path(sys.argv[1])
@@ -755,8 +842,12 @@ jobs:
           directory = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
           assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'
           assert directory.is_dir() and not directory.is_symlink()
+          target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+          assert target == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-target'
+          assert target.is_dir() and not target.is_symlink()
           assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'
           build['intermediates'] = {'directory': str(directory), 'initially_absent': True,
+                                    'target_directory': str(target),
                                     'source': build['source']}
           path.write_text(json.dumps(build, indent=2) + '\n')
           PY

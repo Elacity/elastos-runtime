@@ -8,7 +8,15 @@ umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELASTOS_ROOT="${REPO_ROOT}/elastos"
-ELASTOS_BIN="${ELASTOS_ROOT}/target/debug/elastos"
+if [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" != /* ]]; then
+    export CARGO_TARGET_DIR="${REPO_ROOT}/${CARGO_TARGET_DIR}"
+fi
+ELASTOS_BIN="${CARGO_TARGET_DIR:-${ELASTOS_ROOT}/target}/debug/elastos"
+
+cargo_release_binary() {
+    local workspace="$1" name="$2"
+    printf '%s/release/%s\n' "${CARGO_TARGET_DIR:-${REPO_ROOT}/${workspace}/target}" "$name"
+}
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "local-carrier-setup-smoke currently supports Linux only." >&2
@@ -150,7 +158,7 @@ MEDIA_TOOLS_ARCHIVE=$(
     source scripts/publish-release.sh
     TMPDIR="${TEST_ROOT}/media-package"
     mkdir -p "$TMPDIR"
-    CARGO_TARGET_DIR="${TEST_ROOT}/media-target" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TEST_ROOT}/media-target}" \
         build_packaged_media_tools_archive "${SETUP_PLATFORM}"
 )
 export MEDIA_TOOLS_ARCHIVE
@@ -188,7 +196,7 @@ mkdir -p "${DATA_DIR}/bin"
 # installed. Seed the one required host provider before starting the local
 # source runtime; the rest of the setup still proves Carrier-backed install.
 install -m 755 \
-    "${REPO_ROOT}/elastos/target/release/localhost-provider" \
+    "$(cargo_release_binary elastos localhost-provider)" \
     "${DATA_DIR}/bin/localhost-provider"
 
 COMPONENTS_SRC="${REPO_ROOT}/components.json" \
@@ -196,26 +204,26 @@ COMPONENTS_DEST="${DATA_DIR}/components.json" \
 DATA_DIR="${DATA_DIR}" \
 PUBLISHER_ROOT="${PUBLISHER_ROOT}" \
 SETUP_PLATFORM="${SETUP_PLATFORM}" \
-SHELL_BIN="${REPO_ROOT}/elastos/target/release/shell" \
-LOCALHOST_PROVIDER_BIN="${REPO_ROOT}/elastos/target/release/localhost-provider" \
-DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider" \
-CHAIN_PROVIDER_BIN="${REPO_ROOT}/capsules/chain-provider/target/release/chain-provider" \
-NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider" \
-EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
-IPFS_PROVIDER_BIN="${REPO_ROOT}/capsules/ipfs-provider/target/release/ipfs-provider" \
-MEDIA_PROVIDER_BIN="${REPO_ROOT}/capsules/media-provider/target/release/media-provider" \
-MODEL_PROVIDER_BIN="${REPO_ROOT}/capsules/model-provider/target/release/model-provider" \
-PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
-PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
-BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
-BROWSER_ENGINE_SUPERVISOR_BIN="${REPO_ROOT}/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" \
-BROWSER_NATIVE_PROXY_ENGINE_BIN="${REPO_ROOT}/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" \
-BROWSER_STREAM_BRIDGE_BIN="${REPO_ROOT}/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" \
-BROWSER_LOCAL_EXIT_BIN="${REPO_ROOT}/elastos/tools/browser-local-exit/target/release/browser-local-exit" \
-WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/webspace-provider" \
-WALLET_PROVIDER_BIN="${REPO_ROOT}/capsules/wallet-provider/target/release/wallet-provider" \
-OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object-provider" \
-CONTENT_BLOCK_GRAPH_PROVIDER_BIN="${REPO_ROOT}/capsules/content-block-graph-provider/target/release/content-block-graph-provider" \
+SHELL_BIN="$(cargo_release_binary elastos shell)" \
+LOCALHOST_PROVIDER_BIN="$(cargo_release_binary elastos localhost-provider)" \
+DID_PROVIDER_BIN="$(cargo_release_binary capsules/did-provider did-provider)" \
+CHAIN_PROVIDER_BIN="$(cargo_release_binary capsules/chain-provider chain-provider)" \
+NET_PROVIDER_BIN="$(cargo_release_binary capsules/net-provider net-provider)" \
+EXIT_PROVIDER_BIN="$(cargo_release_binary capsules/exit-provider exit-provider)" \
+IPFS_PROVIDER_BIN="$(cargo_release_binary capsules/ipfs-provider ipfs-provider)" \
+MEDIA_PROVIDER_BIN="$(cargo_release_binary capsules/media-provider media-provider)" \
+MODEL_PROVIDER_BIN="$(cargo_release_binary capsules/model-provider model-provider)" \
+PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-protect-provider protected-content-protect-provider)" \
+PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-decrypt-provider protected-content-decrypt-provider)" \
+BROWSER_ENGINE_ADAPTER_BIN="$(cargo_release_binary capsules/browser-engine-adapter browser-engine-adapter)" \
+BROWSER_ENGINE_SUPERVISOR_BIN="$(cargo_release_binary elastos/tools/browser-engine-supervisor browser-engine-supervisor)" \
+BROWSER_NATIVE_PROXY_ENGINE_BIN="$(cargo_release_binary elastos/tools/browser-native-proxy-engine browser-native-proxy-engine)" \
+BROWSER_STREAM_BRIDGE_BIN="$(cargo_release_binary elastos/tools/browser-stream-bridge browser-stream-bridge)" \
+BROWSER_LOCAL_EXIT_BIN="$(cargo_release_binary elastos/tools/browser-local-exit browser-local-exit)" \
+WEBSPACE_PROVIDER_BIN="$(cargo_release_binary capsules/webspace-provider webspace-provider)" \
+WALLET_PROVIDER_BIN="$(cargo_release_binary capsules/wallet-provider wallet-provider)" \
+OBJECT_PROVIDER_BIN="$(cargo_release_binary capsules/object-provider object-provider)" \
+CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$(cargo_release_binary capsules/content-block-graph-provider content-block-graph-provider)" \
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 HOME_GUI_CAPSULE_DIR="${REPO_ROOT}/capsules/home-gui" \
@@ -519,7 +527,7 @@ DATA_DIR="${XDG_DATA_HOME}/elastos"
 [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
 mkdir -p "${DATA_DIR}/bin"
 cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
-install -m 700 "${REPO_ROOT}/elastos/target/release/localhost-provider" \
+install -m 700 "$(cargo_release_binary elastos localhost-provider)" \
     "${DATA_DIR}/bin/localhost-provider"
 [[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]
 

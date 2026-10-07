@@ -7,6 +7,8 @@ use std::os::unix::fs::PermissionsExt as _;
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const TEST_ROOT_PREFIX: &str = "model-provider-";
+/// Bounds a hang only: every test wait ends on its condition, so load must not trip it.
+pub(crate) const FIXTURE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 thread_local! {
     static TEST_ROOT_REGISTRY: TestRootRegistry = TestRootRegistry::default();
@@ -84,9 +86,19 @@ pub(crate) fn write_fake_llama_server(root: &Path, mode: &str) -> (PathBuf, Path
     let events = root.join("models/fake.events");
     std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
     std::fs::create_dir_all(model.parent().unwrap()).unwrap();
-    std::fs::write(
-        &engine,
+    // Write the script from a child process. A writer fd opened here could be
+    // copied into another test thread's concurrent fork and make exec of this
+    // script fail with ETXTBSY until that child execs.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\"", "sh"])
+        .arg(&engine)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut writer.stdin.take().unwrap(),
         br#"#!/usr/bin/python3
+import errno
 import http.server
 import json
 import os
@@ -151,6 +163,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if mode == 'slow_health':
                 time.sleep(0.225)
             if unresponsive.exists():
+                record('unresponsive')
                 threading.Event().wait()
             model_id = 'wrong-model' if wrong_alias.exists() else alias
             body = {'object': 'list', 'data': [{'id': model_id, 'object': 'model'}]}
@@ -236,12 +249,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(('data: ' + payload + '\n\ndata: [DONE]\n\n').encode('utf-8'))
         self.wfile.flush()
 
-server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+# Another test's listener can briefly hold this just-reserved port; the
+# provider's alias check rejects that listener until this engine binds.
+while True:
+    try:
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+        break
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        time.sleep(0.01)
 server.daemon_threads = True
 server.serve_forever()
 "#,
     )
     .unwrap();
+    assert!(writer.wait().unwrap().success());
     std::fs::write(&model, mode.as_bytes()).unwrap();
     std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o600)).unwrap();

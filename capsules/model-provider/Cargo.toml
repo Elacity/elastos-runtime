@@ -5,6 +5,12 @@ edition = "2021"
 description = "ElastOS model provider - typed local model service"
 license = "MIT"
 
+# main.rs only calls run_main; the unit tests live in the library.
+[[bin]]
+name = "model-provider"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 anyhow = "1.0"
 elastos-model-contract = { path = "../../elastos/crates/elastos-model-contract" }
@@ -15,3 +21,7 @@ sha2 = "0.10"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 url = "2.5"
+
+[dev-dependencies]
+# Paused Tokio clock for tests that hold a deadline until a fixture engine has started.
+tokio = { version = "1.0", features = ["test-util"] }
