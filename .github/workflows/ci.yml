@@ -12,14 +12,16 @@ on:
     branches: [main, develop]
     tags: ["v*"]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,9 +30,8 @@ env:
   CI_LLAMA_ARM64_SHA256: a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8
   # An explicit dispatch ref may select a tag independently of the workflow ref.
   CI_USE_CACHE: ${{ github.ref_type != 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.ref != '') }}
-  # Only merged code on develop or main saves caches. PR runs restore them but
-  # never save, so one PR cannot evict every other PR's cache (10 GB repo cap)
-  # or write a cache that later runs trust.
+  # Only develop/main pushes write shared caches (Rust, apt, Kubo,
+  # BuildKit). PR and merge-queue runs only read them.
   CI_SAVE_CACHE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
 
 jobs:
@@ -42,13 +43,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: rustfmt
-      - uses: actions/setup-node@v4
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
 
@@ -68,6 +72,7 @@ jobs:
       - name: release artifact source proofs
         run: |
           python3 scripts/ci-release-policy-test.py
+          python3 scripts/ci-download-cache-test.py
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
@@ -77,6 +82,9 @@ jobs:
           python3 scripts/update-hop-compare-test.py
           python3 .github/scripts/release-mac-capacity-test.py
           python3 scripts/install-bootstrap-test.py
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-behaviour:
     name: test-behaviour
@@ -84,10 +92,10 @@ jobs:
     timeout-minutes: 10
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       - name: install explicit Browser test inputs
@@ -128,7 +136,7 @@ jobs:
           apt-get update -qq
           read -r -a tools <<< "$ENGINE_BUILD_TOOLS"
           apt-get install -y -qq --no-install-recommends "${tools[@]}"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
           persist-credentials: false
@@ -143,7 +151,7 @@ jobs:
       - name: restore pinned ARM64 engine
         id: engine-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/llama-arm64-bundle
           key: ${{ steps.engine-recipe.outputs.cache-key }}
@@ -158,7 +166,7 @@ jobs:
         run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: save pinned ARM64 engine
         if: env.CI_USE_CACHE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && steps.engine-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/llama-arm64-bundle
           key: ${{ steps.engine-cache.outputs.cache-primary-key }}
@@ -166,7 +174,7 @@ jobs:
         # Retain build receipts on a pin mismatch for review; dependent jobs
         # require this job to succeed before they can consume the archive.
         if: "!cancelled() && (steps.engine-cache.outputs.cache-hit == 'true' || steps.engine-build.outcome == 'success')"
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: llama-arm64-bundle
           path: ${{ runner.temp }}/llama-arm64-bundle/
@@ -180,25 +188,31 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
         working-directory: elastos
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-elastos:
     name: test-elastos
@@ -206,47 +220,26 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
-      # The three provider workspaces are release-built from cold on every
-      # run otherwise; with the cache restored, cargo only re-fingerprints
-      # the workspace members and reuses every dependency artifact.
-      - name: restore provider build artifacts
-        id: providers-cache
-        if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            providers-bd-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
           cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
           cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
-      - name: save provider build artifacts
-        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.providers-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            capsules/protected-content-protect-provider/target
-            capsules/protected-content-decrypt-provider/target
-            capsules/custody-provider/target
-          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
       - name: cargo test
         working-directory: elastos
         env:
@@ -272,7 +265,7 @@ jobs:
           git rev-parse HEAD HEAD^{tree}
           sha256sum elastos/tools/browser-engine-supervisor/target/debug/browser-engine-supervisor elastos/tools/browser-native-proxy-engine/target/debug/browser-native-proxy-engine
           sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       - name: install content boundary browser fixture
@@ -288,6 +281,9 @@ jobs:
         env:
           ELASTOS_PLAYWRIGHT_MODULE: ${{ runner.temp }}/content-sandbox-browser/node_modules/playwright/index.mjs
         run: cargo test -p elastos-server content_sandbox_browser -- --ignored --nocapture
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   test-capsules:
     name: test-capsules
@@ -295,22 +291,23 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
-          # Registry/index cache only. The capsule build artifacts (about
-          # 2.3 GB) are not cached: this job finishes well inside the
-          # source-home critical path, and the develop caches that set wall
-          # time must fit the 10 GB repository cap.
+          # Registry/index cache only; sccache owns compilation reuse.
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
+          cache-bin: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
@@ -328,7 +325,7 @@ jobs:
           exit "$failed"
       # Playwright 1.59.1's installer hangs extracting Chromium under Node 26;
       # the smokes themselves run on Node 26 below.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: install browser layout smoke tools
@@ -338,7 +335,7 @@ jobs:
           sudo apt-get install -y just
           npm ci --prefix elastos/tools/browser-playwright-engine
           npx --prefix elastos/tools/browser-playwright-engine playwright install --with-deps chromium
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
       # The smokes default to a macOS Brave install unless BRAVE_BIN is set.
@@ -359,22 +356,25 @@ jobs:
           done
           total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/capsules-test-list.txt")
           echo "Capsules listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
   # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
   # owns all the logic (throwaway client identity, throwaway compose
   # project, receipt assertions, full teardown); this job is thin glue over
-  # it. Gated to workflow_dispatch and PRs that actually touch the harness
+  # it. Trusted develop/main pushes warm the shared image cache. Runs also for
+  # every merge group, workflow_dispatch, and PRs that touch the harness
   # image, the proof driver, or the protected-content/carrier crates it
-  # exercises -- NOT every push, since the image build + 3-node bring-up
-  # add real wall time.
+  # exercises.
   custody-harness-smoke:
     name: custody-harness-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: source-gate
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'))
     # The top-level `permissions: contents: read` above zeroes every other
     # scope for every job; dorny/paths-filter resolves a pull_request's
     # changed files via the GitHub API (this job's checkout is fetch-depth 1,
@@ -385,13 +385,13 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - name: detect custody/carrier-relevant changes
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         with:
           filters: |
             custody:
@@ -417,36 +417,41 @@ jobs:
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
       - id: should-run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ env.CI_SAVE_CACHE }}" = "true" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "no custody/carrier-relevant paths changed on this PR; skipping the smoke run" >> "$GITHUB_STEP_SUMMARY"
           fi
       - if: steps.should-run.outputs.run == 'true'
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
       # Builds the host `elastos` binary the smoke script itself invokes
       # (identity show, node peer add, node status) -- same cache shape as
       # the test-elastos/lint jobs above.
       - if: steps.should-run.outputs.run == 'true' && env.CI_USE_CACHE == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-custody-smoke-bd
           cache-directories: target-build
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - if: steps.should-run.outputs.run == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       # Pre-warms the custody-host image's BuildKit layer cache via the GHA
       # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
       # own `docker compose up -d --build` expects it -- that later build
       # then hits this same local layer cache instead of rebuilding cold.
+      # The verified Kubo layer precedes COPY, so source changes reuse it.
       - name: pre-build custody-host image (GHA layer cache)
         if: steps.should-run.outputs.run == 'true'
         run: |
           cache_args=()
           if [[ "${CI_USE_CACHE}" == "true" ]]; then
-            cache_args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+            cache_args+=(--cache-from type=gha)
+          fi
+          # Only trusted saving runs write; merge-queue and PR scopes are unreadable elsewhere.
+          if [[ "${CI_SAVE_CACHE}" == "true" ]]; then
+            cache_args+=(--cache-to type=gha,mode=max)
           fi
           docker buildx build \
             -f deploy/custody-host/Dockerfile \
@@ -459,7 +464,7 @@ jobs:
         run: scripts/custody-harness-ci-smoke.sh
       - name: upload evidence receipt on failure
         if: failure() && steps.should-run.outputs.run == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: custody-harness-smoke-evidence
           path: /tmp/custody-harness-ci-smoke-evidence/
@@ -478,6 +483,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: [source-gate, engine-llama-arm64]
+    env:
+      CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
     strategy:
       fail-fast: false
       matrix:
@@ -488,34 +495,92 @@ jobs:
           - os: ubuntu-22.04-arm
             check_name: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-linux-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-linux-build" >> "$GITHUB_ENV"
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
-      # A stalled mirror once held this step until the 90-minute job limit.
-      - name: install host prerequisites
-        timeout-minutes: 15
+      - name: require fresh Linux build artifacts
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          set -euo pipefail
+          # Reuse this job's fresh source only, including across capsule workspaces.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
+      - name: prepare apt archive cache permissions
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 /var/cache/apt/archives
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+      - name: restore Ubuntu prerequisite archives
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
+          restore-keys: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-
+      - name: install host prerequisites
+        id: apt-prerequisites
+        timeout-minutes: 13
+        run: bash scripts/ci-apt-prerequisites.sh
+      - name: save Ubuntu prerequisite archives
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.apt-prerequisites.outputs.changed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci-apt-prerequisites.sh') }}-${{ env.CI_APT_PACKAGES }}-${{ github.run_id }}
+      - name: bind Kubo cache to its pin
+        id: kubo-pin
+        run: |
+          platform=linux-amd64
+          if [[ "${{ runner.arch }}" == ARM64 ]]; then platform=linux-arm64; fi
+          echo "KUBO_PLATFORM=$platform" >> "$GITHUB_ENV"
+          echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
+          python3 scripts/ci-kubo-cache.py key "$platform" "$RUNNER_TEMP/kubo-cache"
+      - name: restore verified Kubo inputs
+        id: kubo-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
+      - name: verify or download Kubo inputs
+        timeout-minutes: 10
+        run: python3 scripts/ci-kubo-cache.py fetch "$KUBO_PLATFORM" "$KUBO_CACHE_DIR"
+      - name: save verified Kubo inputs
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -541,7 +606,7 @@ jobs:
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       - name: download pinned ARM64 engine input
         if: matrix.os == 'ubuntu-22.04-arm'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: llama-arm64-bundle
           path: ${{ runner.temp }}/llama-arm64-bundle
@@ -573,7 +638,7 @@ jobs:
             --receipt elastos-runtime-linux-arm64.receipt.json
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: elastos-runtime-${{ matrix.os }}
           path: |
@@ -582,7 +647,7 @@ jobs:
             elastos-runtime-*.receipt.json
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: source-home-linux-${{ matrix.os }}-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -592,25 +657,36 @@ jobs:
   source-home-macos:
     name: source-home-macos
     runs-on: macos-14
-    timeout-minutes: 90
+    # The two hop builds may take 30 minutes and the update journey step 75.
+    timeout-minutes: 150
     needs: source-gate
     steps:
-      - uses: actions/checkout@v5
+      - name: set job build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-macos-target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-macos-build" >> "$GITHUB_ENV"
+      # Published tarballs keep the shipped Cargo release profile.
+      - name: use CI journey release profile
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos-bd
-          # Shared intermediate build dir (root .cargo/config.toml build-dir)
-          cache-directories: target-build
+          prefix-key: ${{ runner.os }}-source-home-registry
+          # Cache Cargo inputs; journey artifacts start fresh.
+          cache-targets: false
           save-if: ${{ env.CI_SAVE_CACHE == 'true' }}
       - name: reserve hosted Mac build and fixture capacity
         timeout-minutes: 10
@@ -618,24 +694,35 @@ jobs:
       - name: require fresh Mac build intermediates
         run: |
           set -euo pipefail
-          # Cargo 1.91 stores fingerprints here. Start outside the restored
-          # cache, then share intermediates across this source tree's N/N+1.
-          directory="$RUNNER_TEMP/source-home-macos-build"
-          test ! -e "$directory"
-          test ! -L "$directory"
-          mkdir -m 700 "$directory"
-          printf 'CARGO_BUILD_BUILD_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          # Keep outputs and Cargo 1.91 fingerprints outside restored caches.
+          # Reuse this job's fresh source across capsules and version builds.
+          for directory in "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"; do
+            test ! -e "$directory"
+            test ! -L "$directory"
+            mkdir -m 700 "$directory"
+          done
           echo "CI_MAC_BUILD_DIR_FRESH=true" >> "$GITHUB_ENV"
-      # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
-      # macOS runners, and setup's downloader makes a single 600s attempt.
-      # Cache the verified release tarball and pre-seed bin/kubo so setup
-      # skips the download entirely (ELACITY-2308).
-      - name: cache kubo release
+      - name: bind Kubo cache to its pin
+        id: kubo-pin
+        run: |
+          echo "KUBO_CACHE_DIR=$RUNNER_TEMP/kubo-cache" >> "$GITHUB_ENV"
+          python3 scripts/ci-kubo-cache.py key darwin-arm64 "$RUNNER_TEMP/kubo-cache"
+      - name: restore verified Kubo inputs
+        id: kubo-cache
         if: env.CI_USE_CACHE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ runner.temp }}/kubo-cache
-          key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('components.json') }}
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
+      - name: verify or download Kubo inputs
+        timeout-minutes: 10
+        run: python3 scripts/ci-kubo-cache.py fetch darwin-arm64 "$KUBO_CACHE_DIR"
+      - name: save verified Kubo inputs
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.kubo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.kubo-pin.outputs.paths }}
+          key: ${{ steps.kubo-pin.outputs.key }}
       - name: seed kubo into the test HOME
         run: |
           set -euo pipefail
@@ -674,12 +761,13 @@ jobs:
           # version is X.Y.Z or X.Y.Z-{alpha|beta|rc}.N, never the default "-dev".
           export ELASTOS_RELEASE_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path elastos/Cargo.toml \
             | python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "elastos-server"))')"
+          echo "ELASTOS_RELEASE_VERSION=$ELASTOS_RELEASE_VERSION" >> "$GITHUB_ENV"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       # The installed Home journey signs up through the real page. Playwright
       # 1.59.1's installer hangs extracting Chromium under Node 26; the journey runs on 26.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: prepare installed Home browser
@@ -689,11 +777,33 @@ jobs:
           export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/installed-home-browser"
           npx --prefix elastos/tools/browser-playwright-engine playwright install chromium --only-shell
           echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
+      # The hop starts from the published release the pin names. Its signed bytes are
+      # cached by the pin; only a miss reads them from the public seed.
+      - name: restore the pinned published release
+        id: previous-release-cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/previous-release-cache
+          key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
+      - name: fetch the pinned published release
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py fetch-previous-release \
+            "$RUNNER_TEMP/previous-release-cache" "$RUNNER_TEMP/previous-release"
+      - name: save the pinned published release
+        if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.previous-release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/previous-release-cache
+          key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
       - name: build two actual Runtime versions
-        timeout-minutes: 16
+        # This source compiled twice (new and next) over the restored intermediates.
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
@@ -701,7 +811,7 @@ jobs:
           mkdir -p "$CI_HOP_ROOT"
           echo "CI_HOP_ROOT=$CI_HOP_ROOT" >> "$GITHUB_ENV"
           python3 scripts/update-hop-compare.py build-ci-hop "$CI_HOP_ROOT/build-inputs" \
-            --runtime "$PWD/elastos/target/release/elastos"
+            --runtime "$CARGO_TARGET_DIR/release/elastos" --previous "$RUNNER_TEMP/previous-release"
           python3 -I - "$CI_HOP_ROOT/build-inputs/build.json" <<'PY'
           import json, os, pathlib, sys
           path = pathlib.Path(sys.argv[1])
@@ -709,8 +819,12 @@ jobs:
           directory = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
           assert directory == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-build'
           assert directory.is_dir() and not directory.is_symlink()
+          target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+          assert target == pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-home-macos-target'
+          assert target.is_dir() and not target.is_symlink()
           assert os.environ['CI_MAC_BUILD_DIR_FRESH'] == 'true'
           build['intermediates'] = {'directory': str(directory), 'initially_absent': True,
+                                    'target_directory': str(target),
                                     'source': build['source']}
           path.write_text(json.dumps(build, indent=2) + '\n')
           PY
@@ -721,11 +835,17 @@ jobs:
           python3 scripts/update-hop-compare.py generate-ci-hop "$CI_HOP_ROOT/package" \
             --runtime "$CI_HOP_ROOT/build-inputs/elastos-old" \
             --next-runtime "$CI_HOP_ROOT/build-inputs/elastos-new" \
+            --system-runtime "$CI_HOP_ROOT/build-inputs/elastos-system" \
             --build-receipt "$CI_HOP_ROOT/build-inputs/build.json" \
             --support-home "$RUNNER_TEMP/elastos-mac-test-home/Library/Application Support/elastos" \
+            --previous "$RUNNER_TEMP/previous-release" \
             > "$CI_HOP_ROOT/generation.json"
       - name: prove installed Home account and System update with Carrier hop and refusals
-        timeout-minutes: 20
+        # Expected about 20 minutes. The Home journey's waits are capped at: sign-up 240 s,
+        # the published release's System update 480 s, 2 Home starts x 150 s, 2 reconnects
+        # x 420 s (next release, Undo), tampered refusal 330 s, Undo commands 2 x 300 s:
+        # 47 minutes in the worst case, plus the CLI installs and refusals.
+        timeout-minutes: 75
         env:
           ELASTOS_CI_FIXTURE_SCOPE: ci-rehearsal
           ELASTOS_CI_REQUIRE_REAL_RUNTIME: "1"
@@ -734,23 +854,17 @@ jobs:
           export ELASTOS_CI_FIXTURE_MANIFEST_SHA256="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_sha256"])' "$CI_HOP_ROOT/generation.json")"
           python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
           python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
-      - name: require no new provider warnings after the System update
-        run: |
-          python3 -I - "$CI_HOP_ROOT/package/results/result.json" <<'PY'
-          import json, sys
-          result = json.load(open(sys.argv[1]))
-          new = result["paths"]["m1-install"]["checks"]["initial-home"]["system"]["provider_warnings"]["new"]
-          print("\n".join(new) or "no new provider warnings after the update")
-          sys.exit(1 if new else 0)
-          PY
+      - name: require the update from the published release, no new provider warnings and Undo
+        run: python3 scripts/update-hop-compare.py check-result "$CI_HOP_ROOT/package/results/result.json"
       - name: retain the safe CI hop receipt
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: macos-cli-update-hop-receipt
           path: |
             ${{ env.CI_HOP_ROOT }}/package/results/result.json
             ${{ env.CI_HOP_ROOT }}/package/results/home-system/*.png
+            ${{ env.CI_HOP_ROOT }}/package/results/diagnostics/
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
@@ -781,7 +895,7 @@ jobs:
           scripts/package-release-binaries.sh
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: elastos-runtime-macos-14
           path: |
@@ -789,7 +903,7 @@ jobs:
             elastos-runtime-*.tar.gz.sha256
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: source-home-macos-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -814,12 +928,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: elastos-runtime-*
           merge-multiple: true
       - name: publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ElastOS Runtime ${{ github.ref_name }}
           generate_release_notes: true

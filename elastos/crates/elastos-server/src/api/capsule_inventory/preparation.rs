@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::api::gateway::HomeLaunchTokenContext;
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
+use crate::host_lock::FileLock;
 
 mod storage;
 use storage::Inventory;
@@ -1137,7 +1138,7 @@ async fn activate_admitted_model(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    worker: &std::fs::File,
+    worker: &FileLock,
 ) -> anyhow::Result<()> {
     let record = load_operation(data_dir, operation)?;
     if record.state != PreparationState::Admitted {
@@ -1601,7 +1602,7 @@ async fn prepare_capacity(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    _worker: &std::fs::File,
+    _worker: &FileLock,
 ) -> anyhow::Result<bool> {
     for _ in 0..=MAX_RECORDS {
         revalidate()?;
@@ -1976,7 +1977,7 @@ async fn prepare(
     update_operation(data_dir, id, |record| {
         record.index_bytes = index.len() as u64
     })?;
-    // Backend identity/pressure is observed per byte window. Runtime floor and
+    // Backend identity/pressure is observed per byte window. Runtime space and
     // authority remain per read; the outstanding charge is not an OS reservation.
     let mut window_bytes = index.len() as u64;
     for expected in &closure.files {
@@ -2644,7 +2645,7 @@ pub async fn append_admitted_model_startup_offers(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-) -> anyhow::Result<Option<std::fs::File>> {
+) -> anyhow::Result<Option<FileLock>> {
     // A Home without preparation inventory keeps its operator offers unchanged.
     match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2706,7 +2707,7 @@ pub async fn settle_pending_model_startup(
     data_dir: &Path,
     bridge: &elastos_runtime::provider::ProviderBridge,
     config: &elastos_runtime::provider::BridgeProviderConfig,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2768,7 +2769,7 @@ pub async fn settle_pending_model_startup(
 pub async fn complete_admitted_model_startup(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2816,7 +2817,7 @@ async fn append_admitted_model_offers_locked(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-    _worker: &std::fs::File,
+    _worker: &FileLock,
 ) -> anyhow::Result<()> {
     let snapshot = Inventory::open(data_dir, false)?.load()?;
     if !snapshot
@@ -3470,7 +3471,7 @@ mod tests {
             let digest = format!("sha256:{:x}", Sha256::digest(bytes));
             let archive = format!("sha256:{}", "a".repeat(64));
             let platform = crate::setup::detect_platform();
-            std::fs::write(bundle.join("llama-server"), bytes).unwrap();
+            crate::test_support::write_from_child(&bundle.join("llama-server"), bytes, 0o500);
             std::fs::write(
                 bundle.join(".elastos-engine.json"),
                 serde_json::to_vec(&serde_json::json!({
@@ -3488,10 +3489,11 @@ mod tests {
                     }}
                 });
             });
-            for (name, mode) in [("llama-server", 0o500), (".elastos-engine.json", 0o400)] {
-                std::fs::set_permissions(bundle.join(name), std::fs::Permissions::from_mode(mode))
-                    .unwrap();
-            }
+            std::fs::set_permissions(
+                bundle.join(".elastos-engine.json"),
+                std::fs::Permissions::from_mode(0o400),
+            )
+            .unwrap();
             let mut parent = bundle.clone();
             for _ in Path::new(relative).components() {
                 let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
@@ -5632,7 +5634,7 @@ mod tests {
                 };
                 let (result, ()) = tokio::join!(init, during_init);
                 assert_eq!(result.is_err(), busy);
-                // Startup's caller owns this File until the Init result is handled.
+                // Startup's caller owns this guard until the Init result is handled.
                 assert!(Inventory::open(root.path(), false)
                     .unwrap()
                     .worker_lock()
@@ -8025,8 +8027,12 @@ server.serve_forever()
                 + 32 * 1024 * 1024;
             let dir = File::open(&root_path).unwrap();
             let (volume_capacity, initial_free) = volume_bytes(&dir);
-            storage::require_space_floor(volume_capacity, initial_free, u128::from(layout_charge))
-                .unwrap();
+            storage::require_reservation_fits(
+                volume_capacity,
+                initial_free,
+                u128::from(layout_charge),
+            )
+            .unwrap();
             let data = root_path.join("data");
             let seed = root_path.join("seed");
             let repo = data.join("ipfs-repo");
@@ -8389,7 +8395,7 @@ server.serve_forever()
                     combined_allocated_peak = combined_allocated_peak
                         .max(stage.1 + backend.1 + publisher.1 + seed_disk.1);
                     minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                    storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                    storage::require_reservation_fits(volume_capacity, minimum_free, 0).unwrap();
                     assert!(
                         logs.iter()
                             .all(|log| log.metadata().unwrap().len() <= 65536),
@@ -8461,7 +8467,7 @@ server.serve_forever()
                 combined_allocated_peak = combined_allocated_peak
                     .max(admitted_disk.1 + backend_after.1 + publisher_after.1 + seed_disk.1);
                 minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                storage::require_reservation_fits(volume_capacity, minimum_free, 0).unwrap();
                 let requests = test_backend.calls.lock().unwrap().clone();
                 let reads = requests.iter().filter(|op| *op == "cat").count();
                 let expected_reads = 1
@@ -10448,24 +10454,29 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_preparation_disk_floor_uses_checked_outstanding_bytes() {
-        assert!(storage::require_space_floor(1000, 200, 100).is_ok());
-        assert!(storage::require_space_floor(1000, 200, 101).is_err());
-        assert!(storage::require_space_floor(1000, 200, 201).is_err());
-        assert!(storage::require_space_floor(0, 0, 0).is_err());
-        assert!(storage::require_space_floor(1000, 1001, 0).is_err());
-        assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_err());
+    fn model_preparation_disk_check_keeps_the_shared_free_space_reserve() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let capacity = 1 << 40;
+        assert!(storage::require_reservation_fits(capacity, reserve + 200, 200).is_ok());
+        let refused = storage::require_reservation_fits(capacity, reserve + 199, 200).unwrap_err();
+        assert!(refused.is::<elastos_common::NotEnoughFreeSpace>());
+        assert!(!storage::reservation_fits(capacity, reserve + 199, 200).unwrap());
+        // Volume size alone never refuses a reservation that fits.
+        assert!(storage::require_reservation_fits(1 << 50, reserve + 10, 10).is_ok());
+        assert!(storage::require_reservation_fits(0, 0, 0).is_err());
+        assert!(storage::reservation_fits(capacity, capacity + 1, 0).is_err());
+        assert!(storage::require_reservation_fits(u128::MAX, u128::MAX, u128::MAX).is_err());
     }
 
     #[test]
     fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
         let margin = 1024 * 1024;
         let charge = preparation_charge(payload).unwrap();
-        let initial_free = floor + u128::from(charge) + margin;
-        assert!(storage::require_space_floor(capacity, initial_free, charge.into()).is_ok());
+        let initial_free =
+            u128::from(charge) + margin + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        assert!(storage::require_reservation_fits(capacity, initial_free, charge.into()).is_ok());
         for completed in [0, payload / 4, payload / 2, payload] {
             let index = if completed == 0 { 0 } else { 717 };
             let delivered = u128::from(completed + index);
@@ -10474,7 +10485,7 @@ server.serve_forever()
             // are deterministic logical-growth facts, not Kubo allocation proof.
             let free = initial_free - 2 * delivered;
             assert!(
-                storage::require_space_floor(
+                storage::require_reservation_fits(
                     capacity,
                     free,
                     u128::from(stage) + u128::from(backend)
@@ -10493,23 +10504,21 @@ server.serve_forever()
     #[test]
     fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
-        let margin = 1024 * 1024;
+        let capacity = 1_u128 << 40;
+        let margin = 1024 * 1024 + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         let stage_budget = staging_charge(payload).unwrap();
         let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
         let completed = payload / 4;
         let index = 717;
         let delivered = u128::from(completed + index);
         let (stage, backend) = remaining_capacity_charges(payload, completed, index).unwrap();
-        let stage_free = floor + u128::from(stage_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, stage_free, stage.into()).is_ok());
-        let backend_free = floor + u128::from(backend_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, backend_free, backend.into()).is_ok());
+        let stage_free = u128::from(stage_budget) + margin - delivered;
+        assert!(storage::require_reservation_fits(capacity, stage_free, stage.into()).is_ok());
+        let backend_free = u128::from(backend_budget) + margin - delivered;
+        assert!(storage::require_reservation_fits(capacity, backend_free, backend.into()).is_ok());
         // A warm backend stores nothing new. Logical credit stays conservative.
-        let warm_free =
-            floor + u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
-        assert!(storage::require_space_floor(
+        let warm_free = u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
+        assert!(storage::require_reservation_fits(
             capacity,
             warm_free,
             u128::from(stage) + u128::from(backend)
@@ -10520,10 +10529,9 @@ server.serve_forever()
             u128::from(backend),
             u128::from(stage) + u128::from(backend),
         ] {
-            assert!(storage::require_space_floor(capacity, floor + required, required).is_ok());
-            assert!(
-                storage::require_space_floor(capacity, floor + required - 1, required).is_err()
-            );
+            let available = required + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+            assert!(storage::require_reservation_fits(capacity, available, required).is_ok());
+            assert!(storage::require_reservation_fits(capacity, available - 1, required).is_err());
         }
     }
 
@@ -10716,10 +10724,10 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn model_preparation_capacity_windows_runtime_floor_counts_shared_backend_growth() {
+    async fn model_preparation_capacity_windows_runtime_check_counts_shared_backend_growth() {
         let (_root, mut record, _, _) = capacity_window_fixture(true, None).await;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         for completed in [0, 65536, 1024 * 1024, record.total_bytes] {
             record.completed_bytes = completed;
             record.index_bytes = 717;
@@ -10729,23 +10737,23 @@ server.serve_forever()
             for shared in [false, true] {
                 let required = runtime_capacity_charge(&record, shared).unwrap();
                 assert_eq!(required, if shared { stage + backend } else { stage });
-                assert!(storage::require_space_floor(
+                assert!(storage::require_reservation_fits(
                     capacity,
-                    floor + u128::from(required),
+                    u128::from(required) + reserve,
                     required.into()
                 )
                 .is_ok());
-                assert!(storage::require_space_floor(
+                assert!(storage::require_reservation_fits(
                     capacity,
-                    floor + u128::from(required) - 1,
+                    u128::from(required) + reserve - 1,
                     required.into()
                 )
                 .is_err());
             }
             // A Runtime volume with only the stage allowance cannot pass as shared.
-            assert!(storage::require_space_floor(
+            assert!(storage::require_reservation_fits(
                 capacity,
-                floor + u128::from(stage),
+                u128::from(stage) + reserve,
                 runtime_capacity_charge(&record, true).unwrap().into()
             )
             .is_err());

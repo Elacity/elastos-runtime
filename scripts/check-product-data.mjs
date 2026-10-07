@@ -76,12 +76,31 @@ export function validateCapsule(manifest, label = manifest?.name) {
     }
     for (const dependency of manifest.requires ?? []) assert(dependency.kind !== "external", `${label}: Runtime owns external dependencies`);
   }
-  if (manifest.execution === "web-projection") {
-    same(manifest.type, "wasm", `${label}: projection type`);
+  if (manifest.type === "web-projection" || manifest.execution === "web-projection"
+      || manifest.runtime_abi === "elastos.runtime-projection/v1" || manifest.bus_contract === "elastos.runtime-projection/v1") {
+    assert(["wasm", "web-projection"].includes(manifest.type), `${label}: projection type`);
+    same(manifest.execution, "web-projection", `${label}: projection execution`);
+    assert(["app", "viewer", "shell"].includes(manifest.role), `${label}: projection role`);
     same(manifest.runtime_abi, "elastos.runtime-projection/v1", `${label}: projection ABI`);
     same(manifest.bus_contract, "elastos.runtime-projection/v1", `${label}: projection bus`);
-    assert(manifest.wit_world_sha256 === undefined, `${label}: web projection uses Runtime ABI`);
+    assert(manifest.microvm === undefined && manifest.wit_world_sha256 === undefined, `${label}: incompatible projection execution metadata`);
     assert(requireList(manifest.projections, `${label}: projections`).includes("web"), `${label}: web projection is missing`);
+  }
+  if (manifest.type === "native-provider" || manifest.execution === "native-provider" || manifest.runtime_abi === "elastos.provider-stdio/v1") {
+    same(manifest.type, "native-provider", `${label}: native provider type`);
+    same(manifest.execution, "native-provider", `${label}: native provider execution`);
+    same(manifest.role, "provider", `${label}: native provider role`);
+    same(manifest.runtime_abi, "elastos.provider-stdio/v1", `${label}: native provider ABI`);
+    assert(manifest.microvm === undefined && manifest.bus_contract === undefined && manifest.wit_world_sha256 === undefined, `${label}: incompatible native provider execution metadata`);
+  }
+  if (manifest.type === "native-host" || manifest.execution === "native-host" || manifest.runtime_abi === "native-host") {
+    same(manifest.type, "native-host", `${label}: native host type`);
+    same(manifest.execution, "native-host", `${label}: native host execution`);
+    same(manifest.runtime_abi, "native-host", `${label}: native host ABI`);
+    same(manifest.role, "shell", `${label}: native host role`);
+    same(manifest.name, "shell", `${label}: native host name`);
+    same(manifest.entrypoint, "shell", `${label}: native host entrypoint`);
+    assert(manifest.microvm === undefined && manifest.bus_contract === undefined && manifest.wit_world_sha256 === undefined && !(manifest.projections?.length), `${label}: incompatible native host execution metadata`);
   }
   if (manifest.interfaces !== undefined) {
     const interfaces = requireList(manifest.interfaces, `${label}: interfaces`);
@@ -187,7 +206,7 @@ const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
   "browser-engine-adapter", "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "browser-local-exit",
   "webspace-provider", "object-provider", "wallet-provider", "model-provider",
-  "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox",
+  "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
 const obsolete = ["chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
@@ -206,7 +225,7 @@ export function parsePublishData(shellSource, rustSource) {
   };
   const lists = {
     shellDefault: shell("DEFAULT_CAPSULES"), shellRequired: shell("REQUIRED_SUPPORTED_CAPSULES"),
-    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustRequired: rust("REQUIRED_SUPPORTED_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
+    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
   };
   for (const [name, values] of Object.entries(lists)) {
     assert(values.length > 0 && values.every((value) => typeof value === "string" && /^[a-z0-9][a-z0-9-]*$/.test(value)), `${name}: invalid publish capsule data`);
@@ -218,15 +237,13 @@ export function parsePublishData(shellSource, rustSource) {
 export function validatePublishData(components, manifests, lists) {
   const installedHome = components.profiles.home.components.filter((name) => Object.hasOwn(manifests, name)).sort();
   for (const name of ["shellDefault", "rustHome"]) same([...lists[name]].sort(), installedHome, `${name}: published capsules must match the Home profile`);
-  for (const name of ["shellRequired", "rustRequired"]) {
-    for (const capsule of installedHome) assert(lists[name].includes(capsule), `${name}: missing Home capsule ${capsule}`);
-  }
-  same([...lists.shellRequired].sort(), [...lists.rustRequired].sort(), "Shell and Rust supported publish capsules must match");
+  for (const capsule of installedHome) assert(lists.shellRequired.includes(capsule), `shellRequired: missing Home capsule ${capsule}`);
+  same([...lists.shellRequired].sort(), [...lists.rustHome].sort(), "Shell and Rust supported publish capsules must match");
   for (const [name, values] of Object.entries(lists)) {
     unique(values, `${name}: publish capsules`);
     for (const capsule of values) assert(Object.hasOwn(manifests, capsule) && !obsolete.includes(capsule), `${name}: unknown or retired publish capsule ${capsule}`);
   }
-  for (const capsule of ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
+  for (const capsule of ["gba-emulator", "gba-ucity", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
   for (const capsule of lists.rustDemo) assert(components.profiles.demo.components.includes(capsule) && !installedHome.includes(capsule), `rustDemo: ${capsule} belongs in the demo profile`);
 }
 
@@ -251,7 +268,7 @@ export function validateComponents(components, manifests) {
   }
   for (const [profile, required] of [
     ["home", homeCore],
-    ["demo", [...homeCore, "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "chat-room", "cloudflared", "gba-emulator", "gba-ucity"]],
+    ["demo", [...homeCore, "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared", "gba-emulator", "gba-ucity"]],
     ["blockchain", ["shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", ...protectedProviders]],
   ]) {
     const list = components.profiles[profile]?.components ?? [];
@@ -266,12 +283,12 @@ export function validateComponents(components, manifests) {
   for (const name of ["gba-emulator", "gba-ucity"]) assert(!home.includes(name) && components.profiles.demo.components.includes(name), `${name}: demo profile placement`);
   same(Object.entries(components.profiles).filter(([, profile]) => profile.components.includes("custody-provider")).map(([name]) => name).sort(), ["blockchain", "full"], "Custody profile placement");
   for (const [name, component] of Object.entries(components.external)) {
-    assert(object(component.platforms) && Object.keys(component.platforms).length > 0, `${name}: release platforms`);
+    // microVM pieces publish no platform until signed, artifact-backed bytes exist.
+    const unreleased = ["crosvm", "vmlinux"].includes(name);
+    assert(object(component.platforms) && (unreleased || Object.keys(component.platforms).length > 0), `${name}: release platforms`);
     for (const [platform, metadata] of Object.entries(component.platforms)) {
       assert(object(metadata), `${name}: ${platform} metadata`);
-      if (["crosvm", "vmlinux", "cloudflared"].includes(name)) {
-        assert(text(metadata.release_path) || text(metadata.url) || text(metadata.cid) || (metadata.strategy === "local-copy" && text(metadata.source)), `${name}: ${platform} artifact source`);
-      } else present(metadata.release_path, `${name}: ${platform} release path`);
+      present(metadata.release_path, `${name}: ${platform} release path`);
       const installPath = metadata.install_path ?? component.install_path;
       present(installPath, `${name}: ${platform} install path`);
       for (const path of [metadata.release_path, installPath, metadata.extract_path].filter((value) => value !== undefined)) safePath(path, `${name}: ${platform} artifact`);

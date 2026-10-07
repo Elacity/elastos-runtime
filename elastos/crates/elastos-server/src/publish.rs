@@ -36,47 +36,13 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "marketplace",
     "archive-manager",
     "inbox",
+    "chat-room",
     "assistant",
     "elacity-player",
     "model-provider",
 ];
-const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
-const DEMO_PUBLISH_CAPSULES: &[&str] =
-    &["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"];
+const DEMO_PUBLISH_CAPSULES: &[&str] = &["gba-emulator", "gba-ucity", "tunnel-provider"];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
-const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
-    "shell",
-    "localhost-provider",
-    "did-provider",
-    "chain-provider",
-    "net-provider",
-    "exit-provider",
-    "browser-engine-adapter",
-    "webspace-provider",
-    "wallet-provider",
-    "object-provider",
-    "content-block-graph-provider",
-    "ipfs-provider",
-    "home-cli",
-    "home-gui",
-    "home",
-    "system",
-    "services",
-    "people",
-    "wallet-metamask",
-    "wallet-unisat",
-    "wallet-walletconnect",
-    "wallet",
-    "browser",
-    "documents",
-    "library",
-    "marketplace",
-    "archive-manager",
-    "inbox",
-    "assistant",
-    "elacity-player",
-    "model-provider",
-];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
 pub(crate) fn source_discovery_uri(publisher_did: &str, channel: &str) -> String {
@@ -787,7 +753,7 @@ impl PublicationProvider {
         data_dir: &Path,
         repo_bytes: u64,
         local_bytes: u64,
-    ) -> anyhow::Result<(u64, elastos_server::local_http::LoopbackHttpBaseUrl)> {
+    ) -> anyhow::Result<elastos_server::local_http::LoopbackHttpBaseUrl> {
         // The private provider probe validates the actual API repository, its
         // pinned datastore layout and all datastore volumes. Bind that probe
         // to the selected Runtime repository before using its free-space data.
@@ -828,7 +794,7 @@ impl PublicationProvider {
             .await?;
         let local = storage_observation(data_dir)?;
         let selected = storage_observation(&repo)?;
-        let floor = validate_publication_capacity(
+        validate_publication_capacity(
             &observation["data"],
             probe_bytes,
             selected,
@@ -836,7 +802,7 @@ impl PublicationProvider {
             repo_bytes,
             local_bytes,
         )?;
-        Ok((floor, base))
+        Ok(base)
     }
 
     async fn finish(&mut self) -> anyhow::Result<()> {
@@ -953,7 +919,7 @@ fn validate_publication_capacity(
     local: StorageObservation,
     repo_bytes: u64,
     local_bytes: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<()> {
     let fields = value
         .as_object()
         .context("Publication capacity response required")?;
@@ -977,7 +943,6 @@ fn validate_publication_capacity(
         "Publication capacity differs from the selected Runtime repository"
     );
     let repo_free = free.min(repo.free);
-    let floor = u64::try_from(u128::from(repo.capacity).saturating_mul(15).div_ceil(100))?;
     let shared = repo.volume == local.volume;
     anyhow::ensure!(
         !shared || repo.capacity == local.capacity,
@@ -985,20 +950,18 @@ fn validate_publication_capacity(
     );
     let required = u128::from(repo_bytes) + if shared { u128::from(local_bytes) } else { 0 };
     anyhow::ensure!(
-        u128::from(repo_free.min(if shared { local.free } else { repo_free }))
-            >= u128::from(floor) + required,
-        "Publication writes would cross the 15 percent free-space floor"
+        u128::from(repo_free.min(if shared { local.free } else { repo_free })) >= required,
+        "Publication writes need more free space than the volume has"
     );
     if !shared {
-        let local_floor = u128::from(local.capacity).saturating_mul(15).div_ceil(100);
         anyhow::ensure!(
             local.capacity > 0
                 && local.free <= local.capacity
-                && u128::from(local.free) >= local_floor + u128::from(local_bytes),
-            "Publication local copies would cross the 15 percent free-space floor"
+                && u128::from(local.free) >= u128::from(local_bytes),
+            "Publication local copies need more free space than the volume has"
         );
     }
-    Ok(floor)
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
@@ -1210,7 +1173,7 @@ fn discover_available_capsules(workspace_root: &Path) -> anyhow::Result<Vec<Stri
 
 fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Result<Vec<String>> {
     let mut selected = match profile {
-        "home" => DEFAULT_PUBLISH_CAPSULES
+        "home" => HOME_PUBLISH_CAPSULES
             .iter()
             .map(|name| name.to_string())
             .collect::<Vec<_>>(),
@@ -1444,7 +1407,7 @@ fn validate_publish_inputs(
         }
     }
 
-    let missing_supported = REQUIRED_SUPPORTED_PUBLISH_CAPSULES
+    let missing_supported = HOME_PUBLISH_CAPSULES
         .iter()
         .filter(|name| !selected_capsules.iter().any(|selected| selected == *name))
         .copied()
@@ -2139,8 +2102,8 @@ mod tests {
         release_discovery_topics, resolve_platform_input_paths, save_publish_state,
         select_capsules, source_discovery_uri, validate_platform_input_options,
         validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
-        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
-        DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEMO_PUBLISH_CAPSULES,
+        HOME_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -2463,13 +2426,13 @@ mod tests {
 
     #[test]
     fn test_select_capsules_defaults_to_home_publish_set() {
-        let entries = DEFAULT_PUBLISH_CAPSULES
+        let entries = HOME_PUBLISH_CAPSULES
             .iter()
             .map(|name| (*name, &[][..]))
             .collect::<Vec<(&str, &[&str])>>();
         let manifests = test_manifests(&entries);
         let selected = select_capsules("home", &[], &manifests).unwrap();
-        let mut expected = DEFAULT_PUBLISH_CAPSULES
+        let mut expected = HOME_PUBLISH_CAPSULES
             .iter()
             .map(|name| name.to_string())
             .collect::<Vec<_>>();
@@ -2482,13 +2445,13 @@ mod tests {
         assert!(selected.contains(&"wallet-provider".to_string()));
         assert!(selected.contains(&"ipfs-provider".to_string()));
         assert!(!selected.contains(&"custody-provider".to_string()));
-        assert!(!selected.contains(&"chat-room".to_string()));
+        assert!(selected.contains(&"chat-room".to_string()));
         assert!(!selected.contains(&"gba-emulator".to_string()));
     }
 
     #[test]
     fn test_publish_profile_demo_extends_home_with_demo_capsules() {
-        let mut entries = DEFAULT_PUBLISH_CAPSULES
+        let mut entries = HOME_PUBLISH_CAPSULES
             .iter()
             .chain(DEMO_PUBLISH_CAPSULES.iter())
             .map(|name| (*name, &[][..]))
@@ -2591,13 +2554,11 @@ mod tests {
         receipt: serde_json::Value,
         status: u8,
     ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let provider = root.join("fixture-provider");
         let body = format!(
             "#!/bin/sh\nIFS= read -r init || exit 94\nIFS= read -r operation || exit 95\nprintf '%s\\n' \"$init\" \"$operation\" > \"$0.requests\"\ncat <<'PUBLIC_FIXTURE_RECEIPT'\n{receipt}\nPUBLIC_FIXTURE_RECEIPT\nexit {status}\n"
         );
-        std::fs::write(&provider, body).unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&provider, body, 0o700);
         provider
     }
 
@@ -2612,7 +2573,6 @@ mod tests {
 
     #[cfg(unix)]
     fn provider_session_fixture(root: &Path, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let data = root.join("data");
         let artifacts = root.join("artifacts");
         std::fs::create_dir_all(data.join("ipfs-repo")).unwrap();
@@ -2656,8 +2616,7 @@ finally:
     worker.join()
     server.server_close()
 "#.replace("__MODE__", &serde_json::to_string(mode).unwrap());
-        std::fs::write(&provider, provider_program).unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&provider, provider_program, 0o700);
         (provider, data, artifacts)
     }
 
@@ -2725,19 +2684,25 @@ finally:
         let repo = super::StorageObservation {
             volume: 7,
             capacity: 1000,
-            free: 350,
+            free: 299,
         };
-        let value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
-        // Each 150-byte write would fit on its own, but their combined peak
-        // would leave only 50 bytes on the same volume, below the 15% floor.
+        let value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":299,"required_bytes":150});
+        // Each 150-byte write would fit on its own, but their combined
+        // 300-byte peak on the same volume exceeds its 299 available bytes.
         assert!(super::validate_publication_capacity(&value, 150, repo, repo, 150, 150).is_err());
+        let exact = super::StorageObservation { free: 300, ..repo };
+        let exact_value = serde_json::json!({"volume_id":7,"capacity_bytes":1000,"available_bytes":300,"required_bytes":150});
+        assert!(
+            super::validate_publication_capacity(&exact_value, 150, exact, exact, 150, 150).is_ok()
+        );
         let other = super::StorageObservation {
             volume: 8,
             capacity: 1000,
-            free: 350,
+            free: 299,
         };
         assert!(super::validate_publication_capacity(&value, 150, repo, other, 150, 150).is_ok());
-        let wrong = serde_json::json!({"volume_id":8,"capacity_bytes":1000,"available_bytes":350,"required_bytes":150});
+        assert!(super::validate_publication_capacity(&value, 150, repo, other, 150, 300).is_err());
+        let wrong = serde_json::json!({"volume_id":8,"capacity_bytes":1000,"available_bytes":299,"required_bytes":150});
         assert!(super::validate_publication_capacity(&wrong, 150, repo, other, 150, 150).is_err());
     }
 
@@ -3420,7 +3385,7 @@ finally:
             .to_string()
             .contains("--cross aarch64 with --skip-build requested"));
 
-        let selected = super::REQUIRED_SUPPORTED_PUBLISH_CAPSULES
+        let selected = super::HOME_PUBLISH_CAPSULES
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();

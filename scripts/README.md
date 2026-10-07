@@ -44,11 +44,16 @@ Publishing trust and signer verification are separate release gates.
 
 ## Local pre-push gate
 
-Before each push, fetch and merge current `origin/develop` into the task branch,
-commit the candidate, then run `just ci-local-prepush`. Resolve the source and
-base before Git resolves the push object. The hook fetches develop and verifies
-its ancestry; it keeps the checked HEAD fixed. A moving base, a dirty source,
-hidden index flags, or a pushed object from another worktree stops the push.
+Commit the candidate, then run `just ci-local-prepush`. Resolve the source and
+base before Git resolves the push object. The hook fetches develop and keeps the
+checked HEAD fixed. It accepts an older develop base only when the candidate
+merges cleanly with current develop and develop changed none of the candidate's
+files since the merge base; otherwise merge develop first. The required PR checks
+prove the merged result; this gate checks only the pushed HEAD. A moving base, a
+dirty source, hidden index flags, or a pushed object from another worktree stops
+the push. The gate skips `cargo clean -p` for repository packages only when
+`CARGO_BUILD_BUILD_DIR` lies inside this worktree, and keeps it for the shared
+default `target-build` beside the common Git directory.
 
 The gate runs the product-data checks, `cargo fmt --all -- --check` for Runtime,
 chain-provider and checked workspaces, then `cargo check --workspace
@@ -126,7 +131,6 @@ when their manifests change. An untracked, unignored workspace lock path stops
 the gate before resolution creates source dirt. The gate logs each resolved
 lock's SHA-256 with its candidate receipt. Cold caches can fetch dependencies
 during metadata resolution; the following package clean uses `--locked --offline`.
-The source and shared-build volumes each need at least 15% free space for this gate.
 
 If the cause of your last failed Mac install, update, or Home startup step is
 unclear, reproduce that exact step locally before the next push. Hold the same

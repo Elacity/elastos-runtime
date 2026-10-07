@@ -370,6 +370,7 @@ mod tests {
         BACKEND_REPORT_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
     use crate::journal::{deterministic_run_id, RunJournal, StoredRun};
+    use crate::test_support::FIXTURE_EVENT_TIMEOUT;
     use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
     use serde_json::{json, Value};
     use std::io::{self, Read, Write};
@@ -382,10 +383,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    const PROMPT_RETURN_BOUND: Duration = Duration::from_millis(250);
     const SHUTDOWN_RETURN_BOUND: Duration = Duration::from_millis(500);
-    const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-    const FIXTURE_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_LOCAL_TEXT_STREAM_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
     struct ResponseAction {
@@ -513,13 +511,18 @@ mod tests {
                 if shutdown_clone.load(Ordering::Relaxed) {
                     return;
                 }
+                let request = read_request(&mut stream);
+                // Another test's wake-up connect can reach this reused
+                // ephemeral port; only a request takes a scripted response.
+                if request.is_empty() {
+                    continue;
+                }
                 let Some(action) = actions.next() else {
                     if shutdown_clone.load(Ordering::Relaxed) {
                         return;
                     }
                     panic!("unexpected test server request");
                 };
-                let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
                 request_active_clone.store(true, Ordering::SeqCst);
                 write_response(&mut stream, &action);
@@ -721,7 +724,7 @@ mod tests {
                         threads: 1,
                         batch_threads: 1,
                         gpu_layers: 0,
-                        health_timeout_ms: 2_000,
+                        health_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
                         shutdown_timeout_ms: 250,
                         enable_thinking: false,
                     },
@@ -744,7 +747,7 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_fake_llama_event(path: &Path, expected: &str) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while !fake_llama_events(path).iter().any(|line| line == expected) {
             assert!(
                 Instant::now() < deadline,
@@ -1089,7 +1092,7 @@ mod tests {
             request.value["config"]["extra"]["runtime_admitted_offers"] = json!([]);
             request
         };
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             // Drop every withdrawal reply, including the first effectful one.
             // A terminal journal result can precede the worker's exit update.
@@ -1269,7 +1272,7 @@ mod tests {
         // The same real ECHILD injection as the engine-owner test. Reap the
         // exact fixture child outside Tokio; the coordinator must retain uncertainty.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
             if result == pid {
@@ -1415,23 +1418,43 @@ mod tests {
         provider.shutdown_on_eof();
     }
 
-    fn create_run(
-        provider: &ProviderCoordinatorHandle,
+    fn create_run_envelope(
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         input: &Value,
-    ) -> Value {
-        send_request(
-            provider,
-            ProviderOperation::RunsCreate,
-            json!({
+    ) -> ProviderEnvelope {
+        ProviderEnvelope {
+            operation: ProviderOperation::RunsCreate,
+            value: json!({
                 "op": "runs_create",
                 "offer_id": offer.id,
                 "operation": offer.operation,
                 "input": input,
                 "runtime_binding": binding,
             }),
-        )
+        }
+    }
+
+    fn create_run(
+        provider: &ProviderCoordinatorHandle,
+        offer: &ConfiguredOffer,
+        binding: &RuntimeCreateBinding,
+        input: &Value,
+    ) -> Value {
+        provider
+            .request(create_run_envelope(offer, binding, input))
+            .unwrap()
+    }
+
+    fn get_run_envelope(run_id: &str, binding: &RuntimeAccessBinding) -> ProviderEnvelope {
+        ProviderEnvelope {
+            operation: ProviderOperation::RunsGet,
+            value: json!({
+                "op": "runs_get",
+                "run_id": run_id,
+                "runtime_binding": binding,
+            }),
+        }
     }
 
     fn get_run(
@@ -1439,15 +1462,23 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        send_request(
-            provider,
-            ProviderOperation::RunsGet,
-            json!({
-                "op": "runs_get",
+        provider.request(get_run_envelope(run_id, binding)).unwrap()
+    }
+
+    fn events_page_envelope(
+        run_id: &str,
+        binding: &RuntimeAccessBinding,
+        after_sequence: u64,
+    ) -> ProviderEnvelope {
+        ProviderEnvelope {
+            operation: ProviderOperation::RunsEvents,
+            value: json!({
+                "op": "runs_events",
                 "run_id": run_id,
+                "after_sequence": after_sequence,
                 "runtime_binding": binding,
             }),
-        )
+        }
     }
 
     fn events_page(
@@ -1456,16 +1487,20 @@ mod tests {
         binding: &RuntimeAccessBinding,
         after_sequence: u64,
     ) -> Value {
-        send_request(
-            provider,
-            ProviderOperation::RunsEvents,
-            json!({
-                "op": "runs_events",
+        provider
+            .request(events_page_envelope(run_id, binding, after_sequence))
+            .unwrap()
+    }
+
+    fn cancel_run_envelope(run_id: &str, binding: &RuntimeAccessBinding) -> ProviderEnvelope {
+        ProviderEnvelope {
+            operation: ProviderOperation::RunsCancel,
+            value: json!({
+                "op": "runs_cancel",
                 "run_id": run_id,
-                "after_sequence": after_sequence,
                 "runtime_binding": binding,
             }),
-        )
+        }
     }
 
     fn cancel_run(
@@ -1473,15 +1508,24 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        send_request(
-            provider,
-            ProviderOperation::RunsCancel,
-            json!({
-                "op": "runs_cancel",
-                "run_id": run_id,
-                "runtime_binding": binding,
-            }),
-        )
+        provider
+            .request(cancel_run_envelope(run_id, binding))
+            .unwrap()
+    }
+
+    /// Sends one request while the test holds an upstream response stalled.
+    /// The stall lasts until the test releases it, so any response proves the
+    /// request did not wait on that upstream. The bound only turns such a hang
+    /// into a failure; it is not a latency budget, so load cannot fail it.
+    fn request_during_stall(
+        provider: &ProviderCoordinatorHandle,
+        envelope: ProviderEnvelope,
+        description: &str,
+    ) -> Value {
+        spawn_request(provider, envelope)
+            .recv_timeout(FIXTURE_EVENT_TIMEOUT)
+            .unwrap_or_else(|_| panic!("{description} must return while the upstream is stalled"))
+            .unwrap()
     }
 
     fn shutdown_request(provider: &ProviderCoordinatorHandle) -> Value {
@@ -1499,7 +1543,7 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        wait_for_terminal_with_timeout(provider, run_id, binding, WAIT_TIMEOUT)
+        wait_for_terminal_with_timeout(provider, run_id, binding, FIXTURE_EVENT_TIMEOUT)
     }
 
     fn wait_for_terminal_with_timeout(
@@ -1527,7 +1571,7 @@ mod tests {
     }
 
     fn load_run(root: &str, run_id: &str) -> StoredRun {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let journal = match RunJournal::open(crate::config::journal_root(root, None).unwrap()) {
                 Ok(journal) => journal,
@@ -1679,7 +1723,7 @@ mod tests {
     }
 
     fn wait_for_flag(flag: &Arc<AtomicBool>) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while !flag.load(Ordering::Relaxed) {
             assert!(
                 Instant::now() < deadline,
@@ -1696,7 +1740,7 @@ mod tests {
     }
 
     fn wait_for_request_count(server: &TestServer, expected: usize) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             if server.requests.lock().unwrap().len() == expected {
                 return;
@@ -1715,7 +1759,7 @@ mod tests {
         description: &str,
         predicate: impl Fn(&StoredRun) -> bool,
     ) -> StoredRun {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         loop {
             let journal = match RunJournal::open(crate::config::journal_root(root, None).unwrap()) {
                 Ok(journal) => journal,
@@ -2019,7 +2063,7 @@ mod tests {
         binding: &RuntimeAccessBinding,
         expected_request_count: usize,
     ) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         while server.requests.lock().unwrap().len() < expected_request_count {
             let _ = get_run(provider, run_id, binding);
             assert!(
@@ -2059,12 +2103,10 @@ mod tests {
 
         let stalled_input = text_input("stall");
         let stalled_binding = create_binding("request:stall", &offer, &stalled_input);
-        let started = Instant::now();
-        let stalled_run = create_run(&provider, &offer, &stalled_binding, &stalled_input);
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "stalled create must return promptly, took {:?}",
-            started.elapsed()
+        let stalled_run = request_during_stall(
+            &provider,
+            create_run_envelope(&offer, &stalled_binding, &stalled_input),
+            "stalled create",
         );
         let stalled_run_id = stalled_run["data"]["run_id"].as_str().unwrap().to_string();
         assert_eq!(stalled_run["data"]["status"], "running");
@@ -2100,12 +2142,10 @@ mod tests {
 
         let input = artifact_input("stall");
         let binding = create_binding("request:artifact-create-prompt", &offer, &input);
-        let started = Instant::now();
-        let create_response = create_run(&provider, &offer, &binding, &input);
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "stalled artifact create must return promptly, took {:?}",
-            started.elapsed()
+        let create_response = request_during_stall(
+            &provider,
+            create_run_envelope(&offer, &binding, &input),
+            "stalled artifact create",
         );
         let run_id = create_response["data"]["run_id"]
             .as_str()
@@ -2147,34 +2187,18 @@ mod tests {
 
         let stalled_get = spawn_request(
             &provider,
-            ProviderEnvelope {
-                operation: ProviderOperation::RunsGet,
-                value: json!({
-                    "op": "runs_get",
-                    "run_id": run_id,
-                    "runtime_binding": access_binding(&binding),
-                }),
-            },
+            get_run_envelope(&run_id, &access_binding(&binding)),
         );
         wait_for_flag(&stalled_started);
 
-        let started = Instant::now();
-        let status_rx = spawn_request(
+        let status_response = request_during_stall(
             &provider,
             ProviderEnvelope {
                 operation: ProviderOperation::Status,
                 value: json!({"op":"status"}),
             },
+            "unrelated status request",
         );
-        let status_response = status_rx
-            .recv_timeout(PROMPT_RETURN_BOUND)
-            .unwrap_or_else(|_| panic!("unrelated status request must return promptly"));
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "unrelated status request must return promptly, took {:?}",
-            started.elapsed()
-        );
-        let status_response = status_response.unwrap();
         assert_eq!(status_response["status"], "ok");
         assert_eq!(
             status_response["data"]["provider"],
@@ -2183,7 +2207,7 @@ mod tests {
 
         release.store(true, Ordering::Relaxed);
         let stalled_response = stalled_get
-            .recv_timeout(WAIT_TIMEOUT)
+            .recv_timeout(FIXTURE_EVENT_TIMEOUT)
             .unwrap_or_else(|_| panic!("stalled get must finish after release"))
             .unwrap();
         assert_eq!(stalled_response["status"], "ok");
@@ -2725,7 +2749,9 @@ mod tests {
     fn stalled_artifact_cancel_does_not_block_get_or_events() {
         let (stalled, release, started_flag) = stalled_cancel_json_action();
         let server = start_server(vec![stalled]);
-        let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
+        // A cancel that starts after its settlement deadline settles unknown
+        // without sending; keep the deadline beyond any scheduling delay.
+        let offer = artifact_offer_with_cancel_timeout(&server.base_url, 60_000);
         let root = temp_root("artifact-cancel-nonblocking");
         let input = artifact_input("cancel");
         let binding = create_binding("request:artifact-cancel-nonblocking", &offer, &input);
@@ -2739,37 +2765,28 @@ mod tests {
         let mut provider = ProviderCoordinatorHandle::start();
         init_provider(&provider, &root, vec![offer.clone()]);
 
-        let started = Instant::now();
-        let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
-        let cancel_elapsed = started.elapsed();
-        assert_eq!(cancel_response["data"]["status"], "reconciling");
-        assert!(
-            cancel_elapsed < PROMPT_RETURN_BOUND,
-            "cancel must return promptly, took {:?}",
-            cancel_elapsed
+        let cancel_response = request_during_stall(
+            &provider,
+            cancel_run_envelope(&run_id, &access_binding(&binding)),
+            "cancel",
         );
+        assert_eq!(cancel_response["data"]["status"], "reconciling");
         wait_for_one_shot(&started_flag, "stalled cancel response entry");
         wait_for_request_count(&server, 1);
 
-        let get_started = Instant::now();
-        let run_response = get_run(&provider, &run_id, &access_binding(&binding));
-        let get_elapsed = get_started.elapsed();
+        let run_response = request_during_stall(
+            &provider,
+            get_run_envelope(&run_id, &access_binding(&binding)),
+            "runs_get during stalled cancel",
+        );
         assert_eq!(run_response["data"]["status"], "reconciling");
-        assert!(
-            get_elapsed < PROMPT_RETURN_BOUND,
-            "runs_get must remain prompt during stalled cancel, took {:?}",
-            get_elapsed
-        );
 
-        let events_started = Instant::now();
-        let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
-        let events_elapsed = events_started.elapsed();
-        assert_eq!(page["data"]["run_id"], json!(run_id));
-        assert!(
-            events_elapsed < PROMPT_RETURN_BOUND,
-            "runs_events must remain prompt during stalled cancel, took {:?}",
-            events_elapsed
+        let page = request_during_stall(
+            &provider,
+            events_page_envelope(&run_id, &access_binding(&binding), 0),
+            "runs_events during stalled cancel",
         );
+        assert_eq!(page["data"]["run_id"], json!(run_id));
         assert_eq!(server.requests.lock().unwrap().len(), 1);
 
         release.store(true, Ordering::Relaxed);
@@ -3395,7 +3412,8 @@ mod tests {
         let started = Instant::now();
         let _ = cancel_run(&provider, run_id, &access_binding(&binding));
         let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Without the interruption, the stalled count would last until the run deadline.
+        assert!(started.elapsed() < Duration::from_millis(offer.policy.runtime_ms_limit));
         assert_eq!(terminal["data"]["status"], "settlement_unknown");
         assert_eq!(
             fake_llama_events(&events)
@@ -3642,7 +3660,7 @@ mod tests {
         let binding = create_binding("request:local-no-poll-deadline", &offer, &input);
         let created = create_run(&provider, &offer, &binding, &input);
         let run_id = created["data"]["run_id"].as_str().unwrap();
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
         let run = loop {
             let run = load_run(&root, run_id);
             if run.status.is_terminal() {
@@ -4409,12 +4427,10 @@ mod tests {
             let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
             wait_for_flag(&stalled_started);
 
-            let started = Instant::now();
-            let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
-            assert!(
-                started.elapsed() < PROMPT_RETURN_BOUND,
-                "hosted cancel must return promptly, took {:?}",
-                started.elapsed()
+            let cancel_response = request_during_stall(
+                &provider,
+                cancel_run_envelope(&run_id, &access_binding(&binding)),
+                "hosted cancel",
             );
             assert_eq!(cancel_response["data"]["status"], "reconciling");
 
@@ -4749,7 +4765,7 @@ mod tests {
             update_tx,
         };
         runtime.block_on(async {
-            let apply = tokio::time::timeout(WAIT_TIMEOUT, coordinator.updates.recv())
+            let apply = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, coordinator.updates.recv())
                 .await
                 .expect("timed out waiting for create worker apply update")
                 .expect("create worker apply update was dropped");
@@ -4768,7 +4784,7 @@ mod tests {
             }
             coordinator.handle_update(apply).await;
 
-            let exited = tokio::time::timeout(WAIT_TIMEOUT, coordinator.updates.recv())
+            let exited = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, coordinator.updates.recv())
                 .await
                 .expect("timed out waiting for create worker exit update")
                 .expect("create worker exit update was dropped");

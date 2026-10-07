@@ -741,8 +741,8 @@ def copy_support(args):
             raise ValueError("support receipt changed during admission")
         usage = shutil.disk_usage(root)
         required = sum(item["size"] for item in records.values()) + len(receipt_bytes)
-        if (usage.free - required) * 100 < usage.total * 15:
-            raise ValueError("support reuse requires 15% free after its copy")
+        if usage.free < required:
+            raise ValueError("support reuse needs free space for its copy")
         for name, expected in [*records.items(), ("platform-input.json", receipt_record)]:
             target = "support-input.json" if name == "platform-input.json" else name
             input_fd = support_file_descriptor(source_fd, name, os.O_RDONLY | os.O_NONBLOCK)
@@ -965,8 +965,8 @@ def stage_inputs(values, version, output, preview_platform=None):
     parent = output.parent.resolve()
     parent.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(parent)
-    if (usage.free - sum(record["size"] for record in files.values())) * 100 < usage.total * 15:
-        raise ValueError("publication staging requires at least 15% free after its copy")
+    if usage.free < sum(record["size"] for record in files.values()):
+        raise ValueError("publication staging needs free space for its copy")
     with tempfile.TemporaryDirectory(prefix=".platform-import-", dir=parent) as temporary:
         stage = Path(temporary) / "input"
         artifacts = stage / "artifacts"
@@ -986,6 +986,20 @@ def stage_inputs(values, version, output, preview_platform=None):
         verify_staged_inputs(stage, preview_platform=preview_platform)
         stage.rename(output)
     return record
+
+
+def unbound_checksum_descriptors(value, path="components"):
+    """Checksum-bearing CID descriptors without a release_path; the signer refuses them.
+
+    Like the signer, CID+sha256+size descriptors bound to snapshot bytes stay allowed."""
+    if isinstance(value, dict):
+        if "cid" in value and "checksum" in value and not isinstance(value.get("release_path"), str):
+            yield path
+        for key, child in value.items():
+            yield from unbound_checksum_descriptors(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from unbound_checksum_descriptors(child, f"{path}[{index}]")
 
 
 def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
@@ -1010,6 +1024,8 @@ def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     if file_record(components) != record["components"]:
         raise ValueError("staged components changed after admission")
     manifest = json.loads(components.read_text())
+    for path in unbound_checksum_descriptors(manifest):
+        raise ValueError(f"{path}: checksummed CID has no release file")
     for platform in record["platforms"]:
         setup = PLATFORMS[platform][0]
         check_binary(regular_file(stage / "artifacts", f"elastos-{platform}"), platform)
@@ -1172,7 +1188,7 @@ def signing_input(stage, cids_path, stamps_path, channel, output,
     signer.require(not destination.is_relative_to(stage.resolve()), "signing input output must be outside staging")
     usage = shutil.disk_usage(parent)
     total = sum(info["size"] for info in files.values()) + len(manifest_bytes)
-    signer.require((usage.free - total) * 100 >= usage.total * 15, "signing input requires 15 percent free after its copy")
+    signer.require(usage.free >= total, "signing input needs free space for its copy")
     with tempfile.TemporaryDirectory(prefix=".signing-input-", dir=parent) as temporary:
         prepared = Path(temporary) / "input"
         prepared.mkdir(mode=0o700)

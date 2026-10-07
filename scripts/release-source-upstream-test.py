@@ -111,7 +111,8 @@ class SourceUpstreamTests(unittest.TestCase):
         package = self.cache / 'capsules' / receipt['release_path']
         self.assertEqual(receipt['checksum'], 'sha256:' + hashlib.sha256(package.read_bytes()).hexdigest())
         self.assertEqual(receipt['capsule_metadata']['checksum'], receipt['checksum'])
-        self.assertEqual((capsule / '.elastos-artifact-sha256').read_text(), receipt['checksum'] + '\n')
+        self.assertEqual((capsule / '.elastos-artifact-sha256').read_text(),
+                         receipt['checksum'].removeprefix('sha256:') + '\n')
         for source in (self.recipes[0]['source'], self.recipes[0]['license']['files'][0]['source']):
             Path(source['path']).unlink()
         self.assert_ok(self.seed(verify=True))
@@ -167,8 +168,14 @@ class SourceUpstreamTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((bundle / '.elastos-engine.json').stat().st_mode), 0o400)
         self.assertEqual((self.data / 'bin/llama-server').resolve(), bundle / 'llama-server')
         self.assertTrue((self.data / 'capsules/llama-server/LICENSE').is_file())
-        self.assertEqual((self.data / 'capsules/llama-server/.elastos-artifact-sha256').read_text(),
-                         receipt['archive_sha256'] + '\n')
+        marker = self.data / 'capsules/llama-server/.elastos-artifact-sha256'
+        self.assertEqual(marker.read_text(), receipt['archive_sha256'].removeprefix('sha256:') + '\n')
+        # A Home set up by an earlier release keeps its prefixed receipt.
+        marker.parent.chmod(0o700)
+        marker.chmod(0o600)
+        marker.write_text(receipt['archive_sha256'] + '\n')
+        marker.chmod(0o400)
+        marker.parent.chmod(0o500)
         self.assert_ok(self.source_function('install_local_model_engine', {'SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER': '1'}))
         self.assertEqual(len(list(self.cache.glob('sha*'))), 2)
 
@@ -286,7 +293,8 @@ class SourceUpstreamTests(unittest.TestCase):
         prerequisite.write_bytes(b'inert localhost fixture')
         consumer = source.split('PUBLISHER_DATA_DIR="${DATA_DIR}"', 1)[1].split('\nSOURCES_PATH=', 1)[0]
         consumer = 'PUBLISHER_DATA_DIR="${DATA_DIR}"' + consumer
-        result = subprocess.run(['bash', '-c', 'set -euo pipefail\numask 077\n' + consumer],
+        binary_path = 'cargo_release_binary() {' + source.split('cargo_release_binary() {', 1)[1].split('\n}', 1)[0] + '\n}\n'
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\numask 077\n' + binary_path + consumer],
             env={**os.environ, 'DATA_DIR': str(self.data), 'TEST_ROOT': str(self.root),
                  'REPO_ROOT': str(self.root)}, capture_output=True, text=True)
         self.assert_ok(result)

@@ -18,8 +18,12 @@ This repo currently has three distinct version layers. They should not be read a
 
 2. **Stamped public release version**
    - the publish/install/update version injected through `ELASTOS_RELEASE_VERSION`
-   - this is what installed binaries, published providers, and published capsules should report to users
+   - this is what installed Runtime binaries and published app capsules report to users
    - non-stamped source builds may append `-dev`
+   - providers do not read it: they report their crate version, so a new release
+     version alone no longer changes provider bytes (dependencies and toolchain still
+     can); the Runtime accepts a provider by its protocol version and request/response
+     schemas, never by its reported version
 
 3. **Capsule-local package version**
    - many standalone capsules and helper tools still carry local package versions like `0.1.0`
@@ -181,6 +185,10 @@ the version by the contract change (see Meaning) and update the changelog first;
    while the service is stopped ends with the known gossip error
    `No running runtime found` after the commit, and the sequence accepts only
    that error.
+5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
+   and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
+   It checks the signed head and release the seed now serves. Every pull
+   request's CI update journey then starts from this release.
 
 Upgrading the seed Runtime itself is rare. Run the workflow with
 `seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints

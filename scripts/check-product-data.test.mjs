@@ -34,14 +34,13 @@ for (const [name, mutate, message] of [
   ["missing shell default capsule", (_components, lists) => lists.shellDefault = lists.shellDefault.filter((name) => name !== "home-gui"), /shellDefault: published capsules/],
   ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "services"), /rustHome: published capsules/],
   ["missing shell required capsule", (_components, lists) => lists.shellRequired = lists.shellRequired.filter((name) => name !== "wallet-provider"), /shellRequired: missing Home capsule wallet-provider/],
-  ["missing Rust required capsule", (_components, lists) => lists.rustRequired = lists.rustRequired.filter((name) => name !== "documents"), /rustRequired: missing Home capsule documents/],
-  ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("chat-room"), /shellDefault: published capsules/],
+  ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("gba-emulator"), /shellDefault: published capsules/],
   ["missing demo publication", (_components, lists) => lists.rustDemo = lists.rustDemo.filter((name) => name !== "gba-emulator"), /missing demo capsule/],
   ["Home capsule in demo additions", (_components, lists) => lists.rustDemo.push("home"), /belongs in the demo profile/],
   ["uninstalled demo publication", (value) => value.profiles.demo.components = value.profiles.demo.components.filter((name) => name !== "tunnel-provider"), /belongs in the demo profile/],
   ["Home installation without publication parity", (value) => value.profiles.home.components = value.profiles.home.components.filter((name) => name !== "assistant"), /published capsules/],
   ["different supported capsule sets", (_components, lists) => lists.shellRequired.push("key-provider"), /supported publish capsules must match/],
-  ["unknown supported capsule", (_components, lists) => { lists.shellRequired.push("unknown"); lists.rustRequired.push("unknown"); }, /unknown or retired publish capsule/],
+  ["unknown publish capsule", (_components, lists) => lists.rustDemo.push("unknown"), /unknown or retired publish capsule/],
 ]) {
   test(`publication data refuse ${name}`, () => {
     const value = clone(components), lists = clone(publish);
@@ -62,8 +61,7 @@ for (const [name, shell, rust, message] of [
   ["shell default", shellPublish.replace(/(DEFAULT_CAPSULES=\([\s\S]*?)\n    home-gui\n/, "$1\n"), rustPublish, /shellDefault: published capsules/],
   ["shell required", shellPublish.replace(/(REQUIRED_SUPPORTED_CAPSULES=\([\s\S]*?)\n    wallet-provider\n/, "$1\n"), rustPublish, /shellRequired: missing Home capsule/],
   ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "services",/, "$1"), /rustHome: published capsules/],
-  ["Rust required", shellPublish, rustPublish.replace(/(const REQUIRED_SUPPORTED_PUBLISH_CAPSULES:[\s\S]*?)\n    "documents",/, "$1"), /rustRequired: missing Home capsule/],
-  ["Rust demo", shellPublish, rustPublish.replace('"gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"', '"gba-ucity", "chat-room", "tunnel-provider"'), /missing demo capsule/],
+  ["Rust demo", shellPublish, rustPublish.replace('"gba-emulator", "gba-ucity", "tunnel-provider"', '"gba-ucity", "tunnel-provider"'), /missing demo capsule/],
 ]) {
   test(`changed ${name} declared publication data is refused`, () => {
     assert.throws(() => validatePublishData(components, manifests, parsePublishData(shell, rust)), message);
@@ -102,6 +100,64 @@ for (const [name, mutate, message] of [
     assert.throws(() => validateCapsule(value), message);
   });
 }
+
+for (const [name, field, invalid, message] of [
+  ["documents", "type", "microvm", /projection type/],
+  ["home-cli", "type", "native-provider", /projection type/],
+  ["home-gui", "type", "microvm", /projection type/],
+  ["browser", "execution", "component", /projection execution/],
+  ["documents", "execution", null, /projection execution/],
+  ["documents", "runtime_abi", "elastos.provider-stdio/v1", /projection ABI/],
+  ["documents", "microvm", {}, /projection.*metadata/],
+  ["chain-provider", "type", "microvm", /native provider type/],
+  ["chain-provider", "type", "wasm", /native provider type/],
+  ["chain-provider", "execution", "microvm", /native provider execution/],
+  ["chain-provider", "execution", null, /native provider execution/],
+  ["chain-provider", "runtime_abi", "elastos.component/v1", /native provider ABI/],
+  ["chain-provider", "microvm", {}, /native provider.*metadata/],
+  ["chain-provider", "bus_contract", "elastos.runtime-projection/v1", /projection type/],
+  ["shell", "type", "wasm", /native host type/],
+  ["shell", "execution", null, /native host execution/],
+  ["shell", "entrypoint", "arbitrary-program", /native host entrypoint/],
+]) {
+  test(`${name} refuses contradictory ${field}=${JSON.stringify(invalid)}`, () => {
+    const value = clone(manifests[name]);
+    if (value.role === "provider") Object.assign(value, {type: "native-provider", execution: "native-provider", runtime_abi: "elastos.provider-stdio/v1", entrypoint: value.name});
+    if (name === "shell") Object.assign(value, {type: "native-host", execution: "native-host", runtime_abi: "native-host", entrypoint: "shell"});
+    value[field] = invalid;
+    assert.throws(() => validateCapsule(value), message);
+  });
+}
+
+test("old and new provider and web projection formats validate during expansion", () => {
+  const old = clone(manifests["chain-provider"]);
+  assert.equal(old.type, "microvm");
+  assert.equal(old.execution, undefined);
+  assert.equal(old.runtime_abi, undefined);
+  validateCapsule(old);
+  validateCapsule({...old, type: "wasm"});
+  validateCapsule({...old, type: "native-provider", execution: "native-provider", runtime_abi: "elastos.provider-stdio/v1", entrypoint: old.name});
+  assert.equal(manifests.documents.type, "wasm");
+  validateCapsule(manifests.documents);
+  validateCapsule({...manifests.documents, type: "web-projection"});
+});
+
+test("shipped execution enums stay readable by released Runtimes", () => {
+  for (const manifest of Object.values(manifests)) {
+    assert.ok(["wasm", "microvm", "oci", "media", "data"].includes(manifest.type), manifest.name);
+    if (manifest.execution) assert.ok(["wasi-receipt", "wasi-app", "web-projection", "component", "microvm", "data"].includes(manifest.execution), manifest.name);
+    if (manifest.runtime_abi) assert.ok(["wasi-preview1", "elastos.runtime-projection/v1", "elastos.component/v1", "microvm-linux", "data"].includes(manifest.runtime_abi), manifest.name);
+  }
+});
+
+test("descriptive types require their execution metadata in both directions", () => {
+  for (const [name, message] of [["documents", /projection execution/], ["chain-provider", /native provider execution/], ["shell", /native host execution/]]) {
+    const value = clone(manifests[name]);
+    value.type = name === "chain-provider" ? "native-provider" : name === "shell" ? "native-host" : "web-projection";
+    for (const field of ["execution", "runtime_abi", "bus_contract"]) delete value[field];
+    assert.throws(() => validateCapsule(value), message);
+  }
+});
 
 for (const name of ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"]) {
   for (const platform of ["linux-amd64", "linux-arm64"]) {

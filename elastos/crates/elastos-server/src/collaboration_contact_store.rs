@@ -18,7 +18,7 @@ use crate::auth::{
     write_protected_principal_root_object,
 };
 use crate::collaboration_core::{
-    ensure_owner_only_directory, validate_owner_only_regular_file, ExclusiveFileLock,
+    ensure_owner_only_directory, lock_owner_only_file, validate_owner_only_regular_file,
 };
 use crate::collaboration_discovery::{
     bind_stored_collaboration_contact_request,
@@ -1522,7 +1522,7 @@ impl CollaborationContactStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("discovery mutation lock is poisoned"))?;
         self.ensure_writable_state_parent()?;
-        let _file_guard = ExclusiveFileLock::acquire(&self.lock_path()?)?;
+        let _file_guard = lock_owner_only_file(&self.lock_path()?)?;
         let mut loaded = self.load_state()?.unwrap_or_else(|| LoadedState {
             state: ContactStoreState {
                 schema: CONTACT_STORE_SCHEMA.to_string(),

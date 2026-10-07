@@ -295,11 +295,69 @@ class ShellTests(unittest.TestCase):
             with self.subTest(ticket=ticket, node=node):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
+    def test_install_space_keeps_the_shared_reserve_at_its_exact_boundary(self):
+        fake_df = ('df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n'
+                   '/dev/x 1 1 %s 1%% /\\n" "$1"; }\n')
+        reserve_kib = 2 * 1024 * 1024
+        needed_kib = 300 * 1024
+        available_kib = reserve_kib + needed_kib
+        # Exactly needed + reserve is accepted; needing one byte more than that is refused.
+        for available, size, accepted in [(available_kib, str(needed_kib * 1024), True),
+                                           (available_kib, str(needed_kib * 1024 + 1), False),
+                                           (reserve_kib, "", True),
+                                           (reserve_kib - 1, "", False),
+                                           (available_kib + 10**9, "big", False)]:
+            result = shell(fake_df.replace('"$1"', str(available))
+                           + 'require_install_space /tmp "$1"\n', size)
+            with self.subTest(available_kib=available, size=size):
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+        refused = shell(fake_df.replace('"$1"', str(available_kib))
+                        + 'require_install_space /tmp "$1"\n', str(needed_kib * 1024 + 1))
+        self.assertIn("not enough free space: this needs 0.3 GB plus 2 GB kept free",
+                      refused.stderr)
+
     def test_empty_gateway_array_fails_with_installer_message(self):
         result = shell('GATEWAYS=()\nipfs_fetch test-cid /unused\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Failed to fetch CID", result.stderr)
         self.assertNotIn("unbound variable", result.stderr)
+
+    def test_output_mode_is_plain_off_a_terminal_and_rich_on_request(self):
+        script = 'show_banner\nstep 1 Title\ninfo note\nok done\nwarn careful\n'
+        for prefix in ("", "export NO_COLOR=1 TERM=xterm\n", "export CI=true TERM=xterm\n"):
+            result = shell(prefix + "installer_select_output\n" + script)
+            with self.subTest(prefix=prefix):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "ElastOS Installer\n[1/5] Title\n  ... note\n"
+                                                "  [OK] done\n  [WARN] careful\n")
+        rich = shell("INSTALLER_RICH=true\n" + script)
+        self.assertEqual(rich.returncode, 0, rich.stderr)
+        self.assertIn("|_____|", rich.stdout)
+        self.assertIn("[1/5]", rich.stdout)
+        self.assertIn("✓", rich.stdout)
+        self.assertNotIn("[OK]", rich.stdout)
+
+    def test_installed_version_reads_sources_and_rejects_control_text(self):
+        with tempfile.TemporaryDirectory(prefix="installer-version-") as directory:
+            sources = Path(directory, "sources.json")
+            for value, expected in (("0.7.1", "0.7.1"), ("0.8.0-rc.1+abc", "0.8.0-rc.1+abc"),
+                                    ("\x1b]0;owned\x07", ""), ("1 2", ""), (7, "")):
+                sources.write_text(json.dumps({"sources": [{"installed_version": value}]}))
+                result = shell('installed_version "$1"\n', directory)
+                with self.subTest(value=value):
+                    self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+            sources.write_text("not json")
+            self.assertEqual(shell('installed_version "$1"\n', directory).stdout, "")
+            self.assertEqual(shell('installed_version "$1/missing"\n', directory).stdout, "")
+
+    def test_display_path_shortens_home_and_quotes_the_rest(self):
+        result = shell('HOME=/home/ada\nfor p in /home/ada/.local/bin/elastos "/home/ada/a b" /opt/elastos "/opt/a b"; do '
+                       'display_path "$p"; echo; done\n')
+        self.assertEqual(result.stdout, "~/.local/bin/elastos\n/home/ada/a\\ b\n/opt/elastos\n/opt/a\\ b\n")
+
+    def test_elapsed_time_reads_in_seconds_then_minutes(self):
+        result = shell('format_elapsed 9\nformat_elapsed 60\nformat_elapsed 135\n')
+        self.assertEqual(result.stdout, "9 s\n1 min 0 s\n2 min 15 s\n")
 
     def test_json_path_can_contain_quote_and_spaces(self):
         with tempfile.TemporaryDirectory(prefix="installer test's ") as directory:
@@ -436,11 +494,11 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
-    def run(self, *options, transport="publisher"):
+    def run(self, *options, transport="publisher", umask="0022"):
         seen = len(self.requests())
         options = list(options) + (["--publisher-gateway", "https://test.invalid"] if transport == "publisher"
                                    else ["--gateway", "https://test.invalid", "--head-cid", self.head_cid])
-        result = shell('''
+        result = shell('umask "$9"\n' + '''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
@@ -449,9 +507,9 @@ export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INS
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 export FIXTURE_HEAD_CID="$6" FIXTURE_RELEASE_CID="$7" FIXTURE_BINARY_CID="$8"
 # Feed the complete stamped script through stdin, as curl | bash does.
-cat "$3" | "$2" --noprofile --norc -s -- "${@:9}"
+cat "$3" | "$2" --noprofile --norc -s -- "${@:10}"
 ''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, self.head_cid, self.release_cid,
-                       self.binary_cid, "--maintainer-did", self.did, *options)
+                       self.binary_cid, umask, "--maintainer-did", self.did, *options)
         return result, self.requests()[seen:]
 
     def runtime_calls(self):
@@ -659,6 +717,18 @@ class InstallationTests(unittest.TestCase):
                 "https://test.invalid/ipfs/binary-a"],
     }
 
+    def test_installer_refuses_a_maintainer_did_with_control_text_before_printing_it(self):
+        did, head, release = installable_fixture()
+        for bad in (did + "\x1b]0;owned\x07", did + "\nMaintainer DID: did:key:zOther", did + " ",
+                    "did:web:example.com"):
+            with self.subTest(bad=bad), InstallerSandbox(head, release, bad) as sandbox:
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertIn("MAINTAINER_DID must be a did:key value", result.stderr)
+                self.assertNotIn("Maintainer DID:", result.stdout)
+                self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
@@ -747,6 +817,47 @@ class InstallationTests(unittest.TestCase):
                             self.assertIn("Carrier transport is outside this fixture", marker.read_text())
                             self.assertEqual(sandbox.runtime_calls()[-1], "setup")
                         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_piped_run_prints_plain_numbered_steps_and_ready_summary(self):
+        # curl | bash with captured stdout is the CI and log case: no colour,
+        # no banner art, and every step line in order.
+        did, head, release = installable_fixture()
+        version = json.loads(release)["payload"]["version"]
+        for install_only, total in ((False, 5), (True, 4)):
+            with self.subTest(install_only=install_only), InstallerSandbox(head, release, did) as sandbox:
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, _ = sandbox.run(*(["--install-only"] if install_only else []))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("\033", result.stdout + result.stderr)
+                self.assertNotIn("|_____|", result.stdout)
+                self.assertTrue(result.stdout.startswith("ElastOS Installer\n"), result.stdout)
+                titles = ["Check this computer", "Verify the release", "Download ElastOS Runtime",
+                          "Install", "Set up Home"][:total]
+                steps = ["[%d/%d] %s\n" % (number, total, title) for number, title in enumerate(titles, 1)]
+                self.assertEqual(sorted(steps, key=result.stdout.index), steps)
+                self.assertNotIn("[%d/" % (total + 1), result.stdout)
+                self.assertIn("[OK] Fresh install", result.stdout)
+                self.assertIn("[OK] Release: ElastOS %s (stable)" % version, result.stdout)
+                self.assertIn("[OK] Checksum and version match the signed release", result.stdout)
+                self.assertNotIn("Open Home again", result.stdout)
+                if install_only:
+                    self.assertNotIn("is ready", result.stdout)
+                else:
+                    ready = result.stdout.index("ElastOS %s is ready" % version)
+                    self.assertLess(ready, result.stdout.index("Home is installed"))
+                    self.assertIn("update", result.stdout[ready:])
+                    self.assertIn("export PATH=", result.stdout[ready:])
+
+    def test_existing_installation_is_reported_before_download(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertLess(result.stdout.index("[OK] Existing installation found"),
+                            result.stdout.index("[3/4] Download ElastOS Runtime"))
+            self.assertIn("Open Home again after installation to reconnect.", result.stdout)
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
         did, head, release = installable_fixture()
@@ -842,6 +953,45 @@ class InstallationTests(unittest.TestCase):
                         ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos"})
                     self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_group_umask_still_creates_owner_only_writable_directories(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only", umask="0002")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name in (".local", ".local/bin"):
+                self.assertEqual((sandbox.home / name).stat().st_mode & 0o777, 0o755, name)
+            self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
+
+    def test_existing_group_writable_install_dir_is_refused_before_download_with_working_fix(self):
+        did, head, release = installable_fixture()
+        for case in ("default", "alias", "alias/"):
+            with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
+                if case == "default":
+                    bin_dir, options = sandbox.home / ".local/bin", []
+                    bin_dir.mkdir(parents=True)
+                else:
+                    bin_dir = sandbox.home / "it's a \"bin\" $dir"
+                    bin_dir.mkdir()
+                    (sandbox.home / "alias").symlink_to(bin_dir)
+                    options = ["--install-dir", str(sandbox.home / case)]
+                bin_dir.chmod(0o775)
+                before = sandbox.home_state()
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only", *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.home_state(), before)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
+                self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+                command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+                self.assertTrue(command.startswith("chmod go-w "), command)
+                fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                       capture_output=True, text=True)
+                self.assertEqual(fixed.returncode, 0, fixed.stderr)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o755)
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()

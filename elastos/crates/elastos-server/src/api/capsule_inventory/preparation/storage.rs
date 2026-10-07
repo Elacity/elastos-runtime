@@ -5,11 +5,12 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{ensure, Context as _};
 
 use super::PreparationInventory;
+use crate::host_lock::FileLock;
 
 const DIRECTORY: &CStr = c"model-preparation";
 const LOCK: &CStr = c"lock";
@@ -91,12 +92,12 @@ fn unlink_at(dir: &File, name: &CStr) -> anyhow::Result<()> {
 }
 
 // This lock protects exactly one bounded inventory snapshot. Separate opens
-// contend across both processes and threads; dropping the fd releases flock.
+// contend across both processes and threads; dropping the guard releases flock.
 pub(super) struct Inventory {
     data_path: PathBuf,
     data: File,
     dir: File,
-    lock: File,
+    lock: FileLock,
     loaded: RefCell<Option<Option<Stamp>>>,
 }
 
@@ -134,15 +135,8 @@ impl Inventory {
         // lock. Ordinary contention must not terminate the preparation worker.
         // Keep the wait bounded; the separate worker lock still rejects a
         // competing preparation immediately.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if error.kind() != std::io::ErrorKind::WouldBlock || remaining.is_zero() {
-                return Err(error).context("preparation inventory busy");
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(5)));
-        }
+        let lock = FileLock::exclusive_within(lock, Duration::from_secs(1))
+            .context("preparation inventory busy")?;
         let result = Self {
             data_path: data_path.into(),
             data,
@@ -378,7 +372,7 @@ impl Inventory {
 
     pub(super) fn space_fits(&self, reserved_bytes: u64) -> anyhow::Result<bool> {
         let (capacity, available, required) = space_observation(&self.dir, reserved_bytes)?;
-        space_floor_fits(capacity, available, required)
+        reservation_fits(capacity, available, required)
     }
 
     pub(super) fn volume(&self) -> anyhow::Result<u64> {
@@ -387,13 +381,10 @@ impl Inventory {
 
     // This same-inventory lock outlives short snapshot transactions. Status
     // and cancellation remain available while a worker awaits provider drain.
-    pub(super) fn worker_lock(&self) -> anyhow::Result<File> {
+    pub(super) fn worker_lock(&self) -> anyhow::Result<FileLock> {
         let file = open_at(&self.dir, c"worker", libc::O_RDWR | libc::O_CREAT)?;
         check_file(&file.metadata()?, 0)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("preparation worker busy");
-        }
-        Ok(file)
+        FileLock::try_exclusive(file).context("preparation worker busy")
     }
 
     pub(super) fn stage(&self, create: bool) -> anyhow::Result<Stage> {
@@ -704,7 +695,7 @@ impl Stage {
 
 fn require_available_space(dir: &File, reserved_bytes: u64) -> anyhow::Result<()> {
     let (capacity, available, required) = space_observation(dir, reserved_bytes)?;
-    require_space_floor(capacity, available, required)
+    require_reservation_fits(capacity, available, required)
 }
 
 fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u128, u128)> {
@@ -727,31 +718,55 @@ fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u
     Ok((capacity, available, required))
 }
 
-pub(super) fn space_floor_fits(
+pub(super) fn reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<bool> {
-    ensure!(
-        capacity > 0 && available <= capacity,
-        "invalid preparation disk capacity"
-    );
-    let Some(remaining) = available.checked_sub(reserved) else {
-        return Ok(false);
-    };
-    Ok(remaining.checked_mul(10).context("disk floor overflow")? >= capacity)
+    match require_reservation_fits(capacity, available, reserved) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is::<elastos_common::NotEnoughFreeSpace>() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-pub(super) fn require_space_floor(
+/// Model and content preparation keep the shared free-space reserve.
+pub(super) fn require_reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<()> {
-    let fits = space_floor_fits(capacity, available, reserved)?;
-    ensure!(available >= reserved, "insufficient preparation space");
     ensure!(
-        fits,
-        "preparation requires ten percent free space after reservation"
+        capacity > 0 && available <= capacity,
+        "invalid preparation disk capacity"
     );
-    Ok(())
+    Ok(elastos_common::require_free_space(available, reserved)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_lock::test_support::SpawnedWhileOpen;
+
+    #[test]
+    fn ended_inventory_is_free_while_a_command_spawned_under_it_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(root.path(), true).unwrap();
+        let _command = SpawnedWhileOpen::new(&root.path().join("model-preparation/lock"));
+        drop(inventory);
+        Inventory::open(root.path(), false)
+            .expect("the next snapshot must not wait for a command spawned under the last");
+    }
+
+    #[test]
+    fn ended_worker_lock_is_free_while_a_command_spawned_under_it_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(root.path(), true).unwrap();
+        let worker = inventory.worker_lock().unwrap();
+        let _command = SpawnedWhileOpen::new(&root.path().join("model-preparation/worker"));
+        drop(worker);
+        inventory
+            .worker_lock()
+            .expect("the next worker must not wait for a command spawned under the last");
+    }
 }

@@ -25,7 +25,7 @@ NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
-# Demo-only capsules such as chat-room and GBA are published by passing an
+# Demo-only capsules such as GBA are published by passing an
 # explicit --capsules list or through the Rust `demo` publish profile.
 # availability-provider, drm-provider, rights-provider, key-provider,
 # decrypt-provider, and tunnel-provider are supported direct command assets
@@ -60,6 +60,7 @@ DEFAULT_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    chat-room
     assistant
     elacity-player
     model-provider
@@ -94,6 +95,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    chat-room
     assistant
     elacity-player
     model-provider
@@ -489,7 +491,7 @@ build_packaged_capsule_archive() {
             copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}" || return
             [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
             ;;
-        wasm)
+        wasm|web-projection)
             stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}" || return
             ;;
         *)
@@ -525,8 +527,10 @@ for name, component in sorted((components.get("external") or {}).items()):
     if capsule_dir is None:
         continue
     manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
-    if manifest.get("role") != "provider":
-        raise SystemExit(f"{name} capsule manifest role must be provider")
+    honest = (manifest.get("type"), manifest.get("execution"), manifest.get("runtime_abi"), manifest.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+    legacy = manifest.get("type") in ("wasm", "microvm") and manifest.get("execution") is None and manifest.get("runtime_abi") is None and manifest.get("entrypoint") == "rootfs.ext4"
+    if manifest.get("role") != "provider" or not (honest or legacy):
+        raise SystemExit(f"{name} capsule manifest must describe native-provider execution")
     icon_dir = str(manifest.get("icon") or "").strip().strip("/")
     if not icon_dir:
         raise SystemExit(f"{name} provider capsule icon path is missing")
@@ -656,6 +660,13 @@ stage_wasm_capsule() {
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     [[ -n "$entrypoint" ]] || die "${capsule_name} capsule manifest missing entrypoint"
     runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
+    local capsule_type execution
+    capsule_type=$(capsule_manifest_field "$capsule_name" "type")
+    execution=$(capsule_manifest_field "$capsule_name" "execution")
+    if [[ "$runtime_abi" == "elastos.component/v1" && ( "$capsule_type" != "wasm" || "$execution" != "component" ) ]] ||
+       [[ "$runtime_abi" == "elastos.runtime-projection/v1" && ( ( "$capsule_type" != "wasm" && "$capsule_type" != "web-projection" ) || "$execution" != "web-projection" ) ]]; then
+        die "${capsule_name} type contradicts its execution ABI"
+    fi
 
     if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
         ensure_rust_target_installed "wasm32-unknown-unknown" || return
@@ -1344,8 +1355,8 @@ if previous_head.is_file():
 while not root.exists():
     root = root.parent
 disk = shutil.disk_usage(root)
-if (disk.free - required) * 100 < disk.total * 15:
-    raise SystemExit("Release publication staging would cross the 15% free-space floor")
+if disk.free < required:
+    raise SystemExit("Release publication staging needs more free space than the volume has")
 PY
 }
 

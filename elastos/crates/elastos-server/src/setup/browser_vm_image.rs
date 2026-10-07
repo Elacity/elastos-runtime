@@ -676,10 +676,9 @@ fn install_archive_reader(
     outcome
 }
 
-fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
+fn lock_installation(parent: &Path) -> anyhow::Result<crate::host_lock::FileLock> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
             .create(true)
@@ -692,11 +691,7 @@ fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
             file.metadata()?.is_file(),
             "Browser image install lock must be a regular file"
         );
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Browser image install lock failed");
-        }
-        Ok(file)
+        crate::host_lock::FileLock::exclusive(file).context("Browser image install lock failed")
     }
     #[cfg(not(unix))]
     bail!("Browser image installation requires a supported Unix host")
@@ -720,19 +715,14 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
         let block_size = stats.f_frsize;
         #[cfg(target_pointer_width = "32")]
         let block_size = u64::from(stats.f_frsize);
-        disk_budget(
-            needed,
-            disk_block_count(stats.f_bavail).saturating_mul(block_size),
-            disk_block_count(stats.f_blocks).saturating_mul(block_size),
-        )
+        let available = disk_block_count(stats.f_bavail).saturating_mul(block_size);
+        Ok(elastos_common::require_free_space(
+            u128::from(available),
+            u128::from(needed),
+        )?)
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
-}
-
-fn disk_budget(needed: u64, available: u64, total: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available.saturating_sub(total / 10), "Browser image preparation needs {needed} bytes while keeping 10% free space; free disk space and retry (previous set preserved)");
-    Ok(())
 }
 
 fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -1161,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_image_foreign_paths_and_low_disk_space_are_actionable() {
+    fn browser_image_foreign_paths_are_actionable() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("bin")).unwrap();
         fs::write(temp.path().join("bin/vmlinux"), b"operator-owned").unwrap();
@@ -1175,8 +1165,6 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 199, 1000).is_err());
-        assert!(disk_budget(100, 200, 1000).is_ok());
     }
 
     #[test]
@@ -1187,6 +1175,21 @@ mod tests {
         fs::write(dest.join("good"), b"preserved").unwrap();
         assert!(replace_directory(&temp.path().join("absent"), &dest).is_err());
         assert_eq!(fs::read(dest.join("good")).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn browser_image_ended_install_lock_is_free_while_a_command_spawned_under_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock = lock_installation(temp.path()).unwrap();
+        let path = temp.path().join(".browser-image-install.lock");
+        let _command = SpawnedWhileOpen::new(&path);
+        drop(lock);
+        assert!(
+            lock_is_free(&path),
+            "the next install must not wait for a command spawned under the last"
+        );
     }
 
     #[test]

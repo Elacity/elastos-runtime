@@ -4,6 +4,7 @@ pub mod browser_protocol;
 pub mod chat_protocol;
 pub mod collaboration_protocol;
 mod error;
+mod free_space;
 pub mod localhost;
 mod manifest;
 #[cfg(unix)]
@@ -13,6 +14,7 @@ pub mod timestamp;
 mod types;
 
 pub use error::{ElastosError, Result};
+pub use free_space::{require_free_space, NotEnoughFreeSpace, FREE_SPACE_RESERVE_BYTES};
 pub use manifest::{
     elastos_bus_v1_wit_sha256, validate_model_content_path, AffordanceApprovalMode,
     AffordanceAuditMode, AffordanceRisk, CapsuleAffordanceDescriptor, CapsuleExecution,

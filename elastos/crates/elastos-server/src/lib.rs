@@ -66,6 +66,8 @@ pub mod shares;
 pub mod shell_cmd;
 pub mod sources;
 pub mod supervisor;
+#[cfg(all(test, unix))]
+mod test_support;
 pub mod update;
 pub mod update_controller;
 pub mod vm_provider;

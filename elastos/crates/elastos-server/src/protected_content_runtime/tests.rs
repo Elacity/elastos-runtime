@@ -4282,8 +4282,7 @@ fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         request_log.display(),
         ProtectedStartupProvider::Custody.status(),
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4318,8 +4317,7 @@ fn write_mock_protected_startup_provider_with_shutdown(
         shutdown_response,
         status_response,
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4349,8 +4347,7 @@ fn write_blocking_protected_status_provider(
         status_release.display(),
         provider.status(),
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log, status_signal, status_release)
 }
 
@@ -4552,8 +4549,7 @@ fn write_mock_protected_content_decrypt_provider(
         expected_issuer,
         status,
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
