@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -28,7 +29,7 @@ class RootfsPoolLifetime(unittest.TestCase):
                 rootfs = directory / "rootfs.ext4"
                 rootfs.write_bytes(b"fixture")
                 cp = directory / "cp"
-                cp.write_text(f"""#!{shutil.which('python3')}
+                cp.write_text(f"""#!{sys.executable}
 import os, pathlib, signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 pathlib.Path(sys.argv[-1]).write_bytes(b'partial')
@@ -39,7 +40,8 @@ while True: time.sleep(.1)
                 env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
                            ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF="1")
                 if stop == "timeout":
-                    env["ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS"] = "1000"
+                    # Include interpreter startup in the copy deadline.
+                    env["ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS"] = "5000"
                 process = subprocess.Popen([shutil.which("node"), str(ROOT / "scripts/browser-vm-prepare-rootfs-pool.mjs"),
                                             "--data-dir", str(directory), "--rootfs", str(rootfs),
                                             "--pool-dir", str(directory / "pool")],
@@ -56,7 +58,7 @@ while True: time.sleep(.1)
                         process.stdin.close()
                     elif stop != "timeout":
                         process.send_signal(stop)
-                    process.wait(timeout=5)
+                    process.wait(timeout=8)
                     self.assertFalse(alive(copy_pid), "cp survived its owner")
                     self.assertEqual(list((directory / "pool").glob("*.partial")), [], "partial image leaked")
                 finally:
