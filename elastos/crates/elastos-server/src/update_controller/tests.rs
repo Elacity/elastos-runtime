@@ -3999,6 +3999,7 @@ async fn system_update_fetches_the_pinned_network_before_stop_and_joins_after_ac
                 host_ready: true,
                 carrier: None,
                 carrier_close: None,
+                test_readiness: None,
             },
             host: Some(
                 crate::host_lock::acquire_host_process_lock(&fixture.data, "home", "fixture")
