@@ -18,8 +18,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -365,16 +365,14 @@ jobs:
   # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
   # owns all the logic (throwaway client identity, throwaway compose
   # project, receipt assertions, full teardown); this job is thin glue over
-  # it. Gated to workflow_dispatch and PRs that actually touch the harness
-  # image, the proof driver, or the protected-content/carrier crates it
-  # exercises -- NOT every push, since the image build + 3-node bring-up
-  # add real wall time.
+  # it. Runs on every develop push and workflow_dispatch; PRs use the path
+  # filter for the harness, proof driver and protected-content/carrier crates.
   custody-harness-smoke:
     name: custody-harness-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: source-gate
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
     # The top-level `permissions: contents: read` above zeroes every other
     # scope for every job; dorny/paths-filter resolves a pull_request's
     # changed files via the GitHub API (this job's checkout is fetch-depth 1,
@@ -417,7 +415,7 @@ jobs:
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
       - id: should-run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"

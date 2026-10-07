@@ -47,7 +47,7 @@ def evaluate(expression, context):
     expression = re.sub(r"!(?!=)", " not ", expression)
     expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
-    return bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith}))
+    return eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith, "true": True, "false": False})
 
 
 # event, workflow ref, ref type, checkout override, caches, publication
@@ -163,6 +163,46 @@ class ReleasePolicyTests(unittest.TestCase):
                                         expected = expected and apt_changed == "true"
                                 self.assertEqual(evaluate(field(step, "if"), context), expected,
                                                  f"cache guard in {job} (Kubo hit={kubo_hit}, apt changed={apt_changed})")
+
+    def test_custody_smoke_always_runs_on_develop_and_filters_only_prs(self):
+        self.assertNotIn("changes", list(JOBS))
+        self.assertEqual(field(JOBS["custody-harness-smoke"], "needs"), "source-gate")
+        filter_step, = [step for step in steps("custody-harness-smoke") if "id: filter" in step]
+        self.assertEqual(field(filter_step, "if"), "github.event_name == 'pull_request'")
+        self.assertEqual(field(filter_step, "uses"), "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3")
+        decision, = [step for step in steps("custody-harness-smoke") if "id: should-run" in step]
+        script = textwrap.dedent(decision.split("        run: |\n", 1)[1])
+        for event, ref, _, _, _, _ in CASES:
+            context = {"github.event_name": event, "github.ref": ref}
+            eligible = event in ("pull_request", "workflow_dispatch") or (event == "push" and ref == "refs/heads/develop")
+            self.assertEqual(evaluate(field(JOBS["custody-harness-smoke"], "if"), context), eligible)
+            self.assertEqual(evaluate(field(filter_step, "if"), context), event == "pull_request")
+            if not eligible:
+                continue
+            for changed in ("true", "false", ""):
+                values = {**context, "steps.filter.outputs.custody": changed}
+                command = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: values[match[1]], script)
+                with tempfile.TemporaryDirectory() as root:
+                    output = Path(root) / "output"
+                    subprocess.run(["bash", "-eo", "pipefail", "-c", command], check=True,
+                                   env={**os.environ, "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(Path(root) / "summary")})
+                    expected = event != "pull_request" or changed == "true"
+                    self.assertEqual(output.read_text().strip(), "run=" + str(expected).lower())
+        # A filter error fails the required job; the decision step has the default success guard.
+        self.assertNotIn("continue-on-error", filter_step)
+        self.assertNotIn("if:", decision)
+
+    def test_only_pr_runs_share_a_cancellable_concurrency_group(self):
+        concurrency = SOURCE.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+        group = field(concurrency, "group")
+        for event, ref, _, _, _, _ in CASES:
+            groups = []
+            for run_id in ("101", "102", "103"):
+                context = {"github.workflow": "CI", "github.event_name": event,
+                           "github.ref": ref, "github.run_id": run_id}
+                groups.append(re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: str(evaluate(match[1], context)), group))
+                self.assertEqual(evaluate(field(concurrency, "cancel-in-progress"), context), event == "pull_request")
+            self.assertEqual(len(set(groups)), 1 if event == "pull_request" else 3)
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
