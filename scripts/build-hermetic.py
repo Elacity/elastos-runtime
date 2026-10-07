@@ -128,21 +128,28 @@ def canonicalize(root):
         os.utime(directory, stamp, follow_symlinks=False)
 
 
-def tree_digest(root, skip=()):
-    """Digest of a tree as mounted: every directory (incl. empty) with mode and mtime, every symlink with
-    its target, every regular file with mode, size, mtime and sha256."""
+def tree_digest(root, skip=(), strict=False):
+    """Digest of a tree as mounted: every directory (incl. empty) with mode and mtime_ns, every symlink
+    with mtime_ns and target, every regular file with mode, size, mtime_ns and sha256.
+    strict=True also refuses any entry whose mtime_ns is not exactly SOURCE_DATE_EPOCH."""
     root = str(root)
     digest = hashlib.sha256()
+    canonical_ns = SOURCE_DATE_EPOCH * 1_000_000_000
 
     def note(line):
         digest.update(line.encode("utf-8", "surrogateescape") + b"\n")
+
+    def stamp(entry, info):
+        if strict and info.st_mtime_ns != canonical_ns:
+            raise Miss("%s has mtime %d ns, not the canonical %d ns" % (entry, info.st_mtime_ns, canonical_ns))
+        return info.st_mtime_ns
 
     for directory, dirnames, filenames in os.walk(root):
         dirnames.sort()
         rel = os.path.relpath(directory, root)
         info = os.lstat(directory)
         # The root's own mtime changes whenever a seal is written next to its content.
-        note("D %s %o %s" % (rel, stat.S_IMODE(info.st_mode), "-" if rel == "." else int(info.st_mtime)))
+        note("D %s %o %s" % (rel, stat.S_IMODE(info.st_mode), "-" if rel == "." else stamp(rel, info)))
         for name in sorted(filenames + [d for d in dirnames if os.path.islink(os.path.join(directory, d))]):
             path = os.path.join(directory, name)
             entry = os.path.relpath(path, root)
@@ -150,9 +157,9 @@ def tree_digest(root, skip=()):
                 continue
             info = os.lstat(path)
             if stat.S_ISLNK(info.st_mode):
-                note("L %s %d -> %s" % (entry, int(info.st_mtime), os.readlink(path)))
+                note("L %s %d -> %s" % (entry, stamp(entry, info), os.readlink(path)))
             elif stat.S_ISREG(info.st_mode):
-                note("F %s %o %d %d %s" % (entry, stat.S_IMODE(info.st_mode), info.st_size, int(info.st_mtime),
+                note("F %s %o %d %d %s" % (entry, stat.S_IMODE(info.st_mode), info.st_size, stamp(entry, info),
                                            sha256_path(path)))
             else:
                 note("S %s %o" % (entry, info.st_mode))
@@ -545,7 +552,10 @@ def verified_sysroot(directory):
     except (OSError, ValueError):
         raise Miss("%s is not a sealed sysroot (run seal-sysroot)" % directory)
     started = time.time()
-    actual = tree_digest(directory, skip=(SYSROOT_SEAL,))
+    try:
+        actual = tree_digest(directory, skip=(SYSROOT_SEAL,), strict=True)
+    except Miss as drift:
+        raise Miss("sysroot %s drifted from its seal: %s" % (directory, drift))
     if actual != seal.get("digest"):
         raise Miss("sysroot %s drifted from its seal (%s != %s)" % (directory, actual[:12], str(seal.get("digest"))[:12]))
     return directory, {"image": seal.get("image"), "digest": actual}, time.time() - started
@@ -732,7 +742,7 @@ class Producer:
             (stage / name).mkdir()
         for name in ("src", "cargo", "toolchain"):
             canonicalize(stage / name)
-        digests = {name: tree_digest(stage / name) for name in ("src", "cargo", "toolchain")}
+        digests = {name: tree_digest(stage / name, strict=True) for name in ("src", "cargo", "toolchain")}
         seconds = time.time() - started
         return plan, stage, digests, seconds
 

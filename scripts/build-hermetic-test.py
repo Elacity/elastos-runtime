@@ -591,6 +591,41 @@ class HermeticTests(unittest.TestCase):
                                             "stat -f %%m %s/ws/linking/link.rs" % (paths["src"], paths["src"])])
         self.assertEqual(listing.strip(), str(HERMETIC.SOURCE_DATE_EPOCH))
 
+    def test_sub_second_mtimes_are_keyed_and_refused(self):
+        tree = Path(self.scratch.name) / "ns-tree"
+        (tree / "d").mkdir(parents=True)
+        (tree / "d" / "f").write_text("x")
+        os.symlink("f", tree / "d" / "l")
+        HERMETIC.canonicalize(tree)
+        exact = HERMETIC.tree_digest(tree, strict=True)
+        epoch_ns = HERMETIC.SOURCE_DATE_EPOCH * 1_000_000_000
+        for target in (tree / "d" / "f", tree / "d", tree / "d" / "l"):
+            os.utime(target, ns=(epoch_ns + 500_000_000, epoch_ns + 500_000_000), follow_symlinks=False)
+            self.assertNotEqual(exact, HERMETIC.tree_digest(tree), target)
+            with self.assertRaises(BK.Miss) as refused:
+                HERMETIC.tree_digest(tree, strict=True)
+            self.assertIn("1500000000 ns", str(refused.exception))
+            os.utime(target, ns=(epoch_ns, epoch_ns), follow_symlinks=False)
+        self.assertEqual(exact, HERMETIC.tree_digest(tree, strict=True))
+        if LINUX:
+            copy = Path(self.scratch.name) / "sysroot-ns"
+            link_tree(Path(SYSROOT), copy)
+            (copy / HERMETIC.SYSROOT_SEAL).unlink()
+            HERMETIC.seal_sysroot(copy, "sha256:test")
+            key, receipt = self.produce(key_only=True, sysroot=str(copy))
+            self.assertIsNotNone(key, receipt)
+            probe = copy / "etc" / "passwd"
+            replace_file(probe, probe.read_bytes())
+            os.utime(probe, ns=(epoch_ns + 500_000_000, epoch_ns + 500_000_000))
+            os.utime(copy / "etc", ns=(epoch_ns, epoch_ns))  # the replacement touched the directory
+            miss, reason = self.produce(key_only=True, sysroot=str(copy))
+            self.assertIsNone(miss)
+            self.assertIn("drifted from its seal", reason)
+            self.assertIn("1500000000 ns", reason)
+            # resealing cannot launder it either: the seal canonicalizes, so the digest is the exact one
+            HERMETIC.seal_sysroot(copy, "sha256:test")
+            self.assertEqual(os.lstat(probe).st_mtime_ns, epoch_ns)
+
     def test_c_toolchain_cpu_flags_are_refused(self):
         for name, value in (("CFLAGS", "-O2 -march=native"), ("CXXFLAGS", "-mcpu=native"),
                             ("CPPFLAGS", "-march=x86-64-v3"), ("TARGET_CFLAGS", "-mtune=native")):
