@@ -13,8 +13,9 @@ All notable changes to the public ElastOS Runtime repository.
   publication.
 
 - Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
-  report their own crate version in startup logs and status, so a provider whose
-  source did not change keeps the same bytes and checksum across releases (#194).
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
 
 ### Fixed
 
