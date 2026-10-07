@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 // Source UI fixtures for #170. Installed journeys require the candidate receipt.
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, relative, isAbsolute, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const { chromium } = process.env.ELASTOS_PLAYWRIGHT_MODULE
+const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
   ? await import(pathToFileURL(process.env.ELASTOS_PLAYWRIGHT_MODULE).href)
-  : await import("playwright");
+  : createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url))("playwright");
+const { chromium } = playwrightModule.chromium ? playwrightModule : playwrightModule.default;
 const cid = `bafybei${"a".repeat(52)}`;
 const requests = [];
 const misses = [];
