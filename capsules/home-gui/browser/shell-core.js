@@ -284,6 +284,23 @@ export async function fetchJson(url, init) {
   return response.json();
 }
 
+/**
+ * Fetch a binary Home resource with the launch token. Home GUI runs in an
+ * opaque sandboxed frame, so cookie-authenticated CSS `url()` loads cannot be
+ * relied on; this is the same authenticated path every other Home request uses.
+ */
+export async function fetchBlob(url) {
+  const response = await fetch(url, {
+    headers: homeGuiLaunchToken ? { "x-elastos-home-token": homeGuiLaunchToken } : {},
+  });
+  if (!response.ok) {
+    const error = new Error(`request failed: ${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
+  }
+  return response.blob();
+}
+
 export async function mutateDesktopObject(op, payload = {}) {
   return fetchJson("/api/apps/home/desktop/objects", {
     method: "POST",
