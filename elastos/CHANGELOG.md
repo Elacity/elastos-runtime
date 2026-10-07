@@ -6,6 +6,24 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Developer detail
+
+- `elastos update` in Terminal adds missing Home components only on a Home;
+  Terminal and System updates share one support plan.
+- Artifact receipts have one format: the bare sha256 hex digest. Receipts that
+  earlier releases wrote with the `sha256:` prefix are still read.
+- Archive components are verified by their receipt and the recorded hash of
+  the extracted executable, and `elastos home status` reports them that way.
+  Content Exchange status is correct again (#280).
+- One `FileLock` guard unlocks its lock when dropped; `release()` unlocks and
+  reports an unlock failure where callers need it.
+- install.sh creates its directories 0755 under any umask and refuses an unsafe
+  existing directory before any download, naming a repair command that works
+  (#279).
+- Test fixtures that are executed are written from a child process, so a test
+  no longer fails with ETXTBSY.
+- Process-group scans skip processes that exit during the scan.
+
 ## [0.8.0-alpha.8]
 
 Test-channel release. Signed releases show these notes in System before you update.
