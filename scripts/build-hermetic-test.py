@@ -75,7 +75,7 @@ def package(name, extra=""):
 FILES = {
     ".gitignore": "target/\n",
     "ws/Cargo.toml": '[workspace]\nmembers = ["app", "other", "macro-user", "ticking", "probing", "stamping", "delegating",'
-                     ' "linking"]\nresolver = "2"\n',
+                     ' "linking", "versioned"]\nresolver = "2"\n',
     "ws/app/Cargo.toml": package("app", textwrap.dedent("""\
         [dependencies]
         dep = { path = "../../dep" }
@@ -139,6 +139,16 @@ FILES = {
         }
         """),
     "ws/linking/src/main.rs": 'fn main() { println!("{}", env!("LINK_STAMP")); }\n',
+    # Mirrors elastos-server/build.rs: unset, empty and literal values must build (and key) differently.
+    "ws/versioned/Cargo.toml": package("versioned", "build = \"build.rs\"\n"),
+    "ws/versioned/build.rs": textwrap.dedent("""\
+        fn main() {
+            println!("cargo:rerun-if-env-changed=ELASTOS_RELEASE_VERSION");
+            let version = std::env::var("ELASTOS_RELEASE_VERSION").unwrap_or_else(|_| "zq7-dev".to_string());
+            println!("cargo:rustc-env=ELASTOS_VERSION=<{}>", version);
+        }
+        """),
+    "ws/versioned/src/main.rs": 'fn main() { println!("{}", env!("ELASTOS_VERSION")); }\n',
     "pm/Cargo.toml": package("pm", "[lib]\nproc-macro = true\n"),
     # Round-2 bypass: aliased std::fs read at expansion time.
     "pm/src/lib.rs": textwrap.dedent("""\
@@ -258,7 +268,7 @@ class HermeticTests(unittest.TestCase):
             out.mkdir(parents=True)
             sandbox = producer.sandbox(stage, out)
             done = subprocess.run(sandbox.wrap(command(sandbox.paths), producer.workdir(plan, sandbox)),
-                                  cwd=str(self.root), env=sandbox.environment(plan.allowlisted()), text=True,
+                                  cwd=str(self.root), env=sandbox.environment(plan), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(done.returncode, 0, done.stderr)
             return done.stdout
@@ -659,6 +669,22 @@ class HermeticTests(unittest.TestCase):
         self.assertNotEqual(HERMETIC.record_digest([["a", "b"]]), HERMETIC.record_digest([["a"], ["b"]]))
         self.assertNotEqual(HERMETIC.record_digest([["ab"]]), HERMETIC.record_digest([["a", "b"]]))
 
+    def test_release_version_unset_empty_and_literal_key_and_build_differently(self):
+        # Astra round 9: the key must hash exactly the environment the build runs with.
+        results = {}
+        for label, env in (("unset", {}), ("empty", {"ELASTOS_RELEASE_VERSION": ""}),
+                           ("literal", {"ELASTOS_RELEASE_VERSION": "unversioned"})):
+            key, receipt = self.produce(package="versioned", single=True, env=env)
+            self.assertIsNotNone(key, receipt)
+            results[label] = (key, receipt["document"]["env"], self.binary(receipt, 0, "versioned"))
+        self.assertEqual(len({key for key, _, _ in results.values()}), 3)
+        self.assertNotIn("ELASTOS_RELEASE_VERSION", results["unset"][1])
+        self.assertEqual(results["empty"][1]["ELASTOS_RELEASE_VERSION"], "")
+        self.assertEqual(results["literal"][1]["ELASTOS_RELEASE_VERSION"], "unversioned")
+        self.assertIn(b"<zq7-dev>", results["unset"][2])
+        self.assertIn(b"<>", results["empty"][2])
+        self.assertIn(b"<unversioned>", results["literal"][2])
+
     def test_c_toolchain_cpu_flags_are_refused(self):
         for name, value in (("CFLAGS", "-O2 -march=native"), ("CXXFLAGS", "-mcpu=native"),
                             ("CPPFLAGS", "-march=x86-64-v3"), ("TARGET_CFLAGS", "-mtune=native")):
@@ -710,7 +736,8 @@ class HermeticTests(unittest.TestCase):
         self.assertEqual(computed, built, receipt)
 
     def test_allowlisted_environment_changes_key(self):
-        before, _ = self.produce(key_only=True)
+        before, receipt = self.produce(key_only=True)
+        self.assertNotIn("ELASTOS_RELEASE_VERSION", receipt["document"]["env"])
         versioned, receipt = self.produce(key_only=True, env={"ELASTOS_RELEASE_VERSION": "1.2.3"})
         self.assertEqual(receipt["document"]["env"]["ELASTOS_RELEASE_VERSION"], "1.2.3")
         self.assertNotEqual(before, versioned)

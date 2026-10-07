@@ -363,13 +363,6 @@ class Plan:
         return {name: value for name, value in self.environ.items()
                 if name in PASS_THROUGH or name.startswith(PASS_THROUGH_PREFIXES) or name in self.edge_env}
 
-    def keyed_environment(self):
-        values = self.allowlisted()
-        values["ELASTOS_RELEASE_VERSION"] = self.environ.get("ELASTOS_RELEASE_VERSION") or "unversioned"
-        for name in sorted(self.edge_env):
-            values.setdefault(name, None)
-        return values
-
 
 def refuse_cpu_flags(env, config_files):
     sources = dict(env)
@@ -615,12 +608,13 @@ class Bubblewrap:
         return {"kind": self.kind, "paths": self.paths, "uid": SANDBOX_UID, "gid": SANDBOX_UID,
                 "writable": ["<out>", "<home>", "/tmp"], "network": False, "cpuinfo": "masked"}
 
-    def environment(self, allowlisted):
+    def environment(self, plan):
+        """The exact process environment of the build; the key hashes this dict and nothing else."""
         env = {"PATH": "/build/toolchain/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/build/home", "TMPDIR": "/tmp",
                "CARGO_HOME": "/build/cargo", "CARGO_TARGET_DIR": "/build/out",
                "CARGO_BUILD_BUILD_DIR": "/build/out/build", "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never",
                "SOURCE_DATE_EPOCH": str(SOURCE_DATE_EPOCH)}
-        env.update(allowlisted)
+        env.update(plan.allowlisted())
         return env
 
     def wrap(self, command, workdir):
@@ -659,12 +653,13 @@ class SandboxExec:
     def identity(self):
         return {"kind": self.kind, "paths": self.paths, "writable": ["<out>", "<home>"], "network": False}
 
-    def environment(self, allowlisted):
+    def environment(self, plan):
+        """The exact process environment of the build; the key hashes this dict and nothing else."""
         env = {"PATH": "%s/bin:/usr/bin:/bin" % self.paths["toolchain"], "HOME": self.paths["home"],
                "TMPDIR": str(self.stage / "tmp"), "CARGO_HOME": self.paths["cargo"],
                "CARGO_TARGET_DIR": str(self.out), "CARGO_BUILD_BUILD_DIR": str(self.out / "build"),
                "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never", "SOURCE_DATE_EPOCH": str(SOURCE_DATE_EPOCH)}
-        env.update(allowlisted)
+        env.update(plan.allowlisted())
         return env
 
     def profile(self):
@@ -777,7 +772,7 @@ class Producer:
         return {"version": VERSION, "unit": self.unit.describe(self.repo), "src": digests["src"],
                 "cargo": digests["cargo"], "toolchain": toolchain,
                 "sysroot": self.sysroot[1] if self.sysroot else darwin_identity(),
-                "env": plan.keyed_environment(), "target_cfg": target_cfg, "sandbox": sandbox.identity()}
+                "env": sandbox.environment(plan), "target_cfg": target_cfg, "sandbox": sandbox.identity()}
 
     def build(self, plan, stage, sandbox, out):
         if out.exists():
@@ -788,7 +783,7 @@ class Producer:
         command += ["--offline", "--locked"]
         started = time.time()
         done = subprocess.run(sandbox.wrap(command, self.workdir(plan, sandbox)), cwd=str(self.repo),
-                              env=sandbox.environment(plan.allowlisted()), text=True,
+                              env=sandbox.environment(plan), text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         seconds = time.time() - started
         if done.returncode:
@@ -820,7 +815,7 @@ class Producer:
         command[command.index("--manifest-path") + 1] = self.workdir(plan, sandbox) + "/Cargo.toml"
         command += ["--offline", "--locked"]
         done = subprocess.run(sandbox.wrap(command, self.workdir(plan, sandbox)), cwd=str(self.repo),
-                              env=sandbox.environment(plan.allowlisted()), text=True,
+                              env=sandbox.environment(plan), text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if done.returncode:
             raise Miss("diagnostic build failed: %s" % done.stderr[-2000:])
