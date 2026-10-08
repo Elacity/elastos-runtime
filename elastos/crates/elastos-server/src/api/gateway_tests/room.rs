@@ -2382,3 +2382,67 @@ async fn test_room_service_session_leave_appends_system_object() {
     let summary = crate::room_service::load_summary(dir.path()).unwrap();
     assert_eq!(summary.active_session_count, 0);
 }
+
+#[tokio::test]
+async fn test_chat_room_configured_send_asks_a_fast_sender_to_slow_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "rate-network",
+        "rate-conversation",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let token =
+        projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
+    let send = |index: usize| {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/objects/send")
+            .header("x-elastos-home-token", token.as_str())
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "request_id": format!("chat-message:{index:032x}"),
+                    "body": format!("message {index}"),
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    for index in 0..crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW {
+        let response = app.clone().oneshot(send(index)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = app
+        .clone()
+        .oneshot(send(
+            crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = limited.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (1..=crate::collaboration_rate_limit::COMMUNITY_RATE_WINDOW_SECS).contains(&retry_after)
+    );
+    let body = axum::body::to_bytes(limited.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).starts_with("Slow down."));
+    assert_eq!(
+        port.test_live_unresolved_outgoing().unwrap(),
+        crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW
+    );
+
+    // Resending a delivered message is not a new send.
+    let replay = app.clone().oneshot(send(0)).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+}

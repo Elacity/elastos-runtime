@@ -194,6 +194,13 @@ function checkChatStartup() {
   const startup = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8")
     .replace(/^[ \t]*import\b[\s\S]*?;/gm, "")
     .replaceAll("import.meta.url", JSON.stringify("http://home.example/apps/chat-room/chat-room.js"));
+  // The cache version changes with every rebuilt bundle; both asset URLs must
+  // carry the same one.
+  const startupSource = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8");
+  const assetVersions = [...startupSource.matchAll(/\?v=(chat-room-ui-[0-9a-z]+)/g)].map(match => match[1]);
+  assert.equal(assetVersions.length, 2, "Chat startup must version both browser assets");
+  assert.equal(assetVersions[0], assetVersions[1], "Chat startup assets must share one cache version");
+  const assetVersion = assetVersions[0];
   for (const token of ["", "chat-test-token"]) {
     const env = createEnvironment();
     const calls = [];
@@ -222,7 +229,7 @@ function checkChatStartup() {
     assert.equal(calls[0].options.homeToken, token);
     assert.equal(calls[1].options.homeToken, token);
     assert.equal(calls[1].options.targetId, "chat-room");
-    assert.equal(calls[3].url, "http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=chat-room-ui-20260804a");
+    assert.equal(calls[3].url, `http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=${assetVersion}`);
     env.context.elastosChatNavigation({ conversation_id: "fixture" });
     env.context.elastosChatCopyInvite("fixture-invite");
     assert.deepEqual(plainJson(calls.slice(4)), [
