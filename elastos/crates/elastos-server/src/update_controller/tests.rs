@@ -3603,8 +3603,11 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             b"new support".to_vec()
         };
         if outcome.starts_with("support path") {
-            value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
-                ["release_path"] = json!("fixture-provider");
+            // Only a descriptor without a signed CID is fetched by release name.
+            let platform = &mut value["external"]["fixture-provider"]["platforms"]
+                [crate::setup::detect_platform()];
+            platform["release_path"] = json!("fixture-provider");
+            platform.as_object_mut().unwrap().remove("cid");
         }
         value["capsules"]["fixture-app"] = json!({
             "cid":raw_cid(&app), "sha256":digest(&app), "size":app.len()

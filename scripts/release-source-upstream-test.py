@@ -270,20 +270,17 @@ class SourceUpstreamTests(unittest.TestCase):
         artifacts = self.root / 'publisher/artifacts'
         artifacts.mkdir(parents=True, mode=0o700)
         manifest = {'external': {'kubo': {'platforms': {PLATFORM: {'strategy': 'source-build'}}}}}
-        cid = 'bafk' + 'a' * 32
         context = {'pathlib': __import__('pathlib'), 'os': os, 'json': json, 'shutil': shutil,
                    'subprocess': subprocess, 'data_dir': self.data, 'artifacts_dir': artifacts,
                    'upstream': upstream, 'manifest': manifest, 'platform': PLATFORM,
                    'platform_info': lambda name: manifest['external'][name]['platforms'][PLATFORM]}
-        with mock.patch.dict(os.environ, {'KUBO_CACHE_DIR': str(self.cache)}), \
-                mock.patch.object(subprocess, 'run') as initialize, \
-                mock.patch.object(subprocess, 'check_output', return_value=cid + '\n') as publish:
+        with mock.patch.dict(os.environ, {'KUBO_CACHE_DIR': str(self.cache)}):
             exec(compile(staging, 'local-carrier-kubo-fixture', 'exec'), context)
-            self.assertEqual(initialize.call_args.kwargs['env']['IPFS_PATH'], str(self.data / 'ipfs-repo'))
-            self.assertEqual(publish.call_args.args[0][-1], str(artifacts / 'kubo-linux-amd64.tar.gz'))
         info = manifest['external']['kubo']['platforms'][PLATFORM]
         metadata = manifest['external']['kubo']['capsule_metadata']['platforms'][PLATFORM]
-        self.assertEqual((info['cid'], metadata['cid']), (cid, cid))
+        # The local source serves by name only, so its descriptors carry no CID (#287).
+        self.assertNotIn('cid', info)
+        self.assertNotIn('cid', metadata)
         self.assertEqual(info['checksum'], metadata['checksum'])
         self.assertNotIn('strategy', info)
         self.assertEqual(info['checksum'], 'sha256:' + hashlib.sha256((artifacts / info['release_path']).read_bytes()).hexdigest())

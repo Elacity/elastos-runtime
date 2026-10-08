@@ -6,8 +6,33 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.9]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Chat is its own signed capsule. A new install downloads it over Carrier, and an
+  update from System or Terminal adds it if it is missing.
+- Media tools are downloaded again only when they actually change.
+
+### Fixed
+
+- Undo to an earlier release works again. Before, it received the newest
+  release's parts and was refused.
+- On Ubuntu and Jetson, install.sh no longer refuses the folder it just created.
+  If an existing folder is unsafe, it says how to fix it before downloading
+  anything.
+- Home status no longer shows Content Exchange as "stale install" right after a
+  fresh install.
+
 ### Developer detail
 
+- Components are fetched by their signed CID, like the Runtime binary and
+  components.json; the release name is used only when a descriptor has no CID
+  (#287).
+- Media tools build with fixed prefixes; the archive is byte-identical across
+  build directories (#194).
 - `elastos update` in Terminal adds missing Home components only on a Home;
   Terminal and System updates share one support plan.
 - Artifact receipts have one format: the bare sha256 hex digest. Receipts that
@@ -17,12 +42,20 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Content Exchange status is correct again (#280).
 - One `FileLock` guard unlocks its lock when dropped; `release()` unlocks and
   reports an unlock failure where callers need it.
-- install.sh creates its directories 0755 under any umask and refuses an unsafe
-  existing directory before any download, naming a repair command that works
-  (#279).
+- install.sh creates its directories 0755 under any umask. Before any download it
+  checks the data folder's existing parents with the Runtime's rule (owned by you
+  or root, not group- or other-writable). The installer and the media-tools check
+  name the unsafe folder and the exact repair command (#279).
 - Test fixtures that are executed are written from a child process, so a test
   no longer fails with ETXTBSY.
 - Process-group scans skip processes that exit during the scan.
+- Runtime and validators accept legacy execution labels and the honest
+  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
+  manifests retain the legacy values so older Runtimes can complete an update.
+  Switch shipped manifests to the honest values in the next release, once every
+  supported Runtime accepts them. Runtime audits and Home display actual
+  execution boundaries during this transition. Third-party executable admission
+  remains gated by publisher, package approval and revocation checks.
 
 ### Isolation status
 
@@ -32,16 +65,6 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   accessible to the host operator. A stolen device or profile key requires a
   new identity. The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
   sets the remaining installed acceptance gates.
-
-### Changed
-
-- Runtime and validators accept legacy execution labels and the honest
-  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
-  manifests retain the legacy values so older Runtimes can complete an update.
-  Switch shipped manifests to the honest values in the next release, once every
-  supported Runtime accepts them. Runtime audits and Home display actual
-  execution boundaries during this transition. Third-party executable admission
-  remains gated by publisher, package approval and revocation checks.
 
 ## [0.8.0-alpha.8]
 
