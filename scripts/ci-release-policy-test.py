@@ -19,7 +19,6 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 SOURCE = WORKFLOW.read_text()
 CACHE_ACTION = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
 LOCAL_CACHE_ACTION = "./.github/actions/rust-compile-cache"
-RELEASE_CACHE_ACTION = "./source/.github/actions/rust-compile-cache"
 UNIT_CACHE_JOBS = {"lint", "test-elastos", "test-capsules"}
 SOURCE_HOME_CACHE_JOBS = {"source-home-linux", "source-home-linux-arm64", "source-home-macos"}
 # Read the fixed job/step indentation used here; actionlint checks YAML syntax.
@@ -76,7 +75,7 @@ def validate_action_pins(source, cache_action):
         if not uses:
             raise AssertionError("missing action pins")
         for action, comment in uses:
-            if index == 0 and action in (LOCAL_CACHE_ACTION, RELEASE_CACHE_ACTION):
+            if index == 0 and action == LOCAL_CACHE_ACTION:
                 continue
             if not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", action):
                 raise AssertionError(f"unrecognized local action or mutable action: {action}")
@@ -300,38 +299,19 @@ def validate_journey_builds(source, release_source):
             raise AssertionError(f"step changes the shared build environment: {job}")
 
 
-def validate_release_compile_cache(source):
+def validate_release_builds_are_hermetic(source):
     workflow_jobs = jobs(source)
-    if field(source.split("\njobs:\n", 1)[0], "CI_SAVE_CACHE") != "'false'":
-        raise AssertionError("release jobs require read-only shared compiler caches")
-    if re.search(r"CARGO_PROFILE_RELEASE_(?:LTO|CODEGEN_UNITS)|SCCACHE_GHA_RW_MODE", source):
-        raise AssertionError("release profile and remote cache permissions retain their owners")
-    for job in workflow_jobs:
-        job_steps = steps(job, workflow_jobs)
-        cache_steps = [step for step in job_steps if f"uses: {RELEASE_CACHE_ACTION}" in step]
-        if job not in ("mac", "linux"):
-            if cache_steps or re.search(r"(?i)sccache|RUSTC_WRAPPER|rust-compile-cache", workflow_jobs[job]):
-                raise AssertionError(f"release compiler cache outside Mac/Linux builds: {job}")
-            continue
-        if len(cache_steps) != 1 or "CI_SAVE_CACHE" in workflow_jobs[job]:
-            raise AssertionError(f"one read-only release cache action required: {job}")
-        if re.search(r"uses: (?:Swatinem/rust-cache|actions/cache)", workflow_jobs[job]):
-            raise AssertionError(f"release compiler cache keeps target artifacts fresh: {job}")
-        cache = cache_steps[0]
-        if field(cache, "if") != "hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''":
-            raise AssertionError(f"older release sources retain normal compiler builds: {job}")
-        toolchain, = [step for step in job_steps if "uses: dtolnay/rust-toolchain@" in step]
-        root, = [step for step in job_steps if step.startswith("name: bind the source and allocate an owned root\n")]
-        build, = [step for step in job_steps if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
-        if not (job_steps.index(root) < job_steps.index(cache) and
-                job_steps.index(toolchain) < job_steps.index(cache) < job_steps.index(build)):
-            raise AssertionError(f"release cache must follow source/toolchain binding and precede builds: {job}")
-        exports = {"SCCACHE_MULTILEVEL_CHAIN": "disk,gha", "SCCACHE_DIR": "$root/sccache",
-                   "SCCACHE_CACHE_SIZE": "2G", "SCCACHE_LOCAL_RW_MODE": "READ_WRITE",
-                   "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY": "l0"}
-        for key, value in exports.items():
-            if root.count(f'echo "{key}={value}" >> "$GITHUB_ENV"') != 1:
-                raise AssertionError(f"release local cache contract changed: {job} {key}")
+    if field(source.split("\njobs:\n", 1)[0], "RUSTC_WRAPPER") != "''":
+        raise AssertionError("release jobs must clear any inherited compiler wrapper")
+    if re.search(r"(?i)sccache|rust-compile-cache|RUSTC_WRAPPER\s*[=:]\s*['\"]?\w|CI_SAVE_CACHE", source):
+        raise AssertionError("shipped release builds use no compiler cache")
+    if re.search(r"CARGO_PROFILE_RELEASE_(?:LTO|CODEGEN_UNITS)", source):
+        raise AssertionError("release profile retains its owner")
+    if re.search(r"uses: actions/cache(?:/save)?@|uses: Swatinem/rust-cache|cache-targets: true|restore-keys:", source):
+        raise AssertionError("release workflow permits only exact engine input restore")
+    for job in ("mac", "linux"):
+        build, = [step for step in steps(job, workflow_jobs)
+                  if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
         for token in ('for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"',
                       'CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target"',
                       'CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"',
@@ -340,19 +320,6 @@ def validate_release_compile_cache(source):
                       'rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"'):
             if token not in build:
                 raise AssertionError(f"release builds retain fresh outputs and support parity: {job}")
-        stats, = [step for step in job_steps if step.startswith("name: record compiler cache statistics\n")]
-        keep, = [step for step in job_steps if step.startswith("name: keep compiler cache statistics\n")]
-        for step in (stats, keep):
-            if field(step, "if") != "always() && env.RUSTC_WRAPPER == 'sccache'":
-                raise AssertionError(f"release cache statistics require wrapper guard: {job}")
-        for token in ('sccache --show-stats --stats-format=json', 'data["release_input"]',
-                      '"SOURCE_COMMIT", "SOURCE_TREE", "RELEASE_PLATFORM", "INSTALL_VERSION", "UPDATE_VERSION"'):
-            if token not in stats:
-                raise AssertionError(f"release cache statistics require source/version binding: {job}")
-        if 'path: ${{ env.RELEASE_ROOT }}/compiler-cache-stats.json' not in keep:
-            raise AssertionError(f"release cache evidence must be retained: {job}")
-    if re.search(r"uses: actions/cache(?:/save)?@|cache-targets: true|restore-keys:", source):
-        raise AssertionError("release workflow permits only exact input restore and compiler cache reads")
 
 
 class ReleasePolicyTests(unittest.TestCase):
@@ -422,7 +389,7 @@ class ReleasePolicyTests(unittest.TestCase):
         action = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
         for path in (WORKFLOW, WORKFLOW.parent / "release-package.yml", action):
             for uses in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", path.read_text()):
-                if uses in (LOCAL_CACHE_ACTION, RELEASE_CACHE_ACTION):
+                if uses == LOCAL_CACHE_ACTION:
                     continue
                 self.assertRegex(uses, r"^[\w./-]+@[0-9a-f]{40}$", str(path))
         setup_source = action.read_text()
@@ -431,23 +398,11 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertLess(setup_source.index('"${checksum[@]}" -c'), setup_source.index("tar -xzf"))
         self.assertLess(setup_source.index("tar -xzf"), setup_source.index("RUSTC_WRAPPER=sccache"))
 
-    def test_release_cache_keeps_remote_reads_local_writes_and_fresh_outputs(self):
+    def test_release_builds_are_hermetic_with_fresh_outputs(self):
         source = (WORKFLOW.parent / "release-package.yml").read_text()
-        validate_release_compile_cache(source)
-        # Dispatch input refs retain READ_ONLY even when a main workflow runs them.
-        mode = evaluate(field(CACHE_ACTION.read_text(), "CACHE_RW_MODE"), {"env.CI_SAVE_CACHE": "false"})
-        self.assertEqual(mode, "READ_ONLY")
-        _, _, exported, started = run_compile_cache_fixture(CACHE_ACTION.read_text(), mode)
-        self.assertTrue(started)
-        self.assertEqual(exported["SCCACHE_GHA_RW_MODE"], "READ_ONLY")
-        self.assertEqual(exported["RUSTC_WRAPPER"], "sccache")
+        validate_release_builds_are_hermetic(source)
         for job in ("mac", "linux"):
             job_steps = steps(job, jobs(source))
-            cache, = [step for step in job_steps if f"uses: {RELEASE_CACHE_ACTION}" in step]
-            for action_hash in ("", "abc123"):
-                guard = field(cache, "if").replace(
-                    "hashFiles('source/.github/actions/rust-compile-cache/action.yml')", repr(action_hash))
-                self.assertEqual(evaluate(guard, {}), bool(action_hash))
             parity, = [step for step in job_steps if step.startswith("name: check native versions, source and support parity\n")]
             for token in ('cmp "$inputs/N1/support-input.json" "$inputs/N/platform-input.json"',
                           '--version', '$SOURCE_COMMIT $SOURCE_TREE', 'elastos $version'):
@@ -460,9 +415,7 @@ class ReleasePolicyTests(unittest.TestCase):
                     (root / "scripts").mkdir()
                     (root / "shims").mkdir()
                     release = root / "release"
-                    (release / "sccache").mkdir(parents=True)
-                    cache_entry = release / "sccache/fixture-entry"
-                    cache_entry.write_text("retained compiler cache")
+                    release.mkdir()
                     producer = root / "scripts/prepare-release-platform.sh"
                     producer.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
                         import json, os, pathlib, sys
@@ -495,7 +448,6 @@ class ReleasePolicyTests(unittest.TestCase):
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
-                    self.assertEqual(cache_entry.read_text(), "retained compiler cache")
                     if existing:
                         self.assertFalse(calls.exists())
                         self.assertTrue(output.exists() or output.is_symlink())
@@ -510,28 +462,27 @@ class ReleasePolicyTests(unittest.TestCase):
                         self.assertFalse(target.exists() or target.is_symlink())
                         self.assertFalse(build_dir.exists() or build_dir.is_symlink())
 
-    def test_release_cache_policy_rejects_writers_profile_changes_and_target_reuse(self):
+    def test_release_policy_rejects_compiler_cache_profile_changes_and_target_reuse(self):
         source = (WORKFLOW.parent / "release-package.yml").read_text()
+        toolchain = "      - uses: dtolnay/rust-toolchain@"
         mutations = (
-            source.replace("CI_SAVE_CACHE: 'false'", "CI_SAVE_CACHE: 'true'", 1),
-            source.replace("      - name: configure Rust compile cache\n",
-                           "      - name: configure Rust compile cache\n        env:\n          CI_SAVE_CACHE: 'true'\n", 1),
-            source.replace("SCCACHE_LOCAL_RW_MODE=READ_WRITE", "SCCACHE_LOCAL_RW_MODE=READ_ONLY", 1),
-            source.replace("SCCACHE_DIR=$root/sccache", "SCCACHE_DIR=$root/cargo-N", 1),
+            source.replace(toolchain, "      - name: configure Rust compile cache\n"
+                           "        uses: ./source/.github/actions/rust-compile-cache\n" + toolchain, 1),
+            source.replace("RUSTC_WRAPPER: ''", "RUSTC_WRAPPER: sccache", 1),
+            source.replace("  RUSTC_WRAPPER: ''\n", "", 1),
+            source.replace('echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"',
+                           'echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"\n          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"', 1),
             source.replace('[[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]', "true", 1),
             source.replace('CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target"', 'CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-$name"', 1),
             source.replace('CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"', 'CARGO_BUILD_BUILD_DIR="$RELEASE_ROOT/cargo-build-$name"', 1),
             source.replace('--reuse-support "$inputs/N"', '--reuse-support "$inputs/other"', 1),
-            source.replace("sccache --show-stats --stats-format=json", "sccache --show-stats", 1),
             source + '\nCARGO_PROFILE_RELEASE_LTO=false\n',
             source.replace("actions/cache/restore@", "actions/cache@", 1),
-            source.replace("./source/.github/actions/rust-compile-cache", "./source/.github/actions/unknown", 1),
-            source.replace("hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''", "true", 1),
         )
         for index, changed in enumerate(mutations):
             self.assertNotEqual(changed, source)
             with self.subTest(mutation=index), self.assertRaises(AssertionError):
-                validate_release_compile_cache(changed)
+                validate_release_builds_are_hermetic(changed)
 
     def test_release_engine_restore_matches_ci_recipe_and_always_verifies(self):
         release_jobs = jobs((WORKFLOW.parent / "release-package.yml").read_text())

@@ -37,8 +37,8 @@ env:
   UPDATE_VERSION: ${{ inputs.update_version }}
   CARGO_BUILD_JOBS: '4'
   PYTHONDONTWRITEBYTECODE: '1'
-  # Release dispatches read the shared compiler cache; each job owns its disk L0.
-  CI_SAVE_CACHE: 'false'
+  # Shipped release builds stay hermetic: no compiler wrapper or cache.
+  RUSTC_WRAPPER: ''
 
 jobs:
   admit:
@@ -97,20 +97,12 @@ jobs:
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           root="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          install -d -m 700 "$root" "$root/inputs" "$root/home" "$root/sccache"
+          install -d -m 700 "$root" "$root/inputs" "$root/home"
           echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"
-          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
-          echo "SCCACHE_DIR=$root/sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
-          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
-          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: 1.91.0
           targets: wasm32-unknown-unknown,aarch64-apple-darwin
-      - name: configure Rust compile cache
-        if: hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''
-        uses: ./source/.github/actions/rust-compile-cache
       - name: prepare hosted capacity and native tools
         timeout-minutes: 20
         run: |
@@ -132,8 +124,7 @@ jobs:
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           inputs="$RELEASE_ROOT/inputs"
-          # Rust cache keys include Cargo's output paths. Keep their names
-          # stable and remove both directories after each fresh version build.
+          # Fresh Cargo directories for each version; removed after each build.
           for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
             read -r name version <<< "$build"
             export CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target" CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"
@@ -158,27 +149,6 @@ jobs:
           done
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
-      - name: record compiler cache statistics
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        run: |
-          sccache --show-stats
-          sccache --show-stats --stats-format=json > "$RELEASE_ROOT/compiler-cache-stats.json"
-          python3 -I -S - "$RELEASE_ROOT/compiler-cache-stats.json" <<'PYTHON'
-          import json, os, pathlib, sys
-          path = pathlib.Path(sys.argv[1])
-          data = json.loads(path.read_bytes())
-          data["release_input"] = {key: os.environ[key] for key in
-              ("SOURCE_COMMIT", "SOURCE_TREE", "RELEASE_PLATFORM", "INSTALL_VERSION", "UPDATE_VERSION")}
-          path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-          PYTHON
-      - name: keep compiler cache statistics
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: release-compiler-cache-${{ env.RELEASE_PLATFORM }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.RELEASE_ROOT }}/compiler-cache-stats.json
-          if-no-files-found: warn
-          retention-days: 14
       - name: seal the inputs in mode-preserving parts
         run: |
           set -euo pipefail
@@ -317,20 +287,12 @@ jobs:
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           root="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          install -d -m 700 "$root" "$root/inputs" "$root/home" "$root/sccache"
+          install -d -m 700 "$root" "$root/inputs" "$root/home"
           echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"
-          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
-          echo "SCCACHE_DIR=$root/sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
-          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
-          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: 1.91.0
           targets: wasm32-unknown-unknown,${{ matrix.target }}
-      - name: configure Rust compile cache
-        if: hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''
-        uses: ./source/.github/actions/rust-compile-cache
       - name: install host prerequisites
         timeout-minutes: 15
         run: |
@@ -350,8 +312,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export ELASTOS_LLAMA_ARM64_BUNDLE="$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
           inputs="$RELEASE_ROOT/inputs"
-          # Rust cache keys include Cargo's output paths. Keep their names
-          # stable and remove both directories after each fresh version build.
+          # Fresh Cargo directories for each version; removed after each build.
           for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
             read -r name version <<< "$build"
             export CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target" CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"
@@ -397,27 +358,6 @@ jobs:
               --receipt "$RELEASE_ROOT/jetson-$name.receipt.json"
             rm "$RELEASE_ROOT/jetson-$name.tar.gz"
           done
-      - name: record compiler cache statistics
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        run: |
-          sccache --show-stats
-          sccache --show-stats --stats-format=json > "$RELEASE_ROOT/compiler-cache-stats.json"
-          python3 -I -S - "$RELEASE_ROOT/compiler-cache-stats.json" <<'PYTHON'
-          import json, os, pathlib, sys
-          path = pathlib.Path(sys.argv[1])
-          data = json.loads(path.read_bytes())
-          data["release_input"] = {key: os.environ[key] for key in
-              ("SOURCE_COMMIT", "SOURCE_TREE", "RELEASE_PLATFORM", "INSTALL_VERSION", "UPDATE_VERSION")}
-          path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-          PYTHON
-      - name: keep compiler cache statistics
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: release-compiler-cache-${{ env.RELEASE_PLATFORM }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.RELEASE_ROOT }}/compiler-cache-stats.json
-          if-no-files-found: warn
-          retention-days: 14
       - name: seal the inputs in mode-preserving parts
         run: |
           set -euo pipefail
