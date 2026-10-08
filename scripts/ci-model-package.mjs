@@ -189,20 +189,24 @@ export function produceCatalogPayload({ inputs, output, publisher, add, fixture 
   return { cid: entry.cid, packageDir, payload };
 }
 
-// Creates `path` (and parents) as directories with no symlink anywhere on the
-// path; the leaf must be ours so nobody else can swap entries inside it.
+// Creates `path` (and parents, 0700) with the install.sh/Runtime rule checked
+// before any write: every existing component is a real directory owned by us
+// or root and not group/other-writable, so nobody else can swap entries.
 export function ownedDirectory(path) {
   const check = () => {
     for (let current = resolve(path);; current = dirname(current)) {
       const stat = lstatSync(current, { throwIfNoEntry: false });
-      assert(!stat || stat.isDirectory(), `${current} must be a real directory, not a symlink`);
+      if (stat) {
+        assert(stat.isDirectory(), `${current} must be a real directory, not a symlink`);
+        assert(stat.uid === process.getuid() || stat.uid === 0, `${current} must be owned by the current user or root`);
+        assert.equal(stat.mode & 0o022, 0, `${current} must not be group/other-writable`);
+      }
       if (current === dirname(current)) break;
     }
   };
   check();
   mkdirSync(path, { recursive: true, mode: 0o700 });
   check();
-  assert.equal(lstatSync(path).uid, process.getuid(), `${path} must be owned by the current user`);
   return path;
 }
 

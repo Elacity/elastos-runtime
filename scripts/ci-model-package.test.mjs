@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSmolEntry, canonical, contentManifest, download, fileRecord, ownedDirectory, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
@@ -183,4 +183,13 @@ test("output directory refuses a symlinked ancestor", t => {
   symlinkSync(real, join(root, "link"));
   assert.throws(() => ownedDirectory(join(root, "link", "out")), /not a symlink/);
   assert.throws(() => lstatSync(join(real, "out")), /ENOENT/);
+});
+
+test("output directory refuses a group/other-writable OUT or ancestor before writing", t => {
+  const root = temporary(t), shared = join(root, "shared");
+  mkdirSync(shared);
+  chmodSync(shared, 0o777);
+  assert.throws(() => ownedDirectory(shared), /group\/other-writable/);
+  assert.throws(() => ownedDirectory(join(shared, "out", "inputs")), /group\/other-writable/);
+  assert.deepEqual(readdirSync(shared), []);
 });
