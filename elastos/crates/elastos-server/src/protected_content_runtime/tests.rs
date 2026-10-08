@@ -3931,12 +3931,33 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_parent_tools);
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
-    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o770)).unwrap();
-    assert!(
+    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
+    let refusal =
         prepare_runtime_media_provider_prerequisite(&unsafe_parent_data, &unsafe_parent_tools)
             .unwrap_err()
-            .to_string()
-            .contains("prerequisite parent is unsafe")
+            .to_string();
+    let fix = format!(
+        "chmod go-w '{}'",
+        fs::canonicalize(&unsafe_parent_tools).unwrap().display()
+    );
+    assert!(
+        refusal.contains("prerequisite parent is unsafe"),
+        "{refusal}"
+    );
+    assert!(refusal.contains(&fix), "{refusal}");
+    assert!(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&fix)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        fs::metadata(&unsafe_parent_tools)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
     );
 
     let linked_data = temp.path().join("linked-data");
