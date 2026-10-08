@@ -7,10 +7,16 @@ tmp_dir="$(mktemp -d "/tmp/elastos-vm-settlement.XXXXXX")"
 proof_dir="$tmp_dir/proof"
 mkdir -p "$proof_dir"
 service_pid=""
+service_socket=""
 
 cleanup() {
   if [[ -n "$service_pid" ]]; then
     kill "$service_pid" >/dev/null 2>&1 || true
+    for _ in {1..40}; do
+      kill -0 "$service_pid" >/dev/null 2>&1 || break
+      sleep 0.05
+    done
+    kill -KILL "$service_pid" >/dev/null 2>&1 || true
     wait "$service_pid" 2>/dev/null || true
   fi
   if [[ -n "${OWNER_PID_FILE:-}" && -f "${OWNER_PID_FILE:-}" ]]; then
@@ -29,6 +35,39 @@ cleanup() {
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
+
+"$node_bin" --input-type=module - "$repo_root/scripts/browser-vm-control-service.mjs" <<'NODE'
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import vm from "node:vm";
+const source = fs.readFileSync(process.argv[2], "utf8");
+const predicate = source.slice(source.indexOf("function hostProcessIsAlive("),
+  source.indexOf("function parseVzLaunchSettlementFromStderr("));
+for (const [code, alive] of [[null, true], ["ESRCH", false], ["EPERM", true], ["EIO", true]]) {
+  const result = vm.runInNewContext(`${predicate}; hostProcessIsAlive({pid: 12345});`, {
+    process: { kill(pid, signal) {
+      assert.equal(pid, 12345); assert.equal(signal, 0);
+      if (code) throw Object.assign(new Error(code), { code });
+    } },
+  });
+  assert.equal(result, alive, `process absence requires ESRCH, received ${code}`);
+}
+assert.equal(vm.runInNewContext(`${predicate}; hostProcessIsAlive({pid: "12345"});`, {
+  process: { kill() { throw new Error("invalid identity was probed"); } },
+}), false);
+const tracker = source.slice(source.indexOf("function trackOwnedLauncherChild("),
+  source.indexOf("function newHostProcessOwnershipId("));
+const children = new Set();
+const child = new EventEmitter();
+vm.runInNewContext(`${tracker}; trackOwnedLauncherChild(child);`, {
+  ownedLauncherChildren: children, launcherGroupNeedsForce: false, child,
+});
+child.emit("exit", 0, null);
+assert.equal(children.has(child), true, "process exit cannot stand in for stderr drain/reap");
+child.emit("close", 0, null);
+assert.equal(children.has(child), false, "the final close releases the exact tracked child");
+NODE
 
 fake_launcher="$tmp_dir/fake-settlement-launcher.mjs"
 cat > "$fake_launcher" <<'NODE'
@@ -161,8 +200,33 @@ if (typedFailure && launch.transport_authority) {
     }
   }
   process.stderr.write(`${JSON.stringify(failure)}\n`);
+  if (process.env.TYPED_TRANSPORT_LIVE === "1") {
+    fs.writeFileSync(pidPath, `${process.pid}\n`, { mode: 0o600 });
+    process.on("SIGTERM", () => fs.appendFileSync(`${proofDir}/${suffix}.term`, "term\n"));
+    const timer = setInterval(() => {
+      if (fs.existsSync(`${proofDir}/${suffix}.wrong`)) {
+        fs.unlinkSync(`${proofDir}/${suffix}.wrong`);
+        process.stderr.write(`${JSON.stringify({ ...settlement,
+          state: "terminal_post_effect_cleanup", binding_hash: `sha256:${"f".repeat(64)}`,
+          absence: Object.fromEntries(Object.keys(settlement.absence).map(key => [key, true])),
+        })}\n`);
+      }
+      if (fs.existsSync(`${proofDir}/${suffix}.settle`)) {
+        fs.unlinkSync(`${proofDir}/${suffix}.settle`);
+        process.stderr.write(`${JSON.stringify({ ...settlement,
+          state: "terminal_post_effect_cleanup",
+          absence: Object.fromEntries(Object.keys(settlement.absence).map(key => [key, true])),
+        })}\n`);
+      }
+      if (fs.existsSync(`${proofDir}/${suffix}.exit`)) {
+        clearInterval(timer);
+        process.exit(0);
+      }
+    }, 25);
+  } else {
   process.exit(24);
-}
+  }
+} else {
 if (process.env.LAUNCH_MARKER_PATH) {
   fs.appendFileSync(process.env.LAUNCH_MARKER_PATH, `${launch.stream_id}\n`);
 }
@@ -331,7 +395,7 @@ guest.listen(controlSocketPath, () => {
     const delayedPorts = process.env.TYPED_TRANSPORT_DELAYED_PORTS === "1";
     const acted = afterReady !== "did_not_act";
     const profileDurability = process.env.TYPED_TRANSPORT_PROFILE_DURABILITY || "";
-    process.stderr.write(`${JSON.stringify({
+    const settlement = {
       schema: "elastos.browser.vz-launch-settlement/v1",
       state: afterReady,
       message: delayedPorts
@@ -367,10 +431,36 @@ guest.listen(controlSocketPath, () => {
       ...(profileDurability
         ? { profile_durability: profileDurability }
         : {}),
-    })}\n`);
-    process.exit(1);
+    };
+    if (process.env.TYPED_TRANSPORT_LIVE_AFTER_READY === "1") {
+      process.removeAllListeners("SIGTERM");
+      process.on("SIGTERM", () => fs.appendFileSync(`${proofDir}/${suffix}.term`, "term\n"));
+      setTimeout(() => process.stderr.write(`${JSON.stringify(settlement)}\n`), 100);
+      let settling = false;
+      const timer = setInterval(() => {
+        if (!settling && fs.existsSync(`${proofDir}/${suffix}.settle`)) {
+          settling = true;
+          guest.close(() => {
+            process.stderr.write(`${JSON.stringify({ ...settlement,
+              state: "terminal_post_effect_cleanup",
+              absence: Object.fromEntries(Object.keys(settlement.absence).map(key => [key, true])),
+            })}\n`);
+          });
+        }
+        if (fs.existsSync(`${proofDir}/${suffix}.exit`)) {
+          clearInterval(timer);
+          process.exit(0);
+        }
+      }, 25);
+    } else {
+      guest.close(() => {
+        process.stderr.write(`${JSON.stringify(settlement)}\n`);
+        process.exit(1);
+      });
+    }
   }
 });
+}
 }
 NODE
 chmod +x "$fake_launcher"
@@ -416,6 +506,7 @@ NODE
 
 start_service() {
   local socket_path="$1"
+  service_socket="$socket_path"
   local shutdown_program="${2:-}"
   local label="$3"
   local launch_marker="${4:-}"
@@ -429,6 +520,8 @@ start_service() {
   TYPED_TRANSPORT_FAILURE="${TYPED_TRANSPORT_FAILURE:-}" \
   TYPED_TRANSPORT_ERROR_FORM="${TYPED_TRANSPORT_ERROR_FORM:-}" \
   TYPED_TRANSPORT_AFTER_READY="${TYPED_TRANSPORT_AFTER_READY:-}" \
+  TYPED_TRANSPORT_LIVE="${TYPED_TRANSPORT_LIVE:-}" \
+  TYPED_TRANSPORT_LIVE_AFTER_READY="${TYPED_TRANSPORT_LIVE_AFTER_READY:-}" \
   TYPED_TRANSPORT_CHILD_ABSENT="${TYPED_TRANSPORT_CHILD_ABSENT:-}" \
   TYPED_TRANSPORT_DELAYED_PORTS="${TYPED_TRANSPORT_DELAYED_PORTS:-}" \
   TYPED_TRANSPORT_PROFILE_DURABILITY="${TYPED_TRANSPORT_PROFILE_DURABILITY:-}" \
@@ -454,8 +547,18 @@ start_service() {
 
 stop_service() {
   kill "$service_pid" >/dev/null 2>&1 || true
+  # An unresolved fixture deliberately retains its owner. Bound test teardown,
+  # and preserve the pending journal rather than claiming this is settlement.
+  for _ in {1..40}; do
+    kill -0 "$service_pid" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  kill -KILL "$service_pid" >/dev/null 2>&1 || true
   wait "$service_pid" 2>/dev/null || true
   service_pid=""
+  if [[ -S "$service_socket" && "$service_socket" == "$tmp_dir/"* ]]; then
+    rm -f "$service_socket"
+  fi
 }
 
 client="$tmp_dir/settlement-client.mjs"
@@ -824,7 +927,7 @@ if (process.env.PHASE === "binding-equality") {
   );
   if (
     first.status !== 400 ||
-    !String(first.body.error || "").includes("cleanup failed")
+    !String(first.body.error || "").includes("exited with 17")
   ) {
     throw new Error(`first cleanup did not fail closed: ${JSON.stringify(first)}`);
   }
@@ -1519,7 +1622,8 @@ if (process.env.PHASE === "binding-equality") {
       `typed transport failure was not propagated exactly: ${JSON.stringify(failed)}`,
     );
   }
-  const durable = await reconcile(streamId);
+  const durable = await waitForReconcile(streamId, record => record.state === expected,
+    "typed failure did not reach its expected outer settlement");
   if (
     durable.state !== expected ||
     !isDeepStrictEqual(durable.effects, expectedLaunchAcquisition(expected)) ||
@@ -1578,7 +1682,7 @@ if (process.env.PHASE === "binding-equality") {
       durable.launch_settlement_result,
       persisted.launch_settlement_result,
     ) ||
-    durable.launch_settlement_result?.state !== expected ||
+    durable.launch_settlement_result?.state !== (process.env.EXPECTED_NATIVE_SETTLEMENT || expected) ||
     durable.launch_settlement_result?.binding_hash !==
       issuedTransportAuthority.binding_hash ||
     durable.launch_settlement_result?.generation !==
@@ -1630,7 +1734,7 @@ if (process.env.PHASE === "binding-equality") {
     const expectedCode = process.env.EXPECTED_ERROR_FORM === "envelope-missing"
       ? "profile_recovery_required" : undefined;
     if (failed.body.code !== expectedCode) {
-      throw new Error("invalid typed envelope was projected as a recovery error");
+      throw new Error(`invalid typed envelope ${process.env.EXPECTED_ERROR_FORM} was projected as a recovery error: ${JSON.stringify(failed)}`);
     }
   }
 } else if (process.env.PHASE === "polluted-stdout-ready") {
@@ -1892,6 +1996,122 @@ if (process.env.PHASE === "binding-equality") {
       `exited owner without a native settlement became terminal: ${JSON.stringify(durable)}`,
     );
   }
+} else if (process.env.PHASE === "live-native-cleanup") {
+  const acquired = process.env.LIVE_ACQUIRED === "1";
+  let page = null;
+  if (acquired) {
+    page = await request("POST", "/pages", openBody(streamId));
+    issuedTransportAuthority = page.transport_authority;
+    if (process.env.PAGE_FILE) fs.writeFileSync(process.env.PAGE_FILE, JSON.stringify(page));
+  } else {
+    const failed = await requestRaw("POST", "/pages", openBody(streamId));
+    if (failed.status !== 400 || failed.body.code !== "profile_recovery_required" ||
+        failed.body.launch_settlement_result?.state !== "cleanup_pending") {
+      throw new Error(`live native pending failure lost its immediate typed response: ${JSON.stringify(failed)}`);
+    }
+  }
+  const suffix = streamId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const marker = name => path.join(process.env.PERSISTENT_LAUNCHER_PROOF_DIR, `${suffix}.${name}`);
+  const pid = page?.process.pid || Number(fs.readFileSync(marker("pid"), "utf8"));
+  const servicePid = Number(process.env.SERVICE_PID);
+  await waitForReconcile(streamId, record => record.state === "cleanup_pending" &&
+    record.launch_settlement_result?.state === "cleanup_pending",
+    "live native pending settlement was not journaled");
+  if (!processAlive(pid)) throw new Error("Open killed its pending native owner");
+  process.kill(servicePid, "SIGTERM");
+  await waitFor(() => fs.existsSync(marker("term")), "service did not request owned native cleanup");
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  if (!processAlive(pid) || !processAlive(servicePid) || !fs.existsSync(socketPath)) {
+    throw new Error("shutdown timeout discarded pending native ownership");
+  }
+  process.kill(servicePid, "SIGTERM");
+  await new Promise(resolve => setTimeout(resolve, 50));
+  if (!processAlive(servicePid) || !processAlive(pid)) {
+    throw new Error("repeated service shutdown discarded its same pending owner");
+  }
+  if (!acquired) {
+    const status = await request("GET", "/status");
+    if (status.pending_launches !== 1 || status.capacity_available !== false ||
+        status.lifecycle.capacity_available !== false ||
+        status.lifecycle.sessions[0]?.phase !== "QUIESCING_PAGE") {
+      throw new Error("pending native profile ownership advertised a free launch slot");
+    }
+  }
+  if (!acquired) {
+    const before = fs.readFileSync(process.env.JOURNAL_PATH);
+    fs.writeFileSync(marker("wrong"), "");
+    await waitFor(() => !fs.existsSync(marker("wrong")), "substituted fixture was not emitted");
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const rejected = await reconcile(streamId);
+    if (rejected.state !== "cleanup_pending" ||
+        rejected.launch_settlement_result !== undefined ||
+        !processAlive(pid) ||
+        JSON.parse(fs.readFileSync(process.env.JOURNAL_PATH)).records[0].state !== "cleanup_pending") {
+      throw new Error("substituted live terminal proof released ownership");
+    }
+    if (JSON.parse(before).records[0].launch_settlement_result.binding_hash !==
+        issuedTransportAuthority.binding_hash) throw new Error("substituted test lost its exact original binding");
+  }
+  fs.writeFileSync(marker("settle"), "");
+  const innerTerminal = await waitForReconcile(streamId, record =>
+    record.state === "cleanup_pending" &&
+    record.launch_settlement_result?.state === "terminal_post_effect_cleanup",
+    "live later native terminal proof was not retained under outer pending");
+  if (!processAlive(pid) || innerTerminal.terminal_cleanup_receipt !== undefined ||
+      Object.values(innerTerminal.launch_settlement_result.absence).some(value => value !== true)) {
+    throw new Error("inner terminal proof became an outer reap/full cleanup proof");
+  }
+  if (process.env.RESTART_INNER_TERMINAL === "1") {
+    // Crash only these test-owned processes. The durable outer uncertainty
+    // survives restart; this forced teardown grants no terminal proof.
+    process.kill(servicePid, "SIGKILL");
+    process.kill(pid, "SIGKILL");
+  } else {
+    fs.writeFileSync(marker("exit"), "");
+    await waitFor(() => !processAlive(pid), "native fixture did not exit naturally");
+    await waitFor(() => !processAlive(servicePid), "service did not finish exact cleanup after native reap");
+    const final = JSON.parse(fs.readFileSync(process.env.JOURNAL_PATH)).records[0];
+    if (final.state !== "terminal_post_effect_cleanup" ||
+        final.launch_settlement_result?.state !== "terminal_post_effect_cleanup") {
+      throw new Error("reaped native terminal proof did not settle its exact outer launch");
+    }
+    if (acquired && (Object.keys(final.terminal_cleanup_receipt?.effects || {}).length !== 13 ||
+        Object.values(final.terminal_cleanup_receipt.effects).some(value => value !== true) ||
+        !isDeepStrictEqual(final.terminal_cleanup_receipt.binding, runtimeSerializedCloseBody(page).runtime_cleanup) ||
+        final.terminal_cleanup_receipt.profile_durability !== "failed")) {
+      throw new Error("service shutdown bypassed exact full cleanup receipt or profile durability");
+    }
+  }
+} else if (process.env.PHASE === "verify-inner-terminal-restart") {
+  const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
+  issuedTransportAuthority = page.transport_authority;
+  const pending = await reconcile(streamId);
+  if (pending.state !== "cleanup_pending" ||
+      pending.launch_settlement_result?.state !== "terminal_post_effect_cleanup" ||
+      pending.terminal_cleanup_receipt !== undefined) throw new Error("restart upgraded inner proof to outer cleanup");
+  const socketHolder = net.createServer();
+  await new Promise((resolve, reject) => {
+    socketHolder.once("error", reject);
+    socketHolder.listen(page.control_socket_path, resolve);
+  });
+  try {
+    const held = await requestRaw("POST", "/shutdown", runtimeSerializedCloseBody(page));
+    if (held.status !== 400 || !String(held.body.error).includes("socket_absent") ||
+        (await reconcile(streamId)).state !== "cleanup_pending") {
+      throw new Error("native terminal/reap bypassed a present outer control socket");
+    }
+  } finally {
+    await new Promise(resolve => socketHolder.close(resolve));
+  }
+  const closed = await request("POST", "/shutdown", runtimeSerializedCloseBody(page));
+  const terminal = await reconcile(streamId);
+  if (closed.terminal !== true || Object.keys(closed.effects).length !== 13 ||
+      Object.values(closed.effects).some(value => value !== true) ||
+      terminal.state !== "terminal_post_effect_cleanup" ||
+      terminal.launch_settlement_result?.state !== "terminal_post_effect_cleanup" ||
+      !isDeepStrictEqual(terminal.terminal_cleanup_receipt.binding, runtimeSerializedCloseBody(page).runtime_cleanup)) {
+    throw new Error("restart did not use exact full outer cleanup after socket absence");
+  }
 } else if (process.env.PHASE === "native-terminal-then-ordinary-close") {
   const page = await request("POST", "/pages", openBody(streamId));
   issuedTransportAuthority = page.transport_authority || null;
@@ -1902,7 +2122,7 @@ if (process.env.PHASE === "binding-equality") {
   await waitForReconcile(
     streamId,
     (record) =>
-      record.state === "terminal_post_effect_cleanup" &&
+      record.state === "cleanup_pending" &&
       record.launch_settlement_result?.state ===
         "terminal_post_effect_cleanup" &&
       record.launch_settlement_result?.absence?.child_absent === true &&
@@ -1979,6 +2199,61 @@ if (process.env.PHASE === "binding-equality") {
   throw new Error(`unknown settlement phase: ${process.env.PHASE}`);
 }
 NODE
+
+run_live_settlement_cases() {
+  for live_mode in pre-ready acquired restart acquired-restart; do
+    local socket="$tmp_dir/live-${live_mode}.sock"
+    local journal="${socket}.launch-reconciliations.json"
+    if [[ "$live_mode" == acquired* ]]; then
+      TYPED_TRANSPORT_AFTER_READY="cleanup_pending" \
+      TYPED_TRANSPORT_LIVE_AFTER_READY=1 \
+      TYPED_TRANSPORT_CHILD_ABSENT=0 \
+      TYPED_TRANSPORT_PROFILE_DURABILITY="failed" \
+        start_service "$socket" "" "live-${live_mode}-service"
+    else
+      TYPED_TRANSPORT_FAILURE="cleanup_pending" \
+      TYPED_TRANSPORT_ERROR_FORM="nested" \
+      TYPED_TRANSPORT_LIVE=1 \
+        start_service "$socket" "" "live-${live_mode}-service"
+    fi
+    CONTROL_SOCKET="$socket" STREAM_ID="stream:live-${live_mode}" \
+    JOURNAL_PATH="$journal" SERVICE_PID="$service_pid" \
+    PERSISTENT_LAUNCHER_PROOF_DIR="$proof_dir" \
+    PAGE_FILE="$tmp_dir/live-${live_mode}.page.json" \
+    LIVE_ACQUIRED="$([[ "$live_mode" == acquired* ]] && echo 1 || echo 0)" \
+    RESTART_INNER_TERMINAL="$([[ "$live_mode" == *restart ]] && echo 1 || echo 0)" \
+    PHASE="live-native-cleanup" TRANSPORT=1 "$node_bin" "$client"
+    wait "$service_pid" 2>/dev/null || true
+    service_pid=""
+    if [[ "$live_mode" == *restart ]]; then
+      rm -f "$socket"
+      start_service "$socket" "" "live-restart-reloaded-service"
+      local restart_phase="verify-typed-restart"
+      if [[ "$live_mode" == acquired-restart ]]; then restart_phase="verify-inner-terminal-restart"; fi
+      CONTROL_SOCKET="$socket" STREAM_ID="stream:live-${live_mode}" JOURNAL_PATH="$journal" \
+      PAGE_FILE="$tmp_dir/live-${live_mode}.page.json" \
+      EXPECTED_SETTLEMENT="cleanup_pending" EXPECTED_NATIVE_SETTLEMENT="terminal_post_effect_cleanup" \
+      PHASE="$restart_phase" TRANSPORT=1 "$node_bin" "$client"
+      stop_service
+    fi
+  done
+}
+
+if [[ "${BROWSER_SETTLEMENT_CASE:-}" == live-native ]]; then
+  run_live_settlement_cases
+  printf '%s\n' '{"schema":"elastos.browser.vm-control-service-settlement-smoke/v1","ok":true,"case":"live-native"}'
+  exit 0
+fi
+
+if [[ "${BROWSER_SETTLEMENT_CASE:-}" == cleanup-retry ]]; then
+  retry_socket="$tmp_dir/retry-control.sock"
+  start_service "$retry_socket" "$flaky_shutdown" "retry-service"
+  CONTROL_SOCKET="$retry_socket" STREAM_ID="stream:settlement-cleanup-retry" \
+  PHASE="cleanup-retry" "$node_bin" "$client"
+  stop_service
+  printf '%s\n' '{"schema":"elastos.browser.vm-control-service-settlement-smoke/v1","ok":true,"case":"cleanup-retry"}'
+  exit 0
+fi
 
 binding_socket="$tmp_dir/binding-control.sock"
 start_service "$binding_socket" "" "binding-service"
@@ -2494,4 +2769,5 @@ stop_service
 unset LOG_STARTED_OWNER_HOLD
 unset ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG
 
+run_live_settlement_cases
 printf '%s\n' '{"schema":"elastos.browser.vm-control-service-settlement-smoke/v1","ok":true}'

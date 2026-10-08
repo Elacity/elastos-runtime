@@ -32,22 +32,57 @@ export function forwardedParentPipeEnv(env) {
     [PARENT_PIPE_ENV]: `3:${stat.dev}:${BigInt.asUintN(64, stat.ino)}` };
 }
 
-export function watchParentPipe(handleSignal, timeoutMs) {
+export function watchParentPipe(handleSignal, _timeoutMs) {
   const ownerFd = parentPipeFd();
-  if (ownerFd !== null) {
-    // Runtime owns the writer. Its exit, abort, or SIGKILL yields EOF.
-    const owner = fs.createReadStream(null, { fd: ownerFd, autoClose: true });
+  if (ownerFd === null) return async () => {};
+  // Runtime owns the sole writer. Keep its shared reader blocking: net.Socket
+  // would change O_NONBLOCK for every helper that inherits this description.
+  // This passive child owns only readers. Its separate cancellation channel
+  // closes on service death, including SIGKILL while Runtime remains alive.
+  const observer = spawn(process.execPath, ["--input-type=module", "-e", `
+    import fs from "node:fs";
+    import net from "node:net";
+    const stop = () => process.kill(process.pid, "SIGTERM");
+    const owner = fs.createReadStream(null, { fd: 0, autoClose: false });
     owner.on("data", () => {});
-    const ownerLost = () => {
-      // Bound the whole service, including a pending launch which cannot settle.
-      setTimeout(() => process.kill(
-        process.env.ELASTOS_BROWSER_HELPER_GROUP_OWNER === "1" ? -process.pid : process.pid, "SIGKILL"),
-        timeoutMs + 5000).unref();
-      handleSignal();
-    };
-    owner.once("end", ownerLost);
-    owner.once("error", ownerLost);
-  }
+    owner.once("end", stop);
+    owner.once("error", stop);
+    const cancellation = new net.Socket({ fd: 3, readable: true, writable: false });
+    cancellation.once("end", stop);
+    cancellation.once("error", stop);
+    cancellation.resume();
+  `], {
+    stdio: [ownerFd, "ignore", "ignore", "pipe"],
+    env: { ...process.env, NODE_OPTIONS: "" },
+  });
+  let stopping = false, closed = false, lossReported = false, stopPromise = null;
+  const ownerLost = () => {
+    if (stopping || lossReported) return;
+    lossReported = true;
+    // Startup/error/early close use the same retained shutdown owner. A timeout
+    // cannot substitute for native or outer absence proof.
+    handleSignal();
+  };
+  const reaped = new Promise((resolve) => {
+    observer.once("close", () => {
+      closed = true;
+      resolve();
+      ownerLost();
+    });
+  });
+  observer.once("error", ownerLost);
+  return () => {
+    if (stopPromise) return stopPromise;
+    stopping = true;
+    stopPromise = (async () => {
+      if (!closed) {
+        observer.stdio[3].destroy();
+        observer.kill("SIGTERM");
+      }
+      await reaped;
+    })();
+    return stopPromise;
+  };
 }
 
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
@@ -239,6 +274,8 @@ function trackOwnedLauncherChild(child) {
   ownedLauncherChildren.add(child);
   child.once("exit", (code, signal) => {
     if (signal || code !== 0) launcherGroupNeedsForce = true;
+  });
+  child.once("close", () => {
     ownedLauncherChildren.delete(child);
   });
   return child;
@@ -932,8 +969,8 @@ function hostProcessIsAlive(binding) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return error?.code !== "ESRCH";
   }
 }
 
@@ -1112,16 +1149,14 @@ function terminalCleanupReceipt(binding, effects, fields = {}) {
 }
 
 function durableTerminalCleanupReceiptIsSafe(receipt, launch, binding) {
-  if (launch?.transport_authority === undefined) {
-    return receipt === undefined;
-  }
+  const transport = launch?.transport_authority !== undefined;
+  if (!transport && receipt === undefined) return true;
   try {
     validateRuntimeCleanupBinding(binding, binding?.page_id);
-    validateVzTransportAuthority(launch.transport_authority);
-    validateVzTransportEffectReceipt(
-      binding.transport_receipt,
-      launch.transport_authority,
-    );
+    if (transport) {
+      validateVzTransportAuthority(launch.transport_authority);
+      validateVzTransportEffectReceipt(binding.transport_receipt, launch.transport_authority);
+    }
   } catch {
     return false;
   }
@@ -1133,7 +1168,8 @@ function durableTerminalCleanupReceiptIsSafe(receipt, launch, binding) {
     receipt.terminal === true &&
     isDeepStrictEqual(receipt.binding, binding) &&
     launchIdentityMatchesCleanupBinding(launch, binding) &&
-    TERMINAL_CLEANUP_EFFECT_KEYS.every(
+    (transport || exactObjectKeys(receipt.effects, TERMINAL_CLEANUP_EFFECT_KEYS.slice(0, 5))) &&
+    (transport ? TERMINAL_CLEANUP_EFFECT_KEYS : TERMINAL_CLEANUP_EFFECT_KEYS.slice(0, 5)).every(
       (key) => receipt.effects?.[key] === true,
     ) &&
     !valueContainsTransportSecret(receipt)
@@ -1597,7 +1633,11 @@ function launchReconciliationRecordIsSafe(record) {
         launch,
       );
       launchSettlementIsSafe =
-        record.launch_settlement_result.state === state;
+        record.launch_settlement_result.state === state ||
+        (state === LAUNCH_SETTLEMENT_PENDING &&
+          [LAUNCH_SETTLEMENT_TERMINAL, LAUNCH_SETTLEMENT_DID_NOT_ACT].includes(
+            record.launch_settlement_result.state,
+          ));
     } catch {
       launchSettlementIsSafe = false;
     }
@@ -1788,6 +1828,7 @@ function persistLaunchReconciliations(store) {
   if (bytes.length > MAX_LAUNCH_RECONCILIATION_JOURNAL_BYTES) {
     throw new Error("Browser VM launch reconciliation journal is too large");
   }
+  if (store.defer_persist === true) return;
   try {
     const current = fs.lstatSync(store.journal_path);
     requireOwnerOnlyRegularFile(
@@ -1874,8 +1915,12 @@ function recordLaunchReconciliation(
   }
   if (
     next.launch_settlement_result === undefined &&
+    !Object.hasOwn(fields, "launch_settlement_result") &&
     current?.launch_settlement_result !== undefined &&
-    current.launch_settlement_result.state === state
+    (current.launch_settlement_result.state === state ||
+      state === LAUNCH_SETTLEMENT_PENDING ||
+      (state === LAUNCH_SETTLEMENT_TERMINAL &&
+        current.launch_settlement_result.state === LAUNCH_SETTLEMENT_TERMINAL))
   ) {
     next.launch_settlement_result = current.launch_settlement_result;
   }
@@ -1895,6 +1940,15 @@ function recordLaunchReconciliation(
     }
     throw error;
   }
+}
+
+function batchLaunchReconciliations(store, update) {
+  const staged = { ...store, records: new Map(store.records), defer_persist: true };
+  update(staged);
+  delete staged.defer_persist;
+  persistLaunchReconciliations(staged);
+  store.records.clear();
+  for (const [key, record] of staged.records) store.records.set(key, record);
 }
 
 async function settleDispatchedTransportLaunchWithoutBinding(
@@ -2391,7 +2445,7 @@ function lifecycleStatus(config, activePages, activeVms, pendingLaunches) {
     schema: "elastos.browser.lifecycle-status/v1",
     owner: "vm_control_service",
     phases: LIFECYCLE_PHASES,
-    capacity_available: liveCapacityPageCount(activePages, activeVms) < maxActivePages,
+    capacity_available: pendingLaunches.size === 0 && liveCapacityPageCount(activePages, activeVms) < maxActivePages,
     sessions,
     redaction: {
       principal_id: "sha256-16",
@@ -2445,12 +2499,7 @@ function retainIdleVm(config, vmKey, vmRecord, activeVms) {
 function launchSettlementError(error, settlement, cleanupError = null) {
   const settledError =
     error instanceof Error ? error : new Error(String(error));
-  if (settledError.vz_launch_settlement) {
-    settledError.launch_settlement =
-      settledError.vz_launch_settlement.state;
-  } else {
-    settledError.launch_settlement = settlement;
-  }
+  settledError.launch_settlement = settlement;
   if (cleanupError) {
     settledError.launch_cleanup_error =
       cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
@@ -2913,7 +2962,8 @@ function vmSupervisorResultFromGuest(result, launch, vmRecord) {
 }
 
 function persistentLauncherReadyLine(stdout) {
-  for (const line of String(stdout).split(/\r?\n/)) {
+  const lines = String(stdout).split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
@@ -2921,7 +2971,8 @@ function persistentLauncherReadyLine(stdout) {
       if (parsed?.schema === "elastos.browser.engine.supervisor-result/v1") {
         return trimmed;
       }
-    } catch {
+    } catch (error) {
+      if (index < lines.length - 1 && trimmed.startsWith("{")) throw error;
       // Host tools such as debugfs may write stdout before the supervisor result.
     }
   }
@@ -3152,7 +3203,7 @@ function terminateOwnedSupervisorPid(pid, timeoutMs) {
   });
 }
 
-function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, launch) {
+function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, launch, onSettlement) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -3166,6 +3217,8 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
       );
       return;
     }
+    child.native_settlement_owner = Boolean(launch?.transport_authority);
+    if (child.native_settlement_owner) onSettlement?.(child);
     let stdout = "";
     let stderr = "";
     let diagnosticStderr = "";
@@ -3226,9 +3279,11 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
     signal?.addEventListener?.("abort", abortLaunch, { once: true });
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
-      const ready = persistentLauncherReadyLine(stdout);
-      if (ready) {
-        settleOk(ready);
+      try {
+        const ready = persistentLauncherReadyLine(stdout);
+        if (ready) settleOk(ready);
+      } catch (error) {
+        terminateFor(error);
       }
     });
     child.stderr.on("data", (chunk) => {
@@ -3243,6 +3298,8 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
       if (diagnosticStderr.length > 8192) {
         diagnosticStderr = "";
       }
+      let nativeError = null;
+      let nativeObserved = false;
       for (const line of lines) {
         const diagnostic = parseVzMediaDiagnostic(line, launch);
         if (diagnostic) {
@@ -3252,6 +3309,32 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
           if (stderrTail.text.length > 8192) {
             stderrTail.text = stderrTail.text.slice(-8192);
           }
+          if (child.native_settlement_owner) {
+            let parsed;
+            try { parsed = JSON.parse(line); } catch {}
+            if ([VZ_LAUNCH_SETTLEMENT_SCHEMA, "elastos.browser.engine.launch-error/v1"].includes(parsed?.schema)) {
+              nativeObserved = true;
+              nativeError = launcherError("Browser VZ launch failed", line);
+              try {
+                child.vz_launch_settlement = nativeError.vz_launch_settlement
+                  ? validateVzLaunchSettlementForLaunch(nativeError.vz_launch_settlement, launch)
+                  : null;
+              } catch (error) {
+                // A later rejected envelope cannot borrow an earlier proof.
+                child.vz_launch_settlement = null;
+                nativeError = error;
+              }
+              child.vz_launch_error = nativeError;
+            }
+          }
+        }
+      }
+      if (nativeObserved) {
+        onSettlement?.(child);
+        if (phase === "running" &&
+            (!child.vz_launch_settlement ||
+              child.vz_launch_settlement.state === LAUNCH_SETTLEMENT_PENDING)) {
+          settleError(launchSettlementError(nativeError, LAUNCH_SETTLEMENT_PENDING));
         }
       }
     });
@@ -3265,7 +3348,9 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
       }
       terminateFor(error);
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
+      child.native_owner_reaped = true;
+      if (child.native_settlement_owner) onSettlement?.(child);
       if (phase !== "running") return;
       settleError(
         launchSettlementError(
@@ -3329,19 +3414,58 @@ function retainLaunchReconciliationPendingInMemory(
   });
 }
 
+function recordPersistentNativeSettlement(store, launch, child) {
+  const current = store.records.get(launchReconciliationKey(
+    launch.lifecycle_generation, launch.stream_id,
+  ));
+  if (current?.state === LAUNCH_SETTLEMENT_TERMINAL ||
+      current?.state === LAUNCH_SETTLEMENT_DID_NOT_ACT) return current;
+  const native = child.vz_launch_settlement;
+  // Native absence covers its ten effects. Acquired pages require the caller's
+  // exact cleanup binding and full receipt, even after this launcher is reaped.
+  const state = !current?.cleanup_binding && child.native_owner_reaped === true && native
+    ? native.state : LAUNCH_SETTLEMENT_PENDING;
+  try {
+    recordLaunchReconciliation(store, launch, state, {
+      effects: current?.cleanup_binding
+        ? { page_acquired: true, vm_acquired: true }
+        : state === LAUNCH_SETTLEMENT_PENDING
+          ? { page_acquired: null, vm_acquired: null }
+          : { page_acquired: false, vm_acquired: false },
+      launch_settlement_result: native || undefined,
+      ...(native ? {
+        ...profileDurabilityFields(native),
+      } : {}),
+    });
+  } catch (error) {
+    retainLaunchReconciliationPendingInMemory(store, launch);
+    logEvent("launch_reconciliation_persist_failed", {
+      stream_id: launch.stream_id, intended_state: state,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return store.records.get(launchReconciliationKey(
+    launch.lifecycle_generation, launch.stream_id,
+  ));
+}
+
 function recordProvenLaunchFailure(
   launchReconciliationStore,
   launch,
   error,
 ) {
+  const current = launchReconciliationStore.records.get(launchReconciliationKey(
+    launch.lifecycle_generation, launch.stream_id,
+  ));
+  if (current?.state === LAUNCH_SETTLEMENT_TERMINAL ||
+      current?.state === LAUNCH_SETTLEMENT_DID_NOT_ACT) return;
   const settlement = error?.launch_settlement;
   if (
     settlement !== LAUNCH_SETTLEMENT_DID_NOT_ACT &&
     settlement !== LAUNCH_SETTLEMENT_TERMINAL &&
     !(
       settlement === LAUNCH_SETTLEMENT_PENDING &&
-      error?.vz_launch_settlement?.state ===
-        LAUNCH_SETTLEMENT_PENDING
+      error?.vz_launch_settlement
     )
   ) {
     return;
@@ -3417,6 +3541,24 @@ async function settleDispatchedLaunchFailure(
   transportLaunch = false,
 ) {
   const child = launchedChildFromFailure(launcher, error);
+  if (child?.native_settlement_owner && child.vz_launch_error) {
+    error = attachLauncherFailureContext(
+      child.vz_launch_error, child,
+      launchedStderrFromFailure(launcher, error), error?.stderr_tail,
+    );
+  }
+  let settlement = child?.native_settlement_owner
+    ? child.vz_launch_settlement
+    : error?.vz_launch_settlement ||
+      parseVzLaunchSettlementFromStderr(launchedStderrFromFailure(launcher, error));
+  if (child?.native_settlement_owner && settlement) {
+    return launchSettlementError(
+      Object.assign(error instanceof Error ? error : new Error(String(error)), {
+        vz_launch_settlement: settlement,
+      }),
+      child.native_owner_reaped === true ? settlement.state : LAUNCH_SETTLEMENT_PENDING,
+    );
+  }
   if (launcherChildIsLive(child)) {
     try {
       await terminatePersistentLauncher(child, shutdownTimeoutMs);
@@ -3428,9 +3570,10 @@ async function settleDispatchedLaunchFailure(
       );
     }
   }
-  const settlement =
-    error?.vz_launch_settlement ||
-    parseVzLaunchSettlementFromStderr(launchedStderrFromFailure(launcher, error));
+  if (child?.native_settlement_owner) {
+    settlement = child.vz_launch_settlement;
+    if (child.vz_launch_error) error = child.vz_launch_error;
+  }
   if (settlement) {
     return launchSettlementError(
       Object.assign(
@@ -3521,6 +3664,9 @@ async function openPage(
     activeVm = null;
   }
   if (activeVm?.control_socket_path) {
+    if ([...activeVm.pages].some((pageId) => activePages.get(pageId)?.cleanup_pending === true)) {
+      throw codedError("resources_in_use", "Browser profile retains unresolved cleanup ownership");
+    }
     clearIdleVmShutdown(activeVm);
     const startedAt = Date.now();
     const requestId = `browser-vm:${crypto.randomBytes(8).toString("hex")}`;
@@ -3729,6 +3875,21 @@ async function openPage(
           timeoutMs,
           signal,
           launch,
+          (child) => {
+            const pending = pendingLaunches.get(requestId);
+            if (pending) pending.launcher_child = child;
+            if (child.vz_launch_settlement === undefined) return;
+            if (pending) {
+              pending.phase = "QUIESCING_PAGE";
+              pending.failure_reason = "cleanup_pending";
+            }
+            const durable = recordPersistentNativeSettlement(launchReconciliations, launch, child);
+            const page = activePages.get(launch.page_id);
+            if (page?.launcher_child === child) page.cleanup_pending = true;
+            if ([LAUNCH_SETTLEMENT_TERMINAL, LAUNCH_SETTLEMENT_DID_NOT_ACT].includes(durable?.state)) {
+              pendingLaunches.delete(requestId);
+            }
+          },
         )
       : await runProgram(
           config.launcher_program,
@@ -3739,6 +3900,13 @@ async function openPage(
           signal,
         );
     const result = JSON.parse(launcher.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) || "");
+    if (launcher.child?.native_settlement_owner &&
+        launcher.child.vz_launch_settlement !== undefined) {
+      throw attachLauncherFailureContext(
+        launcher.child.vz_launch_error || new Error("Browser native launch cleanup is pending"),
+        launcher.child, launcher.stderr, launcher.stderr_tail,
+      );
+    }
     result.control_service = controlServiceIdentity;
     result.process = bindOwnedLauncherProcess(
       launcher.child,
@@ -3800,10 +3968,7 @@ async function openPage(
               );
         const stderrTail = String(launcher.stderr_tail?.text || "").trim();
         const launchSettlement = parseVzLaunchSettlementFromStderr(stderrTail);
-        const nextState =
-          launchSettlement?.state === LAUNCH_SETTLEMENT_TERMINAL
-            ? LAUNCH_SETTLEMENT_TERMINAL
-            : LAUNCH_SETTLEMENT_PENDING;
+        const nextState = LAUNCH_SETTLEMENT_PENDING;
         for (const affected of affectedPages) {
           affected.cleanup_pending = true;
           affected.stderr_tail = launcher.stderr_tail;
@@ -3836,7 +4001,7 @@ async function openPage(
         }
         if (currentVm?.launcher_child === launcher.child && acquiredVmKey) {
           clearIdleVmShutdown(currentVm);
-          activeVms.delete(acquiredVmKey);
+          if (!launcher.child.native_settlement_owner && !currentVm.retirement_pending) activeVms.delete(acquiredVmKey);
         }
         logEvent("launcher_exit", {
           request_id: requestId,
@@ -3922,7 +4087,15 @@ async function openPage(
     }
     throw settledError;
   } finally {
-    pendingLaunches.delete(requestId);
+    const retainedChild = pendingLaunches.get(requestId)?.launcher_child;
+    const durable = launchReconciliations.records.get(launchReconciliationKey(
+      launch.lifecycle_generation, launch.stream_id,
+    ));
+    if (!retainedChild?.native_settlement_owner ||
+        durable?.cleanup_binding ||
+        [LAUNCH_SETTLEMENT_TERMINAL, LAUNCH_SETTLEMENT_DID_NOT_ACT].includes(durable?.state)) {
+      pendingLaunches.delete(requestId);
+    }
   }
 }
 
@@ -3933,6 +4106,7 @@ async function shutdownPage(
   activePages,
   activeVms,
   launchReconciliations,
+  serviceRetirementVm = null,
 ) {
   const pageId = body?.page_id;
   if (!safeId(pageId)) {
@@ -3972,33 +4146,25 @@ async function shutdownPage(
     }
   }
 
+  const cleanupTargets = [{ pageId, binding: runtimeCleanup, record, durableRecord }];
   const recordCleanupPending = () => {
-    const current = launchReconciliations.records.get(
-      launchReconciliationKey(
-        runtimeCleanup.generation,
-        runtimeCleanup.stream_id,
-      ),
-    );
-    if (current?.state === LAUNCH_SETTLEMENT_TERMINAL) {
-      return;
-    }
-    recordLaunchReconciliation(
-      launchReconciliations,
-      durableRecord.launch,
-      LAUNCH_SETTLEMENT_PENDING,
-      {
-        effects: { page_acquired: true, vm_acquired: true },
-        cleanup_binding: runtimeCleanup,
-      },
-    );
+    batchLaunchReconciliations(launchReconciliations, (staged) => {
+      for (const target of cleanupTargets) {
+        const current = staged.records.get(launchReconciliationKey(target.binding.generation, target.binding.stream_id));
+        if (current?.state === LAUNCH_SETTLEMENT_TERMINAL) continue;
+        recordLaunchReconciliation(staged, target.durableRecord.launch, LAUNCH_SETTLEMENT_PENDING, {
+          effects: { page_acquired: true, vm_acquired: true }, cleanup_binding: target.binding,
+        });
+      }
+    });
   };
-  const runShutdownProgram = async (page) => {
+  const runShutdownProgram = async (target) => {
     if (!config.shutdown_program) return;
     const request = JSON.stringify({
       schema: "elastos.browser.vm-control-service.shutdown/v1",
-      page_id: pageId,
-      page,
-      principal_id: body?.principal_id,
+      page_id: target.pageId,
+      page: target.record?.page || null,
+      principal_id: target.durableRecord.launch.principal_id,
     });
     await runProgram(
       config.shutdown_program,
@@ -4022,7 +4188,7 @@ async function shutdownPage(
         runtimeCleanup,
         {
           graceful: false,
-          terminal_record: false,
+          terminal_record: durableRecord.launch_settlement_result.state === LAUNCH_SETTLEMENT_TERMINAL,
           vz_launch_settlement: durableRecord.launch_settlement_result,
         },
       );
@@ -4037,7 +4203,7 @@ async function shutdownPage(
             child_absent: true,
             vm_absent: true,
             route_absent: true,
-            socket_absent: true,
+            socket_absent: !fs.existsSync(runtimeCleanup.control_socket_path),
             ...delayedEffects,
           },
           {
@@ -4090,9 +4256,26 @@ async function shutdownPage(
     vmRecord &&
     [...vmRecord.pages].some((ownedPageId) => ownedPageId !== pageId)
   ) {
-    throw new Error(
-      "Browser VM cleanup cannot retire a VM that still owns another page",
-    );
+    if (serviceRetirementVm !== vmRecord) {
+      throw new Error("Browser VM cleanup cannot retire a VM that still owns another page");
+    }
+    for (const siblingId of vmRecord.pages) {
+      if (siblingId === pageId) continue;
+      const sibling = activePages.get(siblingId);
+      if (ownedVmRecord(sibling, siblingId, activeVms) !== vmRecord) {
+        throw new Error("Browser VM service retirement page ownership changed");
+      }
+      const binding = cleanupBindingForSupervisorResult(config, controlServiceIdentity, sibling.launch, sibling.page);
+      const durable = requireExactDurableCleanupRecord(launchReconciliations, binding);
+      requireExactRuntimeCleanupRecord(config, controlServiceIdentity, binding, sibling);
+      exactOwnedLauncherProcess(binding, sibling, vmRecord, vmRecord.launcher_child);
+      if (!isDeepStrictEqual(binding.process, runtimeCleanup.process) ||
+          binding.control_socket_path !== runtimeCleanup.control_socket_path ||
+          !isDeepStrictEqual(binding.isolation, runtimeCleanup.isolation)) {
+        throw new Error("Browser VM service retirement shared effect changed");
+      }
+      cleanupTargets.push({ pageId: siblingId, binding, record: sibling, durableRecord: durable });
+    }
   }
   const launcherChild = vmRecord?.launcher_child || record?.launcher_child;
   const ownedLauncherChild = exactOwnedLauncherProcess(
@@ -4101,8 +4284,9 @@ async function shutdownPage(
     vmRecord,
     launcherChild,
   );
+  if (vmRecord) vmRecord.retirement_pending = true;
+  for (const target of cleanupTargets) if (target.record) target.record.cleanup_pending = true;
   recordCleanupPending();
-  if (record) record.cleanup_pending = true;
 
   let closeError = null;
   const controlSocketPath =
@@ -4113,19 +4297,14 @@ async function shutdownPage(
       reason: "supervisor_owns_guest_profile_flush",
     });
   } else if (controlSocketPath) {
-    try {
-      await postJsonOverUnix(
-        controlSocketPath,
-        `/pages/${encodeURIComponent(pageId)}/close`,
-        {},
-        Number(config.shutdown_timeout_ms ?? 30000),
-      );
-    } catch (error) {
-      closeError = error instanceof Error ? error.message : String(error);
-      logEvent("page_close_failed", {
-        page_id: pageId,
-        error: closeError,
-      });
+    for (const target of cleanupTargets) {
+      try {
+        await postJsonOverUnix(controlSocketPath, `/pages/${encodeURIComponent(target.pageId)}/close`, {},
+          Number(config.shutdown_timeout_ms ?? 30000));
+      } catch (error) {
+        closeError = error instanceof Error ? error.message : String(error);
+        logEvent("page_close_failed", { page_id: target.pageId, error: closeError });
+      }
     }
     if (closeError) {
       logEvent("page_close_forced_vm_retirement", {
@@ -4137,7 +4316,7 @@ async function shutdownPage(
   }
   const cleanupErrors = [];
   try {
-    await runShutdownProgram(record?.page || null);
+    for (const target of cleanupTargets) await runShutdownProgram(target);
   } catch (error) {
     cleanupErrors.push(error instanceof Error ? error.message : String(error));
   }
@@ -4186,8 +4365,9 @@ async function shutdownPage(
       `Browser VM cleanup remains indeterminate: ${externallyUnresolved.join(", ")}`,
     );
   }
-  const launchSettlement =
-    parseVzLaunchSettlementFromStderr(
+  const launchSettlement = ownedLauncherChild.native_settlement_owner
+    ? ownedLauncherChild.vz_launch_settlement
+    : parseVzLaunchSettlementFromStderr(
       String(
         record?.stderr_tail?.text ||
           record?.launcher_child?.stderr_tail?.text ||
@@ -4201,10 +4381,15 @@ async function shutdownPage(
       ),
     )?.launch_settlement_result ||
     durableRecord.launch_settlement_result;
+  if (launchSettlement) validateVzLaunchSettlementForLaunch(launchSettlement, durableRecord.launch);
   const transportEffects = await exactTransportCleanupEffects(
     runtimeCleanup,
     {
       ...launcherTermination,
+      ...(ownedLauncherChild.native_settlement_owner &&
+          ownedLauncherChild.vz_launch_settlement !== undefined &&
+          launchSettlement?.state !== LAUNCH_SETTLEMENT_TERMINAL
+        ? { graceful: false } : {}),
       ...(launchSettlement?.state === LAUNCH_SETTLEMENT_TERMINAL
         ? { terminal_record: true }
         : {}),
@@ -4220,59 +4405,52 @@ async function shutdownPage(
     );
   }
 
-  activePages.delete(pageId);
-  if (vmRecord) {
-    clearIdleVmShutdown(vmRecord);
-    vmRecord.pages.delete(pageId);
-    if (vmKey && activeVms.get(vmKey) === vmRecord) {
-      activeVms.delete(vmKey);
+  const retiredPages = new Map(activePages);
+  for (const target of cleanupTargets) retiredPages.delete(target.pageId);
+  const retiredVms = new Map(activeVms);
+  if (vmKey && retiredVms.get(vmKey) === vmRecord) retiredVms.delete(vmKey);
+  const receipts = [];
+  for (const target of cleanupTargets) {
+    if (launchSettlement && target.binding.transport_authority) {
+      validateVzLaunchSettlementForLaunch(launchSettlement, target.durableRecord.launch);
     }
-  }
-  const receipt = terminalCleanupReceipt(
-    runtimeCleanup,
-    exactCleanupEffects(
-      runtimeCleanup,
-      pageId,
-      activePages,
-      activeVms,
-      true,
-      transportEffects,
-    ),
-    {
+    receipts.push(terminalCleanupReceipt(target.binding,
+      exactCleanupEffects(target.binding, target.pageId, retiredPages, retiredVms, true, transportEffects), {
       forced_vm_retirement: Boolean(closeError),
       ...(closeError ? { control_error: closeError } : {}),
-      ...profileDurabilityFields(durableRecord),
-      ...profileDurabilityFields(durableRecord.launch_settlement_result),
+      ...profileDurabilityFields(target.durableRecord),
+      ...profileDurabilityFields(target.durableRecord.launch_settlement_result),
       ...profileDurabilityFields(launchSettlement),
-    },
-  );
-  markVmPendingLaunchReconciliationsTerminal(
-    launchReconciliations,
-    vmRecord,
-  );
+    }));
+  }
+  const stagedVm = vmRecord && { ...vmRecord,
+    pending_reconciliations: vmRecord.pending_reconciliations instanceof Map
+      ? new Map(vmRecord.pending_reconciliations) : vmRecord.pending_reconciliations };
   try {
-    markLaunchReconciliationTerminal(
-      launchReconciliations,
-      runtimeCleanup.generation,
-      runtimeCleanup.stream_id,
-      {
-        page_acquired: true,
-        vm_acquired: true,
-      },
-      runtimeCleanup.transport_authority ? receipt : undefined,
-    );
+    batchLaunchReconciliations(launchReconciliations, (staged) => {
+      markVmPendingLaunchReconciliationsTerminal(staged, stagedVm);
+      for (const [index, target] of cleanupTargets.entries()) {
+        markLaunchReconciliationTerminal(staged, target.binding.generation, target.binding.stream_id,
+          { page_acquired: true, vm_acquired: true }, receipts[index]);
+      }
+    });
   } catch (error) {
-    if (launchSettlement?.state !== LAUNCH_SETTLEMENT_TERMINAL) {
-      throw error;
-    }
     logEvent("launch_reconciliation_persist_failed", {
       stream_id: runtimeCleanup.stream_id,
       page_id: pageId,
       intended_state: LAUNCH_SETTLEMENT_TERMINAL,
       error: error instanceof Error ? error.message : String(error),
     });
+    throw error;
   }
-  return receipt;
+  for (const target of cleanupTargets) activePages.delete(target.pageId);
+  if (vmRecord) {
+    clearIdleVmShutdown(vmRecord);
+    vmRecord.pending_reconciliations = stagedVm.pending_reconciliations;
+    for (const target of cleanupTargets) vmRecord.pages.delete(target.pageId);
+    if (vmKey && activeVms.get(vmKey) === vmRecord) activeVms.delete(vmKey);
+  }
+  return receipts[0];
 }
 
 function activePageGuestControl(activePages, activeVms, pageId) {
@@ -4370,7 +4548,8 @@ async function proxyGuestPageWebrtc(config, activePages, activeVms, pageId, body
 
 function terminatePersistentLauncher(child, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!child || child.exitCode != null || child.signalCode != null) {
+    if (!child || ((child.exitCode != null || child.signalCode != null) &&
+        (!child.native_settlement_owner || child.native_owner_reaped === true))) {
       resolve({
         graceful: child?.exitCode === 0 && child?.signalCode == null,
         already_exited: true,
@@ -4382,12 +4561,13 @@ function terminatePersistentLauncher(child, timeoutMs) {
     let reapTimer;
     let settled = false;
     let forced = false;
+    const exitEvent = child.native_settlement_owner ? "close" : "exit";
     const settle = (error = null) => {
       if (settled) return;
       settled = true;
       clearTimeout(killTimer);
       clearTimeout(reapTimer);
-      child.removeListener("exit", exited);
+      child.removeListener(exitEvent, exited);
       if (error) reject(error);
       else {
         resolve({
@@ -4403,8 +4583,12 @@ function terminatePersistentLauncher(child, timeoutMs) {
     const exited = () => {
       settle();
     };
-    child.once("exit", exited);
+    child.once(exitEvent, exited);
     killTimer = setTimeout(() => {
+      if (child.native_settlement_owner) {
+        settle(codedError("cleanup_pending", "Browser native launcher retains unresolved cleanup ownership"));
+        return;
+      }
       try {
         forced = true;
         if (!child.kill("SIGKILL")) {
@@ -4424,6 +4608,7 @@ function terminatePersistentLauncher(child, timeoutMs) {
         settle(error);
       }
     }, timeoutMs);
+    if (child.exitCode != null || child.signalCode != null) return;
     try {
       if (!child.kill("SIGTERM")) {
         settle(new Error("Browser VM launcher could not be terminated"));
@@ -4496,7 +4681,7 @@ function main() {
           idle_vm_keepalive_ms: idleVmKeepaliveMs(config),
           reuse_idle_vms: idleVmReuseEnabled(config),
           hibernation_mode: config.hibernation_mode || "off",
-          capacity_available: livePages < Number(config.max_active_pages ?? 1),
+          capacity_available: pendingLaunches.size === 0 && livePages < Number(config.max_active_pages ?? 1),
           pending_cleanup_pages: pendingIds.length,
           pending_cleanup_page_ids: pendingIds,
           page_ids: [...activePages.keys()].filter((pageId) =>
@@ -4706,27 +4891,46 @@ function main() {
       acceptingLaunches = false;
       for (const controller of pendingAbortControllers) controller.abort();
       for (const record of activeVms.values()) clearIdleVmShutdown(record);
+      await Promise.allSettled([...pendingLaunchTasks]);
+      const childrenAtShutdown = ownedLauncherChildren.size;
+      while (true) {
+        // Signal, parent EOF and ordinary Close share the same exact binding,
+        // full terminal receipt and journal. Keep this owner/socket for retries.
+        const retiringVms = new Set(), tasks = [];
+        for (const record of [...launchReconciliations.records.values()]) {
+          const binding = record.cleanup_binding;
+          if (!binding || (record.state === LAUNCH_SETTLEMENT_TERMINAL && !activePages.has(binding.page_id))) continue;
+          const vm = [...activeVms.values()].find(owner => owner.pages.has(binding.page_id));
+          if (vm && retiringVms.has(vm)) continue;
+          if (vm) retiringVms.add(vm);
+          tasks.push(shutdownPage(config, controlServiceIdentity, {
+            page_id: binding.page_id, runtime_cleanup: binding, force_retire_vm: true,
+          }, activePages, activeVms, launchReconciliations, vm || null));
+        }
+        const results = await Promise.allSettled(tasks);
+        const boundChildren = new Set([...activePages.values()].map((record) => record.launcher_child));
+        results.push(...await Promise.allSettled(
+          [...ownedLauncherChildren].filter((child) => !boundChildren.has(child))
+            .map((child) => terminatePersistentLauncher(child, Number(config.shutdown_timeout_ms ?? 30000))),
+        ));
+        for (const [key, vm] of activeVms) {
+          if (vm.pages.size === 0 && !launcherChildIsLive(vm.launcher_child)) {
+            markVmPendingLaunchReconciliationsTerminal(launchReconciliations, vm);
+            activeVms.delete(key);
+          }
+        }
+        if (ownedLauncherChildren.size === 0 &&
+            !serviceHasEffects(activePages, activeVms, pendingLaunches) &&
+            results.every((result) => result.status === "fulfilled")) break;
+        logEvent("service_cleanup_pending", {
+          owned_launcher_children: ownedLauncherChildren.size,
+          active_pages: activePages.size, active_vms: activeVms.size,
+          pending_launches: pendingLaunches.size,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
       server.close();
       server.closeAllConnections?.();
-      await Promise.allSettled([...pendingLaunchTasks]);
-      const children = [...ownedLauncherChildren];
-      const results = await Promise.allSettled(
-        children.map((child) =>
-          terminatePersistentLauncher(
-            child,
-            Number(config.shutdown_timeout_ms ?? 30000),
-          ),
-        ),
-      );
-      const failures = results
-        .filter((result) => result.status === "rejected")
-        .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
-      if (failures.length > 0) {
-        throw new Error(`Browser VM control service could not reap owned launchers: ${failures.join("; ")}`);
-      }
-      activePages.clear();
-      activeVms.clear();
-      pendingLaunches.clear();
       try {
         const current = fs.lstatSync(config.control_socket_path);
         if (
@@ -4745,12 +4949,15 @@ function main() {
       }
       logEvent("service_shutdown", {
         forced: force,
-        owned_launcher_children: children.length,
+        owned_launcher_children: childrenAtShutdown,
       });
     })();
     return shutdownPromise;
   };
-  const finishProcess = (status) => {
+  const finishProcess = async (status) => {
+    if (ownedLauncherChildren.size > 0 || serviceHasEffects(activePages, activeVms, pendingLaunches)) return;
+    // Cancel and reap the exact passive observer only after durable cleanup.
+    await stopParentWatcher();
     // The service still anchors its isolated group after a launcher was reaped.
     // Forced launcher exit can leave cp/crosvm workers in that same group.
     if ((status !== 0 || launcherGroupNeedsForce) && process.env.ELASTOS_BROWSER_HELPER_GROUP_OWNER === "1") {
@@ -4763,13 +4970,17 @@ function main() {
       () => finishProcess(0),
       (error) => {
         console.error(error instanceof Error ? error.message : String(error));
-        finishProcess(1);
+        return finishProcess(1);
       },
-    );
+    ).catch((error) => {
+      // An unresolved observer stays owned rather than masking its reap failure
+      // with process exit.
+      console.error(error instanceof Error ? error.message : String(error));
+    });
   };
-  process.once("SIGTERM", handleSignal);
-  process.once("SIGINT", handleSignal);
-  watchParentPipe(handleSignal, Number(config.shutdown_timeout_ms ?? 30000));
+  process.on("SIGTERM", handleSignal);
+  process.on("SIGINT", handleSignal);
+  const stopParentWatcher = watchParentPipe(handleSignal, Number(config.shutdown_timeout_ms ?? 30000));
   server.listen(config.control_socket_path, () => {
     const socketStat = fs.lstatSync(config.control_socket_path);
     if (!socketStat.isSocket()) {
