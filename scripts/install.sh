@@ -97,8 +97,8 @@ ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
-# A download fails only when it stays below this speed for this long; a
-# slow but steady link finishes however long the file takes.
+# curl has no pure idle timeout, so a download fails only when it stays below
+# 1 KiB/s for 60 s (the closest rule); there is no total cap.
 BINARY_DOWNLOAD_SPEED_LIMIT="${ELASTOS_BINARY_DOWNLOAD_SPEED_LIMIT:-1024}"
 BINARY_DOWNLOAD_SPEED_TIME="${ELASTOS_BINARY_DOWNLOAD_SPEED_TIME:-60}"
 

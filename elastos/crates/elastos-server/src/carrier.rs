@@ -8275,46 +8275,93 @@ impl CarrierClient {
     }
 
     pub async fn fetch_file(&self, path: &str) -> Result<Vec<u8>> {
-        self.fetch_file_bounded(path, 200 * 1024 * 1024).await
+        self.fetch_file_bounded(path, MAX_DOWNLOAD_BYTES).await
     }
 
     pub(crate) async fn fetch_file_bounded(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        self.fetch_bytes(None, path, max_bytes, None).await
+        let msg = serde_json::json!({"op":"file","path":path});
+        let operation = format!("trusted source file fetch for {path}");
+        self.fetch_bytes(msg, &operation, path, max_bytes).await
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
-        self.fetch_bytes(Some(cid), path.unwrap_or(""), 200 * 1024 * 1024, None)
+        let mut msg = serde_json::json!({
+            "op": "content_fetch",
+            "cid": cid,
+        });
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            msg["path"] = serde_json::Value::String(path.to_string());
+        }
+        self.fetch_bytes(msg, "content fetch", cid, MAX_DOWNLOAD_BYTES)
             .await
     }
 
-    /// Fetches `cid` when given, else the release file `path`, under
-    /// `deadlines` when given.
+    /// Sends `msg` and reads its length-prefixed reply. Every phase is
+    /// bounded, none by total time: the request and each body read get
+    /// `DOWNLOAD_IDLE_TIMEOUT`, and the source gets `DOWNLOAD_HEADER_WAIT` to
+    /// prepare the file before its length header. A source that trickles one
+    /// byte just inside the idle deadline is still bounded by `max_bytes`.
     async fn fetch_bytes(
         &self,
-        cid: Option<&str>,
-        path: &str,
+        msg: serde_json::Value,
+        operation: &str,
+        name: &str,
         max_bytes: usize,
-        deadlines: Option<FetchDeadlines<'_>>,
     ) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
-        let (msg, operation) = match cid {
-            Some(cid) => {
-                let mut msg = serde_json::json!({"op": "content_fetch", "cid": cid});
-                if !path.is_empty() {
-                    msg["path"] = serde_json::Value::String(path.to_string());
-                }
-                (msg, "content fetch".to_string())
-            }
-            None => (
-                serde_json::json!({"op":"file","path":path}),
-                format!("trusted source file fetch for {path}"),
-            ),
-        };
+        let idle = DOWNLOAD_IDLE_TIMEOUT;
+        let stalled =
+            |_| anyhow::anyhow!("no data for {} s while downloading {name}", idle.as_secs());
+        let (mut send, mut recv) = tokio::time::timeout(idle, self.conn.open_bi())
+            .await
+            .map_err(stalled)??;
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
-        send.write_all(&bytes).await?;
+        tokio::time::timeout(idle, send.write_all(&bytes))
+            .await
+            .map_err(stalled)??;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, &operation, max_bytes, deadlines).await
+        let mut len_buf = [0u8; 8];
+        tokio::time::timeout(DOWNLOAD_HEADER_WAIT, recv.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "trusted source did not start sending {name} within {} s",
+                    DOWNLOAD_HEADER_WAIT.as_secs()
+                )
+            })??;
+        let len = u64::from_be_bytes(len_buf);
+        if len_buf[0] == b'{' {
+            let mut error_bytes = len_buf.to_vec();
+            let tail = tokio::time::timeout(idle, recv.read_to_end(16 * 1024))
+                .await
+                .map_err(stalled)??;
+            error_bytes.extend_from_slice(&tail);
+            if let Ok(text) = String::from_utf8(error_bytes) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                    if json["ok"].as_bool() == Some(false) {
+                        let msg = json["error"]
+                            .as_str()
+                            .unwrap_or("Carrier returned an unknown error");
+                        anyhow::bail!("{operation} failed: {msg}");
+                    }
+                }
+            }
+            anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
+        }
+        anyhow::ensure!(
+            len <= max_bytes as u64,
+            "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
+        );
+        let mut content = vec![0u8; len as usize];
+        let mut filled = 0;
+        while filled < content.len() {
+            let read = tokio::time::timeout(idle, recv.read(&mut content[filled..]))
+                .await
+                .map_err(stalled)??;
+            filled += read
+                .ok_or_else(|| anyhow::anyhow!("{operation} ended early ({filled}/{len} bytes)"))?;
+        }
+        Ok(content)
     }
 
     pub async fn invoke_provider(
@@ -8440,122 +8487,27 @@ impl CarrierClient {
     }
 }
 
-/// Wait limits for a trusted-source download. The source may prepare a held
-/// file (an IPFS `cat` of the signed CID) before its length header, so the
-/// header has its own bound; after it, the download fails only when no bytes
-/// arrive for `idle`, never on total time.
-#[derive(Clone, Copy)]
-struct FetchDeadlines<'a> {
-    header: Duration,
-    idle: Duration,
-    name: &'a str,
-}
+/// A download fails only when no bytes arrive for this long, never on total
+/// time, so a slow but steady link finishes. Unit tests use a short deadline.
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
-/// How long a trusted source may prepare a file before its length header.
-const CARRIER_FETCH_HEADER_WAIT: Duration = Duration::from_secs(300);
+/// How long a trusted source may prepare a held file (an IPFS `cat` of the
+/// signed CID) before it sends the length header. Measured on the public
+/// seed (8 Oct 2026): at most 1.6 s for 92 MB; bound = max(60 s, 4x worst).
+const DOWNLOAD_HEADER_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
 
-async fn read_carrier_len_prefixed_bytes(
-    recv: &mut iroh::endpoint::RecvStream,
-    operation: &str,
-    max_bytes: usize,
-    deadlines: Option<FetchDeadlines<'_>>,
-) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 8];
-    match deadlines {
-        Some(d) => tokio::time::timeout(d.header, recv.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "trusted source did not start sending {} within {} s",
-                    d.name,
-                    d.header.as_secs()
-                )
-            })??,
-        None => recv.read_exact(&mut len_buf).await?,
-    }
-    let len = u64::from_be_bytes(len_buf);
-    if len_buf[0] == b'{' {
-        let mut error_bytes = len_buf.to_vec();
-        let tail = recv.read_to_end(16 * 1024).await?;
-        error_bytes.extend_from_slice(&tail);
-        if let Ok(text) = String::from_utf8(error_bytes) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                if json["ok"].as_bool() == Some(false) {
-                    let msg = json["error"]
-                        .as_str()
-                        .unwrap_or("Carrier returned an unknown error");
-                    anyhow::bail!("{operation} failed: {msg}");
-                }
-            }
-        }
-        anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
-    }
-    anyhow::ensure!(
-        len <= max_bytes as u64,
-        "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
-    );
-    let mut content = vec![0u8; len as usize];
-    read_with_idle(recv, &mut content, deadlines).await?;
-    Ok(content)
-}
+/// Size ceiling for a release download whose signed size is not known.
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
 
-/// Fills `buf`; with `deadlines`, fails only when no bytes arrive for `idle`.
-async fn read_with_idle(
-    recv: &mut iroh::endpoint::RecvStream,
-    buf: &mut [u8],
-    deadlines: Option<FetchDeadlines<'_>>,
-) -> Result<()> {
-    let Some(FetchDeadlines { idle, name, .. }) = deadlines else {
-        recv.read_exact(buf).await?;
-        return Ok(());
+/// Fetches the signed CID when present, else the release name, then closes.
+async fn fetch_and_close(client: CarrierClient, cid: Option<&str>, path: &str) -> Result<Vec<u8>> {
+    let result = match cid {
+        Some(cid) => client.fetch_content(cid, None).await,
+        None => client.fetch_file(path).await,
     };
-    let mut filled = 0;
-    while filled < buf.len() {
-        match tokio::time::timeout(idle, recv.read(&mut buf[filled..])).await {
-            Ok(read) => filled += read?.ok_or_else(|| anyhow::anyhow!("{name} ended early"))?,
-            Err(_) => anyhow::bail!("no data for {} s while downloading {name}", idle.as_secs()),
-        }
-    }
-    Ok(())
-}
-
-/// Fetches the signed CID when present, else the release name. The fetch
-/// fails only after `idle_secs` with no bytes, so a slow, steady link finishes.
-async fn fetch_with_timeout(
-    client: CarrierClient,
-    cid: Option<&str>,
-    path: &str,
-    idle_secs: u64,
-) -> Result<Vec<u8>> {
-    // The CID request names no path; the release name only labels errors.
-    let request_path = if cid.is_some() { "" } else { path };
-    let deadlines = FetchDeadlines {
-        header: CARRIER_FETCH_HEADER_WAIT.max(Duration::from_secs(idle_secs)),
-        idle: Duration::from_secs(idle_secs),
-        name: path,
-    };
-    let result = client
-        .fetch_bytes(cid, request_path, 200 * 1024 * 1024, Some(deadlines))
-        .await;
     client.close().await;
     result
-}
-
-pub async fn fetch_file_from_trusted_source(
-    source: &TrustedSource,
-    path: &str,
-    connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
-) -> Result<Vec<u8>> {
-    fetch_file_from_trusted_source_bound(
-        source,
-        None,
-        path,
-        connect_timeout_secs,
-        fetch_timeout_secs,
-        None,
-    )
-    .await
 }
 
 pub(crate) async fn fetch_file_from_trusted_source_bound(
@@ -8563,7 +8515,6 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
     cid: Option<&str>,
     path: &str,
     connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<Vec<u8>> {
     let node_id = source_transport_endpoint_id(source)?;
@@ -8573,9 +8524,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("ticket[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
         }
@@ -8586,9 +8537,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("relay[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("relay[{index}] connect failed: {err}")),
         }
@@ -8598,10 +8549,10 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
-        Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_and_close(client, cid, path).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
-                errors.push(format!("direct fetch failed: {err}"));
+                errors.push(format!("direct fetch of {path} failed: {err}"));
                 Err(anyhow::anyhow!(
                     "trusted source Carrier fetch failed: {}",
                     errors.join(" | ")
@@ -10816,9 +10767,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_with_timeout(client, None, "artifact", 5)
-                .await
-                .unwrap(),
+            fetch_and_close(client, None, "artifact").await.unwrap(),
             b"fixture"
         );
         assert!(!runtime.is_closed());
@@ -10934,7 +10883,7 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let result = fetch_with_timeout(client, None, "artifact", 1).await;
+        let result = fetch_and_close(client, None, "artifact").await;
         let closed_before_return = observer.is_closed();
         observer.close().await;
         let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)
@@ -10980,8 +10929,9 @@ pub(crate) mod tests {
     }
 
     /// Serves one fetch whose length header comes after `header_delay`, then
-    /// 5 chunks `gap` apart, and fetches it with a 1 s idle deadline and a
-    /// 3 s header wait.
+    /// 5 chunks `gap` apart, and fetches it through `fetch_content` (with a
+    /// CID) or `fetch_file`. Unit tests use a 1 s idle deadline and a 3 s
+    /// header wait.
     async fn carrier_fetch_slowly(
         cid: Option<&str>,
         header_delay: Duration,
@@ -11026,13 +10976,10 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let deadlines = FetchDeadlines {
-            header: Duration::from_secs(3),
-            idle: Duration::from_secs(1),
-            name: "artifact",
+        let result = match cid {
+            Some(cid) => client.fetch_content(cid, None).await,
+            None => client.fetch_file("artifact").await,
         };
-        let path = if cid.is_some() { "" } else { "artifact" };
-        let result = client.fetch_bytes(cid, path, 1024, Some(deadlines)).await;
         client.close().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
         server.close().await;
@@ -11052,14 +10999,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn carrier_fetch_that_stalls_fails_after_idle_deadline() {
-        for cid in [None, Some("bafy-fixture")] {
+        for (cid, name) in [(None, "artifact"), (Some("bafy-fixture"), "bafy-fixture")] {
             let started = std::time::Instant::now();
             let err = carrier_fetch_slowly(cid, Duration::ZERO, Duration::from_secs(3))
                 .await
                 .unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "no data for 1 s while downloading artifact"
+                format!("no data for 1 s while downloading {name}")
             );
             assert!(started.elapsed() < Duration::from_secs(5));
         }
@@ -11080,7 +11027,7 @@ pub(crate) mod tests {
                 .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "trusted source did not start sending artifact within 3 s"
+            "trusted source did not start sending bafy-fixture within 3 s"
         );
     }
 
