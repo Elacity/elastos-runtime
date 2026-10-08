@@ -673,16 +673,13 @@ async fn admit_installed_setup_metadata(
                 let cid = pin.head_cid.clone();
                 let client = &client;
                 async move {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        client.fetch_content_bounded(
+                    client
+                        .fetch_content_bounded(
                             &cid,
                             None,
                             crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES,
-                        ),
-                    )
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Community network Carrier fetch timed out"))?
+                        )
+                        .await
                 }
             },
         )
