@@ -249,8 +249,10 @@ async function produce(args) {
 
 function main(args) {
   if (args[0] === "produce") return produce(args.slice(1));
-  assert.equal(args.length, 3, "usage: ci-model-package.mjs <isolated-data> <pinned-inputs> <fixture-output> | produce <output-dir> <publisher-did> <kubo-data>");
-  const [data, inputs, output] = args.map(arg => resolve(arg));
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <output-dir> <publisher-did> <kubo-data>");
+  // The package Home's Kubo holds the package; the consumer receives the signed catalogue.
+  // A separate package Home is a Carrier holder, so the consumer's Get crosses Carrier.
+  const [data, consumer, inputs, output] = args.map(arg => resolve(arg));
   const manifestPath = join(data, "components.json");
   regular(manifestPath);
   const manifestBytes = readFileSync(manifestPath), components = JSON.parse(manifestBytes);
@@ -260,14 +262,19 @@ function main(args) {
   assert.equal(recipes.length, 1, "Kubo requires one pinned build recipe for this platform");
   const kuboReceipt = verifyInstalledKubo(data, components, host, recipes[0]);
   kuboReceipt.components_sha256 = `sha256:${sha(manifestBytes)}`;
+  const consumerManifestPath = join(consumer, "components.json");
+  regular(consumerManifestPath);
+  const consumerComponents = JSON.parse(readFileSync(consumerManifestPath));
   mkdirSync(output, { recursive: true, mode: 0o700 });
   const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir);
   entry.cid = kuboAdd(join(data, "bin/kubo"), join(data, "ipfs-repo"), packageDir);
   const { catalog, trust } = signedCatalog(entry);
-  writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
-  components.model_catalog = trust;
-  writeFileSync(manifestPath, JSON.stringify(components), { mode: 0o600 });
-  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
+  writeFileSync(join(consumer, "model-catalog.json"), catalog, { mode: 0o600 });
+  consumerComponents.model_catalog = trust;
+  writeFileSync(consumerManifestPath, JSON.stringify(consumerComponents), { mode: 0o600 });
+  const carrier_holder = data !== consumer;
+  const delivery = carrier_holder ? "package pinned only in a separate holder Home's Kubo; consumer Get over Carrier bounded reads" : "local pinned Kubo package";
+  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: `${delivery}; Runtime Use admission`, carrier_holder, kubo: kuboReceipt }, null, 2));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));

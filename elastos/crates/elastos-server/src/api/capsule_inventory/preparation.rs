@@ -1888,11 +1888,12 @@ async fn fetch_model_part_unless_cancelled(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     id: &str,
+    reads: &mut crate::content::ModelPartReads,
     cid: &str,
     path: &str,
     range: Option<(u64, u64)>,
 ) -> anyhow::Result<Vec<u8>> {
-    let fetch = crate::content::fetch_model_part(registry, cid, path, range);
+    let fetch = reads.fetch(registry, cid, path, range);
     tokio::pin!(fetch);
     loop {
         tokio::select! {
@@ -1946,10 +1947,13 @@ async fn prepare(
         .await
         .context(PreparationFailurePhase::Capacity)?;
     require_active(data_dir, id, stop, revalidate)?;
+    // One route per package: after a local miss, later parts skip the local backend.
+    let mut reads = crate::content::ModelPartReads::default();
     let index = fetch_model_part_unless_cancelled(
         data_dir,
         registry,
         id,
+        &mut reads,
         &entry.cid,
         "_elastos_object.json",
         None,
@@ -2007,6 +2011,7 @@ async fn prepare(
                 data_dir,
                 registry,
                 id,
+                &mut reads,
                 &entry.cid,
                 &expected.path,
                 Some((offset, length)),
@@ -9626,6 +9631,107 @@ server.serve_forever()
         );
 
         carrier_fixture::shutdown_test_carrier_node(silent.node).await;
+        carrier_fixture::shutdown_test_carrier_node(holder.node).await;
+        carrier_fixture::shutdown_test_carrier_node(consumer).await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_reads_remaining_parts_from_holders_after_one_local_miss() {
+        use crate::carrier::tests as carrier_fixture;
+        let root = tempfile::tempdir().unwrap();
+        // Four 64 KiB weight parts plus the index and four small files.
+        let mut weights = b"GGUF\x03\0\0\0".to_vec();
+        weights.resize(3 * 65536 + 5, 7);
+        let (payload, files) = package_fixture(weights);
+        write_preparation_catalog(root.path(), &payload);
+        let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+        let backend = Arc::new(PreparationBackend::new(files.clone(), cid.clone()));
+        backend.missing_cache.store(true, Ordering::Release);
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        register_content(&registry, root.path()).await;
+        let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[93u8; 32]);
+        let consumer = crate::carrier::start_isolated_carrier_node_with_registry(
+            &consumer_sk,
+            &consumer_did,
+            root.path().join("carrier"),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    consumer.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        registry
+            .register(Arc::new(
+                crate::carrier::CarrierAvailabilityProvider::with_provider_registry(
+                    consumer.gossip_state.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let holder =
+            carrier_fixture::start_content_holder_runtime(94, files.clone(), served.clone()).await;
+        consumer
+            .memory_lookup
+            .add_endpoint_info(holder.addr.clone());
+        carrier_fixture::seed_content_availability_announcements(
+            &consumer,
+            &cid,
+            &[(
+                holder.ticket.clone(),
+                [94u8; 32],
+                holder.did.clone(),
+                now().unwrap(),
+            )],
+        )
+        .await;
+
+        let owner = PreparationOwner::default();
+        let reply = owner
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("use")),
+                "one-local-miss",
+                &serde_json::json!({"cid": cid}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("preparation settles")
+            .unwrap();
+        let record = load_operation(root.path(), reply["operation_id"].as_str().unwrap()).unwrap();
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        let local_reads = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.as_str() == "cat")
+            .count();
+        assert_eq!(
+            local_reads, 1,
+            "only the first part tries the local backend"
+        );
+        let served = served.lock().unwrap().clone();
+        assert_eq!(
+            served.len(),
+            9,
+            "every part, the index included, came from the holder"
+        );
+        assert!(served.iter().all(|request| request["bounded_read"] == true));
         carrier_fixture::shutdown_test_carrier_node(holder.node).await;
         carrier_fixture::shutdown_test_carrier_node(consumer).await;
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check CI release/cache decisions without builds, Docker, or publication."""
+import base64
 import os
 import hashlib
 import io
@@ -1549,17 +1550,32 @@ class InstalledJourneyTests(unittest.TestCase):
         (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
         return home, data, evidence, receipt
 
-    def execute(self, home, data, evidence, available=20 * 1024 ** 3):
+    PACKAGE_MULTIHASH = b"\x12\x20" + hashlib.sha256(b"fixture package root").digest()
+    PACKAGE_CID = "b" + base64.b32encode(b"\x01\x70" + PACKAGE_MULTIHASH).decode().lower().rstrip("=")
+
+    def consumer_kubo(self, data, holds_root=False):
+        # Kubo's flatfs layout: blocks/<next-to-last 2>/<base32 multihash>.data.
+        blocks = data / "ipfs-repo/blocks"
+        blocks.mkdir(parents=True)
+        (blocks / "SHARDING").write_text("/repo/flatfs/shard/v1/next-to-last/2\n")
+        if holds_root:
+            key = base64.b32encode(self.PACKAGE_MULTIHASH).decode().rstrip("=")
+            (blocks / key[-3:-1]).mkdir()
+            (blocks / key[-3:-1] / f"{key}.data").write_bytes(b"package root")
+
+    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False):
         journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
         child = mock.Mock(pid=12345)
         child.poll.return_value = None
         response = mock.MagicMock()
         response.__enter__.return_value.status = 200
+        self.holder = mock.Mock(return_value=(mock.Mock(pid=23456), {"holder_did": "did:key:holder"}))
 
         def node_journey(*args, **kwargs):
             if args[0][1] == "scripts/ci-model-package.mjs":
-                (evidence / "package.json").write_text("{}")
+                (evidence / "package.json").write_text(json.dumps({"cid": self.PACKAGE_CID}))
                 return
+            self.consumer_kubo(data, consumer_holds_root)
             stages = [("run_started", 2), ("engine_ready", 400), ("generation_started", 500),
                       ("first_delta", 600), ("stream_completed", 1000),
                       ("generation_completed", 1020), ("terminal_applied", 1030)]
@@ -1581,9 +1597,10 @@ class InstalledJourneyTests(unittest.TestCase):
                 mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
                     "capacity_bytes": 100 * 1024 ** 3, "available_bytes": available},
                     "process_rows": lambda: {},
-                    "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}}}):
+                    "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}},
+                    "start_holder": self.holder}):
             try:
-                journey["run"](home, data, evidence)
+                journey["run"](home, data, evidence, carrier=carrier)
             finally:
                 self.gateway, self.node, self.stop = gateway, node, stop
         return child
@@ -1624,10 +1641,47 @@ class InstalledJourneyTests(unittest.TestCase):
                     self.assertEqual(env["PATH"], "/fixture-tools")
                     self.assertEqual(env["ELASTOS_MODEL_TIMING_DIAGNOSTICS"], "1")
                 self.assertEqual(self.node.call_count, 2)
-                self.assertEqual(self.node.call_args_list[0].args[0][1], "scripts/ci-model-package.mjs")
+                package = self.node.call_args_list[0].args[0]
+                self.assertEqual(package[1], "scripts/ci-model-package.mjs")
+                self.assertEqual(package[2:4], [str(data), str(data)])
+                self.holder.assert_not_called()
                 record = json.loads((evidence / "installed-journeys.json").read_text())
                 self.assertEqual(record["installed_model_provider_sha256"],
                                  hashlib.sha256((data / "bin/model-provider").read_bytes()).hexdigest())
+                self.assertNotIn("carrier_get", record["results"])
+
+    def test_carrier_get_places_the_package_only_on_a_separate_holder_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            self.execute(home, data, evidence, carrier=True)
+            package = self.node.call_args_list[0].args[0]
+            # The package goes only to the separate holder Home; the consumer gets the catalogue.
+            holder_home = home.parent / "home-holder"
+            holder_data = holder_home / data.relative_to(home)
+            self.assertEqual(package[2:4], [str(holder_data), str(data)])
+            self.assertEqual(self.holder.call_args.args[:3], (holder_home, holder_data, data))
+            self.assertEqual(self.gateway.call_args.args[0][:2], [str(data / "bin/elastos"), "gateway"])
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["results"]["carrier_get"], "passed")
+            self.assertEqual(record["package_holder"], {"holder_did": "did:key:holder"})
+
+    def test_get_refuses_a_package_present_in_the_consumer_kubo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            with self.assertRaisesRegex(RuntimeError, "Carrier-only package delivery"):
+                self.execute(home, data, evidence, carrier=True, consumer_holds_root=True)
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["consumer_package_root_block"], "present")
+            self.assertEqual(record["results"]["carrier_get"], "failed")
+
+    def test_get_refuses_a_consumer_that_already_holds_a_kubo_repository(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            (data / "ipfs-repo").mkdir()
+            with self.assertRaisesRegex(AssertionError, "starts without the package"):
+                self.execute(home, data, evidence, carrier=True)
+            self.holder.assert_not_called()
+            self.gateway.assert_not_called()
 
     def test_receipt_hash_and_disk_refuse_launch(self):
         for failure in ("receipt", "tree", "dirty", "parity", "built", "components", "hash", "provider", "disk"):
@@ -1704,7 +1758,7 @@ class InstalledJourneyTests(unittest.TestCase):
 
                 def node_journey(command, **_):
                     if command[1] == "scripts/ci-model-package.mjs":
-                        (evidence / "package.json").write_text("{}")
+                        (evidence / "package.json").write_text(json.dumps({"cid": self.PACKAGE_CID}))
                         return
                     self.assertEqual(command[-1], "--home-only")
                     if appeared == "ui_missing":
@@ -2025,6 +2079,55 @@ class InstalledModelTimingTests(unittest.TestCase):
                 if not failure:
                     self.assertIn("acknowledgement_total_ms", summary)
                     self.assertIn("Delta Applied count", summary)
+
+    def test_linux_summary_requires_carrier_get_only_where_the_workflow_names_it(self):
+        shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
+        source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+        for carrier, carrier_get in (("true", "passed"), ("true", None), ("false", None)):
+            with self.subTest(carrier=carrier, carrier_get=carrier_get), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                _, data, _, _ = InstalledJourneyTests().fixture(root, "linux")
+                journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+                identities = {"candidate": "c" * 40, "source_tree": "d" * 40,
+                              "installed_runtime_sha256": journey["digest"](data / "bin/elastos"),
+                              "installed_model_provider_sha256": journey["digest"](data / "bin/model-provider"),
+                              "source_components_sha256": journey["digest"](data / "components.json")}
+                results = {name: "passed" for name in ("home_screenshots", "model_package_admission", "installed_runtime_reply",
+                                                       "model_timing_observer", "process_cleanup", "disk_reserve")}
+                if carrier_get:
+                    results["carrier_get"] = carrier_get
+                (root / "installed-journeys.json").write_text(json.dumps({
+                    **identities, "installed_engine": journey["engine_receipt"](data), "results": results}))
+                (root / "engine-absent-home").mkdir()
+                (root / "engine-absent-home/installed-journeys.json").write_text(json.dumps({
+                    **identities, "engine_absent": True, "dispatch_unavailable_reason": "source_engine_required",
+                    "process_cleanup": {"before": {"llama_server": 0}},
+                    "results": {name: "passed" for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots",
+                                                            "process_cleanup", "disk_reserve")}}))
+                with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
+                        mock.patch.object(sys, "platform", "linux"), \
+                        mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md"), "CI_CARRIER_GET": carrier}), \
+                        mock.patch.object(subprocess, "check_output", side_effect=["c" * 40 + "\n", "d" * 40 + "\n"]):
+                    if carrier == "true" and not carrier_get:
+                        with self.assertRaises(SystemExit):
+                            exec(compile(source, "installed-summary", "exec"), {})
+                    else:
+                        exec(compile(source, "installed-summary", "exec"), {})
+                summary = json.loads((root / "core-summary.json").read_text())["results"]
+                if carrier == "true":
+                    self.assertEqual(summary["carrier_get"], "passed" if carrier_get else "failed or not run")
+                else:
+                    self.assertNotIn("carrier_get", summary)
+
+    def test_only_the_linux_x86_job_gets_the_reply_package_from_a_holder(self):
+        for job in ("source-home-linux", "source-home-macos"):
+            for name in ("installed Marketplace Get and Assistant reply", "summarize installed model journey"):
+                step, = [step for step in steps(job) if step.startswith(f"name: {name}\n")]
+                if job == "source-home-linux":
+                    self.assertEqual(field(step, "CI_CARRIER_GET"), "${{ matrix.os == 'ubuntu-24.04' }}")
+                else:
+                    self.assertNotIn("CI_CARRIER_GET", step)
+        self.assertEqual(re.search(r"(?m)^        os: \[([^\]]+)\]$", JOBS["source-home-linux"])[1], "ubuntu-24.04")
 
     def test_probe_refuses_wrong_alias_malformed_and_oversize_responses(self):
         alias = "a" * 32

@@ -35,7 +35,12 @@ PY
         ;;
     home)
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/engine-absent-home" --home-only
-        python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE"
+        # The workflow names the one job whose reply Get crosses Carrier from a holder Home.
+        if [[ "${CI_CARRIER_GET:-false}" == true ]]; then
+            python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --carrier-get
+        else
+            python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE"
+        fi
         ;;
     home-repeat)
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/engine-absent-home" --home-only
@@ -60,8 +65,10 @@ try:
     engine = journey["engine_receipt"](data)
 except (OSError, ValueError, AssertionError, KeyError, RuntimeError):
     engine = None
+carrier = os.environ.get("CI_CARRIER_GET") == "true"
 results = {name: "failed or not run" for name in (
-    "home_screenshots", "model_package_admission", "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve")}
+    "home_screenshots", "model_package_admission", *(["carrier_get"] if carrier else []),
+    "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve")}
 elapsed = 0
 records = []
 paths = sorted(root.glob("run-*/installed-journeys.json")) or [root / "installed-journeys.json"]
@@ -94,7 +101,8 @@ elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_
 (root / "core-summary.json").write_text(json.dumps({
     "candidate": commit, "source_tree": tree, "installed_runtime_sha256": sha,
     "results": results, "elapsed_seconds": elapsed, "model_timing_spread": spread,
-    "fixture_policy": "fresh Home state and engine process per run; verified source engine prerequisite; same host with potentially warm OS file cache",
+    "fixture_policy": "fresh Home state and engine process per run; verified source engine prerequisite; same host with potentially warm OS file cache"
+                      + ("; reply package only on a separate holder Home, fetched over Carrier" if carrier else ""),
     "engine_absent_home": absence,
 }, indent=2) + "\n")
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
@@ -103,6 +111,8 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
     summary.write("\nEach run uses fresh Home state and a new engine process on the same host. OS file cache can warm between runs.\n")
+    if carrier:
+        summary.write("\nThe reply package lives only in a separate holder Home's Kubo. The consumer Home knows that holder as one Carrier peer and holds no package, so Get reads every piece over Carrier.\n")
     summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh signed-fixture Home proves Get, controlled Use refusal, Retry and Home usability with the optional engine absent.\n")
     summary.write(f"\nTiming receipts: {spread['status']} ({spread['recorded_runs']}/{expected_runs} runs).\n")
     if spread["status"] == "complete":

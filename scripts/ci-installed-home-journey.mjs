@@ -9,7 +9,10 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
-const cid = JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
+const fixture = JSON.parse(readFileSync(join(evidence, "package.json")));
+const cid = fixture.cid;
+// A holder Get reads the package over Carrier in 64 KiB bounded reads; a same-Home Get is local.
+const readyMs = fixture.carrier_holder === true ? 15 * 60 * 1000 : 180000;
 let browser, page;
 let stage = "journey";
 let subcheck = null;
@@ -137,7 +140,7 @@ try {
     }, null, 2));
   } else {
     const openAssistant = marketplace.locator('[data-model-control="open-assistant"]');
-    await openAssistant.waitFor({ state: "visible", timeout: 180000 });
+    await openAssistant.waitFor({ state: "visible", timeout: readyMs });
     const catalog = await projection(marketplace, "/api/capsules/catalog");
     const readyModel = catalog.capsules.find(row => row.cid === cid);
     assert.equal(readyModel?.model_runtime?.dispatch_ready, true);
