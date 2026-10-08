@@ -13,6 +13,7 @@ const state = {
   openCalls: 0,
   openRequests: 0,
   openStatusRequests: 0,
+  resetCalls: [],
   releaseInitialOpen: null,
   serverErrors: [],
   requests: [],
@@ -220,6 +221,11 @@ async function handleApi(req, res, url) {
     });
     return true;
   }
+  if (url.pathname === "/api/apps/browser/profile/reset" && req.method === "POST") {
+    state.resetCalls.push({ token: req.headers["x-elastos-home-token"] });
+    json(res, 200, { schema: "elastos.browser.profile-reset/v1", status: "ok", removed_profile_disk: true });
+    return true;
+  }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
     const body = await readBody(req);
     if (
@@ -337,6 +343,9 @@ const server = createServer(async (req, res) => {
     }
     const path = staticPath(url.pathname);
     if (path && existsSync(path)) {
+      if (path.endsWith(".html")) {
+        res.setHeader("content-security-policy", "sandbox allow-scripts allow-forms allow-popups allow-downloads");
+      }
       send(res, 200, contentType(path), readFileSync(path));
       return;
     }
@@ -631,6 +640,28 @@ try {
     "fresh Browser capsule",
   );
   await browserFrame.waitForFunction(() => document.body.dataset.loading === "false");
+  await browserFrame.locator("#browser-settings").click();
+  const confirmation = browserFrame.locator("#browser-profile-reset-confirmation");
+  await browserFrame.locator("#browser-profile-reset").click();
+  await confirmation.waitFor({ state: "visible" });
+  await browserFrame.locator("#browser-profile-reset-cancel").click();
+  await confirmation.waitFor({ state: "hidden" });
+  assert(state.resetCalls.length === 0, "Cancel changed the Browser profile", state.resetCalls);
+  await browserFrame.locator("#browser-profile-reset").click();
+  await browserFrame.locator("#browser-profile-reset-cancel").press("Escape");
+  await confirmation.waitFor({ state: "hidden" });
+  await browserFrame.locator("#browser-settings").click();
+  assert(state.resetCalls.length === 0, "Escape changed the Browser profile", state.resetCalls);
+  await browserFrame.locator("#browser-profile-reset").click();
+  await browserFrame.locator("#browser-settings-close").click();
+  await browserFrame.locator("#browser-settings").click();
+  await confirmation.waitFor({ state: "hidden" });
+  assert(state.resetCalls.length === 0, "Closing Settings changed the Browser profile", state.resetCalls);
+  await browserFrame.locator("#browser-profile-reset").click();
+  await browserFrame.locator("#browser-profile-reset-commit").click();
+  await browserFrame.locator("#browser-status").getByText("Browser profile reset. Open the address again.", { exact: true }).waitFor();
+  assert(state.resetCalls.length === 1 && state.resetCalls[0].token === browserToken && state.openRequests === 2,
+    "Confirmed reset must use the exact window authority once without opening an Engine", state.resetCalls);
   await shellFrame.evaluate(
     (message) => window.__browserCloseProof.send(message),
     { ...request, requestId: "headless-close-exact-absence" },
@@ -654,6 +685,7 @@ try {
     close_calls: state.closeCalls.length,
     fresh_close: freshResult.terminalKind,
     unload_close_calls: 0,
+    reset_calls: state.resetCalls.length,
   }));
 } finally {
   await chromiumBrowser?.close();
