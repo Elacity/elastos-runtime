@@ -6,6 +6,13 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Developer detail
+
+- `publish-release` no longer sends a release gossip announcement that no Home
+  received. Seeds on an older Runtime still print the old announcement error after
+  the commit (#174). INSTALL.md describes how updates
+  reach a Home, and VERSIONING.md describes the seed's role.
+
 ## [0.8.0-alpha.10]
 
 Test-channel release. Signed releases show these notes in System before you update.
