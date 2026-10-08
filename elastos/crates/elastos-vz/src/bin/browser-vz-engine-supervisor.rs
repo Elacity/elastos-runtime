@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use elastos_common::{
-    CapsuleManifest, CapsuleRole, CapsuleStatus, CapsuleType, MicroVmConfig, Permissions,
-    ResourceLimits, SCHEMA_V1,
+    CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, Permissions, ResourceLimits,
+    SCHEMA_V1,
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_vz::{VmConfig, VzConfig, VzProvider};
@@ -36,6 +36,9 @@ const VZ_LAUNCH_SETTLEMENT_SCHEMA: &str = "elastos.browser.vz-launch-settlement/
 const VZ_MEDIA_DIAGNOSTIC_SCHEMA: &str = "elastos.browser.media-diagnostic/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
 const TURN_PORT_ABSENCE_BUDGET: Duration = Duration::from_secs(3);
+const CLEANUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
+const STARTUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
+const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
@@ -100,7 +103,7 @@ async fn main() {
     }
     init_tracing();
     if let Err(error) = run().await {
-        eprintln!("{error}");
+        emit_stderr_line(&error);
         process::exit(1);
     }
 }
@@ -205,7 +208,19 @@ struct VzLaunchOwner {
     turn_process: bool,
     vm: bool,
     control_proxy_spawned: bool,
+    vm_start_dispatched: bool,
+    vm_absence_proved: bool,
+    vm_cleanup: Option<tokio::task::JoinHandle<String>>,
+    vm_terminal_observed: bool,
+    vm_release: Option<tokio::task::JoinHandle<bool>>,
+    vm_release_proved: bool,
+    startup: Option<tokio::task::JoinHandle<Result<StartupValue, String>>>,
+    startup_indeterminate: bool,
+    ordinary_bridge_absence_proved: bool,
+    media_bridge_absence_proved: bool,
+    control_proxy_absence_proved: bool,
     turn_cleanup: TurnCleanupEvidence,
+    turn_ports_may_be_owned: bool,
     provider: Option<Arc<VzProvider>>,
     handle: Option<CapsuleHandle>,
     shutdown: Option<Arc<AtomicBool>>,
@@ -214,6 +229,27 @@ struct VzLaunchOwner {
     control_proxy: Option<thread::JoinHandle<bool>>,
     launch_rootfs: Option<PreparedLaunchRootfs>,
     profile_disk: Option<PreparedBrowserProfileDisk>,
+}
+
+enum StartupValue {
+    Unit,
+    Handle(CapsuleHandle),
+    Json(Value),
+}
+
+impl StartupValue {
+    fn into_handle(self) -> Result<CapsuleHandle, String> {
+        match self {
+            Self::Handle(handle) => Ok(handle),
+            _ => Err("invalid native load result".to_string()),
+        }
+    }
+    fn into_json(self) -> Result<Value, String> {
+        match self {
+            Self::Json(value) => Ok(value),
+            _ => Err("invalid native guest result".to_string()),
+        }
+    }
 }
 
 enum TurnCleanupEvidence {
@@ -237,7 +273,19 @@ impl VzLaunchOwner {
             turn_process: false,
             vm: false,
             control_proxy_spawned: false,
+            vm_start_dispatched: false,
+            vm_absence_proved: false,
+            vm_cleanup: None,
+            vm_terminal_observed: false,
+            vm_release: None,
+            vm_release_proved: false,
+            startup: None,
+            startup_indeterminate: false,
+            ordinary_bridge_absence_proved: false,
+            media_bridge_absence_proved: false,
+            control_proxy_absence_proved: false,
             turn_cleanup: TurnCleanupEvidence::NotStarted,
+            turn_ports_may_be_owned: false,
             provider: None,
             handle: None,
             shutdown: None,
@@ -249,16 +297,46 @@ impl VzLaunchOwner {
         }
     }
 
+    #[cfg(test)]
     async fn settle_failure(&mut self, message: impl AsRef<str>) -> String {
         let absence = self.cleanup().await;
         self.settlement_with_absence(message, absence)
     }
 
-    async fn settle_failed_profile_flush(&mut self, message: impl AsRef<str>) -> String {
-        let absence = self.cleanup().await;
-        self.settlement_with_absence_and_profile_durability(message, absence, Some("failed"))
+    // The caller's request can settle as pending while this exact owner stays
+    // alive. A timeout bounds one observation; it never retires a writer.
+    async fn finish_cleanup(
+        &mut self,
+        message: impl AsRef<str>,
+        profile_durability: Option<&str>,
+    ) -> String {
+        let mut last_report = None;
+        let mut immediate = self.startup.is_some();
+        loop {
+            let absence = if immediate {
+                immediate = false;
+                self.cleanup_until(Instant::now()).await
+            } else {
+                self.cleanup().await
+            };
+            let terminal = absence_is_complete(&absence);
+            let report = self.settlement_with_absence_and_profile_durability(
+                message.as_ref(),
+                absence,
+                profile_durability,
+            );
+            if terminal {
+                return report;
+            }
+            if last_report.as_ref() != Some(&report) {
+                emit_stderr_line(&report);
+                last_report = Some(report);
+            }
+            tokio::time::sleep(CLEANUP_RETRY_INTERVAL).await;
+        }
     }
 
+    #[cfg(test)]
     fn settlement_with_absence(&self, message: impl AsRef<str>, absence: Value) -> String {
         self.settlement_with_absence_and_profile_durability(message, absence, None)
     }
@@ -269,9 +347,7 @@ impl VzLaunchOwner {
         absence: Value,
         profile_durability: Option<&str>,
     ) -> String {
-        let terminal = absence
-            .as_object()
-            .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)));
+        let terminal = absence_is_complete(&absence);
         let mut settlement = json!({
             "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
             "state": if terminal {
@@ -314,80 +390,90 @@ impl VzLaunchOwner {
     }
 
     async fn cleanup(&mut self) -> Value {
+        self.cleanup_until(Instant::now() + CLEANUP_ATTEMPT_BUDGET)
+            .await
+    }
+
+    async fn cleanup_until(&mut self, deadline: Instant) -> Value {
         if let Some(shutdown) = self.shutdown.as_ref() {
             shutdown.store(true, Ordering::Relaxed);
         }
-        let vm_absent = if let (Some(provider), Some(handle)) =
-            (self.provider.as_ref(), self.handle.as_ref())
-        {
-            let _ = tokio::time::timeout(Duration::from_secs(30), provider.stop(handle)).await;
-            matches!(
-                tokio::time::timeout(Duration::from_secs(30), provider.status(handle),).await,
-                Ok(Ok(CapsuleStatus::Stopped | CapsuleStatus::Failed))
-            )
-        } else {
-            !self.vm
-        };
-        if vm_absent {
-            self.handle.take();
-            self.provider.take();
-        }
-        let control_proxy_absent = match self.control_proxy.take() {
-            Some(proxy) => join_control_proxy_bounded(proxy, Duration::from_secs(30)),
-            None if !self.control_proxy_spawned => true,
-            None => false,
-        };
-        let ordinary_stream_bridge_absent = match self.ordinary_bridge.take() {
-            Some(bridge) => matches!(
-                tokio::time::timeout(Duration::from_secs(30), bridge).await,
-                Ok(Ok(true))
-            ),
-            None => !self.ordinary_stream_bridge,
-        };
-        let media_stream_bridge_absent = match self.media_bridge.take() {
-            Some(bridge) => matches!(
-                tokio::time::timeout(Duration::from_secs(30), bridge).await,
-                Ok(Ok(true))
-            ),
-            None => !self.media_stream_bridge,
-        };
-        let turn_cleanup =
-            std::mem::replace(&mut self.turn_cleanup, TurnCleanupEvidence::Indeterminate);
-        // Port availability is evidence only when this launch may have started TURN.
+        let startup_complete = self.drain_startup(deadline).await;
+        let vm_terminal = startup_complete
+            && (self.vm_terminal_observed || self.observe_vm_absence(deadline).await);
+        let control_proxy_absent = join_control_proxy_until(
+            &mut self.control_proxy,
+            &mut self.control_proxy_absence_proved,
+            deadline,
+        ) || !self.control_proxy_spawned;
+        let ordinary_stream_bridge_absent = join_bridge_until(
+            &mut self.ordinary_bridge,
+            &mut self.ordinary_bridge_absence_proved,
+            deadline,
+        )
+        .await
+            || !self.ordinary_stream_bridge;
+        let media_stream_bridge_absent = join_bridge_until(
+            &mut self.media_bridge,
+            &mut self.media_bridge_absence_proved,
+            deadline,
+        )
+        .await
+            || !self.media_stream_bridge;
+        // A failed reap keeps the Child and every unfinished log reader here.
         // A foreign listener cannot create a cleanup obligation for this owner.
-        let probe_turn_ports = matches!(
-            &turn_cleanup,
+        self.turn_ports_may_be_owned |= matches!(
+            self.turn_cleanup,
             TurnCleanupEvidence::Owned(_) | TurnCleanupEvidence::Indeterminate
         );
-        let turn_child_absent = match turn_cleanup {
-            TurnCleanupEvidence::Owned(mut turn) => turn.terminate_and_reap(),
+        let turn_child_absent = match &mut self.turn_cleanup {
+            TurnCleanupEvidence::Owned(turn) => turn.terminate_and_reap_until(deadline),
             TurnCleanupEvidence::AbsenceProved => true,
             TurnCleanupEvidence::NotStarted => !self.turn_process,
             TurnCleanupEvidence::Indeterminate => false,
         };
-        self.turn_cleanup = if turn_child_absent {
-            TurnCleanupEvidence::AbsenceProved
-        } else {
-            TurnCleanupEvidence::Indeterminate
-        };
-        self.profile_disk.take();
-        self.launch_rootfs.take();
-        let path_absence = remove_owned_launch_paths(&self.paths, &self.acquired_paths);
-        let vm_state_absent = self
-            .identity
-            .vm_id
-            .as_str()
-            .is_some_and(|vm_id| remove_owned_vm_state(&self.paths, vm_id, vm_absent));
-        let (turn_listener_absent, turn_relay_ports_absent) = if probe_turn_ports {
-            wait_for_owned_turn_ports_absent(&self.transport).await
+        if turn_child_absent {
+            self.turn_cleanup = TurnCleanupEvidence::AbsenceProved;
+        }
+        let (turn_listener_absent, turn_relay_ports_absent) = if self.turn_ports_may_be_owned {
+            wait_for_owned_turn_ports_absent_until(
+                &self.transport,
+                deadline.min(Instant::now() + TURN_PORT_ABSENCE_BUDGET),
+            )
+            .await
         } else {
             (true, true)
         };
-        let child_absent = turn_child_absent
+        let io_children_absent = startup_complete
+            && turn_child_absent
             && control_proxy_absent
             && ordinary_stream_bridge_absent
             && media_stream_bridge_absent;
-        json!({
+        let vm_absent = self.vm_release_proved
+            || (io_children_absent
+                && (vm_terminal || self.vm_terminal_observed)
+                && self.observe_vm_release(deadline).await);
+        let child_absent = io_children_absent && vm_absent;
+        let writers_absent =
+            vm_absent && child_absent && turn_listener_absent && turn_relay_ports_absent;
+        // Keep both disk leases and owned paths until every possible writer is
+        // absent. Path retirement can fail too; that keeps the owner pending.
+        let path_absence = if writers_absent {
+            remove_owned_launch_paths(&self.paths, &self.acquired_paths)
+        } else {
+            OwnedPathAbsence {
+                control_socket: false,
+                socket_directory: false,
+                session_directory: false,
+            }
+        };
+        let vm_state_absent = writers_absent
+            && self
+                .identity
+                .vm_id
+                .as_str()
+                .is_some_and(|vm_id| remove_owned_vm_state(&self.paths, vm_id, true));
+        let absence = json!({
             "child_absent": child_absent,
             "supervisor_child_absent": true,
             "control_socket_absent": control_proxy_absent && path_absence.control_socket,
@@ -397,11 +483,190 @@ impl VzLaunchOwner {
             "ordinary_stream_bridge_absent": ordinary_stream_bridge_absent,
             "media_stream_bridge_absent": media_stream_bridge_absent,
             "session_directory_absent": path_absence.socket_directory
-                && path_absence.session_directory
-                && vm_state_absent,
+                && path_absence.session_directory && vm_state_absent,
             "vm_absent": vm_absent,
-        })
+        });
+        if absence_is_complete(&absence) {
+            self.handle.take();
+            self.provider.take();
+            self.profile_disk.take();
+            self.launch_rootfs.take();
+        }
+        absence
     }
+
+    async fn observe_vm_absence(&mut self, deadline: Instant) -> bool {
+        if self.vm_absence_proved {
+            return true;
+        }
+        if !self.vm_start_dispatched {
+            // load_with_vm_config only configures the machine. Execution starts
+            // solely at the explicit start dispatch below.
+            self.vm_absence_proved = true;
+            return true;
+        }
+        if self.vm_cleanup.is_none() {
+            let (Some(provider), Some(handle)) = (self.provider.clone(), self.handle.clone())
+            else {
+                return false;
+            };
+            let runtime = tokio::runtime::Handle::current();
+            // VZ's queue dispatch can block synchronously. Keep this task and
+            // its provider/handle even when the bounded observer times out.
+            self.vm_cleanup = Some(tokio::task::spawn_blocking(move || {
+                runtime.block_on(async move {
+                    let state = provider.guest_state_label(&handle).await;
+                    if state == "Running" || state == "Paused" {
+                        let _ = provider.stop(&handle).await;
+                        provider.guest_state_label(&handle).await
+                    } else {
+                        state
+                    }
+                })
+            }));
+        }
+        let observation = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.vm_cleanup
+                .as_mut()
+                .expect("owned VM cleanup observation"),
+        )
+        .await;
+        match observation {
+            Ok(result) => {
+                self.vm_cleanup.take();
+                if let Ok(state) = result {
+                    self.vm_terminal_observed |= state == "Stopped" || state == "Error";
+                    self.vm_absence_proved = native_vm_absence_proved(&state);
+                }
+                self.vm_absence_proved
+            }
+            Err(_) => false,
+        }
+    }
+    async fn observe_vm_release(&mut self, deadline: Instant) -> bool {
+        if self.vm_release_proved {
+            return true;
+        }
+        if self.handle.is_none() && !self.vm_start_dispatched {
+            self.vm_release_proved = true;
+            return true;
+        }
+        if self.vm_release.is_none() {
+            let (Some(provider), Some(handle)) = (self.provider.clone(), self.handle.clone())
+            else {
+                return false;
+            };
+            let runtime = tokio::runtime::Handle::current();
+            self.vm_release = Some(tokio::task::spawn_blocking(move || {
+                runtime.block_on(provider.release_terminal_native_vm(&handle))
+            }));
+        }
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.vm_release
+                .as_mut()
+                .expect("owned native object retirement"),
+        )
+        .await
+        {
+            Ok(result) => {
+                self.vm_release.take();
+                self.vm_release_proved = matches!(result, Ok(true));
+                self.vm_release_proved
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn startup_operation<F>(
+        &mut self,
+        signals: &ShutdownSignalReporter,
+        operation: F,
+    ) -> Result<StartupValue, String>
+    where
+        F: std::future::Future<Output = Result<StartupValue, String>> + Send + 'static,
+    {
+        if signals.cancellation_requested() {
+            return Err("Browser VZ startup cancelled".to_string());
+        }
+        let runtime = tokio::runtime::Handle::current();
+        self.startup = Some(tokio::task::spawn_blocking(move || {
+            runtime.block_on(operation)
+        }));
+        tokio::select! {
+            _ = wait_for_shutdown_signal(signals) => Err("Browser VZ startup cancelled".to_string()),
+            result = tokio::time::timeout(STARTUP_ATTEMPT_BUDGET,
+                self.startup.as_mut().expect("owned native startup operation")) => match result {
+                Ok(Ok(result)) => {
+                    self.startup.take();
+                    // Adopt the loaded handle before a later cancellation
+                    // checkpoint can enter cleanup.
+                    if let Ok(StartupValue::Handle(handle)) = &result { self.handle = Some(handle.clone()); }
+                    result
+                },
+                Ok(Err(_)) => {
+                    self.startup.take(); self.startup_indeterminate = true;
+                    Err("Browser VZ startup operation did not finish safely".to_string())
+                }
+                Err(_) => Err("Browser VZ startup operation exceeded its observation budget".to_string()),
+            }
+        }
+    }
+
+    async fn drain_startup(&mut self, deadline: Instant) -> bool {
+        if self.startup_indeterminate {
+            return false;
+        }
+        let Some(task) = self.startup.as_mut() else {
+            return true;
+        };
+        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), task).await {
+            Ok(Ok(result)) => {
+                self.startup.take();
+                if let Ok(StartupValue::Handle(handle)) = result {
+                    self.handle = Some(handle);
+                }
+                true
+            }
+            Ok(Err(_)) => {
+                self.startup.take();
+                self.startup_indeterminate = true;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn absence_is_complete(absence: &Value) -> bool {
+    const FIELDS: [&str; 10] = [
+        "child_absent",
+        "supervisor_child_absent",
+        "control_socket_absent",
+        "route_absent",
+        "turn_listener_absent",
+        "turn_relay_ports_absent",
+        "ordinary_stream_bridge_absent",
+        "media_stream_bridge_absent",
+        "session_directory_absent",
+        "vm_absent",
+    ];
+    absence.as_object().is_some_and(|values| {
+        values.len() == FIELDS.len()
+            && FIELDS
+                .iter()
+                .all(|field| values.get(*field) == Some(&Value::Bool(true)))
+    })
+}
+
+fn native_vm_absence_proved(state: &str) -> bool {
+    state == "Stopped"
+}
+
+fn emit_stderr_line(line: &str) {
+    // A broken caller pipe cannot drop a still-live native writer.
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 async fn run() -> Result<(), String> {
@@ -467,15 +732,28 @@ async fn run() -> Result<(), String> {
         .map_err(|error| did_not_act_settlement(&identity, error))?;
     preflight_vz_launch(&paths, &transport, request_from_stdin)
         .map_err(|error| did_not_act_settlement(&identity, error))?;
+    let signals = install_shutdown_signal_reporter()
+        .map_err(|error| did_not_act_settlement(&identity, error))?;
     let mut owner = VzLaunchOwner::new(identity, paths, transport);
-    macro_rules! post_effect_try {
-        ($expression:expr) => {
-            match $expression {
-                Ok(value) => value,
-                Err(error) => return Err(owner.settle_failure(error.to_string()).await),
+    macro_rules! checkpoint {
+        () => {
+            if signals.cancellation_requested() {
+                return Err(owner
+                    .finish_cleanup("Browser VZ startup cancelled", None)
+                    .await);
             }
         };
     }
+    macro_rules! post_effect_try {
+        ($expression:expr) => {{
+            checkpoint!();
+            match $expression {
+                Ok(value) => value,
+                Err(error) => return Err(owner.finish_cleanup(error.to_string(), None).await),
+            }
+        }};
+    }
+    checkpoint!();
     owner.session_directory = true;
     post_effect_try!(create_owned_launch_paths(
         &owner.paths,
@@ -498,6 +776,7 @@ async fn run() -> Result<(), String> {
             .expect("Browser VZ profile disk owner")
             .initialize,
     );
+    checkpoint!();
     owner.turn_process = true;
     owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
     match LaunchTurn::start(&owner.paths, &owner.transport) {
@@ -505,12 +784,13 @@ async fn run() -> Result<(), String> {
             owner.turn_cleanup = TurnCleanupEvidence::Owned(turn);
         }
         Err(error) => {
-            owner.turn_cleanup = if error.child_absent {
-                TurnCleanupEvidence::AbsenceProved
-            } else {
-                TurnCleanupEvidence::Indeterminate
+            owner.turn_ports_may_be_owned |= error.spawned;
+            owner.turn_cleanup = match error.retained_turn {
+                Some(turn) => TurnCleanupEvidence::Owned(turn),
+                None if error.child_absent => TurnCleanupEvidence::AbsenceProved,
+                None => TurnCleanupEvidence::Indeterminate,
             };
-            return Err(owner.settle_failure(error.message).await);
+            return Err(owner.finish_cleanup(error.message, None).await);
         }
     }
     owner.launch_rootfs = Some(post_effect_try!(prepare_launch_rootfs(&owner.paths)));
@@ -536,7 +816,18 @@ async fn run() -> Result<(), String> {
             .with_rootfs_cache_dir(&owner.paths.rootfs_cache_dir),
     ))));
     let provider = Arc::clone(owner.provider.as_ref().expect("Browser VZ provider owner"));
-    post_effect_try!(provider.init().await);
+    let init_provider = Arc::clone(&provider);
+    post_effect_try!(
+        owner
+            .startup_operation(&signals, async move {
+                init_provider
+                    .init()
+                    .await
+                    .map(|_| StartupValue::Unit)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+    );
     trace_stage("provider_init_done", "");
 
     let mut vm_config = VmConfig {
@@ -574,19 +865,54 @@ async fn run() -> Result<(), String> {
         "load_vm_start",
         format!("boot_args={}", vm_config.boot_args),
     );
+    checkpoint!();
     owner.vm = true;
-    owner.handle = Some(post_effect_try!(
-        provider.load_with_vm_config(vm_config, manifest).await
-    ));
+    let load_provider = Arc::clone(&provider);
+    let loaded = post_effect_try!(
+        owner
+            .startup_operation(&signals, async move {
+                load_provider
+                    .load_with_vm_config(vm_config, manifest)
+                    .await
+                    .map(StartupValue::Handle)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+    );
+    owner.handle = Some(post_effect_try!(loaded.into_handle()));
     let handle = owner.handle.as_ref().expect("Browser VZ VM owner").clone();
     trace_stage("load_vm_done", "");
     trace_stage("start_vm_start", "");
-    post_effect_try!(provider.start(&handle).await);
+    checkpoint!();
+    owner.vm_start_dispatched = true;
+    let start_provider = Arc::clone(&provider);
+    let start_handle = handle.clone();
+    post_effect_try!(
+        owner
+            .startup_operation(&signals, async move {
+                start_provider
+                    .start(&start_handle)
+                    .await
+                    .map(|_| StartupValue::Unit)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+    );
     trace_stage("start_vm_done", "");
 
-    let guest_transport_receipt = post_effect_try!(
-        bootstrap_vz_transport(Arc::clone(&provider), &handle, &owner.transport,).await
+    let bootstrap_provider = Arc::clone(&provider);
+    let bootstrap_handle = handle.clone();
+    let bootstrap_transport = owner.transport.clone();
+    let bootstrap = post_effect_try!(
+        owner
+            .startup_operation(&signals, async move {
+                bootstrap_vz_transport(bootstrap_provider, &bootstrap_handle, &bootstrap_transport)
+                    .await
+                    .map(StartupValue::Json)
+            })
+            .await
     );
+    let guest_transport_receipt = post_effect_try!(bootstrap.into_json());
     let shutdown = Arc::new(AtomicBool::new(false));
     owner.shutdown = Some(Arc::clone(&shutdown));
     trace_stage("spawn_egress_bridge", "");
@@ -594,7 +920,10 @@ async fn run() -> Result<(), String> {
         post_effect_try!(env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16,));
     if egress_max_sessions == 0 || egress_max_sessions > 256 {
         return Err(owner
-            .settle_failure("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256")
+            .finish_cleanup(
+                "ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256",
+                None,
+            )
             .await);
     }
     let egress_port = owner
@@ -604,6 +933,7 @@ async fn run() -> Result<(), String> {
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .expect("validated Browser VZ egress vsock port");
+    checkpoint!();
     owner.ordinary_bridge = Some(spawn_egress_bridge(
         Arc::clone(&provider),
         handle.clone(),
@@ -613,6 +943,7 @@ async fn run() -> Result<(), String> {
         egress_max_sessions as usize,
     ));
     owner.ordinary_stream_bridge = true;
+    checkpoint!();
     owner.media_bridge = Some(spawn_egress_bridge(
         Arc::clone(&provider),
         handle.clone(),
@@ -636,6 +967,7 @@ async fn run() -> Result<(), String> {
     ));
     owner.media_stream_bridge = true;
     trace_stage("spawn_control_proxy", "");
+    checkpoint!();
     owner.control_socket = true;
     owner.control_proxy = Some(post_effect_try!(spawn_control_proxy(
         Arc::clone(&provider),
@@ -647,28 +979,29 @@ async fn run() -> Result<(), String> {
     owner.control_proxy_spawned = true;
 
     trace_stage("open_guest_page_start", "");
-    let mut result = match open_guest_page(
-        Arc::clone(&provider),
-        &handle,
-        owner.paths.control_port,
-        &request,
-        &owner.paths,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            if let Ok(delay_ms) = env_u32("ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS", 0) {
-                if delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
-                }
-            }
-            return Err(owner.settle_failure(error).await);
-        }
-    };
+    let open_provider = Arc::clone(&provider);
+    let open_handle = handle.clone();
+    let open_request = request.clone();
+    let open_paths = owner.paths.clone();
+    let opened = post_effect_try!(
+        owner
+            .startup_operation(&signals, async move {
+                open_guest_page(
+                    open_provider,
+                    &open_handle,
+                    open_paths.control_port,
+                    &open_request,
+                    &open_paths,
+                )
+                .await
+                .map(StartupValue::Json)
+            })
+            .await
+    );
+    let mut result = post_effect_try!(opened.into_json());
     if result.get("page_id") != owner.transport.authority.get("page_id") {
         return Err(owner
-            .settle_failure("Browser VZ guest page identity changed")
+            .finish_cleanup("Browser VZ guest page identity changed", None)
             .await);
     }
     result["vm_id"] = owner
@@ -694,62 +1027,55 @@ async fn run() -> Result<(), String> {
     }
     trace_stage("open_guest_page_done", "");
 
-    println!("{}", post_effect_try!(serde_json::to_string(&result)));
+    let readiness = post_effect_try!(serde_json::to_string(&result));
+    post_effect_try!(writeln!(std::io::stdout().lock(), "{readiness}"));
     let shutdown_reason = wait_for_shutdown_or_transport_expiry(
+        &signals,
         Some(&owner.transport),
         owner.provider.clone(),
         owner.handle.clone(),
     )
     .await;
-    eprintln!("{}", format_shutdown_wait_reason(&shutdown_reason));
+    emit_stderr_line(&format_shutdown_wait_reason(&shutdown_reason));
     if let ShutdownWaitReason::Signal { sender_pid, .. } = &shutdown_reason {
-        eprintln!(
+        emit_stderr_line(&format!(
             "browser-vz-engine-supervisor stage=shutdown_wait_sender sender_pid={sender_pid} comm={}",
             shutdown_signal_sender_comm(*sender_pid)
-        );
+        ));
     }
     if let ShutdownWaitReason::GuestStopped { state } = &shutdown_reason {
         return Err(owner
-            .settle_failure(format!("Browser VZ guest or framework stopped ({state})"))
+            .finish_cleanup(
+                format!("Browser VZ guest or framework stopped ({state})"),
+                None,
+            )
             .await);
     }
     let mut profile_durability = None;
     if let (Some(provider), Some(handle)) = (owner.provider.clone(), owner.handle.clone()) {
         let flush =
             request_guest_profile_disk_flush(provider, &handle, owner.paths.control_port).await;
-        eprintln!(
+        emit_stderr_line(&format!(
             "browser-vz-engine-supervisor stage=guest_profile_flush {}",
             format_guest_profile_flush(&flush)
-        );
+        ));
         if !guest_profile_disk_flush_accepted(&flush) {
             return Err(owner
-                .settle_failed_profile_flush(
+                .finish_cleanup(
                     "Browser VZ guest shutdown did not flush the profile disk",
+                    Some("failed"),
                 )
                 .await);
         }
         profile_durability = Some("proved");
     }
-    let absence = owner.cleanup().await;
-    if !absence
-        .as_object()
-        .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)))
-    {
-        return Err(owner.settlement_with_absence(
-            "Browser VZ normal shutdown did not prove terminal cleanup",
-            absence,
-        ));
-    }
-    if let Some(durability) = profile_durability {
-        eprintln!(
-            "{}",
-            owner.settlement_with_absence_and_profile_durability(
-                "Browser VZ guest shutdown flushed the profile disk",
-                absence,
-                Some(durability),
-            )
-        );
-    }
+    let settlement = owner
+        .finish_cleanup(
+            "Browser VZ guest shutdown completed native cleanup",
+            profile_durability,
+        )
+        .await;
+    emit_stderr_line(&settlement);
     Ok(())
 }
 
@@ -770,9 +1096,11 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
     if enabled {
         let detail = detail.as_ref();
         if detail.is_empty() {
-            eprintln!("browser-vz-engine-supervisor stage={stage}");
+            emit_stderr_line(&format!("browser-vz-engine-supervisor stage={stage}"));
         } else {
-            eprintln!("browser-vz-engine-supervisor stage={stage} {detail}");
+            emit_stderr_line(&format!(
+                "browser-vz-engine-supervisor stage={stage} {detail}"
+            ));
         }
     }
 }
@@ -1354,7 +1682,7 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LaunchPaths {
     kernel_path: PathBuf,
     rootfs_path: PathBuf,
@@ -1379,6 +1707,8 @@ struct LaunchTurn {
 struct LaunchTurnStartError {
     message: String,
     child_absent: bool,
+    retained_turn: Option<LaunchTurn>,
+    spawned: bool,
 }
 
 impl From<String> for LaunchTurnStartError {
@@ -1386,6 +1716,8 @@ impl From<String> for LaunchTurnStartError {
         Self {
             message,
             child_absent: true,
+            retained_turn: None,
+            spawned: false,
         }
     }
 }
@@ -1426,7 +1758,7 @@ impl TurnDiagnosticSink {
         if ordinal >= 64 {
             return;
         }
-        eprintln!(
+        emit_stderr_line(&format!(
             "{}",
             json!({
                 "schema": VZ_MEDIA_DIAGNOSTIC_SCHEMA,
@@ -1438,7 +1770,7 @@ impl TurnDiagnosticSink {
                 "media_stream_id": self.media_stream_id,
                 "ordinal": ordinal,
             })
-        );
+        ));
     }
 }
 
@@ -1615,14 +1947,9 @@ impl LaunchTurn {
         loop {
             match turn.child.try_wait() {
                 Ok(Some(status)) => {
-                    let _ = remove_file_if_present(&turn.config_path);
-                    let _ = turn.reap_log_threads();
-                    return Err(LaunchTurnStartError {
-                        message: format!(
-                            "Browser VZ TURN process exited before readiness: {status}"
-                        ),
-                        child_absent: true,
-                    });
+                    return Err(turn.fail_after_spawn(format!(
+                        "Browser VZ TURN process exited before readiness: {status}"
+                    )));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1652,27 +1979,38 @@ impl LaunchTurn {
         Ok(turn)
     }
 
-    fn fail_after_spawn(&mut self, message: String) -> LaunchTurnStartError {
+    fn fail_after_spawn(mut self, message: String) -> LaunchTurnStartError {
+        let child_absent = self.terminate_and_reap();
         LaunchTurnStartError {
             message,
-            child_absent: self.terminate_and_reap(),
+            child_absent,
+            retained_turn: if child_absent { None } else { Some(self) },
+            spawned: true,
         }
     }
 
     fn terminate_and_reap(&mut self) -> bool {
-        let child_pid = self.child.id() as i32;
-        signal_owned_turn_process_group(child_pid, libc::SIGTERM);
+        self.terminate_and_reap_until(Instant::now() + Duration::from_secs(10))
+    }
+
+    fn terminate_and_reap_until(&mut self, deadline: Instant) -> bool {
+        // try_wait comes first: a reaped Child's numeric PID/PGID can be reused.
         let child_absent = match self.child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => {
+                let child_pid = self.child.id() as i32;
+                signal_owned_turn_process_group(child_pid, libc::SIGTERM);
                 signal_owned_turn_process_group(child_pid, libc::SIGKILL);
                 let _ = self.child.kill();
-                let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     match self.child.try_wait() {
                         Ok(Some(_)) => break true,
                         Ok(None) if Instant::now() < deadline => {
-                            thread::sleep(Duration::from_millis(25));
+                            thread::sleep(
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(25)),
+                            );
                         }
                         Ok(None) | Err(_) => break false,
                     }
@@ -1687,9 +2025,18 @@ impl LaunchTurn {
     }
 
     fn reap_log_threads(&mut self) -> bool {
-        self.log_threads
-            .drain(..)
-            .all(|thread| thread.join().is_ok())
+        // Each reader is retained until it ends. Join failure is still proof
+        // that this reader has ended; every other reader must also be joined.
+        let mut index = 0;
+        while index < self.log_threads.len() {
+            if self.log_threads[index].is_finished() {
+                let reader = self.log_threads.swap_remove(index);
+                let _ = reader.join();
+            } else {
+                index += 1;
+            }
+        }
+        self.log_threads.is_empty()
     }
 }
 
@@ -2086,8 +2433,16 @@ fn signal_owned_turn_process_group(child_pid: i32, signum: libc::c_int) {
     }
 }
 
+#[cfg(test)]
 async fn wait_for_owned_turn_ports_absent(transport: &VzTransportLaunch) -> (bool, bool) {
-    let deadline = Instant::now() + TURN_PORT_ABSENCE_BUDGET;
+    wait_for_owned_turn_ports_absent_until(transport, Instant::now() + TURN_PORT_ABSENCE_BUDGET)
+        .await
+}
+
+async fn wait_for_owned_turn_ports_absent_until(
+    transport: &VzTransportLaunch,
+    deadline: Instant,
+) -> (bool, bool) {
     loop {
         let listener = turn_listener_port_absent(transport);
         let relays = turn_relay_ports_absent(transport);
@@ -2097,7 +2452,10 @@ async fn wait_for_owned_turn_ports_absent(transport: &VzTransportLaunch) -> (boo
         if Instant::now() >= deadline {
             return (listener, relays);
         }
-        tokio::time::sleep(TURN_PORT_ABSENCE_POLL).await;
+        tokio::time::sleep(
+            TURN_PORT_ABSENCE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
     }
 }
 
@@ -2513,10 +2871,10 @@ fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
     if !write.success() {
         return Err("debugfs write guest Browser control service failed".to_string());
     }
-    eprintln!(
+    emit_stderr_line(&format!(
         "browser-vz-engine-supervisor stage=guest_control_overlay source={}",
         source.display()
-    );
+    ));
     Ok(())
 }
 
@@ -2630,13 +2988,13 @@ fn overlay_guest_webrtc_send_diagnostic(rootfs: &Path) -> Result<(), String> {
     )?;
     overlay_guest_file(rootfs, &gst, GUEST_GSTWEBRTC_APP)?;
     overlay_guest_file(rootfs, &start, GUEST_SELKIES_START)?;
-    eprintln!(
+    emit_stderr_line(&format!(
         "browser-vz-engine-supervisor stage=guest_webrtc_send_overlay gst={} gst_sha256={} start={} start_sha256={}",
         gst.display(),
         gst_hash,
         start.display(),
         start_hash
-    );
+    ));
     Ok(())
 }
 
@@ -3553,7 +3911,9 @@ fn spawn_control_proxy(
             match listener.accept() {
                 Ok((host_stream, _)) => {
                     if let Err(error) = host_stream.set_nonblocking(false) {
-                        eprintln!("Browser VM host control proxy client setup failed: {error}");
+                        emit_stderr_line(&format!(
+                            "Browser VM host control proxy client setup failed: {error}"
+                        ));
                         continue;
                     }
                     let provider = Arc::clone(&provider);
@@ -3589,7 +3949,9 @@ fn spawn_control_proxy(
                                     File::from(fd),
                                     request_timeout,
                                 ) {
-                                    eprintln!("Browser VM host control proxy failed: {error}");
+                                    emit_stderr_line(&format!(
+                                        "Browser VM host control proxy failed: {error}"
+                                    ));
                                 }
                             }
                             Err(error) => {
@@ -3604,20 +3966,62 @@ fn spawn_control_proxy(
                 Err(_) => break,
             }
         }
-        workers.into_iter().all(|worker| worker.join().is_ok())
+        let mut all_joined = true;
+        for worker in workers {
+            // Always join all workers, including after one worker panics.
+            all_joined &= worker.join().is_ok();
+        }
+        all_joined
     }))
 }
 
-fn join_control_proxy_bounded(handle: thread::JoinHandle<bool>, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !handle.is_finished() && Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(25)));
+fn join_control_proxy_until(
+    handle: &mut Option<thread::JoinHandle<bool>>,
+    absence_proved: &mut bool,
+    deadline: Instant,
+) -> bool {
+    if *absence_proved {
+        return true;
     }
-    if !handle.is_finished() {
+    let Some(worker) = handle.as_ref() else {
+        return false;
+    };
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        );
+    }
+    if !worker.is_finished() {
         return false;
     }
-    matches!(handle.join(), Ok(true))
+    *absence_proved = matches!(
+        handle.take().expect("finished owned proxy").join(),
+        Ok(true)
+    );
+    *absence_proved
+}
+
+async fn join_bridge_until(
+    handle: &mut Option<tokio::task::JoinHandle<bool>>,
+    absence_proved: &mut bool,
+    deadline: Instant,
+) -> bool {
+    if *absence_proved {
+        return true;
+    }
+    let Some(worker) = handle.as_mut() else {
+        return false;
+    };
+    match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), worker).await {
+        Ok(result) => {
+            handle.take();
+            *absence_proved = matches!(result, Ok(true));
+            *absence_proved
+        }
+        Err(_) => false,
+    }
 }
 
 fn proxy_http_control_request(
@@ -3625,6 +4029,12 @@ fn proxy_http_control_request(
     mut guest_stream: File,
     request_timeout: Duration,
 ) -> Result<(), String> {
+    host_stream
+        .set_read_timeout(Some(request_timeout))
+        .map_err(|error| error.to_string())?;
+    host_stream
+        .set_write_timeout(Some(request_timeout))
+        .map_err(|error| error.to_string())?;
     set_file_read_timeout(&guest_stream, request_timeout)?;
     set_file_write_timeout(&guest_stream, request_timeout)?;
     let request = read_one_http_request(&mut host_stream)?;
@@ -3827,9 +4237,12 @@ fn spawn_egress_bridge(
                     let session_id = session_id;
                     let trace_egress = env_bool("ELASTOS_BROWSER_VM_TRACE_EGRESS", false);
                     if trace_egress {
-                        eprintln!("Browser VM host egress bridge accepted session {session_id}");
+                        emit_stderr_line(&format!(
+                            "Browser VM host egress bridge accepted session {session_id}"
+                        ));
                     }
                     let host_path = runtime_stream_path.clone();
+                    let worker_shutdown = Arc::clone(&shutdown);
                     workers.push(tokio::task::spawn_blocking(move || {
                         let _session_slot = session_slot;
                         let guest_stream = File::from(fd);
@@ -3840,18 +4253,19 @@ fn spawn_egress_bridge(
                             let (guest_to_runtime, runtime_to_guest) = forward_pair(
                                 DuplexStream::File(guest_stream),
                                 DuplexStream::Unix(runtime_stream),
+                                worker_shutdown,
                             )?;
                             if trace_egress {
-                                eprintln!(
+                                emit_stderr_line(&format!(
                                     "Browser VM host egress bridge session {session_id} guest_to_runtime={guest_to_runtime} runtime_to_guest={runtime_to_guest}"
-                                );
+                                ));
                             }
                             Ok(())
                         })();
                         if let Err(error) = result {
-                            eprintln!(
+                            emit_stderr_line(&format!(
                                 "Browser VM host egress bridge session {session_id} failed: {error}"
-                            );
+                            ));
                         }
                     }));
                 }
@@ -3915,6 +4329,14 @@ impl DuplexStream {
                 .set_read_timeout(Some(timeout))
                 .map_err(|err| err.to_string()),
             Self::File(file) => set_file_read_timeout(file, timeout),
+        }
+    }
+    fn set_write_timeout(&self, timeout: Duration) -> Result<(), String> {
+        match self {
+            Self::Unix(stream) => stream
+                .set_write_timeout(Some(timeout))
+                .map_err(|error| error.to_string()),
+            Self::File(file) => set_file_write_timeout(file, timeout),
         }
     }
 }
@@ -3988,13 +4410,20 @@ impl Write for DuplexStream {
     }
 }
 
-fn forward_pair(left: DuplexStream, right: DuplexStream) -> Result<(u64, u64), String> {
+fn forward_pair(
+    left: DuplexStream,
+    right: DuplexStream,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(u64, u64), String> {
     let mut left_to_right_in = left.try_clone()?;
     let mut right_to_left_out = left;
     let mut right_to_left_in = right.try_clone()?;
     let mut left_to_right_out = right;
     left_to_right_in.set_read_timeout(Duration::from_millis(250))?;
     right_to_left_in.set_read_timeout(Duration::from_millis(250))?;
+    left_to_right_out.set_write_timeout(Duration::from_millis(250))?;
+    right_to_left_out.set_write_timeout(Duration::from_millis(250))?;
+    let shutdown_to_right = Arc::clone(&shutdown);
     let done = Arc::new(AtomicBool::new(false));
     let done_to_right = Arc::clone(&done);
     let to_right = thread::spawn(move || {
@@ -4002,12 +4431,26 @@ fn forward_pair(left: DuplexStream, right: DuplexStream) -> Result<(u64, u64), S
             &mut left_to_right_in,
             &mut left_to_right_out,
             &done_to_right,
+            &shutdown_to_right,
         );
         done_to_right.store(true, Ordering::Relaxed);
-        left_to_right_out.shutdown_write();
+        if shutdown_to_right.load(Ordering::Relaxed) {
+            left_to_right_in.shutdown_both();
+            left_to_right_out.shutdown_both();
+        } else {
+            left_to_right_out.shutdown_write();
+        }
         result
     });
-    let to_left = copy_stream_until_done(&mut right_to_left_in, &mut right_to_left_out, &done);
+    let to_left = copy_stream_until_done(
+        &mut right_to_left_in,
+        &mut right_to_left_out,
+        &done,
+        &shutdown,
+    );
+    if shutdown.load(Ordering::Relaxed) {
+        right_to_left_in.shutdown_both();
+    }
     done.store(true, Ordering::Relaxed);
     right_to_left_out.shutdown_both();
     let to_right = to_right
@@ -4020,17 +4463,38 @@ fn copy_stream_until_done<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     done: &AtomicBool,
+    shutdown: &AtomicBool,
 ) -> Result<u64, String> {
     let mut copied = 0_u64;
     let mut buffer = [0_u8; EGRESS_COPY_BUFFER_BYTES];
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(copied);
+        }
         match reader.read(&mut buffer) {
             Ok(0) => return Ok(copied),
             Ok(read) => {
-                writer
-                    .write_all(&buffer[..read])
-                    .map_err(|err| err.to_string())?;
-                copied = copied.saturating_add(read as u64);
+                let mut offset = 0;
+                while offset < read {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(copied);
+                    }
+                    match writer.write(&buffer[offset..read]) {
+                        Ok(0) => return Err("Browser VM bridge writer closed".to_string()),
+                        Ok(written) => {
+                            offset += written;
+                            copied = copied.saturating_add(written as u64);
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                ErrorKind::WouldBlock
+                                    | ErrorKind::TimedOut
+                                    | ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
             }
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if done.load(Ordering::Relaxed) {
@@ -4132,28 +4596,65 @@ extern "C" fn report_shutdown_signal(
     }
 }
 
-fn install_shutdown_signal_reporter() -> Result<OwnedFd, String> {
+struct ShutdownSignalReporter {
+    read: tokio::io::unix::AsyncFd<OwnedFd>,
+    write: OwnedFd,
+}
+
+impl ShutdownSignalReporter {
+    fn cancellation_requested(&self) -> bool {
+        let mut buf = [0u8; 12];
+        let read = unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if read == 12 {
+            return true;
+        }
+        read >= 0 || std::io::Error::last_os_error().kind() != ErrorKind::WouldBlock
+    }
+}
+
+impl Drop for ShutdownSignalReporter {
+    fn drop(&mut self) {
+        let _ = SHUTDOWN_SIGNAL_WRITE_FD.compare_exchange(
+            self.write.as_raw_fd(),
+            -1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+fn install_shutdown_signal_reporter() -> Result<ShutdownSignalReporter, String> {
     let mut fds = [0 as RawFd; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err("Browser VZ shutdown signal pipe failed".to_string());
     }
-    unsafe {
-        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
+        {
+            return Err("Browser VZ shutdown signal pipe configuration failed".to_string());
+        }
     }
-    SHUTDOWN_SIGNAL_WRITE_FD.store(fds[1], Ordering::SeqCst);
+    let read = tokio::io::unix::AsyncFd::new(read)
+        .map_err(|_| "Browser VZ shutdown signal reader setup failed".to_string())?;
+    let mut installed = true;
     SHUTDOWN_SIGNAL_INSTALL.call_once(|| {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         action.sa_sigaction = report_shutdown_signal as libc::sighandler_t;
         unsafe {
             libc::sigemptyset(&mut action.sa_mask);
-            let _ = libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
-            let _ = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            installed = libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) == 0
+                && libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0;
         }
     });
-    Ok(unsafe { OwnedFd::from_raw_fd(fds[0]) })
+    if !installed {
+        return Err("Browser VZ shutdown signal handler setup failed".to_string());
+    }
+    SHUTDOWN_SIGNAL_WRITE_FD.store(write.as_raw_fd(), Ordering::SeqCst);
+    Ok(ShutdownSignalReporter { read, write })
 }
 
 fn parse_delivered_shutdown_signal(buf: [u8; 12]) -> ShutdownWaitReason {
@@ -4184,28 +4685,8 @@ fn shutdown_signal_sender_comm(sender_pid: u32) -> String {
     }
 }
 
-async fn wait_for_shutdown_signal() -> ShutdownWaitReason {
-    let read_fd = match install_shutdown_signal_reporter() {
-        Ok(fd) => fd,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return ShutdownWaitReason::Signal {
-                signum: libc::SIGINT,
-                sender_pid: 0,
-                si_code: 0,
-            };
-        }
-    };
-    let afd = match tokio::io::unix::AsyncFd::new(read_fd) {
-        Ok(afd) => afd,
-        Err(_) => {
-            return ShutdownWaitReason::Signal {
-                signum: 0,
-                sender_pid: 0,
-                si_code: 0,
-            };
-        }
-    };
+async fn wait_for_shutdown_signal(signals: &ShutdownSignalReporter) -> ShutdownWaitReason {
+    let afd = &signals.read;
     loop {
         let mut ready = match afd.readable().await {
             Ok(ready) => ready,
@@ -4242,6 +4723,7 @@ async fn wait_until_guest_stopped(provider: Arc<VzProvider>, handle: CapsuleHand
 }
 
 async fn wait_for_shutdown_or_transport_expiry(
+    signals: &ShutdownSignalReporter,
     transport: Option<&VzTransportLaunch>,
     provider: Option<Arc<VzProvider>>,
     handle: Option<CapsuleHandle>,
@@ -4258,7 +4740,7 @@ async fn wait_for_shutdown_or_transport_expiry(
     };
     if let (Some(provider), Some(handle)) = (provider, handle) {
         tokio::select! {
-            reason = wait_for_shutdown_signal() => reason,
+            reason = wait_for_shutdown_signal(signals) => reason,
             _ = tokio::time::sleep(Duration::from_millis(remaining)) => {
                 ShutdownWaitReason::TransportExpired {
                     expires_at_unix_ms: expires_at,
@@ -4271,7 +4753,7 @@ async fn wait_for_shutdown_or_transport_expiry(
         }
     } else {
         tokio::select! {
-            reason = wait_for_shutdown_signal() => reason,
+            reason = wait_for_shutdown_signal(signals) => reason,
             _ = tokio::time::sleep(Duration::from_millis(remaining)) => {
                 ShutdownWaitReason::TransportExpired {
                     expires_at_unix_ms: expires_at,
@@ -4689,31 +5171,488 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_join_evidence_rejects_failed_or_unfinished_workers() {
-        assert!(join_control_proxy_bounded(
-            thread::spawn(|| true),
-            Duration::from_secs(1),
+    fn cleanup_join_evidence_retains_unfinished_workers_and_completed_proof() {
+        let mut proved = false;
+        let mut worker = Some(thread::spawn(|| true));
+        assert!(join_control_proxy_until(
+            &mut worker,
+            &mut proved,
+            Instant::now() + Duration::from_secs(1)
         ));
-        assert!(!join_control_proxy_bounded(
-            thread::spawn(|| false),
-            Duration::from_secs(1),
+        assert!(worker.is_none());
+        assert!(join_control_proxy_until(
+            &mut worker,
+            &mut proved,
+            Instant::now()
         ));
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
+        let mut failed_proof = false;
+        let mut failed = Some(thread::spawn(|| false));
+        assert!(!join_control_proxy_until(
+            &mut failed,
+            &mut failed_proof,
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(!join_control_proxy_until(
+            &mut failed,
+            &mut failed_proof,
+            Instant::now()
+        ));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut retained = Some(thread::spawn(move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            finished_tx.send(()).unwrap();
             true
-        });
+        }));
         started_rx.recv().unwrap();
-        assert!(!join_control_proxy_bounded(
-            worker,
-            Duration::from_millis(1),
+        let mut retained_proof = false;
+        assert!(!join_control_proxy_until(
+            &mut retained,
+            &mut retained_proof,
+            Instant::now() + Duration::from_millis(1)
         ));
+        assert!(retained.is_some(), "timeout detached an owned worker");
         release_tx.send(()).unwrap();
-        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(join_control_proxy_until(
+            &mut retained,
+            &mut retained_proof,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    fn cleanup_owner_fixture(root: &Path) -> VzLaunchOwner {
+        let transport = transport_fixture('k');
+        let launch = launch_for_transport(&transport);
+        let paths = LaunchPaths {
+            kernel_path: root.join("kernel"),
+            rootfs_path: root.join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.join("state"),
+            rootfs_cache_dir: root.join("rootfs-cache"),
+            session_dir: root.join("session"),
+            socket_dir: root.join("socket"),
+            control_socket_path: root.join("socket/c.sock"),
+            runtime_stream_path: root.join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        VzLaunchOwner::new(VzLaunchIdentity::from_launch(&launch), paths, transport)
+    }
+
+    #[test]
+    fn native_cleanup_rejects_cached_and_uncertain_vm_states() {
+        assert!(native_vm_absence_proved("Stopped"));
+        for state in [
+            "Running",
+            "Paused",
+            "Starting",
+            "Pausing",
+            "Resuming",
+            "Stopping",
+            "Saving",
+            "Restoring",
+            "Error",
+            "Failed",
+            "Unknown(42)",
+            "absent",
+            "stopped",
+        ] {
+            assert!(
+                !native_vm_absence_proved(state),
+                "accepted uncertain state {state}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_retains_stop_observation_through_timeout_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.vm = true;
+        owner.vm_start_dispatched = true;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        owner.vm_cleanup = Some(tokio::spawn(async move { wait.await.unwrap() }));
+        assert!(
+            !owner
+                .observe_vm_absence(Instant::now() + Duration::from_millis(1))
+                .await
+        );
+        assert!(owner.vm_cleanup.is_some());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            owner.observe_vm_absence(Instant::now() + Duration::from_secs(30))
+        )
+        .await
+        .is_err());
+        assert!(
+            owner.vm_cleanup.is_some(),
+            "cancelled observer lost stop ownership"
+        );
+        release.send("Stopped".to_string()).unwrap();
+        assert!(
+            owner
+                .observe_vm_absence(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(owner.vm_cleanup.is_none());
+        assert!(owner.observe_vm_absence(Instant::now()).await);
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_keeps_nonstopped_observation_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.vm_start_dispatched = true;
+        owner.vm_cleanup = Some(tokio::spawn(async { "Error".to_string() }));
+        assert!(
+            !owner
+                .observe_vm_absence(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(!owner.vm_absence_proved);
+        assert!(
+            !owner.observe_vm_absence(Instant::now()).await,
+            "missing provider was treated as native absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_retains_bridge_until_its_full_join_proof() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut worker = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            true
+        }));
+        let mut proved = false;
+        assert!(
+            !join_bridge_until(
+                &mut worker,
+                &mut proved,
+                Instant::now() + Duration::from_millis(1)
+            )
+            .await
+        );
+        assert!(worker.is_some());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            join_bridge_until(
+                &mut worker,
+                &mut proved,
+                Instant::now() + Duration::from_secs(30)
+            )
+        )
+        .await
+        .is_err());
+        assert!(worker.is_some());
+        release.send(()).unwrap();
+        assert!(
+            join_bridge_until(
+                &mut worker,
+                &mut proved,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+        assert!(join_bridge_until(&mut worker, &mut proved, Instant::now()).await);
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_keeps_disk_leases_and_paths_until_all_writers_end() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.session_directory = true;
+        create_owned_launch_paths(&owner.paths, &owner.transport, &mut owner.acquired_paths)
+            .unwrap();
+        let profile_path = root.path().join("profile.ext4");
+        fs::write(&profile_path, b"preserved profile bytes").unwrap();
+        let profile_identity = fs::metadata(&profile_path).unwrap();
+        let rootfs_path = owner.paths.rootfs_path.clone();
+        fs::write(&rootfs_path, b"rootfs bytes").unwrap();
+        owner.profile_disk = Some(PreparedBrowserProfileDisk {
+            profile_key: "profile-test".to_string(),
+            path: profile_path.clone(),
+            initialize: false,
+            _lock: LifetimeFileLock::acquire_disk_sidecar(&profile_path, "test profile").unwrap(),
+        });
+        owner.launch_rootfs = Some(PreparedLaunchRootfs {
+            path: rootfs_path.clone(),
+            _lock: Some(
+                LifetimeFileLock::acquire_disk_sidecar(&rootfs_path, "test rootfs").unwrap(),
+            ),
+        });
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        owner.control_proxy_spawned = true;
+        owner.control_proxy = Some(thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            true
+        }));
+        started_rx.recv().unwrap();
+        let pending = owner
+            .cleanup_until(Instant::now() + Duration::from_millis(1))
+            .await;
+        assert!(!absence_is_complete(&pending));
+        assert!(owner.control_proxy.is_some());
+        assert!(owner.profile_disk.is_some() && owner.launch_rootfs.is_some());
+        assert!(owner.paths.session_dir.exists() && owner.paths.socket_dir.exists());
+        assert!(
+            LifetimeFileLock::acquire_disk_sidecar(&profile_path, "other profile writer").is_err()
+        );
+        assert!(
+            LifetimeFileLock::acquire_disk_sidecar(&rootfs_path, "other rootfs writer").is_err()
+        );
+        let pending_receipt: Value =
+            serde_json::from_str(&owner.settlement_with_absence("stop", pending)).unwrap();
+        release_tx.send(()).unwrap();
+        let terminal = owner
+            .cleanup_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(absence_is_complete(&terminal), "{terminal}");
+        let terminal_receipt: Value =
+            serde_json::from_str(&owner.settlement_with_absence("stop", terminal)).unwrap();
+        for key in [
+            "binding_hash",
+            "generation",
+            "page_id",
+            "vm_id",
+            "stream_id",
+            "media_stream_id",
+            "effects",
+        ] {
+            assert_eq!(pending_receipt[key], terminal_receipt[key]);
+        }
+        assert_eq!(pending_receipt["state"], "cleanup_pending");
+        assert_eq!(terminal_receipt["state"], "terminal_post_effect_cleanup");
+        assert!(owner.profile_disk.is_none() && owner.launch_rootfs.is_none());
+        assert!(!owner.paths.session_dir.exists() && !owner.paths.socket_dir.exists());
+        assert!(
+            LifetimeFileLock::acquire_disk_sidecar(&profile_path, "next profile writer").is_ok()
+        );
+        assert!(LifetimeFileLock::acquire_disk_sidecar(&rootfs_path, "next rootfs writer").is_ok());
+        assert_eq!(fs::read(&profile_path).unwrap(), b"preserved profile bytes");
+        assert_eq!(
+            fs::metadata(&profile_path).unwrap().ino(),
+            profile_identity.ino()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_retains_object_retirement_through_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.vm_start_dispatched = true;
+        owner.vm_terminal_observed = true; // Error permits retirement, not absence.
+        let (release, wait) = tokio::sync::oneshot::channel();
+        owner.vm_release = Some(tokio::spawn(async move { wait.await.unwrap() }));
+        assert!(
+            !owner
+                .observe_vm_release(Instant::now() + Duration::from_millis(1))
+                .await
+        );
+        assert!(owner.vm_release.is_some() && !owner.vm_release_proved);
+        release.send(true).unwrap();
+        assert!(
+            owner
+                .observe_vm_release(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(owner.vm_release_proved);
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_drains_cancelled_startup_without_certifying_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        owner.startup = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            Ok(StartupValue::Unit)
+        }));
+        let pending = owner
+            .cleanup_until(Instant::now() + Duration::from_millis(1))
+            .await;
+        assert!(owner.startup.is_some());
+        assert_eq!(pending["child_absent"], false);
+        assert_eq!(pending["vm_absent"], false);
+        release.send(()).unwrap();
+        let terminal = owner
+            .cleanup_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(absence_is_complete(&terminal));
+        assert!(owner.startup.is_none());
+    }
+
+    fn local_shutdown_signal_reporter() -> ShutdownSignalReporter {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
+                0
+            );
+        }
+        ShutdownSignalReporter {
+            read: tokio::io::unix::AsyncFd::new(unsafe { OwnedFd::from_raw_fd(fds[0]) }).unwrap(),
+            write: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+        }
+    }
+
+    fn deliver_fixture_shutdown_signal(write_fd: RawFd) {
+        let mut signal = [0u8; 12];
+        signal[..4].copy_from_slice(&libc::SIGTERM.to_ne_bytes());
+        assert_eq!(
+            unsafe { libc::write(write_fd, signal.as_ptr().cast(), signal.len()) },
+            12
+        );
+    }
+
+    #[tokio::test]
+    async fn native_startup_cancellation_checkpoint_prevents_later_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        let signals = local_shutdown_signal_reporter();
+        deliver_fixture_shutdown_signal(signals.write.as_raw_fd());
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatched_by_task = dispatched.clone();
+        assert!(owner
+            .startup_operation(&signals, async move {
+                dispatched_by_task.store(true, Ordering::SeqCst);
+                Ok(StartupValue::Unit)
+            })
+            .await
+            .is_err());
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(owner.startup.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_startup_cancellation_retains_inflight_operation_until_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        let signals = local_shutdown_signal_reporter();
+        let write_fd = signals.write.as_raw_fd();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let signaler = tokio::spawn(async move {
+            started_rx.await.unwrap();
+            deliver_fixture_shutdown_signal(write_fd);
+        });
+        assert!(owner
+            .startup_operation(&signals, async move {
+                started_tx.send(()).unwrap();
+                wait.await.unwrap();
+                Ok(StartupValue::Unit)
+            })
+            .await
+            .is_err());
+        signaler.await.unwrap();
+        assert!(owner.startup.is_some());
+        assert!(!owner.drain_startup(Instant::now()).await);
+        release.send(()).unwrap();
+        assert!(
+            owner
+                .drain_startup(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(owner.startup.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_keeps_panicked_startup_indeterminate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.startup = Some(tokio::spawn(async { panic!("injected startup fault") }));
+        assert!(
+            !owner
+                .drain_startup(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(owner.startup_indeterminate);
+        assert!(!absence_is_complete(
+            &owner.cleanup_until(Instant::now()).await
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_start_reaped_child_still_proves_owned_ports() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let relay = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        drop(relay);
+        owner.transport.authority["turn"]["listen_host"] = json!("127.0.0.1");
+        owner.transport.authority["turn"]["listen_port"] =
+            json!(listener.local_addr().unwrap().port());
+        owner.transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        owner.transport.authority["turn"]["relay_port_min"] = json!(relay_port);
+        owner.transport.authority["turn"]["relay_port_max"] = json!(relay_port);
+        owner
+            .transport
+            .authority
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_hash");
+        owner.transport.authority["binding_hash"] = json!(sha256_label(
+            &canonical_json_bytes(&owner.transport.authority).unwrap()
+        ));
+        owner.transport.secret["binding_hash"] = owner.transport.authority["binding_hash"].clone();
+        owner.identity = VzLaunchIdentity::from_launch(&launch_for_transport(&owner.transport));
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let error = LaunchTurn {
+            child,
+            config_path: root.path().join("retired.conf"),
+            log_threads: vec![],
+        }
+        .fail_after_spawn("after real spawn".to_string());
+        assert!(error.spawned && error.child_absent && error.retained_turn.is_none());
+        owner.turn_process = true;
+        owner.turn_ports_may_be_owned = error.spawned;
+        owner.turn_cleanup = TurnCleanupEvidence::AbsenceProved;
+        let pending = owner.cleanup_until(Instant::now()).await;
+        assert_eq!(pending["turn_listener_absent"], false);
+        assert!(!absence_is_complete(&pending));
+        drop(listener);
+        assert!(absence_is_complete(
+            &owner
+                .cleanup_until(Instant::now() + Duration::from_secs(1))
+                .await
+        ));
+        let before_spawn = LaunchTurnStartError::from("before spawn".to_string());
+        assert!(!before_spawn.spawned && before_spawn.child_absent);
+    }
+
+    #[test]
+    fn failed_turn_start_retains_its_unfinished_log_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let config_path = root.path().join("turn.conf");
+        fs::write(&config_path, b"fixture").unwrap();
+        let turn = LaunchTurn {
+            child,
+            config_path,
+            log_threads: vec![thread::spawn(move || {
+                release_rx.recv().unwrap();
+            })],
+        };
+        let error = turn.fail_after_spawn("after spawn".to_string());
+        assert!(!error.child_absent);
+        let mut retained = error
+            .retained_turn
+            .expect("failed start detached log reader");
+        assert_eq!(retained.log_threads.len(), 1);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !retained.terminate_and_reap_until(deadline) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(retained.log_threads.is_empty());
+        assert!(retained.terminate_and_reap_until(deadline));
     }
 
     #[test]
@@ -4767,11 +5706,46 @@ mod tests {
         // branch sleeps u64::MAX. Expire the transport instead.
         let mut transport = transport_fixture('w');
         transport.authority["expires_at_unix_ms"] = json!(current_unix_millis().unwrap() + 50);
-        let outcome = wait_for_shutdown_or_transport_expiry(Some(&transport), None, None).await;
+        let signals = install_shutdown_signal_reporter().unwrap();
+        let outcome =
+            wait_for_shutdown_or_transport_expiry(&signals, Some(&transport), None, None).await;
         assert!(
             matches!(outcome, ShutdownWaitReason::TransportExpired { .. }),
             "shutdown wait invented a signal: {outcome:?}"
         );
+        // The select cancelled only a borrowed wait. Cleanup still owns the
+        // pipe; repeated cooperative signals cannot hit a closed reader.
+        for fd in [signals.read.as_raw_fd(), signals.write.as_raw_fd()] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+                0
+            );
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        let mut delivered = [0u8; 12];
+        delivered[..4].copy_from_slice(&libc::SIGTERM.to_ne_bytes());
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    signals.write.as_raw_fd(),
+                    delivered.as_ptr().cast(),
+                    delivered.len(),
+                )
+            },
+            12
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown_signal(&signals))
+                .await
+                .unwrap(),
+            ShutdownWaitReason::Signal {
+                signum: libc::SIGTERM,
+                ..
+            }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5400,6 +6374,103 @@ mod tests {
     }
 
     #[test]
+    fn bridge_shutdown_joins_idle_peers_without_guest_eof() {
+        let (mut guest_client, guest_bridge) = UnixStream::pair().unwrap();
+        let (mut runtime_client, runtime_bridge) = UnixStream::pair().unwrap();
+        runtime_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = forward_pair(
+                DuplexStream::Unix(guest_bridge),
+                DuplexStream::Unix(runtime_bridge),
+                worker_shutdown,
+            );
+            finished_tx.send(()).unwrap();
+            result
+        });
+        guest_client.write_all(b"x").unwrap();
+        let mut forwarded = [0];
+        runtime_client.read_exact(&mut forwarded).unwrap();
+        assert_eq!(forwarded, *b"x");
+        // Both peer sockets stay open: only launch shutdown permits retirement.
+        shutdown.store(true, Ordering::Relaxed);
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn bridge_shutdown_joins_backpressured_write_without_guest_eof() {
+        let (mut guest_client, guest_bridge) = UnixStream::pair().unwrap();
+        let (runtime_client, runtime_bridge) = UnixStream::pair().unwrap();
+        let buffer_bytes: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    runtime_bridge.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&buffer_bytes as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&buffer_bytes) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = forward_pair(
+                DuplexStream::Unix(guest_bridge),
+                DuplexStream::Unix(runtime_bridge),
+                worker_shutdown,
+            );
+            finished_tx.send(()).unwrap();
+            result
+        });
+        let (producer_tx, producer_rx) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            let _ = guest_client.write_all(&vec![7; 4 * 1024 * 1024]);
+            producer_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut backpressured = false;
+        while Instant::now() < deadline {
+            let mut queued: libc::c_int = 0;
+            if unsafe { libc::ioctl(runtime_client.as_raw_fd(), libc::FIONREAD, &mut queued) } == 0
+                && queued >= buffer_bytes
+                && !producer.is_finished()
+            {
+                backpressured = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        producer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        producer.join().unwrap();
+        assert!(
+            backpressured,
+            "fixture did not reach a blocked bridge write"
+        );
+    }
+
+    #[test]
+    fn control_proxy_bounds_silent_host_request_by_existing_timeout() {
+        let (_host_client, host_proxy) = UnixStream::pair().unwrap();
+        let (_guest_peer, guest_proxy) = UnixStream::pair().unwrap();
+        let guest = unsafe { File::from_raw_fd(guest_proxy.into_raw_fd()) };
+        let started = Instant::now();
+        assert!(proxy_http_control_request(host_proxy, guest, Duration::from_millis(50)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn bridge_propagates_runtime_eof_to_guest_and_exits() {
         let (mut guest_client, guest_bridge) = UnixStream::pair().unwrap();
         let (runtime_bridge, mut runtime_client) = UnixStream::pair().unwrap();
@@ -5412,6 +6483,7 @@ mod tests {
             let result = forward_pair(
                 DuplexStream::Unix(guest_bridge),
                 DuplexStream::Unix(runtime_bridge),
+                Arc::new(AtomicBool::new(false)),
             );
             done_tx.send(()).unwrap();
             result
