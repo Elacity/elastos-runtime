@@ -888,6 +888,29 @@ show_ready() {
 
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
+prepare_browser_linux_host() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user
+    [[ -f "$helper" ]] || return 0
+    if [[ ! -e /dev/kvm ]]; then
+        info "Browser virtualization is unavailable: this host has no /dev/kvm device."
+        return 0
+    fi
+    user="$(id -un)"
+    if /usr/bin/python3 -I "$helper" check >/dev/null 2>&1; then
+        info "Browser KVM and network access are ready."
+    elif ( : </dev/tty ) 2>/dev/null && command -v sudo >/dev/null 2>&1; then
+        info "Browser needs one-time administrator setup for KVM access and its private network devices."
+        info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
+        sudo /usr/bin/python3 -I "$helper" setup --user "$user" </dev/tty || return $?
+    else
+        info "Browser needs one-time administrator setup. Run from a terminal:"
+        printf '  sudo /usr/bin/python3 -I %q setup --user %q\n' "$helper" "$user"
+    fi
+    info "To remove Browser host access after closing Browser:"
+    printf '  sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user %q\n' "$user"
+}
+
 finish_install() {
     local runtime_bin="${INSTALL_DIR}/elastos"
     if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
@@ -897,6 +920,7 @@ finish_install() {
     step 5 "Set up Home"
     info "Setting up Home..."
     "$runtime_bin" setup </dev/null || return $?
+    prepare_browser_linux_host || return $?
     show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."

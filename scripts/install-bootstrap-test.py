@@ -1141,6 +1141,47 @@ class InstallationTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
+    def test_browser_host_step_is_installer_only_and_handles_decline_or_unavailable_host(self):
+        function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
+        function = "prepare_browser_linux_host() {" + function
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'scripts').mkdir()
+            (root / 'scripts/browser-vm-linux-network.py').write_text('inert signed-helper fixture')
+            device, terminal = root / 'kvm', root / 'terminal'
+            function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
+            function = function.replace('/usr/bin/python3', 'fixture_python')
+            script = function + '''
+DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
+uname() { printf '%s\\n' "$SYSTEM"; }
+fixture_python() { [[ "$READY" == yes ]]; }
+sudo() { printf 'ROOT_STEP:%s\\n' "$*"; return "$ROOT_RESULT"; }
+prepare_browser_linux_host
+'''
+            for case, system, ready, device_present, terminal_present, root_result in [
+                ('mac', 'Darwin', 'no', True, True, 0),
+                ('unavailable', 'Linux', 'no', False, True, 0),
+                ('ready', 'Linux', 'yes', True, True, 0),
+                ('headless', 'Linux', 'no', True, False, 0),
+                ('setup', 'Linux', 'no', True, True, 0),
+                ('declined', 'Linux', 'no', True, True, 1),
+            ]:
+                for path, present in [(device, device_present), (terminal, terminal_present)]:
+                    path.unlink(missing_ok=True)
+                    if present:
+                        path.touch()
+                result = shell(script, root, system, ready, root_result)
+                with self.subTest(case=case):
+                    self.assertEqual(result.returncode, root_result if case == 'declined' else 0, result.stderr)
+                    self.assertEqual('ROOT_STEP:' in result.stdout, case in ('setup', 'declined'))
+                    if case == 'setup':
+                        self.assertIn('setup --user ', result.stdout)
+                        self.assertIn('remove --user ', result.stdout)
+                    if case == 'headless':
+                        self.assertIn('Run from a terminal', result.stdout)
+                    if case == 'unavailable':
+                        self.assertIn('virtualization is unavailable', result.stdout)
+
     def test_three_platform_release_keys(self):
         for system, machine, expected in [("Linux", "x86_64", "x86_64-linux"),
                                           ("Linux", "aarch64", "aarch64-linux"),
