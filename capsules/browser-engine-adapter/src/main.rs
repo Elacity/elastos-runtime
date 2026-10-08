@@ -33,10 +33,7 @@ use supervisor::*;
 use transport::*;
 use validation::*;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA: &str =
     "elastos.browser.engine.launch-reconciliation/v1";
 const BROWSER_ENGINE_RECONCILIATION_TIMEOUT: std::time::Duration =
@@ -2470,16 +2467,11 @@ enum AdapterKind {
     ContractProof,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AdapterNetworkMode {
+    #[default]
     RuntimeNetOnly,
-}
-
-impl Default for AdapterNetworkMode {
-    fn default() -> Self {
-        Self::RuntimeNetOnly
-    }
 }
 
 #[derive(Debug, Deserialize)]

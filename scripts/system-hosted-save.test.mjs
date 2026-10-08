@@ -210,3 +210,452 @@ test("hosted handoff replaces the previous selection with the exact requested of
   vm.runInContext('applyLaunchQuery({ offer_id: "model:unavailable" });', context);
   assert.equal(selected, "model:unavailable");
 });
+
+const updateFunctions = source.slice(source.indexOf("function configureRuntimeUpdate() {"), source.indexOf("function readQueryParam("));
+const settleUpdateTasks = () => new Promise(resolve => setImmediate(resolve));
+
+function updateFixture(overrides = {}) {
+  const fields = new Map(), hiddenFields = new Map(), timers = new Map(), listeners = new Map();
+  const posts = [], approvals = [];
+  let timerId = 0, now = 0;
+  const button = { hidden: true, disabled: true, addEventListener(type, handler) { this[type] = handler; } };
+  const panel = { hidden: true }, status = { textContent: "" }, top = {};
+  const context = vm.createContext({
+    AbortController,
+    runtimeUpdateNode: panel, runtimeUpdateButton: button, runtimeUpdateStatusNode: status,
+    runtimeUpdate: undefined, runtimeUpdatePending: null, runtimeUpdateBusy: false,
+    runtimeUpdateActive: true, runtimeUpdateTimer: 0, runtimeUpdateReconnects: 0,
+    runtimeUpdateRequests: new Set(),
+    systemSummaryInFlight: null, homeParentOrigin: "https://home.example",
+    document: { hidden: false, addEventListener: (type, handler) => listeners.set(`document:${type}`, handler) },
+    window: {
+      top, crypto: { randomUUID },
+      addEventListener: (type, handler) => listeners.set(type, handler),
+      setTimeout: (handler, delay) => { timers.set(++timerId, { handler, delay, due: now + delay }); return timerId; },
+      clearTimeout: id => timers.delete(id),
+    },
+    readText: value => typeof value === "string" ? value.trim() : "",
+    setTextFields: (field, value) => fields.set(field, value),
+    setHiddenFields: (field, value) => hiddenFields.set(field, value),
+    shellHeaders: extra => ({ "x-elastos-home-token": "system-token", ...extra }),
+    requestPasskeyStepUp: async (operation, intent) => { approvals.push({ operation, intent: JSON.parse(JSON.stringify(intent)) }); return "approved-exact-choice"; },
+    fetchJson: async (url, init) => {
+      posts.push({ url, ...init });
+      return init.method === "POST" ? { id: JSON.parse(init.body).request_id, phase: "queued" } : {};
+    },
+    refreshSystemSummary: async () => {},
+    ...overrides,
+  });
+  vm.runInContext(updateFunctions, context);
+  const offer = {
+    configured: true, available: true, can_apply: true, source_name: "publisher",
+    channel: "stable", publisher: "did:key:verified", publisher_did: "did:key:verified",
+    current_version: "1.0.0", new_version: "1.1.0", head_cid: "head-exact", release_cid: "release-exact",
+    changes: ["A signed change.", "Another signed change."], controller: { phase: "ready", id: null },
+  };
+  context.configureRuntimeUpdate();
+  context.renderRuntimeUpdate(offer);
+  const advance = async ms => {
+    const target = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, timer]) => timer.due <= target).sort((a, b) => a[1].due - b[1].due)[0];
+      if (!next) break;
+      timers.delete(next[0]);
+      now = next[1].due;
+      await next[1].handler();
+      await Promise.resolve();
+    }
+    now = target;
+  };
+  return { context, offer, button, panel, status, fields, hiddenFields, timers, listeners, posts, approvals, top, advance };
+}
+
+test("Home update requires a verified complete offer and a controller that can apply", () => {
+  const f = updateFixture();
+  assert.equal(f.button.hidden, false);
+  assert.equal(f.fields.get("update-current-version"), "1.0.0");
+  assert.equal(f.fields.get("update-new-version"), "1.1.0");
+  assert.equal(f.fields.get("update-publisher"), "did:key:verified");
+  assert.equal(f.fields.get("update-changes"), "A signed change.\nAnother signed change.");
+  for (const refusal of [null, { configured: false }, { available: false }, { can_apply: false },
+    { configured: "true" }, { publisher_did: "" }, { release_cid: "" }, { controller: null }, { controller: { phase: "restarting" } }]) {
+    f.context.renderRuntimeUpdate(refusal === null ? null : { ...f.offer, ...refusal });
+    assert.equal(f.button.hidden, true, JSON.stringify(refusal));
+    assert.equal(f.button.disabled, true);
+  }
+  for (const phase of ["ready", "updated", "restored", "failed"]) {
+    f.context.renderRuntimeUpdate({ ...f.offer, controller: { phase } });
+    assert.equal(f.button.hidden, false, phase);
+  }
+  f.context.renderRuntimeUpdate({ ...f.offer, changes: [] });
+  assert.equal(f.fields.get("update-changes"), "Publisher has not supplied change notes.");
+  f.context.renderRuntimeUpdate({ ...f.offer, available: false, message: "Home is up to date." });
+  assert.equal(f.hiddenFields.get("update-changes"), true);
+  assert.equal(f.status.textContent, "Home is up to date.");
+  f.context.renderRuntimeUpdate({ configured: true, available: false, can_apply: false,
+    controller: { phase: "restarting", current_version: "1.0.0", new_version: "1.1.0" } });
+  assert.equal(f.hiddenFields.get("update-offer"), false, "reopened System keeps durable progress versions");
+  assert.equal(f.fields.get("update-current-version"), "1.0.0");
+  assert.equal(f.fields.get("update-new-version"), "1.1.0");
+  assert.equal(f.hiddenFields.get("update-publisher-row"), true, "progress does not invent a publisher");
+  f.context.renderRuntimeUpdate(null);
+  assert.equal(f.timers.size, 0, "source Home without an installed controller has no update polling");
+});
+
+test("guest System summary keeps update controls and discovery polling hidden", async () => {
+  const f = updateFixture();
+  f.context.renderRuntimeUpdate(null);
+  assert.equal(f.panel.hidden, true);
+  assert.equal(f.button.hidden, true);
+  assert.equal(f.button.disabled, true);
+  await f.context.onRuntimeUpdateApply();
+  await f.advance(60_000);
+  assert.equal(f.approvals.length, 0);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test("Home update freezes one exact passkey intent and retries a lost response with identical bytes", async () => {
+  let approve;
+  let attempt = 0;
+  const f = updateFixture({ requestPasskeyStepUp: (operation, intent) => {
+    f.approvals.push({ operation, intent: JSON.parse(JSON.stringify(intent)) });
+    return new Promise(resolve => { approve = resolve; });
+  } });
+  f.context.fetchJson = async (url, init) => {
+    f.posts.push({ url, ...init });
+    if (++attempt === 1) throw new TypeError("response lost");
+    return { id: JSON.parse(init.body).request_id, phase: "queued" };
+  };
+  const apply = f.context.onRuntimeUpdateApply();
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.approvals.length, 1);
+  assert.equal(f.posts.length, 0, "approval precedes mutation");
+  assert.equal(f.button.disabled, true);
+  f.context.renderRuntimeUpdate({ ...f.offer, new_version: "1.2.0", release_cid: "later-release" });
+  approve("approved-exact-choice");
+  await apply;
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[0].url, "/api/apps/system/summary");
+  assert.equal(f.posts[0].method, "POST");
+  assert.equal(f.posts[0].body, f.posts[1].body);
+  assert.equal(f.approvals[0].operation, "system.update.apply");
+  const intent = f.approvals[0].intent;
+  assert.match(intent.request_id, /^[a-f0-9]{32}$/);
+  assert.deepEqual(Object.keys(intent).sort(), ["action", "request_id", "source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"].sort());
+  assert.deepEqual(JSON.parse(f.posts[0].body), { ...intent, step_up_token: "approved-exact-choice" });
+  assert.equal(intent.release_cid, "release-exact");
+  assert.equal(intent.new_version, "1.1.0");
+  assert.equal(f.fields.get("update-new-version"), "1.1.0", "progress retains the approved choice");
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.approvals.length, 1, "queued choice has one action");
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { phase: "updated", id: "another-choice", message: "Other result" } });
+  assert(f.context.runtimeUpdatePending, "another request result cannot retire this choice");
+  f.context.renderRuntimeUpdate({ ...f.offer, available: false, controller: { phase: "updated", id: intent.request_id, message: "Home is up to date." } });
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.status.textContent, "Home is up to date.");
+});
+
+test("Home update keeps an ambiguous submission pending and stops bounded progress recovery", async () => {
+  for (const status of [undefined, 503]) {
+    const f = updateFixture();
+    const bodies = [];
+    f.context.fetchJson = async (_url, init) => {
+      bodies.push(init.body);
+      const error = new TypeError("connection closed"); error.status = status; throw error;
+    };
+    await f.context.onRuntimeUpdateApply();
+    assert(f.context.runtimeUpdatePending);
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0], bodies[1]);
+    assert.equal(f.button.disabled, true);
+    assert.match(f.status.textContent, /Waiting for Home to confirm/);
+    assert(!f.status.textContent.includes("restarting"));
+    f.context.systemSummaryInFlight = Promise.resolve();
+    const polls = f.context.runtimeUpdatePending.polls;
+    await f.context.pollRuntimeUpdate();
+    assert.equal(f.context.runtimeUpdatePending.polls, polls, "overlapping refresh does not consume recovery attempts");
+    f.context.systemSummaryInFlight = null;
+    f.context.runtimeUpdatePending.polls = 89;
+    const before = f.timers.size;
+    await f.context.pollRuntimeUpdate();
+    assert.equal(f.timers.size, before, "exhausted recovery adds no timer");
+    assert.match(f.status.textContent, /has not confirmed/);
+    assert.match(f.status.textContent, /Open System from Home again/);
+  }
+});
+
+test("Home update cancellation and definitive refusal each allow a fresh approved choice", async () => {
+  const f = updateFixture({ requestPasskeyStepUp: async () => { throw new Error("passkey cancelled"); } });
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.context.runtimeUpdatePending, null);
+  f.context.requestPasskeyStepUp = async (operation, intent) => { f.approvals.push({ operation, intent }); return "approved"; };
+  f.context.fetchJson = async () => { const error = new Error("private failure detail"); error.status = 409; throw error; };
+  await f.context.onRuntimeUpdateApply();
+  const first = f.approvals[0].intent.request_id;
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert(!f.status.textContent.includes("private"));
+  await f.context.onRuntimeUpdateApply();
+  assert.notEqual(f.approvals[1].intent.request_id, first);
+});
+
+test("slow Carrier admission stays neutral beyond thirty seconds and can still refuse the choice", async () => {
+  const f = updateFixture();
+  let refuse;
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise((_resolve, reject) => { refuse = reject; });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await Promise.resolve();
+  await f.advance(35_000);
+  assert.equal(f.posts.length, 1, "slow admission retains one submission");
+  assert.equal(f.posts[0].signal.aborted, false);
+  assert([...f.timers.values()].some(timer => timer.delay === 60_000));
+  assert.equal(f.context.runtimeUpdatePending.dispatched, false);
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id: "another-request", phase: "restarting" } });
+  assert.match(f.status.textContent, /Checking the update with Home/);
+  assert(!f.status.textContent.includes("restarting"), "another controller request cannot prove this restart");
+  const error = new Error("signed choice refused"); error.status = 409;
+  refuse(error);
+  await applying;
+  assert.equal(f.posts.length, 1, "a definite refusal does not replay");
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.context.runtimeUpdateRequests.size, 0);
+  assert.match(f.status.textContent, /could not start/);
+  assert.equal(f.button.disabled, true, "the other active request controls action availability");
+});
+
+test("matching queue confirmation and controller state prove progress after slow admission", async () => {
+  const f = updateFixture();
+  let confirm;
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise(resolve => { confirm = resolve; });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await Promise.resolve();
+  await f.advance(35_000);
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  confirm({ id, phase: "queued" });
+  await applying;
+  assert.equal(f.context.runtimeUpdatePending.dispatched, true);
+  assert.match(f.status.textContent, /update is queued/);
+  assert(!f.status.textContent.includes("restarting"));
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "staging" } });
+  assert.match(f.status.textContent, /Checking the signed update/);
+  f.context.refreshSystemSummary = async () => { throw new TypeError("response lost"); };
+  await f.context.pollRuntimeUpdate();
+  assert.match(f.status.textContent, /report update progress/);
+  assert(!f.status.textContent.includes("restarting"));
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "restarting" } });
+  assert.match(f.status.textContent, /Home is restarting/);
+  await f.context.pollRuntimeUpdate();
+  assert.match(f.status.textContent, /Home is restarting/);
+});
+
+test("only a matching queue reply confirms dispatch and an ambiguous deadline preserves the exact retry", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = async (_url, init) => {
+    f.posts.push(init);
+    return { id: "unrelated-request", phase: "queued" };
+  };
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[0].body, f.posts[1].body);
+  assert.equal(f.context.runtimeUpdatePending.dispatched, false);
+  assert.match(f.status.textContent, /Waiting for Home to confirm/);
+  const g = updateFixture();
+  g.context.fetchJson = (_url, init) => {
+    g.posts.push(init);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("admission deadline")));
+    });
+  };
+  const applying = g.context.onRuntimeUpdateApply();
+  await settleUpdateTasks();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const deadline = [...g.timers.values()].find(timer => timer.delay === 60_000);
+    assert(deadline, "each exact submission has a sixty-second deadline");
+    deadline.handler();
+    await settleUpdateTasks();
+  }
+  await applying;
+  assert.equal(g.posts.length, 2);
+  assert.equal(g.posts[0].body, g.posts[1].body);
+  assert.equal(g.approvals.length, 1);
+  assert.equal(g.context.runtimeUpdateRequests.size, 0);
+  assert.equal(g.context.runtimeUpdatePending.dispatched, false);
+  assert.match(g.status.textContent, /Waiting for Home to confirm/);
+});
+
+test("closing System aborts its owned submission and summary requests without a replay", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = (_url, init) => {
+    f.posts.push(init);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("document closed")));
+    });
+  };
+  const applying = f.context.onRuntimeUpdateApply();
+  await settleUpdateTasks();
+  const reading = f.context.fetchRuntimeUpdateJson({ headers: {} });
+  const readClosed = assert.rejects(reading, /document closed/);
+  assert.equal(f.context.runtimeUpdateRequests.size, 2);
+  f.listeners.get("pagehide")();
+  await Promise.all([applying, readClosed]);
+  assert.equal(f.posts.length, 2, "one POST and one GET stop with their document");
+  assert(f.posts.every(request => request.signal.aborted));
+  assert.equal(f.context.runtimeUpdateRequests.size, 0);
+  assert.equal(f.timers.size, 0, "request deadlines and polling timers are released");
+  await f.context.pollRuntimeUpdate();
+  assert.equal(f.posts.length, 2, "a stale poll cannot restart a closed document");
+  const g = updateFixture({ requestPasskeyStepUp: () => new Promise(resolve => { g.approve = resolve; }) });
+  const approving = g.context.onRuntimeUpdateApply();
+  g.listeners.get("pagehide")();
+  g.approve("approved");
+  await approving;
+  assert.equal(g.posts.length, 0, "late passkey approval cannot submit after page close");
+});
+
+test("Home update polling binds host messages, stops at auth refusal, and closes with its document", async () => {
+  const f = updateFixture();
+  const message = { type: "elastos:runtime-events", schema: "elastos.home.runtime-events/v1", events: [] };
+  const timer = f.context.runtimeUpdateTimer;
+  f.listeners.get("message")({ source: {}, origin: "https://home.example", data: message });
+  assert.equal(f.context.runtimeUpdateTimer, timer);
+  f.listeners.get("message")({ source: f.top, origin: "https://foreign.example", data: message });
+  assert.equal(f.context.runtimeUpdateTimer, timer);
+  f.listeners.get("message")({ source: f.top, origin: "https://home.example", data: message });
+  assert.equal(f.timers.get(f.context.runtimeUpdateTimer).delay, 0);
+  f.context.renderRuntimeUpdate({ ...f.offer, can_apply: false, controller: { phase: "restarting" } });
+  assert.equal(f.timers.get(f.context.runtimeUpdateTimer).delay, 2000);
+  f.context.refreshSystemSummary = async () => { const error = new Error("expired"); error.status = 403; throw error; };
+  f.timers.clear();
+  await f.context.pollRuntimeUpdate();
+  assert.equal(f.timers.size, 0);
+  assert.match(f.status.textContent, /access has changed/);
+  assert.equal(f.button.hidden, true);
+  f.listeners.get("pagehide")();
+  f.context.scheduleRuntimeUpdateRefresh();
+  assert.equal(f.timers.size, 0);
+});
+
+test("Home update summary refreshes share one bounded request", async () => {
+  const f = updateFixture();
+  let finish, reads = 0;
+  f.context.fetchJson = () => { reads++; return new Promise(resolve => { finish = resolve; }); };
+  f.context.renderSystemSummary = value => { f.context.renderRuntimeUpdate(value.runtime_update); };
+  const refresh = source.slice(source.indexOf("async function refreshSystemSummary() {"), source.indexOf("async function fetchJson("));
+  vm.runInContext(refresh, f.context);
+  const first = f.context.refreshSystemSummary();
+  const second = f.context.refreshSystemSummary();
+  assert.equal(reads, 1);
+  assert([...f.timers.values()].some(timer => timer.delay === 10_000));
+  finish({ runtime_update: f.offer });
+  await Promise.all([first, second]);
+  assert.equal(f.context.systemSummaryInFlight, null);
+  assert(![...f.timers.values()].some(timer => timer.delay === 10_000));
+  f.context.fetchJson = (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new Error("request deadline")));
+  });
+  const hung = f.context.refreshSystemSummary();
+  const deadline = [...f.timers.values()].find(timer => timer.delay === 10_000);
+  deadline.handler();
+  await assert.rejects(hung, /request deadline/);
+  assert.equal(f.context.systemSummaryInFlight, null, "timed-out request releases the next refresh");
+  assert(![...f.timers.values()].some(timer => timer.delay === 10_000));
+});
+
+test("System startup and recovery stay ready while the background Carrier check is pending or offline", async () => {
+  const boot = source.slice(source.indexOf("async function boot() {"), source.indexOf("function configureHomeRecoverySave() {"));
+  for (const checking of [true, false]) {
+    const calls = [];
+    const top = {};
+    const context = vm.createContext({
+      hasShellAccess: () => true,
+      requestedSettingsTab: "account", initialRecoveryState: null,
+      window: { parent: top, top }, homeClipboard: { start: () => false },
+      refreshSystemSummary: async () => {
+        calls.push(checking ? "summary-checking" : "summary-offline");
+      },
+      refreshActiveShell: async () => calls.push("shell"),
+      refreshAccountList: async () => calls.push("accounts"),
+      refreshRecoveryStatus: async () => calls.push("recovery"),
+      refreshChainNetworks: async () => calls.push("chains"),
+      refreshCapsuleCatalog: async () => calls.push("catalogue"),
+    });
+    for (const name of ["configureSettingsTabs", "configureSettingsSearch", "activateSettingsTab",
+      "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess",
+      "configureAiProvider", "configurePasskeyAccess", "configureRecoveryAccess", "configureChainAccess",
+      "configureActiveShell", "configureCapsuleCatalog", "configureTechnicalDetails", "configureDeviceDidCopy",
+      "configureRuntimeUpdate", "configureHomeRecoverySave"]) context[name] = () => {};
+    vm.runInContext(boot, context);
+    await context.boot();
+    await context.initialRecoveryState;
+    assert.deepEqual(calls, [checking ? "summary-checking" : "summary-offline",
+      "shell", "accounts", "recovery", "chains", "catalogue"]);
+  }
+});
+
+test("System shows matching download and verification progress while Home stays connected", async () => {
+  const f = updateFixture();
+  await f.context.onRuntimeUpdateApply();
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  for (const [phase, message] of [
+    ["downloading", "Downloading the update (88 MB). Home restarts when the update is ready."],
+    ["verifying", "Verifying the update. Home restarts when the update is ready."],
+  ]) {
+    f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase, message } });
+    assert.equal(f.status.textContent, message);
+    assert.equal(f.context.runtimeUpdatePending.phase, phase);
+    assert.equal(f.button.disabled, true);
+    const reopened = updateFixture();
+    reopened.context.renderRuntimeUpdate({ ...reopened.offer, controller: { id, phase, message } });
+    assert.equal(reopened.status.textContent, message);
+    assert.equal(reopened.button.disabled, true);
+  }
+  const message = "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.";
+  f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "failed", message } });
+  assert.equal(f.status.textContent, message);
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.button.disabled, false);
+});
+
+test("System cancellation explains the unchanged Home and keeps private errors out of update copy", async () => {
+  for (const error of [Object.assign(new Error("private detail"), { name: "NotAllowedError" }),
+    new Error("Passkey verification was cancelled."), new Error("The operation timed out or was not allowed.")]) {
+    const f = updateFixture({ requestPasskeyStepUp: async () => { throw error; } });
+    await f.context.onRuntimeUpdateApply();
+    assert.equal(f.status.textContent, "You cancelled the update. Home is unchanged.");
+    assert.equal(f.posts.length, 0);
+    assert.equal(f.button.disabled, false);
+  }
+  const f = updateFixture({ requestPasskeyStepUp: async () => { throw new Error("private signing path"); } });
+  await f.context.onRuntimeUpdateApply();
+  assert.match(f.status.textContent, /verification failed/);
+  assert(!f.status.textContent.includes("private"));
+});
+
+test("System reports an unreachable update source before queueing and allows a new choice", async () => {
+  const f = updateFixture();
+  f.context.fetchJson = async () => { const error = new Error("private source endpoint"); error.status = 424; throw error; };
+  await f.context.onRuntimeUpdateApply();
+  assert.equal(f.status.textContent, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.");
+  assert.equal(f.context.runtimeUpdatePending, null);
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.approvals.length, 1);
+});
+
+test("a slow update keeps polling while Home reports the approved download", async () => {
+  const f = updateFixture();
+  await f.context.onRuntimeUpdateApply();
+  const id = f.context.runtimeUpdatePending.intent.request_id;
+  const message = "Downloading the update (88 MB). Home restarts when the update is ready.";
+  f.context.refreshSystemSummary = async () => f.context.renderRuntimeUpdate({ ...f.offer, controller: { id, phase: "downloading", message } });
+  for (let poll = 0; poll < 100; poll += 1) await f.context.pollRuntimeUpdate();
+  assert.equal(f.status.textContent, message);
+  assert.equal(f.context.runtimeUpdatePending.polls, 0);
+  assert.equal(f.button.disabled, true);
+});

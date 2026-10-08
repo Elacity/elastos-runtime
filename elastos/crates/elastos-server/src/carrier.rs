@@ -7992,6 +7992,42 @@ pub struct CarrierClient {
     conn: iroh::endpoint::Connection,
     _endpoint: Endpoint,
     owns_endpoint: bool,
+    endpoint_drain: Option<CarrierEndpointDrain>,
+}
+
+/// The bound short-lived endpoint keeps one close task through dial and use.
+/// Dropping a dial or close waiter signals that task and leaves it running.
+struct CarrierEndpointDrain {
+    signal: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl CarrierEndpointDrain {
+    fn new(close: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let (signal, shutdown) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = shutdown.await;
+            close.await;
+        });
+        Self {
+            signal: std::sync::Mutex::new(Some(signal)),
+            task: Mutex::new(Some(task)),
+        }
+    }
+
+    async fn close(&self) {
+        self.signal
+            .lock()
+            .expect("Carrier close signal poisoned")
+            .take();
+        let mut task = self.task.lock().await;
+        if let Some(running) = task.as_mut() {
+            if let Err(error) = running.await {
+                warn!(%error, "temporary Carrier endpoint close task failed");
+            }
+        }
+        task.take();
+    }
 }
 
 fn carrier_provider_invoke_message(
@@ -8106,6 +8142,7 @@ impl CarrierClient {
             conn,
             _endpoint: endpoint.clone(),
             owns_endpoint: false,
+            endpoint_drain: None,
         })
     }
 
@@ -8130,22 +8167,29 @@ impl CarrierClient {
         addr: iroh::EndpointAddr,
         timeout_secs: u64,
     ) -> Result<Self> {
+        let closing = endpoint.clone();
+        let drain = CarrierEndpointDrain::new(async move { closing.close().await });
         match Self::connect_known_endpoint(&endpoint, addr, timeout_secs).await {
             Ok(mut client) => {
                 client.owns_endpoint = true;
+                client.endpoint_drain = Some(drain);
                 Ok(client)
             }
             Err(err) => {
-                endpoint.close().await;
+                drain.close().await;
                 Err(err)
             }
         }
     }
 
     /// Finish a short-lived client without closing a Runtime-owned endpoint.
-    async fn close(self) {
+    pub async fn close(&self) {
         if self.owns_endpoint {
-            self._endpoint.close().await;
+            self.endpoint_drain
+                .as_ref()
+                .expect("owned Carrier endpoint retains its drain task")
+                .close()
+                .await;
         }
     }
 
@@ -8231,14 +8275,22 @@ impl CarrierClient {
     }
 
     pub async fn fetch_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.fetch_file_bounded(path, 200 * 1024 * 1024).await
+    }
+
+    pub(crate) async fn fetch_file_bounded(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         let msg = serde_json::json!({"op":"file","path":path});
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, &format!("trusted source file fetch for {path}"))
-            .await
+        read_carrier_len_prefixed_bytes(
+            &mut recv,
+            &format!("trusted source file fetch for {path}"),
+            max_bytes,
+        )
+        .await
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
@@ -8254,7 +8306,7 @@ impl CarrierClient {
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, "content fetch").await
+        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", 200 * 1024 * 1024).await
     }
 
     pub async fn invoke_provider(
@@ -8383,11 +8435,12 @@ impl CarrierClient {
 async fn read_carrier_len_prefixed_bytes(
     recv: &mut iroh::endpoint::RecvStream,
     operation: &str,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 8];
     recv.read_exact(&mut len_buf).await?;
-    let len = u64::from_be_bytes(len_buf) as usize;
-    if len > 200 * 1024 * 1024 {
+    let len = u64::from_be_bytes(len_buf);
+    if len_buf[0] == b'{' {
         let mut error_bytes = len_buf.to_vec();
         let tail = recv.read_to_end(16 * 1024).await?;
         error_bytes.extend_from_slice(&tail);
@@ -8403,7 +8456,11 @@ async fn read_carrier_len_prefixed_bytes(
         }
         anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
     }
-    let mut content = vec![0u8; len];
+    anyhow::ensure!(
+        len <= max_bytes as u64,
+        "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
+    );
+    let mut content = vec![0u8; len as usize];
     recv.read_exact(&mut content).await?;
     Ok(content)
 }
@@ -10412,7 +10469,13 @@ pub(crate) mod tests {
         let good_checksum = format!("sha256:{:x}", Sha256::digest(b"fixture"));
         let manifest: crate::setup::ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
-                "good-fixture": {"install_path": "good-fixture", "platforms": {
+                "good-fixture": {"install_path": "good-fixture",
+                    "provider_runtime": {
+                        "role": "provider", "substrate": "native",
+                        "runtime_abi": "elastos.provider-stdio/v1",
+                        "execution": "native-provider", "provides": "elastos://fixture/*"
+                    },
+                    "platforms": {
                     "*": {"release_path": "artifact", "checksum": good_checksum}
                 }},
                 "bad-fixture": {"install_path": "bad-fixture", "platforms": {
@@ -10612,6 +10675,64 @@ pub(crate) mod tests {
         server.close().await;
     }
 
+    #[tokio::test]
+    async fn carrier_client_close_keeps_borrowed_runtime_endpoint_usable() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let runtime = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            for _ in 0..2 {
+                let (mut send, recv) = connection.accept_bi().await.unwrap();
+                let mut reader = BufReader::new(recv);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                    "artifact"
+                );
+                send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                send.write_all(b"fixture").await.unwrap();
+                send.finish().unwrap();
+            }
+            connection.closed().await
+        });
+        let client = CarrierClient::connect_known_endpoint(&runtime, address, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client.fetch_file("artifact"))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fixture"
+        );
+        client.close().await;
+        assert!(!runtime.is_closed());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client.fetch_file("artifact"))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fixture"
+        );
+        drop(client);
+        runtime.close().await;
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        server.close().await;
+    }
+
     async fn carrier_client_fetch_cleanup_case(reply: &str) {
         let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .alpns(vec![CARRIER_ALPN.to_vec()])
@@ -10740,6 +10861,115 @@ pub(crate) mod tests {
         assert!(result.is_err());
         assert_eq!(result.err().unwrap().to_string(), "connect timed out");
         assert!(closed_before_return);
+    }
+
+    #[tokio::test]
+    async fn carrier_client_cancelled_dial_closes_only_owned_endpoint() {
+        for owned in [true, false] {
+            let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let observer = endpoint.clone();
+            let address = iroh::EndpointAddr::from(SecretKey::from_bytes(&[139; 32]).public())
+                .with_addrs([iroh::TransportAddr::Ip(blackhole.local_addr().unwrap())]);
+            let dial = tokio::spawn(async move {
+                if owned {
+                    CarrierClient::connect_owned_endpoint(endpoint, address, 10).await
+                } else {
+                    CarrierClient::connect_known_endpoint(&endpoint, address, 10).await
+                }
+            });
+            // A received handshake proves the dial owns a bound endpoint and
+            // is waiting on the peer when its caller is cancelled.
+            let mut packet = [0u8; 2048];
+            tokio::time::timeout(Duration::from_secs(5), blackhole.recv(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+            dial.abort();
+            assert!(dial.await.err().unwrap().is_cancelled());
+            if owned {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !observer.is_closed() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("cancelled owned dial did not finish endpoint shutdown");
+            } else {
+                assert!(!observer.is_closed());
+            }
+            observer.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_client_outer_dial_timeout_drains_owned_endpoint() {
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let observer = endpoint.clone();
+        let address = iroh::EndpointAddr::from(SecretKey::from_bytes(&[140; 32]).public())
+            .with_addrs([iroh::TransportAddr::Ip(blackhole.local_addr().unwrap())]);
+        let (expire, expired) = tokio::sync::oneshot::channel();
+        let dial = tokio::spawn(async move {
+            let connect = CarrierClient::connect_owned_endpoint(endpoint, address, 10);
+            tokio::pin!(connect);
+            tokio::select! {
+                result = &mut connect => panic!("blackhole dial returned before cancellation: {}", result.is_ok()),
+                _ = expired => {
+                    assert!(tokio::time::timeout(Duration::ZERO, connect).await.is_err());
+                }
+            }
+        });
+        let mut packet = [0u8; 2048];
+        tokio::time::timeout(Duration::from_secs(5), blackhole.recv(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        expire.send(()).unwrap();
+        dial.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observer.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("outer dial timeout did not finish endpoint shutdown");
+        observer.close().await;
+    }
+
+    #[tokio::test]
+    async fn carrier_endpoint_drain_retains_task_when_close_waiter_is_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let (release, paused) = tokio::sync::oneshot::channel();
+        let drain = Arc::new(CarrierEndpointDrain::new(async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let _ = started.send(());
+            let _ = paused.await;
+        }));
+        let waiter_drain = drain.clone();
+        let waiter = tokio::spawn(async move { waiter_drain.close().await });
+        tokio::time::timeout(Duration::from_millis(500), starting)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(drain.task.lock().await.as_ref().is_some());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), drain.close())
+            .await
+            .unwrap();
+        assert!(drain.task.lock().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -14,9 +14,7 @@ authorship.
 Use these documents as the sources of truth:
 
 - [Principles](../PRINCIPLES.md): stable implementation constraints.
-- [Current state](../state.md): verified behavior, branch status, and known
-  limitations.
-- [Open work](../TASKS.md): prioritized unfinished work.
+- [GitHub issues](https://github.com/Elacity/elastos-runtime/issues): verified behavior, known limitations and open work.
 - [Architecture](ARCHITECTURE.md): trust boundaries and component ownership.
 - [Capsule model](CAPSULE_MODEL.md): package, execution, and isolation model.
 - [Capsule authoring](CAPSULE_AUTHORING.md): checked manifest and template path.

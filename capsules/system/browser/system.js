@@ -54,6 +54,9 @@ const technicalInspectDetailNode = document.querySelector("#technical-inspect-de
 const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
+const runtimeUpdateNode = document.querySelector("#runtime-update");
+const runtimeUpdateButton = document.querySelector("#runtime-update-apply");
+const runtimeUpdateStatusNode = document.querySelector("#runtime-update-status");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
@@ -115,6 +118,14 @@ let accentCustomPicker = null;
 let accentCustomWriteTimer = 0;
 let deviceDidValue = "";
 let deviceDidCopyTimer = 0;
+let systemSummaryInFlight = null;
+let runtimeUpdate;
+let runtimeUpdatePending = null;
+let runtimeUpdateBusy = false;
+let runtimeUpdateActive = true;
+let runtimeUpdateTimer = 0;
+let runtimeUpdateReconnects = 0;
+const runtimeUpdateRequests = new Set();
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -151,7 +162,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
-  about: ["about", "device", "version", "source", "network", "did"],
+  about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
 const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
@@ -187,6 +198,7 @@ async function boot() {
   configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
+  configureRuntimeUpdate();
   initialRecoveryState = (async () => {
     await refreshSystemSummary();
     await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
@@ -354,10 +366,13 @@ function hasShellAccess() {
 }
 
 async function refreshSystemSummary() {
-  const systemSummary = await fetchJson("/api/apps/system/summary", {
-    headers: shellHeaders(),
-  });
-  renderSystemSummary(systemSummary);
+  if (systemSummaryInFlight) return systemSummaryInFlight;
+  systemSummaryInFlight = (async () => {
+    const systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
+    if (runtimeUpdateActive) renderSystemSummary(systemSummary);
+  })();
+  try { await systemSummaryInFlight; }
+  finally { systemSummaryInFlight = null; }
 }
 
 async function fetchJson(url, init) {
@@ -365,7 +380,9 @@ async function fetchJson(url, init) {
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     const suffix = detail.trim() ? ` ${detail.trim()}` : ` ${response.statusText}`;
-    throw new Error(`request failed: ${response.status}${suffix}`);
+    const error = new Error(`request failed: ${response.status}${suffix}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -400,6 +417,7 @@ function renderSystemSummary(systemSummary) {
   acceptAppearance(appearance);
   setRuntimeState(runtime);
   setSourceState(source);
+  renderRuntimeUpdate(systemSummary.runtime_update);
 }
 
 function setField(field, value, emptyText, titleValue) {
@@ -3697,6 +3715,221 @@ function setSourceState(source) {
     "source-transport",
     sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
   );
+}
+
+function configureRuntimeUpdate() {
+  runtimeUpdateButton?.addEventListener("click", onRuntimeUpdateApply);
+  window.addEventListener("pagehide", () => {
+    runtimeUpdateActive = false;
+    window.clearTimeout(runtimeUpdateTimer);
+    for (const request of runtimeUpdateRequests) request.abort();
+  }, { once: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleRuntimeUpdateRefresh(0);
+  });
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.top || event.origin !== homeParentOrigin
+      || event.data?.type !== "elastos:runtime-events"
+      || event.data?.schema !== "elastos.home.runtime-events/v1"
+      || !Array.isArray(event.data.events)) return;
+    scheduleRuntimeUpdateRefresh(0);
+  });
+  scheduleRuntimeUpdateRefresh();
+}
+
+function renderRuntimeUpdate(update) {
+  runtimeUpdate = update && typeof update === "object" ? update : null;
+  if (!runtimeUpdateNode || !runtimeUpdateButton) return;
+  const configured = runtimeUpdate?.configured === true;
+  runtimeUpdateNode.hidden = !configured && !runtimeUpdatePending;
+  const controller = runtimeUpdate?.controller;
+  const phase = readText(controller?.phase);
+  if (runtimeUpdatePending && (controller?.id === runtimeUpdatePending.intent.request_id
+    && ["updated", "restored", "failed"].includes(phase))) {
+    runtimeUpdatePending = null;
+    runtimeUpdateReconnects = 0;
+  }
+  const choice = runtimeUpdatePending?.intent || runtimeUpdate;
+  const inProgress = runtimeUpdatePending || ["staging", "downloading", "verifying", "restarting"].includes(phase);
+  setTextFields("update-current-version", readText(choice?.current_version) || readText(controller?.current_version));
+  setTextFields("update-new-version", readText(choice?.new_version) || readText(controller?.new_version));
+  const publisher = readText(runtimeUpdatePending?.publisher || runtimeUpdate?.publisher);
+  setTextFields("update-publisher", publisher);
+  setHiddenFields("update-publisher-row", !publisher);
+  const hideOffer = runtimeUpdate?.available !== true && !inProgress;
+  setHiddenFields("update-offer", hideOffer);
+  const notes = runtimeUpdatePending?.changes || runtimeUpdate?.changes;
+  const changes = Array.isArray(notes) ? notes.filter((note) => typeof note === "string")
+    .slice(0, 32).map((note) => readText(note)).filter(Boolean).join("\n") : "";
+  setHiddenFields("update-changes", hideOffer || (inProgress && !changes && runtimeUpdate?.available !== true));
+  setTextFields("update-changes", changes || "Publisher has not supplied change notes.");
+  const actionable = runtimeUpdateCanApply();
+  runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
+  runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
+  const progress = runtimeUpdateProgressPhase();
+  runtimeUpdateButton.textContent = runtimeUpdatePending
+    ? runtimeUpdatePending.dispatched ? "Update in progress" : "Waiting for update status"
+    : "Update and restart Home";
+  if (runtimeUpdatePending) {
+    showRuntimeUpdateStatus(runtimeUpdateBusy && !runtimeUpdatePending.stepUpToken
+      ? "Verify your passkey to start the update."
+      : progress === "restarting" ? "Home is restarting. Reconnecting…"
+        : ["downloading", "verifying"].includes(progress) ? readText(controller?.message)
+          || "Preparing the update. Home restarts when the update is ready."
+        : progress === "staging" ? "Checking the signed update. Keep Home open."
+          : progress === "queued" ? "The update is queued. Keep Home open."
+            : "Checking the update with Home. Keep Home open.");
+  } else if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    showRuntimeUpdateStatus(phase === "restarting"
+      ? "Home is restarting. Reconnecting…" : readText(controller?.message) || "Checking the signed update. Keep Home open.");
+  } else if (["updated", "restored", "failed"].includes(phase)) {
+    showRuntimeUpdateStatus(readText(controller.message) || "Check the update status again.");
+  } else {
+    showRuntimeUpdateStatus(runtimeUpdate?.available === true
+      ? "An update is available. Home will restart after your approval."
+      : readText(runtimeUpdate?.message) || "Update checks are unavailable on this Home.");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+function runtimeUpdateProgressPhase() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  if (!runtimeUpdatePending) return phase;
+  if (runtimeUpdate?.controller?.id === runtimeUpdatePending.intent.request_id
+    && ["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    runtimeUpdatePending.dispatched = true;
+    runtimeUpdatePending.phase = phase;
+  }
+  return runtimeUpdatePending.phase || "checking";
+}
+
+function runtimeUpdateCanApply() {
+  return runtimeUpdate?.configured === true && runtimeUpdate.available === true
+    && runtimeUpdate.can_apply === true
+    && ["ready", "updated", "restored", "failed"].includes(readText(runtimeUpdate.controller?.phase))
+    && ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]
+      .every((field) => readText(runtimeUpdate[field]).length > 0);
+}
+
+function showRuntimeUpdateStatus(message) {
+  if (runtimeUpdateStatusNode) runtimeUpdateStatusNode.textContent = message;
+}
+
+function scheduleRuntimeUpdateRefresh(delay) {
+  window.clearTimeout(runtimeUpdateTimer);
+  if (!runtimeUpdateActive || (runtimeUpdate !== undefined && runtimeUpdate?.configured !== true && !runtimeUpdatePending)) return;
+  runtimeUpdateTimer = window.setTimeout(pollRuntimeUpdate,
+    document.hidden ? 30_000 : delay ?? (runtimeUpdate?.controller?.phase === "restarting" ? 2_000 : 5_000));
+}
+
+async function pollRuntimeUpdate() {
+  if (!runtimeUpdateActive) return;
+  if (systemSummaryInFlight) {
+    scheduleRuntimeUpdateRefresh();
+    return;
+  }
+  if (runtimeUpdatePending && ++runtimeUpdatePending.polls >= 90) {
+    showRuntimeUpdateStatus(runtimeUpdatePending.dispatched
+      ? "Home has not completed the update. Open System from Home again to check its status."
+      : "Home has not confirmed the update. Open System from Home again to check its status.");
+    return;
+  }
+  try {
+    await refreshSystemSummary();
+    runtimeUpdateReconnects = 0;
+    const controller = runtimeUpdate?.controller;
+    if (runtimeUpdatePending && controller?.id === runtimeUpdatePending.intent.request_id
+      && ["staging", "downloading", "verifying"].includes(readText(controller.phase))) {
+      runtimeUpdatePending.polls = 0;
+    }
+  } catch (error) {
+    if (!runtimeUpdateActive) return;
+    if (error.status === 401 || error.status === 403) {
+      runtimeUpdateButton.hidden = true;
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home access has changed. Open System from Home again to check the update.");
+      return;
+    }
+    if (++runtimeUpdateReconnects >= 90) {
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home has not reconnected. Open Home again to check the update.");
+      return;
+    }
+    showRuntimeUpdateStatus(runtimeUpdateProgressPhase() === "restarting"
+      ? "Home is restarting. Reconnecting…"
+      : runtimeUpdatePending?.dispatched ? "Waiting for Home to report update progress. Reconnecting…"
+        : runtimeUpdatePending ? "Waiting for Home to confirm the update. Reconnecting…"
+        : "Update status is unavailable. Reconnecting…");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+async function fetchRuntimeUpdateJson(init) {
+  const abort = new AbortController();
+  runtimeUpdateRequests.add(abort);
+  // Carrier admission includes connection, signed metadata checks and transport drain.
+  const timeout = window.setTimeout(() => abort.abort(), init.method === "POST" ? 60_000 : 10_000);
+  try { return await fetchJson("/api/apps/system/summary", { ...init, signal: abort.signal }); }
+  finally {
+    window.clearTimeout(timeout);
+    runtimeUpdateRequests.delete(abort);
+  }
+}
+
+async function onRuntimeUpdateApply() {
+  if (runtimeUpdateBusy || runtimeUpdatePending || !runtimeUpdateCanApply()) return;
+  const intent = { action: "apply", request_id: window.crypto.randomUUID().replaceAll("-", "") };
+  for (const field of ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]) {
+    intent[field] = runtimeUpdate[field];
+  }
+  const pending = { intent, stepUpToken: null, polls: 0, dispatched: false, phase: "checking",
+    publisher: runtimeUpdate.publisher, changes: runtimeUpdate.changes };
+  runtimeUpdatePending = pending;
+  runtimeUpdateBusy = true;
+  renderRuntimeUpdate(runtimeUpdate);
+  let feedback = "";
+  try {
+    pending.stepUpToken = await requestPasskeyStepUp("system.update.apply", intent);
+    if (!runtimeUpdateActive || runtimeUpdatePending !== pending) return;
+    const body = JSON.stringify({ ...intent, step_up_token: pending.stepUpToken });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const reply = await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body });
+        if (runtimeUpdatePending !== pending || !runtimeUpdateActive) return;
+        if (reply?.id !== intent.request_id || reply?.phase !== "queued") throw new Error("Update queue confirmation is unavailable.");
+        pending.dispatched = true;
+        if (pending.phase === "checking") pending.phase = "queued";
+        break;
+      } catch (error) {
+        if (!runtimeUpdateActive || (error.status >= 400 && error.status < 500) || attempt === 1) throw error;
+      }
+    }
+  } catch (error) {
+    if (runtimeUpdatePending !== pending) return;
+    if (!pending.stepUpToken || (error.status >= 400 && error.status < 500)) {
+      runtimeUpdatePending = null;
+      feedback = !pending.stepUpToken && (error.name === "NotAllowedError"
+        || /cancelled|canceled|timed out or was not allowed/i.test(readText(error.message)))
+        ? "You cancelled the update. Home is unchanged."
+        : error.status === 424
+          ? "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+        : error.status === 401 || error.status === 403
+          ? "Sign in as the Home owner to start the update."
+          : "The update could not start: the release was refused or verification failed. Select Update again.";
+    } else {
+      feedback = runtimeUpdateProgressPhase() === "restarting"
+        ? "Home is restarting. Reconnecting…"
+        : pending.dispatched ? "Waiting for Home to report update progress. Keep Home open."
+          : "Waiting for Home to confirm the update. Keep Home open.";
+    }
+  } finally {
+    runtimeUpdateBusy = false;
+    if (runtimeUpdateActive) {
+      renderRuntimeUpdate(runtimeUpdate);
+      if (feedback) showRuntimeUpdateStatus(feedback);
+      scheduleRuntimeUpdateRefresh(0);
+    }
+  }
 }
 
 function readQueryParam(key) {

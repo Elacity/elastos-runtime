@@ -158,7 +158,13 @@ impl Runtime {
                 .as_ref()
                 .map(|provider| provider.clone() as Arc<dyn ComputeProvider>);
         }
-        if manifest.capsule_type == CapsuleType::Wasm {
+        if matches!(
+            manifest.execution_type(),
+            CapsuleType::Wasm
+                | CapsuleType::WebProjection
+                | CapsuleType::NativeProvider
+                | elastos_common::CapsuleType::NativeHost
+        ) {
             return None;
         }
         self.get_provider(&manifest.capsule_type)
@@ -708,6 +714,58 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("dev_mode=false"));
+    }
+
+    #[tokio::test]
+    async fn descriptive_execution_types_refuse_generic_compute() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            LocalFSProvider::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::new(
+            storage,
+            Arc::new(CountingComputeProvider {
+                loads: loads.clone(),
+            }),
+        );
+        runtime
+            .configure_signature_verification(&[], true)
+            .await
+            .unwrap();
+        for source in [
+            include_str!("../../../../templates/capsules/web-app/capsule.json"),
+            include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
+            include_str!("../../../../capsules/model-provider/capsule.json"),
+            include_str!("../../../../capsules/home/capsule.json"),
+            include_str!("../../../capsules/shell/capsule.json"),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let capsule_dir = temp_dir.path().join(&manifest.name);
+            std::fs::create_dir_all(
+                capsule_dir.join(std::path::Path::new(&manifest.entrypoint).parent().unwrap()),
+            )
+            .unwrap();
+            std::fs::write(
+                capsule_dir.join(&manifest.entrypoint),
+                b"untrusted artifact",
+            )
+            .unwrap();
+            std::fs::write(capsule_dir.join("capsule.json"), source).unwrap();
+            assert!(runtime.get_provider_for_manifest(&manifest).is_none());
+            let error = runtime
+                .run_local(&capsule_dir, Vec::new())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("No compute provider supports"),
+                "{error}"
+            );
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

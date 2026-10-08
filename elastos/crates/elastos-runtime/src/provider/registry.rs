@@ -26,8 +26,8 @@ fn private_ipfs_unavailable() -> ProviderError {
     ProviderError::Provider("local content preparation unavailable".into())
 }
 
-fn private_model_configuration(target: &str, op: &str) -> bool {
-    target.eq_ignore_ascii_case("model") && op == "init"
+fn private_provider_configuration(target: &str, op: &str) -> bool {
+    (target.eq_ignore_ascii_case("model") || target.eq_ignore_ascii_case("ipfs")) && op == "init"
 }
 
 fn model_index_stream(invocation: &ProviderInvocation) -> bool {
@@ -1464,6 +1464,7 @@ impl ProviderRegistry {
 
     /// Observe the actual Ready backend volume through the exact local provider.
     /// The inventory owns reservations; this result grants no retention or admission.
+    /// Content and model downloads keep the shared free-space reserve on the backend volume.
     pub async fn check_local_ipfs_capacity(
         &self,
         required_bytes: u64,
@@ -1486,13 +1487,14 @@ impl ProviderRegistry {
             || observation.capacity_bytes == 0
             || observation.available_bytes > observation.capacity_bytes
             || observation.required_bytes != required_bytes
-            || observation
-                .available_bytes
-                .checked_sub(required_bytes)
-                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
         {
             return Err(private_ipfs_unavailable());
         }
+        elastos_common::require_free_space(
+            u128::from(observation.available_bytes),
+            u128::from(required_bytes),
+        )
+        .map_err(|error| ProviderError::Provider(error.to_string()))?;
         Ok(observation)
     }
 
@@ -1524,9 +1526,9 @@ impl ProviderRegistry {
         target: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(target, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(target, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1566,9 +1568,9 @@ impl ProviderRegistry {
         request: &serde_json::Value,
         include_runtime_only: bool,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1627,14 +1629,14 @@ impl ProviderRegistry {
         &self,
         invocation: ProviderInvocation,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(&invocation.target, &invocation.op)
-            || private_model_configuration(
+        if private_provider_configuration(&invocation.target, &invocation.op)
+            || private_provider_configuration(
                 &invocation.target,
                 invocation.request["op"].as_str().unwrap_or_default(),
             )
         {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if private_ipfs_operation(&invocation.op)
@@ -2965,7 +2967,9 @@ mod tests {
                     serde_json::json!({"status":"ok","data":{"cid":"bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"}})
                 }
                 "runtime_check_capacity" => serde_json::json!({"status":"ok","data":{
-                    "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":request["required_bytes"]
+                    "volume_id":7,"capacity_bytes":1_u64 << 40,
+                    "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                    "required_bytes":request["required_bytes"]
                 }}),
                 _ => panic!("unexpected operation"),
             })
@@ -3210,11 +3214,12 @@ mod tests {
         let carrier = Arc::new(MockCarrierInvoker::default());
         registry.set_carrier_invoker(carrier.clone()).await;
         for op in [
+            "init",
             "runtime_prepare_backend",
             "runtime_hash_staged_directory",
             "runtime_check_capacity",
         ] {
-            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}});
+            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}, "config":{"base_path":"/private/fixture", "extra":{"runtime_host_role":"gateway"}}});
             assert!(registry.send_raw("ipfs", &request).await.is_err());
             assert!(registry
                 .send_runtime_provider_target_raw("ipfs", &request)
@@ -3361,15 +3366,28 @@ mod tests {
                 observed.available_bytes,
                 observed.required_bytes
             ),
-            (7, 1000, 110, 10)
+            (
+                7,
+                1 << 40,
+                elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                10
+            )
         );
         assert_eq!(
             provider.requests.lock().await.as_slice(),
             &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
         );
-        assert!(registry.check_local_ipfs_capacity(11).await.is_err());
+        // Exactly the work plus the shared reserve fits; one byte less does not.
+        assert!(registry.check_local_ipfs_capacity(110).await.is_ok());
+        let refused = registry.check_local_ipfs_capacity(111).await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            ProviderError::Provider(elastos_common::NotEnoughFreeSpace { needed: 111 }.to_string())
+                .to_string()
+        );
         let valid = serde_json::json!({"status":"ok","data":{
-            "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
+            "volume_id":7,"capacity_bytes":1_u64 << 40,
+            "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,"required_bytes":10
         }});
         let mut malformed = vec![
             serde_json::json!({"status":"ok"}),
@@ -3379,9 +3397,8 @@ mod tests {
             ("volume_id", serde_json::json!(0)),
             ("volume_id", serde_json::json!("private-repo-path")),
             ("capacity_bytes", serde_json::json!(0)),
-            ("capacity_bytes", serde_json::json!(1001)),
-            ("available_bytes", serde_json::json!(1001)),
-            ("available_bytes", serde_json::json!(9)),
+            ("capacity_bytes", serde_json::json!(109)),
+            ("available_bytes", serde_json::json!((1_u64 << 40) + 1)),
             ("required_bytes", serde_json::json!(11)),
             ("required_bytes", serde_json::json!(u64::MAX)),
             ("repo_path", serde_json::json!("private-repo-path")),

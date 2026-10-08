@@ -29,6 +29,7 @@ use crate::collaboration_protocol::{
     verify_stored_collaboration_message, VerifiedCollaborationMessage,
 };
 use crate::esp_binding::{esp_request_binding, EspRequestBinding, ESP_REQUEST_BINDING_SCHEMA};
+use crate::host_lock::FileLock;
 
 const CORE_STATE_SCHEMA: &str = "elastos.collaboration.default-conversation-state/v1";
 const CORE_STATE_DIR: &str = "collaboration/default-conversation";
@@ -1084,7 +1085,7 @@ impl CollaborationCore {
             .lock()
             .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
         self.ensure_state_directory()?;
-        let _file_guard = ExclusiveFileLock::acquire(&self.lock_path())?;
+        let _file_guard = lock_owner_only_file(&self.lock_path())?;
         let mut state = self.load_state()?.unwrap_or_else(|| self.empty_state());
         let pruned = prune_now
             .map(|now| prune_terminal_state(&mut state, now))
@@ -1685,40 +1686,18 @@ fn validate_owner_and_mode(
     Ok(())
 }
 
-pub(crate) struct ExclusiveFileLock {
-    file: File,
-}
-
-impl ExclusiveFileLock {
-    pub(crate) fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(path)?;
-        validate_owner_only_regular_file(path, &file.metadata()?)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        Ok(Self { file })
+/// Opens or creates an owner-only lock file and waits for its exclusive lock.
+pub(crate) fn lock_owner_only_file(path: &Path) -> anyhow::Result<FileLock> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-}
-
-impl Drop for ExclusiveFileLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
+    let file = options.open(path)?;
+    validate_owner_only_regular_file(path, &file.metadata()?)?;
+    Ok(FileLock::exclusive(file)?)
 }
 
 #[cfg(test)]
@@ -3553,7 +3532,7 @@ mod tests {
         let serialized_fixture = Fixture::new();
         let first = Arc::new(serialized_fixture.core());
         first.ensure_state_directory().unwrap();
-        let file_guard = ExclusiveFileLock::acquire(&first.lock_path()).unwrap();
+        let file_guard = lock_owner_only_file(&first.lock_path()).unwrap();
         let second = Arc::new(serialized_fixture.core());
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();

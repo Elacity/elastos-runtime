@@ -76,9 +76,25 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
-# Collect local source, lint, and test results before a CI-fix push.
+# Capsule units and script behavior fixtures. Browser fixtures use the explicit
+# Playwright/Chromium inputs installed by CI; NODE_PATH and
+# BROWSER_OPERATOR_PLAYWRIGHT_CORE select the unchanged pinned packages.
+test-behaviour:
+    node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+
+# Disposable Linux fixture; host namespace privileges belong to this test.
+test-native-browser-isolation:
+    cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
+    cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
+    sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
+
+# Check a clean candidate against current develop before each push.
 ci-local-prepush:
     scripts/ci-local-prepush.sh
+
+# Small Git/Cargo decision fixtures; Cargo is simulated.
+test-ci-local-prepush:
+    python3 scripts/ci-local-prepush-test.py
 
 # Cold Debian container check for test-elastos when Docker is available.
 # It copies the working tree and installs Node for integration tests.
@@ -148,14 +164,13 @@ vendor-ui:
 fmt:
     cd elastos && cargo fmt --all
 
-# Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
+# Pre-commit gate: data contracts, behavior tests, smoke tests, fmt/lint/test
 verify:
     git --no-pager diff --check
-    just alignment-check
+    just product-data
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
-    node scripts/home-entropy-check.mjs
     python3 scripts/components-release-integrity-check.py --self-test
     python3 scripts/publish-platform-artifacts-test.py
     python3 scripts/release-platform-input-test.py
@@ -165,10 +180,11 @@ verify:
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs
-    node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
+    node --test scripts/home-link-status.test.mjs
+    node --test scripts/chat-room-enter.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
@@ -202,6 +218,7 @@ product-ui-browser:
     node scripts/inbox-product-layout-smoke.mjs
     node scripts/archive-product-layout-smoke.mjs
     node scripts/marketplace-product-layout-smoke.mjs
+    node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
@@ -216,9 +233,9 @@ verify-release:
     just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
-# Fail-closed check for rooted-localhost and Home-first contract drift
-alignment-check:
-    ./scripts/check-wci-alignment.sh
+# Validate capsule metadata, component profiles and signed catalog bindings.
+product-data:
+    node scripts/check-product-data.mjs
 
 # Verify the checked-in ElastOS Bus contract and real Component fixture
 bus-conformance:

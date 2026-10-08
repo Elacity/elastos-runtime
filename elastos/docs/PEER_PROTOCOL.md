@@ -218,4 +218,4 @@ A conforming provider MAY:
 - **Dependencies:** ~470 unique crates (heavy crypto stack)
 - **Binary size:** ~16MB release
 - **Status:** Frozen for stability in the current source contract. Release and
-  installed status are recorded in the repository's `state.md`.
+  installed status are recorded in GitHub issues.

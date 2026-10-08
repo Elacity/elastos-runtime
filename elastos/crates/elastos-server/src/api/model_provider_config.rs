@@ -388,7 +388,10 @@ pub fn model_provider_bridge_config(
 pub async fn model_provider_config(
     data_dir: &Path,
     registry: &provider::ProviderRegistry,
-) -> anyhow::Result<(provider::BridgeProviderConfig, Option<fs::File>)> {
+) -> anyhow::Result<(
+    provider::BridgeProviderConfig,
+    Option<crate::host_lock::FileLock>,
+)> {
     let config = model_provider_bridge_config(data_dir)?;
     #[cfg(unix)]
     {
@@ -1227,8 +1230,8 @@ pub(super) fn archive_hosted_egress_decision(
         );
         let volume = unsafe { volume.assume_init() };
         anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
-            "hosted egress history disk reserve reached"
+            u128::from(volume.f_bavail) * u128::from(volume.f_frsize) >= bytes.len() as u128,
+            "not enough free space for the hosted egress history entry"
         );
     }
     let stage = directory.join(format!(

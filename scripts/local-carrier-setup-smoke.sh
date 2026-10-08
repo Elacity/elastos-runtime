@@ -8,7 +8,15 @@ umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELASTOS_ROOT="${REPO_ROOT}/elastos"
-ELASTOS_BIN="${ELASTOS_ROOT}/target/debug/elastos"
+if [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" != /* ]]; then
+    export CARGO_TARGET_DIR="${REPO_ROOT}/${CARGO_TARGET_DIR}"
+fi
+ELASTOS_BIN="${CARGO_TARGET_DIR:-${ELASTOS_ROOT}/target}/debug/elastos"
+
+cargo_release_binary() {
+    local workspace="$1" name="$2"
+    printf '%s/release/%s\n' "${CARGO_TARGET_DIR:-${REPO_ROOT}/${workspace}/target}" "$name"
+}
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "local-carrier-setup-smoke currently supports Linux only." >&2
@@ -29,14 +37,15 @@ if [[ "${SETUP_PLATFORM}" == linux-arm64 ]]; then
         echo "ELASTOS_LLAMA_ARM64_BUNDLE is required for the ARM64 Carrier smoke." >&2
         exit 1
     }
-    python3 - "${REPO_ROOT}/components.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
+    python3 - "${REPO_ROOT}/scripts/release-upstream-recipes.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
 import hashlib, json, pathlib, sys
-info = json.loads(pathlib.Path(sys.argv[1]).read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
+info = next(recipe['source'] for recipe in json.loads(pathlib.Path(sys.argv[1]).read_text())['recipes']
+            if recipe['component'] == 'llama-server' and recipe['platform'] == 'linux-arm64')
 source = pathlib.Path(sys.argv[2])
-if not source.is_file() or source.is_symlink() or source.stat().st_size != info["size"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive is missing or has the wrong size")
+if not source.is_file() or source.is_symlink() or not 0 < source.stat().st_size <= info["max_bytes"]:
+    raise SystemExit("ARM64 Carrier smoke engine archive is missing or exceeds its recipe bound")
 if "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != info["checksum"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from components.json")
+    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from its build recipe")
 PY
 fi
 
@@ -149,7 +158,7 @@ MEDIA_TOOLS_ARCHIVE=$(
     source scripts/publish-release.sh
     TMPDIR="${TEST_ROOT}/media-package"
     mkdir -p "$TMPDIR"
-    CARGO_TARGET_DIR="${TEST_ROOT}/media-target" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TEST_ROOT}/media-target}" \
         build_packaged_media_tools_archive "${SETUP_PLATFORM}"
 )
 export MEDIA_TOOLS_ARCHIVE
@@ -164,6 +173,7 @@ for capsule in \
     services \
     documents \
     elacity-player \
+    chat-room \
     inbox \
     library \
     marketplace \
@@ -178,11 +188,16 @@ done
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
 
+# The publisher owns this build-only Kubo prerequisite. The separate consumer
+# starts without Kubo and receives the licensed release capsule through Carrier.
+"${REPO_ROOT}/scripts/seed-kubo-cache.sh" \
+    "${KUBO_CACHE_DIR:-${TEST_ROOT}/kubo-cache}" "${DATA_DIR}" "${SETUP_PLATFORM}"
+
 # `elastos serve` now fails closed unless localhost-provider is already
 # installed. Seed the one required host provider before starting the local
 # source runtime; the rest of the setup still proves Carrier-backed install.
 install -m 755 \
-    "${REPO_ROOT}/elastos/target/release/localhost-provider" \
+    "$(cargo_release_binary elastos localhost-provider)" \
     "${DATA_DIR}/bin/localhost-provider"
 
 COMPONENTS_SRC="${REPO_ROOT}/components.json" \
@@ -190,26 +205,26 @@ COMPONENTS_DEST="${DATA_DIR}/components.json" \
 DATA_DIR="${DATA_DIR}" \
 PUBLISHER_ROOT="${PUBLISHER_ROOT}" \
 SETUP_PLATFORM="${SETUP_PLATFORM}" \
-SHELL_BIN="${REPO_ROOT}/elastos/target/release/shell" \
-LOCALHOST_PROVIDER_BIN="${REPO_ROOT}/elastos/target/release/localhost-provider" \
-DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider" \
-CHAIN_PROVIDER_BIN="${REPO_ROOT}/capsules/chain-provider/target/release/chain-provider" \
-NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider" \
-EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
-IPFS_PROVIDER_BIN="${REPO_ROOT}/capsules/ipfs-provider/target/release/ipfs-provider" \
-MEDIA_PROVIDER_BIN="${REPO_ROOT}/capsules/media-provider/target/release/media-provider" \
-MODEL_PROVIDER_BIN="${REPO_ROOT}/capsules/model-provider/target/release/model-provider" \
-PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
-PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
-BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
-BROWSER_ENGINE_SUPERVISOR_BIN="${REPO_ROOT}/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" \
-BROWSER_NATIVE_PROXY_ENGINE_BIN="${REPO_ROOT}/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" \
-BROWSER_STREAM_BRIDGE_BIN="${REPO_ROOT}/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" \
-BROWSER_LOCAL_EXIT_BIN="${REPO_ROOT}/elastos/tools/browser-local-exit/target/release/browser-local-exit" \
-WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/webspace-provider" \
-WALLET_PROVIDER_BIN="${REPO_ROOT}/capsules/wallet-provider/target/release/wallet-provider" \
-OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object-provider" \
-CONTENT_BLOCK_GRAPH_PROVIDER_BIN="${REPO_ROOT}/capsules/content-block-graph-provider/target/release/content-block-graph-provider" \
+SHELL_BIN="$(cargo_release_binary elastos shell)" \
+LOCALHOST_PROVIDER_BIN="$(cargo_release_binary elastos localhost-provider)" \
+DID_PROVIDER_BIN="$(cargo_release_binary capsules/did-provider did-provider)" \
+CHAIN_PROVIDER_BIN="$(cargo_release_binary capsules/chain-provider chain-provider)" \
+NET_PROVIDER_BIN="$(cargo_release_binary capsules/net-provider net-provider)" \
+EXIT_PROVIDER_BIN="$(cargo_release_binary capsules/exit-provider exit-provider)" \
+IPFS_PROVIDER_BIN="$(cargo_release_binary capsules/ipfs-provider ipfs-provider)" \
+MEDIA_PROVIDER_BIN="$(cargo_release_binary capsules/media-provider media-provider)" \
+MODEL_PROVIDER_BIN="$(cargo_release_binary capsules/model-provider model-provider)" \
+PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-protect-provider protected-content-protect-provider)" \
+PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-decrypt-provider protected-content-decrypt-provider)" \
+BROWSER_ENGINE_ADAPTER_BIN="$(cargo_release_binary capsules/browser-engine-adapter browser-engine-adapter)" \
+BROWSER_ENGINE_SUPERVISOR_BIN="$(cargo_release_binary elastos/tools/browser-engine-supervisor browser-engine-supervisor)" \
+BROWSER_NATIVE_PROXY_ENGINE_BIN="$(cargo_release_binary elastos/tools/browser-native-proxy-engine browser-native-proxy-engine)" \
+BROWSER_STREAM_BRIDGE_BIN="$(cargo_release_binary elastos/tools/browser-stream-bridge browser-stream-bridge)" \
+BROWSER_LOCAL_EXIT_BIN="$(cargo_release_binary elastos/tools/browser-local-exit browser-local-exit)" \
+WEBSPACE_PROVIDER_BIN="$(cargo_release_binary capsules/webspace-provider webspace-provider)" \
+WALLET_PROVIDER_BIN="$(cargo_release_binary capsules/wallet-provider wallet-provider)" \
+OBJECT_PROVIDER_BIN="$(cargo_release_binary capsules/object-provider object-provider)" \
+CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$(cargo_release_binary capsules/content-block-graph-provider content-block-graph-provider)" \
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 HOME_GUI_CAPSULE_DIR="${REPO_ROOT}/capsules/home-gui" \
@@ -223,6 +238,7 @@ MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
 ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
+CHAT_ROOM_CAPSULE_DIR="${REPO_ROOT}/capsules/chat-room" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
 WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
@@ -230,11 +246,14 @@ WALLET_UNISAT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-unisat" \
 WALLET_WALLETCONNECT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-walletconnect" \
 python3 - <<'PY'
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
 import shutil
 import tarfile
+import subprocess
+import tempfile
 
 components_src = pathlib.Path(os.environ["COMPONENTS_SRC"])
 components_dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
@@ -243,6 +262,10 @@ publisher_root = pathlib.Path(os.environ["PUBLISHER_ROOT"])
 artifacts_dir = publisher_root / "artifacts"
 artifacts_dir.mkdir(parents=True, exist_ok=True)
 platform = os.environ["SETUP_PLATFORM"]
+root = components_src.parent
+spec = importlib.util.spec_from_file_location('release_upstream', root / 'scripts/release-upstream-input.py')
+upstream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(upstream)
 
 manifest = json.loads(components_src.read_text())
 
@@ -299,13 +322,39 @@ shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
 media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
 media_info["size"] = media_archive.stat().st_size
 
+cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR', str(data_dir.parent.parent / 'kubo-cache')))
+receipt = json.loads((data_dir / 'receipts/kubo-build.json').read_bytes())
+kubo_archive = artifacts_dir / receipt['release_path']
+shutil.copyfile(cache / 'capsules' / receipt['release_path'], kubo_archive)
+if upstream.digest(kubo_archive) != receipt['checksum'][7:]:
+    raise SystemExit('Kubo capsule differs from its build receipt')
+kubo_info = platform_info('kubo')
+kubo_info.update({key: receipt[key] for key in ('checksum', 'size', 'release_path', 'extract_path', 'install_path')})
+kubo_info.pop('strategy', None)
+manifest['external']['kubo']['capsule_metadata'] = {
+    'role': 'content', 'type': 'data', 'install_path': 'capsules/kubo',
+    'platforms': {platform: receipt['capsule_metadata']}}
+kubo_env = {**os.environ, 'IPFS_PATH': str(data_dir / 'ipfs-repo')}
+subprocess.run([str(data_dir / 'bin/kubo'), 'init', '--profile=test'], env=kubo_env,
+               check=True, stdout=subprocess.DEVNULL)
+cid = subprocess.check_output([str(data_dir / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
+                               '--pin=true', str(kubo_archive)], env=kubo_env, text=True).strip()
+kubo_info['cid'] = cid
+manifest['external']['kubo']['capsule_metadata']['platforms'][platform]['cid'] = cid
+
 if platform == "linux-arm64":
-    engine_info = platform_info("llama-server")
-    engine_archive = artifacts_dir / engine_info["release_path"]
-    shutil.copyfile(os.environ["ELASTOS_LLAMA_ARM64_BUNDLE"], engine_archive)
-    if (engine_archive.stat().st_size != engine_info["size"] or
-            "sha256:" + hashlib.sha256(engine_archive.read_bytes()).hexdigest() != engine_info["checksum"]):
-        raise SystemExit("staged ARM64 engine archive differs from components.json")
+    recipe = next(recipe for recipe in json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
+                  if recipe['component'] == 'llama-server' and recipe['platform'] == platform)
+    recipe['source']['path'] = str(pathlib.Path(os.environ['ELASTOS_LLAMA_ARM64_BUNDLE']).absolute())
+    with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=upstream.directory(cache)) as temporary:
+        engine = upstream.package(recipe, cache, pathlib.Path(temporary))
+        shutil.copyfile(pathlib.Path(temporary) / engine['release_path'], artifacts_dir / engine['release_path'])
+    platform_info('llama-server').update({key: engine[key] for key in
+                                         ('checksum', 'size', 'release_path', 'extract_path', 'install_path', 'binary_path')})
+    platform_info('llama-server').pop('strategy', None)
+    manifest['external']['llama-server']['capsule_metadata'] = {
+        'role': 'content', 'type': 'data', 'install_path': 'capsules/llama-server',
+        'platforms': {platform: engine['capsule_metadata']}}
 
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
@@ -351,6 +400,7 @@ browser_capsules = {
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
     "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
+    "chat-room": pathlib.Path(os.environ["CHAT_ROOM_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
     "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
@@ -361,9 +411,6 @@ for name, capsule_dir in browser_capsules.items():
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
-catalog_dest = data_dir / "model-catalog.json"
-catalog_dest.write_bytes(components_src.with_name("model-catalog.json").read_bytes())
-catalog_dest.chmod(0o600)
 PY
 
 echo "[local-carrier-setup] staged local artifacts into ${ARTIFACTS_DIR}"
@@ -475,10 +522,25 @@ if [[ -z "${CONNECT_TICKET}" || -z "${NODE_ID}" ]]; then
     exit 1
 fi
 
+# The holder keeps its own data and build prerequisite. Only localhost-provider
+# is a fixture startup prerequisite in the consumer; Kubo starts absent.
+PUBLISHER_DATA_DIR="${DATA_DIR}"
+XDG_DATA_HOME="${TEST_ROOT}/consumer-data"
+DATA_DIR="${XDG_DATA_HOME}/elastos"
+[[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
+mkdir -p "${DATA_DIR}/bin"
+cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
+install -m 700 "$(cargo_release_binary elastos localhost-provider)" \
+    "${DATA_DIR}/bin/localhost-provider"
+[[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]
+
+# This fixture has an unsigned local publisher, so it is a source-checkout
+# setup, not an installed signed release: it sets no install_path. Setup then
+# reads ELASTOS_COMPONENTS_MANIFEST and still fetches every part over Carrier.
+# Installed releases admit their private signed pair first (setup.rs tests).
 SOURCES_PATH="${DATA_DIR}/sources.json"
 CONNECT_TICKET="${CONNECT_TICKET}" \
 NODE_ID="${NODE_ID}" \
-ELASTOS_BIN_PATH="${ELASTOS_BIN}" \
 SOURCES_PATH="${SOURCES_PATH}" \
 python3 - <<'PY'
 import json
@@ -497,7 +559,7 @@ sources = {
             "publisher_node_id": os.environ["NODE_ID"],
             "ipns_name": "",
             "gateways": [],
-            "install_path": os.environ["ELASTOS_BIN_PATH"],
+            "install_path": "",
             "installed_version": "",
             "head_cid": "",
         }
@@ -520,6 +582,9 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
 stop_source_runtime
 
 for installed in \
+    "${DATA_DIR}/bin/kubo" \
+    "${DATA_DIR}/capsules/kubo/capsule.json" \
+    "${DATA_DIR}/capsules/kubo/LICENSE" \
     "${DATA_DIR}/bin/shell" \
     "${DATA_DIR}/bin/localhost-provider" \
     "${DATA_DIR}/bin/did-provider" \
@@ -547,6 +612,8 @@ for installed in \
     "${DATA_DIR}/capsules/browser/browser/index.html" \
     "${DATA_DIR}/capsules/documents/browser/index.html" \
     "${DATA_DIR}/capsules/inbox/browser/index.html" \
+    "${DATA_DIR}/capsules/chat-room/browser/index.html" \
+    "${DATA_DIR}/capsules/chat-room/browser/chat_room_ui_bg.wasm" \
     "${DATA_DIR}/capsules/library/browser/index.html" \
     "${DATA_DIR}/capsules/library/browser/library.css" \
     "${DATA_DIR}/capsules/library/browser/src/app.js" \

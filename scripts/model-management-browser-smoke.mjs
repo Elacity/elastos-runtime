@@ -130,7 +130,7 @@ let activePage;
 try {
   for (const app of ["marketplace", "system"]) {
     // Marketplace renders the compact detail: Get instead of Use, device-centred phase copy, no hints.
-    const acquire = app === "marketplace" ? "Get" : "Use";
+    const acquire = app === "marketplace" ? "Get" : "Download";
     const copy = app === "marketplace"
       ? { absent: "Not on this device yet", reclaimed: "Removed from this device" }
       : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };
@@ -164,7 +164,7 @@ try {
     assert.match(await frame.locator("body").textContent(), /did:key:zFixturePublisher/);
     if (app === "marketplace") {
       // The model detail leads with identity and verification, then the controls, then exact identifiers.
-      assert.equal(await frame.locator(".modal-developer").innerText(), "Verified publisher · did:key:zFixturePublisher");
+      assert.equal(await frame.locator(".modal-developer").innerText(), "Runtime-verified publisher · did:key:zFixturePublisher");
       assert.match(await frame.locator(".modal-version").innerText(), /^1\.02 KB download$/);
       assert.equal(await frame.locator(".modal-body .modal-section-title").filter({ hasText: /^(About|Status|Works with|Available actions)$/ }).count(), 0,
         "the model detail has no checklist sections");
@@ -425,7 +425,7 @@ try {
       await frame.getByRole("button", { name: "Media", exact: true }).click();
       assert.match(await frame.locator("#store-sections").innerText(), /No|media/i);
     }
-    selectedCid = `bafybei${"b".repeat(52)}`; phase = "unprepared";
+    selectedCid = `bafybei${"b".repeat(52)}`; phase = "unprepared"; kept = false;
     await frame.locator("body").evaluate(() => { delete document.hidden; document.dispatchEvent(new Event("visibilitychange")); });
     if (app === "marketplace") {
       const refreshed = page.waitForResponse(r => new URL(r.url()).pathname === "/api/capsules/catalog");

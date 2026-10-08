@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::host_lock::FileLock;
+
 const AUTH_STATE_SCHEMA: &str = "elastos.auth.state/v1";
 pub(crate) const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const AUTH_STATE_ROOT: &str = "ElastOS/System/Auth";
@@ -3144,12 +3146,12 @@ fn open_audit_chain_activation_lock(data_dir: &Path) -> anyhow::Result<File> {
     open_regular_lock_file(&path, "audit activation")
 }
 
-fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    file.lock().context("failed to lock auth state")
+fn lock_auth_state_file(file: File) -> anyhow::Result<FileLock> {
+    FileLock::exclusive(file).context("failed to lock auth state")
 }
 
-fn unlock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    file.unlock().context("failed to unlock auth state")
+fn unlock_auth_state_file(lock: FileLock) -> anyhow::Result<()> {
+    lock.release().context("failed to unlock auth state")
 }
 
 fn mutate_auth_state<T>(
@@ -3159,21 +3161,13 @@ fn mutate_auth_state<T>(
     let _guard = auth_state_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
-    let lock_file = open_auth_state_lock(data_dir)?;
-    lock_auth_state_file(&lock_file)?;
-    let result = (|| {
-        let mut state = load_auth_state(data_dir)?;
-        ensure_audit_chain_state(data_dir, &mut state)?;
-        let value = mutation(&mut state)?;
-        save_auth_state(data_dir, &state)?;
-        Ok(value)
-    })();
-    let unlock = unlock_auth_state_file(&lock_file);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    }
+    let lock = lock_auth_state_file(open_auth_state_lock(data_dir)?)?;
+    let mut state = load_auth_state(data_dir)?;
+    ensure_audit_chain_state(data_dir, &mut state)?;
+    let value = mutation(&mut state)?;
+    save_auth_state(data_dir, &state)?;
+    unlock_auth_state_file(lock)?;
+    Ok(value)
 }
 
 pub fn load_or_create_recovery_archive_key(data_dir: &Path) -> anyhow::Result<[u8; 32]> {
@@ -3280,15 +3274,10 @@ fn with_audit_chain_activation_lock<T>(
     let _guard = audit_chain_activation_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("audit activation lock poisoned"))?;
-    let lock_file = open_audit_chain_activation_lock(data_dir)?;
-    lock_auth_state_file(&lock_file)?;
-    let result = operation();
-    let unlock = unlock_auth_state_file(&lock_file);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    }
+    let lock = lock_auth_state_file(open_audit_chain_activation_lock(data_dir)?)?;
+    let value = operation()?;
+    unlock_auth_state_file(lock)?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -6327,6 +6316,35 @@ pub fn migrate_declared_principal_roots_offline<F>(
 where
     F: FnOnce() -> anyhow::Result<Vec<PrincipalRootUpgradeDeclarationV1>>,
 {
+    migrate_declared_principal_roots_offline_inner(data_dir, backup_dir, declarations, None)
+}
+
+pub(crate) fn migrate_declared_principal_roots_for_update<F>(
+    data_dir: &Path,
+    backup_dir: &Path,
+    declarations: F,
+    activation: &crate::install_transaction::SupportActivation<'_>,
+) -> anyhow::Result<PrincipalRootUpgradeReceiptV1>
+where
+    F: FnOnce() -> anyhow::Result<Vec<PrincipalRootUpgradeDeclarationV1>>,
+{
+    migrate_declared_principal_roots_offline_inner(
+        data_dir,
+        backup_dir,
+        declarations,
+        Some(activation),
+    )
+}
+
+fn migrate_declared_principal_roots_offline_inner<F>(
+    data_dir: &Path,
+    backup_dir: &Path,
+    declarations: F,
+    activation: Option<&crate::install_transaction::SupportActivation<'_>>,
+) -> anyhow::Result<PrincipalRootUpgradeReceiptV1>
+where
+    F: FnOnce() -> anyhow::Result<Vec<PrincipalRootUpgradeDeclarationV1>>,
+{
     if !data_dir.is_absolute() || !backup_dir.is_absolute() {
         anyhow::bail!("principal-root upgrade data and backup paths must be absolute");
     }
@@ -6334,8 +6352,16 @@ where
     if backup_dir.parent() != Some(expected_backup_parent.as_path()) {
         anyhow::bail!("principal-root upgrade backup must be a direct child of data-dir/backups");
     }
-    let _host_guard =
-        crate::host_lock::acquire_host_process_lock(data_dir, "principal-root-upgrade", "offline")?;
+    let _host_guard = match activation {
+        Some(activation) => {
+            crate::host_lock::acquire_principal_root_update_lock(data_dir, activation)?
+        }
+        None => crate::host_lock::acquire_host_process_lock(
+            data_dir,
+            "principal-root-upgrade",
+            "offline",
+        )?,
+    };
     let _object_guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
@@ -7300,25 +7326,22 @@ mod tests {
             return;
         };
         let file = File::options().read(true).write(true).open(path).unwrap();
+        let probe = FileLock::try_exclusive(file);
         if std::env::var_os("ELASTOS_AUTH_LOCK_TEST_HELD").is_some() {
-            assert!(matches!(
-                file.try_lock(),
-                Err(std::fs::TryLockError::WouldBlock)
-            ));
+            assert_eq!(probe.unwrap_err().kind(), ErrorKind::WouldBlock);
         } else {
-            file.try_lock().unwrap();
-            unlock_auth_state_file(&file).unwrap();
+            probe.unwrap();
         }
     }
 
     #[test]
     fn auth_state_lock_excludes_another_process_and_releases() {
         let root = tempfile::tempdir().unwrap();
-        let file = open_auth_state_lock(root.path()).unwrap();
-        lock_auth_state_file(&file).unwrap();
+        let mut lock =
+            Some(lock_auth_state_file(open_auth_state_lock(root.path()).unwrap()).unwrap());
         for held in [true, false] {
             if !held {
-                unlock_auth_state_file(&file).unwrap();
+                unlock_auth_state_file(lock.take().unwrap()).unwrap();
             }
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
@@ -9930,6 +9953,90 @@ mod tests {
                     *plaintext
                 );
             }
+        }
+    }
+
+    #[test]
+    fn update_owned_offline_upgrade_migrates_before_commit_and_preserves_release_recovery() {
+        use crate::install_transaction::{InstallTransaction, ReleaseFile};
+        use std::os::unix::fs::PermissionsExt;
+
+        for fault in [None, Some(PrincipalRootMigrationTestFault::Commit(0))] {
+            let fixture = OfflineMigrationFixture::new(2);
+            let data_dir = std::fs::canonicalize(fixture.data_dir.path()).unwrap();
+            let binary = data_dir.join("update-bin/elastos");
+            std::fs::create_dir(binary.parent().unwrap()).unwrap();
+            let metadata = data_dir.join("installation");
+            create_owner_only_dir(&metadata).unwrap();
+            let old_files = [
+                (ReleaseFile::RuntimeBinary, binary.clone()),
+                (ReleaseFile::Components, data_dir.join("components.json")),
+                (ReleaseFile::Sources, data_dir.join("sources.json")),
+                (ReleaseFile::ReleaseHead, metadata.join("release-head.json")),
+                (ReleaseFile::ReleaseManifest, metadata.join("release.json")),
+            ];
+            for (id, path) in &old_files {
+                std::fs::write(path, b"previous release").unwrap();
+                std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(if *id == ReleaseFile::RuntimeBinary {
+                        0o755
+                    } else {
+                        0o600
+                    }),
+                )
+                .unwrap();
+            }
+            let transaction = InstallTransaction::acquire(&data_dir, &binary).unwrap();
+            transaction
+                .prepare(
+                    &old_files
+                        .clone()
+                        .map(|(id, _)| (id, b"candidate release".as_slice())),
+                )
+                .unwrap();
+            let activation = transaction.activate_artifacts_for_support().unwrap();
+            let backup = data_dir.join("backups/update-owned-upgrade");
+            let declarations = vec![PrincipalRootUpgradeDeclarationV1 {
+                principal_id: fixture.principal_id.clone(),
+                localhost_root: fixture.localhost_root.clone(),
+                inventory: vec![PrincipalRootProtectedObjectDeclarationV1::root(format!(
+                    "{}/.AppData/LocalHost/GBA",
+                    fixture.localhost_root,
+                ))],
+            }];
+            if let Some(fault) = fault {
+                inject_principal_root_migration_test_fault(&data_dir, fault);
+            }
+            let result = migrate_declared_principal_roots_for_update(
+                &data_dir,
+                &backup,
+                || Ok(declarations),
+                &activation,
+            );
+            assert!(InstallTransaction::has_pending_recovery(&binary));
+            if fault.is_some() {
+                result.unwrap_err();
+                fixture.assert_all_plaintext();
+                transaction.recover().unwrap();
+                for (_, path) in &old_files {
+                    assert_eq!(std::fs::read(path).unwrap(), b"previous release");
+                }
+            } else {
+                let receipt = result.unwrap();
+                assert_eq!(receipt.status, "migrated");
+                assert_eq!(receipt.object_count, 2);
+                fixture.assert_all_encrypted();
+                activation
+                    .authorize_principal_root_migration(&data_dir)
+                    .unwrap();
+                transaction.commit_checked(|| Ok(())).unwrap();
+                for (_, path) in &old_files {
+                    assert_eq!(std::fs::read(path).unwrap(), b"candidate release");
+                }
+            }
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+            assert!(backup.is_dir());
         }
     }
 

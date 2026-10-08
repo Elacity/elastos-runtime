@@ -73,6 +73,10 @@
   <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
   <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
+  <span id="toolbar-link-status" class="toolbar-link-status" role="status">
+    <span class="toolbar-link-status-dot" aria-hidden="true"></span>
+    <span id="toolbar-link-status-text" class="toolbar-link-status-text"></span>
+  </span>
   <button
     id="toolbar-wallet"
     class="toolbar-btn wallet-btn"
@@ -145,6 +149,10 @@
   inert
   hidden
 >
+  <div class="notification-center-link">
+    <p class="notification-center-link-title">Reconnecting to your Home…</p>
+    <p class="notification-center-link-detail">What you see may be out of date until it answers.</p>
+  </div>
   <div class="nc-cal" aria-label="Date">
     <div class="nc-cal-primary">
       <div id="nc-cal-date" class="nc-cal-date">—</div>
@@ -240,11 +248,6 @@
   <div class="control-centre-divider" role="separator"></div>
   <div class="control-centre-section" aria-label="Nearby">
     <div class="control-centre-label">Nearby</div>
-    <button id="control-centre-discovery" class="control-centre-row" type="button" role="switch" aria-checked="false">
-      <span class="control-centre-row-label">Find People</span>
-      <span class="control-centre-switch" aria-hidden="true"></span>
-    </button>
-    <p id="control-centre-discovery-detail" class="control-centre-hint" hidden></p>
     <div id="control-centre-carrier" class="control-centre-row control-centre-row-static" aria-live="polite">
       <span class="control-centre-row-label">Carrier</span>
       <span id="control-centre-carrier-detail" class="control-centre-row-detail">—</span>
