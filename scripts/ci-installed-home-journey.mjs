@@ -12,6 +12,7 @@ assert(!mode || mode === "--home-only", "supported installed journey mode requir
 const cid = JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
 let browser, page;
 let stage = "journey";
+let subcheck = null;
 const results = {};
 const disk = {};
 function observeDisk() {
@@ -183,23 +184,36 @@ try {
     const request = acceptedResponse.request().postDataJSON();
     assert.equal(request.offer_id, offer);
     assert.equal(request.operation, "text.generate");
+    subcheck = "request_cap";
     assert.equal(request.input?.max_output_tokens, 16, "normal Assistant controls bound the greeting");
+    subcheck = "request_authority";
     const assistantToken = await assistant.evaluate(() => new URLSearchParams(location.hash.slice(1)).get("home_token"));
     assert(Boolean(assistantToken) && acceptedResponse.request().headers()["x-elastos-home-token"] === assistantToken, "Assistant uses its own launch authority");
+    subcheck = null;
     const created = await acceptedResponse.json();
     assert.equal(created.status, "ok");
     assert(created.data?.run_id);
+    subcheck = "terminal_status";
     const finishedResponse = await terminalResponse;
     assert(finishedResponse.ok());
     const finished = await finishedResponse.json();
     const terminal = applyRunEventsPage(finished.data, finishedResponse.request().postDataJSON().after_sequence).terminal;
     assert.equal(terminal?.status, "completed", "installed Runtime completes the visible Assistant turn");
+    subcheck = "terminal_output";
     assert(terminal.outputRetained !== false && terminalOutputText(terminal.output).trim().length > 0, "Runtime retains the real local reply");
+    subcheck = "reply_display";
     await assistant.locator('.agent-msg-agent [data-regenerate]:enabled').last().waitFor({ state: "visible", timeout: 10000 });
-    const text = (await assistant.locator(".agent-msg-agent .agent-msg-body").last().innerText()).trim();
+    const reply = assistant.locator(".agent-msg-agent .agent-msg-body").last();
+    await reply.waitFor({ state: "visible", timeout: 10000 });
+    await assistant.waitForFunction(() => {
+      const body = [...document.querySelectorAll(".agent-msg-agent .agent-msg-body")].at(-1);
+      return /\S/.test(body?.innerText ?? "");
+    }, null, { timeout: 10000 });
+    const text = (await reply.innerText()).trim();
     assert(text.length > 0, "Assistant displays the real local reply");
     results.installed_runtime_reply = "passed";
     await page.screenshot({ path: join(evidence, "assistant-reply-desktop.png"), fullPage: true });
+    subcheck = "reply_bounds";
     await page.setViewportSize({ width: 390, height: 844 });
     await assistant.waitForFunction(() =>
       !document.body.classList.contains("agent-harness-drawer-open") &&
@@ -219,11 +233,11 @@ try {
 } catch (error) {
   results[stage] = "failed";
   disk.at_failure = observeDisk();
-  const failure = publicJourneyFailure(error, stage);
+  const failure = publicJourneyFailure(error, stage, subcheck);
   writeFileSync(join(data, "journey-browser.private.log"), String(error?.stack ?? error), { mode: 0o600 });
   writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, ...failure }, null, 2));
   await page?.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
-  throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}`);
+  throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}${failure.failure_check ? ` check=${failure.failure_check}` : ""}`);
 } finally {
   await browser?.close();
 }

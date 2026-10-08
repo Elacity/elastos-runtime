@@ -21,3 +21,23 @@ test("public failures accept only owned stages and fixed failure codes", () => {
     { failure_stage: "journey", failure: "journey_failed" });
   assert.deepEqual(publicJourneyFailure(null, null), { failure_stage: "journey", failure: "journey_failed" });
 });
+
+test("reply subchecks expose only fixed names while error details stay private", () => {
+  const secret = "home_token=fixture-secret /private/operator/home";
+  for (const subcheck of ["request_cap", "request_authority", "terminal_status", "terminal_output", "reply_display", "reply_bounds"]) {
+    for (const name of ["AssertionError", "TimeoutError", "Error"]) {
+      const failure = publicJourneyFailure({ name, message: secret, code: secret, stack: secret }, "installed_runtime_reply", subcheck);
+      assert.equal(failure.failure_check, subcheck);
+      assert.equal(failure.failure, { AssertionError: "assertion_failed", TimeoutError: "timeout", Error: "journey_failed" }[name]);
+      assert(!JSON.stringify(failure).includes(secret));
+      assert(!JSON.stringify(failure).includes("fixture-secret"));
+      assert(!JSON.stringify(failure).includes("/private/operator"));
+    }
+  }
+  assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: secret, code: "reply_display" }, "installed_runtime_reply", secret),
+    { failure_stage: "installed_runtime_reply", failure: "assertion_failed" });
+  assert.deepEqual(publicJourneyFailure({ name: "Error", message: secret }, secret, "reply_display"),
+    { failure_stage: "journey", failure: "journey_failed" });
+  assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: secret }, "engine_absent_refusal", "reply_display"),
+    { failure_stage: "engine_absent_refusal", failure: "assertion_failed" });
+});
