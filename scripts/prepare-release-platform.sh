@@ -9,12 +9,21 @@ source "$SOURCE_ROOT/scripts/publish-release.sh"
 usage() {
     cat <<'EOF'
 Usage: scripts/prepare-release-platform.sh --version X.Y.Z --output DIR [--reuse-support M1_DIR]
+       [--browser-vm-image PATH --browser-vm-image-sha256 HEX]
+       [--browser-vm-image-set DIR]
 
 Build local release inputs on Linux x86_64/ARM64 or macOS ARM64 from a clean
 checkout. DIR must be absent. Use a directory outside the checkout, or one
 whose temporary sibling is ignored by Git. CARGO_TARGET_DIR selects the native
 build cache; otherwise Cargo resolves it. CARGO_BUILD_JOBS defaults to 4 (max 4).
 The output contains artifacts/, draft components.json and platform-input.json.
+Browser images are operator-built inputs, supplied as a local package and SHA-256.
+--browser-vm-image-set packages the verified rootfs/kernel/initrd set with the
+release producer. Reuse the existing verified set when its guest inputs match.
+Fresh support preparation requires the package for this host platform. It is
+verified before Cargo runs and enters the signed release with the support assets.
+--reuse-support retains the admitted image. Build and qualify guest images on
+the native target outside CI; CI keeps the existing fast source and package tests.
 Generic provider microVM rootfs and Browser substrate acceptance are separate.
 Fresh Linux ARM64 support requires ELASTOS_LLAMA_ARM64_BUNDLE to name the reviewed b10516
 archive. The archive is verified against its build recipe before any build.
@@ -28,14 +37,20 @@ EOF
 VERSION=""
 OUTPUT=""
 REUSE_SUPPORT=""
+BROWSER_VM_IMAGE=""
+BROWSER_VM_IMAGE_SHA256=""
+BROWSER_VM_IMAGE_SET=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version|--output|--reuse-support)
+        --version|--output|--reuse-support|--browser-vm-image|--browser-vm-image-sha256|--browser-vm-image-set)
             [[ $# -ge 2 && -n "$2" ]] || die "Missing value for $1"
             case "$1" in
                 --version) VERSION="$2" ;;
                 --output) OUTPUT="$2" ;;
                 --reuse-support) REUSE_SUPPORT="$2" ;;
+                --browser-vm-image) BROWSER_VM_IMAGE="$2" ;;
+                --browser-vm-image-sha256) BROWSER_VM_IMAGE_SHA256="$2" ;;
+                --browser-vm-image-set) BROWSER_VM_IMAGE_SET="$2" ;;
             esac
             shift 2
             ;;
@@ -57,6 +72,20 @@ path = Path(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
 print(path.parent.resolve() / path.name)
 PY
 )
+if [[ -n "$BROWSER_VM_IMAGE" ]]; then
+    BROWSER_VM_IMAGE=$(python3 - "$CALLER_DIR" "$BROWSER_VM_IMAGE" <<'PYTHON'
+import os, sys
+print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
+PYTHON
+)
+fi
+if [[ -n "$BROWSER_VM_IMAGE_SET" ]]; then
+    BROWSER_VM_IMAGE_SET=$(python3 - "$CALLER_DIR" "$BROWSER_VM_IMAGE_SET" <<'PYTHON'
+import os, sys
+print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
+PYTHON
+)
+fi
 if [[ -n "$REUSE_SUPPORT" ]]; then
     REUSE_SUPPORT=$(python3 - "$CALLER_DIR" "$REUSE_SUPPORT" <<'PY'
 import os, sys
@@ -88,6 +117,9 @@ digest = hashlib.sha256(source.read_bytes()).hexdigest()
 if "sha256:" + digest != info["checksum"]:
     raise SystemExit("ARM64 llama-server bundle checksum differs from components.json")
 PY
+fi
+if [[ -n "$REUSE_SUPPORT" && ( -n "$BROWSER_VM_IMAGE" || -n "$BROWSER_VM_IMAGE_SHA256" || -n "$BROWSER_VM_IMAGE_SET" ) ]]; then
+    die "--reuse-support retains its image; supply Browser image inputs only for fresh support"
 fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 case "$CARGO_BUILD_JOBS" in 1|2|3|4) ;; *) die "CARGO_BUILD_JOBS must be between 1 and 4" ;; esac
@@ -136,6 +168,29 @@ for name in omitted:
 PY
 SUPPORT_BINARY_ASSETS=()
 while IFS= read -r name; do SUPPORT_BINARY_ASSETS+=("$name"); done < "$WORK_DIR/native-assets.txt"
+fi
+
+if [[ -z "$REUSE_SUPPORT" ]]; then
+    if [[ -n "$BROWSER_VM_IMAGE_SET" ]]; then
+        [[ -z "$BROWSER_VM_IMAGE" && -z "$BROWSER_VM_IMAGE_SHA256" ]] || die "Select an image set or a pinned image package"
+        BROWSER_VM_IMAGE="$WORK_DIR/browser-image.tar.gz"
+        python3 "$SOURCE_ROOT/scripts/package-browser-vm-image.py" \
+            --image-dir "$BROWSER_VM_IMAGE_SET" --platform "$SETUP_PLATFORM" \
+            --archive "$BROWSER_VM_IMAGE" --manifest-output "$WORK_DIR/packaged-browser-image.json" \
+            --release-path "browser-vm-image-${SETUP_PLATFORM}.tar.gz"
+        BROWSER_VM_IMAGE_SHA256=$(python3 - "$BROWSER_VM_IMAGE" <<'PYTHON'
+import hashlib, pathlib, sys
+with pathlib.Path(sys.argv[1]).open('rb') as stream:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b''): digest.update(chunk)
+print(digest.hexdigest())
+PYTHON
+)
+    fi
+    python3 scripts/release-platform-input.py stage-browser-image \
+        --root "$STAGING" --platform "$PLATFORM" \
+        --package "$BROWSER_VM_IMAGE" \
+        --sha256 "$BROWSER_VM_IMAGE_SHA256" --output "$WORK_DIR/browser-image.json"
 fi
 
 # locate-project reads workspace ownership without resolving or generating locks.
@@ -204,10 +259,34 @@ NATIVE_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$BU
 APP_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
 PROVIDER_METADATA=$(build_platform_independent_provider_capsule_metadata_assets)
 UPSTREAM_ASSETS=$(build_upstream_direct_assets "$PLATFORM" "$SETUP_PLATFORM")
+# Script wrappers are staged only after every selected native producer completes.
+# The stager checks source bindings; final admission checks all referenced bytes.
+printf '%s\n' "$NATIVE_ASSETS" "$UPSTREAM_ASSETS" | jq -s '.[0] * .[1]' > "$WORK_DIR/browser-native.json"
+BROWSER_HOST_ASSETS=$(python3 - "$SOURCE_ROOT" "$SETUP_PLATFORM" "$TMPDIR/supported-assets-$PLATFORM" "$WORK_DIR/browser-native.json" <<'PYTHON'
+import importlib.util, json, pathlib, sys
+root, platform, output, native_file = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+spec = importlib.util.spec_from_file_location("browser_host", root / "scripts/browser-host-release.py")
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+template = json.loads((root / "components.json").read_text())
+native_assets = json.loads(native_file.read_text())["external"]
+native = []
+for name in template.get("profiles", {}).get("browser-host", {}).get("components", []):
+    info = template["external"][name].get("platforms", {}).get(platform)
+    if info is None or "source" in info: continue
+    staged = native_assets.get(name, {}).get("platforms", {}).get(platform)
+    if not staged or not staged.get("checksum") or not staged.get("size"):
+        raise ValueError("Browser native producer did not complete: " + name)
+    native.append(name)
+print(json.dumps(module.stage(root, platform, output, native)))
+PYTHON
+)
 DIRECT_ASSETS=$(merge_direct_assets "$(merge_direct_assets "$NATIVE_ASSETS" "$APP_ASSETS")" "$PROVIDER_METADATA")
 DIRECT_ASSETS=$(merge_direct_assets "$DIRECT_ASSETS" "$UPSTREAM_ASSETS")
+DIRECT_ASSETS=$(merge_direct_assets "$DIRECT_ASSETS" "$BROWSER_HOST_ASSETS")
+BROWSER_IMAGE_ASSETS=$(cat "$WORK_DIR/browser-image.json")
+DIRECT_ASSETS=$(merge_direct_assets "$DIRECT_ASSETS" "$BROWSER_IMAGE_ASSETS")
 generate_components_json '{}' "$DIRECT_ASSETS" > "$WORK_DIR/components-merged.json"
-printf '%s\n' "$NATIVE_ASSETS" "$APP_ASSETS" "$PROVIDER_METADATA" "$UPSTREAM_ASSETS" | jq -s '.' > "$WORK_DIR/direct-assets.json"
+printf '%s\n' "$NATIVE_ASSETS" "$APP_ASSETS" "$PROVIDER_METADATA" "$UPSTREAM_ASSETS" "$BROWSER_HOST_ASSETS" "$BROWSER_IMAGE_ASSETS" | jq -s '.' > "$WORK_DIR/direct-assets.json"
 
 # Replace each built descriptor, including universal provider metadata, as a unit.
 # A recursive template merge must not retain an old CID or URL for new bytes.

@@ -199,6 +199,30 @@ platform matrix. Generic provider VM archives remain a separate build path.
 Linux preparation needs tracked lockfiles for the standalone Browser helper
 projects; a missing lockfile stops preparation before a native build.
 
+For Mac and Linux ARM64, add `--browser-vm-image-set /path/to/verified-image-set`.
+Browser preparation packages the verified four-member rootfs/kernel/initrd set
+and matching host helpers in this same input. Reuse the qualified image when its
+guest inputs match. An existing package can instead be supplied with
+`--browser-vm-image PATH --browser-vm-image-sha256 HEX`. Image qualification runs
+on the target outside CI. The package checker verifies the receipt and every
+member before native compilation starts.
+
+Pinned build recipes supply Node, TURN, Python, debugfs and Linux ARM64 crosvm.
+The source builds retain their inputs, licences and native library audit. The
+Python package retains the distribution's complete notices and omits the terminal
+database for its noninteractive helpers. Native Linux builds need a musl C/C++
+toolchain with Linux UAPI headers and the Rust musl target; crosvm also needs
+libclang for bindgen. Its pinned libcap source supplies the static capability
+library. The worker leaves seccomp compilation to pinned Minijail and enforces
+its policies; an ambient policy compiler stops preparation.
+Linux UAPI inputs come from the worker's system headers, or the explicit
+`ELASTOS_BROWSER_LINUX_UAPI_INCLUDE` root. The capsule retains these headers and
+locked Cargo sources with normalized archive ownership.
+TURN preparation requires Perl, make, Autoconf, Automake and GNU Libtool before
+compilation starts.
+The build worker uses `zstd` to read the pinned Python notice archive. These are
+build tools; normal setup obtains the prepared payloads from the signed release.
+
 From that same clean candidate checkout, check all three transferred inputs:
 
 ```sh

@@ -107,7 +107,7 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          brew install e2fsprogs coturn pkg-config openssl@3
+          brew install e2fsprogs coturn pkg-config openssl@3 autoconf automake libtool zstd
           python3 -I -S ../workflow/.github/scripts/release-mac-capacity.py
       - name: keep the capacity record
         if: always() && env.RELEASE_ROOT != ''
@@ -297,7 +297,7 @@ jobs:
         timeout-minutes: 15
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config autoconf automake libtool libclang-dev linux-libc-dev zstd
       - name: download pinned ARM64 engine input
         if: matrix.platform == 'aarch64-linux'
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5

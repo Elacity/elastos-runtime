@@ -29,8 +29,9 @@ def selected_recipes(platform):
 
 def resolved_recipe(original, llama_arm64_bundle=None):
     recipe = copy.deepcopy(original)
-    sources = [recipe["source"], *[item["source"] for item in recipe["license"]["files"]],
-               *[item["source"] for item in recipe.get("notices", [])]]
+    sources = [recipe["source"], *[item["source"] for item in recipe["license"]["files"] if "source" in item],
+               *[item["source"] for item in recipe.get("notices", []) if "source" in item],
+               *[dep["source"] for dep in recipe.get("build", {}).get("dependencies", [])]]
     for source in sources:
         if "path" not in source:
             continue

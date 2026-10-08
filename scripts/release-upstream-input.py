@@ -9,6 +9,7 @@ import argparse
 import gzip
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -36,10 +37,11 @@ def canonical(value):
                        ensure_ascii=False) + "\n").encode()
 
 
-def relative(value):
+def relative(value, *, source_archive=False):
+    pattern = r"[.A-Za-z0-9_@][A-Za-z0-9._+@-]*" if source_archive else r"[A-Za-z0-9][A-Za-z0-9._+-]*"
     if (not isinstance(value, str) or len(value) > 240 or "\\" in value
             or PurePosixPath(value).is_absolute()
-            or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part)
+            or any(not re.fullmatch(pattern, part)
                    or part in (".", "..") for part in value.split("/"))):
         raise ValueError(f"unsafe package path: {value!r}")
     return value
@@ -198,7 +200,7 @@ def cached_input(source, cache, limit=MAX_BYTES):
         temporary.unlink(missing_ok=True)
 
 
-def link_target(name, target, root, symbolic):
+def link_target(name, target, root, symbolic, *, source_archive=False):
     """Tar symlinks are parent-relative; hardlinks name archive members."""
     if (not isinstance(target, str) or not target or len(target) > 240
             or "\\" in target or target.startswith("/")):
@@ -212,25 +214,25 @@ def link_target(name, target, root, symbolic):
                 raise ValueError("upstream archive link escapes its capsule root")
             parts.pop()
         else:
-            relative(part)
+            relative(part, source_archive=source_archive)
             parts.append(part)
-    resolved = relative("/".join(parts))
+    resolved = relative("/".join(parts), source_archive=source_archive)
     if resolved != root and not resolved.startswith(root + "/"):
         raise ValueError("upstream archive link escapes its capsule root")
     return resolved
 
 
-def archive_members(path, kind, root, maximum):
+def archive_members(path, kind, root, maximum, *, source_archive=False, max_files=MAX_FILES):
     """Validate the whole archive before creating any package output."""
     files, seen, total = {}, set(), 0
     archive = tarfile.open(path, "r|gz") if kind == "tar.gz" else zipfile.ZipFile(path)
     with archive:
         entries = archive if kind == "tar.gz" else archive.infolist()
         for entry in entries:
-            name = relative((entry.name if kind == "tar.gz" else entry.filename).rstrip("/"))
+            name = relative((entry.name if kind == "tar.gz" else entry.filename).rstrip("/"), source_archive=source_archive)
             if name != root and not name.startswith(root + "/"):
                 raise ValueError("upstream archive escapes its recorded capsule root")
-            if name in seen or len(seen) >= MAX_FILES:
+            if name in seen or len(seen) >= max_files:
                 raise ValueError("duplicate or excessive upstream archive members")
             if any(str(parent) in files for parent in PurePosixPath(name).parents):
                 raise ValueError("upstream archive member is beneath a file")
@@ -238,7 +240,9 @@ def archive_members(path, kind, root, maximum):
                 is_file = entry.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
                 is_dir, size, mode = entry.isdir(), entry.size, entry.mode
                 is_link = entry.issym() or entry.islnk()
-                if not (is_file or is_dir or is_link) or entry.pax_headers:
+                harmless_source_comment = (source_archive and set(entry.pax_headers) <= {'comment'}
+                                           and len(entry.pax_headers.get('comment', '').encode()) <= 4096)
+                if not (is_file or is_dir or is_link) or (entry.pax_headers and not harmless_source_comment):
                     raise ValueError("upstream archive special files or extended headers refused")
             else:
                 mode = entry.external_attr >> 16
@@ -252,9 +256,9 @@ def archive_members(path, kind, root, maximum):
                 if is_link:
                     if size != 0:
                         raise ValueError("upstream archive link contains payload bytes")
-                    files[name] = {"target": link_target(name, entry.linkname, root, entry.issym())}
+                    files[name] = {"target": link_target(name, entry.linkname, root, entry.issym(), source_archive=source_archive)}
                 else:
-                    if size <= 0:
+                    if size < 0 or (size == 0 and not source_archive):
                         raise ValueError("upstream archive file is empty")
                     total += size
                     if total > maximum:
@@ -295,7 +299,7 @@ def archive_members(path, kind, root, maximum):
 def validate_recipe(recipe):
     required = {"schema", "component", "platform", "version", "source", "format", "root",
                 "entrypoint", "extract_path", "install_path", "max_unpacked_bytes", "license"}
-    optional = {"binary_path", "model_content", "notices"}
+    optional = {"binary_path", "model_content", "notices", "build", "payload_members"}
     if not isinstance(recipe, dict) or set(recipe) - required - optional or required - set(recipe):
         raise ValueError("upstream capsule recipe fields differ from the build contract")
     if recipe["schema"] != SCHEMA:
@@ -316,6 +320,10 @@ def validate_recipe(recipe):
         raise ValueError("extraction path must be inside the capsule root")
     if recipe["format"] not in ("raw", "tar.gz", "zip"):
         raise ValueError("unsupported upstream payload format")
+    if "payload_members" in recipe and (recipe["component"] != "node"
+            or recipe["format"] != "tar.gz" or recipe["entrypoint"] != "bin/node"
+            or recipe["payload_members"] != ["bin/node"]):
+        raise ValueError("Node runtime selection requires exactly its recorded executable")
     maximum = recipe["max_unpacked_bytes"]
     if type(maximum) is not int or not 0 < maximum <= MAX_BYTES:
         raise ValueError("capsule requires a bounded unpacked size")
@@ -330,15 +338,22 @@ def validate_recipe(recipe):
         raise ValueError("capsule notices must be pinned build input files")
     names = set()
     for item in [*license_info["files"], *notices]:
-        if not isinstance(item, dict) or set(item) != {"name", "source"}:
-            raise ValueError("license/notice requires a name and pinned source")
+        if not isinstance(item, dict) or set(item) not in ({"name", "source"}, {"name", "from_archive"}):
+            raise ValueError("license/notice requires a pinned source or pinned archive member")
+        if "from_archive" in item:
+            relative(item["from_archive"])
+            if recipe["format"] == "raw" or "build" in recipe:
+                raise ValueError("archive licences require an unchanged pinned archive input")
         name = relative(item["name"])
         if name in names or name in ("capsule.json", "PROVENANCE.json", "_elastos_object.json", recipe["entrypoint"]):
             raise ValueError("duplicate or reserved license/notice file name")
-        source_spec(item["source"], METADATA_BYTES)
+        if "source" in item:
+            source_spec(item["source"], METADATA_BYTES)
         names.add(name)
     if "LICENSE" not in names:
         raise ValueError("capsule requires a pinned LICENSE file")
+    if "build" in recipe:
+        builder_module().validate(recipe, _self_module())
     model = recipe.get("model_content")
     if recipe["component"].startswith("model-") and model is None:
         raise ValueError("model capsule requires its explicit model_content contract")
@@ -385,10 +400,20 @@ def source_record(source):
 def public_recipe(recipe):
     value = dict(recipe, source=source_record(recipe["source"]))
     value["license"] = dict(recipe["license"], files=[
-        dict(item, source=source_record(item["source"])) for item in recipe["license"]["files"]])
+        dict(item, source=source_record(item["source"])) if "source" in item else item for item in recipe["license"]["files"]])
     if "notices" in recipe:
-        value["notices"] = [dict(item, source=source_record(item["source"])) for item in recipe["notices"]]
+        value["notices"] = [dict(item, source=source_record(item["source"])) if "source" in item else item for item in recipe["notices"]]
+    if "build" in recipe:
+        value["build"] = dict(recipe["build"], dependencies=[
+            dict(dep, source=source_record(dep["source"])) for dep in recipe["build"]["dependencies"]])
     return value
+
+
+def notice_record(item, recipe):
+    source = source_record(item.get("source", recipe["source"]))
+    if "from_archive" in item:
+        source = dict(source, archive_member=recipe["root"] + "/" + item["from_archive"])
+    return {"name": item["name"], "source": source}
 
 
 def validate_closure_paths(paths):
@@ -404,10 +429,28 @@ def validate_closure_paths(paths):
             raise ValueError("capsule closure places a member beneath a regular file")
 
 
+def _self_module():
+    from types import SimpleNamespace
+    return SimpleNamespace(**globals())
+
+
+def builder_module():
+    spec = importlib.util.spec_from_file_location("browser_upstream_build", Path(__file__).with_name("browser-upstream-build.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def package(recipe, cache, output):
     validate_recipe(recipe)
     cache, output = directory(cache), directory(output)
     payload = cached_input(recipe["source"], cache)
+    payload_checksum = recipe["source"]["checksum"]
+    if "build" in recipe:
+        for item in [*recipe["license"]["files"], *recipe.get("notices", [])]:
+            cached_input(item["source"], cache, METADATA_BYTES)
+        payload = builder_module().build(recipe, payload, cache, _self_module())
+        payload_checksum = "sha256:" + digest(payload)
     root, kind = recipe["root"], recipe["format"]
     if kind == "raw":
         members = {root + "/" + recipe["entrypoint"]: {
@@ -415,7 +458,11 @@ def package(recipe, cache, output):
         if payload.stat().st_size > recipe["max_unpacked_bytes"]:
             raise ValueError("raw upstream payload exceeds its unpacked size bound")
     else:
-        members = archive_members(payload, kind, root, recipe["max_unpacked_bytes"])
+        distribution = ("payload_members" in recipe
+                        or recipe.get("build", {}).get("kind") == "python-standalone-v1")
+        members = archive_members(payload, kind, root, recipe["max_unpacked_bytes"],
+                                  source_archive=distribution,
+                                  max_files=16384 if "payload_members" in recipe else MAX_FILES)
     if root + "/" + recipe["entrypoint"] not in members:
         raise ValueError("upstream archive has no recorded capsule entrypoint")
     if not any(name == recipe["extract_path"] or name.startswith(recipe["extract_path"] + "/") for name in members):
@@ -436,12 +483,24 @@ def package(recipe, cache, output):
         "license": recipe["license"]["spdx_id"],
         "recipe_sha256": hashlib.sha256(canonical(public_recipe(recipe))).hexdigest(),
         "upstream": source_record(recipe["source"]),
-        "notices": [{"name": item["name"], "source": source_record(item["source"])}
+        "notices": [notice_record(item, recipe)
                     for item in [*recipe["license"]["files"], *recipe.get("notices", [])]]})}
     for item in [*recipe["license"]["files"], *recipe.get("notices", [])]:
-        extra[item["name"]] = cached_input(item["source"], cache, METADATA_BYTES).read_bytes()
+        if "source" in item:
+            extra[item["name"]] = cached_input(item["source"], cache, METADATA_BYTES).read_bytes()
+        else:
+            key = root + "/" + item["from_archive"]
+            if key not in members or members[key]["size"] > METADATA_BYTES:
+                raise ValueError("pinned upstream archive licence is missing or too large")
+            with tarfile.open(payload, "r:gz") if kind == "tar.gz" else zipfile.ZipFile(payload) as original:
+                stream = original.extractfile(members[key]["source"]) if kind == "tar.gz" else original.open(key)
+                with stream:
+                    extra[item["name"]] = stream.read(METADATA_BYTES + 1)
     if any(root + "/" + name in members for name in ("capsule.json", "PROVENANCE.json", "_elastos_object.json")):
         raise ValueError("upstream payload collides with capsule metadata")
+    if "payload_members" in recipe:
+        selected = {root + "/" + name for name in recipe["payload_members"]}
+        members = {name: info for name, info in members.items() if name in selected}
     validate_closure_paths(set(members) | {root + "/" + name for name in (*extra, "_elastos_object.json")})
     if kind != "raw":
         opener = tarfile.open(payload, "r:gz") if kind == "tar.gz" else zipfile.ZipFile(payload)
@@ -500,7 +559,7 @@ def package(recipe, cache, output):
                      "files": list(records), "content_digest": "sha256:" + value.hexdigest()}
             data = canonical(index)
             add("_elastos_object.json", io.BytesIO(data), len(data), 0o644)
-        algorithm, expected = checksum_parts(recipe["source"]["checksum"])
+        algorithm, expected = checksum_parts(payload_checksum)
         if digest(payload, algorithm) != expected:
             raise ValueError("upstream cache changed during packaging")
         os.link(temporary, destination)
@@ -509,6 +568,8 @@ def package(recipe, cache, output):
         if archive is not None:
             archive.close()
         temporary.unlink(missing_ok=True)
+        if "build" in recipe:
+            payload.unlink(missing_ok=True)
     result = {"schema": SCHEMA, "component": recipe["component"], "platform": recipe["platform"],
               "release_path": release_path, "checksum": "sha256:" + digest(destination),
               "size": destination.stat().st_size, "extract_path": recipe["extract_path"],

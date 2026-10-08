@@ -136,6 +136,131 @@ class PlatformInputTest(unittest.TestCase):
         self.refresh(root)
         return root
 
+    def browser_image_package(self, platform="linux-arm64", corrupt=False):
+        payloads = {"rootfs.ext4": b"tiny rootfs", "vmlinux": b"image kernel", "initrd": b"image initrd"}
+        record = lambda data: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        receipt = {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
+                   "target_platform": platform, **record(payloads["rootfs.ext4"]),
+                   "kernel": record(payloads["vmlinux"]), "initrd": record(payloads["initrd"]),
+                   "preflight": {"ok": True, "audio_default_ready": True}}
+        if corrupt:
+            payloads["vmlinux"] = b"different kernel"
+        payloads["browser-vm-rootfs-manifest.json"] = json.dumps(receipt).encode()
+        package = self.root / "browser-image.tar.gz"
+        package.write_bytes(archive_bytes([(inputs.BROWSER_IMAGE + "/" + name, data, None)
+                                          for name, data in payloads.items()]))
+        return package
+
+    def test_browser_scripts_require_reviewed_bytes_and_executable_mode(self):
+        source = inputs.SOURCE_ROOT / "scripts/browser-vm-control-service.mjs"
+        source.parent.mkdir()
+        source.write_bytes(b"#!/usr/bin/env node\n// reviewed fixture\n")
+        name = "browser-vm-control-service-module"
+        component = {"install_path": "bin/browser-vm-control-service.mjs", "platforms": {
+            "darwin-arm64": {"source": "scripts/browser-vm-control-service.mjs", "strategy": "source-build",
+                             "release_path": "browser-control-darwin-arm64"}}}
+        self.template["external"][name] = component
+        self.template["profiles"]["browser-host"] = {"components": [name]}
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        root = self.bundles["aarch64-darwin"]
+        manifest = json.loads((root / "components.json").read_text())
+        manifest["profiles"] = self.template["profiles"]
+        artifact = root / "artifacts/browser-control-darwin-arm64"
+        artifact.write_bytes(source.read_bytes())
+        artifact.chmod(0o755)
+        info = {"release_path": artifact.name, "checksum": "sha256:" + inputs.digest(artifact),
+                "size": artifact.stat().st_size, "install_path": component["install_path"]}
+        manifest["external"][name] = {"install_path": component["install_path"], "platforms": {"darwin-arm64": info}}
+        self.write_json(root / "components-template.json", self.template)
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        inputs.verify(root)
+        artifact.chmod(0o644)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "reviewed executable source"):
+            inputs.verify(root)
+        artifact.chmod(0o755)
+        artifact.write_bytes(b"#!/usr/bin/env node\n// unreviewed replacement\n")
+        info.update(checksum="sha256:" + inputs.digest(artifact), size=artifact.stat().st_size)
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "reviewed executable source"):
+            inputs.verify(root)
+
+    def test_browser_image_input_is_local_pinned_and_platform_checked(self):
+        template = copy.deepcopy(self.template)
+        template["external"][inputs.BROWSER_IMAGE] = {
+            "install_path": inputs.BROWSER_IMAGE_INSTALL, "platforms": {
+                "darwin-arm64": {"strategy": inputs.BROWSER_IMAGE,
+                    "release_path": "browser-vm-image-darwin-arm64.tar.gz"}}}
+        self.write_json(inputs.SOURCE_ROOT / "components.json", template)
+        stage = self.root / "image-stage"
+        (stage / "artifacts").mkdir(parents=True)
+        package = self.browser_image_package()
+        args = SimpleNamespace(root=stage, platform="aarch64-darwin", package=str(package),
+                               sha256=inputs.digest(package), output=stage / "overlay.json")
+        inputs.stage_browser_image(args)
+        info = json.loads(args.output.read_bytes())["external"][inputs.BROWSER_IMAGE]["platforms"]["darwin-arm64"]
+        self.assertEqual(info["strategy"], "browser-vm-image")
+        self.assertEqual(info["install_path"], "browser-vm/image-set")
+        self.assertEqual(info["checksum"], "sha256:" + inputs.digest(package))
+        staged = stage / "artifacts" / info["release_path"]
+        self.assertEqual(staged.read_bytes(), package.read_bytes())
+        # A repeated stage preserves its immutable artifact.
+        with self.assertRaises(FileExistsError):
+            inputs.stage_browser_image(args)
+        self.assertEqual(staged.read_bytes(), package.read_bytes())
+        staged.unlink()
+        args.output.unlink()
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=1000, free=0)):
+            with self.assertRaisesRegex(ValueError, "free disk space"):
+                inputs.stage_browser_image(args)
+        self.assertFalse(staged.exists())
+        for concern in ("missing", "pin", "guest", "payload", "truncated", "symlink"):
+            with self.subTest(concern=concern):
+                args.package = str(self.browser_image_package("linux-amd64" if concern == "guest" else "linux-arm64",
+                                                            corrupt=concern == "payload"))
+                if concern == "truncated":
+                    package = Path(args.package)
+                    package.write_bytes(package.read_bytes()[:-8])
+                args.sha256 = inputs.digest(Path(args.package))
+                if concern == "missing": args.package = ""
+                if concern == "pin": args.sha256 = "0" * 64
+                if concern == "symlink":
+                    alias = self.root / "image-alias"
+                    alias.symlink_to(args.package)
+                    args.package = str(alias)
+                with self.assertRaises((ValueError, FileNotFoundError, EOFError)):
+                    inputs.stage_browser_image(args)
+                self.assertFalse(staged.exists())
+                self.assertFalse(args.output.exists())
+
+    def test_browser_image_signed_input_keeps_install_strategy(self):
+        for platform in self.bundles:
+            setup_platform = inputs.PLATFORMS[platform][0]
+            descriptor = {"strategy": "browser-vm-image", "release_path": "browser-vm-image-" + setup_platform + ".tar.gz",
+                          "install_path": "browser-vm/image-set", "extract_path": "browser-vm-image"}
+            self.template["external"].setdefault(inputs.BROWSER_IMAGE, {"install_path": "browser-vm/image-set", "platforms": {}})["platforms"][setup_platform] = descriptor
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        for platform, root in self.bundles.items():
+            setup_platform = inputs.PLATFORMS[platform][0]
+            package = self.browser_image_package("linux-amd64" if setup_platform == "linux-amd64" else "linux-arm64")
+            self.write_json(root / "components-template.json", self.template)
+            data = json.loads((root / "components.json").read_bytes())
+            component = copy.deepcopy(self.template["external"][inputs.BROWSER_IMAGE])
+            descriptor = component["platforms"][setup_platform]
+            shutil.copyfile(package, root / "artifacts" / descriptor["release_path"])
+            descriptor.update(checksum="sha256:" + inputs.digest(package), size=package.stat().st_size)
+            data["external"][inputs.BROWSER_IMAGE] = component
+            self.write_json(root / "components.json", data)
+            self.refresh(root)
+            inputs.verify(root)
+            descriptor["strategy"] = "other-installer"
+            self.write_json(root / "components.json", data)
+            self.refresh(root)
+            with self.assertRaisesRegex(ValueError, "strategy"):
+                inputs.verify(root)
+
     def reuse_fixture(self, version="0.7.2", platform="aarch64-darwin"):
         stage = (self.root / "reused").resolve()
         stage.mkdir()
@@ -406,7 +531,7 @@ class PlatformInputTest(unittest.TestCase):
         (source / "elastos/Cargo.lock").write_text("version = 4\n")
         self.write_json(source / "components.json", self.template)
         for name in ("release-platform-input.py", "components-release-integrity-check.py",
-                     "publish-release.sh", "check-versioning.sh", "install.sh"):
+                     "publish-release.sh", "check-versioning.sh", "install.sh", "browser-host-release.py"):
             shutil.copyfile(Path(__file__).with_name(name), source / "scripts" / name)
         for args in (("init", "-q"), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -1656,7 +1781,7 @@ def load_tests(loader, tests, pattern):
     # Load each inert wrapper case into CI's existing entry point. The same
     # loader keeps unittest -k filters; explicit class/method selections retain
     # unittest's normal behavior and do not enter this module hook.
-    for name in ("release-upstream-input-test.py", "release-source-upstream-test.py"):
+    for name in ("release-upstream-input-test.py", "release-source-upstream-test.py", "browser-host-release-test.py", "browser-upstream-build-test.py"):
         sibling_spec = importlib.util.spec_from_file_location(
             name.replace("-", "_").removesuffix(".py"), Path(__file__).with_name(name))
         sibling = importlib.util.module_from_spec(sibling_spec)

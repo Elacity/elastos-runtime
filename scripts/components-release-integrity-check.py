@@ -44,7 +44,8 @@ def requires_checksum(info):
 
 
 def checksum_error(name, platform, info, release=False):
-    if release and info.get("strategy") not in (None, "prebuilt"):
+    image_strategy = name == "browser-vm-image" and info.get("strategy") == "browser-vm-image"
+    if release and info.get("strategy") not in (None, "prebuilt") and not image_strategy:
         return f"{name} {platform}: development or unsupported release strategy {info.get('strategy')!r}"
     if not release and not requires_checksum(info):
         return None
@@ -507,6 +508,11 @@ def run_self_test():
     ]:
         if (checksum_error("fixture", "*", info, release=True) is None) != accepted:
             raise AssertionError(info)
+
+    image = {"strategy": "browser-vm-image", "checksum": f"sha256:{good_hash}"}
+    assert checksum_error("browser-vm-image", "darwin-arm64", image, release=True) is None
+    assert checksum_error("another-component", "darwin-arm64", image, release=True) is not None
+    assert checksum_error("browser-vm-image", "darwin-arm64", {"strategy": "browser-vm-image"}, release=True) is not None
 
     current_platform_errors = audit_manifest(manifest, ["linux-amd64"])
     if current_platform_errors != [
