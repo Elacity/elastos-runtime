@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/runtime-cleanup.sh"
+
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
 
@@ -8,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_MANIFEST="${ROOT}/elastos/Cargo.toml"
 DEFAULT_ELASTOS_BIN="${ROOT}/elastos/target/debug/elastos"
 ELASTOS_BIN="${ELASTOS_BIN:-${DEFAULT_ELASTOS_BIN}}"
-HOME_DIR="${ELASTOS_LOCAL_IDENTITY_HOME:-$(mktemp -d /tmp/elastos-local-identity-XXXXXX)}"
+HOME_DIR="${ELASTOS_LOCAL_IDENTITY_HOME:-$(smoke_home_dir local-identity)}"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe}"
 SOURCE_COMPONENTS_MANIFEST="${ROOT}/components.json"

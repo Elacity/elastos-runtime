@@ -96,29 +96,19 @@ says so in its PR and merges after its parent. Name branches `feat/<slug>` or
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
-## Weekly Releases
+## Releases
 
-- Each weekly release has a milestone `0.7.N`. Its scope is fixed on the
-  Wednesday before the release; work that misses it moves to the next milestone.
-- On Tuesday the candidate is cut from `develop` as `release/0.7.N` with the
-  version bump and changelog, and opened as a PR to `main`.
-- Three people confirm the candidate before the tag. Sasha reviews the visible
-  changes (CI screenshots and a short look) on his Wednesday. `irzhywau`
-  approves the release PR. Anders runs the ten-minute journey on his Mac: a
-  fresh install (an update from the previous weekly release once the signed
-  update tasks UP-01 to UP-03 are merged), sign in, one local AI reply, one chat
-  message and one Browser page. A failed journey or a visible regression holds
-  the tag for that week.
-- On Wednesday the PR merges, `v0.7.N` is tagged on the merge commit, and `main`
+- Weekly test releases (`0.8.0-alpha.N`, canary channel) are built from a
+  `develop` merge commit through `.github/workflows/release-package.yml`
+  (dispatched from `develop`) and published with `scripts/release-publish.sh`
+  (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)). Each one
+  gets one comment on #93 naming its commit and accepted scope.
+- Milestones: `0.8.0` (the five first-release goals, phones, isolation S0-S2 and
+  the release gates in #93) and `After 0.8.0`. There are no weekly milestones.
+- `main` changes only when a stable release is tagged: a release PR from the
+  accepted `develop` commit, then `vX.Y.Z` on the merge commit, then `main`
   merges back into `develop`.
-- 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets
-  its Done means.
-
-## Canary releases
-
-Canary builds come from a `develop` commit through
-`.github/workflows/release-package.yml` and are published with
-`scripts/release-publish.sh` (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)).
+- 0.8.0 ships when every result in the 0.8.0 milestone meets its Done means.
 
 ## Branch Lifecycle
 

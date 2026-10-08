@@ -1988,13 +1988,28 @@ fn validate_safe_media_source_parent_chain(path: &Path, name: &str) -> anyhow::R
         let metadata = fs::symlink_metadata(parent).map_err(|_| {
             invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
         })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != uid)
-            || metadata.permissions().mode() & 0o022 != 0
-        {
+        let quoted = crate::install_transaction::shell_quote_path(parent);
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe"
+                "{name} prerequisite parent is unsafe: {} is not a real directory",
+                parent.display()
+            )));
+        }
+        if metadata.uid() != 0 && metadata.uid() != uid {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite parent is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
+                parent.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            let sudo = if metadata.uid() == 0 && uid != 0 {
+                "sudo "
+            } else {
+                ""
+            };
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
+                parent.display()
             )));
         }
     }

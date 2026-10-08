@@ -1362,6 +1362,11 @@ impl InstallTransaction {
     }
 }
 
+/// Quote a path so a repair command pastes into a POSIX shell for any path.
+pub(crate) fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 fn check_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -1370,8 +1375,7 @@ fn check_directory(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    // The repair command must paste into a shell for any path.
-    let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let quoted = shell_quote_path(path);
     if metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
             "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",

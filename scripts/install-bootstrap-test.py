@@ -25,6 +25,7 @@ from unittest import mock
 
 
 INSTALLER = Path(__file__).with_name("install.sh")
+SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
 HELPERS = SOURCE.split("# ── Parse args", 1)[0]
 PYTHON = SOURCE.split("<<'PY_ED25519'\n", 1)[1].split("\nPY_ED25519", 1)[0]
@@ -441,7 +442,12 @@ class InstallerSandbox:
     """
 
     def __init__(self, head, release, did, system="Linux", machine="x86_64"):
-        self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-")
+        # The installer refuses a data directory under a writable parent such as
+        # /tmp, so sandboxes live under the repository's ignored target/.
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        for path in (SANDBOX_BASE.parent, SANDBOX_BASE):
+            path.chmod(0o755)
+        self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-", dir=SANDBOX_BASE)
         self.root = Path(self.directory.name)
         self.did, self.system, self.machine = did, system, machine
         self.installer = self.root / "install.sh"
@@ -992,6 +998,34 @@ class InstallationTests(unittest.TestCase):
                                        capture_output=True, text=True)
                 self.assertEqual(fixed.returncode, 0, fixed.stderr)
                 self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_root_owned_ancestor_of_the_data_directory_is_accepted(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            root_owned = [p for p in sandbox.data.parents if p.exists()
+                          and p.stat().st_uid == 0 and p.stat().st_mode & 0o777 == 0o755]
+            self.assertNotEqual(root_owned, [])
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_group_writable_data_ancestor_is_refused_before_download_with_exact_fix(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            unsafe = sandbox.root / "a\\b it's"
+            (unsafe / "xdg-data").mkdir(parents=True)
+            (sandbox.home / "xdg-data").symlink_to(unsafe / "xdg-data")
+            unsafe.chmod(0o775)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(requests, [])
+            command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+            self.assertTrue(command.startswith("chmod go-w "), command)
+            fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                   capture_output=True, text=True)
+            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+            self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()
