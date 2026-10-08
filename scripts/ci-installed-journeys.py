@@ -256,7 +256,7 @@ def consumer_root_block(data, cid):
     return "present" if (blocks / key[-3:-1] / f"{key}.data").exists() else "absent"
 
 
-def run(home, data, evidence, model=True):
+def run(home, data, evidence, model=True, carrier=False):
     if (evidence / "home-journey.json").exists() or (evidence / "home-journey.json").is_symlink():
         raise RuntimeError("installed journey requires fresh UI evidence")
     preparation_started = time.monotonic()
@@ -293,17 +293,20 @@ def run(home, data, evidence, model=True):
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(data.parent),
                        ELASTOS_MODEL_TIMING_DIAGNOSTICS="1")
     inputs = Path(os.environ.get("CI_MODEL_INPUTS", str(home / "model-inputs/inputs")))
-    # Package, holder Kubo blocks and the consumer's admitted model cache can each own a copy.
+    # Package, its Kubo blocks and the admitted model cache can each own a copy.
     needed = 3 * sum(path.stat().st_size for path in inputs.iterdir() if path.is_file())
     require_disk_space(data, needed)
-    # Only a separate holder Home's Kubo holds the package. The consumer knows the
-    # holder as one Carrier peer, so its Get reads every piece over Carrier.
-    holder_home = home.parent / f"{home.name}-holder"
-    holder_data = fresh_fixture(home, data, holder_home, include_engine=False)
-    for owner in (holder_data, data):
-        with (owner / "config.toml").open("a") as config:
-            config.write(f'carrier_bind_addr = "127.0.0.1:{free_port(socket.SOCK_DGRAM)}"\n')
-    subprocess.run(["node", "scripts/ci-model-package.mjs", str(holder_data), str(data), str(inputs), str(evidence)],
+    holder = holder_data = None
+    package_data = data
+    if carrier:
+        # Only a separate holder Home's Kubo holds the package. The consumer knows the
+        # holder as one Carrier peer, so its Get reads every piece over Carrier.
+        holder_home = home.parent / f"{home.name}-holder"
+        holder_data = package_data = fresh_fixture(home, data, holder_home, include_engine=False)
+        for owner in (holder_data, data):
+            with (owner / "config.toml").open("a") as config:
+                config.write(f'carrier_bind_addr = "127.0.0.1:{free_port(socket.SOCK_DGRAM)}"\n')
+    subprocess.run(["node", "scripts/ci-model-package.mjs", str(package_data), str(data), str(inputs), str(evidence)],
                    env=environment, check=True)
     record["fixture_package_receipt_sha256"] = digest(evidence / "package.json")
     record["fixture_components_sha256"] = digest(data / "components.json")
@@ -313,8 +316,9 @@ def run(home, data, evidence, model=True):
     record["processes_before_launch"] = process_counts(prior)
     if prior:
         raise RuntimeError("installed journey fixture already owns running processes")
-    assert not (data / "ipfs-repo").exists() and not (data / "ipfs-repo").is_symlink(), "consumer Home starts without the package"
-    holder, record["package_holder"] = start_holder(holder_home, holder_data, data, environment)
+    if carrier:
+        assert not (data / "ipfs-repo").exists() and not (data / "ipfs-repo").is_symlink(), "consumer Home starts without the package"
+        holder, record["package_holder"] = start_holder(holder_home, holder_data, data, environment)
     number = free_port()
     address = f"localhost:{number}"
     started = time.monotonic()
@@ -324,7 +328,8 @@ def run(home, data, evidence, model=True):
         log = (home / "journey-runtime.private.log").open("wb")
         child = subprocess.Popen([str(installed), "gateway", "--addr", f"127.0.0.1:{number}"], env=environment, stdout=log, stderr=log, start_new_session=True)
     except BaseException:
-        cleanup_runtime(holder, holder_data)
+        if holder:
+            cleanup_runtime(holder, holder_data)
         raise
     try:
         wait_healthy(child, address, "Runtime")
@@ -355,10 +360,11 @@ def run(home, data, evidence, model=True):
         except (OSError, ValueError, subprocess.SubprocessError):
             record["process_cleanup"] = {"status": "failed", "reason": "process census unavailable"}
         finally:
-            try:
-                holder_cleanup = cleanup_runtime(holder, holder_data)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                holder_cleanup = {"status": "failed", "reason": "process census unavailable"}
+            if holder:
+                try:
+                    holder_cleanup = cleanup_runtime(holder, holder_data)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    holder_cleanup = {"status": "failed", "reason": "process census unavailable"}
             log.close()
             if model:
                 timing = record.setdefault("model_timing", {})
@@ -368,9 +374,10 @@ def run(home, data, evidence, model=True):
                                        if sys.platform == "darwin" else
                                        {"status": "unavailable_with_confined_provider_stderr"})
                 record["results"]["model_timing_observer"] = "passed" if timing.get("observer_complete") is True else "failed"
-        record["process_cleanup"]["holder"] = holder_cleanup
-        if holder_cleanup["status"] != "passed":
-            record["process_cleanup"]["status"] = "failed"
+        if holder:
+            record["process_cleanup"]["holder"] = holder_cleanup
+            if holder_cleanup["status"] != "passed":
+                record["process_cleanup"]["status"] = "failed"
         record["results"]["process_cleanup"] = record["process_cleanup"]["status"]
         record["disk_after"] = disk_observation(data)
         record["results"]["disk_reserve"] = ("passed" if record["disk_after"]["available_bytes"] >= DISK_RESERVE_BYTES else "failed")
@@ -378,10 +385,11 @@ def run(home, data, evidence, model=True):
         if (evidence / "home-journey.json").exists():
             ui = json.loads((evidence / "home-journey.json").read_text())
             record["results"].update(ui["results"])
-        admitted = record["results"].get("model_package_admission" if model else "engine_absent_refusal") == "passed"
-        record["consumer_package_root_block"] = consumer_root_block(data, cid)
-        record["results"]["carrier_get"] = ("passed" if admitted and record["consumer_package_root_block"] == "absent"
-                                            else "failed")
+        if carrier:
+            admitted = record["results"].get("model_package_admission" if model else "engine_absent_refusal") == "passed"
+            record["consumer_package_root_block"] = consumer_root_block(data, cid)
+            record["results"]["carrier_get"] = ("passed" if admitted and record["consumer_package_root_block"] == "absent"
+                                                else "failed")
         if not model:
             record["results"]["engine_absent_refusal"] = (
                 "passed" if record.get("dispatch_unavailable_reason") == "source_engine_required"
@@ -395,7 +403,7 @@ def run(home, data, evidence, model=True):
         raise RuntimeError("installed journey left owned processes running")
     if not model and record["results"]["engine_absent_refusal"] != "passed":
         raise RuntimeError("installed engine-absence refusal proof is incomplete")
-    if record["results"]["carrier_get"] != "passed":
+    if carrier and record["results"]["carrier_get"] != "passed":
         raise RuntimeError("installed Get did not prove Carrier-only package delivery")
     if model and record["results"]["model_timing_observer"] != "passed":
         raise RuntimeError("installed timing observer did not stop")
@@ -459,9 +467,13 @@ if __name__ == "__main__":
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--repeat", type=int, choices=[3])
     parser.add_argument("--home-only", action="store_true")
+    # One reply Get from a separate holder Home over Carrier; other runs use a same-Home package.
+    parser.add_argument("--carrier-get", action="store_true")
     args = parser.parse_args()
     if args.home_only and args.repeat:
         parser.error("--home-only has one engine-absent Home")
+    if args.carrier_get and (args.home_only or args.repeat):
+        parser.error("--carrier-get proves one reply Get")
     operation = repeat if args.repeat else run
     arguments = [args.home.resolve(), args.data.resolve(), args.evidence.resolve()]
     if args.repeat:
@@ -473,5 +485,5 @@ if __name__ == "__main__":
     else:
         home, data, evidence = arguments
         destination = home.parent / "reply-home"
-        arguments = [destination, fresh_fixture(home, data, destination), evidence]
+        arguments = [destination, fresh_fixture(home, data, destination), evidence, True, args.carrier_get]
     operation(*arguments)

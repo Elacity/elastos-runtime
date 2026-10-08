@@ -640,16 +640,18 @@ jobs:
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
         run: scripts/ci-installed-journeys.sh prepare
-      # Each Get reads the 145 MB package from a separate holder Home over Carrier (~6 min per Home).
+      # Only the x86-64 job proves one reply Get from a separate holder Home over Carrier.
       - name: installed Marketplace Get and Assistant reply
-        timeout-minutes: 35
+        timeout-minutes: ${{ matrix.os == 'ubuntu-24.04' && 25 || 15 }}
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
+          CI_CARRIER_GET: ${{ matrix.os == 'ubuntu-24.04' }}
         run: scripts/ci-installed-journeys.sh home
       - name: summarize installed model journey
         if: always()
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
+          CI_CARRIER_GET: ${{ matrix.os == 'ubuntu-24.04' }}
         run: scripts/ci-installed-journeys.sh summary
       - name: upload installed model journey
         if: always()
@@ -867,9 +869,8 @@ jobs:
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
         run: scripts/ci-installed-journeys.sh prepare
-      # Four Homes each Get the package from a separate holder over Carrier (~6 min each).
       - name: installed Marketplace Get and Assistant reply
-        timeout-minutes: 60
+        timeout-minutes: 15
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
         run: scripts/ci-installed-journeys.sh home-repeat

@@ -9,9 +9,10 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
-const cid = JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
-// Get reads the package from a separate holder over Carrier in 64 KiB bounded reads.
-const carrierGetMs = 15 * 60 * 1000;
+const fixture = JSON.parse(readFileSync(join(evidence, "package.json")));
+const cid = fixture.cid;
+// A holder Get reads the package over Carrier in 64 KiB bounded reads; a same-Home Get is local.
+const readyMs = fixture.carrier_holder === true ? 15 * 60 * 1000 : 180000;
 let browser, page;
 let stage = "journey";
 let subcheck = null;
@@ -104,7 +105,7 @@ try {
   if (mode === "--home-only") {
     stage = "engine_absent_refusal";
     const recovery = "This source Home needs its local model engine. Install the engine through source setup, then Retry.";
-    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: carrierGetMs });
+    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: 90000 });
     const unavailable = (await projection(marketplace, "/api/capsules/catalog")).capsules.find(row => row.cid === cid)?.model_runtime;
     assert.equal(unavailable?.admitted, true, "engine refusal preserves admitted content");
     assert.equal(unavailable?.dispatch_ready, false);
@@ -139,7 +140,7 @@ try {
     }, null, 2));
   } else {
     const openAssistant = marketplace.locator('[data-model-control="open-assistant"]');
-    await openAssistant.waitFor({ state: "visible", timeout: carrierGetMs });
+    await openAssistant.waitFor({ state: "visible", timeout: readyMs });
     const catalog = await projection(marketplace, "/api/capsules/catalog");
     const readyModel = catalog.capsules.find(row => row.cid === cid);
     assert.equal(readyModel?.model_runtime?.dispatch_ready, true);

@@ -159,10 +159,10 @@ export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)
 }
 
 function main(args) {
-  assert.equal(args.length, 4, "usage: ci-model-package.mjs <holder-data> <consumer-data> <pinned-inputs> <fixture-output>");
-  // The holder Home's Kubo alone holds the package; the consumer receives only the signed catalogue.
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output>");
+  // The package Home's Kubo holds the package; the consumer receives the signed catalogue.
+  // A separate package Home is a Carrier holder, so the consumer's Get crosses Carrier.
   const [data, consumer, inputs, output] = args.map(arg => resolve(arg));
-  assert.notEqual(data, consumer, "the package holder is a separate Home");
   const manifestPath = join(data, "components.json");
   regular(manifestPath);
   const manifestBytes = readFileSync(manifestPath), components = JSON.parse(manifestBytes);
@@ -188,7 +188,9 @@ function main(args) {
   writeFileSync(join(consumer, "model-catalog.json"), catalog, { mode: 0o600 });
   consumerComponents.model_catalog = trust;
   writeFileSync(consumerManifestPath, JSON.stringify(consumerComponents), { mode: 0o600 });
-  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "package pinned only in a separate holder Home's Kubo; consumer Get over Carrier bounded reads; Runtime Use admission", kubo: kuboReceipt }, null, 2));
+  const carrier_holder = data !== consumer;
+  const delivery = carrier_holder ? "package pinned only in a separate holder Home's Kubo; consumer Get over Carrier bounded reads" : "local pinned Kubo package";
+  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: `${delivery}; Runtime Use admission`, carrier_holder, kubo: kuboReceipt }, null, 2));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));
