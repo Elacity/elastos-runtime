@@ -2369,9 +2369,8 @@ const refusedToken = acknowledgeChat(deniedPrepare, false);
 assert((await waitForShellResponse(chatReplies, deniedRequest.requestId)).payload.error,
   "refused or closed GUI entry did not return a recovery error", chatReplies);
 const openCommands = () => shellMessages.filter(m => m.payload?.command === "open-target").length;
-function assertChatTokenRetired(token) {
+function assertChatTokenRetired(token, frame = chatFrameWindow) {
   const before = openCommands();
-  const frame = { postMessage() {} };
   sendChildMessage("null", frame, { type: "home:app-ready", homeToken: token });
   sendChildMessage("null", frame, { type: "home:open-target", homeToken: token, target: "inbox", query: {} });
   assert(openCommands() === before, "failed recovery retained fresh launch authority", { token, shellMessages });
@@ -2409,6 +2408,19 @@ assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && 
   "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
 assert(shellMessages.some(m => m.payload?.command === "renew-chat-authority"
   && m.payload.phase === "commit" && m.payload.requestId === "chat-success"), "Home omitted the same-frame metadata commit", shellMessages);
+function acknowledgeChatCommit(command, ok, source = shellFrameWindow) {
+  sendChildMessage("null", source, { type: "home:chat-authority-committed", requestId: command.requestId,
+    oldHomeToken: command.homeToken,
+    freshHomeToken: new URL(command.launched.route, window.location.origin).hash.split("home_token=")[1],
+    ok, homeToken: "gui-token" });
+}
+const beforeMissingCommitReceipt = openCommands();
+sendChildMessage("null", chatFrameWindow, { type: "home:open-target", target: "inbox", query: {}, homeToken: freshChatToken });
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(openCommands() === beforeMissingCommitReceipt + 1 && chatReconnectTimers.size === 0,
+  "a missing GUI commit receipt made fresh authority unavailable or started a rollback timer");
+acknowledgeChatCommit(successfulPrepare, true);
+acknowledgeChatCommit(successfulPrepare, false);
 const launchesAfterRenewal = chatLaunches();
 sendChildMessage("null", chatFrameWindow, reconnect("old-authority-replay"));
 assert(chatLaunches() === launchesAfterRenewal, "old Chat authority remained usable after renewal");
@@ -2421,9 +2433,27 @@ for (const target of ["people", "inbox"]) sendChildMessage("null", chatFrameWind
   { type: "home:open-target", homeToken: freshChatToken, target, query: {} });
 await new Promise(resolve => setTimeout(resolve, 0));
 assert(openCommands() === beforeProfileActions + 2, "Profile card did not open its exact People and Inbox targets", shellMessages);
+sendChildMessage("null", chatFrameWindow, { ...reconnect("chat-commit-refused"), homeToken: freshChatToken });
+const refusedCommitPrepare = await waitForChatPrepare("chat-commit-refused");
+const refusedCommitToken = acknowledgeChat(refusedCommitPrepare, true);
+await waitForShellResponse(chatReplies, "chat-commit-refused");
+acknowledgeChatCommit(refusedCommitPrepare, false, {});
+const beforeWrongCommitReceipt = openCommands();
+sendChildMessage("null", chatFrameWindow, { type: "home:open-target", target: "inbox", query: {}, homeToken: refusedCommitToken });
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(openCommands() === beforeWrongCommitReceipt + 1, "a forged GUI commit receipt retired valid Chat authority");
+acknowledgeChatCommit(refusedCommitPrepare, false);
+assertChatTokenRetired(refusedCommitToken);
+acknowledgeChatCommit(refusedCommitPrepare, true);
+assertChatTokenRetired(refusedCommitToken);
+sendChildMessage("null", shellFrameWindow, { type: "home:launch-target", requestId: "launch-chat-sign-out",
+  target: "chat-room", query: {}, homeToken: "gui-token" });
+const signOutChatLaunch = await waitForShellResponse(shellMessages, "launch-chat-sign-out");
+const signOutChatToken = new URL(signOutChatLaunch.payload.result.route, window.location.origin).hash.split("home_token=")[1];
+sendChildMessage("null", chatFrameWindow, { type: "home:app-ready", homeToken: signOutChatToken });
 // Keep a prepared renewal pending when the existing sign-out test changes
 // Home authority; context retirement must cancel its timer and fresh launch.
-sendChildMessage("null", chatFrameWindow, { ...reconnect("chat-sign-out"), homeToken: freshChatToken });
+sendChildMessage("null", chatFrameWindow, { ...reconnect("chat-sign-out"), homeToken: signOutChatToken });
 const signOutChatPrepare = await waitForChatPrepare("chat-sign-out");
 
 const signOutRequestsBefore = requests.filter(

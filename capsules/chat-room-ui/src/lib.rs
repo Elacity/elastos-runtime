@@ -75,6 +75,7 @@ struct AppState {
     pending_chat_send: Option<PendingChatSend>,
     selection_generation: u64,
     drafts: BTreeMap<Option<String>, ComposerDraft>,
+    pending_direct_launch: Option<String>,
     session_lost: bool,
     reconnecting: bool,
     room_mode_known: bool,
@@ -690,6 +691,9 @@ impl App {
     }
 
     async fn poll_and_render_once(&self) {
+        if self.state.borrow().session_lost {
+            return;
+        }
         if self.is_direct_mode() {
             let (selection_guard, polled_transient_error) = {
                 let state = self.state.borrow();
@@ -833,14 +837,24 @@ impl App {
     }
 
     async fn refresh_direct_conversations(&self) -> Result<bool, u16> {
-        if !self.is_shell_mode() {
+        if !self.is_shell_mode()
+            || (self.state.borrow().session_lost && !self.state.borrow().reconnecting)
+        {
             return Ok(false);
         }
-        let response: DirectConversationList = direct_get_json(
+        let guard = current_selection_guard(&self.state.borrow());
+        let request_token = self.home_token();
+        let response: Result<DirectConversationList, u16> = direct_get_json(
             &format!("{DIRECT_API_BASE}/conversations"),
             &self.home_token_headers(),
         )
-        .await?;
+        .await;
+        if self.home_token() != request_token || !self.selection_guard_is_current(&guard) {
+            return Ok(false);
+        }
+        let response = response.inspect_err(|&status| {
+            self.handle_direct_authority_loss(status);
+        })?;
         if response.conversations.iter().any(|conversation| {
             conversation.conversation_id.trim().is_empty()
                 || conversation.display_name.trim().is_empty()
@@ -857,6 +871,7 @@ impl App {
 
     fn return_to_conversation_selector(&self, unavailable_conversation_id: Option<&str>) {
         let mut state = self.state.borrow_mut();
+        state.pending_direct_launch = None;
         retain_composer(&mut state, &self.message_input.value());
         bump_selection_generation(&mut state);
         if let Some(unavailable_conversation_id) = unavailable_conversation_id {
@@ -878,16 +893,22 @@ impl App {
     }
 
     async fn refresh_direct_messages_for_guard(&self, guard: &SelectionGuard) -> Result<bool, u16> {
+        if self.state.borrow().session_lost {
+            return Ok(false);
+        }
         let conversation_id = guard.selected_conversation_id.clone().ok_or(403u16)?;
+        let request_token = self.home_token();
         let conversations_result: Result<DirectConversationList, u16> = direct_get_json(
             &format!("{DIRECT_API_BASE}/conversations"),
             &self.home_token_headers(),
         )
         .await;
-        if !self.selection_guard_is_current(guard) {
+        if self.home_token() != request_token || !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
-        let conversations = conversations_result?;
+        let conversations = conversations_result.inspect_err(|&status| {
+            self.handle_direct_authority_loss(status);
+        })?;
         if conversations.conversations.iter().any(|conversation| {
             conversation.conversation_id.trim().is_empty()
                 || conversation.display_name.trim().is_empty()
@@ -907,10 +928,12 @@ impl App {
             &self.home_token_headers(),
         )
         .await;
-        if !self.selection_guard_is_current(guard) {
+        if self.home_token() != request_token || !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
-        let response = messages_result?;
+        let response = messages_result.inspect_err(|&status| {
+            self.handle_direct_authority_loss(status);
+        })?;
         if response
             .messages
             .iter()
@@ -1101,6 +1124,7 @@ impl App {
                 if let Err(error) = app.reconnect_from_home().await {
                     app.set_error(Some(error));
                 }
+                app.start_poll_loop();
                 let _ = app.render();
             });
         }));
@@ -1778,27 +1802,15 @@ impl App {
 
     fn handle_session_loss(&self, detail: &str) {
         self.clear_browser_session_request_storage();
-        let mut state = self.state.borrow_mut();
-        state.request_id = None;
-        state.session_active = false;
-        state.session_lost = self.is_shell_mode();
-        bump_selection_generation(&mut state);
-        state.show_participants = false;
-        state.show_access_controls = false;
-        state.force_message_follow = true;
-        state.latest_seq = 0;
-        state.objects.clear();
-        state.participants.clear();
-        state.active_sessions.clear();
-        state.attachment_urls.clear();
-        state.status_badge = if self.is_shell_mode() {
-            "Reconnect".to_string()
-        } else {
-            "Join".to_string()
-        };
-        state.status_detail = detail.to_string();
-        state.error_text = None;
-        state.error_transient = false;
+        apply_session_loss_state(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
+    }
+
+    fn handle_direct_authority_loss(&self, status: u16) {
+        if status == 401 && self.is_shell_mode() {
+            record_composer_edit(&mut self.state.borrow_mut(), &self.message_input.value());
+            self.handle_session_loss(self.session_loss_detail());
+            let _ = self.render();
+        }
     }
 
     async fn reconnect_from_home(&self) -> Result<(), String> {
@@ -1828,7 +1840,48 @@ impl App {
             *self.current_home_token.borrow_mut() = Some(token);
             bump_selection_generation(&mut self.state.borrow_mut());
             let guard = current_selection_guard(&self.state.borrow());
+            let requested = self.state.borrow().pending_direct_launch.clone();
+            if let Some(conversation_id) = requested {
+                match self.refresh_direct_conversations().await {
+                    Ok(_) => {}
+                    Err(401) => return Ok(()),
+                    Err(_) => {
+                        return Err("Direct conversations are temporarily unavailable.".to_string())
+                    }
+                }
+                if self.selection_guard_is_current(&guard)
+                    && self.state.borrow().pending_direct_launch.as_deref()
+                        == Some(conversation_id.as_str())
+                {
+                    let mut state = self.state.borrow_mut();
+                    retain_composer(&mut state, &self.message_input.value());
+                    let direct_guard = commit_direct_selection(&mut state, &conversation_id);
+                    self.message_input.set_value(&restore_composer(&mut state));
+                    drop(state);
+                    if direct_guard.is_none() {
+                        self.return_to_conversation_selector(Some(&conversation_id));
+                    }
+                }
+            }
+            let guard = current_selection_guard(&self.state.borrow());
             self.ensure_shell_session_for_guard(&guard).await?;
+            if self.selection_guard_is_current(&guard)
+                && self.state.borrow().session_active
+                && guard.selected_conversation_id.is_some()
+            {
+                match self.refresh_direct_messages_for_guard(&guard).await {
+                    Ok(_) | Err(401) => {}
+                    Err(403) if self.selection_guard_is_current(&guard) => {
+                        self.return_to_conversation_selector(
+                            guard.selected_conversation_id.as_deref(),
+                        );
+                    }
+                    Err(_) if self.selection_guard_is_current(&guard) => {
+                        return Err("Direct messages are temporarily unavailable.".to_string());
+                    }
+                    Err(_) => {}
+                }
+            }
             Ok(())
         }
         .await;
@@ -1851,7 +1904,20 @@ impl App {
         spawn_local(async move {
             let requested_direct = app.config.initial_direct_conversation_id.clone();
             let bootstrap_generation = app.state.borrow().selection_generation;
-            let direct_loaded = app.refresh_direct_conversations().await.is_ok();
+            let direct_result = app.refresh_direct_conversations().await;
+            let direct_loaded = direct_result.is_ok();
+            if app.state.borrow().session_lost {
+                if matches!(direct_result, Err(401))
+                    && app.state.borrow().selection_generation
+                        == bootstrap_generation.wrapping_add(1)
+                {
+                    app.state.borrow_mut().pending_direct_launch = requested_direct;
+                }
+                return;
+            }
+            if app.state.borrow().selection_generation != bootstrap_generation {
+                return;
+            }
             if let Some(conversation_id) = requested_direct {
                 let decision = requested_conversation_decision(
                     direct_loaded,
@@ -1901,6 +1967,9 @@ impl App {
                         ));
                     }
                 }
+            }
+            if app.state.borrow().session_lost {
+                return;
             }
             let summary = match api_get_json_with_headers::<SummaryView>(
                 &app.room_api_url("/summary"),
@@ -2338,6 +2407,9 @@ impl App {
     }
 
     async fn send_direct_message(&self) -> Result<(), String> {
+        if self.state.borrow().session_lost || self.state.borrow().reconnecting {
+            return Ok(());
+        }
         let conversation_id = self
             .state
             .borrow()
@@ -2387,6 +2459,10 @@ impl App {
         let draft_is_current = composer_send_is_current(&self.state.borrow(), &guard);
         let (http_status, response) = match response_result {
             Ok(response) => response,
+            Err(401) => {
+                self.handle_direct_authority_loss(401);
+                return Ok(());
+            }
             Err(403) if draft_is_current => {
                 self.return_to_conversation_selector(Some(&conversation_id));
                 return Err("That conversation is no longer available.".to_string());
@@ -2753,9 +2829,17 @@ impl App {
             return;
         }
         let app = Rc::clone(self);
+        let guard = {
+            let mut state = app.state.borrow_mut();
+            bump_selection_generation(&mut state);
+            state.pending_direct_launch = Some(conversation_id.clone());
+            current_selection_guard(&state)
+        };
         spawn_local(async move {
             let _ = app.refresh_direct_conversations().await;
-            app.select_conversation(conversation_id);
+            if app.selection_guard_is_current(&guard) && !app.state.borrow().session_lost {
+                app.select_conversation(conversation_id);
+            }
         });
     }
 
@@ -3401,7 +3485,7 @@ impl App {
             self.attach_button.remove_attribute("aria-label")?;
         }
         self.send_button.set_disabled(if direct_mode {
-            !direct_send_enabled
+            !direct_send_enabled || state.session_lost || state.reconnecting
         } else {
             !controls.enable_text_send
         });
@@ -4277,6 +4361,7 @@ fn clear_selected_direct_conversation(state: &mut AppState) {
 }
 
 fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
+    state.pending_direct_launch = None;
     bump_selection_generation(state);
     clear_selected_direct_conversation(state);
     current_selection_guard(state)
@@ -4285,6 +4370,7 @@ fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
 fn commit_direct_selection(state: &mut AppState, conversation_id: &str) -> Option<SelectionGuard> {
     let clean_id = conversation_id.trim();
     selected_conversation(&state.direct.conversations, clean_id)?;
+    state.pending_direct_launch = None;
     if state.direct.selected_conversation_id.as_deref() != Some(clean_id) {
         bump_selection_generation(state);
         state.direct.selected_conversation_id = Some(clean_id.to_string());
@@ -4354,6 +4440,25 @@ fn apply_active_poll_state(
         || previous_status_badge != state.status_badge
         || previous_status_detail != state.status_detail;
     (attachments_to_cache, changed)
+}
+
+fn apply_session_loss_state(state: &mut AppState, shell_mode: bool, detail: &str) {
+    state.request_id = None;
+    state.session_active = false;
+    state.session_lost = shell_mode;
+    bump_selection_generation(state);
+    state.show_participants = false;
+    state.show_access_controls = false;
+    state.force_message_follow = true;
+    state.latest_seq = 0;
+    state.objects.clear();
+    state.participants.clear();
+    state.active_sessions.clear();
+    state.attachment_urls.clear();
+    state.status_badge = if shell_mode { "Reconnect" } else { "Join" }.to_string();
+    state.status_detail = detail.to_string();
+    state.error_text = None;
+    state.error_transient = false;
 }
 
 fn apply_active_poll_if_current(
@@ -4517,6 +4622,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         pending_chat_send: None,
         selection_generation: 0,
         drafts: BTreeMap::new(),
+        pending_direct_launch: None,
         session_lost: false,
         reconnecting: false,
         room_mode_known: false,
@@ -4613,6 +4719,79 @@ mod tests {
     use super::direct::{
         DirectConversationView, DirectMessageList, DirectUiState, PendingDirectSend,
     };
+
+    #[test]
+    fn authority_loss_keeps_direct_selection_drafts_and_pending_send() {
+        let mut state = AppState {
+            session_active: true,
+            ..AppState::default()
+        };
+        super::record_composer_edit(&mut state, "shared draft");
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:a".into(),
+            display_name: "A".into(),
+            removed: false,
+            unread: false,
+        }];
+        commit_direct_selection(&mut state, "direct:a").unwrap();
+        super::record_composer_edit(&mut state, "newer direct draft");
+        state.direct.pending_send = Some(PendingDirectSend {
+            request_id: "uncertain-send".into(),
+            conversation_id: "direct:a".into(),
+            text: "sent draft".into(),
+        });
+        let guard = current_selection_guard(&state);
+        let direct = state.direct.clone();
+        let revision = state.drafts[&Some("direct:a".into())].revision;
+        super::apply_session_loss_state(&mut state, true, "Reconnect through Home.");
+        assert!(state.session_lost);
+        assert!(!state.session_active);
+        assert_eq!(state.direct, direct);
+        assert_eq!(state.drafts[&None].body, "shared draft");
+        assert_eq!(
+            state.drafts[&Some("direct:a".into())].body,
+            "newer direct draft"
+        );
+        assert_eq!(state.drafts[&Some("direct:a".into())].revision, revision);
+        assert!(!selection_guard_matches(&state, &guard));
+    }
+
+    #[test]
+    fn failed_initial_direct_intent_survives_loss_and_yields_to_a_user_selection() {
+        let mut state = AppState::default();
+        state.pending_direct_launch = Some("direct:a".into());
+        super::apply_session_loss_state(&mut state, true, "Reconnect through Home.");
+        assert_eq!(state.pending_direct_launch.as_deref(), Some("direct:a"));
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:a".into(),
+            display_name: "A".into(),
+            removed: false,
+            unread: false,
+        }];
+        let restored_generation = state.selection_generation;
+        assert!(commit_requested_direct_selection_if_current(
+            &mut state,
+            restored_generation,
+            "direct:a"
+        )
+        .is_some());
+        assert_eq!(
+            state.direct.selected_conversation_id.as_deref(),
+            Some("direct:a")
+        );
+        assert!(state.pending_direct_launch.is_none());
+        state.pending_direct_launch = Some("direct:a".into());
+        let pending_generation = state.selection_generation;
+        commit_shared_selection(&mut state);
+        assert!(state.pending_direct_launch.is_none());
+        assert!(commit_requested_direct_selection_if_current(
+            &mut state,
+            pending_generation,
+            "direct:a"
+        )
+        .is_none());
+        assert!(state.direct.selected_conversation_id.is_none());
+    }
     use super::{
         apply_active_poll_if_current, apply_active_poll_state, apply_direct_refresh_if_current,
         chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,

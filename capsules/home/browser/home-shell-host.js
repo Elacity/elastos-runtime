@@ -222,6 +222,7 @@ function settleChatReconnect(old, record, error = null) {
     } else {
       try {
         requireHomeGuiActive("reconnect Chat");
+        fresh.chatReconnectCommit = { requestId: record.requestId, oldToken: record.oldToken };
         if (!postToActiveShell({ type: "home:gui-command", command: "renew-chat-authority",
           phase: "commit", requestId: record.requestId, homeToken: record.oldToken,
           launched: record.launched, expiresAt: record.expiresAt })) {
@@ -1646,6 +1647,17 @@ window.addEventListener("message", (event) => {
     if (!record || record.requestId !== data.requestId || record.freshToken !== data.freshHomeToken
       || !record.launched || typeof data.ok !== "boolean") return;
     settleChatReconnect(old, record, data.ok ? null : new Error("Home could not reopen this Chat window"));
+    return;
+  }
+  if (data.type === "home:chat-authority-committed") {
+    if (context.kind !== "shell-frame" || context.targetId !== HOME_GUI_SHELL_ID
+      || !hasExactMessageKeys(data, ["type", "requestId", "oldHomeToken", "freshHomeToken", "ok", "homeToken"])) return;
+    const fresh = launchedAppContexts.get(data.freshHomeToken);
+    const commit = fresh?.chatReconnectCommit;
+    if (fresh?.targetId !== "chat-room" || !commit || commit.requestId !== data.requestId
+      || commit.oldToken !== data.oldHomeToken || typeof data.ok !== "boolean") return;
+    delete fresh.chatReconnectCommit;
+    if (!data.ok) retireLaunchedAppContext(data.freshHomeToken);
     return;
   }
   if (data.type === "home:launch-target") {
