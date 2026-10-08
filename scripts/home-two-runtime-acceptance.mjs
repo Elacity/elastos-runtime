@@ -8,10 +8,9 @@
 // the contact, and survive a restart of both runtimes — asserting along the
 // way that normal UI never shows a raw DID.
 //
-// Each side signs in with a persisted virtual-authenticator credential
-// created by scripts/home-passkey-virtual-auth-smoke.mjs run with
-// HOME_VIRTUAL_AUTH_CLEANUP=0 and HOME_VIRTUAL_AUTH_PROFILE pointing at the
-// same directory passed here.
+// Each fresh Home enrolls its first owner passkey with a virtual authenticator.
+// A persisted credential can also be loaded from the fixture browser profile.
+// This run proves owner enrollment; guest account enrollment is a separate leg.
 //
 //   ELASTOS_A_BASE_URL=<fixture-a-origin> \
 //   ELASTOS_A_PROFILE=<fixture-a-browser-profile> \
@@ -281,7 +280,14 @@ async function waitForFrame(side, target, timeoutMs = 30_000) {
 }
 
 async function openAppWindow(side, target) {
-  await signIn(side);
+  // Keep existing capsule documents and their drafts alive when Home is ready.
+  const ready = await side.page.evaluate(() => (
+    document.body?.dataset?.homeAuthority === "signed"
+      && document.body?.dataset?.homeStatus === "ready"
+  )).catch(() => false);
+  if (!ready) {
+    await signIn(side);
+  }
   const homeGuiFrame = await waitForFrame(side, "home-gui");
   await homeGuiFrame.locator("#launcher-toggle").click();
   const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
@@ -291,6 +297,11 @@ async function openAppWindow(side, target) {
   await homeGuiFrame.evaluate((appTarget) => {
     document.querySelector(`#launcher-grid [data-target="${appTarget}"]`)?.click();
   }, target);
+  return waitForAppWindow(side, target);
+}
+
+async function waitForAppWindow(side, target) {
+  const homeGuiFrame = await waitForFrame(side, "home-gui");
   const windowFrameEl = homeGuiFrame
     .locator(`section.window[data-target="${target}"] iframe.window-frame`)
     .last();
@@ -543,15 +554,22 @@ async function requestContact(side, frame, peerName) {
 async function acceptContactRequest(side, frame, peerName) {
   await poll(`${side.prefix}: accepted request from ${peerName}`, 120_000, 3_000, async () => {
     const result = await frame.evaluate((name) => {
-      const entries = [...document.querySelectorAll("#entry-list article, #entry-list li, #entry-list section")];
-      const scope = entries.length > 0 ? entries : [document.querySelector("#entry-list")].filter(Boolean);
-      const matches = scope.flatMap((entry) => {
+      const entries = [...document.querySelectorAll("#entry-rows .entry-rail-card, #entry-rows .entry-row")];
+      const matches = entries.flatMap((entry) => {
         const text = (entry.textContent || "").replace(/\s+/g, " ");
         if (!text.includes(name)) {
           return [];
         }
-        const accept = [...entry.querySelectorAll("button")]
+        let accept = [...entry.querySelectorAll("button")]
           .find((button) => button.textContent?.trim() === "Accept");
+        if (!accept && entry.classList.contains("entry-row")) {
+          entry.click();
+          const detail = document.querySelector("#entry-detail");
+          if (detail?.textContent?.includes(name)) {
+            accept = [...detail.querySelectorAll("button")]
+              .find((button) => button.textContent?.trim() === "Accept");
+          }
+        }
         return accept ? [{ accept }] : [];
       });
       if (matches.length === 1) {
@@ -605,33 +623,17 @@ async function openConversation(side, peopleFrame, peerName, expectedConversatio
       .find((node) => node.dataset.conversationId === id);
     exact?.click();
   }, conversationId);
-  const homeGuiFrame = await waitForFrame(side, "home-gui");
-  const windowFrameEl = homeGuiFrame
-    .locator('section.window[data-target="chat-room"] iframe.window-frame')
-    .last();
-  try {
-    await windowFrameEl.waitFor({ state: "visible", timeout: 30_000 });
-  } catch (error) {
-    fail(`${side.prefix}: chat window never opened`, {
-      console: side.consoleTail.slice(-15),
-    });
-  }
-  const handle = await windowFrameEl.elementHandle();
-  const chatFrame = handle ? await handle.contentFrame() : null;
-  assertOk(chatFrame, `${side.prefix}: chat window had no content frame`);
-  await poll(`${side.prefix}: chat document`, 20_000, 200, async () => (
-    { done: chatFrame.url().includes("/apps/chat-room/") }
-  ));
-  await chatFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
+  const chatFrame = await waitForAppWindow(side, "chat-room");
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
+async function assertDirectSelection(side, chatFrame, conversationId) {
   await chatFrame.waitForFunction(() => {
     const input = document.querySelector("#message-input");
     return input && !input.disabled;
   }, null, { timeout: 60_000 });
-  await chatFrame.evaluate((id) => {
-    const exact = [...document.querySelectorAll("[data-conversation-choice]")]
-      .find((node) => node.dataset.conversationChoice === id);
-    exact?.click();
-  }, conversationId);
+  // A launch must select its requested contact without a corrective rail click.
   const selection = await poll(`${side.prefix}: exact direct conversation selected`, 30_000, 250, async () => {
     const state = await chatFrame.evaluate(() => ({
       availableConversationIds: [...document.querySelectorAll("[data-conversation-choice]")]
@@ -651,7 +653,16 @@ async function openConversation(side, peopleFrame, peerName, expectedConversatio
     }
   });
   assertExactDirectConversation({ expectedConversationId: conversationId, ...selection });
-  return { frame: chatFrame, conversationId };
+  return selection;
+}
+
+async function selectDirectConversation(side, chatFrame, conversationId) {
+  await chatFrame.evaluate((id) => {
+    const exact = [...document.querySelectorAll("[data-conversation-choice]")]
+      .find((node) => node.dataset.conversationChoice === id);
+    exact?.click();
+  }, conversationId);
+  await assertDirectSelection(side, chatFrame, conversationId);
 }
 
 async function selectSharedConversation(side, chatFrame) {
@@ -678,6 +689,110 @@ async function openSharedConversation(side) {
   return chatFrame;
 }
 
+async function openParticipantCard(side, chatFrame, peerName, expectedAction) {
+  if (!(await chatFrame.locator("#participant-list").isVisible())) {
+    await chatFrame.locator("#participant-toggle").click();
+  }
+  let opened = false;
+  let nextRefresh = 0;
+  await poll(`${side.prefix}: Community Profile for ${peerName}`, 120_000, 1_000, async () => {
+    const shouldOpen = !opened || Date.now() >= nextRefresh;
+    const result = await chatFrame.evaluate(({ name, action, shouldOpen }) => {
+      const peers = [...document.querySelectorAll("#participant-list [data-participant-ref]")]
+        .filter((node) => node.querySelector(".participant-name")?.textContent?.trim() === name);
+      const pending = document.querySelector("#participant-card-action")?.disabled === true;
+      if (peers.length === 1 && shouldOpen && !pending) {
+        peers[0].click();
+      }
+      const card = document.querySelector("#participant-card");
+      const button = document.querySelector("#participant-card-action");
+      return {
+        count: peers.length,
+        opened: peers.length === 1 && shouldOpen && !pending,
+        name: document.querySelector("#participant-card-name")?.textContent?.trim() || "",
+        action: button?.dataset?.cardAction || "",
+        ready: card?.hidden === false && button?.hidden === false && !button?.disabled
+          && button?.dataset?.cardAction === action,
+      };
+    }, { name: peerName, action: expectedAction, shouldOpen });
+    assertOk(result.count <= 1, `${side.prefix}: ambiguous Community Profile`, result);
+    if (result.opened) {
+      opened = true;
+      nextRefresh = Date.now() + 5_000;
+    }
+    return { done: result.count === 1 && result.name === peerName && result.ready, value: result };
+  });
+}
+
+async function requestCommunityContact(side, chatFrame, peopleFrame, peerName) {
+  await openParticipantCard(side, chatFrame, peerName, "add-contact");
+  const requestResponse = side.page.waitForResponse((response) => (
+    response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/apps/chat-room/contacts/request"
+  ), { timeout: 30_000 });
+  requestResponse.catch(() => {});
+  await chatFrame.locator("#participant-card-action").click();
+  const response = await requestResponse;
+  assertOk(response.ok(), `${side.prefix}: Community contact request failed`, { status: response.status() });
+  await poll(`${side.prefix}: one Community contact request`, 60_000, 1_000, async () => {
+    const snapshot = await peopleSnapshot(peopleFrame);
+    const requested = snapshot.contacts.filter((card) => (
+      card.text.includes(peerName) && /Request sent|Requested/i.test(card.text)
+    ));
+    assertOk(requested.length <= 1, `${side.prefix}: duplicate outgoing contact requests`, { count: requested.length });
+    return { done: requested.length === 1, value: { count: requested.length } };
+  });
+  return { count: 1, request_surface: "community_profile" };
+}
+
+async function openInboxFromCommunity(side, chatFrame, peerName) {
+  await openParticipantCard(side, chatFrame, peerName, "inbox");
+  await chatFrame.locator("#participant-card-action").click();
+  // No launcher fallback: the Profile action itself must open Inbox.
+  return waitForAppWindow(side, "inbox");
+}
+
+async function openDirectFromCommunity(side, chatFrame, peerName, conversationId) {
+  await selectSharedConversation(side, chatFrame);
+  await openParticipantCard(side, chatFrame, peerName, "message");
+  await chatFrame.locator("#participant-card-action").click();
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
+async function openDirectFromInbox(side, inboxFrame, message, conversationId) {
+  await poll(`${side.prefix}: Inbox notification opens its conversation`, 60_000, 1_000, async () => {
+    const result = await inboxFrame.evaluate((needle) => {
+      const entries = [...document.querySelectorAll("#entry-rows .entry-rail-card, #entry-rows .entry-row")]
+        .filter((node) => node.textContent?.includes(needle));
+      if (entries.length !== 1) {
+        return { count: entries.length, opened: false };
+      }
+      const row = entries[0];
+      let button = [...row.querySelectorAll("button")]
+        .find((node) => node.textContent?.trim() === "Open");
+      if (!button) {
+        row.click();
+        const detail = document.querySelector("#entry-detail");
+        if (detail?.textContent?.includes(needle)) {
+          button = [...detail.querySelectorAll("button")]
+            .find((node) => node.textContent?.trim() === "Open");
+        }
+      }
+      if (button && !button.disabled) {
+        button.click();
+        return { count: 1, opened: true };
+      }
+      return { count: 1, opened: false };
+    }, message);
+    assertOk(result.count <= 1, `${side.prefix}: ambiguous Inbox direct notification`, result);
+    return { done: result.opened, value: result };
+  });
+  const chatFrame = await waitForAppWindow(side, "chat-room");
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
 async function chatFrameState(chatFrame) {
   return chatFrame.evaluate(() => ({
     chatMode: document.body?.dataset?.chatMode || "",
@@ -699,10 +814,9 @@ async function sendMessage(side, chatFrame, text) {
   });
   try {
     await poll(`${side.prefix}: sent "${text}"`, 45_000, 1_000, async () => {
-      const listed = await chatFrame.evaluate((needle) => (
-        (document.querySelector("#message-list")?.textContent || "").includes(needle)
-      ), text);
-      return { done: listed };
+      const count = await exactMessageCount(chatFrame, text);
+      assertOk(count <= 1, `${side.prefix}: duplicate rendered message`, { count });
+      return { done: count === 1, value: { count } };
     });
     const sent = await chatFrameState(chatFrame);
     console.error(`[acceptance] ${side.prefix}: post-send tail: ${sent.messagesTail.slice(-160)}`);
@@ -718,10 +832,9 @@ async function sendMessage(side, chatFrame, text) {
 async function waitForMessage(side, chatFrame, text, timeoutMs = 300_000) {
   try {
     await poll(`${side.prefix}: received "${text}"`, timeoutMs, 2_000, async () => {
-      const listed = await chatFrame.evaluate((needle) => (
-        (document.querySelector("#message-list")?.textContent || "").includes(needle)
-      ), text);
-      return { done: listed };
+      const count = await exactMessageCount(chatFrame, text);
+      assertOk(count <= 1, `${side.prefix}: duplicate received message`, { count });
+      return { done: count === 1, value: { count } };
     });
   } catch (error) {
     fail(`${side.prefix}: message never arrived`, {
@@ -730,6 +843,214 @@ async function waitForMessage(side, chatFrame, text, timeoutMs = 300_000) {
       console: side.consoleTail.slice(-10),
       network: side.netTail.slice(-10),
     });
+  }
+}
+
+async function exactMessageCount(chatFrame, text) {
+  return chatFrame.evaluate((needle) => [...document.querySelectorAll("#message-list .message-body")]
+    .filter((node) => node.textContent === needle).length, text);
+}
+
+async function assertDraft(side, chatFrame, selected, text) {
+  const state = await chatFrameState(chatFrame);
+  assertOk(
+    state.selectedConversationId === selected && state.inputValue === text,
+    `${side.prefix}: conversation draft changed`,
+    { selected: state.selectedConversationId, expected: selected, draft_preserved: state.inputValue === text },
+  );
+}
+
+async function withHeldSendResponse(side, chatFrame, path, sentText, conversationId, operation) {
+  const matcher = (url) => url.origin === side.base && url.pathname === path;
+  let responseStatus;
+  let release;
+  let handlerCompletion;
+  let handlerError;
+  let intercepted = 0;
+  let deadlineExpired = false;
+  const handler = async (route) => {
+    try {
+      const request = route.request();
+      if (request.method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      const payload = request.postDataJSON();
+      if ((payload?.text ?? payload?.body) !== sentText) {
+        await route.continue();
+        return;
+      }
+      intercepted += 1;
+      assertOk(intercepted === 1, "held send was submitted more than once");
+      if (conversationId !== "shared") {
+        assertOk(payload.conversation_id === conversationId, "held send targeted the wrong contact");
+      }
+      const response = await route.fetch({ timeout: 10_000 });
+      responseStatus = response.status();
+      const gate = new Promise((resolve) => { release = resolve; });
+      const deadline = setTimeout(() => { deadlineExpired = true; release(); }, 20_000);
+      handlerCompletion = (async () => {
+        try {
+          await gate;
+          await route.fulfill({ response });
+        } finally {
+          clearTimeout(deadline);
+        }
+      })();
+      await handlerCompletion;
+    } catch (error) {
+      handlerError = error;
+      await route.abort().catch(() => {});
+    }
+  };
+  await side.page.route(matcher, handler);
+  try {
+    await chatFrame.locator("#message-input").fill(sentText);
+    await chatFrame.locator("#send-button").click();
+    await poll("successful send response is held", 15_000, 100, async () => {
+      assertOk(!handlerError, "held-response interception failed");
+      return { done: Boolean(release), value: { status: responseStatus } };
+    });
+    assertOk(responseStatus >= 200 && responseStatus < 300, "held send did not succeed", { status: responseStatus });
+    await operation(async () => {
+      assertOk(!deadlineExpired, "held response deadline elapsed before draft checks");
+      release();
+      await handlerCompletion;
+      assertOk(!handlerError, "held-response release failed");
+    });
+    assertOk(!handlerError && !deadlineExpired, "held-response proof did not complete within its bound");
+    return responseStatus;
+  } finally {
+    release?.();
+    await handlerCompletion?.catch(() => {});
+    await side.page.unroute(matcher, handler);
+  }
+}
+
+async function proveDraftPreservation(a, chatFrame, b, bChatFrame, conversationId) {
+  const directDraft = `Direct draft @ ${Date.now()}`;
+  const sharedDraft = `Community draft @ ${Date.now()}`;
+  await chatFrame.locator("#message-input").fill(directDraft);
+  await selectSharedConversation(a, chatFrame);
+  await assertDraft(a, chatFrame, "shared", "");
+  await chatFrame.locator("#message-input").fill(sharedDraft);
+  await selectDirectConversation(a, chatFrame, conversationId);
+  await assertDraft(a, chatFrame, conversationId, directDraft);
+
+  // An edit within the same direct selection must invalidate its old send.
+  const directText = `Held direct response @ ${Date.now()}`;
+  const newerDirectDraft = `Newer direct draft @ ${Date.now()}`;
+  const directStatus = await withHeldSendResponse(
+    a, chatFrame, "/api/apps/chat-room/direct/messages/send", directText, conversationId,
+    async (release) => {
+      await chatFrame.locator("#message-input").fill(newerDirectDraft);
+      await release();
+      await waitForMessage(a, chatFrame, directText, 30_000);
+      await delay(1_000);
+      await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+      await waitForMessage(b, bChatFrame, directText, 60_000);
+    },
+  );
+  await selectSharedConversation(a, chatFrame);
+  await assertDraft(a, chatFrame, "shared", sharedDraft);
+  await selectSharedConversation(b, bChatFrame);
+
+  // Returning to Community must still invalidate a response from its older
+  // selection, even though the conversation name is the same again.
+  const sharedText = `Held Community response @ ${Date.now()}`;
+  const newerSharedDraft = `Newer Community draft @ ${Date.now()}`;
+  const sharedStatus = await withHeldSendResponse(
+    a, chatFrame, "/api/apps/chat-room/objects/send", sharedText, "shared",
+    async (release) => {
+      await chatFrame.locator("#message-input").fill(newerSharedDraft);
+      await selectDirectConversation(a, chatFrame, conversationId);
+      await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+      await selectSharedConversation(a, chatFrame);
+      await assertDraft(a, chatFrame, "shared", newerSharedDraft);
+      await release();
+      await waitForMessage(a, chatFrame, sharedText, 30_000);
+      await delay(1_000);
+      await assertDraft(a, chatFrame, "shared", newerSharedDraft);
+      await waitForMessage(b, bChatFrame, sharedText, 60_000);
+    },
+  );
+  await chatFrame.locator("#message-input").fill("");
+  await selectDirectConversation(a, chatFrame, conversationId);
+  await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+  await chatFrame.locator("#message-input").fill("");
+  await selectDirectConversation(b, bChatFrame, conversationId);
+  return {
+    switched_drafts_preserved: true,
+    direct_newer_draft_after_response: true,
+    shared_newer_draft_after_response: true,
+    held_send_status: { direct: directStatus, shared: sharedStatus },
+    receiver_message_count: { direct: 1, shared: 1 },
+  };
+}
+
+async function proveSharedSessionRecovery(side, chatFrame, receiver, receiverFrame) {
+  await selectSharedConversation(side, chatFrame);
+  const documentStartedAt = await chatFrame.evaluate(() => performance.timeOrigin);
+  const draft = `Reconnect draft @ ${Date.now()}`;
+  await chatFrame.locator("#message-input").fill(draft);
+  assertOk(!(await chatFrame.locator("#chat-reconnect").isVisible()), "Reconnect was already visible before session loss");
+  let injected = false;
+  let starts = 0;
+  let authPosts = 0;
+  const countStarts = (request) => {
+    if (request.method() === "POST") {
+      const path = new URL(request.url()).pathname;
+      if (path === "/api/apps/chat-room/session/start") {
+        starts += 1;
+      } else if (path.startsWith("/api/auth/")) {
+        authPosts += 1;
+      }
+    }
+  };
+  const matcher = (url) => url.origin === side.base && url.pathname === "/api/apps/chat-room/poll";
+  const handler = async (route) => {
+    if (!injected) {
+      injected = true;
+      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "invalid or expired session" }) });
+    } else {
+      await route.continue();
+    }
+  };
+  side.page.on("request", countStarts);
+  await side.page.route(matcher, handler);
+  try {
+    await chatFrame.locator("#chat-reconnect").waitFor({ state: "visible", timeout: 30_000 });
+    assertOk(injected, "Reconnect appeared without the injected session loss");
+    assertOk(await chatFrame.locator("#chat-reconnect").isEnabled(), "Reconnect control was disabled");
+    assertOk(Boolean((await chatFrame.locator("#chat-reconnect-status").innerText()).trim()), "Reconnect had no visible explanation");
+    await assertDraft(side, chatFrame, "shared", draft);
+    await delay(1_500);
+    assertOk(starts === 0, "room session restarted before the Reconnect click", { session_starts: starts });
+    assertOk(authPosts === 0, "sign-in started before the Reconnect click", { auth_posts: authPosts });
+    await side.page.unroute(matcher, handler);
+    await chatFrame.locator("#chat-reconnect").click();
+    await poll(`${side.prefix}: user Reconnect resumes the room`, 30_000, 250, async () => {
+      const state = await chatFrameState(chatFrame);
+      return {
+        done: starts > 0 && !state.inputDisabled && !(await chatFrame.locator("#chat-reconnect").isVisible()),
+        value: { session_starts: starts, input_disabled: state.inputDisabled },
+      };
+    });
+    assertOk(
+      (await waitForAppWindow(side, "chat-room")) === chatFrame
+        && (await chatFrame.evaluate(() => performance.timeOrigin)) === documentStartedAt,
+      "Reconnect replaced the Chat document",
+    );
+    await assertDraft(side, chatFrame, "shared", draft);
+    await chatFrame.locator("#message-input").fill("");
+    await selectSharedConversation(receiver, receiverFrame);
+    const message = `After Reconnect @ ${Date.now()}`;
+    await sendMessage(side, chatFrame, message);
+    await waitForMessage(receiver, receiverFrame, message, 120_000);
+    return { visible_reconnect: true, session_starts_before_click: 0, auth_posts_before_click: 0, session_starts_after_click: starts, same_document: true, draft_preserved: true, receiver_message_count: 1, message };
+  } finally {
+    side.page.off("request", countStarts);
+    await side.page.unroute(matcher, handler);
   }
 }
 
@@ -828,11 +1149,16 @@ async function main() {
   try {
     a = await openSide(SIDE_A);
     b = await openSide(SIDE_B);
+    report.toolchain = {
+      node: process.version,
+      playwright: require("playwright/package.json").version,
+      chromium: a.context.browser()?.version() || "",
+    };
 
     await runLeg(report, "provisioning_and_sign_in", "provision and sign in both fixture Homes", async () => {
       await ensureAccount(a);
       await ensureAccount(b);
-      return { a: "signed", b: "signed" };
+      return { a: "signed", b: "signed", enrollment_surface: "fresh_home_owner_passkey" };
     });
 
     let aDeviceDid;
@@ -889,20 +1215,34 @@ async function main() {
       };
     });
 
-    await runLeg(report, "exactly_one_contact_request", "A sends exactly one contact request", async () => {
+    // Enter Community through Home on both sides. Signed room messages make
+    // the peer's Profile available through the normal participant controls.
+    const [aCommunity, bCommunity] = await Promise.all([
+      openSharedConversation(a),
+      openSharedConversation(b),
+    ]);
+    const aCommunityMarker = `Community hello A @ ${Date.now()}`;
+    const bCommunityMarker = `Community hello B @ ${Date.now()}`;
+    await sendMessage(a, aCommunity, aCommunityMarker);
+    await waitForMessage(b, bCommunity, aCommunityMarker, 120_000);
+    await sendMessage(b, bCommunity, bCommunityMarker);
+    await waitForMessage(a, aCommunity, bCommunityMarker, 120_000);
+
+    await runLeg(report, "exactly_one_contact_request", "A requests the Community Profile once", async () => {
       await assertPeopleHasNoDecisionActions(b, bPeople);
-      const evidence = await requestContact(a, aPeople, SIDE_B.name);
+      const evidence = await requestCommunityContact(a, aCommunity, aPeople, SIDE_B.name);
       assertOk(evidence.count === 1, "outgoing request evidence was not exact", evidence);
       await assertPeopleHasNoDecisionActions(b, bPeople);
       return evidence;
     });
 
-    await runLeg(report, "inbox_only_accept", "B accepts only in Inbox", async () => {
-      const bInbox = await openAppWindow(b, "inbox");
+    let bInbox;
+    await runLeg(report, "inbox_only_accept", "B opens Inbox from the Community Profile and accepts", async () => {
+      bInbox = await openInboxFromCommunity(b, bCommunity, SIDE_A.name);
       await acceptContactRequest(b, bInbox, SIDE_A.name);
       bPeople = await openAppWindow(b, "people");
       await assertPeopleHasNoDecisionActions(b, bPeople);
-      return { decision_surface: "inbox" };
+      return { decision_surface: "inbox", launch_surface: "community_profile" };
     });
 
     let conversationId;
@@ -928,13 +1268,25 @@ async function main() {
       return { a_contact_id: aContactId, b_contact_id: bContactId };
     });
 
-    const aDirect = await openConversation(a, aPeople, SIDE_B.name, conversationId);
-    const bDirect = await openConversation(b, bPeople, SIDE_A.name, conversationId);
+    let aDirect;
+    await runLeg(report, "community_profile_launch", "Community Profile Message selects the accepted conversation", async () => {
+      aDirect = await openDirectFromCommunity(a, aCommunity, SIDE_B.name, conversationId);
+      return { conversation_id: conversationId, launch_surface: "community_profile", corrective_selection: false };
+    });
+    let bDirect = await openConversation(b, bPeople, SIDE_A.name, conversationId);
+    // Leave B in Community so Inbox Open must change its selection.
+    await selectSharedConversation(b, bDirect.frame);
     const helloFromA = `Hello from ${SIDE_A.name} @ ${Date.now()}`;
     await runLeg(report, "direct_message_a_to_b", "direct message A to B", async () => {
       await sendMessage(a, aDirect.frame, helloFromA);
+      bDirect = await openDirectFromInbox(b, bInbox, helloFromA, conversationId);
       await waitForMessage(b, bDirect.frame, helloFromA);
       return { conversation_id: conversationId, message: helloFromA };
+    });
+
+    await runLeg(report, "inbox_direct_launch", "Inbox Open selects the incoming direct conversation", async () => {
+      await assertDirectSelection(b, bDirect.frame, conversationId);
+      return { conversation_id: conversationId, launch_surface: "inbox", corrective_selection: false };
     });
 
     const helloFromB = `Hello back from ${SIDE_B.name} @ ${Date.now()}`;
@@ -943,6 +1295,14 @@ async function main() {
       await waitForMessage(a, aDirect.frame, helloFromB);
       return { conversation_id: conversationId, message: helloFromB };
     });
+
+    await runLeg(report, "conversation_draft_preservation", "preserve drafts through selection and a late send response", async () => (
+      proveDraftPreservation(a, aDirect.frame, b, bDirect.frame, conversationId)
+    ));
+
+    await runLeg(report, "shared_session_recovery", "recover the room only after visible Reconnect", async () => (
+      proveSharedSessionRecovery(a, aDirect.frame, b, bDirect.frame)
+    ));
 
     await runLeg(report, "rename_propagation", "signed Profile rename propagates", async () => {
       await saveProfile(a, aPeople, RENAMED_A);

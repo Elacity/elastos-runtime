@@ -348,12 +348,20 @@ test("identity evidence rejects empty, wrong, and raw-identity frames", () => {
 });
 
 test("skipped legs and incomplete reports can never become acceptance evidence", () => {
-  const report = validReport();
-  for (const leg of REQUIRED_ACCEPTANCE_LEGS) {
-    report.results.push({ leg, status: leg === "both_runtime_restart" ? "skipped" : "passed" });
+  // Exercise every mandatory leg, including launch, drafts, and recovery.
+  // A harness that omits or skips any one of them must retain ok=false.
+  for (const skipped of REQUIRED_ACCEPTANCE_LEGS) {
+    const report = validReport();
+    for (const leg of REQUIRED_ACCEPTANCE_LEGS) {
+      report.results.push({ leg, status: leg === skipped ? "skipped" : "passed" });
+    }
+    assert.throws(() => finalizeAcceptanceReport(report), new RegExp(`nonpassing=${skipped}`));
+    assert.equal(report.ok, false);
+
+    report.results = report.results.filter((result) => result.leg !== skipped);
+    assert.throws(() => finalizeAcceptanceReport(report), new RegExp(`missing=${skipped}`));
+    assert.equal(report.ok, false);
   }
-  assert.throws(() => finalizeAcceptanceReport(report), /nonpassing=both_runtime_restart/);
-  assert.equal(report.ok, false);
 
   const incomplete = validReport();
   recordAcceptancePass(incomplete, REQUIRED_ACCEPTANCE_LEGS[0]);
