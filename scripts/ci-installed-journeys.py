@@ -120,20 +120,32 @@ def process_counts(rows):
             for role in ("runtime", "model_provider", "guard", "llama_server", "other")}
 
 
-def cleanup_runtime(child, data):
+def cleanup_runtime(child, data, allow_group=True):
     try:
         known = owned_processes(process_rows(), child.pid, data)
     except (OSError, ValueError, subprocess.SubprocessError):
         known = None
     before = process_counts(known or {})
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    def signal_runtime_group(action):
+        # poll() can reap an exited Runtime. Its former group id then needs the
+        # same birth/command proof as every individual descendant before a signal.
+        original = (known or {}).get(child.pid)
+        if original is None or original["role"] != "runtime" or child.poll() is not None:
+            return
+        latest = process_rows().get(child.pid)
+        if latest and latest["start"] == original["start"] and latest["command"] == original["command"]:
+            try:
+                if allow_group:
+                    os.killpg(child.pid, action)
+                else:
+                    os.kill(child.pid, action)
+            except ProcessLookupError:
+                pass
+    signal_runtime_group(signal.SIGTERM)
     try:
         child.wait(timeout=15)
     except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
+        signal_runtime_group(signal.SIGKILL)
         child.wait(timeout=5)
     if known is None:
         return {"status": "failed", "reason": "process census unavailable", "before": before}
@@ -253,7 +265,8 @@ def run(home, data, evidence, model=True):
             record["results"]["engine_absent_home"] = "passed"
     finally:
         try:
-            record["process_cleanup"] = cleanup_runtime(child, data)
+            observer_complete = not model or record.get("model_timing", {}).get("observer_complete") is True
+            record["process_cleanup"] = cleanup_runtime(child, data, allow_group=observer_complete)
         except (OSError, ValueError, subprocess.SubprocessError):
             record["process_cleanup"] = {"status": "failed", "reason": "process census unavailable"}
         finally:
@@ -265,6 +278,7 @@ def run(home, data, evidence, model=True):
                 timing["durations"] = (TIMING["run_metrics"](timing["provider_stages"], timing["acknowledgements"])
                                        if sys.platform == "darwin" else
                                        {"status": "unavailable_with_confined_provider_stderr"})
+                record["results"]["model_timing_observer"] = "passed" if timing.get("observer_complete") is True else "failed"
         record["results"]["process_cleanup"] = record["process_cleanup"]["status"]
         record["disk_after"] = disk_observation(data)
         record["results"]["disk_reserve"] = ("passed" if record["disk_after"]["available_bytes"] >= DISK_RESERVE_BYTES else "failed")
@@ -275,6 +289,8 @@ def run(home, data, evidence, model=True):
 
     if record["process_cleanup"]["status"] != "passed":
         raise RuntimeError("installed journey left owned processes running")
+    if model and record["results"]["model_timing_observer"] != "passed":
+        raise RuntimeError("installed timing observer did not stop")
     require_disk_space(data)
     if model and sys.platform == "darwin" and record["model_timing"]["durations"]["status"] != "complete":
         raise RuntimeError("installed reply timing evidence is incomplete")

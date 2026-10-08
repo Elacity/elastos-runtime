@@ -213,7 +213,9 @@ class ModelTimingObserver:
 
     def observe(self):
         seen = {}
-        while not self.stop.is_set() and self.gateway.poll() is None:
+        # Only the journey owner reaps Runtime. This observer reads process and
+        # endpoint state, so shutdown cannot race with a second poll() owner.
+        while not self.stop.is_set():
             if len(self.events) >= 512:
                 break
             try:
@@ -224,6 +226,8 @@ class ModelTimingObserver:
                     if len(fields) == 3:
                         rows[int(fields[0])] = (int(fields[1]), fields[2])
                 for pid, path, alias in owned_engine(rows, self.gateway.pid, self.data):
+                    if self.stop.is_set():
+                        break
                     if pid not in seen:
                         seen[pid] = False
                         self.events.append({"stage": "engine_spawn_observed", "elapsed_seconds": round(time.monotonic() - self.started, 3)})

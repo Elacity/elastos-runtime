@@ -61,7 +61,7 @@ try:
 except (OSError, ValueError, AssertionError, KeyError, RuntimeError):
     engine = None
 results = {name: "failed or not run" for name in (
-    "home_screenshots", "model_package_admission", "installed_runtime_reply", "process_cleanup", "disk_reserve")}
+    "home_screenshots", "model_package_admission", "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve")}
 elapsed = 0
 records = []
 paths = sorted(root.glob("run-*/installed-journeys.json")) or [root / "installed-journeys.json"]

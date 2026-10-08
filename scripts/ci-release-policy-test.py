@@ -1176,7 +1176,7 @@ class InstalledJourneyTests(unittest.TestCase):
                 mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
                     "capacity_bytes": 100 * 1024 ** 3, "available_bytes": available},
                     "process_rows": lambda: {},
-                    "cleanup_runtime": lambda *_: {"status": "passed", "before": {}, "after": {}}}):
+                    "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}}}):
             try:
                 journey["run"](home, data, evidence)
             finally:
@@ -1301,8 +1301,9 @@ class InstalledJourneyTests(unittest.TestCase):
         detached = {12: row(1, initial[12]["command"]), 13: initial[13]}
         gone = {13: initial[13]}
         child = mock.Mock(pid=10)
+        child.poll.return_value = None
         with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
-                "process_rows": mock.Mock(side_effect=[initial, detached, detached, gone])}), \
+                "process_rows": mock.Mock(side_effect=[initial, initial, detached, detached, gone])}), \
                 mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
             result = journey["cleanup_runtime"](child, data)
         self.assertEqual(result["status"], "passed")
@@ -1310,10 +1311,20 @@ class InstalledJourneyTests(unittest.TestCase):
         kill.assert_called_once_with(12, signal.SIGTERM)
         # ps start time has one-second precision; command identity also protects reuse.
         reused = {12: row(1, "/foreign/new-process", start="original")}
+        child.poll.return_value = 0
         with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
                 "process_rows": mock.Mock(side_effect=[initial, reused])}), \
-                mock.patch.object(os, "killpg"), mock.patch.object(os, "kill") as kill:
+                mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
             self.assertEqual(journey["cleanup_runtime"](child, data)["status"], "passed")
+            groups.assert_not_called()
+            kill.assert_not_called()
+        child.poll.return_value = None
+        replacement = {10: row(1, "/foreign/replacement-runtime-group")}
+        with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
+                "process_rows": mock.Mock(side_effect=[initial, replacement, replacement])}), \
+                mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
+            self.assertEqual(journey["cleanup_runtime"](child, data)["status"], "passed")
+            groups.assert_not_called()
             kill.assert_not_called()
 
     def test_three_runs_use_distinct_fresh_state_and_continue_after_one_failed_run(self):
@@ -1489,7 +1500,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                               "source_components_sha256": journey["digest"](data / "components.json")}
                 row = {**identities, "candidate": "c" * 40, "source_tree": "d" * 40, "installed_engine": journey["engine_receipt"](data),
                        "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
-                       "results": {name: "passed" for name in ["home_screenshots", "model_package_admission", "installed_runtime_reply", "process_cleanup", "disk_reserve"]},
+                       "results": {name: "passed" for name in ["home_screenshots", "model_package_admission", "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve"]},
                        "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
                 for index in range(1, 4):
                     if failure == "missing" and index == 3:
