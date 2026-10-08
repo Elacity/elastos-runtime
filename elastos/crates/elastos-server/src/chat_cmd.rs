@@ -100,9 +100,9 @@ impl ChatTerminalUi {
         });
     }
 
-    fn push_char(&self, byte: u8) {
+    fn push_char(&self, ch: char) {
         let _ = self.with_output(|output, current| {
-            current.push(byte as char);
+            current.push(ch);
             redraw_chat_input(output, current);
         });
     }
@@ -1183,6 +1183,7 @@ fn native_chat_tty_loop_from_io(
     input: &mut dyn Read,
     ui: &ChatTerminalUi,
 ) -> bool {
+    let mut utf8 = Vec::with_capacity(4);
     loop {
         let mut byte = [0u8; 1];
         let read = match input.read(&mut byte) {
@@ -1192,6 +1193,13 @@ fn native_chat_tty_loop_from_io(
         if read == 0 {
             return false;
         }
+        if byte[0] >= 0x80 {
+            if let Some(ch) = push_utf8_byte(&mut utf8, byte[0]) {
+                ui.push_char(ch);
+            }
+            continue;
+        }
+        utf8.clear();
 
         match byte[0] {
             b'\x1b' => {
@@ -1230,9 +1238,32 @@ fn native_chat_tty_loop_from_io(
                 ui.backspace();
             }
             b if !b.is_ascii_control() => {
-                ui.push_char(b);
+                ui.push_char(char::from(b));
             }
             _ => {}
+        }
+    }
+}
+
+/// Collects the bytes of one typed UTF-8 character and returns it once
+/// complete, so "é" (C3 A9) is one character rather than two Latin-1 ones. An
+/// invalid sequence is dropped; the byte that broke it may start the next
+/// character, so it is kept when it is a lead byte.
+fn push_utf8_byte(pending: &mut Vec<u8>, byte: u8) -> Option<char> {
+    pending.push(byte);
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let ch = text.chars().next();
+            pending.clear();
+            ch
+        }
+        Err(error) if error.error_len().is_none() && pending.len() < 4 => None,
+        Err(_) => {
+            pending.clear();
+            if byte >= 0xC0 {
+                pending.push(byte);
+            }
+            None
         }
     }
 }
@@ -1445,11 +1476,14 @@ async fn sign_via_did_provider(
         }))
         .send()
         .await
+        .ok()?
+        .error_for_status()
         .ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
     body.get("data")
         .and_then(|d| d.get("signature"))
         .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -1508,23 +1542,16 @@ fn send_chat_message(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let signature =
-            sign_via_did_provider(client, api, token, did_cap, self_did, ts, message).await;
-        let mut payload = serde_json::json!({
-            "topic": CHAT_TOPIC,
-            "message": message,
-            "sender": nick,
-            "ts": ts,
-        });
-        if !self_did.is_empty() {
-            payload["sender_id"] = serde_json::Value::String(self_did.to_string());
-        }
-        if !self_session_id.is_empty() {
-            payload["sender_session_id"] = serde_json::Value::String(self_session_id.to_string());
-        }
-        if let Some(sig) = signature {
-            payload["signature"] = serde_json::Value::String(sig);
-        }
+        let signature = if self_did.is_empty() {
+            None
+        } else {
+            sign_via_did_provider(client, api, token, did_cap, self_did, ts, message).await
+        };
+        let payload =
+            match chat_send_payload(nick, message, ts, self_did, self_session_id, signature) {
+                Ok(payload) => payload,
+                Err(refusal) => return ChatSendOutcome::Error(refusal.to_string()),
+            };
         match client
             .post(format!("{}/api/provider/peer/gossip_send", api))
             .header("Authorization", format!("Bearer {}", token))
@@ -1554,6 +1581,34 @@ fn send_chat_message(
             Err(err) => ChatSendOutcome::Error(err.to_string()),
         }
     })
+}
+
+/// The gossip payload for one chat line. Receivers drop a line that is not
+/// signed by its sender, so an unsigned line is refused here instead of being
+/// broadcast and shown as sent.
+fn chat_send_payload(
+    nick: &str,
+    message: &str,
+    ts: u64,
+    self_did: &str,
+    self_session_id: &str,
+    signature: Option<String>,
+) -> Result<serde_json::Value, &'static str> {
+    let signature = signature
+        .filter(|signature| !self_did.is_empty() && !signature.is_empty())
+        .ok_or("message not sent: it could not be signed with this Home's identity")?;
+    let mut payload = serde_json::json!({
+        "topic": CHAT_TOPIC,
+        "message": message,
+        "sender": nick,
+        "ts": ts,
+        "sender_id": self_did,
+        "signature": signature,
+    });
+    if !self_session_id.is_empty() {
+        payload["sender_session_id"] = serde_json::Value::String(self_session_id.to_string());
+    }
+    Ok(payload)
 }
 
 fn report_chat_send_outcome(
@@ -2093,6 +2148,57 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_chat_line_is_refused_before_broadcast() {
+        assert!(chat_send_payload("nick", "hi", 1, "did:key:me", "", None).is_err());
+        assert!(chat_send_payload("nick", "hi", 1, "did:key:me", "", Some(String::new())).is_err());
+        assert!(chat_send_payload("nick", "hi", 1, "", "", Some("sig".into())).is_err());
+        let payload = chat_send_payload(
+            "nick",
+            "hi",
+            1,
+            "did:key:me",
+            "session-1",
+            Some("sig".into()),
+        )
+        .unwrap();
+        assert_eq!(payload["signature"], "sig");
+        assert_eq!(payload["sender_id"], "did:key:me");
+        assert_eq!(payload["sender_session_id"], "session-1");
+    }
+
+    #[test]
+    fn tty_typing_keeps_utf8_characters() {
+        let client = reqwest::Client::new();
+        let mut input = Cursor::new("café ✓".as_bytes().to_vec());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let ui = ChatTerminalUi::buffer(Arc::clone(&output));
+        let ctx = NativeChatCtx {
+            client: &client,
+            api: "http://127.0.0.1",
+            token: "token",
+            peer_cap: "cap",
+            did_cap: "cap",
+            self_did: "",
+            self_session_id: "",
+            nick: "nick",
+        };
+
+        native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
+
+        assert_eq!(ui.current.lock().unwrap().as_str(), "café ✓");
+        let mut pending = Vec::new();
+        // A broken "é" followed by a whole "✓" (E2 9C 93) keeps the check mark.
+        assert_eq!(push_utf8_byte(&mut pending, 0xC3), None);
+        assert_eq!(push_utf8_byte(&mut pending, 0xE2), None);
+        assert_eq!(push_utf8_byte(&mut pending, 0x9C), None);
+        assert_eq!(push_utf8_byte(&mut pending, 0x93), Some('✓'));
+        assert!(pending.is_empty());
+        // A stray continuation byte is dropped.
+        assert_eq!(push_utf8_byte(&mut pending, 0x93), None);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn tty_loop_quit_returns_false() {
         let client = reqwest::Client::new();
         let mut input = Cursor::new(b"/quit\r".to_vec());
@@ -2259,8 +2365,8 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let ui = ChatTerminalUi::buffer(Arc::clone(&output));
 
-        ui.push_char(b'h');
-        ui.push_char(b'i');
+        ui.push_char('h');
+        ui.push_char('i');
         ui.print_event("<peer> hello");
 
         let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
