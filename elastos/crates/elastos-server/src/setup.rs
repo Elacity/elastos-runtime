@@ -5120,10 +5120,8 @@ pub(crate) mod tests {
 
         assert_eq!(actual, expected);
 
-        for helper in ["browser-local-exit"] {
-            let component = components.external.get(helper).unwrap();
-            assert!(component.provider_runtime.is_none(), "{helper}");
-        }
+        let component = components.external.get("browser-local-exit").unwrap();
+        assert!(component.provider_runtime.is_none(), "browser-local-exit");
 
         for (name, provides) in expected {
             let component = components.external.get(&name).unwrap();
