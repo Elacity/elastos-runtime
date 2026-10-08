@@ -10,16 +10,8 @@ const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
 const cid = mode ? null : JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
-const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-const page = await context.newPage();
-const cdp = await context.newCDPSession(page);
-await cdp.send("WebAuthn.enable");
-await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
-  protocol: "ctap2", transport: "internal", hasResidentKey: true,
-  hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true,
-} });
-let stage = "sign_in";
+let browser, page;
+let stage = "journey";
 const results = {};
 const disk = {};
 function observeDisk() {
@@ -54,6 +46,16 @@ async function projection(frame, path) {
   }, path);
 }
 try {
+  browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  page = await context.newPage();
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
+    protocol: "ctap2", transport: "internal", hasResidentKey: true,
+    hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true,
+  } });
+  stage = "sign_in";
   assert((await page.goto(`${base}/home/`, { waitUntil: "domcontentloaded" })).ok(), "installed Home frontdoor responds successfully");
   await page.locator("#home-unlock-name").waitFor({ state: "visible", timeout: 60000 });
   await page.locator("#home-unlock-name").fill("CI journey");
@@ -185,8 +187,8 @@ try {
   const failure = publicJourneyFailure(error, stage);
   writeFileSync(join(data, "journey-browser.private.log"), String(error?.stack ?? error), { mode: 0o600 });
   writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, ...failure }, null, 2));
-  await page.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
+  await page?.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
   throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}`);
 } finally {
-  await browser.close();
+  await browser?.close();
 }
