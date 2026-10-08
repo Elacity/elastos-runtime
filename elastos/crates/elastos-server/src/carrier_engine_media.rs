@@ -377,6 +377,7 @@ async fn replace_media_warm(key: (PathBuf, String), warm: MediaWarm) {
 
 #[cfg(test)]
 struct PreadmitCommitBarrier {
+    key: (PathBuf, String),
     prepared: Arc<tokio::sync::Barrier>,
     release: watch::Sender<bool>,
 }
@@ -386,12 +387,13 @@ static PREADMIT_COMMIT_BARRIER: OnceLock<std::sync::Mutex<Option<Arc<PreadmitCom
     OnceLock::new();
 
 #[cfg(test)]
-async fn await_preadmit_commit_barrier() {
+async fn await_preadmit_commit_barrier(key: &(PathBuf, String)) {
     let barrier = PREADMIT_COMMIT_BARRIER
         .get_or_init(Default::default)
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
+        .and_then(|slot| slot.clone())
+        .filter(|barrier| &barrier.key == key);
     let Some(barrier) = barrier else {
         return;
     };
@@ -412,7 +414,7 @@ async fn commit_prepared_media<T>(
     into_payload: impl FnOnce(T) -> Result<WarmPayload, String>,
 ) -> bool {
     #[cfg(test)]
-    await_preadmit_commit_barrier().await;
+    await_preadmit_commit_barrier(&key).await;
 
     let ingresses = INGRESS.get_or_init(Default::default).lock().await;
     if ingresses.get(&key).is_none() {
@@ -1130,9 +1132,10 @@ mod tests {
         }
     }
 
-    fn install_preadmit_commit_barrier() -> PreadmitBarrierGuard {
+    fn install_preadmit_commit_barrier(key: (PathBuf, String)) -> PreadmitBarrierGuard {
         let (release, _) = watch::channel(false);
         let barrier = Arc::new(PreadmitCommitBarrier {
+            key,
             prepared: Arc::new(tokio::sync::Barrier::new(2)),
             release,
         });
@@ -1163,7 +1166,7 @@ mod tests {
         let page = "page:late-preadmit";
         let key = (root.path().to_owned(), page.into());
         insert_fast_close_ingress(root.path(), page, "gen").await;
-        let barrier = install_preadmit_commit_barrier();
+        let barrier = install_preadmit_commit_barrier(key.clone());
         let released = Arc::new(AtomicBool::new(false));
         let pending = tokio::spawn({
             let key = key.clone();
