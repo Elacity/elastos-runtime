@@ -4,7 +4,7 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildSmolEntry, canonical, contentManifest, fileRecord, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
+import { buildSmolEntry, canonical, contentManifest, fileRecord, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 function temporary(t) {
@@ -144,3 +144,23 @@ for (const [name, mutate, message] of [
     assert.throws(fixture.check, message);
   });
 }
+
+test("production payload is deterministic for fixed inputs and names the publisher", t => {
+  const root = temporary(t), inputs = join(root, "inputs"), weights = Buffer.from("GGUF fake weights"), license = Buffer.from("Apache-2.0 text\n");
+  mkdirSync(inputs);
+  writeFileSync(join(inputs, "fake.gguf"), weights);
+  writeFileSync(join(inputs, "LICENSE"), license);
+  const fixture = { ...SMOL_FIXTURE, model: { name: "fake.gguf", size: weights.length, sha256: sha(weights) }, license: { name: "LICENSE", size: license.length, sha256: sha(license) } };
+  const publisher = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
+  // Stand-in for Kubo: the CID is a function of the package's closure index.
+  const add = dir => rawCid(readFileSync(join(dir, "_elastos_object.json")));
+  const runs = ["a", "b"].map(name => produceCatalogPayload({ inputs, output: join(root, name), publisher, add, fixture, publishedAt: 1700000000 }));
+  assert.equal(runs[0].cid, runs[1].cid);
+  assert.deepEqual(readFileSync(join(root, "a/payload.json")), readFileSync(join(root, "b/payload.json")));
+  const { payload } = runs[0];
+  assert.equal(payload.schema, "elastos.model.catalog/v1");
+  assert.equal(payload.entries.length, 1);
+  assert(!("expires_at" in payload));
+  assert.match(readFileSync(join(runs[0].packageDir, "PROVENANCE.md"), "utf8"), new RegExp(publisher));
+  assert.throws(() => produceCatalogPayload({ inputs, output: join(root, "a"), publisher, add, fixture }), /EEXIST/);
+});

@@ -4,7 +4,9 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, lstatSync, openSync, readSync, closeSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, lstatSync, openSync, readSync, closeSync, existsSync, createWriteStream, renameSync, mkdtempSync, rmSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -66,28 +68,32 @@ export function contentManifest(files) {
   return { schema: "elastos.content.object.manifest/v1", kind: "capsule", files: sorted, content_digest: `sha256:${digest.digest("hex")}` };
 }
 
-export function buildSmolEntry(inputs, packageDir) {
-  const model = join(inputs, SMOL_FIXTURE.model.name);
-  fileRecord(model, "weights.gguf", SMOL_FIXTURE.model);
-  fileRecord(join(inputs, "LICENSE"), "LICENSE", SMOL_FIXTURE.license);
+// The publisher named in PROVENANCE.md is the closure's attesting publisher:
+// the CI fixture uses a disposable key; production names the maintainer DID.
+export function buildSmolEntry(inputs, packageDir, publisher = null, fixture = SMOL_FIXTURE) {
+  const model = join(inputs, fixture.model.name);
+  fileRecord(model, "weights.gguf", fixture.model);
+  fileRecord(join(inputs, "LICENSE"), "LICENSE", fixture.license);
   const license = readFileSync(join(inputs, "LICENSE"));
-  const provenance = SMOL_FIXTURE.capsule_manifest.model_content.provenance;
+  const provenance = fixture.capsule_manifest.model_content.provenance;
+  const attestation = publisher ? `Publisher attestation by ${publisher}.` : "Isolated CI publisher attestation.";
+  const keyNote = publisher ? "" : " This fixture uses an in-memory disposable publisher key.";
   const files = {
     LICENSE: license, "LICENSE.base": license,
-    "PROVENANCE.md": Buffer.from(`Isolated CI publisher attestation. Apache-2.0 base: ${provenance.base_repository} at ${provenance.base_revision}. Q8_0 weights: ${provenance.quantized_repository} at ${provenance.quantized_revision}. Weights SHA-256: ${SMOL_FIXTURE.model.sha256}. This fixture uses an in-memory disposable publisher key.\n`),
-    "capsule.json": Buffer.from(canonical(SMOL_FIXTURE.capsule_manifest)),
+    "PROVENANCE.md": Buffer.from(`${attestation} Apache-2.0 base: ${provenance.base_repository} at ${provenance.base_revision}. Q8_0 weights: ${provenance.quantized_repository} at ${provenance.quantized_revision}. Weights SHA-256: ${fixture.model.sha256}.${keyNote}\n`),
+    "capsule.json": Buffer.from(canonical(fixture.capsule_manifest)),
   };
   mkdirSync(packageDir, { mode: 0o700 });
   for (const [name, bytes] of Object.entries(files)) writeFileSync(join(packageDir, name), bytes, { mode: 0o400, flag: "wx" });
   copyFileSync(model, join(packageDir, "weights.gguf"));
   chmodSync(join(packageDir, "weights.gguf"), 0o400);
   // Check the copied bytes before committing their complete closure metadata.
-  const weights = fileRecord(join(packageDir, "weights.gguf"), "weights.gguf", SMOL_FIXTURE.model);
+  const weights = fileRecord(join(packageDir, "weights.gguf"), "weights.gguf", fixture.model);
   const object_manifest = contentManifest([
     ...Object.entries(files).map(([path, bytes]) => ({ path, size: bytes.length, sha256: sha(bytes) })), weights,
   ]);
   writeFileSync(join(packageDir, "_elastos_object.json"), canonical(object_manifest), { mode: 0o400, flag: "wx" });
-  return { capsule_manifest: structuredClone(SMOL_FIXTURE.capsule_manifest), object_manifest };
+  return { capsule_manifest: structuredClone(fixture.capsule_manifest), object_manifest };
 }
 
 export function verifyInstalledKubo(data, components, host, recipe) {
@@ -158,8 +164,64 @@ export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)
   return { catalog, trust: { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: 1024 ** 3, max_model_memory_bytes: 4 * 1024 ** 3 } } };
 }
 
+// Production Kubo import profile; the package CID only reproduces with these flags.
+export const KUBO_ADD_FLAGS = ["--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false"];
+
+// Adds one directory to a fresh offline repo and returns its root CID.
+export function kuboAdd(kubo, repo, dir) {
+  const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 600000 }).trim();
+  run(["init", "--empty-repo"]);
+  for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
+  run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
+  const cid = run(["add", ...KUBO_ADD_FLAGS, dir]).split("\n").at(-1);
+  assert.match(cid, /^bafy[a-z2-7]+$/);
+  return cid;
+}
+
+// Unsigned production payload for `release-signer.py --model-catalog`.
+export function produceCatalogPayload({ inputs, output, publisher, add, fixture = SMOL_FIXTURE, publishedAt = Math.floor(Date.now() / 1000) }) {
+  assert.match(publisher, /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/, "publisher must be a did:key");
+  mkdirSync(output, { recursive: true, mode: 0o700 });
+  const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir, publisher, fixture);
+  entry.cid = add(packageDir);
+  const payload = { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries: [entry] };
+  writeFileSync(join(output, "payload.json"), canonical(payload) + "\n", { mode: 0o600, flag: "wx" });
+  return { cid: entry.cid, packageDir, payload };
+}
+
+async function download(source, path) {
+  if (existsSync(path)) return fileRecord(path, source.name, source);
+  const response = await fetch(source.url);
+  assert(response.ok, `download ${source.url} failed: ${response.status}`);
+  const pending = `${path}.partial`;
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(pending, { mode: 0o600, flags: "w" }));
+  fileRecord(pending, source.name, source);
+  renameSync(pending, path);
+}
+
+// usage: produce <output-dir> <publisher-did> <kubo-data>
+// <kubo-data> is a data dir prepared by scripts/seed-kubo-cache.sh (pinned recipe Kubo).
+async function produce(args) {
+  assert.equal(args.length, 3, "usage: ci-model-package.mjs produce <output-dir> <publisher-did> <kubo-data>");
+  const output = resolve(args[0]), publisher = args[1], data = resolve(args[2]);
+  const receipt = JSON.parse(readFileSync(join(data, "receipts/kubo-build.json")));
+  const entrypoint = receipt.object_manifest.files.find(file => file.path === receipt.capsule_manifest.entrypoint);
+  const kubo = join(data, "bin/kubo");
+  assert.deepEqual(fileRecord(kubo, entrypoint.path), entrypoint, "Kubo binary matches its pinned recipe build");
+  const inputs = join(output, "inputs");
+  mkdirSync(inputs, { recursive: true, mode: 0o700 });
+  await download(SMOL_FIXTURE.model, join(inputs, SMOL_FIXTURE.model.name));
+  await download(SMOL_FIXTURE.license, join(inputs, "LICENSE"));
+  const repo = mkdtempSync(join(output, ".ipfs-repo-"));
+  try {
+    const { cid, packageDir } = produceCatalogPayload({ inputs, output, publisher, add: dir => kuboAdd(kubo, repo, dir) });
+    console.log(`package_cid ${cid}\npackage_dir ${packageDir}\npayload ${join(output, "payload.json")}`);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+}
+
 function main(args) {
-  assert.equal(args.length, 3, "usage: ci-model-package.mjs <isolated-data> <pinned-inputs> <fixture-output>");
+  if (args[0] === "produce") return produce(args.slice(1));
+  assert.equal(args.length, 3, "usage: ci-model-package.mjs <isolated-data> <pinned-inputs> <fixture-output> | produce <output-dir> <publisher-did> <kubo-data>");
   const [data, inputs, output] = args.map(arg => resolve(arg));
   const manifestPath = join(data, "components.json");
   regular(manifestPath);
@@ -172,13 +234,7 @@ function main(args) {
   kuboReceipt.components_sha256 = `sha256:${sha(manifestBytes)}`;
   mkdirSync(output, { recursive: true, mode: 0o700 });
   const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir);
-  const kubo = join(data, "bin/kubo"), repo = join(data, "ipfs-repo");
-  const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120000 }).trim();
-  run(["init", "--empty-repo"]);
-  for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
-  run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
-  entry.cid = run(["add", "--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false", packageDir]).split("\n").at(-1);
-  assert.match(entry.cid, /^bafy[a-z2-7]+$/);
+  entry.cid = kuboAdd(join(data, "bin/kubo"), join(data, "ipfs-repo"), packageDir);
   const { catalog, trust } = signedCatalog(entry);
   writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
   components.model_catalog = trust;
@@ -186,4 +242,4 @@ function main(args) {
   writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));
