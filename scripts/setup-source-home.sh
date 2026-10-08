@@ -1404,18 +1404,18 @@ install_content_publish_backend() {
     fi
 
     echo "[setup-source-home] install Kubo for Library/Documents publish"
-    local verify=()
-    if [[ -e "${DATA_DIR}/bin/kubo" || -L "${DATA_DIR}/bin/kubo" ]]; then
-        verify=(--verify-installed)
-    fi
     # CI seeds this cache before source-home verifies the installed prerequisite.
     local default_cache="${ROOT}/target-build/upstream-cache"
     if [[ -n "${RUNNER_TEMP:-}" ]]; then
         default_cache="${RUNNER_TEMP}/kubo-cache"
     fi
-    "${ROOT}/scripts/seed-kubo-cache.sh" \
-        "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${KUBO_CACHE_DIR:-${default_cache}}}" \
-        "$DATA_DIR" "$PLATFORM" "${verify[@]}"
+    local command=("${ROOT}/scripts/seed-kubo-cache.sh"
+        "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${KUBO_CACHE_DIR:-${default_cache}}}"
+        "$DATA_DIR" "$PLATFORM")
+    if [[ -e "${DATA_DIR}/bin/kubo" || -L "${DATA_DIR}/bin/kubo" ]]; then
+        command+=(--verify-installed)
+    fi
+    "${command[@]}"
     if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
         echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
         exit 1
