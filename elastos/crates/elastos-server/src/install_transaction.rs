@@ -1405,9 +1405,21 @@ fn check_file(file: &File, path: &Path, owner_only: bool) -> anyhow::Result<()> 
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
         || metadata.mode() & 0o6000 != 0
-        || metadata.mode() & if owner_only { 0o077 } else { 0o022 } != 0
     {
         bail!("installation file is unsafe: {}", path.display());
+    }
+    let refused = if owner_only { 0o077 } else { 0o022 };
+    if metadata.mode() & refused != 0 {
+        let fix = if owner_only {
+            "chmod go-rwx"
+        } else {
+            "chmod go-w"
+        };
+        bail!(
+            "installation file is unsafe: {} is accessible to other users; fix with: {fix} {}",
+            path.display(),
+            shell_quote_path(path)
+        );
     }
     Ok(())
 }
@@ -3048,6 +3060,26 @@ pub(crate) mod tests {
                 b"data written by owner"
             );
         }
+    }
+
+    #[test]
+    fn group_writable_release_file_names_a_working_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("component's list.json");
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let error = check_file(&File::open(&path).unwrap(), &path, false)
+            .unwrap_err()
+            .to_string();
+        let command = format!("chmod go-w {}", shell_quote_path(&path));
+        assert!(error.contains(&format!("fix with: {command}")), "{error}");
+        assert!(std::process::Command::new("sh")
+            .args(["-c", &command])
+            .status()
+            .unwrap()
+            .success());
+        check_file(&File::open(&path).unwrap(), &path, false).unwrap();
     }
 
     #[test]
