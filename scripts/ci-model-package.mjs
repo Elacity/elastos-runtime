@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, lstatSync, openSync, readSync, closeSync, existsSync, createWriteStream, renameSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, lstatSync, openSync, readSync, closeSync, existsSync, createWriteStream, renameSync, mkdtempSync, rmSync, constants } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { resolve, join, dirname } from "node:path";
@@ -189,14 +189,39 @@ export function produceCatalogPayload({ inputs, output, publisher, add, fixture 
   return { cid: entry.cid, packageDir, payload };
 }
 
-async function download(source, path) {
+// Creates `path` (and parents) as directories with no symlink anywhere on the
+// path; the leaf must be ours so nobody else can swap entries inside it.
+export function ownedDirectory(path) {
+  const check = () => {
+    for (let current = resolve(path);; current = dirname(current)) {
+      const stat = lstatSync(current, { throwIfNoEntry: false });
+      assert(!stat || stat.isDirectory(), `${current} must be a real directory, not a symlink`);
+      if (current === dirname(current)) break;
+    }
+  };
+  check();
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  check();
+  assert.equal(lstatSync(path).uid, process.getuid(), `${path} must be owned by the current user`);
+  return path;
+}
+
+// The partial file is created exclusively without following links, before any
+// network read; a pre-placed partial or symlink is refused and left untouched.
+export async function download(source, path, get = fetch) {
   if (existsSync(path)) return fileRecord(path, source.name, source);
-  const response = await fetch(source.url);
-  assert(response.ok, `download ${source.url} failed: ${response.status}`);
   const pending = `${path}.partial`;
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(pending, { mode: 0o600, flags: "w" }));
-  fileRecord(pending, source.name, source);
-  renameSync(pending, path);
+  const fd = openSync(pending, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    const response = await get(source.url);
+    assert(response.ok, `download ${source.url} failed: ${response.status}`);
+    await pipeline(Readable.fromWeb(response.body), createWriteStream(null, { fd }));
+    fileRecord(pending, source.name, source);
+    renameSync(pending, path);
+  } catch (error) {
+    rmSync(pending, { force: true });
+    throw error;
+  }
 }
 
 // usage: produce <output-dir> <publisher-did> <kubo-data>
@@ -208,8 +233,7 @@ async function produce(args) {
   const entrypoint = receipt.object_manifest.files.find(file => file.path === receipt.capsule_manifest.entrypoint);
   const kubo = join(data, "bin/kubo");
   assert.deepEqual(fileRecord(kubo, entrypoint.path), entrypoint, "Kubo binary matches its pinned recipe build");
-  const inputs = join(output, "inputs");
-  mkdirSync(inputs, { recursive: true, mode: 0o700 });
+  const inputs = ownedDirectory(join(ownedDirectory(output), "inputs"));
   await download(SMOL_FIXTURE.model, join(inputs, SMOL_FIXTURE.model.name));
   await download(SMOL_FIXTURE.license, join(inputs, "LICENSE"));
   const repo = mkdtempSync(join(output, ".ipfs-repo-"));

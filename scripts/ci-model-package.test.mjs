@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildSmolEntry, canonical, contentManifest, fileRecord, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
+import { buildSmolEntry, canonical, contentManifest, download, fileRecord, ownedDirectory, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 function temporary(t) {
@@ -163,4 +163,24 @@ test("production payload is deterministic for fixed inputs and names the publish
   assert(!("expires_at" in payload));
   assert.match(readFileSync(join(runs[0].packageDir, "PROVENANCE.md"), "utf8"), new RegExp(publisher));
   assert.throws(() => produceCatalogPayload({ inputs, output: join(root, "a"), publisher, add, fixture }), /EEXIST/);
+});
+
+test("download refuses a pre-placed symlink partial and leaves its target untouched", async t => {
+  const root = temporary(t), inputs = join(root, "inputs"), victim = join(root, "victim");
+  mkdirSync(inputs);
+  writeFileSync(victim, "keep");
+  symlinkSync(victim, join(inputs, "LICENSE.partial"));
+  let fetched = false;
+  const get = async () => { fetched = true; return new Response("replaced"); };
+  await assert.rejects(download(SMOL_FIXTURE.license, join(inputs, "LICENSE"), get), /EEXIST/);
+  assert.equal(readFileSync(victim, "utf8"), "keep");
+  assert.equal(fetched, false);
+});
+
+test("output directory refuses a symlinked ancestor", t => {
+  const root = temporary(t), real = join(root, "real");
+  mkdirSync(real);
+  symlinkSync(real, join(root, "link"));
+  assert.throws(() => ownedDirectory(join(root, "link", "out")), /not a symlink/);
+  assert.throws(() => lstatSync(join(real, "out")), /ENOENT/);
 });
