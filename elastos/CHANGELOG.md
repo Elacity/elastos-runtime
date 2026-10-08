@@ -14,16 +14,15 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 - Chat is its own signed capsule. A new install downloads it over Carrier, and an
   update from System or Terminal adds it if it is missing.
-- Every part of a release is now downloaded by its content ID and checked against
-  the signed release, so any host that holds it can serve it.
-- From this release on, your Home keeps the parts an update replaces, so a later
-  Undo can go back without downloading them again.
+- From this release on, an update keeps the files it replaces until the next
+  update, so Undo goes back without downloading anything.
 - Media tools are downloaded again only when they actually change.
 
 ### Fixed
 
-- Undo to an earlier release works again. Before, it received the newest
-  release's parts and was refused.
+- Undo works again for updates made from this release on. Going back from
+  alpha.9 to alpha.8 is still refused cleanly, because alpha.8 did not keep the
+  files it replaced.
 - On Ubuntu and Jetson, install.sh no longer refuses the folder it just created.
   If an existing folder is unsafe, it says how to fix it before downloading
   anything.
@@ -32,14 +31,10 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Developer detail
 
-- Release content is fetched with a Carrier `content_file` request (CID, SHA-256,
-  size); the trusted source serves only Kubo-pinned bytes, offline and streamed,
-  and refuses anything else. The name `file` request stays for released clients
-  (#287).
-- The Home keeps verified artifacts in `release-artifacts/<sha256>` for the
-  current and previous release; Undo reads it first (#287).
-- The macOS update journey republishes only the newest set before Undo, like the
-  seed, so it catches name-served bytes (#287).
+- An update keeps its verified rollback copy of the replaced release files and
+  components until the next update starts; `elastos update --rollback-to` the
+  previous head restores it offline after checking it against the previous
+  signed release (#287).
 - Media tools build with fixed prefixes; the archive is byte-identical across
   build directories (#194).
 - `elastos update` in Terminal adds missing Home components only on a Home;
