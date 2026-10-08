@@ -58,6 +58,11 @@ def archive_bytes(entries=None):
     return output.getvalue()
 
 
+
+_GUEST_SPEC = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))
+guest_inputs = importlib.util.module_from_spec(_GUEST_SPEC)
+_GUEST_SPEC.loader.exec_module(guest_inputs)
+
 class PlatformInputTest(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory()
@@ -140,6 +145,8 @@ class PlatformInputTest(unittest.TestCase):
         payloads = {"rootfs.ext4": b"tiny rootfs", "vmlinux": b"image kernel", "initrd": b"image initrd"}
         record = lambda data: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         receipt = {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
+                   "inputs_sha256": guest_inputs.identity()["sha256"],
+                   "recipe_options": guest_inputs.identity()["options"],
                    "target_platform": platform, **record(payloads["rootfs.ext4"]),
                    "kernel": record(payloads["vmlinux"]), "initrd": record(payloads["initrd"]),
                    "preflight": {"ok": True, "audio_default_ready": True}}
@@ -238,13 +245,17 @@ class PlatformInputTest(unittest.TestCase):
     def test_browser_image_signed_input_keeps_install_strategy(self):
         for platform in self.bundles:
             setup_platform = inputs.PLATFORMS[platform][0]
-            descriptor = {"strategy": "browser-vm-image", "release_path": "browser-vm-image-" + setup_platform + ".tar.gz",
+            if setup_platform == "linux-amd64":
+                continue
+            descriptor = {"strategy": "browser-vm-image", "release_path": "browser-vm-image-arm64.tar.gz",
                           "install_path": "browser-vm/image-set", "extract_path": "browser-vm-image"}
             self.template["external"].setdefault(inputs.BROWSER_IMAGE, {"install_path": "browser-vm/image-set", "platforms": {}})["platforms"][setup_platform] = descriptor
         self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
         for platform, root in self.bundles.items():
             setup_platform = inputs.PLATFORMS[platform][0]
-            package = self.browser_image_package("linux-amd64" if setup_platform == "linux-amd64" else "linux-arm64")
+            if setup_platform == "linux-amd64":
+                continue
+            package = self.browser_image_package("linux-arm64")
             self.write_json(root / "components-template.json", self.template)
             data = json.loads((root / "components.json").read_bytes())
             component = copy.deepcopy(self.template["external"][inputs.BROWSER_IMAGE])

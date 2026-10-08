@@ -71,7 +71,9 @@ BROWSER_IMAGE_INSTALL = "browser-vm/image-set"
 
 
 def check_browser_image_archive(path, platform):
-    """Read the complete image set without extracting or booting it."""
+    """Read the complete shared ARM64 image without extracting or booting it."""
+    if platform not in ("darwin-arm64", "linux-arm64"):
+        raise ValueError("This host uses a remote Browser Engine; the shared guest is ARM64")
     records, receipt = {}, None
     files = {"rootfs.ext4", "vmlinux", "initrd", "browser-vm-rootfs-manifest.json"}
     with gzip.open(path, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r|") as archive:
@@ -94,11 +96,17 @@ def check_browser_image_archive(path, platform):
         # Tar ends before the gzip trailer; consume it to verify CRC/truncation.
         while compressed.read(1024 * 1024):
             pass
-    guest = "linux-amd64" if platform == "linux-amd64" else "linux-arm64"
+    guest = "linux-arm64"
     if (set(records) != files or not isinstance(receipt, dict)
             or receipt.get("schema") != "elastos.browser.vm-rootfs-build/v1"
             or receipt.get("ok") is not True or receipt.get("target_platform") != guest):
         raise ValueError("Browser image set is incomplete or has the wrong guest platform")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))
+    inputs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inputs)
+    if receipt.get("inputs_sha256") != inputs.identity(options=receipt.get("recipe_options"))["sha256"]:
+        raise ValueError("Browser guest recipe input hash differs from the candidate")
     for name, info in (("rootfs.ext4", receipt), ("vmlinux", receipt.get("kernel", {})),
                        ("initrd", receipt.get("initrd", {}))):
         if not isinstance(info, dict) or any(info.get(key) != records[name][key] for key in ("size", "sha256")):

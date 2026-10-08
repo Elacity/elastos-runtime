@@ -199,6 +199,17 @@ platform matrix. Generic provider VM archives remain a separate build path.
 Linux preparation needs tracked lockfiles for the standalone Browser helper
 projects; a missing lockfile stops preparation before a native build.
 
+The Browser guest is one ARM64 Chromium/Selkies image shared by Mac and Linux
+ARM64. Its release artifact is `browser-vm-image-arm64.tar.gz`; both platform
+rows bind the same bytes. Linux x86-64 is a remote Engine consumer.
+
+The guest builder hashes its recipe, pinned Selkies inputs, guest helper sources
+and build options. Running it again with the same output directory reuses an
+intact image with the same `inputs_sha256`; changed inputs require a new build.
+Image admission checks that identity against the candidate. Source options and
+payload hashes stay in its build receipt. Legacy receipts keep their historical
+proof and need explicit qualification before entering a new signed candidate.
+
 For Mac and Linux ARM64, add `--browser-vm-image-set /path/to/verified-image-set`.
 Browser preparation packages the verified four-member rootfs/kernel/initrd set
 and matching host helpers in this same input. Reuse the qualified image when its

@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 
 SOURCE = Path(__file__).resolve().parent.parent
-LINUX_ONLY = {"browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge"}
+# A synthetic platform-scoped helper exercises omission and lock admission.
+LINUX_ONLY = {"linux-fixture-helper"}
 APPS = [
     "home-cli", "home-gui", "home", "system", "wallet-metamask", "wallet-unisat",
     "wallet-walletconnect", "wallet", "browser", "documents", "library", "marketplace",
@@ -133,9 +134,20 @@ class PrepareWorkerTest(unittest.TestCase):
             "publish-release.sh", "prepare-release-platform.sh", "release-platform-input.py",
             "components-release-integrity-check.py", "check-versioning.sh", "build-media-tools.sh",
             "release-upstream-assets.py", "release-upstream-input.py", "browser-host-release.py",
+            "browser-vm-image-inputs.py",
         ):
             (scripts / name).write_bytes((SOURCE / "scripts" / name).read_bytes())
             (scripts / name).chmod(0o755)
+        publisher_path = scripts / "publish-release.sh"
+        publisher_path.write_text(publisher_path.read_text().replace(
+            "SUPPORT_BINARY_ASSETS=(\n", "SUPPORT_BINARY_ASSETS=(\n    linux-fixture-helper\n", 1))
+        spec = importlib.util.spec_from_file_location("guest_inputs", scripts / "browser-vm-image-inputs.py")
+        self.guest_inputs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.guest_inputs)
+        for name in self.guest_inputs.REQUIRED_FILES:
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((SOURCE / name).read_bytes())
         # The synthetic builder keeps source pins real to exercise archive admission.
         (scripts / "media-tools-build.py").write_text(MOCK_MEDIA_BUILD)
         # Fake binaries cannot establish static linking; only this audit is stubbed.
@@ -262,7 +274,7 @@ class PrepareWorkerTest(unittest.TestCase):
             "schema": "elastos.components/v1", "external": external,
             "profiles": {"home": {"components": ["home", "shell", "media-tools", "media-provider"]},
                          "browser-host": host_profile}}))
-        (self.repo / "elastos").mkdir()
+        (self.repo / "elastos").mkdir(exist_ok=True)
         (self.repo / "elastos/Cargo.toml").write_text("[workspace]\n")
         (self.repo / "elastos/Cargo.lock").write_text("version = 4\n")
         (self.repo / ".gitignore").write_text("__pycache__/\nsecret.txt\n")
@@ -369,6 +381,8 @@ class PrepareWorkerTest(unittest.TestCase):
         files = {"rootfs.ext4": b"rootfs", "vmlinux": b"browser kernel", "initrd": b"initrd"}
         record = lambda data: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         receipt = {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True, "target_platform": "linux-arm64",
+                   "inputs_sha256": self.guest_inputs.identity()["sha256"],
+                   "recipe_options": self.guest_inputs.identity()["options"],
                    **record(files["rootfs.ext4"]), "kernel": record(files["vmlinux"]), "initrd": record(files["initrd"]),
                    "preflight": {"ok": True, "audio_default_ready": True}}
         files["browser-vm-rootfs-manifest.json"] = json.dumps(receipt).encode()

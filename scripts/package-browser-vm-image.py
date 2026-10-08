@@ -62,7 +62,7 @@ def digest(path):
 
 
 def package(image, platform, archive, manifest_output, release_path):
-    if platform not in {"darwin-arm64", "linux-arm64", "linux-amd64"}:
+    if platform not in {"darwin-arm64", "linux-arm64"}:
         raise ValueError(f"unsupported Browser image platform: {platform}")
     if (not release_path.endswith(".tar.gz") or release_path.startswith("/")
             or any(part in {"", ".", ".."} for part in release_path.split("/"))):
@@ -86,7 +86,8 @@ def package(image, platform, archive, manifest_output, release_path):
         raise ValueError("Browser image set failed verification; source and existing package preserved")
     receipt = json.loads(files["browser-vm-rootfs-manifest.json"].read_bytes())
     # Publish the byte/contract receipt. Operator paths remain in the build receipt.
-    portable = {k: receipt[k] for k in ("schema", "ok", "target_platform", "size", "sha256")}
+    portable = {k: receipt[k] for k in ("schema", "ok", "target_platform", "size", "sha256",
+                                      "inputs_sha256", "recipe_options")}
     for name in ("kernel", "initrd"):
         portable[name] = {k: receipt[name][k] for k in ("size", "sha256")}
     preflight = receipt["preflight"]

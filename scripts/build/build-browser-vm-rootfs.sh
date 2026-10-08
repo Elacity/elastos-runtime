@@ -21,7 +21,7 @@ contract, then emits plain artifacts consumed by crosvm or Apple VZ:
 
 Options:
   --out-dir PATH              Build output directory
-  --target-platform PLATFORM  linux-arm64|linux-amd64 (default: linux-arm64)
+  --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest)
   --rootfs-size SIZE          mke2fs image size (default: 8192M)
   --debian-suite SUITE        Debian suite (default: bookworm)
   --debian-mirror URL         Debian mirror (default: https://deb.debian.org/debian)
@@ -74,6 +74,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$out_dir" ]] || { usage >&2; exit 2; }
+
+image_inputs_args=(--target-platform "$target_platform" --rootfs-size "$rootfs_size"
+  --debian-suite "$debian_suite" --debian-mirror "$debian_mirror" --image-dir "$out_dir")
+if image_inputs=$(python3 "$repo_root/scripts/browser-vm-image-inputs.py" "${image_inputs_args[@]}"); then
+  echo "[browser-vm-rootfs] reuse verified guest: recipe input hash matches" >&2
+  cat "$out_dir/browser-vm-rootfs-manifest.json"
+  exit 0
+else
+  input_status=$?
+  [[ "$input_status" == 2 ]] || die "Guest input or cached image verification failed"
+fi
 
 case "$target_platform" in
   linux-arm64)
@@ -131,6 +142,7 @@ fi
 debootstrap_bin="$(resolve_cmd debootstrap)"
 
 mkdir -p "$out_dir"
+printf '%s\n' "$image_inputs" > "$out_dir/browser-vm-inputs.json"
 out_dir="$(cd "$out_dir" && pwd)"
 target_dir="$out_dir/target-contract"
 rootfs_dir="$out_dir/rootfs"
@@ -179,13 +191,13 @@ echo "[browser-vm-rootfs] selkies: vendored 1.6.1"
 
 cargo_target_dir="${ELASTOS_BROWSER_VM_CARGO_TARGET_DIR:-$out_dir/cargo-target}"
 echo "[browser-vm-rootfs] build guest binaries"
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-native-proxy-engine/Cargo.toml" \
   --target "$rust_target" --release
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-vm-runtime-relay/Cargo.toml" \
   --target "$rust_target" --release
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-vm-guest-control-bridge/Cargo.toml" \
   --target "$rust_target" --release
 
@@ -411,6 +423,9 @@ mkdir -p "$target_dir"
   --runtime-relay-bin "$cargo_target_dir/$rust_target/release/browser-vm-runtime-relay" \
   --guest-control-bridge-bin "$cargo_target_dir/$rust_target/release/browser-vm-guest-control-bridge" \
   --control-service "$repo_root/scripts/browser-selkies-control-service.mjs" \
+  --vz-transport-bootstrap "$repo_root/scripts/browser-vm-vz-transport-bootstrap.mjs" \
+  --runtime-exit-transport vsock_relay \
+  --display-backend vm_selkies_gstreamer_webrtc \
   --node-bin "$out_dir/node" \
   --chromium-bin "$out_dir/chromium" > "$out_dir/stage-result.json"
 
@@ -606,6 +621,9 @@ rm -f "$rootfs_image"
 as_root "$mke2fs_bin" -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
 as_root chown "$(id -u):$(id -g)" "$rootfs_image"
 
+current_inputs=$(python3 "$repo_root/scripts/browser-vm-image-inputs.py" "${image_inputs_args[@]:0:8}")
+[[ "$current_inputs" == "$image_inputs" ]] || die "Guest inputs changed during build"
+
 python3 - "$out_dir" "$target_platform" "$rootfs_image" "$kernel_image" "$initrd_image" <<'PY'
 import hashlib
 import json
@@ -631,6 +649,8 @@ manifest = {
     "ok": bool(preflight.get("ok")),
     "builder": "debootstrap",
     "target_platform": target_platform,
+    "inputs_sha256": json.loads((out_dir / "browser-vm-inputs.json").read_text())["sha256"],
+    "recipe_options": json.loads((out_dir / "browser-vm-inputs.json").read_text())["options"],
     "rootfs_ext4": str(rootfs),
     "sha256": sha256(rootfs),
     "size": rootfs.stat().st_size,

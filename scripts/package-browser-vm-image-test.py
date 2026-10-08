@@ -29,6 +29,11 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+
+_GUEST_SPEC = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))
+guest_inputs = importlib.util.module_from_spec(_GUEST_SPEC)
+_GUEST_SPEC.loader.exec_module(guest_inputs)
+
 class BrowserImagePackageTest(unittest.TestCase):
     def setUp(self):
         scratch = tempfile.TemporaryDirectory()
@@ -48,6 +53,8 @@ class BrowserImagePackageTest(unittest.TestCase):
             (self.image / name).write_bytes(payload)
         self.receipt = {
             "schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
+                   "inputs_sha256": guest_inputs.identity()["sha256"],
+                   "recipe_options": guest_inputs.identity()["options"],
             # Mac ARM64 runs the Linux ARM64 guest, as artifact preflight requires.
             "target_platform": "linux-arm64",
             "size": len(self.payloads["rootfs.ext4"]),
@@ -112,8 +119,37 @@ class BrowserImagePackageTest(unittest.TestCase):
         self.metadata.write_bytes(b"existing metadata")
         return self.outputs()
 
+    def test_one_guest_archive_is_identical_for_mac_and_jetson(self):
+        self.package()
+        checksum = sha(self.archive.read_bytes())
+        self.archive = self.root / "jetson.tar.gz"
+        self.metadata = self.root / "jetson.json"
+        self.platform = "linux-arm64"
+        self.package()
+        self.assertEqual(sha(self.archive.read_bytes()), checksum)
+
+    def test_x86_local_image_is_refused(self):
+        self.platform = "linux-amd64"
+        with self.assertRaises(ValueError):
+            self.package()
+        self.assertFalse(self.archive.exists())
+
+    def test_matching_input_cache_reuses_only_unchanged_payloads(self):
+        inputs = {"sha256": self.receipt["inputs_sha256"]}
+        self.assertTrue(guest_inputs.reusable(self.image, inputs))
+        self.assertFalse(guest_inputs.reusable(self.image, {"sha256": "0" * 64}))
+        (self.image / "vmlinux").write_bytes(b"changed kernel")
+        with self.assertRaises(ValueError):
+            guest_inputs.reusable(self.image, inputs)
+
+    def test_recipe_options_must_be_complete_and_arm64(self):
+        for options in ({}, {**guest_inputs.DEFAULT_OPTIONS, "target_platform": "linux-amd64"},
+                        {**guest_inputs.DEFAULT_OPTIONS, "cdp_timeout_ms": "0"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                guest_inputs.identity(options=options)
+
     def test_complete_portable_archive_hash_size_and_deterministic_reuse(self):
-        for platform in ("darwin-arm64", "linux-arm64", "linux-amd64"):
+        for platform in ("darwin-arm64", "linux-arm64"):
             with self.subTest(platform=platform):
                 self.platform = platform
                 self.receipt["target_platform"] = "linux-amd64" if platform == "linux-amd64" else "linux-arm64"
@@ -139,7 +175,7 @@ class BrowserImagePackageTest(unittest.TestCase):
                     portable_bytes = archive.extractfile("browser-vm-image/" + FILES[-1]).read()
                 self.assertNotIn(b"/operator/private", portable_bytes)
                 portable = json.loads(portable_bytes)
-                self.assertEqual(set(portable), {"schema", "ok", "target_platform", "size", "sha256", "kernel", "initrd", "preflight"})
+                self.assertEqual(set(portable), {"schema", "ok", "target_platform", "size", "sha256", "kernel", "initrd", "preflight", "inputs_sha256", "recipe_options"})
                 self.assertEqual(portable["preflight"]["required"], {"init": {"ok": True}})
                 before = self.outputs()
                 self.assertEqual(self.package(), overlay)
@@ -266,6 +302,28 @@ class BrowserImagePackageTest(unittest.TestCase):
                     self.assertEqual(self.archive.read_bytes(), b"replacement foreign archive")
                 else:
                     self.assertFalse(self.archive.exists())
+
+
+class GuestInputIdentityTest(unittest.TestCase):
+    def test_only_guest_inputs_and_recipe_options_invalidate_reuse(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            subprocess.run(["git", "init", "--quiet", root], check=True)
+            for name in guest_inputs.REQUIRED_FILES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"guest input fixture")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            before = guest_inputs.identity(root=root)["sha256"]
+            runtime = root / "elastos/crates/elastos-server/src/setup.rs"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(b"Runtime changes separately")
+            self.assertEqual(guest_inputs.identity(root=root)["sha256"], before)
+            (root / guest_inputs.REQUIRED_FILES[0]).write_bytes(b"changed guest builder")
+            self.assertNotEqual(guest_inputs.identity(root=root)["sha256"], before)
+            options = {**guest_inputs.DEFAULT_OPTIONS, "rootfs_size": "16384M"}
+            self.assertNotEqual(guest_inputs.identity(root=root, options=options)["sha256"],
+                                guest_inputs.identity(root=root)["sha256"])
 
 
 if __name__ == "__main__":

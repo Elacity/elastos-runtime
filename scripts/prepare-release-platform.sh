@@ -80,6 +80,7 @@ PYTHON
 )
 fi
 if [[ -n "$BROWSER_VM_IMAGE_SET" ]]; then
+    [[ "$SETUP_PLATFORM" != linux-amd64 ]] || die "This host uses a remote Browser Engine; ARM64 guest inputs belong to Mac/Jetson"
     BROWSER_VM_IMAGE_SET=$(python3 - "$CALLER_DIR" "$BROWSER_VM_IMAGE_SET" <<'PYTHON'
 import os, sys
 print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
@@ -177,7 +178,7 @@ if [[ -z "$REUSE_SUPPORT" ]]; then
         python3 "$SOURCE_ROOT/scripts/package-browser-vm-image.py" \
             --image-dir "$BROWSER_VM_IMAGE_SET" --platform "$SETUP_PLATFORM" \
             --archive "$BROWSER_VM_IMAGE" --manifest-output "$WORK_DIR/packaged-browser-image.json" \
-            --release-path "browser-vm-image-${SETUP_PLATFORM}.tar.gz"
+            --release-path "browser-vm-image-arm64.tar.gz"
         BROWSER_VM_IMAGE_SHA256=$(python3 - "$BROWSER_VM_IMAGE" <<'PYTHON'
 import hashlib, pathlib, sys
 with pathlib.Path(sys.argv[1]).open('rb') as stream:
