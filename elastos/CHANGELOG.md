@@ -6,6 +6,34 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.10]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Fixed
+
+- Installs and updates now finish on slow connections. A download stops only
+  when no data arrives for a while, not because a large file takes long.
+- On Ubuntu and Jetson, ElastOS no longer creates files that a later update
+  refuses as unsafe. If an existing file is unsafe, the update names the
+  command that fixes it.
+
+### Developer detail
+
+- Carrier `fetch_file` and `fetch_content` bound each step (30 s to open, send
+  and read an error reply, 60 s for the source's header, then 30 s without
+  body bytes) and have no total cap. HTTP release downloads read in chunks with
+  a byte ceiling (signed size, else 200 MiB) and a 30 s idle timeout. install.sh
+  drops its 30-minute binary cap and keeps curl's minimum-speed rule (1 KiB/s
+  over 60 s) (#113).
+- Release packaging extracts capsule trees from a file instead of a pipe, so
+  macOS bsdtar can no longer stop `git archive` with SIGPIPE (#194).
+- The Runtime drops group and world write from its umask before it starts any
+  thread (keeping stricter bits such as 077), so Ubuntu's 0002 no longer makes
+  group-writable files; an unsafe release file's refusal names `chmod go-w`
+  (#279). Installs made by alpha.8 under umask 0002 need `chmod -R go-w` on the
+  data folder once, because the installed binary performs the update.
+
 ## [0.8.0-alpha.9]
 
 Test-channel release. Signed releases show these notes in System before you update.

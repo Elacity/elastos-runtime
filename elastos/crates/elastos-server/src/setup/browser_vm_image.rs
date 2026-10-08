@@ -498,21 +498,18 @@ pub(super) async fn install_via_carrier(
         }
         Ok(())
     };
-    // Progress can continue beyond the old 30-second total limit. Each Carrier
-    // read/write still has a 30-second idle limit, with one hour for all routes.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(60 * 60),
-        crate::carrier::fetch_file_from_trusted_source_to_bound(
-            &source,
-            info.release_path.as_deref().unwrap(),
-            &mut download,
-            size,
-            &mut progress,
-            bind_addr,
-        ),
+    // The download fails only when no bytes arrive for 30 s (each Carrier
+    // read/write has that idle limit); progress keeps it alive.
+    crate::carrier::fetch_file_from_trusted_source_to_bound(
+        &source,
+        info.release_path.as_deref().unwrap(),
+        &mut download,
+        size,
+        &mut progress,
+        bind_addr,
     )
     .await
-    .context("Browser image download exceeded its one-hour deadline (previous set preserved)")??;
+    .context("Browser image download failed (previous set preserved)")?;
     tokio::time::timeout(std::time::Duration::from_secs(30), download.sync_all())
         .await
         .context("Browser image download sync deadline")??;
