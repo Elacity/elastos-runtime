@@ -4,10 +4,12 @@ set -euo pipefail
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/public-install-guards.sh"
+
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 TARGET_ADDR="${ELASTOS_OPERATOR_TARGET_ADDR:-127.0.0.1:33100}"
-SRC_HOME="$(mktemp -d /tmp/elastos-public-operator-src-XXXXXX)"
-DST_HOME="$(mktemp -d /tmp/elastos-public-operator-dst-XXXXXX)"
+SRC_HOME="$(smoke_home_dir public-operator-src)"
+DST_HOME="$(smoke_home_dir public-operator-dst)"
 
 cleanup() {
     if [[ -f "${DST_HOME}/serve.pid" ]]; then
