@@ -223,7 +223,9 @@ elastos update --rollback-to <previous head CID>
 
 Replace `<previous head CID>` with the saved CID. A plain update to an older
 release is refused. Undo keeps your identity, accounts, and user data, including
-data written after the update.
+data written after the update. It also keeps the joined Community network and
+its accepted revision, contacts, and messages. Leaving Community is a separate
+action.
 
 For a legacy Home, the first update to a new publisher key uses the installer's
 re-trust step. After that step, Undo accepts only heads signed by the current

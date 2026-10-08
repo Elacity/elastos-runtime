@@ -672,15 +672,21 @@ async fn admit_installed_setup_metadata(
         let network = crate::collaboration_release_network::fetch_release_network(
             data_dir,
             manifest.collaboration_network.as_ref(),
-            |_| async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.fetch_file(
-                        crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE,
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("Community network Carrier fetch timed out"))?
+            |pin| {
+                let cid = pin.head_cid.clone();
+                let client = &client;
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.fetch_content_bounded(
+                            &cid,
+                            None,
+                            crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Community network Carrier fetch timed out"))?
+                }
             },
         )
         .await?;
@@ -7409,7 +7415,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn installed_setup_fetches_the_pinned_network_by_name_and_joins_it() {
+    async fn installed_setup_fetches_the_pinned_network_by_cid_and_joins_it() {
         signed_setup_carrier_fixture("network fresh", false).await;
     }
 
@@ -7422,6 +7428,13 @@ pub(crate) mod tests {
     async fn installed_setup_refuses_a_mismatched_network_without_writes() {
         for existing in [false, true] {
             signed_setup_carrier_fixture("network hash", existing).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_setup_refuses_oversized_network_before_body_without_writes() {
+        for existing in [false, true] {
+            signed_setup_carrier_fixture("network size", existing).await;
         }
     }
 
@@ -7854,6 +7867,10 @@ pub(crate) mod tests {
         let endpoint = server.clone();
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
+        let oversized_network = case == "network size";
+        let network_cid = network
+            .as_ref()
+            .map(|bytes| catalog_head_cid(bytes).unwrap());
         let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -7867,12 +7884,24 @@ pub(crate) mod tests {
                         .await
                         .unwrap();
                     let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    // The signed component CID is fetched by CID, not by its release name.
+                    // Signed component and network pins select content by CID.
                     if request["op"] == "content_fetch" {
-                        assert_eq!(request["cid"], effect_cid);
-                        request["path"] = "effect".into();
+                        if request["cid"] == effect_cid {
+                            request["path"] = "effect".into();
+                        } else {
+                            assert_eq!(request["cid"].as_str(), network_cid.as_deref());
+                            assert!(request.get("path").is_none(), "network fetch used a name");
+                            request["path"] =
+                                crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                                    .into();
+                        }
                     } else {
                         assert_ne!(request["path"], "effect", "signed CID fetched by name");
+                        assert_ne!(
+                            request["path"],
+                            crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE,
+                            "signed network CID fetched by name"
+                        );
                     }
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
@@ -7888,6 +7917,20 @@ pub(crate) mod tests {
                         send.write_all(&((MAX_MODEL_CATALOG_BYTES as u64) + 1).to_be_bytes())
                             .await
                             .unwrap();
+                        let _ = send.stopped().await;
+                        continue;
+                    }
+                    if oversized_network
+                        && request["path"]
+                            == crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                    {
+                        // Refuse the header without waiting for an oversized body.
+                        send.write_all(
+                            &((crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES as u64) + 1)
+                                .to_be_bytes(),
+                        )
+                        .await
+                        .unwrap();
                         let _ = send.stopped().await;
                         continue;
                     }
@@ -7929,17 +7972,22 @@ pub(crate) mod tests {
         } else {
             assert!(result.is_err(), "{case}");
             assert_eq!(signed_setup_snapshot(&data), before, "{case}");
-            if case == "catalog size" {
+            if matches!(case, "catalog size" | "network size") {
+                let bound = if case == "catalog size" {
+                    MAX_MODEL_CATALOG_BYTES
+                } else {
+                    crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES
+                };
                 let error = format!("{:#}", result.unwrap_err());
                 assert!(
-                    error.contains(&format!("exceeds its {MAX_MODEL_CATALOG_BYTES}-byte bound")),
+                    error.contains(&format!("exceeds its {bound}-byte bound")),
                     "{error}"
                 );
             }
             let expected_requests = match case {
                 "component hash" => 1,
                 "catalog hash" | "catalog signer" | "catalog size" => 2,
-                "network hash" => 3,
+                "network hash" | "network size" => 3,
                 "head signer" | "release signer" | "pending journal" | "writer busy" => 0,
                 _ => panic!("unknown refusal case"),
             };

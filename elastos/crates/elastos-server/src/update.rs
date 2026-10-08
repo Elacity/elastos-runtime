@@ -4936,6 +4936,16 @@ mod tests {
         components: &[u8],
         network: Option<&[u8]>,
     ) -> PublishedRelease {
+        published_release_with_version(executable, components, network, "0.7.1")
+    }
+
+    #[cfg(unix)]
+    fn published_release_with_version(
+        executable: &[u8],
+        components: &[u8],
+        network: Option<&[u8]>,
+        version: &str,
+    ) -> PublishedRelease {
         use sha2::Digest;
         let input = tempfile::tempdir().unwrap();
         // Publication admission refuses symlinked ancestors such as macOS /var.
@@ -4965,7 +4975,7 @@ mod tests {
         };
         let release = binding_envelope(
             serde_json::json!({
-                "schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+                "schema": "elastos.release/v1", "version": version, "channel": "stable",
                 "source": {"commit": "a".repeat(40), "tree": "b".repeat(40)},
                 "released_at": 1, "prev_release_cid": null,
                 "installer_sha256": hex::encode(sha2::Sha256::digest(installer)),
@@ -4978,6 +4988,7 @@ mod tests {
         let did =
             crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
         let mut head = binding_head(&release);
+        head["version"] = serde_json::json!(version);
         head["signer_did"] = serde_json::json!(did);
         head["updated_at"] = serde_json::json!(2);
         head["prev_head_cid"] = serde_json::Value::Null;
@@ -5095,6 +5106,94 @@ mod tests {
             components
         );
         assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undo_keeps_joined_network_revision_and_data_written_after_update() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(2);
+        for previous_pins_network in [false, true] {
+            let previous_network = previous_pins_network.then_some(chain[0].as_slice());
+            let previous_components = previous_network
+                .map(components_pinning_network)
+                .unwrap_or_else(|| EMPTY_COMPONENTS.to_vec());
+            let (_fixture, data, binary, _source) = default_apply_fixture(&previous_components);
+            let previous_binary = std::fs::read(&binary).unwrap();
+            let previous = published_release_with_version(
+                &previous_binary,
+                &previous_components,
+                previous_network,
+                "0.7.0",
+            );
+            let components = components_pinning_network(&chain[1]);
+            let next = published_release(NEXT_EXECUTABLE, &components, Some(&chain[1]));
+            update_from_published(&data, &binary, &next)
+                .await
+                .0
+                .unwrap();
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                &data,
+            )
+            .unwrap();
+            let accepted_path = data.join("collaboration/config/accepted-profile-head-v1.json");
+            let accepted = std::fs::read(&accepted_path).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&accepted).unwrap()["revision"],
+                2
+            );
+            std::fs::write(data.join("owner-data"), b"written after update").unwrap();
+
+            let content = previous.content.clone();
+            let fetch: FetchFn = Box::new(move |cid, gateways| {
+                assert!(gateways.is_empty(), "fixture uses only its Carrier source");
+                let served = content.get(&cid).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("content {cid} is not published by this source")
+                });
+                Box::pin(async move { served })
+            });
+            // release_cmd maps --rollback-to to this head override and force=true.
+            run_update_for_data_dir(
+                &data,
+                &fetch,
+                None,
+                false,
+                Some(previous.head_cid),
+                true,
+                vec![],
+                "0.7.1",
+                true,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(std::fs::read(&binary).unwrap(), previous_binary);
+            assert_eq!(
+                std::fs::read(data.join("components.json")).unwrap(),
+                previous_components
+            );
+            assert_eq!(
+                load_trusted_sources(&data)
+                    .unwrap()
+                    .default_source()
+                    .unwrap()
+                    .installed_version,
+                "0.7.0"
+            );
+            assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[1]);
+            assert_eq!(std::fs::read(&accepted_path).unwrap(), accepted);
+            assert_eq!(
+                std::fs::read(data.join("owner-data")).unwrap(),
+                b"written after update"
+            );
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                &data,
+            )
+            .unwrap();
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+        }
     }
 
     #[cfg(unix)]

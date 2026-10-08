@@ -101,14 +101,17 @@ itself still reads only `collaboration-network-v1.json`.
 The release delivers that file the same way it delivers `model-catalog.json`.
 Release staging and the custodian signer bind it to the pin, and release
 publication admits it only when its bytes match the pin and pass the startup
-validator. Installed setup fetches it by name from the trusted source over
-Carrier. `elastos update` and Home's System update both fetch it by its pinned
-CID with the Runtime and `components.json`, while Home still runs and before the
-new Runtime replaces the old one. `elastos update` installs it as its last
+validator. Installed setup fetches the exact pinned CID from the trusted source
+over Carrier, with the startup configuration's 3 MiB byte bound checked before
+the body is read. `elastos update` and Home's System update also fetch it by its
+pinned CID with the Runtime and `components.json`, while Home still runs and
+before the new Runtime replaces the old one. `elastos update` installs it as its last
 update step; System update installs it right after activation, before Home
 restarts. A refusal before or during that step restores the previous release
-files. A release rolled back after the network was joined keeps the network,
-because Runtime never drops an accepted network. A Home that stays isolated
+files. Undo restores the earlier release and keeps the joined network, its
+accepted revision, contacts, and messages, including state written after the
+update. An older release pin cannot replace a newer accepted configuration.
+Leaving Community is a separate action. A Home that stays isolated
 fetches nothing. An offline update hop refuses a changed pin, like other support
 changes.
 
@@ -146,11 +149,23 @@ and its configuration bytes that a release then pins.
 startup file and is never called by the installer or Runtime. Key creation,
 profile generation, and verification are offline. The separate explicit local
 bootstrap export attaches only to the selected running Runtime. The
-configuration authority is a dedicated raw 32-byte Ed25519 key at an explicit
-operator path; it is not a Runtime device key, Carrier identity, release
-publisher, Wallet/passkey identity, or host identity.
+configuration authority is the signer explicitly named in
+`trusted_profile_signer_dids`. The approved release maintainer may use the same
+Ed25519 signer for release publication and Community configuration. Runtime
+checks each role separately: the release signature binds the exact configuration
+CID and signer set, and the profile signature uses
+`elastos.collaboration-network.profile.v1`. Runtime device, Carrier, Wallet,
+passkey, and user-message authority keep their own identities and checks.
 
-Create the key as a separate explicit action:
+Production signing stays with the approved key custodian outside CI.
+`scripts/release-signer.py` uses the custodian's Ed25519 PEM key through OpenSSL.
+The `collaboration-config` file interface accepts an owner-only raw 32-byte
+Ed25519 key for the offline generation flow below. Keep production keys in
+their existing custody workflow.
+
+For an isolated test fixture, create a disposable authority key as a separate
+explicit action. Give the fixture an owner and cleanup condition, keep its trust
+store separate from real Homes, and keep its private key out of source and logs:
 
 ```text
 elastos collaboration-config create-authority-key --key <owner-only-key-path>

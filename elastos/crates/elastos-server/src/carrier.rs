@@ -8294,6 +8294,16 @@ impl CarrierClient {
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
+        self.fetch_content_bounded(cid, path, 200 * 1024 * 1024)
+            .await
+    }
+
+    pub(crate) async fn fetch_content_bounded(
+        &self,
+        cid: &str,
+        path: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         let mut msg = serde_json::json!({
             "op": "content_fetch",
@@ -8306,7 +8316,7 @@ impl CarrierClient {
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", 200 * 1024 * 1024).await
+        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", max_bytes).await
     }
 
     pub async fn invoke_provider(
