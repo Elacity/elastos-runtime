@@ -2763,10 +2763,7 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                         state,
                         &cleanup,
                         None,
-                        engine_result
-                            .as_ref()
-                            .ok()
-                            .and_then(browser_profile_durability_from_receipt),
+                        engine_result.as_ref().ok(),
                     )
                     .await
                     {
@@ -2841,10 +2838,8 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                 )
                 .await;
                 settled = true;
-            } else {
-                release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                continue;
             }
-            continue;
         }
         let engine_result = tokio::time::timeout(
             BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
@@ -2863,16 +2858,9 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
         .map_err(|_| "Browser stream cleanup timed out".to_string())
         .and_then(|result| result);
         if engine_result.is_ok() && stream_result.is_ok() {
-            if let Err(err) = commit_browser_terminal_cleanup(
-                state,
-                &cleanup,
-                None,
-                engine_result
-                    .as_ref()
-                    .ok()
-                    .and_then(browser_profile_durability_from_receipt),
-            )
-            .await
+            if let Err(err) =
+                commit_browser_terminal_cleanup(state, &cleanup, None, engine_result.as_ref().ok())
+                    .await
             {
                 release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                 tracing::warn!(
@@ -2935,13 +2923,13 @@ async fn commit_browser_terminal_cleanup(
     state: &GatewayState,
     cleanup: &BrowserEngineCleanup,
     terminal_owner_launch_id: Option<&str>,
-    profile_durability: Option<&str>,
+    terminal_receipt: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     record_browser_reaped_page_tombstone(
         &state.data_dir,
         cleanup,
         terminal_owner_launch_id,
-        profile_durability,
+        terminal_receipt,
     )
     .await?;
     gateway_browser_remote::mark_consumer_terminal_retirement(
@@ -2998,10 +2986,7 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             state,
             &engine_cleanup,
             None,
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
         {
@@ -3258,10 +3243,7 @@ async fn reap_browser_open_effect_after_failure(
             state,
             &engine_cleanup,
             None,
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
         {
@@ -4039,10 +4021,7 @@ pub(super) async fn browser_app_page_close(
             &state,
             &engine_cleanup,
             Some(&owner_launch_id),
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
     } else {
