@@ -1001,48 +1001,92 @@ async function proveDraftPreservation(a, chatFrame, b, bChatFrame, conversationI
   };
 }
 
-async function proveSharedSessionRecovery(side, chatFrame, receiver, receiverFrame) {
-  await selectSharedConversation(side, chatFrame);
+async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
+  conversationId = "shared",
+  lossSource = "poll",
+} = {}) {
+  const direct = conversationId !== "shared";
+  assertOk(lossSource === "poll" || direct && lossSource === "send", "unsupported recovery fault");
+  if (direct) {
+    await selectDirectConversation(side, chatFrame, conversationId);
+    await selectDirectConversation(receiver, receiverFrame, conversationId);
+  } else {
+    await selectSharedConversation(side, chatFrame);
+  }
   const documentStartedAt = await chatFrame.evaluate(() => performance.timeOrigin);
-  const draft = `Reconnect draft @ ${Date.now()}`;
+  const oldHomeToken = await chatFrame.evaluate(() => globalThis.elastosChatHomeToken?.());
+  assertOk(typeof oldHomeToken === "string" && oldHomeToken.length > 0, "Chat had no launch authority before session loss");
+  const draft = `${direct ? "Direct" : "Community"} ${lossSource} Reconnect draft @ ${Date.now()}`;
   await chatFrame.locator("#message-input").fill(draft);
   assertOk(!(await chatFrame.locator("#chat-reconnect").isVisible()), "Reconnect was already visible before session loss");
   let injected = false;
+  let handlerError;
   let starts = 0;
   let authPosts = 0;
+  const startTokens = [];
   const countStarts = (request) => {
     if (request.method() === "POST") {
       const path = new URL(request.url()).pathname;
       if (path === "/api/apps/chat-room/session/start") {
         starts += 1;
+        startTokens.push(request.headers()["x-elastos-home-token"] || "");
       } else if (path.startsWith("/api/auth/")) {
         authPosts += 1;
       }
     }
   };
-  const matcher = (url) => url.origin === side.base && url.pathname === "/api/apps/chat-room/poll";
+  const faultPath = direct
+    ? lossSource === "send" ? "/api/apps/chat-room/direct/messages/send"
+      : `/api/apps/chat-room/direct/conversations/${encodeURIComponent(conversationId)}/messages`
+    : "/api/apps/chat-room/poll";
+  const matcher = (url) => url.origin === side.base && url.pathname === faultPath;
   const handler = async (route) => {
-    if (!injected) {
+    try {
+      const request = route.request();
+      if (request.method() !== (lossSource === "send" ? "POST" : "GET") || injected) {
+        await route.continue();
+        return;
+      }
+      if (lossSource === "send") {
+        const payload = request.postDataJSON();
+        if (payload?.conversation_id !== conversationId || payload?.text !== draft) {
+          await route.continue();
+          return;
+        }
+      }
+      assertOk(request.headers()["x-elastos-home-token"] === oldHomeToken, "recovery fault targeted stale Chat authority");
       injected = true;
-      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "invalid or expired session" }) });
-    } else {
-      await route.continue();
+      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({
+        error: direct ? "invalid or expired launch token" : "invalid or expired session",
+      }) });
+    } catch (error) {
+      handlerError = error;
+      await route.abort().catch(() => {});
     }
   };
   side.page.on("request", countStarts);
   await side.page.route(matcher, handler);
   try {
+    if (lossSource === "send") {
+      await chatFrame.locator("#send-button").click();
+    }
     await chatFrame.locator("#chat-reconnect").waitFor({ state: "visible", timeout: 30_000 });
+    assertOk(!handlerError, "session-loss interception failed");
     assertOk(injected, "Reconnect appeared without the injected session loss");
     assertOk(await chatFrame.locator("#chat-reconnect").isEnabled(), "Reconnect control was disabled");
     assertOk(Boolean((await chatFrame.locator("#chat-reconnect-status").innerText()).trim()), "Reconnect had no visible explanation");
-    await assertDraft(side, chatFrame, "shared", draft);
+    await assertDraft(side, chatFrame, conversationId, draft);
+    const lost = await chatFrameState(chatFrame);
+    assertOk(lost.sendDisabled && (direct || lost.inputDisabled), "Chat kept sending enabled after session loss");
     await delay(1_500);
     assertOk(starts === 0, "room session restarted before the Reconnect click", { session_starts: starts });
     assertOk(authPosts === 0, "sign-in started before the Reconnect click", { auth_posts: authPosts });
+    if (lossSource === "send") {
+      assertOk(await exactMessageCount(receiverFrame, draft) === 0, "refused direct send reached its peer");
+    }
     await side.page.unroute(matcher, handler);
     await chatFrame.locator("#chat-reconnect").click();
-    await poll(`${side.prefix}: user Reconnect resumes the room`, 30_000, 250, async () => {
+    await poll(`${side.prefix}: user Reconnect resumes ${direct ? "Direct" : "Community"}`, 30_000, 250, async () => {
       const state = await chatFrameState(chatFrame);
       return {
         done: starts > 0 && !state.inputDisabled && !(await chatFrame.locator("#chat-reconnect").isVisible()),
@@ -1054,13 +1098,27 @@ async function proveSharedSessionRecovery(side, chatFrame, receiver, receiverFra
         && (await chatFrame.evaluate(() => performance.timeOrigin)) === documentStartedAt,
       "Reconnect replaced the Chat document",
     );
-    await assertDraft(side, chatFrame, "shared", draft);
+    const freshHomeToken = await chatFrame.evaluate(() => globalThis.elastosChatHomeToken?.());
+    assertOk(typeof freshHomeToken === "string" && freshHomeToken.length > 0 && freshHomeToken !== oldHomeToken,
+      "Reconnect retained its old launch authority");
+    assertOk(startTokens.length > 0 && startTokens.every((token) => token === freshHomeToken),
+      "Reconnect started a room session with stale launch authority");
+    await assertDraft(side, chatFrame, conversationId, draft);
+    if (direct) {
+      await assertDirectSelection(side, chatFrame, conversationId);
+    }
     await chatFrame.locator("#message-input").fill("");
-    await selectSharedConversation(receiver, receiverFrame);
-    const message = `After Reconnect @ ${Date.now()}`;
+    if (!direct) {
+      await selectSharedConversation(receiver, receiverFrame);
+    }
+    const message = `${direct ? "Direct" : "Community"} after ${lossSource} Reconnect @ ${Date.now()}`;
     await sendMessage(side, chatFrame, message);
     await waitForMessage(receiver, receiverFrame, message, 120_000);
-    return { visible_reconnect: true, session_starts_before_click: 0, auth_posts_before_click: 0, session_starts_after_click: starts, same_document: true, draft_preserved: true, receiver_message_count: 1, message };
+    assertOk(!handlerError, "session-loss interception did not finish cleanly");
+    return { loss_source: lossSource, injected_status: 401, conversation_id: conversationId,
+      visible_reconnect: true, session_starts_before_click: 0, auth_posts_before_click: 0,
+      session_starts_after_click: starts, fresh_home_token: true, same_document: true,
+      draft_preserved: true, receiver_message_count: 1, message };
   } finally {
     side.page.off("request", countStarts);
     await side.page.unroute(matcher, handler);
@@ -1316,8 +1374,13 @@ async function main() {
     ));
 
     await runLeg(report, "shared_session_recovery", "recover the room only after visible Reconnect", async () => (
-      proveSharedSessionRecovery(a, aDirect.frame, b, bDirect.frame)
+      proveSessionRecovery(a, aDirect.frame, b, bDirect.frame)
     ));
+
+    await runLeg(report, "direct_session_recovery", "recover Direct polling and sending only after visible Reconnect", async () => ({
+      poll: await proveSessionRecovery(a, aDirect.frame, b, bDirect.frame, { conversationId }),
+      send: await proveSessionRecovery(a, aDirect.frame, b, bDirect.frame, { conversationId, lossSource: "send" }),
+    }));
 
     await runLeg(report, "rename_propagation", "signed Profile rename propagates", async () => {
       await saveProfile(a, aPeople, RENAMED_A);

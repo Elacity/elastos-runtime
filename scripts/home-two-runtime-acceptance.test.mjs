@@ -356,7 +356,9 @@ test("identity evidence rejects empty, wrong, and raw-identity frames", () => {
 });
 
 test("skipped legs and incomplete reports can never become acceptance evidence", () => {
-  // Exercise every mandatory leg, including launch, drafts, and recovery.
+  assert.ok(REQUIRED_ACCEPTANCE_LEGS.includes("shared_session_recovery"));
+  assert.ok(REQUIRED_ACCEPTANCE_LEGS.includes("direct_session_recovery"));
+  // Exercise every mandatory leg, including launch, drafts, and both recovery modes.
   // A harness that omits or skips any one of them must retain ok=false.
   for (const skipped of REQUIRED_ACCEPTANCE_LEGS) {
     const report = validReport();

@@ -24,6 +24,7 @@ export const REQUIRED_ACCEPTANCE_LEGS = Object.freeze([
   "direct_message_b_to_a",
   "conversation_draft_preservation",
   "shared_session_recovery",
+  "direct_session_recovery",
   "rename_propagation",
   "bilateral_removal",
   "re_add_contact",
