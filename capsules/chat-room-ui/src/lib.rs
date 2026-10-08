@@ -37,6 +37,8 @@ const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
+/// The Attach button is an icon; this is its accessible name.
+const ATTACH_LABEL: &str = "Attach";
 const SHELL_SESSION_LOST_DETAIL: &str =
     "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
 const SHELL_RECONNECT_FAILED_DETAIL: &str =
@@ -1523,13 +1525,22 @@ impl App {
         let attachment_result_app = Rc::clone(self);
         let attachment_result =
             Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                // Documents answers through Home, so the result comes from
+                // Home's window and origin, like a Library delivery.
                 let Some(window) = window() else {
                     return;
                 };
-                let Ok(origin) = window.location().origin() else {
+                let Some(origin) =
+                    admitted_home_origin(attachment_result_app.home_parent_origin.as_deref())
+                else {
                     return;
                 };
-                if event.origin() != origin {
+                let Ok(Some(top)) = window.top() else {
+                    return;
+                };
+                let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
+                    .unwrap_or(JsValue::NULL);
+                if event.origin() != origin || !JsObject::is(&source, top.as_ref()) {
                     return;
                 }
                 let data = event.data();
@@ -2452,10 +2463,7 @@ impl App {
                 Err(err) => return Err(err),
             };
 
-        let mut state = self.state.borrow_mut();
-        state.latest_seq = sent.seq;
-        state.objects.push(sent);
-        state.force_message_follow = true;
+        record_own_shared_send(&mut self.state.borrow_mut(), sent);
         Ok(true)
     }
 
@@ -2467,39 +2475,10 @@ impl App {
         if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
             return Ok(false);
         }
-        let Some(window) = window() else {
-            return Ok(false);
-        };
-        let Some(parent) = window.parent()? else {
-            return Ok(false);
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
-            return Ok(false);
-        }
-
-        let message = JsObject::new();
-        Reflect::set(
-            &message,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("home:open-uri"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("uri"),
-            &JsValue::from_str(clean_uri),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("preferredViewer"),
-            &JsValue::from_str("documents"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("homeToken"),
-            &JsValue::from_str(home_token),
-        )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
-        Ok(true)
+        self.post_home_message(&serde_json::json!({
+            "type": "home:open-uri", "uri": clean_uri, "preferredViewer": "documents",
+            "homeToken": home_token,
+        }))
     }
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
@@ -2533,68 +2512,15 @@ impl App {
                 .ok_or_else(|| JsValue::from_str("Attachment bytes are still loading."))?;
             (attachment, data_url)
         };
-        let Some(window) = window() else {
-            return Err(JsValue::from_str("Browser window is unavailable."));
-        };
-        let Some(parent) = window.parent()? else {
-            return Err(JsValue::from_str("Home shell is unavailable."));
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
+        if !self.post_home_message(&documents_attachment_message(
+            home_token,
+            &attachment,
+            &data_url,
+        ))? {
             return Err(JsValue::from_str(
                 "Open Chat from Home to open attachments in Documents.",
             ));
         }
-
-        let payload = JsObject::new();
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("documents:open-chat-attachment"),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("attachmentId"),
-            &JsValue::from_str(&attachment.attachment_id),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("fileName"),
-            &JsValue::from_str(&attachment.file_name),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("mimeType"),
-            &JsValue::from_str(&attachment.mime_type),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("sizeBytes"),
-            &JsValue::from_f64(attachment.size_bytes as f64),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("dataUrl"),
-            &JsValue::from_str(&data_url),
-        )?;
-
-        let message = JsObject::new();
-        Reflect::set(
-            &message,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("home:open-target-with-payload"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("target"),
-            &JsValue::from_str("documents"),
-        )?;
-        Reflect::set(&message, &JsValue::from_str("payload"), &payload)?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("homeToken"),
-            &JsValue::from_str(home_token),
-        )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
         Ok(true)
     }
 
@@ -2922,21 +2848,34 @@ impl App {
         Ok(true)
     }
 
-    fn post_library_picker_message(&self, message: serde_json::Value) -> Result<(), JsValue> {
-        let window = window().ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        let top = window
-            .top()?
-            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        let origin = self
-            .home_parent_origin
-            .as_deref()
-            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        if origin == "null" || origin == "*" || JsObject::is(top.as_ref(), window.as_ref()) {
-            return Err(JsValue::from_str(
-                "Open Chat from Home to choose a Library item.",
-            ));
+    /// Posts to Home, the top window at the origin named by `?home_origin=`.
+    /// Home loads Chat in an opaque frame, so Chat's own origin can never
+    /// address it. Returns false outside Home.
+    fn post_home_message(&self, message: &serde_json::Value) -> Result<bool, JsValue> {
+        let Some(window) = window() else {
+            return Ok(false);
+        };
+        let Some(top) = window.top()? else {
+            return Ok(false);
+        };
+        let Some(origin) = admitted_home_origin(self.home_parent_origin.as_deref()) else {
+            return Ok(false);
+        };
+        if JsObject::is(top.as_ref(), window.as_ref()) {
+            return Ok(false);
         }
-        top.post_message(&js_sys::JSON::parse(&message.to_string())?, origin)
+        top.post_message(&js_sys::JSON::parse(&message.to_string())?, origin)?;
+        Ok(true)
+    }
+
+    fn post_library_picker_message(&self, message: serde_json::Value) -> Result<(), JsValue> {
+        if self.post_home_message(&message)? {
+            Ok(())
+        } else {
+            Err(JsValue::from_str(
+                "Open Chat from Home to choose a Library item.",
+            ))
+        }
     }
 
     fn library_picker_is_current(&self, request: &LibraryPickerRequest) -> bool {
@@ -3298,8 +3237,9 @@ impl App {
             self.attach_button
                 .set_attribute("aria-label", DIRECT_ATTACHMENTS_UNAVAILABLE)?;
         } else {
-            self.attach_button.set_title("");
-            self.attach_button.remove_attribute("aria-label")?;
+            self.attach_button.set_title(ATTACH_LABEL);
+            self.attach_button
+                .set_attribute("aria-label", ATTACH_LABEL)?;
         }
         self.send_button.set_disabled(if direct_mode {
             !direct_send_enabled
@@ -4216,6 +4156,35 @@ fn commit_requested_direct_selection_if_current(
     commit_direct_selection(state, conversation_id)
 }
 
+/// Home's origin from `?home_origin=`, refused when it could not name Home:
+/// missing, opaque or a wildcard.
+fn admitted_home_origin(origin: Option<&str>) -> Option<&str> {
+    origin
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty() && *origin != "null" && *origin != "*")
+}
+
+/// The Home message that opens one Chat attachment in Documents.
+fn documents_attachment_message(
+    home_token: &str,
+    attachment: &AttachmentView,
+    data_url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "home:open-target-with-payload",
+        "target": "documents",
+        "homeToken": home_token,
+        "payload": {
+            "type": "documents:open-chat-attachment",
+            "attachmentId": attachment.attachment_id,
+            "fileName": attachment.file_name,
+            "mimeType": attachment.mime_type,
+            "sizeBytes": attachment.size_bytes,
+            "dataUrl": data_url,
+        },
+    })
+}
+
 /// The first element under `root` whose `attribute` is exactly `value`. The
 /// value is compared, never spliced into a selector.
 fn element_with_attribute(root: &Element, attribute: &str, value: &str) -> Option<Element> {
@@ -4248,6 +4217,17 @@ fn apply_reconnect_failure(state: &mut AppState, error: String) {
     } else {
         state.error_text = Some(SHELL_RECONNECT_FAILED_DETAIL.to_string());
         state.error_transient = false;
+    }
+}
+
+/// Adds the person's own accepted Community message. It scrolls to the newest
+/// message only while Community is open: a response that arrives after they
+/// moved to a direct conversation leaves that conversation's reading place.
+fn record_own_shared_send(state: &mut AppState, sent: ConversationObjectView) {
+    state.latest_seq = sent.seq;
+    state.objects.push(sent);
+    if state.direct.selected_conversation_id.is_none() {
+        state.force_message_follow = true;
     }
 }
 
@@ -4315,7 +4295,10 @@ fn apply_active_poll_state(
             .participants
             .retain(configured_shared_participant_visible);
     }
-    if previous_latest_seq != state.latest_seq {
+    // A new session opens at the newest message. Later messages follow only a
+    // reader already at the bottom (`should_follow_scroll`), so reading older
+    // history keeps its place; the person's own send forces follow itself.
+    if !was_session_active {
         state.force_message_follow = true;
     }
 
@@ -4590,17 +4573,19 @@ mod tests {
         DirectConversationView, DirectMessageList, DirectUiState, PendingDirectSend,
     };
     use super::{
-        apply_active_poll_if_current, apply_active_poll_state, apply_direct_refresh_if_current,
-        apply_session_loss, chat_control_policy, clear_selected_direct_conversation,
-        commit_direct_selection, commit_requested_direct_selection_if_current,
-        commit_shared_selection, conversation_initial, current_selection_guard, decode_query_value,
-        extract_fragment_param, extract_query_param, format_chat_message_request_id,
-        note_composer_edit, object_sender_name, participant_detail, participant_shown_name,
-        pending_chat_request_id, render_projection, resolve_conversation_choice,
-        selection_guard_matches, settle_sent_draft, shell_summary_allows_session,
-        switch_composer_draft, AccessMode, AppConfig, AppState, ConversationObjectKind,
-        ConversationObjectView, ParticipantView, PendingChatSend, RenderProjection, RoomPollView,
-        RoomTransportView, ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+        admitted_home_origin, apply_active_poll_if_current, apply_active_poll_state,
+        apply_direct_refresh_if_current, apply_session_loss, chat_control_policy,
+        clear_selected_direct_conversation, commit_direct_selection,
+        commit_requested_direct_selection_if_current, commit_shared_selection,
+        conversation_initial, current_selection_guard, decode_query_value,
+        documents_attachment_message, extract_fragment_param, extract_query_param,
+        format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
+        participant_shown_name, pending_chat_request_id, render_projection,
+        resolve_conversation_choice, selection_guard_matches, settle_sent_draft,
+        shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
+        AttachmentView, ConversationObjectKind, ConversationObjectView, ParticipantView,
+        PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
+        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
     };
 
     fn two_direct_conversations() -> AppState {
@@ -4686,6 +4671,94 @@ mod tests {
         apply_session_loss(&mut guest, false, "removed");
         assert_eq!(guest.error_text, None);
         assert_eq!(guest.status_badge, "Join");
+    }
+
+    fn shared_poll(latest_seq: u64) -> RoomPollView {
+        RoomPollView {
+            room_slug: "chat-room".to_string(),
+            display_name: "Shared room".to_string(),
+            latest_seq,
+            participants: vec![],
+            objects: vec![],
+            transport: RoomTransportView::default(),
+        }
+    }
+
+    #[test]
+    fn only_a_new_session_pulls_the_reader_to_the_newest_message() {
+        let mut state = AppState::default();
+        apply_active_poll_state(&mut state, shared_poll(1));
+        assert!(state.force_message_follow);
+        state.force_message_follow = false;
+        // A message arrives while the person reads older history.
+        apply_active_poll_state(&mut state, shared_poll(2));
+        assert!(!state.force_message_follow);
+    }
+
+    #[test]
+    fn a_late_community_send_does_not_move_a_direct_reader() {
+        let sent = || ConversationObjectView {
+            seq: 7,
+            sender: "Me".into(),
+            sender_ref: None,
+            sender_profile_verified: Some(true),
+            from_current_session: true,
+            kind: ConversationObjectKind::Text,
+            body: Some("hi".into()),
+            emoji: None,
+            link: None,
+            attachment: None,
+            created_at: 1,
+        };
+        let mut state = two_direct_conversations();
+        super::record_own_shared_send(&mut state, sent());
+        assert!(state.force_message_follow);
+
+        let mut state = two_direct_conversations();
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        super::record_own_shared_send(&mut state, sent());
+        assert!(!state.force_message_follow);
+        assert_eq!(state.latest_seq, 7);
+    }
+
+    #[test]
+    fn home_messages_need_a_real_home_origin() {
+        assert_eq!(
+            admitted_home_origin(Some("http://127.0.0.1:3000")),
+            Some("http://127.0.0.1:3000")
+        );
+        for refused in [None, Some(""), Some("null"), Some("*"), Some(" ")] {
+            assert_eq!(admitted_home_origin(refused), None);
+        }
+    }
+
+    #[test]
+    fn opening_an_attachment_asks_home_for_documents() {
+        let attachment = AttachmentView {
+            attachment_id: "att-1".into(),
+            file_name: "notes.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 5,
+            is_image: false,
+            is_audio: false,
+            is_video: false,
+        };
+        assert_eq!(
+            documents_attachment_message("home-token", &attachment, "data:text/plain,hello"),
+            serde_json::json!({
+                "type": "home:open-target-with-payload",
+                "target": "documents",
+                "homeToken": "home-token",
+                "payload": {
+                    "type": "documents:open-chat-attachment",
+                    "attachmentId": "att-1",
+                    "fileName": "notes.txt",
+                    "mimeType": "text/plain",
+                    "sizeBytes": 5,
+                    "dataUrl": "data:text/plain,hello",
+                },
+            })
+        );
     }
 
     #[test]
