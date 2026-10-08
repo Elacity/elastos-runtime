@@ -403,7 +403,6 @@ async function waitForConfiguredChatWithoutLegacyFlash(frame, label) {
         "#browser-access-section",
         "#browser-access-stage",
         "#conversation-invite-create",
-        "#conversation-join-section",
         "#room-access-section",
         "#room-access-toggle",
       ];
@@ -499,16 +498,19 @@ async function runScenario(scenario) {
     if (scenario.startsWith("direct-initial-401")) {
       const originalFrame = frame;
       const timeOrigin = await frame.evaluate(() => performance.timeOrigin);
-      await frame.locator("#chat-reconnect").waitFor({ state: "visible" });
+      await frame.locator("#reconnect-button").waitFor({ state: "visible" });
       await new Promise(resolveDelay => setTimeout(resolveDelay, 2200));
       assert(trace.directConversations === 1 && trace.directMessages === 0 && trace.cycles[0].starts === 0,
         "initial Direct401 performed automatic recovery work", trace);
       assert(await page.evaluate(() => window.fixtureReconnects) === 0, "initial Direct401 reopened itself");
       const selectedByUser = scenario === "direct-initial-401-user-selection";
       if (selectedByUser) await clickSharedChoice(frame);
-      await frame.locator("#chat-reconnect").click();
+      await frame.locator("#error-text").waitFor({ state: "visible" });
+      assert((await frame.locator("#error-text").innerText()).trim(),
+        "Reconnect lost its visible recovery explanation");
+      await frame.locator("#reconnect-button").click();
       await frame.waitForFunction((shared) => document.body.dataset.roomSessionActive === "true"
-        && document.querySelector("#chat-reconnect")?.hidden === true
+        && document.querySelector("#reconnect-button")?.hidden === true
         && document.querySelector("[data-conversation-choice].active")?.dataset.conversationChoice
           === (shared ? "shared" : "direct:sha256:fixture-conversation"), selectedByUser);
       frame = await chatFrame(page);
@@ -547,10 +549,6 @@ async function runScenario(scenario) {
       assert(
         await frame.evaluate(() => document.body.dataset.roomSessionActive) === "false",
         "bootstrap failure activated Chat",
-      );
-      assert(
-        await frame.evaluate(() => document.querySelector("#conversation-join-section")?.hidden),
-        "bootstrap failure exposed the legacy Join surface",
       );
       return;
     }
@@ -722,7 +720,6 @@ async function runScenario(scenario) {
               browserStageHidden: hidden("#browser-access-stage"),
               browserRequestsHidden: hidden("#browser-access-section"),
               roomSettingsHidden: hidden("#room-access-toggle") && hidden("#room-access-section"),
-              joinHidden: hidden("#conversation-join-section"),
               textVisible: !hidden("#composer-form") && !!input && !input.disabled && !!send && !send.disabled,
               messageInputTag: input?.tagName || "",
               shellDisplay: shell ? getComputedStyle(shell).display : "",
@@ -748,7 +745,6 @@ async function runScenario(scenario) {
       assert(state.attachHidden, "configured Chat exposed Attach", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
       assert(state.roomSettingsHidden, "configured Chat exposed legacy room settings", state);
-      assert(state.joinHidden, "configured Chat exposed invite/join controls", state);
       assert(state.textVisible, "configured Chat text composer is unavailable", state);
       assert(state.messageInputTag === "TEXTAREA", "published Chat composer was not retained", state);
       assert(state.shellDisplay === "grid" && state.sidebarBeforeThread, "Chat is not a split conversation shell", state);

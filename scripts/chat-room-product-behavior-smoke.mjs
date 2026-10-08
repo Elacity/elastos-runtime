@@ -81,8 +81,6 @@ function createEnvironment() {
     { dataset: { conversationChoice: "shared" } },
     { dataset: { conversationChoice: "direct:sha256:fixture-conversation" } },
   ];
-  const conversationJoinSection = new FakeElement("conversation-join-section");
-  conversationJoinSection.hidden = true;
   const composerForm = new FakeElement("composer-form");
   const composerField = new FakeElement("composer-field");
   const messageInput = new FakeTextAreaElement("message-input");
@@ -112,7 +110,6 @@ function createEnvironment() {
     ["participant-toggle", participantToggle],
     ["room-access-toggle", roomAccessToggle],
     ["conversation-selector", conversationSelector],
-    ["conversation-join-section", conversationJoinSection],
     ["composer-form", composerForm],
     ["message-input", messageInput],
   ]);
@@ -162,7 +159,6 @@ function createEnvironment() {
     body,
     composerField,
     context,
-    conversationJoinSection,
     conversationSelector,
     messageInput,
     notify(target) {
@@ -319,10 +315,7 @@ function main() {
   assert.equal(env.body.dataset.roomCompactRail, "visible", "Two conversations must keep the compact rail available");
   env.conversationSelector.children = [{ dataset: { conversationChoice: "shared" } }];
   env.notify(env.conversationSelector);
-  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail when no required join control is visible");
-  env.conversationJoinSection.hidden = false;
-  env.notify(env.conversationJoinSection);
-  assert.equal(env.body.dataset.roomCompactRail, "visible", "Visible join controls must keep the compact rail available");
+  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail");
 
   env.messageInput.value = "line one\nline two\nline three";
   env.messageInput.dispatchEvent({ type: "input" });

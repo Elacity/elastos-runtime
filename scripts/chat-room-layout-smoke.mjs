@@ -93,19 +93,15 @@ try {
     const result = await page.evaluate(() => {
       document.body.dataset.roomAccessMode = "shell";
       document.body.dataset.roomSessionActive = "true";
-      document.body.dataset.roomJoinVisible = "true";
       const chatCard = document.querySelector("#chat-card");
       chatCard.dataset.rosterOpen = "true";
       for (const id of [
         "room-access-toggle",
         "room-access-section",
-        "conversation-join-section",
         "conversation-invite-output-row",
       ]) {
         document.querySelector(`#${id}`).hidden = false;
       }
-      document.querySelector("#conversation-join-input").value =
-        "elastos://peer/invite?token=" + "j".repeat(180);
       document.querySelector("#conversation-invite-output").value =
         "elastos://peer/invite?token=" + "a".repeat(180);
       document.querySelector("#room-policy-list").innerHTML = `
@@ -121,38 +117,10 @@ try {
           </div>
         </li>`;
 
-      for (const selector of [
-        "#conversation-join-section",
-        "#conversation-join-input",
-        "#conversation-join-submit",
-      ]) {
-        if (document.querySelector(selector).getClientRects().length === 0) {
-          throw new Error(`Chat join control is not visible: ${selector}`);
-        }
-      }
-      if (
-        !document
-          .querySelector("#conversation-join-section p")
-          .textContent.includes("replaces this unused local conversation")
-      ) {
-        throw new Error(
-          "Chat join copy does not explain unused-conversation replacement",
-        );
-      }
-      for (const selector of ["#message-list", "#composer-form"]) {
-        if (getComputedStyle(document.querySelector(selector)).display !== "none") {
-          throw new Error(`Chat surface remains visible behind join UI: ${selector}`);
-        }
-      }
-
       const selectors = [
         "html",
         "body",
         "#chat-card",
-        "#conversation-join-section",
-        "#conversation-join-form",
-        "#conversation-join-input",
-        "#conversation-join-submit",
         ".presence-card",
         "#room-access-section",
         ".join-link-card",

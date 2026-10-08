@@ -150,18 +150,21 @@ startup file and is never called by the installer or Runtime. Key creation,
 profile generation, and verification are offline. The separate explicit local
 bootstrap export attaches only to the selected running Runtime. The
 configuration authority is the signer explicitly named in
-`trusted_profile_signer_dids`. The approved release maintainer may use the same
-Ed25519 signer for release publication and Community configuration. Runtime
-checks each role separately: the release signature binds the exact configuration
-CID and signer set, and the profile signature uses
-`elastos.collaboration-network.profile.v1`. Runtime device, Carrier, Wallet,
-passkey, and user-message authority keep their own identities and checks.
+`trusted_profile_signer_dids`. Runtime device, Carrier, Wallet, passkey, and
+user-message authority keep their own identities and checks.
 
-Production signing stays with the approved key custodian outside CI.
-`scripts/release-signer.py` uses the custodian's Ed25519 PEM key through OpenSSL.
-The `collaboration-config` file interface accepts an owner-only raw 32-byte
-Ed25519 key for the offline generation flow below. Keep production keys in
-their existing custody workflow.
+The production Community network's profile signer is the release maintainer
+DID. Runtime checks each signing role separately: the signed release pins the
+file's CID and its signer set, and profile signatures use their own domain,
+`elastos.collaboration-network.profile.v1`. Production profiles are signed by
+the approved offline release custodian outside CI; that custodian operation is
+prepared when this network ships.
+
+The existing release-signing interface, `scripts/release-signer.py`, uses the
+custodian's Ed25519 PEM key through OpenSSL. The `collaboration-config` file
+interface accepts an owner-only raw 32-byte Ed25519 key for the disposable test
+and fixture networks below. Production keys stay in their existing custody
+workflow.
 
 For an isolated test fixture, create a disposable authority key as a separate
 explicit action. Give the fixture an owner and cleanup condition, keep its trust

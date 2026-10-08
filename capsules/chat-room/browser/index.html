@@ -31,10 +31,6 @@
         <button id="participant-toggle" type="button" class="secondary participant-toggle" aria-expanded="false">People</button>
       </header>
       <section class="conversation-surface">
-        <div id="chat-reconnect-row" class="chat-reconnect-row" hidden>
-          <p id="chat-reconnect-status" role="status" hidden></p>
-          <button id="chat-reconnect" type="button" class="secondary" hidden>Reconnect</button>
-        </div>
         <section id="browser-access-stage" class="browser-access-stage">
           <div id="browser-access-status-row" class="status-row browser-access-status" hidden>
             <span id="status-badge" class="badge"></span>
@@ -47,16 +43,7 @@
           <a id="chat-open-home" href="/home/" target="_self">Open Home</a>
         </section>
         <p id="error-text" class="error" hidden></p>
-        <section id="conversation-join-section" class="conversation-join" hidden>
-          <div class="conversation-join-copy">
-            <h2>Join a Conversation</h2>
-            <p>Paste a join code or link from another ElastOS user. Joining replaces this unused local conversation; conversations with messages or other members cannot be replaced.</p>
-          </div>
-          <form id="conversation-join-form" class="conversation-join-form">
-            <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite code or link" aria-label="Invite code or link" />
-            <button id="conversation-join-submit" type="submit">Join</button>
-          </form>
-        </section>
+        <button id="reconnect-button" type="button" class="secondary reconnect" hidden>Reconnect</button>
         <ol id="message-list" class="messages"></ol>
         <form id="composer-form" class="composer">
           <button id="attach-button" type="button" class="composer-icon" aria-label="Attach" title="Attach" hidden disabled>

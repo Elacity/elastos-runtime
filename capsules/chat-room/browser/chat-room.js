@@ -2,7 +2,7 @@
     import {
       createHomeClipboardClient,
     } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
-    import init from "./chat_room_ui.js?v=chat-room-ui-20261006a";
+    import init from "./chat_room_ui.js?v=chat-room-ui-20261008a";
 
     const chatLaunchParams = new URLSearchParams(window.location.search);
     let chatHomeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -80,6 +80,6 @@
         return pendingReconnect;
       };
       init({
-        module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20261006a", import.meta.url),
+        module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20261008a", import.meta.url),
       });
     }

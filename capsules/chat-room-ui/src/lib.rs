@@ -37,6 +37,10 @@ const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
+/// The Attach button is an icon; this is its accessible name.
+const ATTACH_LABEL: &str = "Attach";
+const SHELL_SESSION_LOST_DETAIL: &str =
+    "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
     "This device is not part of this conversation yet. Join from an invite or connect it first.";
 const EMOJI_BUTTON_IDS: [(&str, &str); 12] = [
@@ -64,7 +68,6 @@ enum AccessMode {
 struct AppConfig {
     access_mode: AccessMode,
     home_token: Option<String>,
-    initial_join_invite: Option<String>,
     initial_direct_conversation_id: Option<String>,
     browser_session_request_storage_key: String,
 }
@@ -74,10 +77,6 @@ struct AppState {
     request_id: Option<String>,
     pending_chat_send: Option<PendingChatSend>,
     selection_generation: u64,
-    drafts: BTreeMap<Option<String>, ComposerDraft>,
-    pending_direct_launch: Option<String>,
-    session_lost: bool,
-    reconnecting: bool,
     room_mode_known: bool,
     collaboration_configured: bool,
     session_active: bool,
@@ -102,6 +101,26 @@ struct AppState {
     attachment_urls: BTreeMap<String, String>,
     join_invite_url: Option<String>,
     direct: DirectUiState,
+    /// The conversation whose text the composer shows: `None` is the shared
+    /// room, `Some(id)` a direct conversation.
+    composer_conversation: Option<String>,
+    /// The Home session was lost and has not come back: Reconnect stays
+    /// offered whatever other message is showing.
+    reconnect_needed: bool,
+    reconnecting: bool,
+    pending_direct_launch: Option<String>,
+    /// Unsent text of the conversations the composer does not show, with the
+    /// revision it had when it left the composer.
+    drafts: BTreeMap<Option<String>, (String, u64)>,
+    /// Names the composer's current content; every change gets a new one from
+    /// `composer_edits`. A finished send clears only the revision it sent, so
+    /// newer typing, even identical text, and a repeated response leave it.
+    composer_revision: u64,
+    composer_edits: u64,
+    /// Direct sends still awaiting a response, kept by conversation while
+    /// another one is open. Sending the restored draft again reuses the
+    /// request ID, so Runtime treats it as the same message.
+    held_direct_sends: BTreeMap<String, PendingDirectSend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,24 +129,10 @@ struct PendingChatSend {
     body: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ComposerDraft {
-    body: String,
-    revision: u64,
-    pending_direct_send: Option<PendingDirectSend>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectionGuard {
     generation: u64,
     selected_conversation_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ComposerSendGuard {
-    selection: SelectionGuard,
-    revision: u64,
-    body: String,
 }
 
 #[derive(Clone)]
@@ -143,16 +148,21 @@ struct App {
     home_parent_origin: Option<String>,
     picker_document_nonce: String,
     picker_request: RefCell<Option<LibraryPickerRequest>>,
+    /// Counts card openings, so a late action response only updates the card
+    /// that sent it.
+    participant_card_opening: Cell<u64>,
+    /// The name that opened the card: its reference, and the message `seq`
+    /// when it was a message sender. Lists re-render, so closing the card finds
+    /// that exact name again and returns focus to it.
+    participant_card_opener: RefCell<Option<(String, Option<u64>)>>,
     state: RefCell<AppState>,
     document: Document,
     body: HtmlElement,
     session_storage: Option<Storage>,
     status_badge: Option<HtmlElement>,
     status_detail: Option<HtmlElement>,
-    reconnect_row: HtmlElement,
-    reconnect_status: HtmlElement,
-    reconnect_button: HtmlButtonElement,
     error_text: HtmlElement,
+    reconnect_button: HtmlButtonElement,
     gateway_ui: Option<GatewayUi>,
     chat_card: HtmlElement,
     conversation_selector: HtmlElement,
@@ -178,17 +188,11 @@ struct App {
     participant_card_state: HtmlElement,
     participant_card_action: HtmlButtonElement,
     participant_card_close: HtmlButtonElement,
-    participant_card_generation: Cell<u64>,
-    participant_card_opener: RefCell<Option<HtmlElement>>,
     browser_access_section: HtmlElement,
     browser_access_count: HtmlElement,
     browser_access_list: HtmlElement,
     room_access_section: HtmlElement,
     room_policy_list: HtmlElement,
-    conversation_join_section: HtmlElement,
-    conversation_join_form: HtmlFormElement,
-    conversation_join_input: HtmlInputElement,
-    conversation_join_submit: HtmlButtonElement,
     conversation_invite_create: HtmlButtonElement,
     conversation_invite_output_row: HtmlElement,
     conversation_invite_output: HtmlInputElement,
@@ -518,22 +522,6 @@ struct ConversationJoinInviteView {
     expires_at: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct ConversationJoinInviteJoinInput<'a> {
-    invite: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConversationJoinInviteJoinResponse {
-    #[allow(dead_code)]
-    status: String,
-    room_title: String,
-    #[allow(dead_code)]
-    issuer_gateway: String,
-    #[allow(dead_code)]
-    invite_id: String,
-}
-
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -572,6 +560,8 @@ pub fn start() -> Result<(), JsValue> {
         picker_document_nonce: new_chat_message_request_id()
             .map_err(|error| JsValue::from_str(&error))?,
         picker_request: RefCell::new(None),
+        participant_card_opening: Cell::new(0),
+        participant_card_opener: RefCell::new(None),
         state: RefCell::new(state),
         document: document.clone(),
         body: document
@@ -580,10 +570,8 @@ pub fn start() -> Result<(), JsValue> {
         session_storage,
         status_badge: optional_element_by_id(&document, "status-badge"),
         status_detail: optional_element_by_id(&document, "status-detail"),
-        reconnect_row: element_by_id(&document, "chat-reconnect-row")?,
-        reconnect_status: element_by_id(&document, "chat-reconnect-status")?,
-        reconnect_button: button_by_id(&document, "chat-reconnect")?,
         error_text: element_by_id(&document, "error-text")?,
+        reconnect_button: button_by_id(&document, "reconnect-button")?,
         gateway_ui,
         chat_card: element_by_id(&document, "chat-card")?,
         conversation_selector: element_by_id(&document, "conversation-selector")?,
@@ -612,17 +600,11 @@ pub fn start() -> Result<(), JsValue> {
         participant_card_state: element_by_id(&document, "participant-card-state")?,
         participant_card_action: button_by_id(&document, "participant-card-action")?,
         participant_card_close: button_by_id(&document, "participant-card-close")?,
-        participant_card_generation: Cell::new(0),
-        participant_card_opener: RefCell::new(None),
         browser_access_section: element_by_id(&document, "browser-access-section")?,
         browser_access_count: element_by_id(&document, "browser-access-count")?,
         browser_access_list: element_by_id(&document, "browser-access-list")?,
         room_access_section: element_by_id(&document, "room-access-section")?,
         room_policy_list: element_by_id(&document, "room-policy-list")?,
-        conversation_join_section: element_by_id(&document, "conversation-join-section")?,
-        conversation_join_form: form_by_id(&document, "conversation-join-form")?,
-        conversation_join_input: input_by_id(&document, "conversation-join-input")?,
-        conversation_join_submit: button_by_id(&document, "conversation-join-submit")?,
         conversation_invite_create: button_by_id(&document, "conversation-invite-create")?,
         conversation_invite_output_row: element_by_id(&document, "conversation-invite-output-row")?,
         conversation_invite_output: input_by_id(&document, "conversation-invite-output")?,
@@ -691,7 +673,7 @@ impl App {
     }
 
     async fn poll_and_render_once(&self) {
-        if self.state.borrow().session_lost {
+        if self.state.borrow().reconnect_needed {
             return;
         }
         if self.is_direct_mode() {
@@ -838,7 +820,7 @@ impl App {
 
     async fn refresh_direct_conversations(&self) -> Result<bool, u16> {
         if !self.is_shell_mode()
-            || (self.state.borrow().session_lost && !self.state.borrow().reconnecting)
+            || (self.state.borrow().reconnect_needed && !self.state.borrow().reconnecting)
         {
             return Ok(false);
         }
@@ -872,8 +854,6 @@ impl App {
     fn return_to_conversation_selector(&self, unavailable_conversation_id: Option<&str>) {
         let mut state = self.state.borrow_mut();
         state.pending_direct_launch = None;
-        retain_composer(&mut state, &self.message_input.value());
-        bump_selection_generation(&mut state);
         if let Some(unavailable_conversation_id) = unavailable_conversation_id {
             remove_unavailable_conversation(&mut state.direct, unavailable_conversation_id);
         } else {
@@ -886,14 +866,12 @@ impl App {
         state.error_text = state.direct.notice.clone();
         state.error_transient = false;
         let guard = current_selection_guard(&state);
-        let draft = restore_composer(&mut state);
         drop(state);
-        self.message_input.set_value(&draft);
         self.publish_home_navigation(&guard);
     }
 
     async fn refresh_direct_messages_for_guard(&self, guard: &SelectionGuard) -> Result<bool, u16> {
-        if self.state.borrow().session_lost {
+        if self.state.borrow().reconnect_needed {
             return Ok(false);
         }
         let conversation_id = guard.selected_conversation_id.clone().ok_or(403u16)?;
@@ -1075,6 +1053,14 @@ impl App {
             reset_click.forget();
         }
 
+        let reconnect_app = Rc::clone(self);
+        let reconnect_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            reconnect_app.reconnect_shell_session();
+        }));
+        self.reconnect_button
+            .add_event_listener_with_callback("click", reconnect_click.as_ref().unchecked_ref())?;
+        reconnect_click.forget();
+
         let send_app = Rc::clone(self);
         let send_submit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
             event.prevent_default();
@@ -1093,10 +1079,9 @@ impl App {
 
         let edit_app = Rc::clone(self);
         let message_edit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
-            let body = edit_app.message_input.value();
+            let body = edit_app.message_input.value().trim().to_string();
             let mut state = edit_app.state.borrow_mut();
-            record_composer_edit(&mut state, &body);
-            let body = body.trim();
+            note_composer_edit(&mut state);
             if let Some(conversation_id) = state.direct.selected_conversation_id.clone() {
                 if state.direct.pending_send.as_ref().is_some_and(|pending| {
                     pending.conversation_id != conversation_id || pending.text != body
@@ -1116,21 +1101,6 @@ impl App {
         self.message_input
             .add_event_listener_with_callback("input", message_edit.as_ref().unchecked_ref())?;
         message_edit.forget();
-
-        let reconnect_app = Rc::clone(self);
-        let reconnect_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
-            let app = Rc::clone(&reconnect_app);
-            spawn_local(async move {
-                if let Err(error) = app.reconnect_from_home().await {
-                    app.set_error(Some(error));
-                }
-                app.start_poll_loop();
-                let _ = app.render();
-            });
-        }));
-        self.reconnect_button
-            .add_event_listener_with_callback("click", reconnect_click.as_ref().unchecked_ref())?;
-        reconnect_click.forget();
 
         let selector_app = Rc::clone(self);
         let selector_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
@@ -1274,26 +1244,6 @@ impl App {
         browser_access_click.forget();
         self.install_participant_card_listeners()?;
 
-        let join_invite_app = Rc::clone(self);
-        let join_invite_submit =
-            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
-                event.prevent_default();
-                let app = Rc::clone(&join_invite_app);
-                spawn_local(async move {
-                    app.clear_error();
-                    if let Err(err) = app.join_conversation_from_invite().await {
-                        app.set_error(Some(err));
-                    }
-                    let _ = app.render();
-                });
-            }));
-        self.conversation_join_form
-            .add_event_listener_with_callback(
-                "submit",
-                join_invite_submit.as_ref().unchecked_ref(),
-            )?;
-        join_invite_submit.forget();
-
         let create_invite_app = Rc::clone(self);
         let create_invite_click =
             Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
@@ -1411,7 +1361,7 @@ impl App {
                     format!("{current} {emoji}")
                 };
                 emoji_app.message_input.set_value(&next);
-                record_composer_edit(&mut emoji_app.state.borrow_mut(), &next);
+                note_composer_edit(&mut emoji_app.state.borrow_mut());
                 let _ = emoji_app.message_input.focus();
             }));
             button
@@ -1558,13 +1508,22 @@ impl App {
         let attachment_result_app = Rc::clone(self);
         let attachment_result =
             Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                // Documents answers through Home, so the result comes from
+                // Home's window and origin, like a Library delivery.
                 let Some(window) = window() else {
                     return;
                 };
-                let Ok(origin) = window.location().origin() else {
+                let Some(origin) =
+                    admitted_home_origin(attachment_result_app.home_parent_origin.as_deref())
+                else {
                     return;
                 };
-                if event.origin() != origin {
+                let Ok(Some(top)) = window.top() else {
+                    return;
+                };
+                let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
+                    .unwrap_or(JsValue::NULL);
+                if event.origin() != origin || !JsObject::is(&source, top.as_ref()) {
                     return;
                 }
                 let data = event.data();
@@ -1682,7 +1641,7 @@ impl App {
 
     fn session_loss_detail(&self) -> &'static str {
         if self.is_shell_mode() {
-            "The local conversation session ended. Use Reconnect to open Chat through Home."
+            SHELL_SESSION_LOST_DETAIL
         } else {
             "This browser was removed from the conversation."
         }
@@ -1800,26 +1759,28 @@ impl App {
         state.error_transient = false;
     }
 
-    fn handle_session_loss(&self, detail: &str) {
-        self.clear_browser_session_request_storage();
-        apply_session_loss_state(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
-    }
-
-    fn handle_direct_authority_loss(&self, status: u16) {
-        if status == 401 && self.is_shell_mode() {
-            record_composer_edit(&mut self.state.borrow_mut(), &self.message_input.value());
-            self.handle_session_loss(self.session_loss_detail());
-            let _ = self.render();
+    /// One visible action asks Home for fresh launch authority in the same
+    /// Chat document. Home owns sign-in; the existing composer keeps its draft.
+    fn reconnect_shell_session(self: &Rc<Self>) {
+        if self.state.borrow().reconnecting {
+            return;
         }
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            if let Err(error) = app.reconnect_from_home().await {
+                apply_reconnect_failure(&mut app.state.borrow_mut(), error);
+            }
+            app.start_poll_loop();
+            let _ = app.render();
+        });
     }
 
     async fn reconnect_from_home(&self) -> Result<(), String> {
         {
             let mut state = self.state.borrow_mut();
-            if !self.is_shell_mode() || !state.session_lost || state.reconnecting {
+            if !self.is_shell_mode() || !state.reconnect_needed || state.reconnecting {
                 return Ok(());
             }
-            record_composer_edit(&mut state, &self.message_input.value());
             state.reconnecting = true;
         }
         let _ = self.render();
@@ -1854,10 +1815,9 @@ impl App {
                         == Some(conversation_id.as_str())
                 {
                     let mut state = self.state.borrow_mut();
-                    retain_composer(&mut state, &self.message_input.value());
                     let direct_guard = commit_direct_selection(&mut state, &conversation_id);
-                    self.message_input.set_value(&restore_composer(&mut state));
                     drop(state);
+                    let _ = self.render();
                     if direct_guard.is_none() {
                         self.return_to_conversation_selector(Some(&conversation_id));
                     }
@@ -1889,6 +1849,18 @@ impl App {
         result
     }
 
+    fn handle_session_loss(&self, detail: &str) {
+        self.clear_browser_session_request_storage();
+        apply_session_loss(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
+    }
+
+    fn handle_direct_authority_loss(&self, status: u16) {
+        if status == 401 && self.is_shell_mode() {
+            self.handle_session_loss(self.session_loss_detail());
+            let _ = self.render();
+        }
+    }
+
     fn hydrate_defaults(self: &Rc<Self>) {
         let should_fetch = {
             let state = self.state.borrow();
@@ -1906,7 +1878,7 @@ impl App {
             let bootstrap_generation = app.state.borrow().selection_generation;
             let direct_result = app.refresh_direct_conversations().await;
             let direct_loaded = direct_result.is_ok();
-            if app.state.borrow().session_lost {
+            if app.state.borrow().reconnect_needed {
                 if matches!(direct_result, Err(401))
                     && app.state.borrow().selection_generation
                         == bootstrap_generation.wrapping_add(1)
@@ -1968,15 +1940,20 @@ impl App {
                     }
                 }
             }
-            if app.state.borrow().session_lost {
+            if app.state.borrow().reconnect_needed {
                 return;
             }
-            let summary = match api_get_json_with_headers::<SummaryView>(
+            let shared_guard = current_selection_guard(&app.state.borrow());
+            let request_token = app.home_token();
+            let summary_result = api_get_json_with_headers::<SummaryView>(
                 &app.room_api_url("/summary"),
                 &app.home_token_headers(),
             )
-            .await
-            {
+            .await;
+            if app.home_token() != request_token || !app.selection_guard_is_current(&shared_guard) {
+                return;
+            }
+            let summary = match summary_result {
                 Ok(summary) => summary,
                 Err(error) => {
                     if app.is_shell_mode() {
@@ -1992,18 +1969,10 @@ impl App {
             };
             let _ = app.apply_summary(&summary);
             if app.is_shell_mode() {
-                let shared_guard = {
-                    let state = app.state.borrow();
-                    current_selection_guard(&state)
-                };
-                let bootstrap = if let Some(invite) = app.config.initial_join_invite.as_deref() {
-                    app.conversation_join_input.set_value(invite);
-                    app.join_conversation_from_invite().await
-                } else {
-                    app.ensure_shell_session_for_guard(&shared_guard)
-                        .await
-                        .map(|_| ())
-                };
+                let bootstrap = app
+                    .ensure_shell_session_for_guard(&shared_guard)
+                    .await
+                    .map(|_| ());
                 if let Err(err) = bootstrap {
                     if app.selection_guard_is_current(&shared_guard) {
                         app.set_error(Some(err));
@@ -2105,7 +2074,7 @@ impl App {
         if !self.is_shell_mode() || self.state.borrow().session_active {
             return Ok(false);
         }
-        if self.state.borrow().session_lost && !self.state.borrow().reconnecting {
+        if self.state.borrow().reconnect_needed && !self.state.borrow().reconnecting {
             return Ok(false);
         }
 
@@ -2304,36 +2273,6 @@ impl App {
         Ok(())
     }
 
-    async fn join_conversation_from_invite(&self) -> Result<(), String> {
-        if !self.is_shell_mode() {
-            return Err("conversation links must be opened from Home".to_string());
-        }
-        let invite = self.conversation_join_input.value().trim().to_string();
-        if invite.is_empty() {
-            return Err("Paste a conversation invite code or link.".to_string());
-        }
-        self.set_status("Joining", "Claiming the invite and connecting this device.");
-        let joined: ConversationJoinInviteJoinResponse = api_post_json_with_headers(
-            &self.room_api_url("/invites/join"),
-            &ConversationJoinInviteJoinInput { invite: &invite },
-            &self.home_token_headers(),
-        )
-        .await?;
-        self.conversation_join_input.set_value("");
-        let selection_guard = {
-            let state = self.state.borrow();
-            current_selection_guard(&state)
-        };
-        let _ = self
-            .refresh_shell_summary_for_guard(&selection_guard)
-            .await?;
-        let _ = self
-            .ensure_shell_session_for_guard(&selection_guard)
-            .await?;
-        self.set_status("Joined", &format!("Joined {}.", joined.room_title));
-        Ok(())
-    }
-
     async fn revoke_runtime_invite(&self, invite_id: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
             return Err("ElastOS invite cancellation is only available from Home".to_string());
@@ -2361,38 +2300,26 @@ impl App {
         if !self.state.borrow().session_active {
             return Ok(());
         }
-        let draft = self.message_input.value();
-        let body = draft.trim().to_string();
+        let body = self.message_input.value().trim().to_string();
         if body.is_empty() {
             return Ok(());
         }
 
-        let (request_id, guard) = {
+        let (request_id, sent_revision, selection_guard) = {
             let mut state = self.state.borrow_mut();
-            let guard = composer_send_guard(&mut state, &draft);
+            let sent_revision = state.composer_revision;
             let request_id = pending_chat_request_id(
                 &mut state.pending_chat_send,
                 &body,
                 new_chat_message_request_id,
             )?;
-            (request_id, guard)
+            (request_id, sent_revision, current_selection_guard(&state))
         };
-        let sent = match self
-            .send_room_text(&request_id, &body, &guard.selection)
-            .await
+        if self
+            .send_room_text(&request_id, &body, &selection_guard)
+            .await?
         {
-            Ok(sent) => sent,
-            Err(error) if composer_send_is_current(&self.state.borrow(), &guard) => {
-                return Err(error)
-            }
-            Err(_) => return Ok(()),
-        };
-        if sent {
             let mut state = self.state.borrow_mut();
-            record_composer_edit(&mut state, &self.message_input.value());
-            if !complete_composer_send(&mut state, &guard) {
-                return Ok(());
-            }
             if state
                 .pending_chat_send
                 .as_ref()
@@ -2400,14 +2327,17 @@ impl App {
             {
                 state.pending_chat_send = None;
             }
+            let clear = settle_sent_draft(&mut state, &None, sent_revision);
             drop(state);
-            self.message_input.set_value("");
+            if clear {
+                self.message_input.set_value("");
+            }
         }
         Ok(())
     }
 
     async fn send_direct_message(&self) -> Result<(), String> {
-        if self.state.borrow().session_lost || self.state.borrow().reconnecting {
+        if self.state.borrow().reconnect_needed || self.state.borrow().reconnecting {
             return Ok(());
         }
         let conversation_id = self
@@ -2423,21 +2353,20 @@ impl App {
             self.return_to_conversation_selector(Some(&conversation_id));
             return Err("That conversation is no longer available.".to_string());
         }
-        let draft = self.message_input.value();
-        let text = draft.trim().to_string();
+        let text = self.message_input.value().trim().to_string();
         if text.is_empty() {
             return Ok(());
         }
-        let (request_id, guard) = {
+        let (request_id, sent_revision, selection_guard) = {
             let mut state = self.state.borrow_mut();
-            let guard = composer_send_guard(&mut state, &draft);
+            let sent_revision = state.composer_revision;
             let request_id = pending_direct_request_id(
                 &mut state.direct.pending_send,
                 &conversation_id,
                 &text,
                 new_chat_message_request_id,
             )?;
-            (request_id, guard)
+            (request_id, sent_revision, current_selection_guard(&state))
         };
         let payload = DirectSendInput {
             request_id: &request_id,
@@ -2451,39 +2380,31 @@ impl App {
             &self.home_token_headers(),
         )
         .await;
-        if self.home_token() != request_token || !self.selection_guard_is_current(&guard.selection)
-        {
+        if self.home_token() != request_token || self.state.borrow().reconnect_needed {
             return Ok(());
         }
-        record_composer_edit(&mut self.state.borrow_mut(), &self.message_input.value());
-        let draft_is_current = composer_send_is_current(&self.state.borrow(), &guard);
         let (http_status, response) = match response_result {
             Ok(response) => response,
+            Err(_) if !self.selection_guard_is_current(&selection_guard) => return Ok(()),
             Err(401) => {
                 self.handle_direct_authority_loss(401);
                 return Ok(());
             }
-            Err(403) if draft_is_current => {
+            Err(403) => {
                 self.return_to_conversation_selector(Some(&conversation_id));
                 return Err("That conversation is no longer available.".to_string());
             }
-            Err(_) if draft_is_current => {
-                return Err("Message could not be sent. Try again.".to_string())
-            }
-            Err(_) => return Ok(()),
+            Err(_) => return Err("Message could not be sent. Try again.".to_string()),
         };
         if !valid_direct_send_response(http_status, response.status) {
-            return if draft_is_current {
+            return if self.selection_guard_is_current(&selection_guard) {
                 Err("Message could not be sent. Try again.".to_string())
             } else {
                 Ok(())
             };
         }
-        {
+        let clear = {
             let mut state = self.state.borrow_mut();
-            if !complete_composer_send(&mut state, &guard) {
-                return Ok(());
-            }
             if state.direct.pending_send.as_ref().is_some_and(|pending| {
                 pending.request_id == request_id
                     && pending.conversation_id == conversation_id
@@ -2491,15 +2412,26 @@ impl App {
             }) {
                 state.direct.pending_send = None;
             }
-        }
-        self.message_input.set_value("");
-        let selection_guard = {
-            let state = self.state.borrow();
-            current_selection_guard(&state)
+            if state
+                .held_direct_sends
+                .get(&conversation_id)
+                .is_some_and(|held| held.request_id == request_id)
+            {
+                state.held_direct_sends.remove(&conversation_id);
+            }
+            // Accepted text settles by its conversation and revision, even
+            // while another conversation is open. Current UI effects below
+            // also require the original selection generation.
+            settle_sent_draft(&mut state, &Some(conversation_id.clone()), sent_revision)
         };
-        let _ = self
-            .refresh_direct_messages_for_guard(&selection_guard)
-            .await;
+        if clear {
+            self.message_input.set_value("");
+        }
+        if self.selection_guard_is_current(&selection_guard) {
+            let _ = self
+                .refresh_direct_messages_for_guard(&selection_guard)
+                .await;
+        }
         Ok(())
     }
 
@@ -2590,31 +2522,21 @@ impl App {
         let payload = SendMessageInput { request_id, body };
         let request_token = self.home_token();
         let headers = self.room_request_headers();
-        let response =
+        let result =
             api_post_session_json(&self.room_api_url("/objects/send"), &payload, &headers).await;
-        if self.home_token() != request_token || !self.selection_guard_is_current(guard) {
+        if self.home_token() != request_token || self.state.borrow().reconnect_needed {
             return Ok(false);
         }
-        let sent: ConversationObjectView = match response {
+        let sent: ConversationObjectView = match result {
             Ok(sent) => sent,
+            Err(_) if !self.selection_guard_is_current(guard) => return Ok(false),
             Err(err) if is_session_error(&err) => {
-                if self.selection_guard_is_current(guard) {
-                    self.handle_session_loss(self.session_loss_detail());
-                }
+                self.handle_session_loss(self.session_loss_detail());
                 return Ok(false);
             }
             Err(err) => return Err(err),
         };
-
-        if !self.selection_guard_is_current(guard) {
-            return Ok(false);
-        }
-        let mut state = self.state.borrow_mut();
-        state.latest_seq = state.latest_seq.max(sent.seq);
-        if !state.objects.iter().any(|object| object.seq == sent.seq) {
-            state.objects.push(sent);
-        }
-        state.force_message_follow = true;
+        record_own_shared_send(&mut self.state.borrow_mut(), sent);
         Ok(true)
     }
 
@@ -2626,39 +2548,10 @@ impl App {
         if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
             return Ok(false);
         }
-        let Some(window) = window() else {
-            return Ok(false);
-        };
-        let Some(parent) = window.parent()? else {
-            return Ok(false);
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
-            return Ok(false);
-        }
-
-        let message = JsObject::new();
-        Reflect::set(
-            &message,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("home:open-uri"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("uri"),
-            &JsValue::from_str(clean_uri),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("preferredViewer"),
-            &JsValue::from_str("documents"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("homeToken"),
-            &JsValue::from_str(&home_token),
-        )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
-        Ok(true)
+        self.post_home_message(&serde_json::json!({
+            "type": "home:open-uri", "uri": clean_uri, "preferredViewer": "documents",
+            "homeToken": home_token,
+        }))
     }
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
@@ -2692,68 +2585,15 @@ impl App {
                 .ok_or_else(|| JsValue::from_str("Attachment bytes are still loading."))?;
             (attachment, data_url)
         };
-        let Some(window) = window() else {
-            return Err(JsValue::from_str("Browser window is unavailable."));
-        };
-        let Some(parent) = window.parent()? else {
-            return Err(JsValue::from_str("Home shell is unavailable."));
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
+        if !self.post_home_message(&documents_attachment_message(
+            &home_token,
+            &attachment,
+            &data_url,
+        ))? {
             return Err(JsValue::from_str(
                 "Open Chat from Home to open attachments in Documents.",
             ));
         }
-
-        let payload = JsObject::new();
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("documents:open-chat-attachment"),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("attachmentId"),
-            &JsValue::from_str(&attachment.attachment_id),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("fileName"),
-            &JsValue::from_str(&attachment.file_name),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("mimeType"),
-            &JsValue::from_str(&attachment.mime_type),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("sizeBytes"),
-            &JsValue::from_f64(attachment.size_bytes as f64),
-        )?;
-        Reflect::set(
-            &payload,
-            &JsValue::from_str("dataUrl"),
-            &JsValue::from_str(&data_url),
-        )?;
-
-        let message = JsObject::new();
-        Reflect::set(
-            &message,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("home:open-target-with-payload"),
-        )?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("target"),
-            &JsValue::from_str("documents"),
-        )?;
-        Reflect::set(&message, &JsValue::from_str("payload"), &payload)?;
-        Reflect::set(
-            &message,
-            &JsValue::from_str("homeToken"),
-            &JsValue::from_str(&home_token),
-        )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
         Ok(true)
     }
 
@@ -2762,24 +2602,16 @@ impl App {
     fn select_conversation(self: &Rc<Self>, choice: String) {
         let selection_guard = {
             let mut state = self.state.borrow_mut();
-            if choice != "shared"
-                && selected_conversation(&state.direct.conversations, &choice).is_none()
-            {
-                return;
-            }
-            retain_composer(&mut state, &self.message_input.value());
             state.error_text = None;
             state.error_transient = false;
-            let guard = if choice == "shared" {
+            if choice == "shared" {
                 commit_shared_selection(&mut state)
             } else {
                 let Some(guard) = commit_direct_selection(&mut state, &choice) else {
                     return;
                 };
                 guard
-            };
-            self.message_input.set_value(&restore_composer(&mut state));
-            guard
+            }
         };
         let _ = self.render();
         if choice == "shared" {
@@ -2837,7 +2669,7 @@ impl App {
         };
         spawn_local(async move {
             let _ = app.refresh_direct_conversations().await;
-            if app.selection_guard_is_current(&guard) && !app.state.borrow().session_lost {
+            if app.selection_guard_is_current(&guard) && !app.state.borrow().reconnect_needed {
                 app.select_conversation(conversation_id);
             }
         });
@@ -2877,17 +2709,15 @@ impl App {
         }
     }
 
-    fn open_participant_card(&self, participant_ref: &str) {
+    fn open_participant_card(&self, participant_ref: &str, message_seq: Option<u64>) {
         let Some((name, card)) = self.participant_card_for(participant_ref) else {
             return;
         };
+        self.participant_card_opening
+            .set(self.participant_card_opening.get().wrapping_add(1));
+        *self.participant_card_opener.borrow_mut() =
+            Some((participant_ref.to_string(), message_seq));
         let (state_text, action) = participant_card_copy(&card, self.home_token().is_some());
-        self.participant_card_generation
-            .set(self.participant_card_generation.get().wrapping_add(1));
-        *self.participant_card_opener.borrow_mut() = self
-            .document
-            .active_element()
-            .and_then(|element| element.dyn_into::<HtmlElement>().ok());
         let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
             .set_text_content(Some(&participant_initial(&name)));
@@ -2922,24 +2752,34 @@ impl App {
         let _ = self.participant_card_close.focus();
     }
 
-    fn close_participant_card(&self) {
-        self.participant_card_generation
-            .set(self.participant_card_generation.get().wrapping_add(1));
+    fn close_participant_card(&self, return_focus: bool) {
         self.participant_card.set_hidden(true);
         let _ = self
             .participant_card
             .remove_attribute("data-participant-ref");
-        if let Some(opener) = self
-            .participant_card_opener
-            .borrow_mut()
-            .take()
-            .filter(|element| element.is_connected())
-        {
-            let _ = opener.focus();
-        } else if !self.message_input.disabled() {
-            let _ = self.message_input.focus();
-        } else {
-            let _ = self.participant_toggle.focus();
+        self.participant_card_opening
+            .set(self.participant_card_opening.get().wrapping_add(1));
+        let opener = self.participant_card_opener.borrow_mut().take();
+        if let Some((participant_ref, message_seq)) = opener.filter(|_| return_focus) {
+            let row = match message_seq {
+                Some(seq) => {
+                    element_with_attribute(&self.message_list, "data-seq", &seq.to_string())
+                }
+                None => Some(Element::from(self.participant_list.clone())),
+            };
+            let named = row.and_then(|row| {
+                element_with_attribute(&row, "data-participant-ref", &participant_ref)
+            });
+            match named.and_then(|named| named.dyn_into::<HtmlElement>().ok()) {
+                Some(named) => {
+                    let _ = named.focus();
+                }
+                // The name is gone (its message left the window or the person
+                // left the room): the composer is the next useful place.
+                None => {
+                    let _ = self.message_input.focus();
+                }
+            }
         }
     }
 
@@ -2955,30 +2795,23 @@ impl App {
             return;
         };
         let Some((_, card)) = self.participant_card_for(&participant_ref) else {
-            self.close_participant_card();
+            self.close_participant_card(true);
             return;
         };
         match action.as_str() {
             "message" => {
-                self.close_participant_card();
+                self.close_participant_card(false);
                 if let Some(conversation_id) = card.conversation_id {
                     self.open_direct_conversation(conversation_id);
                 }
             }
             "add-contact" => {
                 self.participant_card_action.set_disabled(true);
-                let generation = self.participant_card_generation.get();
+                let opening = self.participant_card_opening.get();
                 let app = Rc::clone(self);
                 spawn_local(async move {
                     let result = app.request_contact(&participant_ref).await;
-                    if !participant_card_response_is_current(
-                        app.participant_card_generation.get(),
-                        generation,
-                        app.participant_card
-                            .get_attribute("data-participant-ref")
-                            .as_deref(),
-                        &participant_ref,
-                    ) {
+                    if app.participant_card_opening.get() != opening {
                         return;
                     }
                     match result {
@@ -2995,7 +2828,7 @@ impl App {
                 });
             }
             "inbox" | "people" => {
-                self.close_participant_card();
+                self.close_participant_card(false);
                 let _ = self.post_library_picker_message(serde_json::json!({
                     "type": "home:open-target", "target": action, "query": {},
                     "homeToken": self.home_token(),
@@ -3018,7 +2851,7 @@ impl App {
     /// Profile cards: a click, Enter or Space on any name with a card opens
     /// it; the card closes on its close button or Escape.
     fn install_participant_card_listeners(self: &Rc<Self>) -> Result<(), JsValue> {
-        for list in [&self.participant_list, &self.message_list] {
+        for (list, from_messages) in [(&self.participant_list, false), (&self.message_list, true)] {
             let card_app = Rc::clone(self);
             let open_card = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
                 if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
@@ -3039,7 +2872,12 @@ impl App {
                     return;
                 };
                 event.prevent_default();
-                card_app.open_participant_card(&participant_ref);
+                let message_seq = from_messages
+                    .then(|| named.closest("[data-seq]").ok().flatten())
+                    .flatten()
+                    .and_then(|row| row.get_attribute("data-seq"))
+                    .and_then(|seq| seq.parse().ok());
+                card_app.open_participant_card(&participant_ref, message_seq);
             }));
             list.add_event_listener_with_callback("click", open_card.as_ref().unchecked_ref())?;
             list.add_event_listener_with_callback("keydown", open_card.as_ref().unchecked_ref())?;
@@ -3054,7 +2892,7 @@ impl App {
         card_action.forget();
         let card_close_app = Rc::clone(self);
         let card_close = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
-            card_close_app.close_participant_card();
+            card_close_app.close_participant_card(true);
         }));
         self.participant_card_close
             .add_event_listener_with_callback("click", card_close.as_ref().unchecked_ref())?;
@@ -3063,7 +2901,7 @@ impl App {
         let card_escape = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
             if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
                 if key_event.key() == "Escape" && !card_escape_app.participant_card.hidden() {
-                    card_escape_app.close_participant_card();
+                    card_escape_app.close_participant_card(true);
                 }
             }
         }));
@@ -3091,21 +2929,34 @@ impl App {
         Ok(true)
     }
 
-    fn post_library_picker_message(&self, message: serde_json::Value) -> Result<(), JsValue> {
-        let window = window().ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        let top = window
-            .top()?
-            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        let origin = self
-            .home_parent_origin
-            .as_deref()
-            .ok_or_else(|| JsValue::from_str("Home is unavailable"))?;
-        if origin == "null" || origin == "*" || JsObject::is(top.as_ref(), window.as_ref()) {
-            return Err(JsValue::from_str(
-                "Open Chat from Home to choose a Library item.",
-            ));
+    /// Posts to Home, the top window at the origin named by `?home_origin=`.
+    /// Home loads Chat in an opaque frame, so Chat's own origin can never
+    /// address it. Returns false outside Home.
+    fn post_home_message(&self, message: &serde_json::Value) -> Result<bool, JsValue> {
+        let Some(window) = window() else {
+            return Ok(false);
+        };
+        let Some(top) = window.top()? else {
+            return Ok(false);
+        };
+        let Some(origin) = admitted_home_origin(self.home_parent_origin.as_deref()) else {
+            return Ok(false);
+        };
+        if JsObject::is(top.as_ref(), window.as_ref()) {
+            return Ok(false);
         }
-        top.post_message(&js_sys::JSON::parse(&message.to_string())?, origin)
+        top.post_message(&js_sys::JSON::parse(&message.to_string())?, origin)?;
+        Ok(true)
+    }
+
+    fn post_library_picker_message(&self, message: serde_json::Value) -> Result<(), JsValue> {
+        if self.post_home_message(&message)? {
+            Ok(())
+        } else {
+            Err(JsValue::from_str(
+                "Open Chat from Home to choose a Library item.",
+            ))
+        }
     }
 
     fn library_picker_is_current(&self, request: &LibraryPickerRequest) -> bool {
@@ -3289,6 +3140,9 @@ impl App {
         let previous_participant_scroll_top = self.participant_list.scroll_top();
         let (state, force_message_follow) = {
             let mut state = self.state.borrow_mut();
+            if let Some(draft) = switch_composer_draft(&mut state, &self.message_input.value()) {
+                self.message_input.set_value(&draft);
+            }
             let force_message_follow = state.force_message_follow;
             state.force_message_follow = false;
             (state.clone(), force_message_follow)
@@ -3323,17 +3177,6 @@ impl App {
             state.show_access_controls,
             !state.pending_requests.is_empty(),
         );
-        let show_reconnect = self.is_shell_mode() && state.session_lost;
-        self.reconnect_row.set_hidden(!show_reconnect);
-        self.reconnect_status.set_hidden(!show_reconnect);
-        self.reconnect_button.set_hidden(!show_reconnect);
-        self.reconnect_button.set_disabled(state.reconnecting);
-        self.reconnect_status
-            .set_text_content(Some(if state.reconnecting {
-                "Opening Chat through Home. Your drafts are kept."
-            } else {
-                "Chat needs to reconnect. Your drafts are kept."
-            }));
         self.participant_count
             .set_text_content(Some(&projection.participant_count));
         self.browser_access_count
@@ -3383,13 +3226,27 @@ impl App {
             },
         )?;
 
-        if let Some(error) = &state.error_text {
+        let visible_error = state.error_text.as_deref().or_else(|| {
+            shows_reconnect(
+                self.is_shell_mode(),
+                state.session_active,
+                state.reconnect_needed,
+            )
+            .then_some(SHELL_SESSION_LOST_DETAIL)
+        });
+        if let Some(error) = visible_error {
             self.error_text.remove_attribute("hidden")?;
             self.error_text.set_text_content(Some(error));
         } else {
             self.error_text.set_attribute("hidden", "")?;
             self.error_text.set_text_content(None);
         }
+        self.reconnect_button.set_disabled(state.reconnecting);
+        self.reconnect_button.set_hidden(!shows_reconnect(
+            self.is_shell_mode(),
+            state.session_active,
+            state.reconnect_needed,
+        ));
 
         let show_reset = pending
             || !state.display_name.trim().is_empty()
@@ -3449,12 +3306,6 @@ impl App {
             &self.room_access_section,
             direct_mode || !controls.show_room_access,
         )?;
-        set_hidden(
-            &self.conversation_join_section,
-            direct_mode || !controls.show_conversation_join,
-        )?;
-        self.conversation_join_submit
-            .set_disabled(!controls.enable_gateway_controls);
         let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
         self.conversation_invite_output.set_value(invite_url);
         set_hidden(
@@ -3481,11 +3332,12 @@ impl App {
             self.attach_button
                 .set_attribute("aria-label", DIRECT_ATTACHMENTS_UNAVAILABLE)?;
         } else {
-            self.attach_button.set_title("");
-            self.attach_button.remove_attribute("aria-label")?;
+            self.attach_button.set_title(ATTACH_LABEL);
+            self.attach_button
+                .set_attribute("aria-label", ATTACH_LABEL)?;
         }
         self.send_button.set_disabled(if direct_mode {
-            !direct_send_enabled || state.session_lost || state.reconnecting
+            !direct_send_enabled || state.reconnect_needed || state.reconnecting
         } else {
             !controls.enable_text_send
         });
@@ -4024,6 +3876,7 @@ impl App {
         for object in objects {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
+            item.set_attribute("data-seq", &object.seq.to_string())?;
             let is_self = object.from_current_session;
             item.set_class_name(
                 if is_self && object.kind != ConversationObjectKind::System {
@@ -4180,14 +4033,10 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     } else {
         AccessMode::Gateway
     };
-    let initial_join_invite = ["invite", "join", "join_invite"]
-        .into_iter()
-        .find_map(|key| extract_query_param(&url, key));
     let initial_direct_conversation_id = extract_query_param(&url, "conversation_id");
     Ok(AppConfig {
         access_mode,
         home_token,
-        initial_join_invite,
         initial_direct_conversation_id,
         browser_session_request_storage_key: BROWSER_SESSION_REQUEST_STORAGE_KEY.to_string(),
     })
@@ -4198,6 +4047,67 @@ fn bump_selection_generation(state: &mut AppState) {
     if state.selection_generation == 0 {
         state.selection_generation = 1;
     }
+}
+
+/// Gives the composer's new content a revision no earlier content had.
+fn note_composer_edit(state: &mut AppState) {
+    state.composer_edits += 1;
+    state.composer_revision = state.composer_edits;
+}
+
+/// Keeps unsent text with its conversation. When the selection has moved, the
+/// composer's text is saved under the conversation it belonged to, and the
+/// draft of the newly selected conversation is returned for the composer.
+fn switch_composer_draft(state: &mut AppState, composer: &str) -> Option<String> {
+    let selected = state.direct.selected_conversation_id.clone();
+    if state.composer_conversation == selected {
+        return None;
+    }
+    let leaving = std::mem::replace(&mut state.composer_conversation, selected.clone());
+    if composer.trim().is_empty() {
+        state.drafts.remove(&leaving);
+    } else {
+        state
+            .drafts
+            .insert(leaving, (composer.to_string(), state.composer_revision));
+    }
+    match state.drafts.remove(&selected) {
+        Some((draft, revision)) => {
+            state.composer_revision = revision;
+            Some(draft)
+        }
+        None => {
+            note_composer_edit(state);
+            Some(String::new())
+        }
+    }
+}
+
+/// After a send is accepted, the composer is cleared only while it still
+/// shows that conversation at the revision that was sent; newer typing, even
+/// the same words, stays, and a second response for the same send finds the
+/// cleared revision gone. A saved draft still at the sent revision is
+/// dropped, so the message does not come back after A -> B -> A.
+fn settle_sent_draft(
+    state: &mut AppState,
+    sent_conversation: &Option<String>,
+    sent_revision: u64,
+) -> bool {
+    if state.composer_conversation == *sent_conversation {
+        if state.composer_revision != sent_revision {
+            return false;
+        }
+        note_composer_edit(state);
+        return true;
+    }
+    if state
+        .drafts
+        .get(sent_conversation)
+        .is_some_and(|(_, revision)| *revision == sent_revision)
+    {
+        state.drafts.remove(sent_conversation);
+    }
+    false
 }
 
 fn current_selection_guard(state: &AppState) -> SelectionGuard {
@@ -4224,69 +4134,6 @@ fn library_picker_accepts(
 fn selection_guard_matches(state: &AppState, guard: &SelectionGuard) -> bool {
     state.selection_generation == guard.generation
         && state.direct.selected_conversation_id == guard.selected_conversation_id
-}
-
-fn record_composer_edit(state: &mut AppState, body: &str) {
-    let draft = state
-        .drafts
-        .entry(state.direct.selected_conversation_id.clone())
-        .or_default();
-    if draft.body != body {
-        draft.body = body.to_string();
-        draft.revision = draft.revision.wrapping_add(1);
-    }
-}
-
-fn retain_composer(state: &mut AppState, body: &str) {
-    record_composer_edit(state, body);
-    state
-        .drafts
-        .get_mut(&state.direct.selected_conversation_id)
-        .unwrap()
-        .pending_direct_send = state.direct.pending_send.take();
-}
-
-fn restore_composer(state: &mut AppState) -> String {
-    let draft = state
-        .drafts
-        .entry(state.direct.selected_conversation_id.clone())
-        .or_default();
-    state.direct.pending_send = draft.pending_direct_send.take();
-    draft.body.clone()
-}
-
-fn composer_send_guard(state: &mut AppState, body: &str) -> ComposerSendGuard {
-    record_composer_edit(state, body);
-    ComposerSendGuard {
-        selection: current_selection_guard(state),
-        revision: state.drafts[&state.direct.selected_conversation_id].revision,
-        body: body.to_string(),
-    }
-}
-
-fn composer_send_is_current(state: &AppState, guard: &ComposerSendGuard) -> bool {
-    selection_guard_matches(state, &guard.selection)
-        && state
-            .drafts
-            .get(&guard.selection.selected_conversation_id)
-            .is_some_and(|draft| draft.revision == guard.revision && draft.body == guard.body)
-}
-
-fn complete_composer_send(state: &mut AppState, guard: &ComposerSendGuard) -> bool {
-    if !composer_send_is_current(state, guard) {
-        return false;
-    }
-    record_composer_edit(state, "");
-    true
-}
-
-fn participant_card_response_is_current(
-    generation: u64,
-    expected: u64,
-    participant_ref: Option<&str>,
-    expected_ref: &str,
-) -> bool {
-    generation == expected && participant_ref == Some(expected_ref)
 }
 
 fn navigation_query_for_guard(
@@ -4356,8 +4203,17 @@ fn append_conversation_choice_content(
 fn clear_selected_direct_conversation(state: &mut AppState) {
     state.direct.selected_conversation_id = None;
     state.direct.messages.clear();
-    state.direct.pending_send = None;
+    hold_pending_direct_send(state);
     state.direct.notice = None;
+}
+
+/// Keeps the open conversation's unanswered send while the person is elsewhere.
+fn hold_pending_direct_send(state: &mut AppState) {
+    if let Some(pending) = state.direct.pending_send.take() {
+        state
+            .held_direct_sends
+            .insert(pending.conversation_id.clone(), pending);
+    }
 }
 
 fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
@@ -4373,9 +4229,10 @@ fn commit_direct_selection(state: &mut AppState, conversation_id: &str) -> Optio
     state.pending_direct_launch = None;
     if state.direct.selected_conversation_id.as_deref() != Some(clean_id) {
         bump_selection_generation(state);
+        hold_pending_direct_send(state);
         state.direct.selected_conversation_id = Some(clean_id.to_string());
         state.direct.messages.clear();
-        state.direct.pending_send = None;
+        state.direct.pending_send = state.held_direct_sends.remove(clean_id);
     }
     state.direct.notice = None;
     Some(current_selection_guard(state))
@@ -4390,6 +4247,97 @@ fn commit_requested_direct_selection_if_current(
         return None;
     }
     commit_direct_selection(state, conversation_id)
+}
+
+/// Home's origin from `?home_origin=`, refused when it could not name Home:
+/// missing, opaque or a wildcard.
+fn admitted_home_origin(origin: Option<&str>) -> Option<&str> {
+    origin
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty() && *origin != "null" && *origin != "*")
+}
+
+/// The Home message that opens one Chat attachment in Documents.
+fn documents_attachment_message(
+    home_token: &str,
+    attachment: &AttachmentView,
+    data_url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "home:open-target-with-payload",
+        "target": "documents",
+        "homeToken": home_token,
+        "payload": {
+            "type": "documents:open-chat-attachment",
+            "attachmentId": attachment.attachment_id,
+            "fileName": attachment.file_name,
+            "mimeType": attachment.mime_type,
+            "sizeBytes": attachment.size_bytes,
+            "dataUrl": data_url,
+        },
+    })
+}
+
+/// The first element under `root` whose `attribute` is exactly `value`. The
+/// value is compared, never spliced into a selector.
+fn element_with_attribute(root: &Element, attribute: &str, value: &str) -> Option<Element> {
+    let mut child = root.first_element_child();
+    while let Some(element) = child {
+        if element.get_attribute(attribute).as_deref() == Some(value) {
+            return Some(element);
+        }
+        if let Some(found) = element_with_attribute(&element, attribute, value) {
+            return Some(found);
+        }
+        child = element.next_element_sibling();
+    }
+    None
+}
+
+/// The Reconnect action shows only inside Home, while a lost session has not
+/// come back. It does not depend on which message is showing.
+fn shows_reconnect(shell_mode: bool, session_active: bool, reconnect_needed: bool) -> bool {
+    shell_mode && !session_active && reconnect_needed
+}
+
+/// A Reconnect attempt failed. Only a session that is still lost reports that
+/// Chat could not reconnect; when the session came back and a later step
+/// failed (such as loading an attachment), that step's error shows instead.
+fn apply_reconnect_failure(state: &mut AppState, error: String) {
+    state.error_text = Some(error);
+    state.error_transient = state.session_active;
+}
+
+/// Adds the person's own accepted Community message. It scrolls to the newest
+/// message only while Community is open: a response that arrives after they
+/// moved to a direct conversation leaves that conversation's reading place.
+fn record_own_shared_send(state: &mut AppState, sent: ConversationObjectView) {
+    state.latest_seq = sent.seq;
+    state.objects.push(sent);
+    if state.direct.selected_conversation_id.is_none() {
+        state.force_message_follow = true;
+    }
+}
+
+/// Ends the conversation session. Home has no status row, so in Shell mode the
+/// reason and how to reconnect show as a lasting error the person can see.
+fn apply_session_loss(state: &mut AppState, shell_mode: bool, detail: &str) {
+    bump_selection_generation(state);
+    state.request_id = None;
+    state.session_active = false;
+    state.show_participants = false;
+    state.show_access_controls = false;
+    state.force_message_follow = true;
+    state.latest_seq = 0;
+    state.objects.clear();
+    state.participants.clear();
+    state.active_sessions.clear();
+    state.attachment_urls.clear();
+    state.status_badge = if shell_mode { "Reconnect" } else { "Join" }.to_string();
+    state.status_detail = detail.to_string();
+    state.error_text = shell_mode.then(|| detail.to_string());
+    state.error_transient = false;
+    state.reconnect_needed = shell_mode;
 }
 
 fn apply_active_poll_state(
@@ -4412,8 +4360,14 @@ fn apply_active_poll_state(
     let previous_status_detail = state.status_detail.clone();
     let previous_collaboration_configured = state.collaboration_configured;
     state.collaboration_configured = poll.transport.configured;
+    if !was_session_active
+        && (state.reconnect_needed
+            || state.error_text.as_deref() == Some(SHELL_SESSION_LOST_DETAIL))
+    {
+        state.error_text = None;
+    }
+    state.reconnect_needed = false;
     state.session_active = true;
-    state.session_lost = false;
     state.close_leave_sent = false;
     state.display_name = poll.display_name.clone();
     state.status_badge = "Live".to_string();
@@ -4428,7 +4382,10 @@ fn apply_active_poll_state(
             .participants
             .retain(configured_shared_participant_visible);
     }
-    if previous_latest_seq != state.latest_seq {
+    // A new session opens at the newest message. Later messages follow only a
+    // reader already at the bottom (`should_follow_scroll`), so reading older
+    // history keeps its place; the person's own send forces follow itself.
+    if !was_session_active {
         state.force_message_follow = true;
     }
 
@@ -4440,25 +4397,6 @@ fn apply_active_poll_state(
         || previous_status_badge != state.status_badge
         || previous_status_detail != state.status_detail;
     (attachments_to_cache, changed)
-}
-
-fn apply_session_loss_state(state: &mut AppState, shell_mode: bool, detail: &str) {
-    state.request_id = None;
-    state.session_active = false;
-    state.session_lost = shell_mode;
-    bump_selection_generation(state);
-    state.show_participants = false;
-    state.show_access_controls = false;
-    state.force_message_follow = true;
-    state.latest_seq = 0;
-    state.objects.clear();
-    state.participants.clear();
-    state.active_sessions.clear();
-    state.attachment_urls.clear();
-    state.status_badge = if shell_mode { "Reconnect" } else { "Join" }.to_string();
-    state.status_detail = detail.to_string();
-    state.error_text = None;
-    state.error_transient = false;
 }
 
 fn apply_active_poll_if_current(
@@ -4621,10 +4559,6 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         },
         pending_chat_send: None,
         selection_generation: 0,
-        drafts: BTreeMap::new(),
-        pending_direct_launch: None,
-        session_lost: false,
-        reconnecting: false,
         room_mode_known: false,
         collaboration_configured: false,
         session_active: false,
@@ -4648,6 +4582,14 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         attachment_urls: BTreeMap::new(),
         join_invite_url: None,
         direct: DirectUiState::default(),
+        composer_conversation: None,
+        reconnect_needed: false,
+        reconnecting: false,
+        pending_direct_launch: None,
+        drafts: BTreeMap::new(),
+        composer_revision: 0,
+        composer_edits: 0,
+        held_direct_sends: BTreeMap::new(),
         error_text: None,
     }
 }
@@ -4719,40 +4661,59 @@ mod tests {
     use super::direct::{
         DirectConversationView, DirectMessageList, DirectUiState, PendingDirectSend,
     };
+    use super::{
+        admitted_home_origin, apply_active_poll_if_current, apply_active_poll_state,
+        apply_direct_refresh_if_current, apply_session_loss, chat_control_policy,
+        clear_selected_direct_conversation, commit_direct_selection,
+        commit_requested_direct_selection_if_current, commit_shared_selection,
+        conversation_initial, current_selection_guard, decode_query_value,
+        documents_attachment_message, extract_fragment_param, extract_query_param,
+        format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
+        participant_shown_name, pending_chat_request_id, render_projection,
+        resolve_conversation_choice, selection_guard_matches, settle_sent_draft,
+        shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
+        AttachmentView, ConversationObjectKind, ConversationObjectView, ParticipantView,
+        PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
+        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+    };
+
+    fn two_direct_conversations() -> AppState {
+        let mut state = AppState::default();
+        state.direct.conversations = ["a", "b"]
+            .into_iter()
+            .map(|name| DirectConversationView {
+                conversation_id: format!("direct:sha256:{name}"),
+                display_name: name.to_uppercase(),
+                removed: false,
+                unread: false,
+            })
+            .collect();
+        state
+    }
 
     #[test]
     fn authority_loss_keeps_direct_selection_drafts_and_pending_send() {
-        let mut state = AppState {
-            session_active: true,
-            ..AppState::default()
-        };
-        super::record_composer_edit(&mut state, "shared draft");
-        state.direct.conversations = vec![DirectConversationView {
-            conversation_id: "direct:a".into(),
-            display_name: "A".into(),
-            removed: false,
-            unread: false,
-        }];
-        commit_direct_selection(&mut state, "direct:a").unwrap();
-        super::record_composer_edit(&mut state, "newer direct draft");
-        state.direct.pending_send = Some(PendingDirectSend {
+        let mut state = two_direct_conversations();
+        switch_composer_draft(&mut state, "");
+        note_composer_edit(&mut state);
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "shared draft");
+        note_composer_edit(&mut state);
+        state.direct.pending_send = Some(super::PendingDirectSend {
             request_id: "uncertain-send".into(),
-            conversation_id: "direct:a".into(),
+            conversation_id: "direct:sha256:a".into(),
             text: "sent draft".into(),
         });
+        state.session_active = true;
         let guard = current_selection_guard(&state);
         let direct = state.direct.clone();
-        let revision = state.drafts[&Some("direct:a".into())].revision;
-        super::apply_session_loss_state(&mut state, true, "Reconnect through Home.");
-        assert!(state.session_lost);
+        let revision = state.composer_revision;
+        super::apply_session_loss(&mut state, true, "Reconnect through Home.");
+        assert!(state.reconnect_needed);
         assert!(!state.session_active);
         assert_eq!(state.direct, direct);
-        assert_eq!(state.drafts[&None].body, "shared draft");
-        assert_eq!(
-            state.drafts[&Some("direct:a".into())].body,
-            "newer direct draft"
-        );
-        assert_eq!(state.drafts[&Some("direct:a".into())].revision, revision);
+        assert_eq!(state.drafts[&None].0, "shared draft");
+        assert_eq!(state.composer_revision, revision);
         assert!(!selection_guard_matches(&state, &guard));
     }
 
@@ -4762,7 +4723,7 @@ mod tests {
             pending_direct_launch: Some("direct:a".into()),
             ..AppState::default()
         };
-        super::apply_session_loss_state(&mut state, true, "Reconnect through Home.");
+        super::apply_session_loss(&mut state, true, "Reconnect through Home.");
         assert_eq!(state.pending_direct_launch.as_deref(), Some("direct:a"));
         state.direct.conversations = vec![DirectConversationView {
             conversation_id: "direct:a".into(),
@@ -4794,113 +4755,266 @@ mod tests {
         .is_none());
         assert!(state.direct.selected_conversation_id.is_none());
     }
-    use super::{
-        apply_active_poll_if_current, apply_active_poll_state, apply_direct_refresh_if_current,
-        chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,
-        commit_requested_direct_selection_if_current, commit_shared_selection,
-        conversation_initial, current_selection_guard, decode_query_value, extract_fragment_param,
-        extract_query_param, format_chat_message_request_id, object_sender_name,
-        participant_detail, participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, selection_guard_matches, shell_summary_allows_session,
-        AccessMode, AppConfig, AppState, ConversationObjectKind, ConversationObjectView,
-        ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
-        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
-    };
 
     #[test]
-    fn send_completion_only_clears_the_unchanged_draft() {
-        let mut state = AppState::default();
-        let sent = super::composer_send_guard(&mut state, "sent text");
-        super::record_composer_edit(&mut state, "new text");
-        assert!(!super::complete_composer_send(&mut state, &sent));
-        assert_eq!(super::restore_composer(&mut state), "new text");
-        // Retyping the same body still creates a different draft revision.
-        super::record_composer_edit(&mut state, "sent text");
-        assert!(!super::complete_composer_send(&mut state, &sent));
-        let current = super::composer_send_guard(&mut state, "sent text");
-        assert!(super::complete_composer_send(&mut state, &current));
-        assert_eq!(super::restore_composer(&mut state), "");
-    }
-
-    #[test]
-    fn conversation_switch_keeps_drafts_and_retry_identity_and_rejects_old_send() {
-        let mut state = AppState::default();
-        state.direct.conversations = vec![DirectConversationView {
-            conversation_id: "direct:a".into(),
-            display_name: "A".into(),
-            removed: false,
-            unread: false,
-        }];
-        super::retain_composer(&mut state, "shared draft");
-        commit_direct_selection(&mut state, "direct:a").unwrap();
-        assert_eq!(super::restore_composer(&mut state), "");
-        let sent = super::composer_send_guard(&mut state, "direct draft");
-        let pending = PendingDirectSend {
-            request_id: "retry-a".into(),
-            conversation_id: "direct:a".into(),
-            text: "direct draft".into(),
+    fn a_lost_home_session_shows_how_to_reconnect_until_it_is_back() {
+        let poll = || RoomPollView {
+            room_slug: "chat-room".to_string(),
+            display_name: "Shared room".to_string(),
+            latest_seq: 1,
+            participants: vec![],
+            objects: vec![],
+            transport: RoomTransportView::default(),
         };
-        state.direct.pending_send = Some(pending.clone());
-        super::retain_composer(&mut state, "direct draft");
-        commit_shared_selection(&mut state);
-        assert_eq!(super::restore_composer(&mut state), "shared draft");
-        assert!(state.direct.pending_send.is_none());
-        super::retain_composer(&mut state, "new shared draft");
-        commit_direct_selection(&mut state, "direct:a").unwrap();
-        assert_eq!(super::restore_composer(&mut state), "direct draft");
-        assert_eq!(state.direct.pending_send, Some(pending));
-        assert!(!super::complete_composer_send(&mut state, &sent));
-        super::retain_composer(&mut state, "direct draft");
-        commit_shared_selection(&mut state);
-        assert_eq!(super::restore_composer(&mut state), "new shared draft");
+        let mut state = AppState {
+            session_active: true,
+            ..AppState::default()
+        };
+        apply_session_loss(&mut state, true, super::SHELL_SESSION_LOST_DETAIL);
+        assert!(!state.session_active);
+        assert_eq!(
+            state.error_text.as_deref(),
+            Some(super::SHELL_SESSION_LOST_DETAIL)
+        );
+        assert!(!state.error_transient);
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        // A passing error replaces the message, but Reconnect stays offered.
+        state.error_text = Some("temporary".into());
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+        // A failed attempt while still lost says so and keeps the action.
+        super::apply_reconnect_failure(&mut state, "Home refused".into());
+        assert_eq!(state.error_text.as_deref(), Some("Home refused"));
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        apply_active_poll_state(&mut state, poll());
+        assert!(state.session_active);
+        assert_eq!(state.error_text, None);
+        assert!(!super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+        // A later step failing after the session came back is reported as
+        // itself, not as a failed reconnect.
+        super::apply_reconnect_failure(&mut state, "attachment failed".into());
+        assert_eq!(state.error_text.as_deref(), Some("attachment failed"));
+        assert!(!super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        // A browser guest keeps its own Join stage instead.
+        let mut guest = AppState::default();
+        apply_session_loss(&mut guest, false, "removed");
+        assert_eq!(guest.error_text, None);
+        assert_eq!(guest.status_badge, "Join");
+    }
+
+    fn shared_poll(latest_seq: u64) -> RoomPollView {
+        RoomPollView {
+            room_slug: "chat-room".to_string(),
+            display_name: "Shared room".to_string(),
+            latest_seq,
+            participants: vec![],
+            objects: vec![],
+            transport: RoomTransportView::default(),
+        }
     }
 
     #[test]
-    fn returning_to_shared_or_renewing_authority_rejects_the_old_send_guard() {
+    fn only_a_new_session_pulls_the_reader_to_the_newest_message() {
         let mut state = AppState::default();
-        state.direct.conversations = vec![DirectConversationView {
-            conversation_id: "direct:a".into(),
-            display_name: "A".into(),
-            removed: false,
-            unread: false,
-        }];
-        let sent = super::composer_send_guard(&mut state, "shared draft");
-        super::retain_composer(&mut state, "shared draft");
-        commit_direct_selection(&mut state, "direct:a").unwrap();
-        super::restore_composer(&mut state);
-        super::retain_composer(&mut state, "direct draft");
-        commit_shared_selection(&mut state);
-        assert_eq!(super::restore_composer(&mut state), "shared draft");
-        assert!(!super::complete_composer_send(&mut state, &sent));
-        let before_renewal = super::composer_send_guard(&mut state, "shared draft");
-        super::bump_selection_generation(&mut state);
-        assert!(!super::complete_composer_send(&mut state, &before_renewal));
-        assert_eq!(super::restore_composer(&mut state), "shared draft");
+        apply_active_poll_state(&mut state, shared_poll(1));
+        assert!(state.force_message_follow);
+        state.force_message_follow = false;
+        // A message arrives while the person reads older history.
+        apply_active_poll_state(&mut state, shared_poll(2));
+        assert!(!state.force_message_follow);
     }
 
     #[test]
-    fn profile_card_response_requires_the_same_opening_and_person() {
-        assert!(super::participant_card_response_is_current(
-            1,
-            1,
-            Some("a"),
-            "a"
-        ));
-        assert!(!super::participant_card_response_is_current(
-            2,
-            1,
-            Some("b"),
-            "a"
-        ));
-        assert!(!super::participant_card_response_is_current(
-            3,
-            1,
-            Some("a"),
-            "a"
-        ));
-        assert!(!super::participant_card_response_is_current(
-            1, 1, None, "a"
-        ));
+    fn a_late_community_send_does_not_move_a_direct_reader() {
+        let sent = || ConversationObjectView {
+            seq: 7,
+            sender: "Me".into(),
+            sender_ref: None,
+            sender_profile_verified: Some(true),
+            from_current_session: true,
+            kind: ConversationObjectKind::Text,
+            body: Some("hi".into()),
+            emoji: None,
+            link: None,
+            attachment: None,
+            created_at: 1,
+        };
+        let mut state = two_direct_conversations();
+        super::record_own_shared_send(&mut state, sent());
+        assert!(state.force_message_follow);
+
+        let mut state = two_direct_conversations();
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        super::record_own_shared_send(&mut state, sent());
+        assert!(!state.force_message_follow);
+        assert_eq!(state.latest_seq, 7);
+    }
+
+    #[test]
+    fn home_messages_need_a_real_home_origin() {
+        assert_eq!(
+            admitted_home_origin(Some("http://127.0.0.1:3000")),
+            Some("http://127.0.0.1:3000")
+        );
+        for refused in [None, Some(""), Some("null"), Some("*"), Some(" ")] {
+            assert_eq!(admitted_home_origin(refused), None);
+        }
+    }
+
+    #[test]
+    fn opening_an_attachment_asks_home_for_documents() {
+        let attachment = AttachmentView {
+            attachment_id: "att-1".into(),
+            file_name: "notes.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 5,
+            is_image: false,
+            is_audio: false,
+            is_video: false,
+        };
+        assert_eq!(
+            documents_attachment_message("home-token", &attachment, "data:text/plain,hello"),
+            serde_json::json!({
+                "type": "home:open-target-with-payload",
+                "target": "documents",
+                "homeToken": "home-token",
+                "payload": {
+                    "type": "documents:open-chat-attachment",
+                    "attachmentId": "att-1",
+                    "fileName": "notes.txt",
+                    "mimeType": "text/plain",
+                    "sizeBytes": 5,
+                    "dataUrl": "data:text/plain,hello",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_draft_stays_with_its_conversation() {
+        let mut state = two_direct_conversations();
+        assert_eq!(switch_composer_draft(&mut state, "shared words"), None);
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "shared words").as_deref(),
+            Some("")
+        );
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "for A").as_deref(),
+            Some("")
+        );
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "").as_deref(),
+            Some("for A")
+        );
+        commit_shared_selection(&mut state);
+        assert_eq!(
+            switch_composer_draft(&mut state, "for A").as_deref(),
+            Some("shared words")
+        );
+        // B was left empty, so nothing is kept for it.
+        assert!(!state.drafts.contains_key(&Some("direct:sha256:b".into())));
+    }
+
+    #[test]
+    fn resending_a_restored_draft_reuses_its_request_id() {
+        let mut state = two_direct_conversations();
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        let first = super::pending_direct_request_id(
+            &mut state.direct.pending_send,
+            "direct:sha256:a",
+            "hello",
+            || Ok("request-1".to_string()),
+        )
+        .unwrap();
+        // The response is held while the person visits B and comes back.
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        assert!(state.direct.pending_send.is_none());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        let again = super::pending_direct_request_id(
+            &mut state.direct.pending_send,
+            "direct:sha256:a",
+            "hello",
+            || Ok("request-2".to_string()),
+        )
+        .unwrap();
+        assert_eq!(first, again);
+        commit_shared_selection(&mut state);
+        assert!(state.held_direct_sends.contains_key("direct:sha256:a"));
+    }
+
+    #[test]
+    fn an_accepted_send_clears_only_the_text_it_sent() {
+        let mut state = two_direct_conversations();
+        let a = Some("direct:sha256:a".to_string());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "");
+        note_composer_edit(&mut state);
+        let sent = state.composer_revision;
+        assert!(settle_sent_draft(&mut state, &a, sent));
+        // A second response for the same send finds newer content, even when
+        // the person typed the same words again.
+        note_composer_edit(&mut state);
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        // A shared-room send that completes while A is open leaves A alone.
+        let current = state.composer_revision;
+        assert!(!settle_sent_draft(&mut state, &None, current));
+    }
+
+    #[test]
+    fn a_send_accepted_after_a_to_b_to_a_does_not_come_back_or_clear_new_text() {
+        let mut state = two_direct_conversations();
+        let a = Some("direct:sha256:a".to_string());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "");
+        note_composer_edit(&mut state);
+        let sent = state.composer_revision;
+        // Sent "hello" in A, then moved to B before the response.
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        switch_composer_draft(&mut state, "hello");
+        note_composer_edit(&mut state);
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "typing to B").as_deref(),
+            Some("")
+        );
+
+        // Moved away again with the draft unsent: a late response for an
+        // older revision keeps the saved newer draft.
+        note_composer_edit(&mut state);
+        let newer = state.composer_revision;
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        switch_composer_draft(&mut state, "a newer line");
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        assert_eq!(
+            state.drafts.get(&a).map(|(_, revision)| *revision),
+            Some(newer)
+        );
     }
 
     #[test]
@@ -5085,13 +5199,11 @@ mod tests {
         assert!(!policy.show_browser_requests);
         assert!(!policy.show_room_access_toggle);
         assert!(!policy.show_room_access);
-        assert!(!policy.show_conversation_join);
         assert!(!policy.enable_gateway_controls);
 
         let public_policy = chat_control_policy(true, true, false, false, true, true);
         assert!(!public_policy.enable_text_send);
         assert!(!public_policy.show_browser_requests);
-        assert!(!public_policy.show_conversation_join);
     }
 
     #[test]
@@ -5273,14 +5385,12 @@ mod tests {
         assert!(!shell_isolated.show_browser_requests);
         assert!(!shell_isolated.show_room_access_toggle);
         assert!(!shell_isolated.show_room_access);
-        assert!(!shell_isolated.show_conversation_join);
         assert!(!shell_isolated.enable_gateway_controls);
 
         let gateway_isolated = chat_control_policy(true, false, false, true, true, true);
         assert!(gateway_isolated.show_browser_requests);
         assert!(gateway_isolated.show_room_access_toggle);
         assert!(gateway_isolated.show_room_access);
-        assert!(!gateway_isolated.show_conversation_join);
         assert!(gateway_isolated.enable_gateway_controls);
     }
 
@@ -5292,17 +5402,7 @@ mod tests {
         assert!(!unknown.show_browser_requests);
         assert!(!unknown.show_room_access_toggle);
         assert!(!unknown.show_room_access);
-        assert!(!unknown.show_conversation_join);
         assert!(!unknown.enable_gateway_controls);
-
-        let configured = chat_control_policy(true, true, true, false, true, true);
-        assert!(!configured.show_conversation_join);
-
-        let unconfigured_gateway = chat_control_policy(true, false, false, false, false, false);
-        assert!(unconfigured_gateway.show_conversation_join);
-
-        let unconfigured_shell = chat_control_policy(true, false, true, false, false, false);
-        assert!(!unconfigured_shell.show_conversation_join);
     }
 
     #[test]
@@ -5346,7 +5446,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5427,7 +5526,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5471,7 +5569,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: Some("direct:sha256:fixture-conversation".to_string()),
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5499,7 +5596,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5546,7 +5642,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5741,7 +5836,6 @@ struct ChatControlPolicy {
     show_browser_requests: bool,
     show_room_access_toggle: bool,
     show_room_access: bool,
-    show_conversation_join: bool,
     enable_gateway_controls: bool,
 }
 
@@ -5761,7 +5855,6 @@ fn chat_control_policy(
         show_browser_requests: gateway_surface && has_pending_requests,
         show_room_access_toggle: gateway_surface && session_active,
         show_room_access: gateway_surface && session_active && show_access_controls,
-        show_conversation_join: gateway_surface && !session_active,
         enable_gateway_controls: gateway_surface && session_active,
     }
 }

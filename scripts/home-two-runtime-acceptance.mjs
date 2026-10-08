@@ -1018,7 +1018,7 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
   assertOk(typeof oldHomeToken === "string" && oldHomeToken.length > 0, "Chat had no launch authority before session loss");
   const draft = `${direct ? "Direct" : "Community"} ${lossSource} Reconnect draft @ ${Date.now()}`;
   await chatFrame.locator("#message-input").fill(draft);
-  assertOk(!(await chatFrame.locator("#chat-reconnect").isVisible()), "Reconnect was already visible before session loss");
+  assertOk(!(await chatFrame.locator("#reconnect-button").isVisible()), "Reconnect was already visible before session loss");
   let injected = false;
   let handlerError;
   let starts = 0;
@@ -1043,7 +1043,7 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
   const handler = async (route) => {
     try {
       const request = route.request();
-      if (request.method() !== (lossSource === "send" ? "POST" : "GET") || injected) {
+      if (request.method() !== (!direct || lossSource === "send" ? "POST" : "GET") || injected) {
         await route.continue();
         return;
       }
@@ -1070,11 +1070,12 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
     if (lossSource === "send") {
       await chatFrame.locator("#send-button").click();
     }
-    await chatFrame.locator("#chat-reconnect").waitFor({ state: "visible", timeout: 30_000 });
+    await chatFrame.locator("#reconnect-button").waitFor({ state: "visible", timeout: 30_000 });
     assertOk(!handlerError, "session-loss interception failed");
     assertOk(injected, "Reconnect appeared without the injected session loss");
-    assertOk(await chatFrame.locator("#chat-reconnect").isEnabled(), "Reconnect control was disabled");
-    assertOk(Boolean((await chatFrame.locator("#chat-reconnect-status").innerText()).trim()), "Reconnect had no visible explanation");
+    assertOk(await chatFrame.locator("#reconnect-button").isEnabled(), "Reconnect control was disabled");
+    const explanation = chatFrame.locator("#error-text");
+    assertOk(await explanation.isVisible() && Boolean((await explanation.innerText()).trim()), "Reconnect had no visible explanation");
     await assertDraft(side, chatFrame, conversationId, draft);
     const lost = await chatFrameState(chatFrame);
     assertOk(lost.sendDisabled && (direct || lost.inputDisabled), "Chat kept sending enabled after session loss");
@@ -1085,11 +1086,11 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
       assertOk(await exactMessageCount(receiverFrame, draft) === 0, "refused direct send reached its peer");
     }
     await side.page.unroute(matcher, handler);
-    await chatFrame.locator("#chat-reconnect").click();
+    await chatFrame.locator("#reconnect-button").click();
     await poll(`${side.prefix}: user Reconnect resumes ${direct ? "Direct" : "Community"}`, 30_000, 250, async () => {
       const state = await chatFrameState(chatFrame);
       return {
-        done: starts > 0 && !state.inputDisabled && !(await chatFrame.locator("#chat-reconnect").isVisible()),
+        done: starts > 0 && !state.inputDisabled && !(await chatFrame.locator("#reconnect-button").isVisible()),
         value: { session_starts: starts, input_disabled: state.inputDisabled },
       };
     });

@@ -666,6 +666,8 @@ async fn admit_installed_setup_metadata(
         } else {
             None
         };
+        // The pinned CID names exact bytes; the release name could serve
+        // newer ones, so setup fetches by CID as update does.
         let network = crate::collaboration_release_network::fetch_release_network(
             data_dir,
             manifest.collaboration_network.as_ref(),
