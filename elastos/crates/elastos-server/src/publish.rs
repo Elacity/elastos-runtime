@@ -53,34 +53,6 @@ pub(crate) fn source_discovery_uri(publisher_did: &str, channel: &str) -> String
     format!("elastos://source/{}/{}", channel, &digest[..32])
 }
 
-fn release_discovery_topic_for_uri(discovery_uri: &str) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(discovery_uri.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    format!("elastos:source:{}", &digest[..32])
-}
-
-pub(crate) fn release_discovery_topics(
-    discovery_uri: Option<&str>,
-    publisher_did: &str,
-    channel: &str,
-) -> Vec<String> {
-    let discovery_uri = discovery_uri
-        .filter(|uri| !uri.trim().is_empty())
-        .map(|uri| uri.trim().to_string())
-        .unwrap_or_else(|| source_discovery_uri(publisher_did, channel));
-    let channel = normalize_release_channel(channel);
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(publisher_did.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let specific = format!("elastos:releases:{}:{}", channel, &digest[..32]);
-    vec![
-        release_discovery_topic_for_uri(&discovery_uri),
-        specific,
-        "elastos:releases".to_string(),
-    ]
-}
-
 fn normalize_release_channel(channel: &str) -> String {
     let mut normalized = String::new();
     for ch in channel.chars() {
@@ -467,7 +439,7 @@ async fn run_signed_publication(
     );
 
     // The public pin and CID receipt are part of the head-last publication
-    // transaction. Ledger and gossip are derived, retryable work after commit.
+    // transaction. The ledger is derived, retryable work after commit.
     let entry = build_release_ledger_entry(&snapshot, &release_cid, &head_cid, &[])?;
     let ledger_path = release_ledger_path(&data_dir);
     let mut ledger = load_release_ledger(&ledger_path)?;
@@ -481,12 +453,7 @@ async fn run_signed_publication(
     save_release_ledger(&ledger_path, &ledger)
         .context("The signed set is committed; retry publication to record its ledger")?;
     print_release_diff_summary(&entry, earlier.as_ref(), &ledger_path);
-    match announce_release_head(&entry).await {
-        Ok(topics) => println!("Release head announced on {}", topics.join(", ")),
-        Err(error) => anyhow::bail!(
-            "The signed set is committed; retry publication to announce its head: {error}"
-        ),
-    }
+    println!("Release published. Homes find it when they next check for updates.");
     Ok(())
 }
 
@@ -1894,63 +1861,6 @@ fn print_release_diff_summary(
     }
 }
 
-/// Announce a release via the running runtime's built-in Carrier (HTTP API).
-/// No peer-provider process spawn — Carrier is built into the runtime.
-async fn announce_release_head(entry: &ReleaseLedgerEntry) -> anyhow::Result<Vec<String>> {
-    let data_dir = elastos_server::sources::default_data_dir();
-    let coords_path = super::runtime_control::runtime_coord_path(&data_dir);
-    let coords = super::runtime_control::read_runtime_coords(&coords_path)
-        .await
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No running runtime found. Start `elastos serve` first for gossip announcements."
-            )
-        })?;
-
-    let tokens = super::runtime_control::attach_to_runtime(&coords).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let topics = release_discovery_topics(None, &entry.signer_did, &entry.channel);
-
-    for topic in &topics {
-        // Join topic via built-in CarrierGossipProvider
-        let _ = client
-            .post(format!("{}/api/provider/peer/gossip_join", coords.api_url))
-            .bearer_auth(&tokens.shell_token)
-            .json(&serde_json::json!({"topic": topic}))
-            .send()
-            .await;
-
-        // Broadcast announcement
-        let announcement = serde_json::json!({
-            "head_cid": entry.head_cid,
-            "release_cid": entry.release_cid,
-            "release_object_cid": entry.release_object_cid,
-            "version": entry.version,
-            "channel": entry.channel,
-            "signer_did": entry.signer_did,
-            "discovery_uri": source_discovery_uri(&entry.signer_did, &entry.channel),
-        });
-        client
-            .post(format!("{}/api/provider/peer/gossip_send", coords.api_url))
-            .bearer_auth(&tokens.shell_token)
-            .json(&serde_json::json!({
-                "topic": topic,
-                "message": announcement.to_string(),
-                "sender": "publisher",
-                "sender_id": entry.signer_did,
-                "ts": entry.published_at,
-            }))
-            .send()
-            .await
-            .context("gossip announcement failed")?;
-    }
-
-    Ok(topics)
-}
-
 fn changed_capsules(
     previous: Option<&BTreeMap<String, String>>,
     current: &BTreeMap<String, String>,
@@ -2099,11 +2009,10 @@ mod tests {
     use super::{
         append_publish_selection_args, build_release_ledger_entry, changed_capsules,
         discover_available_capsules, load_publish_state, publish_profile_capsules,
-        release_discovery_topics, resolve_platform_input_paths, save_publish_state,
-        select_capsules, source_discovery_uri, validate_platform_input_options,
-        validate_prepare_options, validate_publish_inputs, validate_publishable_manifest,
-        PublishReleaseOptions, PublishState, ReleaseLedgerPlatform, DEMO_PUBLISH_CAPSULES,
-        HOME_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        resolve_platform_input_paths, save_publish_state, select_capsules,
+        validate_platform_input_options, validate_prepare_options, validate_publish_inputs,
+        validate_publishable_manifest, PublishReleaseOptions, PublishState, ReleaseLedgerPlatform,
+        DEMO_PUBLISH_CAPSULES, HOME_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -3146,16 +3055,6 @@ finally:
         };
         save_publish_state(&path, &state).unwrap();
         assert_eq!(load_publish_state(&path).unwrap(), state);
-    }
-
-    #[test]
-    fn test_release_discovery_topics_include_scoped_and_global_topics() {
-        let discovery_uri = source_discovery_uri("did:key:z6Mktest", "stable");
-        let topics = release_discovery_topics(Some(&discovery_uri), "did:key:z6Mktest", "stable");
-        assert_eq!(topics.len(), 3);
-        assert!(topics[0].starts_with("elastos:source:"));
-        assert!(topics[1].starts_with("elastos:releases:stable:"));
-        assert_eq!(topics[2], "elastos:releases");
     }
 
     #[test]

@@ -6,17 +6,192 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
 PLATFORM = 'linux-amd64'
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='release-workflow-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.bin = self.root / 'bin'
+        self.bin.mkdir(mode=0o700)
+        self.calls = self.root / 'calls'
+        self.output = self.root / 'output'
+        self.commit, self.tree = 'a' * 40, 'b' * 40
+        self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+                    'SOURCE_COMMIT': self.commit, 'SOURCE_TREE': self.tree,
+                    'INSTALL_VERSION': '1.2.3', 'UPDATE_VERSION': '1.2.4',
+                    'GITHUB_REPOSITORY': 'fixture/runtime', 'GITHUB_OUTPUT': str(self.output),
+                    'GH_CALLS': str(self.calls), 'GH_TREE': self.tree, 'GH_ON_DEVELOP': 'true',
+                    'PYTHONDONTWRITEBYTECODE': '1'}
+        gh = self.bin / 'gh'
+        gh.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$GH_CALLS"
+[[ "$1" == api ]]
+case "$2" in
+  */git/commits/*) [[ "${GH_ERROR:-}" != tree ]] || exit 42; echo "$GH_TREE" ;;
+  */compare/develop...*) echo 0 ;;
+  */compare/*...develop) [[ "${GH_ERROR:-}" != compare ]] || exit 42; echo "$GH_ON_DEVELOP" ;;
+  */commits/*/pulls) echo 1 ;;
+  *) exit 99 ;;
+esac
+''')
+        gh.chmod(0o700)
+
+    def workflow_script(self, job, name, workflow='release-package.yml'):
+        source = (ROOT / '.github/workflows' / workflow).read_text()
+        body = re.split(r'\n  (?=\S)', source.split('\n  ' + job + ':\n', 1)[1], maxsplit=1)[0]
+        marker = '      - ' + name + '\n'
+        step = body.split(marker, 1)[1].split('\n      - ', 1)[0]
+        return textwrap.dedent(step.split('        run: |\n', 1)[1])
+
+    def admit(self, **overrides):
+        return subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                               self.workflow_script('admit', 'id: admit')], cwd=self.root,
+                              env={**self.env, **overrides}, capture_output=True, text=True,
+                              timeout=10)
+
+    def test_release_admits_develop_ancestor(self):
+        result = self.admit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), 'source_tree=' + self.tree + '\n')
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_release_rejects_open_pr_head_before_output(self):
+        result = self.admit(GH_ON_DEVELOP='false')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+        self.assertNotIn('/pulls', self.calls.read_text())
+
+    def test_release_rejects_invalid_or_equal_versions_before_api(self):
+        for overrides in ({'INSTALL_VERSION': '01.2.3'}, {'UPDATE_VERSION': 'broken'},
+                          {'UPDATE_VERSION': '1.2.3'}, {'SOURCE_COMMIT': 'short'}):
+            with self.subTest(overrides=overrides):
+                result = self.admit(**overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse(self.output.exists())
+
+    def test_release_rejects_api_errors_before_output(self):
+        for endpoint in ('tree', 'compare'):
+            with self.subTest(endpoint=endpoint):
+                result = self.admit(GH_ERROR=endpoint)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
+
+    def test_release_rejects_invalid_api_tree(self):
+        result = self.admit(GH_TREE='null')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+    def engine_fixture(self, cached):
+        scripts = self.root / 'scripts'
+        (scripts / 'build').mkdir(parents=True)
+        archive_name = 'llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz'
+        payload = b'inert engine bytes'
+        checksum = hashlib.sha256(payload).hexdigest()
+        (scripts / 'release-upstream-recipes.json').write_text(json.dumps({'recipes': [{
+            'component': 'llama-server', 'platform': 'linux-arm64',
+            'source': {'checksum': 'sha256:' + checksum}}]}))
+        # Only the cold producer is inert. Archive admission executes the real
+        # recipe's verification branch, which ends before any fetch or build.
+        verifier = ROOT / 'scripts/build/build-llama-server-bundle.sh'
+        recipe = scripts / 'build/build-llama-server-bundle.sh'
+        recipe.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --verify-archive ]]; then
+    exec bash "$REAL_ENGINE_VERIFIER" "$@"
+fi
+printf 'build\\n' >> "$ENGINE_CALLS"
+mkdir "$1"
+printf '%s' 'inert engine bytes' > "$1/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+printf 'recipe_commit=%s\\n' "$RECIPE_COMMIT" > "$1/build-info.txt"
+printf 'fixture ELF and reply receipts\\n' > "$1/elf-verification.txt"
+''')
+        git = self.bin / 'git'
+        git.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  'rev-parse HEAD') echo "$SOURCE_COMMIT" ;;
+  'rev-parse HEAD^{tree}') echo "$SOURCE_TREE" ;;
+  'status --porcelain=v1 --untracked-files=all') ;;
+  *) exit 99 ;;
+esac
+''')
+        git.chmod(0o700)
+        temporary = self.root / 'runner-temp'
+        temporary.mkdir(mode=0o700)
+        bundle = temporary / 'llama-arm64-bundle'
+        if cached:
+            bundle.mkdir(mode=0o700)
+            (bundle / archive_name).write_bytes(payload)
+            (bundle / 'build-info.txt').write_text('recipe_commit=original-producer\n')
+            (bundle / 'elf-verification.txt').write_text('original producer ELF receipt\n')
+        self.engine_env = {**self.env, 'RUNNER_ENVIRONMENT': 'github-hosted',
+                           'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'ARM64',
+                           'RUNNER_TEMP': str(temporary), 'GITHUB_ENV': str(self.root / 'env'),
+                           'REAL_ENGINE_VERIFIER': str(verifier),
+                           'ENGINE_CALLS': str(self.root / 'engine-calls'),
+                           'BUILD_CONTAINER_IMAGE': 'pinned-container',
+                           'ENGINE_BUILD_TOOLS': 'pinned-tools'}
+        self.assert_engine_ok(self.engine_step('bind the source and approved ARM64 engine'))
+        for line in (self.root / 'env').read_text().splitlines():
+            name, value = line.split('=', 1)
+            self.engine_env[name] = value
+        return bundle
+
+    def engine_step(self, name, workflow='release-package.yml'):
+        return subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                               self.workflow_script('engine-llama-arm64', 'name: ' + name, workflow)],
+                              cwd=self.root, env=self.engine_env, capture_output=True, text=True,
+                              timeout=10)
+
+    def assert_engine_ok(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_release_engine_restore_retains_producer_and_matches_ci_key(self):
+        bundle = self.engine_fixture(cached=True)
+        original = {path.name: path.read_bytes() for path in bundle.iterdir()}
+        self.assert_engine_ok(self.engine_step('bind engine cache to build recipe'))
+        release_key = self.output.read_text()
+        self.output.unlink()
+        self.assert_engine_ok(self.engine_step('bind engine cache to build recipe', 'ci.yml'))
+        self.assertEqual(self.output.read_text(), release_key)
+        self.assert_engine_ok(self.engine_step('verify accepted ARM64 engine archive'))
+        self.assertEqual({path.name: path.read_bytes() for path in bundle.iterdir()}, original)
+        self.assertFalse(Path(self.engine_env['ENGINE_CALLS']).exists())
+
+    def test_release_engine_cold_build_is_verified_with_current_recipe_receipt(self):
+        bundle = self.engine_fixture(cached=False)
+        self.assert_engine_ok(self.engine_step('build and validate pinned ARM64 engine'))
+        self.assert_engine_ok(self.engine_step('verify accepted ARM64 engine archive'))
+        self.assertEqual((bundle / 'build-info.txt').read_text(), 'recipe_commit=' + self.commit + '\n')
+        self.assertEqual(Path(self.engine_env['ENGINE_CALLS']).read_text(), 'build\n')
+
+    def test_release_engine_restore_refuses_wrong_archive_without_rebuilding(self):
+        bundle = self.engine_fixture(cached=True)
+        receipt = (bundle / 'build-info.txt').read_bytes()
+        (bundle / 'llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz').write_bytes(b'corrupt cache')
+        result = self.engine_step('verify accepted ARM64 engine archive')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('SHA-256 mismatch', result.stderr)
+        self.assertEqual((bundle / 'build-info.txt').read_bytes(), receipt)
+        self.assertFalse(Path(self.engine_env['ENGINE_CALLS']).exists())
 
 
 class SourceUpstreamTests(unittest.TestCase):
