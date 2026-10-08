@@ -742,10 +742,10 @@ fn notifications_root_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
 /// Serializes every read-modify-write of the shared store, so one account's
 /// write never replaces another's fresh entry with an older snapshot. Held by
 /// each public writer; internal helpers such as [`record_event`] run under it.
-fn lock_store(data_dir: &Path) -> anyhow::Result<crate::collaboration_core::ExclusiveFileLock> {
+fn lock_store(data_dir: &Path) -> anyhow::Result<crate::host_lock::FileLock> {
     let root = notifications_root_dir(data_dir)?;
     fs::create_dir_all(&root)?;
-    crate::collaboration_core::ExclusiveFileLock::acquire(&root.join(".notifications.lock"))
+    crate::collaboration_core::lock_owner_only_file(&root.join(".notifications.lock"))
         .context("failed to lock the notification store")
 }
 

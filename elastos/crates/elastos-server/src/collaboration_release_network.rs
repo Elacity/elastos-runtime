@@ -127,11 +127,11 @@ pub fn choose_isolated(data_dir: &Path) -> anyhow::Result<()> {
 /// startup acceptance. A missing data root has nothing to serialize.
 pub(crate) fn lock_network_choice(
     data_dir: &Path,
-) -> anyhow::Result<Option<crate::collaboration_core::ExclusiveFileLock>> {
+) -> anyhow::Result<Option<crate::host_lock::FileLock>> {
     if !data_dir.is_dir() {
         return Ok(None);
     }
-    crate::collaboration_core::ExclusiveFileLock::acquire(
+    crate::collaboration_core::lock_owner_only_file(
         &data_dir.join(COLLABORATION_NETWORK_CHOICE_LOCK_FILE),
     )
     .map(Some)
