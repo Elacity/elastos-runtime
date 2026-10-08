@@ -7741,6 +7741,7 @@ pub(crate) mod tests {
         let endpoint = server.clone();
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
+        let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -7752,7 +7753,12 @@ pub(crate) mod tests {
                         .read_line(&mut request)
                         .await
                         .unwrap();
-                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    // The signed component CID is fetched by CID, not by its release name.
+                    if request["op"] == "content_fetch" {
+                        assert_eq!(request["cid"], effect_cid);
+                        request["path"] = "effect".into();
+                    }
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
                             .is_err(),
@@ -7859,6 +7865,7 @@ pub(crate) mod tests {
             "checksum": format!("sha256:{digest:x}")
         }))
         .unwrap();
+        let served_cid = cid.to_string();
         let endpoint = server.clone();
         let serving = tokio::spawn(async move {
             let connection = endpoint.accept().await.unwrap().await.unwrap();
@@ -7868,10 +7875,13 @@ pub(crate) mod tests {
                 .read_line(&mut request)
                 .await
                 .unwrap();
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
-                release_path
-            );
+            // A signed CID is fetched by CID; only a name-only descriptor uses the name.
+            let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            if request["op"] == "content_fetch" {
+                assert_eq!(request["cid"], served_cid);
+            } else {
+                assert_eq!(request["path"], release_path);
+            }
             send.write_all(&(bytes.len() as u64).to_be_bytes())
                 .await
                 .unwrap();
