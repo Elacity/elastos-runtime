@@ -71,7 +71,7 @@ jobs:
           node scripts/people-discovery-smoke.mjs
       - name: release artifact source proofs
         run: |
-          node --test scripts/ci-model-package.test.mjs
+          node --test scripts/ci-model-package.test.mjs scripts/ci-installed-home-failure.test.mjs
           python3 scripts/ci-release-policy-test.py
           python3 scripts/ci-download-cache-test.py
           python3 scripts/components-release-integrity-check.py --self-test

@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { readFileSync, statfsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyRunEventsPage, terminalOutputText } from "../capsules/assistant/browser/model-contract.js";
+import { publicJourneyFailure } from "./ci-installed-home-failure.mjs";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
@@ -181,9 +182,11 @@ try {
 } catch (error) {
   results[stage] = "failed";
   disk.at_failure = observeDisk();
-  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, failure_stage: stage, failure: error.message }, null, 2));
+  const failure = publicJourneyFailure(error, stage);
+  writeFileSync(join(data, "journey-browser.private.log"), String(error?.stack ?? error), { mode: 0o600 });
+  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, ...failure }, null, 2));
   await page.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
-  throw error;
+  throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}`);
 } finally {
   await browser.close();
 }
