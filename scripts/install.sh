@@ -1043,8 +1043,28 @@ require_safe_existing_dir() {
         die "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
     fi
 }
+# The runtime also refuses media tools under a parent others can write, such
+# as a group-writable ~/.local. Apply that rule to every existing ancestor of
+# the data directory now, before any download: owned by you or root, and not
+# group- or world-writable.
+require_safe_parent_chain() {
+    local dir="$1" real
+    while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
+    real="$(cd -P -- "$dir" && pwd -P)" || die "Cannot resolve directory: $(printf '%q' "$dir")"
+    while :; do
+        if [[ ! -O "$real" && "$(stat -f %u "$real" 2>/dev/null || stat -c %u "$real")" != 0 ]]; then
+            die "Unsafe parent directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+        fi
+        if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
+            die "Unsafe parent directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+        fi
+        [[ "$real" != "/" ]] || break
+        real="$(dirname -- "$real")"
+    done
+}
 require_safe_existing_dir "$INSTALL_DIR"
 require_safe_existing_dir "$DATA_DIR"
+require_safe_parent_chain "$DATA_DIR"
 
 # ── Fetch + verify release head ──────────────────────────────────────
 
