@@ -1274,8 +1274,22 @@ impl std::io::Write for ConditionalStderrWriter {
 // Host terminal raw mode — needed for interactive VM serial console
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Ubuntu's default umask 0002 made files a later update refuses as
+    // group-writable (#279). Drop group/world write before any thread starts and
+    // keep any stricter bits the caller set (for example 077).
+    #[cfg(unix)]
+    unsafe {
+        let inherited = libc::umask(0o022);
+        libc::umask(inherited | 0o022);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let argv: Vec<String> = std::env::args().skip(1).collect();
