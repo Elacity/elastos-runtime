@@ -1397,11 +1397,13 @@ class InstalledJourneyTests(unittest.TestCase):
                 self.assertFalse((data / "passkeys.json").exists())
 
     def test_mac_workflow_runs_three_fresh_journeys_and_uploads_their_receipts(self):
-        self.assertIn("scripts/ci-installed-journeys.sh home-repeat", JOBS["source-home-macos"])
-        source = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
-        self.assertIn('"$EVIDENCE" --repeat 3', source)
-        self.assertIn("source-home-journeys/**/*.json", JOBS["source-home-macos"])
-        self.assertIn("source-home-journeys/**/*.png", JOBS["source-home-macos"])
+        mac_steps = steps("source-home-macos")
+        journey, = [step for step in mac_steps
+                    if step.startswith("name: installed Marketplace Get and Assistant reply\n")]
+        self.assertEqual(field(journey, "run"), "scripts/ci-installed-journeys.sh home-repeat")
+        upload, = [step for step in mac_steps if step.startswith("name: upload installed model journey\n")]
+        self.assertIn("source-home-journeys/**/*.json", upload)
+        self.assertIn("source-home-journeys/**/*.png", upload)
 
 
 class InstalledModelTimingTests(unittest.TestCase):
