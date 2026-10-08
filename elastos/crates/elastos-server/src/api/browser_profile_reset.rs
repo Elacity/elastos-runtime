@@ -25,6 +25,13 @@ const LOCK_LEAF: &CStr = c"profile.ext4.lifetime.lock";
 pub(super) enum ProfileResetError {
     Busy,
     Unsafe(&'static str),
+    #[cfg_attr(
+        unix,
+        expect(
+            dead_code,
+            reason = "UnsupportedHost is constructed only on non-Unix hosts"
+        )
+    )]
     UnsupportedHost,
     Io(std::io::Error),
     WorkerFailed,
