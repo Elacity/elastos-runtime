@@ -84,6 +84,12 @@ p {
   font-weight: 600;
 }
 
+.reconnect {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  margin: 0 1rem 0.55rem;
+}
+
 .chat-sidebar,
 .chat-people,
 .messages {

@@ -1,5 +1,5 @@
 use base64::Engine as _;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -37,6 +37,10 @@ const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
+const SHELL_SESSION_LOST_DETAIL: &str =
+    "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
+const SHELL_RECONNECT_FAILED_DETAIL: &str =
+    "Chat could not reconnect. Open Chat again from Home; your unsent text stays here until then.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
     "This device is not part of this conversation yet. Join from an invite or connect it first.";
 const EMOJI_BUTTON_IDS: [(&str, &str); 12] = [
@@ -101,6 +105,9 @@ struct AppState {
     /// The conversation whose text the composer shows: `None` is the shared
     /// room, `Some(id)` a direct conversation.
     composer_conversation: Option<String>,
+    /// The Home session was lost and has not come back: Reconnect stays
+    /// offered whatever other message is showing.
+    reconnect_needed: bool,
     /// Unsent text of the conversations the composer does not show, with the
     /// revision it had when it left the composer.
     drafts: BTreeMap<Option<String>, (String, u64)>,
@@ -139,6 +146,13 @@ struct App {
     home_parent_origin: Option<String>,
     picker_document_nonce: String,
     picker_request: RefCell<Option<LibraryPickerRequest>>,
+    /// Counts card openings, so a late action response only updates the card
+    /// that sent it.
+    participant_card_opening: Cell<u64>,
+    /// The name that opened the card: its reference, and the message `seq`
+    /// when it was a message sender. Lists re-render, so closing the card finds
+    /// that exact name again and returns focus to it.
+    participant_card_opener: RefCell<Option<(String, Option<u64>)>>,
     state: RefCell<AppState>,
     document: Document,
     body: HtmlElement,
@@ -146,6 +160,7 @@ struct App {
     status_badge: Option<HtmlElement>,
     status_detail: Option<HtmlElement>,
     error_text: HtmlElement,
+    reconnect_button: HtmlButtonElement,
     gateway_ui: Option<GatewayUi>,
     chat_card: HtmlElement,
     conversation_selector: HtmlElement,
@@ -562,6 +577,8 @@ pub fn start() -> Result<(), JsValue> {
         picker_document_nonce: new_chat_message_request_id()
             .map_err(|error| JsValue::from_str(&error))?,
         picker_request: RefCell::new(None),
+        participant_card_opening: Cell::new(0),
+        participant_card_opener: RefCell::new(None),
         state: RefCell::new(state),
         document: document.clone(),
         body: document
@@ -571,6 +588,7 @@ pub fn start() -> Result<(), JsValue> {
         status_badge: optional_element_by_id(&document, "status-badge"),
         status_detail: optional_element_by_id(&document, "status-detail"),
         error_text: element_by_id(&document, "error-text")?,
+        reconnect_button: button_by_id(&document, "reconnect-button")?,
         gateway_ui,
         chat_card: element_by_id(&document, "chat-card")?,
         conversation_selector: element_by_id(&document, "conversation-selector")?,
@@ -1029,6 +1047,14 @@ impl App {
                 .add_event_listener_with_callback("click", reset_click.as_ref().unchecked_ref())?;
             reset_click.forget();
         }
+
+        let reconnect_app = Rc::clone(self);
+        let reconnect_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            reconnect_app.reconnect_shell_session();
+        }));
+        self.reconnect_button
+            .add_event_listener_with_callback("click", reconnect_click.as_ref().unchecked_ref())?;
+        reconnect_click.forget();
 
         let send_app = Rc::clone(self);
         let send_submit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
@@ -1621,7 +1647,7 @@ impl App {
 
     fn session_loss_detail(&self) -> &'static str {
         if self.is_shell_mode() {
-            "The local conversation session ended. Open Chat again to reconnect."
+            SHELL_SESSION_LOST_DETAIL
         } else {
             "This browser was removed from the conversation."
         }
@@ -1732,27 +1758,28 @@ impl App {
         state.error_transient = false;
     }
 
+    /// Reconnect after a lost Home session: one person-chosen action that
+    /// starts a new conversation session with Chat's Home launch token. The
+    /// page is not reloaded, so drafts stay, and nothing signs in on its own;
+    /// when Home no longer admits the launch, Chat says to reopen it from Home.
+    fn reconnect_shell_session(self: &Rc<Self>) {
+        self.reconnect_button.set_disabled(true);
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            let guard = current_selection_guard(&app.state.borrow());
+            if let Err(error) = app.ensure_shell_session_for_guard(&guard).await {
+                if app.selection_guard_is_current(&guard) {
+                    apply_reconnect_failure(&mut app.state.borrow_mut(), error);
+                }
+            }
+            app.reconnect_button.set_disabled(false);
+            let _ = app.render();
+        });
+    }
+
     fn handle_session_loss(&self, detail: &str) {
         self.clear_browser_session_request_storage();
-        let mut state = self.state.borrow_mut();
-        state.request_id = None;
-        state.session_active = false;
-        state.show_participants = false;
-        state.show_access_controls = false;
-        state.force_message_follow = true;
-        state.latest_seq = 0;
-        state.objects.clear();
-        state.participants.clear();
-        state.active_sessions.clear();
-        state.attachment_urls.clear();
-        state.status_badge = if self.is_shell_mode() {
-            "Reconnect".to_string()
-        } else {
-            "Join".to_string()
-        };
-        state.status_detail = detail.to_string();
-        state.error_text = None;
-        state.error_transient = false;
+        apply_session_loss(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
     }
 
     fn hydrate_defaults(self: &Rc<Self>) {
@@ -2675,10 +2702,14 @@ impl App {
         }
     }
 
-    fn open_participant_card(&self, participant_ref: &str) {
+    fn open_participant_card(&self, participant_ref: &str, message_seq: Option<u64>) {
         let Some((name, card)) = self.participant_card_for(participant_ref) else {
             return;
         };
+        self.participant_card_opening
+            .set(self.participant_card_opening.get().wrapping_add(1));
+        *self.participant_card_opener.borrow_mut() =
+            Some((participant_ref.to_string(), message_seq));
         let (state_text, action) = participant_card_copy(&card, self.config.home_token.is_some());
         let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
@@ -2714,11 +2745,35 @@ impl App {
         let _ = self.participant_card_close.focus();
     }
 
-    fn close_participant_card(&self) {
+    fn close_participant_card(&self, return_focus: bool) {
         self.participant_card.set_hidden(true);
         let _ = self
             .participant_card
             .remove_attribute("data-participant-ref");
+        self.participant_card_opening
+            .set(self.participant_card_opening.get().wrapping_add(1));
+        let opener = self.participant_card_opener.borrow_mut().take();
+        if let Some((participant_ref, message_seq)) = opener.filter(|_| return_focus) {
+            let row = match message_seq {
+                Some(seq) => {
+                    element_with_attribute(&self.message_list, "data-seq", &seq.to_string())
+                }
+                None => Some(Element::from(self.participant_list.clone())),
+            };
+            let named = row.and_then(|row| {
+                element_with_attribute(&row, "data-participant-ref", &participant_ref)
+            });
+            match named.and_then(|named| named.dyn_into::<HtmlElement>().ok()) {
+                Some(named) => {
+                    let _ = named.focus();
+                }
+                // The name is gone (its message left the window or the person
+                // left the room): the composer is the next useful place.
+                None => {
+                    let _ = self.message_input.focus();
+                }
+            }
+        }
     }
 
     fn run_participant_card_action(self: &Rc<Self>) {
@@ -2733,21 +2788,26 @@ impl App {
             return;
         };
         let Some((_, card)) = self.participant_card_for(&participant_ref) else {
-            self.close_participant_card();
+            self.close_participant_card(true);
             return;
         };
         match action.as_str() {
             "message" => {
-                self.close_participant_card();
+                self.close_participant_card(false);
                 if let Some(conversation_id) = card.conversation_id {
                     self.open_direct_conversation(conversation_id);
                 }
             }
             "add-contact" => {
                 self.participant_card_action.set_disabled(true);
+                let opening = self.participant_card_opening.get();
                 let app = Rc::clone(self);
                 spawn_local(async move {
-                    match app.request_contact(&participant_ref).await {
+                    let result = app.request_contact(&participant_ref).await;
+                    if app.participant_card_opening.get() != opening {
+                        return;
+                    }
+                    match result {
                         Ok(()) => {
                             app.participant_card_state
                                 .set_text_content(Some(PARTICIPANT_CARD_REQUEST_SENT));
@@ -2761,7 +2821,7 @@ impl App {
                 });
             }
             "inbox" | "people" => {
-                self.close_participant_card();
+                self.close_participant_card(false);
                 let _ = self.post_library_picker_message(serde_json::json!({
                     "type": "home:open-target", "target": action, "query": {},
                     "homeToken": self.config.home_token,
@@ -2784,7 +2844,7 @@ impl App {
     /// Profile cards: a click, Enter or Space on any name with a card opens
     /// it; the card closes on its close button or Escape.
     fn install_participant_card_listeners(self: &Rc<Self>) -> Result<(), JsValue> {
-        for list in [&self.participant_list, &self.message_list] {
+        for (list, from_messages) in [(&self.participant_list, false), (&self.message_list, true)] {
             let card_app = Rc::clone(self);
             let open_card = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
                 if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
@@ -2805,7 +2865,12 @@ impl App {
                     return;
                 };
                 event.prevent_default();
-                card_app.open_participant_card(&participant_ref);
+                let message_seq = from_messages
+                    .then(|| named.closest("[data-seq]").ok().flatten())
+                    .flatten()
+                    .and_then(|row| row.get_attribute("data-seq"))
+                    .and_then(|seq| seq.parse().ok());
+                card_app.open_participant_card(&participant_ref, message_seq);
             }));
             list.add_event_listener_with_callback("click", open_card.as_ref().unchecked_ref())?;
             list.add_event_listener_with_callback("keydown", open_card.as_ref().unchecked_ref())?;
@@ -2820,7 +2885,7 @@ impl App {
         card_action.forget();
         let card_close_app = Rc::clone(self);
         let card_close = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
-            card_close_app.close_participant_card();
+            card_close_app.close_participant_card(true);
         }));
         self.participant_card_close
             .add_event_listener_with_callback("click", card_close.as_ref().unchecked_ref())?;
@@ -2829,7 +2894,7 @@ impl App {
         let card_escape = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
             if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
                 if key_event.key() == "Escape" && !card_escape_app.participant_card.hidden() {
-                    card_escape_app.close_participant_card();
+                    card_escape_app.close_participant_card(true);
                 }
             }
         }));
@@ -3137,6 +3202,11 @@ impl App {
             self.error_text.set_attribute("hidden", "")?;
             self.error_text.set_text_content(None);
         }
+        self.reconnect_button.set_hidden(!shows_reconnect(
+            self.is_shell_mode(),
+            state.session_active,
+            state.reconnect_needed,
+        ));
 
         let show_reset = pending
             || !state.display_name.trim().is_empty()
@@ -3771,6 +3841,7 @@ impl App {
         for object in objects {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
+            item.set_attribute("data-seq", &object.seq.to_string())?;
             let is_self = object.from_current_session;
             item.set_class_name(
                 if is_self && object.kind != ConversationObjectKind::System {
@@ -4145,6 +4216,61 @@ fn commit_requested_direct_selection_if_current(
     commit_direct_selection(state, conversation_id)
 }
 
+/// The first element under `root` whose `attribute` is exactly `value`. The
+/// value is compared, never spliced into a selector.
+fn element_with_attribute(root: &Element, attribute: &str, value: &str) -> Option<Element> {
+    let mut child = root.first_element_child();
+    while let Some(element) = child {
+        if element.get_attribute(attribute).as_deref() == Some(value) {
+            return Some(element);
+        }
+        if let Some(found) = element_with_attribute(&element, attribute, value) {
+            return Some(found);
+        }
+        child = element.next_element_sibling();
+    }
+    None
+}
+
+/// The Reconnect action shows only inside Home, while a lost session has not
+/// come back. It does not depend on which message is showing.
+fn shows_reconnect(shell_mode: bool, session_active: bool, reconnect_needed: bool) -> bool {
+    shell_mode && !session_active && reconnect_needed
+}
+
+/// A Reconnect attempt failed. Only a session that is still lost reports that
+/// Chat could not reconnect; when the session came back and a later step
+/// failed (such as loading an attachment), that step's error shows instead.
+fn apply_reconnect_failure(state: &mut AppState, error: String) {
+    if state.session_active {
+        state.error_text = Some(error);
+        state.error_transient = true;
+    } else {
+        state.error_text = Some(SHELL_RECONNECT_FAILED_DETAIL.to_string());
+        state.error_transient = false;
+    }
+}
+
+/// Ends the conversation session. Home has no status row, so in Shell mode the
+/// reason and how to reconnect show as a lasting error the person can see.
+fn apply_session_loss(state: &mut AppState, shell_mode: bool, detail: &str) {
+    state.request_id = None;
+    state.session_active = false;
+    state.show_participants = false;
+    state.show_access_controls = false;
+    state.force_message_follow = true;
+    state.latest_seq = 0;
+    state.objects.clear();
+    state.participants.clear();
+    state.active_sessions.clear();
+    state.attachment_urls.clear();
+    state.status_badge = if shell_mode { "Reconnect" } else { "Join" }.to_string();
+    state.status_detail = detail.to_string();
+    state.error_text = shell_mode.then(|| detail.to_string());
+    state.error_transient = false;
+    state.reconnect_needed = shell_mode;
+}
+
 fn apply_active_poll_state(
     state: &mut AppState,
     mut poll: RoomPollView,
@@ -4165,6 +4291,15 @@ fn apply_active_poll_state(
     let previous_status_detail = state.status_detail.clone();
     let previous_collaboration_configured = state.collaboration_configured;
     state.collaboration_configured = poll.transport.configured;
+    if !was_session_active
+        && matches!(
+            state.error_text.as_deref(),
+            Some(SHELL_SESSION_LOST_DETAIL | SHELL_RECONNECT_FAILED_DETAIL)
+        )
+    {
+        state.error_text = None;
+    }
+    state.reconnect_needed = false;
     state.session_active = true;
     state.close_leave_sent = false;
     state.display_name = poll.display_name.clone();
@@ -4378,6 +4513,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         join_invite_url: None,
         direct: DirectUiState::default(),
         composer_conversation: None,
+        reconnect_needed: false,
         drafts: BTreeMap::new(),
         composer_revision: 0,
         composer_edits: 0,
@@ -4455,16 +4591,16 @@ mod tests {
     };
     use super::{
         apply_active_poll_if_current, apply_active_poll_state, apply_direct_refresh_if_current,
-        chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,
-        commit_requested_direct_selection_if_current, commit_shared_selection,
-        conversation_initial, current_selection_guard, decode_query_value, extract_fragment_param,
-        extract_query_param, format_chat_message_request_id, note_composer_edit,
-        object_sender_name, participant_detail, participant_shown_name, pending_chat_request_id,
-        render_projection, resolve_conversation_choice, selection_guard_matches, settle_sent_draft,
-        shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
-        ConversationObjectKind, ConversationObjectView, ParticipantView, PendingChatSend,
-        RenderProjection, RoomPollView, RoomTransportView, ShellSessionBootstrapFailure,
-        ShellSessionStartOutput, SummaryView,
+        apply_session_loss, chat_control_policy, clear_selected_direct_conversation,
+        commit_direct_selection, commit_requested_direct_selection_if_current,
+        commit_shared_selection, conversation_initial, current_selection_guard, decode_query_value,
+        extract_fragment_param, extract_query_param, format_chat_message_request_id,
+        note_composer_edit, object_sender_name, participant_detail, participant_shown_name,
+        pending_chat_request_id, render_projection, resolve_conversation_choice,
+        selection_guard_matches, settle_sent_draft, shell_summary_allows_session,
+        switch_composer_draft, AccessMode, AppConfig, AppState, ConversationObjectKind,
+        ConversationObjectView, ParticipantView, PendingChatSend, RenderProjection, RoomPollView,
+        RoomTransportView, ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
     };
 
     fn two_direct_conversations() -> AppState {
@@ -4479,6 +4615,77 @@ mod tests {
             })
             .collect();
         state
+    }
+
+    #[test]
+    fn a_lost_home_session_shows_how_to_reconnect_until_it_is_back() {
+        let poll = || RoomPollView {
+            room_slug: "chat-room".to_string(),
+            display_name: "Shared room".to_string(),
+            latest_seq: 1,
+            participants: vec![],
+            objects: vec![],
+            transport: RoomTransportView::default(),
+        };
+        let mut state = AppState {
+            session_active: true,
+            ..AppState::default()
+        };
+        apply_session_loss(&mut state, true, super::SHELL_SESSION_LOST_DETAIL);
+        assert!(!state.session_active);
+        assert_eq!(
+            state.error_text.as_deref(),
+            Some(super::SHELL_SESSION_LOST_DETAIL)
+        );
+        assert!(!state.error_transient);
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        // A passing error replaces the message, but Reconnect stays offered.
+        state.error_text = Some("temporary".into());
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+        // A failed attempt while still lost says so and keeps the action.
+        super::apply_reconnect_failure(&mut state, "Home refused".into());
+        assert_eq!(
+            state.error_text.as_deref(),
+            Some(super::SHELL_RECONNECT_FAILED_DETAIL)
+        );
+        assert!(super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        apply_active_poll_state(&mut state, poll());
+        assert!(state.session_active);
+        assert_eq!(state.error_text, None);
+        assert!(!super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+        // A later step failing after the session came back is reported as
+        // itself, not as a failed reconnect.
+        super::apply_reconnect_failure(&mut state, "attachment failed".into());
+        assert_eq!(state.error_text.as_deref(), Some("attachment failed"));
+        assert!(!super::shows_reconnect(
+            true,
+            state.session_active,
+            state.reconnect_needed
+        ));
+
+        // A browser guest keeps its own Join stage instead.
+        let mut guest = AppState::default();
+        apply_session_loss(&mut guest, false, "removed");
+        assert_eq!(guest.error_text, None);
+        assert_eq!(guest.status_badge, "Join");
     }
 
     #[test]
