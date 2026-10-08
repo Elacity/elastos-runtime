@@ -1615,6 +1615,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                 if failure in ("absence", "refusal", "refusal_reason", "engine_process"):
                     self.assertEqual(result["results"]["engine_absent_home"], "failed or not run")
                 summary = (root / "summary.md").read_text()
+                self.assertIn(f"Source tree: `{'d' * 40}`", summary)
                 self.assertIn("OS file cache can warm", summary)
                 if not failure:
                     self.assertIn("acknowledgement_total_ms", summary)

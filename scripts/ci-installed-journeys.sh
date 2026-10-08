@@ -98,7 +98,7 @@ elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_
     "engine_absent_home": absence,
 }, indent=2) + "\n")
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-    summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
+    summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nSource tree: `{tree}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
     summary.write("| Journey | Result |\n| --- | --- |\n")
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
