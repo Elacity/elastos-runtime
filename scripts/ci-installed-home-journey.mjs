@@ -120,6 +120,7 @@ try {
     await assistantElement.waitFor({ state: "visible", timeout: 30000 });
     const assistant = await (await assistantElement.elementHandle()).contentFrame();
     await assistant.waitForURL(url => url.pathname.startsWith("/apps/assistant/"));
+    await assistant.locator('#agent-model-picker[aria-label^="Model: "]').waitFor({ state: "visible", timeout: 30000 });
     await assistant.locator("#agent-model-picker").click();
     const selection = assistant.locator(`#agent-model-menu [role="option"][data-model-cid="${cid}"]`);
     await selection.waitFor({ state: "visible", timeout: 30000 });
