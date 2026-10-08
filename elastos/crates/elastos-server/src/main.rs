@@ -23,6 +23,8 @@ mod server_infra;
 mod share_cmd;
 mod shares_cmd;
 mod site_cmd;
+#[cfg(all(test, unix))]
+mod test_support;
 mod trust_cmd;
 mod webspace_cmd;
 

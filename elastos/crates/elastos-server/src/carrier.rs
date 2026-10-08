@@ -8465,12 +8465,20 @@ async fn read_carrier_len_prefixed_bytes(
     Ok(content)
 }
 
-async fn fetch_file_with_timeout(
+/// Fetches the signed CID when present, else the release name.
+async fn fetch_with_timeout(
     client: CarrierClient,
+    cid: Option<&str>,
     path: &str,
     timeout_secs: u64,
 ) -> Result<Vec<u8>> {
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
+    let fetch = async {
+        match cid {
+            Some(cid) => client.fetch_content(cid, None).await,
+            None => client.fetch_file(path).await,
+        }
+    };
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), fetch)
         .await
         .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))
         .and_then(|result| result);
@@ -8486,6 +8494,7 @@ pub async fn fetch_file_from_trusted_source(
 ) -> Result<Vec<u8>> {
     fetch_file_from_trusted_source_bound(
         source,
+        None,
         path,
         connect_timeout_secs,
         fetch_timeout_secs,
@@ -8496,6 +8505,7 @@ pub async fn fetch_file_from_trusted_source(
 
 pub(crate) async fn fetch_file_from_trusted_source_bound(
     source: &TrustedSource,
+    cid: Option<&str>,
     path: &str,
     connect_timeout_secs: u64,
     fetch_timeout_secs: u64,
@@ -8508,7 +8518,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
             },
@@ -8521,7 +8531,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
             },
@@ -8533,7 +8543,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
-        Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 errors.push(format!("direct fetch failed: {err}"));
@@ -10357,6 +10367,7 @@ pub(crate) mod tests {
             Duration::from_secs(5),
             crate::setup::fetch_first_party_component_via_carrier(
                 dir.path(),
+                None,
                 "artifact",
                 crate::setup::FirstPartyCarrierContext::Setup,
             ),
@@ -10389,6 +10400,7 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let bytes = crate::setup::fetch_first_party_component_via_carrier(
                 dir.path(),
+                None,
                 "artifact",
                 crate::setup::FirstPartyCarrierContext::Setup,
             )
@@ -10415,6 +10427,94 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn carrier_terminal_install_fetches_signed_cid_before_release_name() {
+        use sha2::Digest;
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = TrustedSource {
+            name: "fixture".into(),
+            publisher_dids: vec![],
+            channel: "stable".into(),
+            discovery_uri: String::new(),
+            connect_ticket: encode_ticket_for(address),
+            gateways: vec![],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: server.id().to_string(),
+            ipns_name: String::new(),
+        };
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.default_source = source.name.clone();
+        sources.sources.push(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+
+        // The seed serves the newest file under a name; the signed CID names the old bytes.
+        for (cid, expected) in [
+            (Some("bafy-signed-old"), b"signed old".as_slice()),
+            (None, b"newest by name".as_slice()),
+        ] {
+            let server_endpoint = server.clone();
+            let serving = tokio::spawn(async move {
+                let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let reply: &[u8] = if request["op"] == "content_fetch" {
+                    assert_eq!(request["cid"], "bafy-signed-old");
+                    b"signed old"
+                } else {
+                    assert_eq!(request["path"], "fixture-tool");
+                    b"newest by name"
+                };
+                send.write_all(&(reply.len() as u64).to_be_bytes())
+                    .await
+                    .unwrap();
+                send.write_all(reply).await.unwrap();
+                send.finish().unwrap();
+                conn.closed().await;
+            });
+            let info: crate::setup::PlatformInfo = serde_json::from_value(serde_json::json!({
+                "cid": cid,
+                "release_path": "fixture-tool",
+                "checksum": format!("sha256:{}", hex::encode(sha2::Sha256::digest(expected))),
+            }))
+            .unwrap();
+            let dest = dir.path().join("bin/fixture-tool");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::setup::install_first_party_component_via_carrier(
+                    dir.path(),
+                    "fixture-tool",
+                    &info,
+                    &dest,
+                    crate::setup::FirstPartyCarrierContext::Setup,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), expected);
+            tokio::time::timeout(Duration::from_secs(5), serving)
+                .await
+                .unwrap()
+                .unwrap();
+        }
         server.close().await;
     }
 
@@ -10661,7 +10761,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_file_with_timeout(client, "artifact", 5)
+            fetch_with_timeout(client, None, "artifact", 5)
                 .await
                 .unwrap(),
             b"fixture"
@@ -10778,7 +10878,7 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let result = fetch_file_with_timeout(client, "artifact", 1).await;
+        let result = fetch_with_timeout(client, None, "artifact", 1).await;
         let closed_before_return = observer.is_closed();
         observer.close().await;
         let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)

@@ -47,7 +47,6 @@ import {
   desktopObjectByEntryId,
   desktopEntryExists,
   trapTabWithin,
-  mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
   pushUiPreferencesToFrameWindow,
@@ -2185,9 +2184,6 @@ function contextMenuItems(target) {
   }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
   const items = [
-    { action: "new-folder", label: "New Folder" },
-    { action: "new-text-document", label: "New Text Document" },
-    { kind: "divider" },
     {
       action: "toggle-desktop-icons",
       label: iconsVisible ? "Hide Desktop Icons" : "Show Desktop Icons",
@@ -2235,8 +2231,6 @@ function desktopObjectContextMenuItems(target) {
   if (canRevealDesktopObject(object)) {
     items.push({ action: "reveal-desktop-object", label: "Show in Library" });
   }
-  items.push({ action: "rename-desktop-file", label: "Rename" });
-  items.push({ action: "trash-desktop-object", label: "Move to Trash" });
   if (items.length > 0 && (hasObjectCapability(object, "download") || hasObjectCapability(object, "properties"))) {
     items.push({ kind: "divider" });
   }
@@ -2307,10 +2301,6 @@ export function handleContextAction(action) {
     clearDesktopSelection();
     return;
   }
-  if (action === "new-folder" || action === "new-text-document") {
-    void createDesktopItem(action === "new-folder");
-    return;
-  }
   if (action === "change-wallpaper") {
     openTarget("system", { query: { settings: "personalization" } });
     return;
@@ -2326,14 +2316,6 @@ export function handleContextAction(action) {
     }
     if (action === "reveal-desktop-object") {
       revealDesktopObject(shellState.contextMenuTarget.entryId);
-      return;
-    }
-    if (action === "rename-desktop-file") {
-      startDesktopObjectRename(shellState.contextMenuTarget.entryId);
-      return;
-    }
-    if (action === "trash-desktop-object") {
-      void trashDesktopObject(shellState.contextMenuTarget.entryId);
       return;
     }
     if (action === "download-desktop-object" || action === "properties-desktop-object") {
@@ -2459,140 +2441,6 @@ export function handleContextAction(action) {
     if (unpinTargetFromTaskbar(shellState.contextMenuTarget.targetId)) {
       commitTaskbarLayoutChange();
     }
-  }
-}
-
-function nextAvailableDesktopName(baseName) {
-  const taken = new Set(
-    desktopObjects(shellState.currentSummary)
-      .filter((object) => !isTrashDesktopObject(object))
-      .map((object) => String(object.name || "").toLowerCase()),
-  );
-  if (!taken.has(baseName.toLowerCase())) {
-    return baseName;
-  }
-  for (let index = 2; index < 1000; index += 1) {
-    const candidate = baseName.includes(".")
-      ? (() => {
-        const dot = baseName.lastIndexOf(".");
-        return `${baseName.slice(0, dot)} ${index}${baseName.slice(dot)}`;
-      })()
-      : `${baseName} ${index}`;
-    if (!taken.has(candidate.toLowerCase())) {
-      return candidate;
-    }
-  }
-  return `${baseName} ${Date.now()}`;
-}
-
-async function createDesktopItem(isFolder) {
-  const name = nextAvailableDesktopName(isFolder ? "untitled folder" : "untitled.txt");
-  try {
-    await mutateDesktopObject(isFolder ? "mkdir" : "write", { name });
-    shellState.requestSummaryRefresh?.();
-  } catch (error) {
-    console.warn("desktop create failed", error);
-    showDesktopMutationError();
-  }
-}
-
-async function trashDesktopObject(entryId) {
-  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
-  if (!object?.uri || isTrashDesktopObject(object)) {
-    return;
-  }
-  try {
-    await mutateDesktopObject("trash", { uri: object.uri });
-    playUiSound("trash");
-    if (shellState.selectedDesktopTargetId === entryId) {
-      clearDesktopSelection();
-    }
-    shellState.requestSummaryRefresh?.();
-  } catch (error) {
-    console.warn("desktop trash failed", error);
-    showDesktopMutationError();
-  }
-}
-
-function startDesktopObjectRename(entryId) {
-  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
-  if (!object?.uri || isTrashDesktopObject(object)) {
-    return;
-  }
-  const shortcut = document.getElementById(desktopShortcutIdForEntry(entryId));
-  if (!shortcut) {
-    return;
-  }
-  cancelDesktopRename();
-  shellState.editingDesktopTargetId = entryId;
-  shortcut.classList.add("editing");
-  const titleNode = shortcut.querySelector(".desktop-shortcut-title");
-  const input = document.createElement("input");
-  input.className = "desktop-shortcut-rename";
-  input.type = "text";
-  input.spellcheck = false;
-  input.maxLength = 120;
-  input.value = object.name;
-  input.addEventListener("pointerdown", (event) => {
-    event.stopPropagation();
-  });
-  input.addEventListener("click", (event) => {
-    event.stopPropagation();
-  });
-  titleNode.replaceChildren(input);
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      void commitDesktopObjectRename(entryId, object.uri, input.value);
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      cancelDesktopRename();
-    }
-  });
-  input.addEventListener("blur", () => {
-    const now = window.performance ? window.performance.now() : Date.now();
-    const ignoreBlurUntil = Number.parseFloat(input.dataset.ignoreBlurUntil || "0");
-    if (Number.isFinite(ignoreBlurUntil) && now < ignoreBlurUntil) {
-      window.setTimeout(() => {
-        if (shellState.editingDesktopTargetId === entryId) {
-          input.focus();
-          input.select();
-        }
-      }, 0);
-      return;
-    }
-    if (shellState.editingDesktopTargetId === entryId) {
-      void commitDesktopObjectRename(entryId, object.uri, input.value);
-    }
-  });
-  input.dataset.ignoreBlurUntil = String(
-    (window.performance ? window.performance.now() : Date.now()) + DESKTOP_RENAME_BLUR_GUARD_MS,
-  );
-  input.focus();
-  input.select();
-}
-
-async function commitDesktopObjectRename(entryId, uri, value) {
-  const name = String(value || "").trim();
-  shellState.editingDesktopTargetId = null;
-  if (!name || !uri) {
-    cancelDesktopRename();
-    return;
-  }
-  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
-  if (object && object.name === name) {
-    renderDesktop(shellState.currentSummary);
-    return;
-  }
-  try {
-    await mutateDesktopObject("rename", { uri, name });
-    shellState.requestSummaryRefresh?.();
-  } catch (error) {
-    console.warn("desktop rename failed", error);
-    showDesktopMutationError();
-    renderDesktop(shellState.currentSummary);
   }
 }
 
@@ -2758,25 +2606,6 @@ function walletApprovalEntries(summary) {
 
 function walletApprovalKey(entry) {
   return String(entry?.id || entry?.action_ref?.action_id || "");
-}
-
-function showDesktopMutationError() {
-  playUiSound("error");
-  if (
-    !homeNotificationToast ||
-    !homeNotificationTitle ||
-    !homeNotificationBody ||
-    !homeNotificationAction
-  ) {
-    return;
-  }
-  bindHomeNotificationToast();
-  homeNotificationTitle.textContent = "Desktop";
-  homeNotificationBody.textContent = "Couldn't update the Desktop. Try again.";
-  homeNotificationAction.hidden = true;
-  setOverlayOpen(homeNotificationToast, true);
-  window.clearTimeout(homeNotificationToastTimer);
-  homeNotificationToastTimer = window.setTimeout(hideHomeNotificationToast, 5000);
 }
 
 function showHomeNotificationToast(entry) {

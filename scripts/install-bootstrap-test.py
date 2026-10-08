@@ -25,6 +25,7 @@ from unittest import mock
 
 
 INSTALLER = Path(__file__).with_name("install.sh")
+SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
 HELPERS = SOURCE.split("# ── Parse args", 1)[0]
 PYTHON = SOURCE.split("<<'PY_ED25519'\n", 1)[1].split("\nPY_ED25519", 1)[0]
@@ -441,7 +442,12 @@ class InstallerSandbox:
     """
 
     def __init__(self, head, release, did, system="Linux", machine="x86_64"):
-        self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-")
+        # The installer refuses a data directory under a writable parent such as
+        # /tmp, so sandboxes live under the repository's ignored target/.
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        for path in (SANDBOX_BASE.parent, SANDBOX_BASE):
+            path.chmod(0o755)
+        self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-", dir=SANDBOX_BASE)
         self.root = Path(self.directory.name)
         self.did, self.system, self.machine = did, system, machine
         self.installer = self.root / "install.sh"
@@ -494,11 +500,11 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
-    def run(self, *options, transport="publisher"):
+    def run(self, *options, transport="publisher", umask="0022"):
         seen = len(self.requests())
         options = list(options) + (["--publisher-gateway", "https://test.invalid"] if transport == "publisher"
                                    else ["--gateway", "https://test.invalid", "--head-cid", self.head_cid])
-        result = shell('''
+        result = shell('umask "$9"\n' + '''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
@@ -507,9 +513,9 @@ export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INS
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 export FIXTURE_HEAD_CID="$6" FIXTURE_RELEASE_CID="$7" FIXTURE_BINARY_CID="$8"
 # Feed the complete stamped script through stdin, as curl | bash does.
-cat "$3" | "$2" --noprofile --norc -s -- "${@:9}"
+cat "$3" | "$2" --noprofile --norc -s -- "${@:10}"
 ''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, self.head_cid, self.release_cid,
-                       self.binary_cid, "--maintainer-did", self.did, *options)
+                       self.binary_cid, umask, "--maintainer-did", self.did, *options)
         return result, self.requests()[seen:]
 
     def runtime_calls(self):
@@ -953,6 +959,73 @@ class InstallationTests(unittest.TestCase):
                         ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos"})
                     self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_group_umask_still_creates_owner_only_writable_directories(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only", umask="0002")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name in (".local", ".local/bin"):
+                self.assertEqual((sandbox.home / name).stat().st_mode & 0o777, 0o755, name)
+            self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
+
+    def test_existing_group_writable_install_dir_is_refused_before_download_with_working_fix(self):
+        did, head, release = installable_fixture()
+        for case in ("default", "alias", "alias/"):
+            with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
+                if case == "default":
+                    bin_dir, options = sandbox.home / ".local/bin", []
+                    bin_dir.mkdir(parents=True)
+                else:
+                    bin_dir = sandbox.home / "it's a \"bin\" $dir"
+                    bin_dir.mkdir()
+                    (sandbox.home / "alias").symlink_to(bin_dir)
+                    options = ["--install-dir", str(sandbox.home / case)]
+                bin_dir.chmod(0o775)
+                before = sandbox.home_state()
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only", *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.home_state(), before)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
+                self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+                command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+                self.assertTrue(command.startswith("chmod go-w "), command)
+                fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                       capture_output=True, text=True)
+                self.assertEqual(fixed.returncode, 0, fixed.stderr)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_root_owned_ancestor_of_the_data_directory_is_accepted(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            root_owned = [p for p in sandbox.data.parents if p.exists()
+                          and p.stat().st_uid == 0 and p.stat().st_mode & 0o777 == 0o755]
+            self.assertNotEqual(root_owned, [])
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_group_writable_data_ancestor_is_refused_before_download_with_exact_fix(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            unsafe = sandbox.root / "a\\b it's"
+            (unsafe / "xdg-data").mkdir(parents=True)
+            (sandbox.home / "xdg-data").symlink_to(unsafe / "xdg-data")
+            unsafe.chmod(0o775)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(requests, [])
+            command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+            self.assertTrue(command.startswith("chmod go-w "), command)
+            fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                   capture_output=True, text=True)
+            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+            self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()

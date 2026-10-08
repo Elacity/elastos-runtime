@@ -161,7 +161,8 @@ class PrepareWorkerTest(unittest.TestCase):
                 external[name]["capsule_metadata"] = {
                     "install_path": "capsules/shell", "platforms": {"*": self.stale_descriptor("metadata")}}
                 (capsule / "capsule.json").write_text(json.dumps(
-                    {"name": name, "role": "provider", "icon": "icons"}))
+                    {"name": name, "role": "provider", "type": "microvm",
+                     "entrypoint": "rootfs.ext4", "icon": "icons"}))
                 (capsule / "icons").mkdir()
                 for size in (32, 64, 128, 256):
                     (capsule / "icons" / f"icon-{size}.png").write_bytes(b"fixture icon")
@@ -171,6 +172,7 @@ class PrepareWorkerTest(unittest.TestCase):
             (capsule / "browser/index.html").write_text(f"tracked-{name}")
             (capsule / "capsule.json").write_text(json.dumps({
                 "name": name, "type": "wasm", "runtime_abi": "elastos.runtime-projection/v1",
+                "execution": "web-projection",
                 "entrypoint": "browser/index.html"}))
             external[name] = {"install_path": f"capsules/{name}",
                               "platforms": {"*": self.stale_descriptor(name)}}
@@ -506,6 +508,28 @@ class PrepareWorkerTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("Output already exists", refused.stderr)
         self.assertEqual((output / "platform-input.json").read_bytes(), before)
+
+    def test_packaging_refuses_a_projection_with_microvm_type(self):
+        path = self.repo / "capsules/home-cli/capsule.json"
+        manifest = json.loads(path.read_text())
+        manifest["type"] = "microvm"
+        path.write_text(json.dumps(manifest))
+        self.commit("contradictory projection fixture")
+        output, result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported packaged app capsule type for home-cli: microvm", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_source_home_refuses_a_projection_with_microvm_type(self):
+        path = self.repo / "capsules/home-cli/capsule.json"
+        manifest = json.loads(path.read_text())
+        manifest["type"] = "microvm"
+        path.write_text(json.dumps(manifest))
+        source = (SOURCE / "scripts/setup-source-home.sh").read_text()
+        function = "capsule_runtime_abi() {" + source.split("capsule_runtime_abi() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        result = self.command("/bin/bash", "-euc", function + '\ncapsule_runtime_abi "$1"\n', "fixture", str(path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("projection execution requires type=wasm (legacy) or web-projection", result.stderr)
 
     def test_build_failure_removes_stage_and_preserves_missing_output(self):
         output, result = self.prepare(env={**self.env, "FAIL_BUILD": "1"})

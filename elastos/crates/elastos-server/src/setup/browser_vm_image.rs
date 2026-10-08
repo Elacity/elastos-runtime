@@ -676,10 +676,9 @@ fn install_archive_reader(
     outcome
 }
 
-fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
+fn lock_installation(parent: &Path) -> anyhow::Result<crate::host_lock::FileLock> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
             .create(true)
@@ -692,11 +691,7 @@ fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
             file.metadata()?.is_file(),
             "Browser image install lock must be a regular file"
         );
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Browser image install lock failed");
-        }
-        Ok(file)
+        crate::host_lock::FileLock::exclusive(file).context("Browser image install lock failed")
     }
     #[cfg(not(unix))]
     bail!("Browser image installation requires a supported Unix host")
@@ -1180,6 +1175,21 @@ mod tests {
         fs::write(dest.join("good"), b"preserved").unwrap();
         assert!(replace_directory(&temp.path().join("absent"), &dest).is_err());
         assert_eq!(fs::read(dest.join("good")).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn browser_image_ended_install_lock_is_free_while_a_command_spawned_under_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock = lock_installation(temp.path()).unwrap();
+        let path = temp.path().join(".browser-image-install.lock");
+        let _command = SpawnedWhileOpen::new(&path);
+        drop(lock);
+        assert!(
+            lock_is_free(&path),
+            "the next install must not wait for a command spawned under the last"
+        );
     }
 
     #[test]

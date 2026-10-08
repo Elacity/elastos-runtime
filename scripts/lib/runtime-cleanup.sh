@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# A private test HOME outside /tmp: install.sh refuses a data directory under a
+# parent others can write, and /tmp is world-writable.
+smoke_home_dir() {
+    local base="${XDG_CACHE_HOME:-$HOME/.cache}"
+    (umask 077 && mkdir -p "$base" && mktemp -d "$base/elastos-smoke-$1.XXXXXX")
+}
+
 _elastos_installer_helper() (
     # Isolate the installer's shell options and bootstrap variables.
     source "$(dirname "${BASH_SOURCE[0]}")/../install.sh"

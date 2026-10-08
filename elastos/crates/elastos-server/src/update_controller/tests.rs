@@ -1,4 +1,5 @@
 use super::*;
+use crate::host_lock::test_support::SpawnedWhileOpen;
 use elastos_common::localhost::{
     installation_release_head_path, installation_release_manifest_path,
 };
@@ -1681,6 +1682,16 @@ fn controller_lease_excludes_a_second_owner_and_keeps_the_same_lock_inode() {
 }
 
 #[test]
+fn ended_controller_lease_is_free_while_a_command_spawned_under_it_runs() {
+    let fixture = PrivateFixture::new();
+    let lease = acquire_lease(&fixture.directory).unwrap();
+    let _command = SpawnedWhileOpen::new(&fixture.directory.join("controller.lock"));
+    drop(lease);
+    acquire_lease(&fixture.directory)
+        .expect("the next controller must not wait for a command spawned under the last");
+}
+
+#[test]
 fn consumed_request_completion_preserves_a_different_request_identity() {
     let fixture = PrivateFixture::new();
     let (_, choice, _) = choice_fixture();
@@ -2514,40 +2525,16 @@ fn second_owner_action_reserves_before_consumption_and_refuses_old_replay() {
 #[test]
 fn ended_owner_action_frees_its_lock_while_a_command_spawned_during_it_runs() {
     let (fixture, request) = owner_queue_fixture();
-    let (_, action) = owner_action_guard(&fixture.data).unwrap();
-    let lock = action.as_raw_fd();
-    // Another thread spawns a command while the action holds its lock. A fork
-    // shares the lock's open description until exec closes its CLOEXEC copy;
-    // keeping the child's copy across exec holds that window open.
-    let mut child = std::thread::spawn(move || {
-        let mut command = std::process::Command::new("/bin/sleep");
-        command
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(lock, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command.spawn().unwrap()
-    })
-    .join()
-    .unwrap();
+    let (directory, action) = owner_action_guard(&fixture.data).unwrap();
+    let _command = SpawnedWhileOpen::new(&directory.join("owner-action.lock"));
     drop(action);
-    let next = queue_owner_update(
+    queue_owner_update(
         &fixture.data,
         request,
         "passkey:step-up:fixture",
         &owner_effect_sha(),
-    );
-    let _ = child.kill();
-    let _ = child.wait();
-    next.expect("the next owner action must not wait for a command spawned during the last");
+    )
+    .expect("the next owner action must not wait for a command spawned during the last");
     assert!(has_queued_update(&fixture.data).unwrap());
 }
 
@@ -2847,7 +2834,7 @@ async fn real_controller_restart_failure(failure: &str) {
             module_path!().split_once("::").unwrap().1
         )),
     );
-    fs::write(&fixture.binary, previous.as_bytes()).unwrap();
+    crate::test_support::write_from_child(&fixture.binary, &previous, 0o755);
     let home = fixture.data.join("capsules/home");
     fs::create_dir_all(home.join("browser")).unwrap();
     fixture.file(
@@ -3356,7 +3343,7 @@ async fn stopped_home_with_unreconciled_child_record_reports_failure_and_retains
 
 struct StagingRestartOwner {
     controller: Controller,
-    host: Option<crate::host_lock::HostProcessGuard>,
+    host: Option<crate::host_lock::FileLock>,
     stops: usize,
     starts: usize,
     fail_candidate: bool,
@@ -3616,8 +3603,11 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             b"new support".to_vec()
         };
         if outcome.starts_with("support path") {
-            value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
-                ["release_path"] = json!("fixture-provider");
+            // Only a descriptor without a signed CID is fetched by release name.
+            let platform = &mut value["external"]["fixture-provider"]["platforms"]
+                [crate::setup::detect_platform()];
+            platform["release_path"] = json!("fixture-provider");
+            platform.as_object_mut().unwrap().remove("cid");
         }
         value["capsules"]["fixture-app"] = json!({
             "cid":raw_cid(&app), "sha256":digest(&app), "size":app.len()

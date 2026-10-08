@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_core::{
-    ensure_owner_only_directory, random_hex_128, validate_owner_only_directory,
-    validate_owner_only_regular_file, CollaborationCore, DurableOutgoingMessage, ExclusiveFileLock,
-    PendingProductHandoff, DEFAULT_CONVERSATION_SEND_METHOD,
+    ensure_owner_only_directory, lock_owner_only_file, random_hex_128,
+    validate_owner_only_directory, validate_owner_only_regular_file, CollaborationCore,
+    DurableOutgoingMessage, PendingProductHandoff, DEFAULT_CONVERSATION_SEND_METHOD,
 };
 use crate::collaboration_product::{CHAT_INTERFACE, CHAT_ROOM_CAPSULE, CHAT_SERVICE};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
@@ -420,7 +420,7 @@ impl PresenceReadModel {
             .lock()
             .map_err(|_| anyhow::anyhow!("presence mutation lock is poisoned"))?;
         self.ensure_state_directory()?;
-        let _file_lock = ExclusiveFileLock::acquire(&self.lock_path())?;
+        let _file_lock = lock_owner_only_file(&self.lock_path())?;
         let mut state = self.load_state()?.unwrap_or_else(|| self.empty_state());
         let before = state.records.len();
         state.records.retain(|record| {
