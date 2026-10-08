@@ -202,7 +202,14 @@ fn aliases(platform: &str) -> Vec<(&'static str, &'static str)> {
     vec![
         ("browser-vm/rootfs.ext4", "rootfs.ext4"),
         ("browser-vm/browser-vm-rootfs-manifest.json", RECEIPT),
-        ("bin/vmlinux", "vmlinux"),
+        (
+            if platform == "darwin-arm64" {
+                "bin/vmlinux"
+            } else {
+                "browser-vm/vmlinux"
+            },
+            "vmlinux",
+        ),
         (
             if platform == "darwin-arm64" {
                 "bin/initrd"
@@ -480,8 +487,24 @@ pub(super) async fn install_via_carrier(
     let temporary = tempfile::tempfile_in(parent)?;
     let mut download = tokio::fs::File::from_std(temporary);
     let mut checkpoint = 0;
+    let mut displayed = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
         check_cancelled(Some(&cancellation.0))?;
+        if received == 0
+            || received == total
+            || displayed.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            eprint!(
+                "\rBrowser image: {} / {} MiB ({}%)",
+                received / (1024 * 1024),
+                total / (1024 * 1024),
+                received.saturating_mul(100) / total.max(1)
+            );
+            if received == total {
+                eprintln!();
+            }
+            displayed = std::time::Instant::now();
+        }
         if received == 0
             || received == total
             || received.saturating_sub(checkpoint) >= 16 * 1024 * 1024
@@ -1145,6 +1168,24 @@ mod tests {
             assert!(install_archive(temp.path(), &bytes, &info, "darwin-arm64").is_err());
             assert!(!temp.path().join(INSTALL_PATH).exists());
         }
+    }
+
+    #[test]
+    fn browser_image_linux_keeps_capsule_kernel_owned_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("bin")).unwrap();
+        fs::write(temp.path().join("bin/vmlinux"), b"capsule kernel").unwrap();
+        let (bytes, info) = archive(&fixture(b"image"));
+        install_archive(temp.path(), &bytes, &info, "linux-arm64").unwrap();
+        verify_installed(temp.path(), &info, "linux-arm64").unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("bin/vmlinux")).unwrap(),
+            b"capsule kernel"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("browser-vm/image-set/vmlinux")).unwrap(),
+            b"kernel"
+        );
     }
 
     #[test]

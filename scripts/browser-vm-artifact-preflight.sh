@@ -39,7 +39,7 @@ engine_supervisor="${ELASTOS_BROWSER_VM_ENGINE_SUPERVISOR:-${data_dir}/bin/brows
 target_preflight="${ELASTOS_BROWSER_VM_TARGET_PREFLIGHT:-${repo_root}/scripts/browser-vm-target-preflight.sh}"
 debugfs_bin="${ELASTOS_DEBUGFS_BIN:-$(command -v debugfs 2>/dev/null || true)}"
 
-exec python3 - \
+exec "${ELASTOS_BROWSER_VM_PYTHON:-python3}" - \
   "$platform" \
   "$data_dir" \
   "$control_socket" \
@@ -533,6 +533,9 @@ if mode == "--host-readiness":
                    (host_platform.system(), host_platform.machine()))
     if platform != host_id:
         reason = "host_unsupported"
+    elif platform.startswith("linux-") and not os.path.exists("/dev/kvm"):
+        reason = "host_unsupported"
+        message = "Browser needs KVM virtualization. This host has no /dev/kvm device."
     elif image_reason := verify_image_set():
         reason = image_reason
     elif not local_substrate_artifacts_ready:
@@ -555,7 +558,7 @@ if mode == "--host-readiness":
                     reason = ("preparation_required" if host.get("reason") == "preparation_required"
                               else "host_unsupported")
             elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
-                network = subprocess.run(["python3", str(pathlib.Path(data_dir) / "scripts/browser-vm-linux-network.py"), "check"],
+                network = subprocess.run([sys.executable, str(pathlib.Path(data_dir) / "scripts/browser-vm-linux-network.py"), "check"],
                                          capture_output=True, text=True, timeout=5)
                 if network.returncode:
                     reason = "preparation_required"

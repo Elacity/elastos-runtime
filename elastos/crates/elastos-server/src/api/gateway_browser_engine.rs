@@ -212,7 +212,7 @@ fn browser_engine_config_uses_runtime_image(
             &format!("bin/{launcher}"),
         )
         && path_matches(&env["ELASTOS_BROWSER_VM_DATA_DIR"], "")
-        && [
+        && ([
             ("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
             (
                 "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
@@ -227,6 +227,24 @@ fn browser_engine_config_uses_runtime_image(
         ]
         .iter()
         .all(|(key, path)| env[*key].is_null() || path_matches(&env[*key], path))
+            || [
+                ("ELASTOS_BROWSER_VM_ROOTFS", "rootfs.ext4"),
+                (
+                    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                    "browser-vm-rootfs-manifest.json",
+                ),
+                ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
+                (
+                    if platform.starts_with("darwin-") {
+                        "ELASTOS_BROWSER_VM_INITRAMFS"
+                    } else {
+                        "ELASTOS_BROWSER_VM_INITRD"
+                    },
+                    "initrd",
+                ),
+            ]
+            .iter()
+            .all(|(key, file)| path_matches(&env[*key], &format!("browser-vm/image-set/{file}"))))
 }
 
 pub(in crate::api::gateway) async fn browser_engine_summary(
@@ -688,6 +706,41 @@ mod tests {
             ));
             assert!(!browser_engine_config_uses_runtime_image(
                 &config, data, "absent", platform
+            ));
+        }
+    }
+
+    #[test]
+    fn image_acquisition_admits_the_complete_release_image_set() {
+        let data = FsPath::new("/runtime-test");
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let mut config = image_config(data, platform);
+            let env = &mut config["adapters"][0]["supervisor"]["env"];
+            for (key, file) in [
+                ("ELASTOS_BROWSER_VM_ROOTFS", "rootfs.ext4"),
+                (
+                    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                    "browser-vm-rootfs-manifest.json",
+                ),
+                ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
+                (
+                    if platform.starts_with("darwin-") {
+                        "ELASTOS_BROWSER_VM_INITRAMFS"
+                    } else {
+                        "ELASTOS_BROWSER_VM_INITRD"
+                    },
+                    "initrd",
+                ),
+            ] {
+                env[key] = json!(data.join("browser-vm/image-set").join(file));
+            }
+            assert!(browser_engine_config_uses_runtime_image(
+                &config, data, "local", platform
+            ));
+            config["adapters"][0]["supervisor"]["env"]["ELASTOS_BROWSER_VM_KERNEL"] =
+                json!("/manual/kernel");
+            assert!(!browser_engine_config_uses_runtime_image(
+                &config, data, "local", platform
             ));
         }
     }

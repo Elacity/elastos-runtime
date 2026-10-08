@@ -23,7 +23,7 @@ test("Runtime Browser helpers and adapter contain no escalation command", () => 
 
 function networkApi(result) {
   const calls = [];
-  const context = vm.createContext({ path, os: { userInfo: () => ({ username: "elastos-agent" }) }, process: { getuid: () => 1001 },
+  const context = vm.createContext({ path, os: { userInfo: () => ({ username: "elastos-agent" }) }, process: { getuid: () => 1001, env: {} },
     runSync(command, args) { calls.push([command, args]); return result; },
   });
   const start = source.indexOf("function linuxNetworkCommand(");

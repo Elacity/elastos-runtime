@@ -62,6 +62,7 @@ Options:
   --vm-control-launcher <path>    Optional launcher used to auto-start the VM control socket.
                                   Linux default: <data-dir>/bin/browser-vm-local-crosvm-launcher
                                   Darwin default: <data-dir>/bin/browser-vz-engine-supervisor
+  --release-image                Use the atomic Browser image set supplied by the signed release
   --vm-rootfs <path>              Optional Browser VM rootfs path
   --allow-private-targets         Allow Browser Exit to resolve private targets. Disabled by default.
 `;
@@ -100,6 +101,9 @@ function parseArgs(argv) {
         break;
       case "--vm-control-launcher":
         args.vmControlLauncher = next();
+        break;
+      case "--release-image":
+        args.releaseImage = true;
         break;
       case "--vm-rootfs":
         args.vmRootfs = next();
@@ -634,6 +638,13 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     copyVmIceEnv(env, sourceEnv);
     copyVmMediaRelayEnv(env, args.platform, sourceEnv);
   }
+  for (const key of ["ELASTOS_BROWSER_VM_PYTHON", "ELASTOS_DEBUGFS_BIN"]) {
+    const value = sourceEnv[key];
+    if (value) {
+      validateAbsolute(key, value);
+      env[key] = value;
+    }
+  }
   copyVmDiagnosticEnv(env, sourceEnv);
   if (!remoteVzControlLauncher) {
     if (vzTransport) {
@@ -661,6 +672,13 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "2";
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
+  }
+  if (args.releaseImage) {
+    const image = path.join(args.dataDir, "browser-vm/image-set");
+    env.ELASTOS_BROWSER_VM_ROOTFS = path.join(image, "rootfs.ext4");
+    env.ELASTOS_BROWSER_VM_ROOTFS_MANIFEST = path.join(image, "browser-vm-rootfs-manifest.json");
+    env.ELASTOS_BROWSER_VM_KERNEL = path.join(image, "vmlinux");
+    env[args.platform === "darwin-arm64" ? "ELASTOS_BROWSER_VM_INITRAMFS" : "ELASTOS_BROWSER_VM_INITRD"] = path.join(image, "initrd");
   }
   supervisorConfig.env = env;
   return {

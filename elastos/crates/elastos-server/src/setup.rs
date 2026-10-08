@@ -13,6 +13,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod browser_config;
 mod browser_vm_image;
 #[cfg(unix)]
 mod local_model_engine_receipt;
@@ -555,6 +556,29 @@ async fn run_with_data_dir(
         stamped
     };
 
+    if components.iter().any(|name| name == "browser")
+        && manifest.profiles.contains_key("browser-host")
+    {
+        println!("Preparing Browser Engine helpers...");
+        browser_config::ensure_host_components(
+            &data_dir,
+            &manifest,
+            &platform,
+            FirstPartyCarrierContext::Setup,
+        )
+        .await?;
+        if manifest.external.contains_key(browser_vm_image::NAME) {
+            println!("Preparing Browser Engine image...");
+            ensure_browser_vm_image_in_context(&data_dir, FirstPartyCarrierContext::Setup).await?;
+        }
+    }
+
+    browser_config::configure(
+        &data_dir,
+        &platform,
+        manifest.external.contains_key(browser_vm_image::NAME),
+    )?;
+
     println!();
     if !stamped.is_empty() {
         println!(
@@ -1095,6 +1119,13 @@ pub(crate) struct CapsuleComponentEnsure {
 /// Prepare only the image dependency of an explicitly selected local Engine.
 /// Host helper admission and page allocation remain with the Engine adapter.
 pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow::Result<()> {
+    ensure_browser_vm_image_in_context(data_dir, FirstPartyCarrierContext::Runtime).await
+}
+
+async fn ensure_browser_vm_image_in_context(
+    data_dir: &Path,
+    context: FirstPartyCarrierContext,
+) -> anyhow::Result<()> {
     let check_dir = data_dir.to_path_buf();
     let pending = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<PlatformInfo>> {
         let platform = detect_platform();
@@ -1127,7 +1158,7 @@ pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow
         &info,
         &dest,
         &build_gateway_list(data_dir),
-        FirstPartyCarrierContext::Runtime,
+        context,
     )
     .await
 }
@@ -1176,6 +1207,15 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     let install_state =
         component_install_state_for_name(&manifest, data_dir, name, component, Some(platform_info));
     if matches!(install_state, InstallState::Installed) {
+        if name == "browser" {
+            browser_config::ensure_host_components(
+                data_dir,
+                &manifest,
+                &platform,
+                FirstPartyCarrierContext::Runtime,
+            )
+            .await?;
+        }
         return Ok(CapsuleComponentEnsure {
             name: name.to_string(),
             status: "installed".to_string(),
@@ -1214,19 +1254,28 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     let manifest_bytes = fs::read(&installed_manifest).map_err(|err| {
         anyhow::anyhow!("materialized capsule '{name}' is missing capsule.json: {err}")
     })?;
-    let manifest: elastos_common::CapsuleManifest = serde_json::from_slice(&manifest_bytes)
+    let capsule_manifest: elastos_common::CapsuleManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|err| {
             anyhow::anyhow!("materialized capsule '{name}' has invalid capsule.json: {err}")
         })?;
-    manifest.validate().map_err(|err| {
+    capsule_manifest.validate().map_err(|err| {
         anyhow::anyhow!("materialized capsule '{name}' failed manifest validation: {err}")
     })?;
-    if manifest.name != name {
+    if capsule_manifest.name != name {
         anyhow::bail!(
             "materialized capsule name mismatch: requested '{}', package declared '{}'",
             name,
-            manifest.name
+            capsule_manifest.name
         );
+    }
+    if name == "browser" {
+        browser_config::ensure_host_components(
+            data_dir,
+            &manifest,
+            &platform,
+            FirstPartyCarrierContext::Runtime,
+        )
+        .await?;
     }
 
     Ok(CapsuleComponentEnsure {
@@ -3025,6 +3074,12 @@ pub(crate) fn admit_release_components(
     manifest: &ComponentsManifest,
     platform: &str,
 ) -> anyhow::Result<()> {
+    let platform = match platform {
+        "aarch64-darwin" => "darwin-arm64",
+        "aarch64-linux" => "linux-arm64",
+        "x86_64-linux" => "linux-amd64",
+        other => other,
+    };
     for (name, component) in &manifest.external {
         let assets = [
             resolve_platform_info(component, platform),
@@ -3032,9 +3087,14 @@ pub(crate) fn admit_release_components(
                 resolve_component_capsule_metadata_platform_info(metadata, platform)
             }),
         ];
-        for info in assets.into_iter().flatten() {
+        for (index, info) in assets.into_iter().enumerate() {
+            let Some(info) = info else { continue };
+            let image = index == 0 && name == browser_vm_image::NAME;
+            if image {
+                browser_vm_image::component_info(manifest, platform)?;
+            }
             anyhow::ensure!(
-                matches!(info.strategy.as_deref(), None | Some("prebuilt")),
+                image || matches!(info.strategy.as_deref(), None | Some("prebuilt")),
                 "component '{name}' has a development or unsupported release strategy"
             );
             valid_release_artifact_checksum(name, info.checksum.as_deref())?;
@@ -3068,6 +3128,9 @@ fn plan_update_support<'a>(
 ) -> Vec<SupportUpdate<'a>> {
     let mut plan = Vec::new();
     for (name, component) in &new.external {
+        if name == browser_vm_image::NAME {
+            continue;
+        }
         let Some(info) = resolve_platform_info(component, platform) else {
             continue;
         };
@@ -3347,6 +3410,9 @@ pub(crate) async fn stage_update_support(
         }
     }
     for (name, component) in &old.external {
+        if name == browser_vm_image::NAME {
+            continue;
+        }
         if !new.external.contains_key(name) {
             if let Some(path) =
                 resolve_install_path(component, resolve_platform_info(component, platform))
@@ -7089,6 +7155,102 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn runtime_support_update_defers_installed_browser_image_to_engine_selection() {
+        struct UnusedOwner;
+        impl crate::update::RestartOwner for UnusedOwner {
+            fn progress(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                panic!("image acquisition belongs to Engine selection")
+            }
+            fn plan(
+                &self,
+                _: String,
+                _: &str,
+                _: &str,
+            ) -> anyhow::Result<crate::install_transaction::RestartPlan> {
+                unreachable!()
+            }
+            fn start<'a>(
+                &'a mut self,
+                _: &'a crate::install_transaction::InstallTransaction,
+                _: crate::install_transaction::RestartRecord,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+            {
+                unreachable!()
+            }
+            fn stop<'a>(
+                &'a mut self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+            {
+                unreachable!()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(browser_vm_image::INSTALL_PATH)).unwrap();
+        let retained = temp
+            .path()
+            .join(browser_vm_image::INSTALL_PATH)
+            .join("rootfs.ext4");
+        fs::write(&retained, b"previous image").unwrap();
+        let manifest = |checksum| {
+            serde_json::to_vec(&serde_json::json!({
+            "schema": "elastos.components/v1", "profiles": {}, "external": {
+                "browser-vm-image": {"install_path": browser_vm_image::INSTALL_PATH,
+                    "platforms": {"darwin-arm64": {"install_path": browser_vm_image::INSTALL_PATH,
+                        "strategy": "browser-vm-image", "release_path": "image.tar.gz",
+                        "extract_path": "browser-vm-image", "size": 1, "checksum": checksum}}}}}))
+            .unwrap()
+        };
+        let old = manifest(format!("sha256:{}", "a".repeat(64)));
+        let new = manifest(format!("sha256:{}", "b".repeat(64)));
+        let fetch: crate::update::FetchFn = Box::new(|_, _| {
+            Box::pin(async { panic!("Runtime support update must defer the image transfer") })
+        });
+        let (_, paths) = stage_update_support(
+            temp.path(),
+            &old,
+            &new,
+            "darwin-arm64",
+            &fetch,
+            &mut UnusedOwner,
+        )
+        .await
+        .unwrap();
+        assert!(paths.is_empty());
+        assert!(refresh_installed_components_for_update(
+            temp.path(),
+            Some(&old),
+            &new,
+            "darwin-arm64"
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert_eq!(fs::read(retained).unwrap(), b"previous image");
+    }
+
+    #[test]
+    fn browser_release_image_is_on_demand_for_every_supported_host() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let manifest = load_manifest_from_path(&path).unwrap();
+        for profile in manifest.profiles.values() {
+            assert!(!profile
+                .components
+                .iter()
+                .any(|name| name == browser_vm_image::NAME));
+        }
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let info = &manifest.external[browser_vm_image::NAME].platforms[platform];
+            assert_eq!(info.strategy.as_deref(), Some(browser_vm_image::NAME));
+            assert_eq!(
+                info.install_path.as_deref(),
+                Some(browser_vm_image::INSTALL_PATH)
+            );
+            assert!(info.release_path.as_ref().unwrap().ends_with(".tar.gz"));
+            assert!(admit_release_components(&manifest, platform).is_err());
+        }
+    }
+
     #[test]
     fn checkout_manifest_prepared_for_release_admits_every_platform() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
@@ -7108,9 +7270,19 @@ pub(crate) mod tests {
                 if info.checksum.as_deref().is_none_or(str::is_empty) {
                     info.checksum = Some(format!("sha256:{}", "a".repeat(64)));
                 }
+                if info.strategy.as_deref() == Some(browser_vm_image::NAME) {
+                    info.size = Some(1); // Simulate the prepared archive descriptor.
+                }
             }
         }
-        for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
+        for platform in [
+            "darwin-arm64",
+            "linux-amd64",
+            "linux-arm64",
+            "aarch64-darwin",
+            "x86_64-linux",
+            "aarch64-linux",
+        ] {
             admit_release_components(&manifest, platform)
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }

@@ -72,7 +72,7 @@ export function friendlyOpenError(error) {
       case "artifact_invalid":
         return "Browser Engine files need repair. Prepare this Engine or choose another approved Engine.";
       case "host_unsupported":
-        return "The selected Engine needs a compatible host. Choose another approved Engine.";
+        return "Browser virtualization is unavailable on the selected host. Use a host with Apple Virtualization or KVM, or choose another approved Engine.";
       case "readiness_unsupported":
         return "Browser Engine needs an update to report readiness. Update it or choose another approved Engine.";
       case "control_unavailable":

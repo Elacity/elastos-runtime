@@ -320,7 +320,7 @@ function runSync(command, args, { ignoreFailure = false, timeout = 30000 } = {})
 function linuxNetworkCommand(scriptPath, action) {
   const scriptsDir = path.basename(path.dirname(scriptPath)) === "bin"
     ? path.join(path.dirname(scriptPath), "../scripts") : path.dirname(scriptPath);
-  return { command: "python3", args: [path.join(scriptsDir, "browser-vm-linux-network.py"), action] };
+  return { command: process.env.ELASTOS_BROWSER_VM_PYTHON || "python3", args: [path.join(scriptsDir, "browser-vm-linux-network.py"), action] };
 }
 
 function requireLinuxNetwork(scriptPath) {
@@ -1077,10 +1077,10 @@ async function main() {
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
   const rootfs = process.env.ELASTOS_BROWSER_VM_ROOTFS || path.join(dataDir, "browser-vm/rootfs.ext4");
-  const kernel = process.env.ELASTOS_BROWSER_VM_KERNEL || path.join(dataDir, "bin/vmlinux");
+  requireFile(rootfs, "Browser VM rootfs");
+  const kernel = process.env.ELASTOS_BROWSER_VM_KERNEL || path.join(path.dirname(fs.realpathSync(rootfs)), "vmlinux");
   const initrd = process.env.ELASTOS_BROWSER_VM_INITRD || path.join(dataDir, "browser-vm/initrd");
   const crosvm = process.env.ELASTOS_BROWSER_VM_CROSVM_BIN || path.join(dataDir, "bin/crosvm");
-  requireFile(rootfs, "Browser VM rootfs");
   requireFile(kernel, "Browser VM kernel");
   requireFile(initrd, "Browser VM initrd");
   requireFile(crosvm, "crosvm");
