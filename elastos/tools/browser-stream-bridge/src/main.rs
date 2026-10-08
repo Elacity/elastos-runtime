@@ -240,7 +240,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     fn config(adapter_ipc_path: String, runtime_stream_path: String) -> BridgeConfig {
         BridgeConfig {
@@ -257,18 +258,48 @@ mod tests {
     }
 
     fn temp_socket_dir() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        temp_socket_dir_with_counter(&NEXT_ID)
+    }
+
+    fn temp_socket_dir_with_counter(next_id: &AtomicU64) -> PathBuf {
         // Unix socket paths must stay under SUN_LEN (104 bytes on macOS), and
         // macOS's per-user temp dir alone takes about half of that.
-        let path = PathBuf::from("/tmp").join(format!(
-            "esb-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .subsec_nanos()
-        ));
-        fs::create_dir_all(&path).expect("temp socket dir");
-        path
+        loop {
+            let path = PathBuf::from("/tmp").join(format!(
+                "esb-{}-{}",
+                std::process::id(),
+                next_id.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("temp socket dir {}: {error}", path.display()),
+            }
+        }
+    }
+
+    #[test]
+    fn temp_socket_dirs_do_not_adopt_an_existing_fixture() {
+        let first_id = u64::MAX / 2;
+        let next_id = AtomicU64::new(first_id);
+        let first = temp_socket_dir_with_counter(&next_id);
+        let marker = first.join("owner");
+        fs::write(&marker, b"first fixture").expect("fixture marker");
+
+        // Force the same candidate name, as a repeated clock tick or PID reuse
+        // can do. The allocator must claim a different directory.
+        next_id.store(first_id, Ordering::Relaxed);
+        let second = temp_socket_dir_with_counter(&next_id);
+        let distinct = first != second;
+        if distinct {
+            fs::remove_dir_all(&second).expect("second fixture cleanup");
+        }
+        let preserved = fs::read(&marker).expect("first fixture remains");
+        fs::remove_dir_all(&first).expect("first fixture cleanup");
+
+        assert!(distinct, "a fixture adopted an existing directory");
+        assert_eq!(preserved, b"first fixture");
     }
 
     fn wait_for_socket(path: &Path) {
