@@ -190,15 +190,17 @@ Updates are pull only. Nothing is pushed to your Home. The publisher's seed
 keeps the signed release, and your Home asks for it.
 
 **When Home checks.** Home checks only while its System page is open. System
-asks every 5 seconds while it is visible and every 30 seconds while it is
-hidden, and the Runtime reuses a check that is less than 30 seconds old. Home
-does not check when the Runtime starts, on a timer or when System is closed.
-Home itself shows no update badge yet; open System to see an update.
+asks every 5 seconds while it is visible (every 2 seconds while Home restarts)
+and every 30 seconds while it is hidden, and the Runtime reuses a check that is
+less than 30 seconds old. Home does not check when the Runtime starts, on a
+timer or when System is closed. Home itself shows no update badge yet; open
+System to see an update.
 
 **What a check does.** The Runtime opens one Carrier connection to the trusted
 source saved in `sources.json` during install. It asks for the latest signed
-release head, fetches the head and the release by CID, and checks both
-signatures, the release hash, the channel and the version order. An older
+release head, fetches the head and the release by CID (a source that gives no
+separate head CID sends the head file by name), and checks both signatures, the
+release hash, the channel and the version order. An older
 release is refused. The `gateways`, `discovery_uri` and `ipns_name` fields in
 `sources.json` are shown but not used to find updates. If the Carrier
 connection fails, the check fails.
@@ -207,8 +209,9 @@ connection fails, the check fails.
 
 **Approve and restart.** You approve the update with your passkey for that
 exact release. The Runtime downloads the binary and components by CID over
-Carrier, stages everything beside the running Home and restarts Home. A
-download fails only after 30 seconds without data.
+Carrier (a component listed without a CID comes by its release name), stages
+everything beside the running Home and restarts Home. A download fails only
+after 30 seconds without data.
 
 **If it fails.** If the new release does not start, the previous release is
 restored.

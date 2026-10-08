@@ -640,12 +640,9 @@ async fn admit_installed_setup_metadata(
         )?;
         let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
         let catalog = if let Some(trust) = &manifest.model_catalog {
-            let bytes = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                client.fetch_file_bounded(MODEL_CATALOG_FILE, MAX_MODEL_CATALOG_BYTES),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("model catalogue Carrier fetch timed out"))??;
+            let bytes = client
+                .fetch_file_bounded(MODEL_CATALOG_FILE, MAX_MODEL_CATALOG_BYTES)
+                .await?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
@@ -3542,15 +3539,8 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    crate::carrier::fetch_file_from_trusted_source_bound(
-        &source,
-        cid,
-        release_path,
-        15,
-        30,
-        bind_addr,
-    )
-    .await
+    crate::carrier::fetch_file_from_trusted_source_bound(&source, cid, release_path, 15, bind_addr)
+        .await
 }
 
 fn require_component_not_model(name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -3692,9 +3682,7 @@ async fn download_component(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
+    let client = crate::update::download_http_client()?;
     println!("  Resolving {} from {}...", name, elastos_url);
     let mut last_err = String::new();
     let mut response = None;
@@ -3722,17 +3710,20 @@ async fn download_component(
             last_err
         )
     })?;
-    let content_length = response.content_length();
+    // The signed size bounds the body; else the general download ceiling.
+    let max_bytes = platform_info
+        .size
+        .unwrap_or(crate::carrier::MAX_DOWNLOAD_BYTES as u64);
     let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);
     let is_tarball =
         url.ends_with(".tar.gz") || url.ends_with(".tgz") || platform_info.extract_path.is_some();
 
     if is_model {
         // Stream large model files to disk with progress
-        download_streaming(name, response, dest, platform_info, content_length).await?;
+        download_streaming(name, response, dest, platform_info, max_bytes).await?;
     } else {
         // Buffer smaller binaries in memory for checksum
-        let bytes = response.bytes().await?;
+        let bytes = crate::update::read_download_body(response, name, max_bytes).await?;
 
         verify_checksum(name, &bytes, platform_info)?;
 
@@ -3762,7 +3753,7 @@ async fn download_streaming(
     response: reqwest::Response,
     dest: &Path,
     platform_info: &PlatformInfo,
-    content_length: Option<u64>,
+    max_bytes: u64,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -3779,16 +3770,23 @@ async fn download_streaming(
 
     let mut downloaded: u64 = 0;
     let mut last_progress: u64 = 0;
+    let content_length = response.content_length();
+    crate::update::ensure_download_within(name, content_length.unwrap_or(0), max_bytes)?;
 
     let mut response = response;
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| crate::update::download_read_error(err, name))?
+    {
+        downloaded += chunk.len() as u64;
+        crate::update::ensure_download_within(name, downloaded, max_bytes)?;
         if use_sha512 {
             hasher_512.update(&chunk);
         } else {
             hasher_256.update(&chunk);
         }
         file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
 
         // Print progress every 50 MB
         if downloaded - last_progress >= 50 * 1024 * 1024 {
@@ -7947,6 +7945,100 @@ pub(crate) mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("Checksum mismatch for kubo"), "{error}");
         assert_eq!(fs::read(dest).unwrap(), b"installed fixture");
+    }
+
+    /// Serves every HTTP request with a `declared` Content-Length, then each
+    /// chunk after `gap`; returns the base URL.
+    pub(crate) async fn serve_http_slowly(
+        declared: u64,
+        chunks: &'static [&'static [u8]],
+        gap: std::time::Duration,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for chunk in chunks {
+                        tokio::time::sleep(gap).await;
+                        if socket.write_all(chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    async fn download_component_over_slow_gateway(
+        size: u64,
+        gap: std::time::Duration,
+    ) -> (anyhow::Result<()>, std::path::PathBuf, tempfile::TempDir) {
+        const CHUNKS: &[&[u8]] = &[b"fi", b"xt", b"ur", b"e-", b"ok"];
+        let base = serve_http_slowly(10, CHUNKS, gap).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+            "cid": "bafy-slow-fixture",
+            "checksum": format!("sha256:{:x}", sha2::Sha256::digest(b"fixture-ok")),
+            "size": size,
+        }))
+        .unwrap();
+        let dest = tmp.path().join("bin/kubo");
+        let gateways = [ElastosFetchPath {
+            transport_base: base,
+            description: "slow fixture gateway".to_string(),
+        }];
+        let result = download_component(
+            tmp.path(),
+            "kubo",
+            "unused",
+            &info,
+            &dest,
+            &gateways,
+            FirstPartyCarrierContext::Setup,
+        )
+        .await;
+        (result, dest, tmp)
+    }
+
+    #[tokio::test]
+    async fn download_component_http_progress_outlives_idle_deadline_and_stall_fails() {
+        // 5 chunks 400 ms apart: 2 s in total, twice the 1 s test idle deadline.
+        let (result, dest, _tmp) =
+            download_component_over_slow_gateway(10, std::time::Duration::from_millis(400)).await;
+        result.unwrap();
+        assert_eq!(fs::read(dest).unwrap(), b"fixture-ok");
+
+        let (result, dest, _tmp) =
+            download_component_over_slow_gateway(10, std::time::Duration::from_secs(3)).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("no data for 1 s while downloading kubo"),
+            "{error}"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn download_component_http_refuses_body_beyond_signed_size() {
+        let (result, dest, _tmp) =
+            download_component_over_slow_gateway(4, std::time::Duration::ZERO).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("kubo exceeds its 4-byte bound (10 bytes)"),
+            "{error}"
+        );
+        assert!(!dest.exists());
     }
 
     #[tokio::test]
