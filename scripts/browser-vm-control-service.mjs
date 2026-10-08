@@ -55,7 +55,8 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
     stdio: [ownerFd, "ignore", "ignore", "pipe"],
     env: { ...process.env, NODE_OPTIONS: "" },
   });
-  let stopping = false, closed = false, lossReported = false, stopPromise = null;
+  const observerStarted = Number.isInteger(observer.pid) && observer.pid > 1;
+  let stopping = false, closed = false, lossReported = false, stopPromise = null, resolveReaped;
   const ownerLost = () => {
     if (stopping || lossReported) return;
     lossReported = true;
@@ -64,20 +65,30 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
     handleSignal();
   };
   const reaped = new Promise((resolve) => {
+    resolveReaped = resolve;
     observer.once("close", () => {
       closed = true;
       resolve();
       ownerLost();
     });
   });
-  observer.once("error", ownerLost);
+  observer.once("error", () => {
+    // A failed spawn has no child to reap and may have no cancellation stdio.
+    // An error on a spawned child still requires that exact child's close.
+    if (!observerStarted) {
+      observer.stdio?.[3]?.destroy?.();
+      closed = true;
+      resolveReaped();
+    }
+    ownerLost();
+  });
   return () => {
     if (stopPromise) return stopPromise;
     stopping = true;
     stopPromise = (async () => {
       if (!closed) {
-        observer.stdio[3].destroy();
-        observer.kill("SIGTERM");
+        observer.stdio?.[3]?.destroy?.();
+        if (observerStarted) observer.kill("SIGTERM");
       }
       await reaped;
     })();
@@ -1863,9 +1874,11 @@ function persistLaunchReconciliations(store) {
 
 function launchReconciliationStore(config, controlServiceIdentity) {
   const journalPath = launchReconciliationJournalPath(config);
+  const records = loadLaunchReconciliations(journalPath);
   return {
     journal_path: journalPath,
-    records: loadLaunchReconciliations(journalPath),
+    records,
+    inherited_keys: new Set(records.keys()),
     control_service: controlServiceIdentity,
   };
 }
@@ -3626,6 +3639,15 @@ async function openPage(
       "Browser VM lifecycle generation or stream identity already exists",
     );
   }
+  // Runtime owns the default profile per principal. An inherited unresolved
+  // launch keeps that principal's ownership barrier without acquiring effects
+  // in this service instance or preventing another principal from launching.
+  if ([...launchReconciliations.records].some(([key, record]) =>
+    launchReconciliations.inherited_keys.has(key) &&
+    record.state === LAUNCH_SETTLEMENT_PENDING &&
+    record.launch.principal_id === launch.principal_id)) {
+    throw codedError("cleanup_pending", "Browser profile retains unresolved launch ownership from an earlier service instance");
+  }
   recordLaunchReconciliation(
     launchReconciliations,
     launch,
@@ -4894,17 +4916,20 @@ function main() {
       await Promise.allSettled([...pendingLaunchTasks]);
       const childrenAtShutdown = ownedLauncherChildren.size;
       while (true) {
-        // Signal, parent EOF and ordinary Close share the same exact binding,
-        // full terminal receipt and journal. Keep this owner/socket for retries.
+        // Retire this instance's pages through the same exact binding and
+        // journal as ordinary Close. Inherited records keep their profile
+        // barriers; this service owns only its active effects and launchers.
         const retiringVms = new Set(), tasks = [];
-        for (const record of [...launchReconciliations.records.values()]) {
-          const binding = record.cleanup_binding;
-          if (!binding || (record.state === LAUNCH_SETTLEMENT_TERMINAL && !activePages.has(binding.page_id))) continue;
-          const vm = [...activeVms.values()].find(owner => owner.pages.has(binding.page_id));
+        for (const [pageId, page] of [...activePages]) {
+          const record = launchReconciliations.records.get(launchReconciliationKey(
+            page.launch.lifecycle_generation, page.launch.stream_id,
+          ));
+          const binding = record?.cleanup_binding;
+          const vm = [...activeVms.values()].find(owner => owner.pages.has(pageId));
           if (vm && retiringVms.has(vm)) continue;
           if (vm) retiringVms.add(vm);
           tasks.push(shutdownPage(config, controlServiceIdentity, {
-            page_id: binding.page_id, runtime_cleanup: binding, force_retire_vm: true,
+            page_id: pageId, runtime_cleanup: binding, force_retire_vm: true,
           }, activePages, activeVms, launchReconciliations, vm || null));
         }
         const results = await Promise.allSettled(tasks);

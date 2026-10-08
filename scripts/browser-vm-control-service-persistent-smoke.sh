@@ -37,9 +37,12 @@ import vm from "node:vm";
 const source = fs.readFileSync(process.argv[2], "utf8");
 const watcher = source.slice(source.indexOf("export function watchParentPipe("),
   source.indexOf("const CONFIG_ENV =")).replace("export function", "function");
-for (const mode of ["cancel", "early-close", "start-error"]) {
+for (const mode of ["cancel", "early-close", "owned-error", "no-spawn"]) {
   const observer = new EventEmitter(), actions = [];
-  observer.stdio = [null, null, null, { destroy: () => actions.push("cancel-channel") }];
+  if (mode !== "no-spawn") {
+    observer.pid = 12345;
+    observer.stdio = [null, null, null, { destroy: () => actions.push("cancel-channel") }];
+  }
   observer.kill = signal => { actions.push(signal); return true; };
   let ownerLosses = 0;
   const watch = vm.runInNewContext(`${watcher}; watchParentPipe;`, {
@@ -51,18 +54,18 @@ for (const mode of ["cancel", "early-close", "start-error"]) {
     },
   });
   const stop = watch(() => { ownerLosses++; }, 1000);
-  if (mode === "start-error") observer.emit("error", new Error("injected observer spawn failure"));
+  if (mode === "owned-error" || mode === "no-spawn") observer.emit("error", new Error("injected observer failure"));
   if (mode === "early-close") observer.emit("close");
   const pending = stop(); assert.equal(stop(), pending, "one exact observer reap owns cancellation");
   let reaped = false; pending.then(() => { reaped = true; });
-  if (mode !== "early-close") {
+  if (!["early-close", "no-spawn"].includes(mode)) {
     await Promise.resolve();
     assert.equal(reaped, false, "observer cancellation waits for ChildProcess.close");
     observer.emit("close");
   }
   await pending;
   assert.equal(ownerLosses, mode === "cancel" ? 0 : 1, "early/error closure invokes the same shutdown once");
-  assert.deepEqual(actions, mode === "early-close" ? [] : ["cancel-channel", "SIGTERM"]);
+  assert.deepEqual(actions, ["early-close", "no-spawn"].includes(mode) ? [] : ["cancel-channel", "SIGTERM"]);
 }
 const parser = source.slice(source.indexOf("function persistentLauncherReadyLine("),
   source.indexOf("function attachLauncherFailureContext("));
@@ -860,32 +863,36 @@ watcher_program = '''
 const {watchParentPipe} = await import(process.argv[2]);
 let stop;
 const finish = async reason => { await stop(); console.log('DONE '+reason); process.exit(0); };
+if (process.argv[3]) process.execPath = process.argv[3];
 stop = watchParentPipe(() => { void finish('owner-loss'); }, 1000);
 process.on('SIGTERM', () => { void finish('signal'); });
 console.log('READY');
 setInterval(() => {}, 1000);
 '''
-for mode in ('held-writer', 'runtime-eof', 'service-crash'):
+for mode in ('held-writer', 'runtime-eof', 'service-crash', 'observer-no-spawn'):
     reader, writer = os.pipe(); identity = os.fstat(reader)
     original_flags = fcntl.fcntl(reader, fcntl.F_GETFL)
     environment = dict(os.environ, ELASTOS_UPDATE_PARENT_PIPE=
         f'{reader}:{identity.st_dev}:{identity.st_ino & ((1<<64)-1)}')
     # The eval caller has no entry file; the imported service stays a library.
-    service = subprocess.Popen([node, '--input-type=module', '-e', watcher_program, '', service_script],
+    command = [node, '--input-type=module', '-e', watcher_program, '', service_script]
+    if mode == 'observer-no-spawn': command.append(str(root/'missing-observer-node'))
+    service = subprocess.Popen(command,
         env=environment, pass_fds=(reader,), stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sibling = subprocess.Popen([sys.executable, '-c',
         'import os,sys; print("READING",flush=True); assert os.read(int(sys.argv[1]),1) in (b"",b"x")',
         str(reader)], pass_fds=(reader,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     observer_pid = None
     try:
         assert select.select([service.stdout], [], [], 3)[0], 'passive service readiness timed out'
-        assert service.stdout.readline().strip() == 'READY'
+        assert service.stdout.readline().strip() == b'READY'
         assert select.select([sibling.stdout], [], [], 3)[0], 'sibling reader readiness timed out'
         assert sibling.stdout.readline().strip() == 'READING'
-        observers = subprocess.check_output(['pgrep', '-P', str(service.pid)], text=True, timeout=2).split()
-        assert len(observers) == 1, 'passive watcher did not have one exact owned observer'
-        observer_pid = int(observers[0])
+        if mode != 'observer-no-spawn':
+            observers = subprocess.check_output(['pgrep', '-P', str(service.pid)], text=True, timeout=2).split()
+            assert len(observers) == 1, 'passive watcher did not have one exact owned observer'
+            observer_pid = int(observers[0])
         time.sleep(.1)
         assert fcntl.fcntl(reader, fcntl.F_GETFL) == original_flags, 'watcher changed shared reader flags'
         assert sibling.poll() is None, 'a live forwarded sibling reader exited before Runtime EOF'
@@ -893,14 +900,15 @@ for mode in ('held-writer', 'runtime-eof', 'service-crash'):
             os.close(writer); writer = None
         elif mode == 'service-crash':
             service.kill()
-        else:
+        elif mode != 'observer-no-spawn':
             service.send_signal(signal.SIGTERM)
         output, error = service.communicate(timeout=3)
+        output, error = output.decode(), error.decode()
         assert service.returncode == (-signal.SIGKILL if mode == 'service-crash' else 0), error
         if mode != 'service-crash':
-            assert 'DONE '+('owner-loss' if mode == 'runtime-eof' else 'signal') in output
+            assert 'DONE '+('owner-loss' if mode in ('runtime-eof', 'observer-no-spawn') else 'signal') in output
         deadline = time.monotonic()+3
-        while True:
+        while observer_pid is not None:
             try: os.kill(observer_pid, 0)
             except ProcessLookupError: break
             assert time.monotonic() < deadline, 'passive observer survived its service'

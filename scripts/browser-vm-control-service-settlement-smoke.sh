@@ -561,6 +561,26 @@ stop_service() {
   fi
 }
 
+expect_natural_service_stop() {
+  local before="$tmp_dir/natural-stop-journal.json"
+  cp "${service_socket}.launch-reconciliations.json" "$before"
+  kill -TERM "$service_pid"
+  # This assertion owns a three-second natural-exit bound. Trap cleanup after
+  # failure cannot turn an inherited-owner shutdown hang into a passing result.
+  for _ in {1..60}; do
+    kill -0 "$service_pid" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  if kill -0 "$service_pid" >/dev/null 2>&1; then
+    echo "journal-only inherited owner blocked natural service shutdown" >&2
+    return 1
+  fi
+  wait "$service_pid"
+  service_pid=""
+  [[ ! -e "$service_socket" ]]
+  cmp -s "$before" "${service_socket}.launch-reconciliations.json"
+}
+
 client="$tmp_dir/settlement-client.mjs"
 cat > "$client" <<'NODE'
 import crypto from "node:crypto";
@@ -573,7 +593,7 @@ import { isDeepStrictEqual } from "node:util";
 
 const socketPath = process.env.CONTROL_SOCKET;
 const streamId = process.env.STREAM_ID;
-const principalId = "person:local:vm-settlement-smoke";
+const principalId = process.env.PRINCIPAL_ID || "person:local:vm-settlement-smoke";
 const transportEnabled = process.env.TRANSPORT === "1";
 let issuedTransportSecret = null;
 let issuedTransportAuthority = null;
@@ -1291,6 +1311,33 @@ if (process.env.PHASE === "binding-equality") {
   }
   if ((await reconcile(streamId)).state !== "cleanup_pending") {
     throw new Error("stale process identity did not remain pending");
+  }
+  const beforeBlockedOpen = fs.readFileSync(socketPath + ".launch-reconciliations.json");
+  const blockedStream = streamId + "-inherited-blocked";
+  const blocked = await requestRaw("POST", "/pages", openBody(blockedStream));
+  const afterBlocked = await request("GET", "/status");
+  if (blocked.status !== 400 || blocked.body.code !== "cleanup_pending" ||
+      !fs.readFileSync(socketPath + ".launch-reconciliations.json").equals(beforeBlockedOpen) ||
+      afterBlocked.active_pages !== 0 || afterBlocked.active_vms !== 0 || afterBlocked.pending_launches !== 0 ||
+      fs.existsSync(path.join(process.env.PROOF_DIR, blockedStream.replace(/[^A-Za-z0-9_-]/g, "_") + ".pid"))) {
+    throw new Error("inherited principal barrier wrote a new journal record or acquired a child");
+  }
+} else if (process.env.PHASE === "verify-inherited-other-principal") {
+  const journalPath = socketPath + ".launch-reconciliations.json";
+  const before = JSON.parse(fs.readFileSync(journalPath, "utf8")).records
+    .find(record => record.launch.stream_id === process.env.INHERITED_STREAM_ID);
+  if (!before || before.launch.principal_id === principalId) throw new Error("inherited fixture principal is not distinct");
+  const page = await request("POST", "/pages", openBody(streamId));
+  const closed = await request("POST", "/shutdown", runtimeSerializedCloseBody(page));
+  if (closed.terminal !== true || Object.values(closed.effects).some(value => value !== true)) {
+    throw new Error("different principal did not close its exact acquired effects");
+  }
+  const after = JSON.parse(fs.readFileSync(journalPath, "utf8")).records
+    .find(record => record.launch.stream_id === process.env.INHERITED_STREAM_ID);
+  if (after?.state !== "cleanup_pending" || after.terminal_cleanup_receipt !== undefined ||
+      !isDeepStrictEqual(after.launch, before.launch) || !isDeepStrictEqual(after.cleanup_binding, before.cleanup_binding) ||
+      !isDeepStrictEqual(after.launch_settlement_result, before.launch_settlement_result)) {
+    throw new Error("different principal disturbed inherited unresolved ownership");
   }
 } else if (process.env.PHASE === "verify-transport-restart") {
   const page = JSON.parse(fs.readFileSync(process.env.PAGE_FILE, "utf8"));
@@ -2321,9 +2368,54 @@ start_service "$restart_socket" "" "restart-service-second"
 CONTROL_SOCKET="$restart_socket" \
 STREAM_ID="stream:settlement-restart" \
 PAGE_FILE="$restart_page" \
+PROOF_DIR="$proof_dir" \
 PHASE="verify-restart" \
   "$node_bin" "$client"
-stop_service
+CONTROL_SOCKET="$restart_socket" \
+STREAM_ID="stream:settlement-other-principal" \
+INHERITED_STREAM_ID="stream:settlement-restart" \
+PRINCIPAL_ID="person:local:vm-settlement-other" \
+PHASE="verify-inherited-other-principal" \
+  "$node_bin" "$client"
+expect_natural_service_stop
+
+python3 - "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" \
+  "$restart_socket" "$(config_json "$restart_socket")" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+node, script, control, config = sys.argv[1:]
+control = Path(control)
+journal = Path(str(control)+'.launch-reconciliations.json')
+before = journal.read_bytes()
+assert len(before) <= 2*1024**2
+assert any(record['state']=='cleanup_pending' and record.get('cleanup_binding')
+           for record in json.loads(before)['records'])
+reader, writer = os.pipe(); identity = os.fstat(reader)
+environment = dict(os.environ, ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG=config,
+    ELASTOS_UPDATE_PARENT_PIPE=f'{reader}:{identity.st_dev}:{identity.st_ino & ((1<<64)-1)}')
+service = subprocess.Popen([node, script], env=environment, pass_fds=(reader,),
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+os.close(reader)
+try:
+    deadline = time.monotonic()+3
+    while not control.exists():
+        assert service.poll() is None, 'inherited EOF fixture exited before readiness'
+        assert time.monotonic()<deadline, 'inherited EOF fixture readiness timed out'
+        time.sleep(.025)
+    assert journal.read_bytes()==before
+    os.close(writer); writer=None
+    assert service.wait(timeout=3)==0, 'inherited journal blocked natural EOF exit'
+    assert not control.exists(), 'natural EOF shutdown retained the service socket'
+    assert journal.read_bytes()==before, 'natural EOF shutdown changed inherited proof bytes'
+finally:
+    if writer is not None: os.close(writer)
+    if service.poll() is None: service.kill()
+    service.wait(timeout=3); service.stderr.close()
+PY
 
 transport_restart_socket="$tmp_dir/transport-restart-control.sock"
 transport_restart_page="$tmp_dir/transport-restart-page.json"
@@ -2364,6 +2456,7 @@ start_service "$fingerprint_socket" "" "fingerprint-service-second"
 CONTROL_SOCKET="$fingerprint_socket" \
 STREAM_ID="stream:settlement-fingerprint-restart" \
 PAGE_FILE="$fingerprint_page" \
+PROOF_DIR="$proof_dir" \
 PHASE="verify-restart" \
   "$node_bin" "$client"
 stop_service
