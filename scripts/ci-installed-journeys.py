@@ -207,6 +207,7 @@ def run(home, data, evidence, model=True):
         absent_paths = (data / "bin/llama-server", bundle, data / "capsules/llama-server")
         assert all(not path.exists() and not path.is_symlink() for path in absent_paths)
         record["engine_absent"] = True
+        record["engine_absent_after_ui"] = False
     record["disk_before"] = disk_observation(data)
     (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
     require_disk_space(data)
@@ -260,7 +261,8 @@ def run(home, data, evidence, model=True):
             subprocess.run([*command, "--home-only"], env=environment, check=True)
         record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
         if not model:
-            assert all(not path.exists() and not path.is_symlink() for path in absent_paths)
+            record["engine_absent_after_ui"] = all(not path.exists() and not path.is_symlink() for path in absent_paths)
+            assert record["engine_absent_after_ui"]
             assert record["results"]["home_screenshots"] == "passed"
             record["results"]["engine_absent_home"] = "passed"
     finally:
@@ -285,6 +287,8 @@ def run(home, data, evidence, model=True):
         record["elapsed_seconds"] = round(time.monotonic() - started, 2)
         if (evidence / "home-journey.json").exists():
             record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
+        if not model:
+            record["results"]["engine_absent_home"] = "passed" if record["engine_absent_after_ui"] else "failed"
         (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
 
     if record["process_cleanup"]["status"] != "passed":

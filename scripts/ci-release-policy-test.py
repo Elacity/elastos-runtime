@@ -1263,6 +1263,50 @@ class InstalledJourneyTests(unittest.TestCase):
                     journey["fresh_fixture"](home, data, low_disk_home)
                 self.assertFalse(low_disk_home.exists())
 
+    def test_engine_absence_receipt_preserves_post_ui_filesystem_failure(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        for appeared in (None, "alias", "bundle", "capsule"):
+            with self.subTest(appeared=appeared), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "linux")
+                target_home = Path(temp) / "absent"
+                target = journey["fresh_fixture"](home, data, target_home, include_engine=False)
+                _, _, _, bundle = journey["engine_paths"](target)
+                child = mock.Mock(pid=12345)
+                child.poll.return_value = None
+                response = mock.MagicMock()
+                response.__enter__.return_value.status = 200
+
+                def node_journey(command, **_):
+                    self.assertEqual(command[-1], "--home-only")
+                    (evidence / "home-journey.json").write_text(json.dumps({"results": {
+                        "home_screenshots": "passed", "engine_absent_home": "passed"}}))
+                    if appeared == "alias":
+                        (target / "bin/llama-server").write_text("engine appeared during UI")
+                    elif appeared == "bundle":
+                        bundle.mkdir(parents=True)
+                    elif appeared == "capsule":
+                        (target / "capsules/llama-server").mkdir(parents=True)
+
+                with mock.patch.object(subprocess, "check_output", side_effect=lambda args, **_: (
+                        ("c" if args[-1] == "HEAD" else "d") * 40 + "\n")), \
+                        mock.patch.object(subprocess, "Popen", return_value=child), \
+                        mock.patch.object(subprocess, "run", side_effect=node_journey), \
+                        mock.patch("urllib.request.urlopen", return_value=response), \
+                        mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
+                            "capacity_bytes": 100 * 1024 ** 3, "available_bytes": 20 * 1024 ** 3},
+                            "process_rows": lambda: {},
+                            "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}}}):
+                    if appeared:
+                        with self.assertRaises(AssertionError):
+                            journey["run"](target_home, target, evidence, model=False)
+                    else:
+                        journey["run"](target_home, target, evidence, model=False)
+                record = json.loads((evidence / "installed-journeys.json").read_text())
+                self.assertTrue(record["engine_absent"])
+                self.assertEqual(record["engine_absent_after_ui"], appeared is None)
+                self.assertEqual(record["results"]["engine_absent_home"], "failed" if appeared else "passed")
+                self.assertEqual(record["results"]["process_cleanup"], "passed")
+
     def test_engine_receipt_refuses_changed_bytes_and_build_provenance(self):
         journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
         for fault in ("bytes", "recipe", "duplicate"):
@@ -1490,7 +1534,7 @@ class InstalledModelTimingTests(unittest.TestCase):
     def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
         shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
         source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
-        for failure in (None, "missing", "candidate", "reply"):
+        for failure in (None, "missing", "candidate", "reply", "absence"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 _, data, _, _ = InstalledJourneyTests().fixture(root, "macos")
@@ -1518,7 +1562,8 @@ class InstalledModelTimingTests(unittest.TestCase):
                 (absent / "installed-journeys.json").write_text(json.dumps({
                     **identities, "candidate": "c" * 40, "source_tree": "d" * 40, "engine_absent": True,
                     "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
-                    "results": {name: "passed" for name in ("engine_absent_home", "home_screenshots", "process_cleanup", "disk_reserve")}}))
+                    "results": {name: "failed" if failure == "absence" and name == "engine_absent_home" else "passed"
+                                for name in ("engine_absent_home", "home_screenshots", "process_cleanup", "disk_reserve")}}))
                 with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
                         mock.patch.object(sys, "platform", "darwin"), \
                         mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), \
@@ -1529,9 +1574,12 @@ class InstalledModelTimingTests(unittest.TestCase):
                     else:
                         exec(compile(source, "installed-summary", "exec"), {})
                 result = json.loads((root / "core-summary.json").read_text())
-                self.assertEqual(result["model_timing_spread"]["status"], "incomplete" if failure else "complete")
+                self.assertEqual(result["model_timing_spread"]["status"],
+                                 "incomplete" if failure in ("missing", "candidate", "reply") else "complete")
                 if failure == "reply":
                     self.assertEqual(result["results"]["installed_runtime_reply"], "failed or not run")
+                if failure == "absence":
+                    self.assertEqual(result["results"]["engine_absent_home"], "failed or not run")
                 summary = (root / "summary.md").read_text()
                 self.assertIn("OS file cache can warm", summary)
                 if not failure:
