@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFileSync, statfsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { applyRunEventsPage, terminalOutputText } from "../capsules/assistant/browser/model-contract.js";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
@@ -135,9 +136,10 @@ try {
     const terminalResponse = page.waitForResponse(async response => {
       if (!response.url().endsWith("/api/provider/model/runs_events") || response.request().frame() !== assistant) return false;
       const created = await (await createdResponse).json();
-      if (response.request().postDataJSON()?.run_id !== created.data?.run_id) return false;
+      const request = response.request().postDataJSON();
+      if (request?.run_id !== created.data?.run_id) return false;
       const body = await response.json();
-      return body.data?.events?.some(event => ["completed", "failed", "cancelled", "settlement_unknown"].includes(event.kind));
+      return Boolean(applyRunEventsPage(body.data, request.after_sequence).terminal);
     }, { timeout: 150000 });
     terminalResponse.catch(() => {});
     await assistant.locator("#agent-composer-input").fill("Say hello in one sentence.");
@@ -156,8 +158,9 @@ try {
     const finishedResponse = await terminalResponse;
     assert(finishedResponse.ok());
     const finished = await finishedResponse.json();
-    const terminal = finished.data.events.find(event => ["completed", "failed", "cancelled", "settlement_unknown"].includes(event.kind));
-    assert.equal(terminal.kind, "completed", "installed Runtime completes the visible Assistant turn");
+    const terminal = applyRunEventsPage(finished.data, finishedResponse.request().postDataJSON().after_sequence).terminal;
+    assert.equal(terminal?.status, "completed", "installed Runtime completes the visible Assistant turn");
+    assert(terminal.outputRetained !== false && terminalOutputText(terminal.output).trim().length > 0, "Runtime retains the real local reply");
     await assistant.locator('.agent-msg-agent [data-regenerate]:enabled').last().waitFor({ state: "visible", timeout: 10000 });
     const text = (await assistant.locator(".agent-msg-agent .agent-msg-body").last().innerText()).trim();
     assert(text.length > 0, "Assistant displays the real local reply");
