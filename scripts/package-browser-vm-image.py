@@ -39,6 +39,20 @@ class PackageWriter:
         return written
 
 
+class PayloadReader:
+    """Bind the image receipt to the bytes that enter the archive."""
+    def __init__(self, source):
+        self.source = source
+        self.size = 0
+        self.sha256 = hashlib.sha256()
+
+    def read(self, size=-1):
+        data = self.source.read(size)
+        self.size += len(data)
+        self.sha256.update(data)
+        return data
+
+
 def digest(path):
     result = hashlib.sha256()
     with path.open("rb") as source:
@@ -80,6 +94,9 @@ def package(image, platform, archive, manifest_output, release_path):
     for group in ("required", "optional_audio"):
         portable["preflight"][group] = {name: {"ok": entry["ok"]} for name, entry in preflight[group].items()}
     receipt_bytes = (json.dumps(portable, sort_keys=True, indent=2) + "\n").encode()
+    payload_records = {"rootfs.ext4": receipt, "vmlinux": receipt["kernel"], "initrd": receipt["initrd"],
+                       "browser-vm-rootfs-manifest.json": {"size": len(receipt_bytes),
+                                                          "sha256": hashlib.sha256(receipt_bytes).hexdigest()}}
     archive.parent.mkdir(parents=True, exist_ok=True)
     manifest_output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".browser-image-package-", dir=archive.parent) as temp:
@@ -89,10 +106,13 @@ def package(image, platform, archive, manifest_output, release_path):
                 for name, source in sorted(files.items()):
                     content = io.BytesIO(receipt_bytes) if name == "browser-vm-rootfs-manifest.json" else source.open("rb")
                     with content:
-                        size = len(receipt_bytes) if name == "browser-vm-rootfs-manifest.json" else source.stat().st_size
+                        record = payload_records[name]
                         info = tarfile.TarInfo("browser-vm-image/" + name)
-                        info.mode, info.size, info.mtime = 0o644, size, 0
-                        tar.addfile(info, content)
+                        info.mode, info.size, info.mtime = 0o644, record["size"], 0
+                        payload = PayloadReader(content)
+                        tar.addfile(info, payload)
+                        if payload.size != record["size"] or payload.sha256.hexdigest() != record["sha256"]:
+                            raise ValueError("source image changed during packaging: " + name)
         # Recheck source hashes after reading: a concurrent build cannot silently
         # turn the archive into a mixed image set.
         for name, entry in (("rootfs.ext4", receipt), ("vmlinux", receipt["kernel"]), ("initrd", receipt["initrd"])):
