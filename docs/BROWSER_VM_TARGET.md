@@ -509,10 +509,11 @@ These target steps prove installed behavior. Root-free source tests establish
 command construction and refusal, and leave target media acceptance to this
 operator journey.
 
-`components.json` currently owns the packaged provider binaries such as
-`browser-engine-adapter`, `browser-engine-supervisor`, `browser-stream-bridge`,
-and `browser-local-exit`. It does not currently own the source-home Browser VM
-helper script wrappers or VM guest artifacts.
+`components.json` owns the signed provider binaries, including
+`browser-engine-adapter` and `browser-local-exit`, the VM host helper closure,
+managed dependencies and shared ARM64 guest image. Normal Runtime setup admits
+that closure before launch. The host-native supervisor and stream bridge remain
+test tools; the guest retains its network wrapper through the image recipe.
 
 Full source-home setup installs the Runtime at the stable platform data-root
 path `bin/elastos` and writes

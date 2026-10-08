@@ -336,8 +336,8 @@ The real Browser surface negotiates an explicit display session:
 }
 ```
 
-For hosted Home and source-home VM launches, `webrtc_remote_display` is the
-product target. For local launcher/mobile hosts, `native_surface` is the product target.
+The production VM Engine returns `webrtc_remote_display` for local and remote
+viewers. Retained native adapter experiments use `native_surface` in test-only builds.
 Each Browser Engine Adapter must declare its supported display modes in operator
 config. Runtime passes exactly the requested mode to the adapter, and the
 adapter must return the same mode in `display_session`; mismatches fail closed.

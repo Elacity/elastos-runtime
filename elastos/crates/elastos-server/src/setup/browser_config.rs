@@ -92,18 +92,43 @@ pub(super) async fn ensure_host_components(
 }
 
 pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<bool> {
+    local_vm_selected_with_override(
+        data,
+        platform,
+        std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn read_engine_selection(data: &Path, inline: Option<&str>) -> anyhow::Result<Option<serde_json::Value>> {
+    if let Some(raw) = inline {
+        return Ok(Some(serde_json::from_str(raw)?));
+    }
+    let path = data.join("config/browser-engine-adapter.json");
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && path.symlink_metadata().is_err() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn local_vm_selected_with_override(
+    data: &Path,
+    platform: &str,
+    inline: Option<&str>,
+) -> anyhow::Result<bool> {
     if !matches!(platform, "darwin-arm64" | "linux-arm64") {
         return Ok(false);
     }
-    let path = std::env::var_os("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data.join("config/browser-engine-adapter.json"));
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error.into()),
+    let Some(config) = read_engine_selection(data, inline)? else {
+        return Ok(true);
     };
-    let config: serde_json::Value = serde_json::from_slice(&bytes)?;
     Ok(config["adapters"].as_array().is_some_and(|adapters| {
         adapters.iter().any(|adapter| {
             let supervisor = &adapter["supervisor"];
@@ -161,13 +186,12 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
     ensure_viewer_ingress(data)?;
     // Existing Engine/Exit selection belongs to the Home owner, including a
     // remote Engine. Setup initializes a fresh selection only.
-    if config
-        .join("browser-engine-adapter.json")
-        .symlink_metadata()
-        .is_ok()
-    {
-        let existing: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.join("browser-engine-adapter.json"))?)?;
+    if let Some(existing) = read_engine_selection(
+        data,
+        std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
+            .ok()
+            .as_deref(),
+    )? {
         if existing["adapters"].as_array().is_some_and(|adapters| {
             adapters
                 .iter()
@@ -480,6 +504,27 @@ mod tests {
         assert_eq!(config["adapters"], serde_json::json!([]));
         assert!(crate::carrier::browser_engine_media::configuration_ready(data).is_ok());
         assert!(!data.join("bin").exists());
+    }
+
+    #[test]
+    fn inline_engine_selection_is_json_and_overrides_the_owner_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let local = r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/local"}}]}"#;
+        fs::create_dir_all(data.join("config")).unwrap();
+        let file = data.join("config/browser-engine-adapter.json");
+        fs::write(&file, local).unwrap();
+        assert!(local_vm_selected_with_override(data, "linux-arm64", None).unwrap());
+        for inline in [
+            r#"{"adapters":[]}"#,
+            r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/browser-vm-remote-vz-launcher"}}]}"#,
+        ] {
+            assert!(!local_vm_selected_with_override(data, "linux-arm64", Some(inline)).unwrap());
+            assert!(!local_vm_selected_with_override(data, "darwin-arm64", Some(inline)).unwrap());
+        }
+        assert!(local_vm_selected_with_override(data, "linux-arm64", Some(local)).unwrap());
+        assert!(local_vm_selected_with_override(data, "linux-arm64", Some("invalid")).is_err());
+        assert_eq!(fs::read_to_string(file).unwrap(), local);
     }
 
     #[test]
