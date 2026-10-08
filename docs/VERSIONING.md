@@ -167,7 +167,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
    succeeded and that its source is on `develop` (merge an open pull request
    first), downloads and verifies all three platform artifacts, and passes one
-   `--platform-input PLATFORM=DIR` per platform. For a Mac-only preview, run
+   `--platform-input PLATFORM=DIR` per platform. Prepare also requires successful
+   CI at that exact source commit, from a `develop` push or `develop` merge group,
+   with every required job completed successfully. For a Mac-only preview, run
    `scripts/release-publish.sh prepare RUN_ID VERSION aarch64-darwin`. The Mac
    coordinator requires `aarch64-darwin` in every selection; only a single
    platform uses `--preview-platform`. Prepare checks out the exact source as
@@ -181,14 +183,21 @@ the version by the contract change (see Meaning) and update the changelog first;
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every
-   hash, stop the service, run the preflight, import, and start the service. An import run
-   while the service is stopped ends with the known gossip error
-   `No running runtime found` after the commit, and the sequence accepts only
-   that error.
+   hash, stop the service, run the preflight, import, and start the service.
+   The import sends no gossip. Older seed Runtimes still print `No running
+   runtime found` after the commit; that is expected, and the sequence accepts
+   only that error.
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull
    request's CI update journey then starts from this release.
+
+The seed only answers requests. It serves three Carrier ops: `release_head`
+(the signed head), `content_fetch` (any object by CID, from its Kubo pins) and
+`file` (a file by name, for older Homes and for parts without a CID). It keeps
+every published release pinned, so Undo and older Homes keep working. It does
+not push or notify anything. How Homes check and install is in
+[INSTALL.md](INSTALL.md#how-updates-reach-your-home).
 
 Upgrading the seed Runtime itself is rare. Run the workflow with
 `seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints

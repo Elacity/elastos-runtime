@@ -184,17 +184,49 @@ Refresh-only is not sufficient for package/dependency changes: rebuild the targe
 `scripts/browser-vm-artifact-preflight.sh`, including the complete
 PipeWire/WirePlumber/GStreamer dependency set, before installation.
 
-## Update
+## How updates reach your Home
+
+Updates are pull only. Nothing is pushed to your Home. The publisher's seed
+keeps the signed release, and your Home asks for it.
+
+**When Home checks.** Home checks only while its System page is open. System
+asks every 5 seconds while it is visible (every 2 seconds while Home restarts)
+and every 30 seconds while it is hidden, and the Runtime reuses a check that is
+less than 30 seconds old. Home does not check when the Runtime starts, on a
+timer or when System is closed. Home itself shows no update badge yet; open
+System to see an update.
+
+**What a check does.** The Runtime opens one Carrier connection to the trusted
+source saved in `sources.json` during install. It asks for the latest signed
+release head, fetches the head and the release by CID (a source that gives no
+separate head CID sends the head file by name), and checks both signatures, the
+release hash, the channel and the version order. An older
+release is refused. The `gateways`, `discovery_uri` and `ipns_name` fields in
+`sources.json` are shown but not used to find updates. If the Carrier
+connection fails, the check fails.
+
+**What System shows.** System shows the new version and its release notes.
+
+**Approve and restart.** You approve the update with your passkey for that
+exact release. The Runtime downloads the binary and components by CID over
+Carrier (a component listed without a CID comes by its release name), stages
+everything beside the running Home and restarts Home. A download fails only
+after 30 seconds without data.
+
+**If it fails.** If the new release does not start, the previous release is
+restored.
+
+**Terminal.** From a terminal, check or install in place:
 
 ```bash
-elastos update
 elastos update --check
+elastos update
 ```
 
-`elastos update` discovers newer signed releases through the trusted source
-created during install.
+`elastos upgrade` does the same as `elastos update`. HTTP is used only when you
+pass `--gateway` or `--no-p2p`, and by the first download in `install.sh`.
 
-Runtime consumes the verified signed pair in `installation/release-head.json`
+Runtime keeps the verified signed pair in `installation/release-head.json`
 and `installation/release.json` within its data directory. Publisher owns its
 separate publication files. For an older installation, Runtime migrates the
 signed pair after it verifies the trusted source, binary, components and installed
@@ -208,12 +240,16 @@ another channel, a pending Home update, a second writer and an installed Runtime
 without a readable `sources.json`. Until an interrupted install is restored,
 Home does not start and asks you to run `install.sh` again.
 
+How releases get to the seed is in
+[VERSIONING.md](VERSIONING.md#publishing-a-release).
+
 ### Undo an update
 
-Use Undo if an update causes a problem and you need the previous release. Before
-an update, run `elastos source show` and save the full `Head CID:` value. That
-command shows the current head; after the update, it shows the new head. If it
-shows `unknown`, get the previous signed head CID from the publisher.
+Use Undo if an update causes a problem and you need the previous release. Undo
+is in the terminal only. Before an update, run `elastos source show` and save
+the full `Head CID:` value. That command shows the current head; after the
+update, it shows the new head. If it shows `unknown`, get the previous signed
+head CID from the publisher.
 
 To restore the previous release, run:
 
@@ -222,8 +258,10 @@ elastos update --rollback-to <previous head CID>
 ```
 
 Replace `<previous head CID>` with the saved CID. A plain update to an older
-release is refused. Undo keeps your identity, accounts, and user data, including
-data written after the update.
+release is refused. Undo needs the network: it fetches the changed parts of the
+previous release again by CID from the trusted source, so the source must be
+reachable. Undo keeps your identity, accounts, and user data, including data
+written after the update.
 
 For a legacy Home, the first update to a new publisher key uses the installer's
 re-trust step. After that step, Undo accepts only heads signed by the current
