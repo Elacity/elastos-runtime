@@ -4496,6 +4496,13 @@ fn copy_stream_until_done<R: Read, W: Write>(
                                     | ErrorKind::TimedOut
                                     | ErrorKind::Interrupted
                             ) => {}
+                        // Shutdown can retire the shared socket during a blocked write.
+                        Err(error)
+                            if error.kind() == ErrorKind::BrokenPipe
+                                && shutdown.load(Ordering::Relaxed) =>
+                        {
+                            return Ok(copied);
+                        }
                         Err(error) => return Err(error.to_string()),
                     }
                 }
@@ -6378,6 +6385,62 @@ mod tests {
     }
 
     #[test]
+    fn bridge_copy_reconciles_shutdown_during_broken_pipe_write() {
+        struct FailingWriter<'a> {
+            shutdown: &'a AtomicBool,
+            shutdown_during_write: bool,
+            errno: libc::c_int,
+            accepted: Vec<u8>,
+        }
+
+        impl Write for FailingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.accepted.is_empty() {
+                    let written = bytes.len().min(2);
+                    self.accepted.extend_from_slice(&bytes[..written]);
+                    return Ok(written);
+                }
+                if self.shutdown_during_write {
+                    self.shutdown.store(true, Ordering::Relaxed);
+                }
+                Err(std::io::Error::from_raw_os_error(self.errno))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (errno, shutdown_during_write, peer_done) in [
+            (libc::EPIPE, true, false),
+            (libc::EPIPE, false, false),
+            (libc::EPIPE, false, true),
+            (libc::EIO, true, false),
+        ] {
+            let shutdown = AtomicBool::new(false);
+            let done = AtomicBool::new(peer_done);
+            let mut reader = std::io::Cursor::new(b"payload");
+            let mut writer = FailingWriter {
+                shutdown: &shutdown,
+                shutdown_during_write,
+                errno,
+                accepted: Vec::new(),
+            };
+            let result = copy_stream_until_done(&mut reader, &mut writer, &done, &shutdown);
+            assert_eq!(writer.accepted, b"pa");
+            if errno == libc::EPIPE && shutdown_during_write {
+                assert_eq!(result, Ok(2), "cancelled in-flight write: {result:?}");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(std::io::Error::from_raw_os_error(errno).to_string()),
+                    "errno={errno}, shutdown={shutdown_during_write}, peer_done={peer_done}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bridge_shutdown_joins_idle_peers_without_guest_eof() {
         let (mut guest_client, guest_bridge) = UnixStream::pair().unwrap();
         let (mut runtime_client, runtime_bridge) = UnixStream::pair().unwrap();
@@ -6456,8 +6519,9 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         producer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(worker.join().unwrap().is_ok());
+        let result = worker.join().unwrap();
         producer.join().unwrap();
+        assert!(result.is_ok(), "shutdown bridge failed: {result:?}");
         assert!(
             backpressured,
             "fixture did not reach a blocked bridge write"
