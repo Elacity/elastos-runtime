@@ -231,6 +231,10 @@ struct VzLaunchOwner {
     profile_disk: Option<PreparedBrowserProfileDisk>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One sequential startup task owns one result; keeping CapsuleHandle inline avoids a separate allocation"
+)]
 enum StartupValue {
     Unit,
     Handle(CapsuleHandle),
