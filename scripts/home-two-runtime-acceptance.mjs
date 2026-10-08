@@ -23,12 +23,13 @@
 //   node scripts/home-two-runtime-acceptance.mjs
 
 import { execSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 
 import {
   assertRecoverySetupEvidence,
+  assertRecoveryBundleEvidence,
   assertDistinctProfileContactEvidence,
   assertDistinctRuntimeEvidence,
   assertExactDirectConversation,
@@ -228,6 +229,13 @@ async function ensureAccount(side) {
   assertOk(completion.ok(), `${side.prefix}: passkey registration failed`, {
     status: completion.status(),
   });
+  const verified = await completion.json();
+  assertOk(verified?.schema === "elastos.auth.passkey.verify/v2"
+    && typeof verified.principal_id === "string" && verified.principal_id.length > 0
+    && verified.profile_readiness?.schema === "elastos.profile.readiness/v1"
+    && verified.profile_readiness.status === "ready",
+  `${side.prefix}: signup did not create a ready signed Profile`);
+  side.signupPrincipalId = verified.principal_id;
   const credentials = await persistCredentials(side);
   assertOk(credentials === 1, `${side.prefix}: fresh enrollment did not create exactly one passkey`, { credential_count: credentials });
   side.hasStoredCredential = true;
@@ -302,6 +310,15 @@ async function openAppWindow(side, target) {
     await signIn(side);
   }
   const homeGuiFrame = await waitForFrame(side, "home-gui");
+  if (target === "system" && await homeGuiFrame.locator("#setup-sheet:not(.is-yielded)").isVisible()) {
+    const saveRecoveryKit = homeGuiFrame.locator("#setup-sheet-recovery");
+    assertOk(
+      (await saveRecoveryKit.innerText()).trim() === "Save Recovery Kit",
+      `${side.prefix}: fresh Home Welcome did not offer Save Recovery Kit`,
+    );
+    await saveRecoveryKit.click();
+    return waitForAppWindow(side, target);
+  }
   await homeGuiFrame.locator("#launcher-toggle").click();
   const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
   await card.waitFor({ state: "visible", timeout: 10_000 });
@@ -381,114 +398,110 @@ async function peopleSnapshot(frame) {
   });
 }
 
-async function peopleReadiness(frame) {
-  return frame.evaluate(async () => {
-    const token = new URLSearchParams(window.location.hash.replace(/^#/, ""))
-      .get("home_token") || "";
-    if (!token) {
-      return { status: "", schema: "" };
-    }
-    const response = await fetch("/api/apps/people/summary", {
+async function homeRecoveryState(side, systemFrame = null) {
+  const home = await side.page.evaluate(async () => {
+    const response = await fetch("/api/apps/home/summary", { credentials: "same-origin" });
+    if (!response.ok) throw new Error(`Home Recovery acceptance read failed: HTTP ${response.status}`);
+    const home = await response.json();
+    return {
+      signedIn: home?.authority?.signed_in === true,
+      profileSchema: home?.identity?.profile_readiness?.schema || "",
+      profileStatus: home?.identity?.profile_readiness?.status || "",
+      profileName: home?.identity?.profile?.display_name || "",
+      recoverySchema: home?.identity?.recovery_readiness?.schema || "",
+      recoveryStatus: home?.identity?.recovery_readiness?.status || "",
+    };
+  });
+  if (!systemFrame) return home;
+  const recovery = await systemFrame.evaluate(async () => {
+    const token = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+    if (!token) throw new Error("Recovery acceptance requires the launched System window");
+    const response = await fetch("/api/auth/recovery/status", {
       credentials: "same-origin",
       headers: { "x-elastos-home-token": token },
     });
-    if (!response.ok) {
-      return { status: "", schema: "" };
-    }
-    const summary = await response.json();
-    const readiness = summary?.identity?.profile_readiness;
+    if (!response.ok) throw new Error(`System Recovery acceptance read failed: HTTP ${response.status}`);
+    const recovery = await response.json();
     return {
-      schema: typeof readiness?.schema === "string" ? readiness.schema.trim() : "",
-      status: typeof readiness?.status === "string" ? readiness.status.trim() : "",
+      archiveSchema: recovery?.schema || "",
+      principalId: recovery?.principal_id || "",
+      localhostRoot: recovery?.localhost_root || "",
+      rootEncrypted: recovery?.root_encrypted === true,
+      recoveryConfigured: recovery?.recovery_configured === true,
+      archiveAvailable: recovery?.recovery_download_available === true,
+      profileCovered: Array.isArray(recovery?.required_actions)
+        && !recovery.required_actions.includes("download_recovery_kit_with_profile"),
     };
   });
+  return { ...home, ...recovery };
 }
 
-async function completeRecoverySetup(side, peopleFrame) {
-  const before = await peopleReadiness(peopleFrame);
-  assertOk(
-    before.schema === "elastos.profile.readiness/v1" && before.status === "setup_required",
-    `${side.prefix}: fresh Home did not begin in setup_required Profile readiness`,
-    before,
-  );
-  await peopleFrame.locator("#profile-name").fill(side.name);
-  const blockedSave = side.page.waitForResponse((response) => (
-    response.request().method() === "POST"
-      && response.url().endsWith("/api/apps/people/profile")
-  ), { timeout: 30_000 });
-  blockedSave.catch(() => {});
-  await peopleFrame.evaluate(() => {
-    document.querySelector("#profile-submit")?.click();
-  });
-  const blockedResponse = await blockedSave;
-  const blockedBody = await blockedResponse.json().catch(() => ({}));
-  assertOk(
-    blockedResponse.status() === 409
-      && blockedBody?.schema === "elastos.people.profile-protection-required/v1"
-      && blockedBody?.status === "recovery_required"
-      && blockedBody?.action_target === "system",
-    `${side.prefix}: first Profile save did not fail with the exact Recovery-required result`,
-    {
-      status: blockedResponse.status(),
-      body: blockedBody,
-    },
-  );
-  const systemFramePromise = waitForFrame(side, "system", 30_000);
-  await peopleFrame.evaluate(() => {
-    document.querySelector("#profile-submit")?.click();
-  });
-  const systemFrame = await systemFramePromise;
-  await systemFrame.evaluate(() => {
-    const button = document.querySelector('button[data-settings="security"]');
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error("System security button is missing");
-    }
-    button.click();
-  });
-  await systemFrame.locator('button[data-settings="security"].active').waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await systemFrame.locator('#recovery-download').waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  const downloadTarget = recoveryDownloadPath(side);
-  mkdirSync(join(side.fixture.dataRoot, "acceptance-recovery"), {
-    recursive: true,
-    mode: 0o700,
-  });
+async function completeRecoverySetup(side) {
+  const before = await homeRecoveryState(side);
+  assertOk(before.signedIn
+    && before.profileSchema === "elastos.profile.readiness/v1" && before.profileStatus === "ready"
+    && before.profileName === `${side.name} Admin`
+    && before.recoverySchema === "elastos.recovery.readiness/v1" && before.recoveryStatus === "setup_required",
+  `${side.prefix}: fresh signup did not create its consented Profile with Recovery still required`);
+  const homeGuiFrame = await waitForFrame(side, "home-gui");
+  await homeGuiFrame.locator("#setup-sheet:not(.is-yielded)").waitFor({ state: "visible", timeout: 30_000 });
+  let downloads = 0;
+  const countDownload = () => { downloads += 1; };
+  side.page.on("download", countDownload);
   const downloadPromise = side.page.waitForEvent("download", { timeout: 45_000 });
-  await systemFrame.evaluate(() => {
-    const button = document.querySelector("#recovery-download");
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error("System Recovery download button is missing");
-    }
-    button.click();
-  });
-  const download = await downloadPromise;
-  await download.saveAs(downloadTarget);
-  chmodSync(downloadTarget, 0o600);
-  const bundle = JSON.parse(readFileSync(downloadTarget, "utf8"));
-  assertOk(
-    bundle?.schema === "elastos.full-recovery-bundle/v1",
-    `${side.prefix}: Recovery download did not produce the expected bundle`,
-    { schema: bundle?.schema || "", suggested: download.suggestedFilename() },
-  );
-  const after = await poll(`${side.prefix}: Recovery changes Profile readiness`, 30_000, 500, async () => {
-    const current = await peopleReadiness(peopleFrame);
+  downloadPromise.catch(() => {});
+  try {
+    const [systemFrame, download] = await Promise.all([
+      openAppWindow(side, "system"),
+      downloadPromise,
+    ]);
+    await systemFrame.locator('button[data-settings="security"].active').waitFor({
+      state: "visible", timeout: 10_000,
+    });
+    const downloadTarget = recoveryDownloadPath(side);
+    mkdirSync(join(side.fixture.dataRoot, "acceptance-recovery"), { recursive: true, mode: 0o700 });
+    await download.saveAs(downloadTarget);
+    chmodSync(downloadTarget, 0o600);
+    const bytes = statSync(downloadTarget).size;
+    assertOk(bytes > 0 && bytes <= 8 * 1024 * 1024, `${side.prefix}: Recovery Kit size is invalid`);
+    let bundle;
+    try { bundle = JSON.parse(readFileSync(downloadTarget, "utf8")); }
+    catch { fail(`${side.prefix}: Recovery Kit is not valid JSON`); }
+    const after = await poll(`${side.prefix}: saved Recovery Kit is ready`, 30_000, 500, async () => {
+      const current = await homeRecoveryState(side, systemFrame);
+      return {
+        done: current.recoverySchema === "elastos.recovery.readiness/v1" && current.recoveryStatus === "ready"
+          && current.rootEncrypted && current.recoveryConfigured && current.archiveAvailable && current.profileCovered,
+        value: current,
+      };
+    });
+    assertOk(after.signedIn && after.archiveSchema === "elastos.principal.root-recovery.status/v1"
+      && after.principalId === side.signupPrincipalId && after.localhostRoot.startsWith("localhost://Users/")
+      && after.profileSchema === "elastos.profile.readiness/v1" && after.profileStatus === "ready"
+      && after.profileName === before.profileName,
+    `${side.prefix}: Recovery export changed the signup account or Profile`);
+    const proof = assertRecoveryBundleEvidence(bundle, {
+      principalId: side.signupPrincipalId,
+      localhostRoot: after.localhostRoot,
+      profileName: before.profileName,
+    });
+    // Home exposes the Profile name. Mutual accepted contacts later bind this
+    // private Recovery identity through Runtime's opaque contact projection.
+    side.recoveryProfileDid = bundle.people_identity.profile_authority_bundle.signed_profile.payload.profile_did;
+    assertOk(downloads === 1, `${side.prefix}: Welcome did not save exactly one Recovery Kit`, { download_count: downloads });
     return {
-      done: current.schema === "elastos.profile.readiness/v1" && current.status === "setup_required",
-      value: current,
+      download_count: downloads,
+      download_path: downloadTarget,
+      profile_status: after.profileStatus,
+      profile_name: after.profileName,
+      before_recovery_status: before.recoveryStatus,
+      after_recovery_status: after.recoveryStatus,
+      ...proof,
+      archive_available: after.archiveAvailable,
     };
-  });
-  return {
-    download_count: 1,
-    download_path: downloadTarget,
-    before_status: before.status,
-    blocked_status: blockedBody.status,
-    after_status: after.status,
-  };
+  } finally {
+    side.page.off("download", countDownload);
+  }
 }
 
 async function saveProfile(side, frame, name) {
@@ -1235,6 +1248,14 @@ async function main() {
       return { a: aEnrollment, b: bEnrollment, enrollment_surface: "home_owner_passkey" };
     });
 
+    await runLeg(report, "system_recovery_after_signup", "save each signup Profile in a Recovery Kit from Welcome", async () => {
+      const evidence = {
+        a: await completeRecoverySetup(a),
+        b: await completeRecoverySetup(b),
+      };
+      return assertRecoverySetupEvidence(CONFIG, evidence);
+    });
+
     let aDeviceDid;
     let bDeviceDid;
     await runLeg(report, "distinct_runtime_instances", "prove two distinct fixture Runtimes in System", async () => {
@@ -1255,14 +1276,6 @@ async function main() {
       ]);
       assertFreshFixturePrecondition(aSnapshot.contacts, bSnapshot.contacts);
       return { a_contacts: 0, b_contacts: 0 };
-    });
-
-    await runLeg(report, "system_recovery_before_profile", "complete System Recovery on both fresh Homes", async () => {
-      const evidence = {
-        a: await completeRecoverySetup(a, aPeople),
-        b: await completeRecoverySetup(b, bPeople),
-      };
-      return assertRecoverySetupEvidence(CONFIG, evidence);
     });
 
     await runLeg(report, "distinct_profile_names", "save two distinct Profile names", async () => {
@@ -1338,8 +1351,8 @@ async function main() {
     });
 
     await runLeg(report, "distinct_profile_identities", "prove distinct Profile identities through opaque contacts", async () => {
-      assertDistinctProfileContactEvidence(aContactId, bContactId);
-      return { a_contact_id: aContactId, b_contact_id: bContactId };
+      const binding = assertDistinctProfileContactEvidence(aContactId, bContactId, a.recoveryProfileDid, b.recoveryProfileDid);
+      return { a_contact_id: aContactId, b_contact_id: bContactId, ...binding };
     });
 
     let aDirect;

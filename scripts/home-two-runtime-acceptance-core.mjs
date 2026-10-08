@@ -5,13 +5,14 @@ import {
   openSync,
   readFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
 export const REQUIRED_ACCEPTANCE_LEGS = Object.freeze([
   "provisioning_and_sign_in",
+  "system_recovery_after_signup",
   "distinct_runtime_instances",
   "fresh_fixture_precondition",
-  "system_recovery_before_profile",
   "distinct_profile_names",
   "overlapping_opt_in_discovery",
   "exactly_one_contact_request",
@@ -290,7 +291,7 @@ export function assertDistinctRuntimeEvidence(aDeviceDid, bDeviceDid, config) {
   }
 }
 
-export function assertDistinctProfileContactEvidence(aContactId, bContactId) {
+export function assertDistinctProfileContactEvidence(aContactId, bContactId, aRecoveryProfileDid, bRecoveryProfileDid) {
   if (
     typeof aContactId !== "string"
     || typeof bContactId !== "string"
@@ -300,6 +301,14 @@ export function assertDistinctProfileContactEvidence(aContactId, bContactId) {
   ) {
     throw new AcceptanceEvidenceError("opaque contact projections do not prove distinct Profile identities");
   }
+  const contactId = (profileDid) => `contact:${createHash("sha256")
+    .update(`elastos.people.contact.v1:${profileDid}`).digest("hex").slice(0, 24)}`;
+  if (!isDidKey(aRecoveryProfileDid) || !isDidKey(bRecoveryProfileDid)
+    || aContactId !== contactId(bRecoveryProfileDid)
+    || bContactId !== contactId(aRecoveryProfileDid)) {
+    throw new AcceptanceEvidenceError("opaque contact projections do not bind both Recovery Profiles");
+  }
+  return { recovery_profile_binding_checked: true };
 }
 
 export function assertRestartTransition({ before, after, side, systemDeviceDid }) {
@@ -374,15 +383,48 @@ export function assertFreshFixturePrecondition(aContacts, bContacts) {
   }
 }
 
+export function assertRecoveryBundleEvidence(bundle, expected) {
+  if (!expected.principalId || !expected.localhostRoot || !expected.profileName
+    || bundle?.schema !== "elastos.full-recovery-bundle/v1"
+    || bundle.principal_id !== expected.principalId
+    || bundle.localhost_root !== expected.localhostRoot
+    || bundle.included?.data_kit !== true
+    || bundle.data_kit?.schema !== "elastos.recovery-kit/v1"
+    || bundle.data_kit.principal_id !== expected.principalId
+    || bundle.data_kit.localhost_root !== expected.localhostRoot) {
+    throw new AcceptanceEvidenceError("Recovery Kit does not contain the current principal's bound data kit");
+  }
+  const identity = bundle.people_identity;
+  const authority = identity?.profile_authority_bundle;
+  const signed = authority?.signed_profile;
+  const profile = signed?.payload;
+  if (bundle.included?.people_identity !== true
+    || identity?.schema !== "elastos.people.recovery-identity/v1"
+    || authority?.schema !== "elastos.profile-authority-bundle/v1"
+    || !/^[0-9a-f]{64}$/.test(authority.profile_signing_seed_hex || "")
+    || profile?.schema !== "elastos.profile-document/v1"
+    || !isDidKey(profile.profile_did)
+    || signed.signer_did !== profile.profile_did
+    || !/^[0-9a-f]{128}$/.test(signed.signature || "")
+    || profile.display_name !== expected.profileName) {
+    throw new AcceptanceEvidenceError("Recovery Kit does not include the signed Profile created by signup");
+  }
+  return { principal_binding_checked: true, profile_included: true };
+}
+
 export function assertRecoverySetupEvidence(config, evidence) {
   exactObjectKeys(evidence, ["a", "b"], "recovery setup evidence");
   const validateSide = (side, summary) => {
     exactObjectKeys(summary, [
       "download_count",
       "download_path",
-      "before_status",
-      "blocked_status",
-      "after_status",
+      "profile_status",
+      "profile_name",
+      "before_recovery_status",
+      "after_recovery_status",
+      "principal_binding_checked",
+      "profile_included",
+      "archive_available",
     ], `${side.prefix} recovery evidence`);
     const downloadPath = absolutePath(
       summary.download_path,
@@ -390,22 +432,20 @@ export function assertRecoverySetupEvidence(config, evidence) {
     );
     if (
       summary.download_count !== 1
-      || summary.before_status !== "setup_required"
-      || summary.blocked_status !== "recovery_required"
-      || summary.after_status !== "setup_required"
+      || summary.profile_status !== "ready"
+      || summary.profile_name !== `${side.name} Admin`
+      || summary.before_recovery_status !== "setup_required"
+      || summary.after_recovery_status !== "ready"
+      || summary.principal_binding_checked !== true
+      || summary.profile_included !== true
+      || summary.archive_available !== true
       || !isPathInsideRoot(side.fixture.dataRoot, downloadPath)
     ) {
       throw new AcceptanceEvidenceError(
         `${side.prefix} recovery evidence is not a single verified fixture-owned Recovery setup`,
       );
     }
-    return {
-      download_count: summary.download_count,
-      download_path: downloadPath,
-      before_status: summary.before_status,
-      blocked_status: summary.blocked_status,
-      after_status: summary.after_status,
-    };
+    return { ...summary, download_path: downloadPath };
   };
   const a = validateSide(config.a, evidence.a);
   const b = validateSide(config.b, evidence.b);
