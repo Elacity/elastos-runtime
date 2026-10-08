@@ -70,29 +70,6 @@ fn validate_product_engine(kind: AdapterKind, test_engine: bool) -> Result<(), S
     Ok(())
 }
 
-#[cfg(test)]
-mod product_engine_tests {
-    use super::*;
-
-    #[test]
-    fn production_accepts_only_the_vm_engine() {
-        assert!(validate_product_engine(AdapterKind::ChromiumMicrovm, false).is_ok());
-        for kind in [
-            AdapterKind::Cef,
-            AdapterKind::ChromiumHeadless,
-            AdapterKind::SelkiesGstreamer,
-            AdapterKind::HostedRemoteBrowser,
-            AdapterKind::ContractProof,
-            AdapterKind::Webview2,
-            AdapterKind::Geckoview,
-            AdapterKind::Wkwebview,
-        ] {
-            assert!(validate_product_engine(kind, false).is_err());
-            assert!(validate_product_engine(kind, true).is_ok());
-        }
-    }
-}
-
 pub(super) fn validate_supervisor(supervisor: &EngineSupervisorConfig) -> Result<(), String> {
     if supervisor.program.is_empty() || !supervisor.program.starts_with('/') {
         return Err("browser engine supervisor program must be absolute".to_string());
@@ -317,4 +294,27 @@ pub(super) fn validate_relay_ipc(endpoint: &RelayIpcEndpoint) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod product_engine_tests {
+    use super::*;
+
+    #[test]
+    fn production_accepts_only_the_vm_engine() {
+        assert!(validate_product_engine(AdapterKind::ChromiumMicrovm, false).is_ok());
+        for kind in [
+            AdapterKind::Cef,
+            AdapterKind::ChromiumHeadless,
+            AdapterKind::SelkiesGstreamer,
+            AdapterKind::HostedRemoteBrowser,
+            AdapterKind::ContractProof,
+            AdapterKind::Webview2,
+            AdapterKind::Geckoview,
+            AdapterKind::Wkwebview,
+        ] {
+            assert!(validate_product_engine(kind, false).is_err());
+            assert!(validate_product_engine(kind, true).is_ok());
+        }
+    }
 }
