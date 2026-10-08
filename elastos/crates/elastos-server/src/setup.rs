@@ -3550,7 +3550,7 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         30,
         bind_addr,
     )
-        .await
+    .await
 }
 
 fn require_component_not_model(name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -3584,7 +3584,8 @@ pub(crate) async fn install_first_party_component_via_carrier(
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
     let cid = platform_info.cid.as_deref().filter(|cid| !cid.is_empty());
-    let bytes = fetch_first_party_component_via_carrier(data_dir, cid, release_path, context).await?;
+    let bytes =
+        fetch_first_party_component_via_carrier(data_dir, cid, release_path, context).await?;
 
     verify_checksum(name, &bytes, platform_info)?;
 
