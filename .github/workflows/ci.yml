@@ -640,8 +640,9 @@ jobs:
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
         run: scripts/ci-installed-journeys.sh prepare
+      # Each Get reads the 145 MB package from a separate holder Home over Carrier (~6 min per Home).
       - name: installed Marketplace Get and Assistant reply
-        timeout-minutes: 15
+        timeout-minutes: 35
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
         run: scripts/ci-installed-journeys.sh home
@@ -866,8 +867,9 @@ jobs:
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
         run: scripts/ci-installed-journeys.sh prepare
+      # Four Homes each Get the package from a separate holder over Carrier (~6 min each).
       - name: installed Marketplace Get and Assistant reply
-        timeout-minutes: 15
+        timeout-minutes: 60
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
         run: scripts/ci-installed-journeys.sh home-repeat

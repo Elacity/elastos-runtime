@@ -159,8 +159,10 @@ export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)
 }
 
 function main(args) {
-  assert.equal(args.length, 3, "usage: ci-model-package.mjs <isolated-data> <pinned-inputs> <fixture-output>");
-  const [data, inputs, output] = args.map(arg => resolve(arg));
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs <holder-data> <consumer-data> <pinned-inputs> <fixture-output>");
+  // The holder Home's Kubo alone holds the package; the consumer receives only the signed catalogue.
+  const [data, consumer, inputs, output] = args.map(arg => resolve(arg));
+  assert.notEqual(data, consumer, "the package holder is a separate Home");
   const manifestPath = join(data, "components.json");
   regular(manifestPath);
   const manifestBytes = readFileSync(manifestPath), components = JSON.parse(manifestBytes);
@@ -170,6 +172,9 @@ function main(args) {
   assert.equal(recipes.length, 1, "Kubo requires one pinned build recipe for this platform");
   const kuboReceipt = verifyInstalledKubo(data, components, host, recipes[0]);
   kuboReceipt.components_sha256 = `sha256:${sha(manifestBytes)}`;
+  const consumerManifestPath = join(consumer, "components.json");
+  regular(consumerManifestPath);
+  const consumerComponents = JSON.parse(readFileSync(consumerManifestPath));
   mkdirSync(output, { recursive: true, mode: 0o700 });
   const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir);
   const kubo = join(data, "bin/kubo"), repo = join(data, "ipfs-repo");
@@ -180,10 +185,10 @@ function main(args) {
   entry.cid = run(["add", "--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false", packageDir]).split("\n").at(-1);
   assert.match(entry.cid, /^bafy[a-z2-7]+$/);
   const { catalog, trust } = signedCatalog(entry);
-  writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
-  components.model_catalog = trust;
-  writeFileSync(manifestPath, JSON.stringify(components), { mode: 0o600 });
-  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
+  writeFileSync(join(consumer, "model-catalog.json"), catalog, { mode: 0o600 });
+  consumerComponents.model_catalog = trust;
+  writeFileSync(consumerManifestPath, JSON.stringify(consumerComponents), { mode: 0o600 });
+  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "package pinned only in a separate holder Home's Kubo; consumer Get over Carrier bounded reads; Runtime Use admission", kubo: kuboReceipt }, null, 2));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));

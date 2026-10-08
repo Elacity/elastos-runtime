@@ -10,6 +10,8 @@ const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
 const cid = JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
+// Get reads the package from a separate holder over Carrier in 64 KiB bounded reads.
+const carrierGetMs = 15 * 60 * 1000;
 let browser, page;
 let stage = "journey";
 let subcheck = null;
@@ -102,7 +104,7 @@ try {
   if (mode === "--home-only") {
     stage = "engine_absent_refusal";
     const recovery = "This source Home needs its local model engine. Install the engine through source setup, then Retry.";
-    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: 90000 });
+    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: carrierGetMs });
     const unavailable = (await projection(marketplace, "/api/capsules/catalog")).capsules.find(row => row.cid === cid)?.model_runtime;
     assert.equal(unavailable?.admitted, true, "engine refusal preserves admitted content");
     assert.equal(unavailable?.dispatch_ready, false);
@@ -137,7 +139,7 @@ try {
     }, null, 2));
   } else {
     const openAssistant = marketplace.locator('[data-model-control="open-assistant"]');
-    await openAssistant.waitFor({ state: "visible", timeout: 180000 });
+    await openAssistant.waitFor({ state: "visible", timeout: carrierGetMs });
     const catalog = await projection(marketplace, "/api/capsules/catalog");
     const readyModel = catalog.capsules.find(row => row.cid === cid);
     assert.equal(readyModel?.model_runtime?.dispatch_ready, true);
