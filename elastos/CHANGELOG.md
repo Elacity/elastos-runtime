@@ -51,9 +51,10 @@ Test-channel release. Signed releases show these notes in System before you upda
   Content Exchange status is correct again (#280).
 - One `FileLock` guard unlocks its lock when dropped; `release()` unlocks and
   reports an unlock failure where callers need it.
-- install.sh creates its directories 0755 under any umask and refuses an unsafe
-  existing directory before any download, naming a repair command that works
-  (#279).
+- install.sh creates its directories 0755 under any umask. Before any download it
+  checks the data folder's existing parents with the Runtime's rule (owned by you
+  or root, not group- or other-writable). The installer and the media-tools check
+  name the unsafe folder and the exact repair command (#279).
 - Test fixtures that are executed are written from a child process, so a test
   no longer fails with ETXTBSY.
 - Process-group scans skip processes that exit during the scan.
