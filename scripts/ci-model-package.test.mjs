@@ -36,16 +36,19 @@ test("Smol producer refuses absent or truncated model before writing a package",
   assert.throws(() => readFileSync(join(packageDir, "capsule.json")), /ENOENT/);
 });
 
-test("fixture provenance carries exact independent source revisions and licensing", () => {
+test("fixture fetch selects its declared immutable provenance and licensing", () => {
   const manifest = SMOL_FIXTURE.capsule_manifest, model = manifest.model_content;
   assert.equal(manifest.role, "content");
   assert.deepEqual(manifest.projections, ["content"]);
-  assert.equal(model.provenance.base_revision, "12fd25f77366fa6b3b4b768ec3050bf629380bac");
-  assert.equal(model.provenance.quantized_revision, "9e6855bc4be717fca1ef21360a1db4b29d5c559a");
+  assert.match(model.provenance.base_revision, /^[0-9a-f]{40}$/);
+  assert.match(model.provenance.quantized_revision, /^[0-9a-f]{40}$/);
+  const url = new URL(SMOL_FIXTURE.model.url);
+  assert.equal(url.origin, "https://huggingface.co");
+  assert.equal(url.pathname, `/${model.provenance.quantized_repository}/resolve/${model.provenance.quantized_revision}/${SMOL_FIXTURE.model.name}`);
   assert.equal(model.license.spdx_id, "Apache-2.0");
+  assert.equal(model.license.path, SMOL_FIXTURE.license.name);
   assert.equal(model.provenance.base_license.path, "LICENSE.base");
-  const fetchProof = readFileSync(new URL("./pinned-model-consumer-proof.sh", import.meta.url), "utf8");
-  for (const pin of [SMOL_FIXTURE.model.sha256, SMOL_FIXTURE.license.sha256, String(SMOL_FIXTURE.model.size), String(SMOL_FIXTURE.license.size)]) assert(fetchProof.includes(pin));
+  assert.equal(model.provenance.base_license.spdx_id, model.license.spdx_id);
 });
 
 function decodeBase(bytes, alphabet, bits) {

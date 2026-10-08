@@ -33,27 +33,9 @@ function encode(bytes, alphabet, bits) {
 }
 export const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), Buffer.from(sha(bytes), "hex")]), "abcdefghijklmnopqrstuvwxyz234567", 5);
 
-// Fixture provenance belongs to this producer, independently of any production
-// catalog. The build-only input proof uses these same immutable byte pins.
-export const SMOL_FIXTURE = {
-  model: { name: "SmolLM2-135M-Instruct-Q8_0.gguf", size: 144811072, sha256: "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a" },
-  license: { name: "LICENSE", size: 11358, sha256: "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" },
-  capsule_manifest: {
-    schema: "elastos.capsule/v1", name: "smollm2-135m-instruct-q8-0-local", role: "content", type: "data",
-    projections: ["content"], version: "0.1.0", entrypoint: "weights.gguf",
-    model_content: {
-      consumer_interface: "elastos.provider.model", consumer_interface_version: "0.1.0", engine: "llama.cpp",
-      format: "gguf", quantization: "Q8_0", minimum_memory_mb: 512,
-      license: { path: "LICENSE", spdx_id: "Apache-2.0" },
-      provenance: {
-        base_license: { path: "LICENSE.base", spdx_id: "Apache-2.0" },
-        base_repository: "HuggingFaceTB/SmolLM2-135M-Instruct", base_revision: "12fd25f77366fa6b3b4b768ec3050bf629380bac",
-        quantized_repository: "unsloth/SmolLM2-135M-Instruct-GGUF", quantized_revision: "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
-        path: "PROVENANCE.md",
-      },
-    },
-  },
-};
+// The producer and build-only input proof share this fixture's byte pins and
+// provenance independently of any production catalog.
+export const SMOL_FIXTURE = JSON.parse(readFileSync(new URL("./pinned-smollm2-fixture.json", import.meta.url), "utf8"));
 
 function regular(path) {
   for (let current = resolve(path);; current = dirname(current)) {

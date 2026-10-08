@@ -34,9 +34,9 @@ Arguments:
                   when ELASTOS_PROOF_MODEL_PATH / _LICENSE_PATH are unset.
   --native-only   Skip the cold Content proof (no Kubo or ipfs-provider).
   --check-inputs  Verify pinned inputs and print the plan; run nothing else.
-  --self-test     Check the test-output verifier against captured cargo output
-                  shapes (zero matches, unselected ignored test, wrong test,
-                  one real pass); run nothing else.
+  --self-test     Check fixture field refusals and the test-output verifier
+                  against captured cargo output shapes (zero matches,
+                  unselected ignored test, wrong test, one real pass).
 
 Environment:
   ELASTOS_PROOF_MODEL          Pinned model id. Default and only value: smollm2
@@ -68,23 +68,31 @@ sha256_file() {
     fi
 }
 
-# Pinned model table. Bytes and digests are the same on every host; the
+# Shared fixture pins. Bytes and digests are the same on every host; the
 # engine executable identity is per platform and lives in the Rust proof.
 pinned_field() {
     local model="$1" field="$2"
-    case "${model}:${field}" in
-        smollm2:file) echo "SmolLM2-135M-Instruct-Q8_0.gguf" ;;
-        smollm2:url) echo "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-Q8_0.gguf" ;;
-        smollm2:bytes) echo "144811072" ;;
-        smollm2:sha256) echo "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a" ;;
-        smollm2:license_url) echo "https://www.apache.org/licenses/LICENSE-2.0.txt" ;;
-        smollm2:license_bytes) echo "11358" ;;
-        smollm2:license_sha256) echo "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" ;;
-        smollm2:env_prefix) echo "SMOLLM2" ;;
-        smollm2:native_test) echo "model_native_smollm2_exact_profile_lifecycle" ;;
-        smollm2:cold_test) echo "model_preparation_real_smollm2_cold_reply_restart" ;;
-        *) die "unknown pinned model field ${model}:${field}" ;;
-    esac
+    python3 - "${ROOT}/scripts/pinned-smollm2-fixture.json" "$model" "$field" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    fixture = json.load(source)
+model, field = sys.argv[2:]
+fields = {
+    "file": fixture["model"]["name"],
+    "url": fixture["model"]["url"],
+    "bytes": fixture["model"]["size"],
+    "sha256": fixture["model"]["sha256"],
+    "license_url": fixture["license"]["url"],
+    "license_bytes": fixture["license"]["size"],
+    "license_sha256": fixture["license"]["sha256"],
+    "env_prefix": fixture["proof"]["env_prefix"],
+    "native_test": fixture["proof"]["native_test"],
+    "cold_test": fixture["proof"]["cold_test"],
+}
+if model != fixture["id"] or field not in fields:
+    sys.exit(f"[pinned-model-proof] unknown pinned model field {model}:{field}")
+print(fields[field])
+PY
 }
 
 detect_platform() {
@@ -153,7 +161,16 @@ verify_proof_output() {
 # filter and an unselected ignored test are refused, a wrong test is refused,
 # and one real passing execution is accepted.
 verifier_self_test() {
-    local intended="${PROOF_MODULE}::model_native_smollm2_exact_profile_lifecycle"
+    need_cmd python3
+    local rejected reason
+    for rejected in unknown:file smollm2:unknown; do
+        if reason="$(pinned_field "${rejected%:*}" "${rejected#*:}" 2>&1)"; then
+            die "self-test: unknown fixture field ${rejected} was accepted"
+        fi
+        [[ "$reason" == "[pinned-model-proof] unknown pinned model field ${rejected}" ]] \
+            || die "self-test: fixture refusal differs from the field contract"
+    done
+    local intended="${PROOF_MODULE}::$(pinned_field smollm2 native_test)"
     local scratch
     scratch="$(mktemp -d)"
     cat >"${scratch}/zero-match.log" <<'EOF'
@@ -197,7 +214,7 @@ test ${intended} ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1902 filtered out; finished in 4.17s
 
 EOF
-    local failures=0 reason
+    local failures=0
     for refused in zero-match not-selected wrong-test; do
         if reason="$(verify_proof_output "${scratch}/${refused}.log" "$intended")"; then
             echo "[pinned-model-proof] self-test: ${refused} output was accepted" >&2
