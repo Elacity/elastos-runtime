@@ -218,8 +218,8 @@ export function start() {
     wasm.start();
 }
 
-function wasm_bindgen__convert__closures_____invoke__h76bc78299e8b98a7(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h76bc78299e8b98a7(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__hd8efc278d60539af(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hd8efc278d60539af(arg0, arg1);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h5883bfd253e22722(arg0, arg1, arg2) {
@@ -230,8 +230,8 @@ function wasm_bindgen__convert__closures_____invoke__he5a716c89cafc3f6(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__he5a716c89cafc3f6(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__hd8efc278d60539af(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hd8efc278d60539af(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__h76bc78299e8b98a7(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h76bc78299e8b98a7(arg0, arg1);
 }
 
 const __wbindgen_enum_RequestCredentials = ["omit", "same-origin", "include"];
