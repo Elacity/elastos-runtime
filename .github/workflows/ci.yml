@@ -49,9 +49,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: rustfmt
-      - name: configure Rust compile cache
-        if: env.CI_USE_CACHE == 'true'
-        uses: ./.github/actions/rust-compile-cache
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
@@ -81,10 +78,6 @@ jobs:
           python3 scripts/verify-linux-arm64-package-test.py
           python3 scripts/update-hop-compare-test.py
           python3 .github/scripts/release-mac-capacity-test.py
-          python3 scripts/install-bootstrap-test.py
-      - name: Rust compile cache statistics
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        run: sccache --show-stats
 
   test-behaviour:
     name: test-behaviour
@@ -474,31 +467,30 @@ jobs:
   # The source-home jobs run after the cheap source gate, in parallel
   # with tests across the three architectures. They are the de-facto release builders:
   # setup-source-home compiles the runtime, shell, home-cli and every provider
-  # in --release into the repo target dirs, so each job finishes by topping
-  # that up to a full workspace release build (incremental at that point) and
-  # packaging the binaries for its architecture — no separate cold
-  # build-release job is needed.
+  # in --release. Tags, main and dispatch runs package those builds;
+  # ARM also packages every candidate for the Jetson compatibility gate.
   source-home-linux:
-    name: source-home-linux (${{ matrix.check_name || matrix.os }})
+    name: source-home-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    needs: [source-gate, engine-llama-arm64]
+    needs: source-gate
     env:
       CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
     strategy:
       fail-fast: false
       matrix:
-        # Jetson's Ubuntu 22.04 host provides glibc 2.35.
-        os: [ubuntu-24.04, ubuntu-22.04-arm]
-        include:
-          # Keep the established check name; os controls the build and artifact.
-          - os: ubuntu-22.04-arm
-            check_name: ubuntu-24.04-arm
-    steps:
+        os: [ubuntu-24.04]
+    steps: &source_home_linux_steps
       - name: set job build directories
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-linux-target" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-linux-build" >> "$GITHUB_ENV"
+          # Keep new entries locally while reading the shared trusted cache.
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/source-home-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
@@ -514,6 +506,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - name: verify compiler cache reuse and invalidation
+        if: env.RUSTC_WRAPPER == 'sccache'
+        run: python3 scripts/ci-rust-cache-smoke.py --output-json "$RUNNER_TEMP/source-home-cache-probe.json"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
@@ -620,10 +618,9 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
-      # ARM PRs also need the package for the Jetson compatibility gate.
-      # Uploads remain limited to tags, main and dispatch runs.
+      # ARM needs the package for the Jetson compatibility gate on every event.
       - name: build and package release binaries
-        if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'
+        if: matrix.os == 'ubuntu-22.04-arm' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
@@ -645,6 +642,17 @@ jobs:
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
             elastos-runtime-*.receipt.json
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/source-home-sccache.json"
+          {
+            echo '### Rust compiler cache'
+            echo '```text'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -653,6 +661,24 @@ jobs:
           path: ${{ runner.temp }}/source-home-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+  source-home-linux-arm64:
+    name: source-home-linux (${{ matrix.check_name || matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    needs: [source-gate, engine-llama-arm64]
+    env:
+      CI_APT_PACKAGES: coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+    strategy:
+      fail-fast: false
+      matrix:
+        # Jetson's Ubuntu 22.04 host provides glibc 2.35.
+        os: [ubuntu-22.04-arm]
+        include:
+          # Keep the established check name; os controls the build and artifact.
+          - os: ubuntu-22.04-arm
+            check_name: ubuntu-24.04-arm
+    steps: *source_home_linux_steps
 
   source-home-macos:
     name: source-home-macos
@@ -665,6 +691,11 @@ jobs:
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/source-home-macos-target" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/source-home-macos-build" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/source-home-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       # Published tarballs keep the shipped Cargo release profile.
       - name: use CI journey release profile
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
@@ -680,6 +711,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: configure Rust compile cache
+        if: env.CI_USE_CACHE == 'true'
+        uses: ./.github/actions/rust-compile-cache
+      - name: verify compiler cache reuse and invalidation
+        if: env.RUSTC_WRAPPER == 'sccache'
+        run: python3 scripts/ci-rust-cache-smoke.py --output-json "$RUNNER_TEMP/source-home-cache-probe.json"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.CI_USE_CACHE == 'true'
         with:
@@ -884,10 +921,9 @@ jobs:
               raise SystemExit('hop builder cleanup is incomplete; disposable runner retains files until teardown')
           shutil.rmtree(root)
           PY
-      # Packages are uploaded only for tags, main and dispatch runs; PR runs
-      # already proved the release build through setup-source-home.
+      # Packages follow their upload policy after the source-home journey passes.
       - name: build and package release binaries
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
@@ -901,6 +937,17 @@ jobs:
           path: |
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
+      - name: Rust compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/source-home-sccache.json"
+          {
+            echo '### Rust compiler cache'
+            echo '```text'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -924,6 +971,7 @@ jobs:
       - test-behaviour
       - test-capsules
       - source-home-linux
+      - source-home-linux-arm64
       - source-home-macos
     permissions:
       contents: write

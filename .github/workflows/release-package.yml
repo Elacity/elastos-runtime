@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source_commit:
-        description: Commit on develop, or the head of an open PR into develop
+        description: Full SHA of a commit on develop
         required: true
         type: string
       install_version:
@@ -37,6 +37,8 @@ env:
   UPDATE_VERSION: ${{ inputs.update_version }}
   CARGO_BUILD_JOBS: '4'
   PYTHONDONTWRITEBYTECODE: '1'
+  # Release dispatches read the shared compiler cache; each job owns its disk L0.
+  CI_SAVE_CACHE: 'false'
 
 jobs:
   admit:
@@ -57,16 +59,11 @@ jobs:
             || { echo 'Two different SemVer versions are required' >&2; exit 1; }
           repo="repos/$GITHUB_REPOSITORY"
           tree=$(gh api "$repo/git/commits/$SOURCE_COMMIT" --jq .tree.sha)
+          [[ "$tree" =~ ^[0-9a-f]{40}$ ]] || { echo 'Source tree must be a full SHA' >&2; exit 1; }
           on_develop=$(gh api "$repo/compare/$SOURCE_COMMIT...develop" --jq '.status == "ahead" or .status == "identical"')
-          if [[ "$on_develop" != true ]]; then
-            # A key-free build of an open PR head may start before merge; the
-            # signer still refuses a commit that is not on develop.
-            open=$(gh api "$repo/commits/$SOURCE_COMMIT/pulls" --jq "[.[] | select(.state == \"open\" and .base.ref == \"develop\"
-              and .head.sha == \"$SOURCE_COMMIT\" and .head.repo.full_name == \"$GITHUB_REPOSITORY\")] | length")
-            behind=$(gh api "$repo/compare/develop...$SOURCE_COMMIT" --jq .behind_by)
-            [[ "$open" -ge 1 && "$behind" == 0 ]] \
-              || { echo 'Source must be on develop or the head of an open PR containing develop' >&2; exit 1; }
-          fi
+          [[ "$on_develop" == true ]] || { echo 'Source must be a commit on develop' >&2; exit 1; }
+          # Preparation may run beside CI. Publication still requires green CI
+          # for this exact source and the release acceptance gate.
           echo "source_tree=$tree" >> "$GITHUB_OUTPUT"
 
   mac:
@@ -80,6 +77,7 @@ jobs:
         working-directory: source
     env:
       SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+      RELEASE_PLATFORM: aarch64-darwin
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -99,12 +97,20 @@ jobs:
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           root="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          install -d -m 700 "$root" "$root/inputs" "$root/home"
+          install -d -m 700 "$root" "$root/inputs" "$root/home" "$root/sccache"
           echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$root/sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: 1.91.0
           targets: wasm32-unknown-unknown,aarch64-apple-darwin
+      - name: configure Rust compile cache
+        if: hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''
+        uses: ./source/.github/actions/rust-compile-cache
       - name: prepare hosted capacity and native tools
         timeout-minutes: 20
         run: |
@@ -126,10 +132,12 @@ jobs:
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           inputs="$RELEASE_ROOT/inputs"
+          # Rust cache keys include Cargo's output paths. Keep their names
+          # stable and remove both directories after each fresh version build.
           for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
             read -r name version <<< "$build"
-            export CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-$name" CARGO_BUILD_BUILD_DIR="$RELEASE_ROOT/cargo-build-$name"
-            [[ ! -e "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" ]]
+            export CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target" CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"
+            [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
@@ -150,6 +158,27 @@ jobs:
           done
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+      - name: record compiler cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RELEASE_ROOT/compiler-cache-stats.json"
+          python3 -I -S - "$RELEASE_ROOT/compiler-cache-stats.json" <<'PYTHON'
+          import json, os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_bytes())
+          data["release_input"] = {key: os.environ[key] for key in
+              ("SOURCE_COMMIT", "SOURCE_TREE", "RELEASE_PLATFORM", "INSTALL_VERSION", "UPDATE_VERSION")}
+          path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+          PYTHON
+      - name: keep compiler cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-compiler-cache-${{ env.RELEASE_PLATFORM }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_ROOT }}/compiler-cache-stats.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: seal the inputs in mode-preserving parts
         run: |
           set -euo pipefail
@@ -200,13 +229,13 @@ jobs:
           ref: ${{ inputs.source_commit }}
           path: source
           persist-credentials: false
-      - name: build and verify the recipe-pinned ARM64 engine
+      - name: bind the source and approved ARM64 engine
+        id: engine-input
         run: |
           set -euo pipefail
           [[ "$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == github-hosted/Linux/ARM64 ]]
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
-          export RECIPE_COMMIT="$SOURCE_COMMIT"
           CI_LLAMA_ARM64_SHA256=$(python3 -I -S - <<'PYTHON'
           import json
           recipes = json.load(open("scripts/release-upstream-recipes.json"))["recipes"]
@@ -214,8 +243,31 @@ jobs:
                      if r["component"] == "llama-server" and r["platform"] == "linux-arm64"))
           PYTHON
           )
-          export CI_LLAMA_ARM64_SHA256
+          echo "CI_LLAMA_ARM64_SHA256=$CI_LLAMA_ARM64_SHA256" >> "$GITHUB_ENV"
+      - name: bind engine cache to build recipe
+        id: engine-recipe
+        run: |
+          recipe_hash=$( {
+            cat scripts/build/build-llama-server-bundle.sh
+            printf '\n%s\n%s\n' "$BUILD_CONTAINER_IMAGE" "$ENGINE_BUILD_TOOLS"
+          } | sha256sum | cut -d ' ' -f 1)
+          echo "cache-key=develop-llama-arm64-${recipe_hash}" >> "$GITHUB_OUTPUT"
+      - name: restore pinned ARM64 engine
+        id: engine-cache
+        # Caches belong to the workflow ref. A main dispatch can miss the
+        # develop cache and take the same verified cold build below.
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/llama-arm64-bundle
+          key: ${{ steps.engine-recipe.outputs.cache-key }}
+      - name: build and validate pinned ARM64 engine
+        id: engine-build
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          export RECIPE_COMMIT="$SOURCE_COMMIT"
           bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
+      - name: verify accepted ARM64 engine archive
+        run: |
           bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
@@ -265,12 +317,20 @@ jobs:
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           root="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          install -d -m 700 "$root" "$root/inputs" "$root/home"
+          install -d -m 700 "$root" "$root/inputs" "$root/home" "$root/sccache"
           echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,gha" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$root/sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_LOCAL_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: 1.91.0
           targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - name: configure Rust compile cache
+        if: hashFiles('source/.github/actions/rust-compile-cache/action.yml') != ''
+        uses: ./source/.github/actions/rust-compile-cache
       - name: install host prerequisites
         timeout-minutes: 15
         run: |
@@ -290,10 +350,12 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export ELASTOS_LLAMA_ARM64_BUNDLE="$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
           inputs="$RELEASE_ROOT/inputs"
+          # Rust cache keys include Cargo's output paths. Keep their names
+          # stable and remove both directories after each fresh version build.
           for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"; do
             read -r name version <<< "$build"
-            export CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-$name" CARGO_BUILD_BUILD_DIR="$RELEASE_ROOT/cargo-build-$name"
-            [[ ! -e "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" ]]
+            export CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target" CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"
+            [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
@@ -335,6 +397,27 @@ jobs:
               --receipt "$RELEASE_ROOT/jetson-$name.receipt.json"
             rm "$RELEASE_ROOT/jetson-$name.tar.gz"
           done
+      - name: record compiler cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RELEASE_ROOT/compiler-cache-stats.json"
+          python3 -I -S - "$RELEASE_ROOT/compiler-cache-stats.json" <<'PYTHON'
+          import json, os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_bytes())
+          data["release_input"] = {key: os.environ[key] for key in
+              ("SOURCE_COMMIT", "SOURCE_TREE", "RELEASE_PLATFORM", "INSTALL_VERSION", "UPDATE_VERSION")}
+          path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+          PYTHON
+      - name: keep compiler cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-compiler-cache-${{ env.RELEASE_PLATFORM }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_ROOT }}/compiler-cache-stats.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: seal the inputs in mode-preserving parts
         run: |
           set -euo pipefail

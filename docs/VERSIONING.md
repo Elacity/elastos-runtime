@@ -167,7 +167,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
    succeeded and that its source is on `develop` (merge an open pull request
    first), downloads and verifies all three platform artifacts, and passes one
-   `--platform-input PLATFORM=DIR` per platform. For a Mac-only preview, run
+   `--platform-input PLATFORM=DIR` per platform. Prepare also requires successful
+   CI at that exact source commit, from a `develop` push or `develop` merge group,
+   with every required job completed successfully. For a Mac-only preview, run
    `scripts/release-publish.sh prepare RUN_ID VERSION aarch64-darwin`. The Mac
    coordinator requires `aarch64-darwin` in every selection; only a single
    platform uses `--preview-platform`. Prepare checks out the exact source as
