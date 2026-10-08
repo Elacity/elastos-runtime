@@ -361,15 +361,13 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .browser
 }
 
 .browser-access-copy,
-.conversation-join-copy,
 .browser-access-form,
 .stack {
   display: grid;
   gap: 0.45rem;
 }
 
-.browser-access-copy h2,
-.conversation-join-copy h2 {
+.browser-access-copy h2 {
   font-size: 1.05rem;
   font-weight: 700;
 }
@@ -391,23 +389,6 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .browser
   gap: 0.4rem;
 }
 
-.conversation-join {
-  display: grid;
-  gap: 0.55rem;
-  margin: 0.75rem 1rem 0;
-  padding: 0.85rem 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel-strong);
-}
-
-.conversation-join-copy p {
-  color: var(--muted);
-  font-size: 0.78rem;
-  line-height: 1.4;
-}
-
-.conversation-join-form,
 .join-link-output {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -964,11 +945,6 @@ button.secondary {
 .emoji-chip:focus-visible {
   background: var(--el-inset);
   outline: none;
-}
-
-body[data-room-access-mode="shell"][data-room-join-visible="true"] .messages,
-body[data-room-access-mode="shell"][data-room-join-visible="true"] .composer {
-  display: none;
 }
 
 body[data-room-access-mode="shell"][data-room-session-active="false"] .roster-head {

@@ -375,7 +375,6 @@ async function waitForConfiguredChatWithoutLegacyFlash(frame, label) {
         "#browser-access-section",
         "#browser-access-stage",
         "#conversation-invite-create",
-        "#conversation-join-section",
         "#room-access-section",
         "#room-access-toggle",
       ];
@@ -491,10 +490,6 @@ async function runScenario(scenario) {
       assert(
         await frame.evaluate(() => document.body.dataset.roomSessionActive) === "false",
         "bootstrap failure activated Chat",
-      );
-      assert(
-        await frame.evaluate(() => document.querySelector("#conversation-join-section")?.hidden),
-        "bootstrap failure exposed the legacy Join surface",
       );
       return;
     }
@@ -665,7 +660,6 @@ async function runScenario(scenario) {
               browserStageHidden: hidden("#browser-access-stage"),
               browserRequestsHidden: hidden("#browser-access-section"),
               roomSettingsHidden: hidden("#room-access-toggle") && hidden("#room-access-section"),
-              joinHidden: hidden("#conversation-join-section"),
               textVisible: !hidden("#composer-form") && !!input && !input.disabled && !!send && !send.disabled,
               messageInputTag: input?.tagName || "",
               shellDisplay: shell ? getComputedStyle(shell).display : "",
@@ -691,7 +685,6 @@ async function runScenario(scenario) {
       assert(state.attachHidden, "configured Chat exposed Attach", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
       assert(state.roomSettingsHidden, "configured Chat exposed legacy room settings", state);
-      assert(state.joinHidden, "configured Chat exposed invite/join controls", state);
       assert(state.textVisible, "configured Chat text composer is unavailable", state);
       assert(state.messageInputTag === "TEXTAREA", "published Chat composer was not retained", state);
       assert(state.shellDisplay === "grid" && state.sidebarBeforeThread, "Chat is not a split conversation shell", state);

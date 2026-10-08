@@ -70,7 +70,6 @@ enum AccessMode {
 struct AppConfig {
     access_mode: AccessMode,
     home_token: Option<String>,
-    initial_join_invite: Option<String>,
     initial_direct_conversation_id: Option<String>,
     browser_session_request_storage_key: String,
 }
@@ -193,10 +192,6 @@ struct App {
     browser_access_list: HtmlElement,
     room_access_section: HtmlElement,
     room_policy_list: HtmlElement,
-    conversation_join_section: HtmlElement,
-    conversation_join_form: HtmlFormElement,
-    conversation_join_input: HtmlInputElement,
-    conversation_join_submit: HtmlButtonElement,
     conversation_invite_create: HtmlButtonElement,
     conversation_invite_output_row: HtmlElement,
     conversation_invite_output: HtmlInputElement,
@@ -526,22 +521,6 @@ struct ConversationJoinInviteView {
     expires_at: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct ConversationJoinInviteJoinInput<'a> {
-    invite: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConversationJoinInviteJoinResponse {
-    #[allow(dead_code)]
-    status: String,
-    room_title: String,
-    #[allow(dead_code)]
-    issuer_gateway: String,
-    #[allow(dead_code)]
-    invite_id: String,
-}
-
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -624,10 +603,6 @@ pub fn start() -> Result<(), JsValue> {
         browser_access_list: element_by_id(&document, "browser-access-list")?,
         room_access_section: element_by_id(&document, "room-access-section")?,
         room_policy_list: element_by_id(&document, "room-policy-list")?,
-        conversation_join_section: element_by_id(&document, "conversation-join-section")?,
-        conversation_join_form: form_by_id(&document, "conversation-join-form")?,
-        conversation_join_input: input_by_id(&document, "conversation-join-input")?,
-        conversation_join_submit: button_by_id(&document, "conversation-join-submit")?,
         conversation_invite_create: button_by_id(&document, "conversation-invite-create")?,
         conversation_invite_output_row: element_by_id(&document, "conversation-invite-output-row")?,
         conversation_invite_output: input_by_id(&document, "conversation-invite-output")?,
@@ -1240,26 +1215,6 @@ impl App {
         )?;
         browser_access_click.forget();
         self.install_participant_card_listeners()?;
-
-        let join_invite_app = Rc::clone(self);
-        let join_invite_submit =
-            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
-                event.prevent_default();
-                let app = Rc::clone(&join_invite_app);
-                spawn_local(async move {
-                    app.clear_error();
-                    if let Err(err) = app.join_conversation_from_invite().await {
-                        app.set_error(Some(err));
-                    }
-                    let _ = app.render();
-                });
-            }));
-        self.conversation_join_form
-            .add_event_listener_with_callback(
-                "submit",
-                join_invite_submit.as_ref().unchecked_ref(),
-            )?;
-        join_invite_submit.forget();
 
         let create_invite_app = Rc::clone(self);
         let create_invite_click =
@@ -1884,14 +1839,10 @@ impl App {
                     let state = app.state.borrow();
                     current_selection_guard(&state)
                 };
-                let bootstrap = if let Some(invite) = app.config.initial_join_invite.as_deref() {
-                    app.conversation_join_input.set_value(invite);
-                    app.join_conversation_from_invite().await
-                } else {
-                    app.ensure_shell_session_for_guard(&shared_guard)
-                        .await
-                        .map(|_| ())
-                };
+                let bootstrap = app
+                    .ensure_shell_session_for_guard(&shared_guard)
+                    .await
+                    .map(|_| ());
                 if let Err(err) = bootstrap {
                     if app.selection_guard_is_current(&shared_guard) {
                         app.set_error(Some(err));
@@ -2186,36 +2137,6 @@ impl App {
         .ok_or_else(|| "Create a join link first.".to_string())?;
         copy_text_to_clipboard(&invite_url).await?;
         self.set_status("Copied", "Conversation join link copied.");
-        Ok(())
-    }
-
-    async fn join_conversation_from_invite(&self) -> Result<(), String> {
-        if !self.is_shell_mode() {
-            return Err("conversation links must be opened from Home".to_string());
-        }
-        let invite = self.conversation_join_input.value().trim().to_string();
-        if invite.is_empty() {
-            return Err("Paste a conversation invite code or link.".to_string());
-        }
-        self.set_status("Joining", "Claiming the invite and connecting this device.");
-        let joined: ConversationJoinInviteJoinResponse = api_post_json_with_headers(
-            &self.room_api_url("/invites/join"),
-            &ConversationJoinInviteJoinInput { invite: &invite },
-            &self.home_token_headers(),
-        )
-        .await?;
-        self.conversation_join_input.set_value("");
-        let selection_guard = {
-            let state = self.state.borrow();
-            current_selection_guard(&state)
-        };
-        let _ = self
-            .refresh_shell_summary_for_guard(&selection_guard)
-            .await?;
-        let _ = self
-            .ensure_shell_session_for_guard(&selection_guard)
-            .await?;
-        self.set_status("Joined", &format!("Joined {}.", joined.room_title));
         Ok(())
     }
 
@@ -3205,12 +3126,6 @@ impl App {
             &self.room_access_section,
             direct_mode || !controls.show_room_access,
         )?;
-        set_hidden(
-            &self.conversation_join_section,
-            direct_mode || !controls.show_conversation_join,
-        )?;
-        self.conversation_join_submit
-            .set_disabled(!controls.enable_gateway_controls);
         let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
         self.conversation_invite_output.set_value(invite_url);
         set_hidden(
@@ -3938,14 +3853,10 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     } else {
         AccessMode::Gateway
     };
-    let initial_join_invite = ["invite", "join", "join_invite"]
-        .into_iter()
-        .find_map(|key| extract_query_param(&url, key));
     let initial_direct_conversation_id = extract_query_param(&url, "conversation_id");
     Ok(AppConfig {
         access_mode,
         home_token,
-        initial_join_invite,
         initial_direct_conversation_id,
         browser_session_request_storage_key: BROWSER_SESSION_REQUEST_STORAGE_KEY.to_string(),
     })
@@ -5048,13 +4959,11 @@ mod tests {
         assert!(!policy.show_browser_requests);
         assert!(!policy.show_room_access_toggle);
         assert!(!policy.show_room_access);
-        assert!(!policy.show_conversation_join);
         assert!(!policy.enable_gateway_controls);
 
         let public_policy = chat_control_policy(true, true, false, false, true, true);
         assert!(!public_policy.enable_text_send);
         assert!(!public_policy.show_browser_requests);
-        assert!(!public_policy.show_conversation_join);
     }
 
     #[test]
@@ -5236,14 +5145,12 @@ mod tests {
         assert!(!shell_isolated.show_browser_requests);
         assert!(!shell_isolated.show_room_access_toggle);
         assert!(!shell_isolated.show_room_access);
-        assert!(!shell_isolated.show_conversation_join);
         assert!(!shell_isolated.enable_gateway_controls);
 
         let gateway_isolated = chat_control_policy(true, false, false, true, true, true);
         assert!(gateway_isolated.show_browser_requests);
         assert!(gateway_isolated.show_room_access_toggle);
         assert!(gateway_isolated.show_room_access);
-        assert!(!gateway_isolated.show_conversation_join);
         assert!(gateway_isolated.enable_gateway_controls);
     }
 
@@ -5255,17 +5162,7 @@ mod tests {
         assert!(!unknown.show_browser_requests);
         assert!(!unknown.show_room_access_toggle);
         assert!(!unknown.show_room_access);
-        assert!(!unknown.show_conversation_join);
         assert!(!unknown.enable_gateway_controls);
-
-        let configured = chat_control_policy(true, true, true, false, true, true);
-        assert!(!configured.show_conversation_join);
-
-        let unconfigured_gateway = chat_control_policy(true, false, false, false, false, false);
-        assert!(unconfigured_gateway.show_conversation_join);
-
-        let unconfigured_shell = chat_control_policy(true, false, true, false, false, false);
-        assert!(!unconfigured_shell.show_conversation_join);
     }
 
     #[test]
@@ -5309,7 +5206,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5390,7 +5286,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5434,7 +5329,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: Some("direct:sha256:fixture-conversation".to_string()),
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5462,7 +5356,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5509,7 +5402,6 @@ mod tests {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
             home_token: Some("test-token".to_string()),
-            initial_join_invite: None,
             initial_direct_conversation_id: None,
             browser_session_request_storage_key: "test-key".to_string(),
         };
@@ -5704,7 +5596,6 @@ struct ChatControlPolicy {
     show_browser_requests: bool,
     show_room_access_toggle: bool,
     show_room_access: bool,
-    show_conversation_join: bool,
     enable_gateway_controls: bool,
 }
 
@@ -5724,7 +5615,6 @@ fn chat_control_policy(
         show_browser_requests: gateway_surface && has_pending_requests,
         show_room_access_toggle: gateway_surface && session_active,
         show_room_access: gateway_surface && session_active && show_access_controls,
-        show_conversation_join: gateway_surface && !session_active,
         enable_gateway_controls: gateway_surface && session_active,
     }
 }
