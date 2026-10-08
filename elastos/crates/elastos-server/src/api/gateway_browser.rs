@@ -2826,20 +2826,19 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                 continue;
             }
         };
-        if terminal_retirement {
-            if commit_browser_terminal_cleanup(state, &cleanup, None, None)
+        if terminal_retirement
+            && commit_browser_terminal_cleanup(state, &cleanup, None, None)
                 .await
                 .is_ok()
-            {
-                release_browser_open_job_instance_for_owner(
-                    &state.data_dir,
-                    &cleanup.principal_id,
-                    &cleanup.owner_launch_id,
-                )
-                .await;
-                settled = true;
-                continue;
-            }
+        {
+            release_browser_open_job_instance_for_owner(
+                &state.data_dir,
+                &cleanup.principal_id,
+                &cleanup.owner_launch_id,
+            )
+            .await;
+            settled = true;
+            continue;
         }
         let engine_result = tokio::time::timeout(
             BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
