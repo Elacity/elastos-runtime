@@ -207,7 +207,8 @@ try {
     await reply.waitFor({ state: "visible", timeout: 10000 });
     await assistant.waitForFunction(() => {
       const body = [...document.querySelectorAll(".agent-msg-agent .agent-msg-body")].at(-1);
-      return /\S/.test(body?.innerText ?? "");
+      return body?.closest(".agent-msg-agent")?.dataset.streamPhase === "presentation_done" &&
+        /\S/.test(body?.innerText ?? "");
     }, null, { timeout: 10000 });
     const text = (await reply.innerText()).trim();
     assert(text.length > 0, "Assistant displays the real local reply");
