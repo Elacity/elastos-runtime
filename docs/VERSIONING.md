@@ -183,14 +183,20 @@ the version by the contract change (see Meaning) and update the changelog first;
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every
-   hash, stop the service, run the preflight, import, and start the service. An import run
-   while the service is stopped ends with the known gossip error
-   `No running runtime found` after the commit, and the sequence accepts only
-   that error.
+   hash, stop the service, run the preflight, import, and start the service.
+   The import does not announce the release. Homes find it when they next
+   check.
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull
    request's CI update journey then starts from this release.
+
+The seed only answers requests. It serves three Carrier ops: `release_head`
+(the signed head), `content_fetch` (any object by CID, from its Kubo pins) and
+`file` (a file by name, for older Homes and for parts without a CID). It keeps
+every published release pinned, so Undo and older Homes keep working. It does
+not push or notify anything. How Homes check and install is in
+[INSTALL.md](INSTALL.md#how-updates-reach-your-home).
 
 Upgrading the seed Runtime itself is rare. Run the workflow with
 `seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints
