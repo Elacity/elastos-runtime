@@ -2166,7 +2166,7 @@ pub(crate) async fn ensure_local_model_engine(
     verify_arm64_model_host(&platform)?;
     let bytes = fetch_first_party_component_via_carrier(
         data_dir,
-        None,
+        info.cid.as_deref().filter(|cid| !cid.is_empty()),
         release_path,
         FirstPartyCarrierContext::Runtime,
     )
