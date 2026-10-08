@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildSmolEntry, canonical, contentManifest, fileRecord, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
+import { buildSmolEntry, canonical, contentManifest, download, fileRecord, ownedDirectory, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 function temporary(t) {
@@ -144,3 +144,52 @@ for (const [name, mutate, message] of [
     assert.throws(fixture.check, message);
   });
 }
+
+test("production payload is deterministic for fixed inputs and names the publisher", t => {
+  const root = temporary(t), inputs = join(root, "inputs"), weights = Buffer.from("GGUF fake weights"), license = Buffer.from("Apache-2.0 text\n");
+  mkdirSync(inputs);
+  writeFileSync(join(inputs, "fake.gguf"), weights);
+  writeFileSync(join(inputs, "LICENSE"), license);
+  const fixture = { ...SMOL_FIXTURE, model: { name: "fake.gguf", size: weights.length, sha256: sha(weights) }, license: { name: "LICENSE", size: license.length, sha256: sha(license) } };
+  const publisher = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
+  // Stand-in for Kubo: the CID is a function of the package's closure index.
+  const add = dir => rawCid(readFileSync(join(dir, "_elastos_object.json")));
+  const runs = ["a", "b"].map(name => produceCatalogPayload({ inputs, output: join(root, name), publisher, add, fixture, publishedAt: 1700000000 }));
+  assert.equal(runs[0].cid, runs[1].cid);
+  assert.deepEqual(readFileSync(join(root, "a/payload.json")), readFileSync(join(root, "b/payload.json")));
+  const { payload } = runs[0];
+  assert.equal(payload.schema, "elastos.model.catalog/v1");
+  assert.equal(payload.entries.length, 1);
+  assert(!("expires_at" in payload));
+  assert.match(readFileSync(join(runs[0].packageDir, "PROVENANCE.md"), "utf8"), new RegExp(publisher));
+  assert.throws(() => produceCatalogPayload({ inputs, output: join(root, "a"), publisher, add, fixture }), /EEXIST/);
+});
+
+test("download refuses a pre-placed symlink partial and leaves its target untouched", async t => {
+  const root = temporary(t), inputs = join(root, "inputs"), victim = join(root, "victim");
+  mkdirSync(inputs);
+  writeFileSync(victim, "keep");
+  symlinkSync(victim, join(inputs, "LICENSE.partial"));
+  let fetched = false;
+  const get = async () => { fetched = true; return new Response("replaced"); };
+  await assert.rejects(download(SMOL_FIXTURE.license, join(inputs, "LICENSE"), get), /EEXIST/);
+  assert.equal(readFileSync(victim, "utf8"), "keep");
+  assert.equal(fetched, false);
+});
+
+test("output directory refuses a symlinked ancestor", t => {
+  const root = temporary(t), real = join(root, "real");
+  mkdirSync(real);
+  symlinkSync(real, join(root, "link"));
+  assert.throws(() => ownedDirectory(join(root, "link", "out")), /not a symlink/);
+  assert.throws(() => lstatSync(join(real, "out")), /ENOENT/);
+});
+
+test("output directory refuses a group/other-writable OUT or ancestor before writing", t => {
+  const root = temporary(t), shared = join(root, "shared");
+  mkdirSync(shared);
+  chmodSync(shared, 0o777);
+  assert.throws(() => ownedDirectory(shared), /group\/other-writable/);
+  assert.throws(() => ownedDirectory(join(shared, "out", "inputs")), /group\/other-writable/);
+  assert.deepEqual(readdirSync(shared), []);
+});
