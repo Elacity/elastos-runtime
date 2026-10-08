@@ -5,6 +5,8 @@ const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;
 const windowListeners = new Map();
+const chatReconnectTimers = new Map();
+let chatReconnectTimerSequence = 0;
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],
 ]);
@@ -244,6 +246,7 @@ const summary = {
     { target: "browser", title: "Browser", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "inbox", title: "Inbox", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "people", title: "People", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "chat-room", title: "Chat", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "assistant", title: "Assistant", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "home-agent", title: "Home Agent", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "marketplace", title: "Apps", attach_kind: "iframe", role: "app", target_kind: "app" },
@@ -255,6 +258,8 @@ let activeShellName = "home-cli";
 const pendingAppearanceResponses = [];
 const renewalBrowserInstance = "browser:authority-renewal-bridge";
 let renewalBrowserLaunchCount = 0;
+let chatLaunchCount = 0;
+let expireNextChatLaunch = false;
 let passkeyCompleted = false;
 const braveAddress = "0x2222222222222222222222222222222222222222";
 const metamaskAddress = "0x1111111111111111111111111111111111111111";
@@ -376,9 +381,14 @@ globalThis.window = {
   removeEventListener: removeWindowEventListener,
   dispatchEvent: dispatchWindowEvent,
   clearInterval() {},
-  clearTimeout() {},
+  clearTimeout(id) { chatReconnectTimers.delete(id); },
   setInterval: () => 0,
-  setTimeout: () => 0,
+  setTimeout(fn, delay) {
+    if (delay !== 25000) return 0;
+    const id = ++chatReconnectTimerSequence;
+    chatReconnectTimers.set(id, fn);
+    return id;
+  },
   open() {
     extraWindowOpenCount += 1;
     throw new Error("Home wallet connector must not open another window");
@@ -527,6 +537,15 @@ globalThis.fetch = async (url, init = {}) => {
         target: "people",
         title: "People",
       });
+    }
+    if (body?.target === "chat-room") {
+      if (expireNextChatLaunch) {
+        expireNextChatLaunch = false;
+        return { ...jsonResponse({ error: "Home session expired" }), ok: false, status: 401 };
+      }
+      chatLaunchCount += 1;
+      return jsonResponse({ target: "chat-room", attach_kind: "iframe", launch_status: "launched",
+        route: `/apps/chat-room/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=chat-token-${chatLaunchCount}` });
     }
     if (body?.target === "wallet") {
       return jsonResponse({
@@ -2299,6 +2318,114 @@ assert(
   systemStepUpBegin,
 );
 
+// Actual Home admission and canonical launch path: only the registered Chat
+// frame may request this recovery, and GUI preparation keeps its retry lookup.
+sendChildMessage("null", shellFrameWindow, { type: "home:launch-target", requestId: "launch-chat",
+  target: "chat-room", query: {}, homeToken: "gui-token" });
+await waitForShellResponse(shellMessages, "launch-chat");
+const chatReplies = [];
+const chatFrameWindow = { parent: shellFrameWindow, postMessage: (payload, origin) => chatReplies.push({ payload, origin }) };
+sendChildMessage("null", chatFrameWindow, { type: "home:app-ready", homeToken: "chat-token-1" });
+const reconnect = requestId => ({ type: "home:launch-target", requestId, target: "chat-room",
+  query: { conversation_id: "direct:a" }, homeToken: "chat-token-1" });
+const chatLaunches = () => requests.filter(r => r.url === "/api/apps/home/launch" && r.body?.target === "chat-room").length;
+const beforeWrongChatMessages = chatLaunches();
+const allLaunches = () => requests.filter(r => r.url === "/api/apps/home/launch").length;
+const beforeAllWrongChatMessages = allLaunches();
+for (const [origin, source, data] of [
+  ["https://evil.invalid", chatFrameWindow, reconnect("wrong-origin")],
+  ["null", {}, reconnect("wrong-source")],
+  ["null", chatFrameWindow, { ...reconnect("wrong-token"), homeToken: "substituted" }],
+  ["null", chatFrameWindow, { ...reconnect("wrong-target"), target: "browser" }],
+  ["null", chatFrameWindow, { ...reconnect("wrong-query"), query: { conversation_id: "direct:a", authority: "extra" } }],
+  ["null", chatFrameWindow, { ...reconnect("wrong-shape"), extra: true }],
+]) sendChildMessage(origin, source, data);
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(allLaunches() === beforeAllWrongChatMessages, "Chat recovery accepted a wrong source/token/origin/target/query", requests);
+async function waitForChatPrepare(requestId) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const command = shellMessages.find(m => m.payload?.command === "renew-chat-authority"
+      && m.payload?.phase === "prepare" && m.payload?.requestId === requestId)?.payload;
+    if (command) return command;
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  throw new Error(`missing Chat GUI prepare ${requestId}`);
+}
+function acknowledgeChat(command, ok, source = shellFrameWindow, extra = {}) {
+  const freshHomeToken = new URL(command.launched.route, window.location.origin).hash.split("home_token=")[1];
+  sendChildMessage("null", source, { type: "home:chat-authority-renewed", requestId: command.requestId,
+    oldHomeToken: command.homeToken, freshHomeToken, ok, homeToken: "gui-token", ...extra });
+  return freshHomeToken;
+}
+const deniedRequest = reconnect("chat-gui-refused");
+sendChildMessage("null", chatFrameWindow, deniedRequest);
+sendChildMessage("null", chatFrameWindow, deniedRequest);
+const deniedPrepare = await waitForChatPrepare(deniedRequest.requestId);
+assert(chatLaunches() === beforeWrongChatMessages + 1, "duplicate Chat recovery minted two authorities", requests);
+acknowledgeChat(deniedPrepare, true, {});
+acknowledgeChat(deniedPrepare, true, shellFrameWindow, { freshHomeToken: "substituted" });
+assert(!chatReplies.some(r => r.payload.requestId === deniedRequest.requestId), "Chat returned authority before a valid GUI receipt", chatReplies);
+const refusedToken = acknowledgeChat(deniedPrepare, false);
+assert((await waitForShellResponse(chatReplies, deniedRequest.requestId)).payload.error,
+  "refused or closed GUI entry did not return a recovery error", chatReplies);
+const openCommands = () => shellMessages.filter(m => m.payload?.command === "open-target").length;
+function assertChatTokenRetired(token) {
+  const before = openCommands();
+  const frame = { postMessage() {} };
+  sendChildMessage("null", frame, { type: "home:app-ready", homeToken: token });
+  sendChildMessage("null", frame, { type: "home:open-target", homeToken: token, target: "inbox", query: {} });
+  assert(openCommands() === before, "failed recovery retained fresh launch authority", { token, shellMessages });
+}
+assertChatTokenRetired(refusedToken);
+
+sendChildMessage("null", chatFrameWindow, reconnect("chat-timeout"));
+const timeoutPrepare = await waitForChatPrepare("chat-timeout");
+assert(chatReconnectTimers.size === 1, "Chat recovery timer must be bounded", chatReconnectTimers.size);
+[...chatReconnectTimers.values()][0]();
+assert((await waitForShellResponse(chatReplies, "chat-timeout")).payload.error, "timeout did not leave a retryable result");
+const repliesAfterTimeout = chatReplies.length;
+acknowledgeChat(timeoutPrepare, true);
+assert(chatReplies.length === repliesAfterTimeout, "late GUI receipt returned retired authority", chatReplies);
+assertChatTokenRetired(new URL(timeoutPrepare.launched.route, window.location.origin).hash.split("home_token=")[1]);
+
+expireNextChatLaunch = true;
+sendChildMessage("null", chatFrameWindow, reconnect("chat-home-expired"));
+assert((await waitForShellResponse(chatReplies, "chat-home-expired")).payload.status === 401,
+  "expired Home sign-in did not reach the reconnect control", chatReplies);
+
+sendChildMessage("null", chatFrameWindow, reconnect("chat-gui-gone"));
+activeShellFrame.contentWindow = null;
+const unavailableReply = await waitForShellResponse(chatReplies, "chat-gui-gone");
+activeShellFrame.contentWindow = shellFrameWindow;
+assert(unavailableReply.payload.error && chatReconnectTimers.size === 0,
+  "GUI failure leaked fresh authority or recovery timer", chatReplies);
+assertChatTokenRetired(`chat-token-${chatLaunchCount}`);
+
+sendChildMessage("null", chatFrameWindow, reconnect("chat-success"));
+const successfulPrepare = await waitForChatPrepare("chat-success");
+const freshChatToken = acknowledgeChat(successfulPrepare, true);
+const chatSuccess = await waitForShellResponse(chatReplies, "chat-success");
+assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && chatReconnectTimers.size === 0,
+  "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
+assert(shellMessages.some(m => m.payload?.command === "renew-chat-authority"
+  && m.payload.phase === "commit" && m.payload.requestId === "chat-success"), "Home omitted the same-frame metadata commit", shellMessages);
+const launchesAfterRenewal = chatLaunches();
+sendChildMessage("null", chatFrameWindow, reconnect("old-authority-replay"));
+assert(chatLaunches() === launchesAfterRenewal, "old Chat authority remained usable after renewal");
+const beforeProfileActions = openCommands();
+for (const [source, target, query] of [[{}, "inbox", {}], [chatFrameWindow, "system", {}],
+  [chatFrameWindow, "inbox", { item: "extra" }], [chatFrameWindow, "people", { extra: "injected" }]])
+  sendChildMessage("null", source, { type: "home:open-target", homeToken: freshChatToken, target, query });
+assert(openCommands() === beforeProfileActions, "Chat gained unrelated Home action authority", shellMessages);
+for (const target of ["people", "inbox"]) sendChildMessage("null", chatFrameWindow,
+  { type: "home:open-target", homeToken: freshChatToken, target, query: {} });
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(openCommands() === beforeProfileActions + 2, "Profile card did not open its exact People and Inbox targets", shellMessages);
+// Keep a prepared renewal pending when the existing sign-out test changes
+// Home authority; context retirement must cancel its timer and fresh launch.
+sendChildMessage("null", chatFrameWindow, { ...reconnect("chat-sign-out"), homeToken: freshChatToken });
+const signOutChatPrepare = await waitForChatPrepare("chat-sign-out");
+
 const signOutRequestsBefore = requests.filter(
   (request) => request.url === "/api/auth/sessions/sign-out",
 ).length;
@@ -2350,4 +2477,9 @@ assert(
   shellMessages,
 );
 
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(chatReconnectTimers.size === 0, "Home sign-out kept a pending Chat authority renewal", chatReconnectTimers.size);
+assert(!chatReplies.some(r => r.payload.requestId === "chat-sign-out" && r.payload.result),
+  "Home sign-out delivered a prepared Chat authority", chatReplies);
+assertChatTokenRetired(new URL(signOutChatPrepare.launched.route, window.location.origin).hash.split("home_token=")[1]);
 console.log("[home-shell-bridge] PASS");

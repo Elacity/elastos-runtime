@@ -1,5 +1,5 @@
 use base64::Engine as _;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -23,7 +23,7 @@ use direct::{
     remove_unavailable_conversation, requested_conversation_decision, selected_conversation,
     should_clear_polled_transient_error, valid_direct_send_response, DirectConversationList,
     DirectMessageDirection, DirectMessageList, DirectSendInput, DirectSendResponse, DirectUiState,
-    RequestedConversationDecision, DIRECT_API_BASE,
+    PendingDirectSend, RequestedConversationDecision, DIRECT_API_BASE,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -74,6 +74,9 @@ struct AppState {
     request_id: Option<String>,
     pending_chat_send: Option<PendingChatSend>,
     selection_generation: u64,
+    drafts: BTreeMap<Option<String>, ComposerDraft>,
+    session_lost: bool,
+    reconnecting: bool,
     room_mode_known: bool,
     collaboration_configured: bool,
     session_active: bool,
@@ -106,10 +109,24 @@ struct PendingChatSend {
     body: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ComposerDraft {
+    body: String,
+    revision: u64,
+    pending_direct_send: Option<PendingDirectSend>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectionGuard {
     generation: u64,
     selected_conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ComposerSendGuard {
+    selection: SelectionGuard,
+    revision: u64,
+    body: String,
 }
 
 #[derive(Clone)]
@@ -121,6 +138,7 @@ struct LibraryPickerRequest {
 
 struct App {
     config: AppConfig,
+    current_home_token: RefCell<Option<String>>,
     home_parent_origin: Option<String>,
     picker_document_nonce: String,
     picker_request: RefCell<Option<LibraryPickerRequest>>,
@@ -130,6 +148,9 @@ struct App {
     session_storage: Option<Storage>,
     status_badge: Option<HtmlElement>,
     status_detail: Option<HtmlElement>,
+    reconnect_row: HtmlElement,
+    reconnect_status: HtmlElement,
+    reconnect_button: HtmlButtonElement,
     error_text: HtmlElement,
     gateway_ui: Option<GatewayUi>,
     chat_card: HtmlElement,
@@ -156,6 +177,8 @@ struct App {
     participant_card_state: HtmlElement,
     participant_card_action: HtmlButtonElement,
     participant_card_close: HtmlButtonElement,
+    participant_card_generation: Cell<u64>,
+    participant_card_opener: RefCell<Option<HtmlElement>>,
     browser_access_section: HtmlElement,
     browser_access_count: HtmlElement,
     browser_access_list: HtmlElement,
@@ -542,6 +565,7 @@ pub fn start() -> Result<(), JsValue> {
     };
 
     let app = Rc::new(App {
+        current_home_token: RefCell::new(config.home_token.clone()),
         config,
         home_parent_origin: extract_query_param(&window.location().href()?, "home_origin"),
         picker_document_nonce: new_chat_message_request_id()
@@ -555,6 +579,9 @@ pub fn start() -> Result<(), JsValue> {
         session_storage,
         status_badge: optional_element_by_id(&document, "status-badge"),
         status_detail: optional_element_by_id(&document, "status-detail"),
+        reconnect_row: element_by_id(&document, "chat-reconnect-row")?,
+        reconnect_status: element_by_id(&document, "chat-reconnect-status")?,
+        reconnect_button: button_by_id(&document, "chat-reconnect")?,
         error_text: element_by_id(&document, "error-text")?,
         gateway_ui,
         chat_card: element_by_id(&document, "chat-card")?,
@@ -584,6 +611,8 @@ pub fn start() -> Result<(), JsValue> {
         participant_card_state: element_by_id(&document, "participant-card-state")?,
         participant_card_action: button_by_id(&document, "participant-card-action")?,
         participant_card_close: button_by_id(&document, "participant-card-close")?,
+        participant_card_generation: Cell::new(0),
+        participant_card_opener: RefCell::new(None),
         browser_access_section: element_by_id(&document, "browser-access-section")?,
         browser_access_count: element_by_id(&document, "browser-access-count")?,
         browser_access_list: element_by_id(&document, "browser-access-list")?,
@@ -784,11 +813,15 @@ impl App {
     }
 
     fn home_token_headers(&self) -> Vec<(&'static str, String)> {
-        self.config
-            .home_token
+        self.current_home_token
+            .borrow()
             .as_ref()
             .map(|token| vec![(HOME_TOKEN_HEADER, token.clone())])
             .unwrap_or_default()
+    }
+
+    fn home_token(&self) -> Option<String> {
+        self.current_home_token.borrow().clone()
     }
 
     fn room_request_headers(&self) -> Vec<(&'static str, String)> {
@@ -824,6 +857,8 @@ impl App {
 
     fn return_to_conversation_selector(&self, unavailable_conversation_id: Option<&str>) {
         let mut state = self.state.borrow_mut();
+        retain_composer(&mut state, &self.message_input.value());
+        bump_selection_generation(&mut state);
         if let Some(unavailable_conversation_id) = unavailable_conversation_id {
             remove_unavailable_conversation(&mut state.direct, unavailable_conversation_id);
         } else {
@@ -836,7 +871,9 @@ impl App {
         state.error_text = state.direct.notice.clone();
         state.error_transient = false;
         let guard = current_selection_guard(&state);
+        let draft = restore_composer(&mut state);
         drop(state);
+        self.message_input.set_value(&draft);
         self.publish_home_navigation(&guard);
     }
 
@@ -1033,8 +1070,10 @@ impl App {
 
         let edit_app = Rc::clone(self);
         let message_edit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
-            let body = edit_app.message_input.value().trim().to_string();
+            let body = edit_app.message_input.value();
             let mut state = edit_app.state.borrow_mut();
+            record_composer_edit(&mut state, &body);
+            let body = body.trim();
             if let Some(conversation_id) = state.direct.selected_conversation_id.clone() {
                 if state.direct.pending_send.as_ref().is_some_and(|pending| {
                     pending.conversation_id != conversation_id || pending.text != body
@@ -1054,6 +1093,20 @@ impl App {
         self.message_input
             .add_event_listener_with_callback("input", message_edit.as_ref().unchecked_ref())?;
         message_edit.forget();
+
+        let reconnect_app = Rc::clone(self);
+        let reconnect_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            let app = Rc::clone(&reconnect_app);
+            spawn_local(async move {
+                if let Err(error) = app.reconnect_from_home().await {
+                    app.set_error(Some(error));
+                }
+                let _ = app.render();
+            });
+        }));
+        self.reconnect_button
+            .add_event_listener_with_callback("click", reconnect_click.as_ref().unchecked_ref())?;
+        reconnect_click.forget();
 
         let selector_app = Rc::clone(self);
         let selector_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
@@ -1334,6 +1387,7 @@ impl App {
                     format!("{current} {emoji}")
                 };
                 emoji_app.message_input.set_value(&next);
+                record_composer_edit(&mut emoji_app.state.borrow_mut(), &next);
                 let _ = emoji_app.message_input.focus();
             }));
             button
@@ -1464,7 +1518,7 @@ impl App {
                         app.set_error(Some(err));
                     }
                     let _ = app.post_library_picker_message(serde_json::json!({
-                        "type": "home:picker-accepted", "homeToken": app.config.home_token,
+                        "type": "home:picker-accepted", "homeToken": app.home_token(),
                         "pickerId": picker_id, "requestId": request_id,
                         "documentNonce": document_nonce, "deliveryId": delivery_id, "accepted": accepted,
                     }));
@@ -1604,7 +1658,7 @@ impl App {
 
     fn session_loss_detail(&self) -> &'static str {
         if self.is_shell_mode() {
-            "The local conversation session ended. Open Chat again to reconnect."
+            "The local conversation session ended. Use Reconnect to open Chat through Home."
         } else {
             "This browser was removed from the conversation."
         }
@@ -1642,15 +1696,22 @@ impl App {
         }
 
         let app = Rc::clone(self);
+        let guard = current_selection_guard(&self.state.borrow());
+        let request_token = self.home_token();
         spawn_local(async move {
             let headers = app.room_request_headers();
-            match api_post_session_json(
+            let result = api_post_session_json(
                 &app.room_api_url("/poll"),
                 &RoomPollInput { since: 0 },
                 &headers,
             )
-            .await
+            .await;
+            if request_token != app.home_token()
+                || !selection_guard_matches(&app.state.borrow(), &guard)
             {
+                return;
+            }
+            match result {
                 Ok(poll) => {
                     let (attachments, _changed) = app.apply_active_poll(poll);
                     for attachment in attachments {
@@ -1720,6 +1781,8 @@ impl App {
         let mut state = self.state.borrow_mut();
         state.request_id = None;
         state.session_active = false;
+        state.session_lost = self.is_shell_mode();
+        bump_selection_generation(&mut state);
         state.show_participants = false;
         state.show_access_controls = false;
         state.force_message_follow = true;
@@ -1736,6 +1799,41 @@ impl App {
         state.status_detail = detail.to_string();
         state.error_text = None;
         state.error_transient = false;
+    }
+
+    async fn reconnect_from_home(&self) -> Result<(), String> {
+        {
+            let mut state = self.state.borrow_mut();
+            if !self.is_shell_mode() || !state.session_lost || state.reconnecting {
+                return Ok(());
+            }
+            record_composer_edit(&mut state, &self.message_input.value());
+            state.reconnecting = true;
+        }
+        let _ = self.render();
+        let result = async {
+            let window = window().ok_or_else(|| "Open Chat from Home to reconnect.".to_string())?;
+            let reconnect =
+                Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatReconnect"))
+                    .and_then(|value| value.dyn_into::<Function>())
+                    .map_err(js_error)?;
+            let token = JsFuture::from(Promise::from(
+                reconnect.call0(&JsValue::NULL).map_err(js_error)?,
+            ))
+            .await
+            .map_err(js_error)?
+            .as_string()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "Home could not reopen Chat. Try again.".to_string())?;
+            *self.current_home_token.borrow_mut() = Some(token);
+            bump_selection_generation(&mut self.state.borrow_mut());
+            let guard = current_selection_guard(&self.state.borrow());
+            self.ensure_shell_session_for_guard(&guard).await?;
+            Ok(())
+        }
+        .await;
+        self.state.borrow_mut().reconnecting = false;
+        result
     }
 
     fn hydrate_defaults(self: &Rc<Self>) {
@@ -1936,6 +2034,9 @@ impl App {
 
     async fn ensure_shell_session_for_guard(&self, guard: &SelectionGuard) -> Result<bool, String> {
         if !self.is_shell_mode() || self.state.borrow().session_active {
+            return Ok(false);
+        }
+        if self.state.borrow().session_lost && !self.state.borrow().reconnecting {
             return Ok(false);
         }
 
@@ -2191,21 +2292,38 @@ impl App {
         if !self.state.borrow().session_active {
             return Ok(());
         }
-        let body = self.message_input.value().trim().to_string();
+        let draft = self.message_input.value();
+        let body = draft.trim().to_string();
         if body.is_empty() {
             return Ok(());
         }
 
-        let request_id = {
+        let (request_id, guard) = {
             let mut state = self.state.borrow_mut();
-            pending_chat_request_id(
+            let guard = composer_send_guard(&mut state, &draft);
+            let request_id = pending_chat_request_id(
                 &mut state.pending_chat_send,
                 &body,
                 new_chat_message_request_id,
-            )?
+            )?;
+            (request_id, guard)
         };
-        if self.send_room_text(&request_id, &body).await? {
+        let sent = match self
+            .send_room_text(&request_id, &body, &guard.selection)
+            .await
+        {
+            Ok(sent) => sent,
+            Err(error) if composer_send_is_current(&self.state.borrow(), &guard) => {
+                return Err(error)
+            }
+            Err(_) => return Ok(()),
+        };
+        if sent {
             let mut state = self.state.borrow_mut();
+            record_composer_edit(&mut state, &self.message_input.value());
+            if !complete_composer_send(&mut state, &guard) {
+                return Ok(());
+            }
             if state
                 .pending_chat_send
                 .as_ref()
@@ -2233,47 +2351,63 @@ impl App {
             self.return_to_conversation_selector(Some(&conversation_id));
             return Err("That conversation is no longer available.".to_string());
         }
-        let text = self.message_input.value().trim().to_string();
+        let draft = self.message_input.value();
+        let text = draft.trim().to_string();
         if text.is_empty() {
             return Ok(());
         }
-        let request_id = {
+        let (request_id, guard) = {
             let mut state = self.state.borrow_mut();
-            pending_direct_request_id(
+            let guard = composer_send_guard(&mut state, &draft);
+            let request_id = pending_direct_request_id(
                 &mut state.direct.pending_send,
                 &conversation_id,
                 &text,
                 new_chat_message_request_id,
-            )?
+            )?;
+            (request_id, guard)
         };
         let payload = DirectSendInput {
             request_id: &request_id,
             conversation_id: &conversation_id,
             text: &text,
         };
+        let request_token = self.home_token();
         let response_result: Result<(u16, DirectSendResponse), u16> = direct_post_json(
             &format!("{DIRECT_API_BASE}/messages/send"),
             &payload,
             &self.home_token_headers(),
         )
         .await;
-        let current_selection = self.state.borrow().direct.selected_conversation_id.clone();
-        if current_selection.as_deref() != Some(conversation_id.as_str()) {
+        if self.home_token() != request_token || !self.selection_guard_is_current(&guard.selection)
+        {
             return Ok(());
         }
+        record_composer_edit(&mut self.state.borrow_mut(), &self.message_input.value());
+        let draft_is_current = composer_send_is_current(&self.state.borrow(), &guard);
         let (http_status, response) = match response_result {
             Ok(response) => response,
-            Err(403) => {
+            Err(403) if draft_is_current => {
                 self.return_to_conversation_selector(Some(&conversation_id));
                 return Err("That conversation is no longer available.".to_string());
             }
-            Err(_) => return Err("Message could not be sent. Try again.".to_string()),
+            Err(_) if draft_is_current => {
+                return Err("Message could not be sent. Try again.".to_string())
+            }
+            Err(_) => return Ok(()),
         };
         if !valid_direct_send_response(http_status, response.status) {
-            return Err("Message could not be sent. Try again.".to_string());
+            return if draft_is_current {
+                Err("Message could not be sent. Try again.".to_string())
+            } else {
+                Ok(())
+            };
         }
         {
             let mut state = self.state.borrow_mut();
+            if !complete_composer_send(&mut state, &guard) {
+                return Ok(());
+            }
             if state.direct.pending_send.as_ref().is_some_and(|pending| {
                 pending.request_id == request_id
                     && pending.conversation_id == conversation_id
@@ -2368,34 +2502,49 @@ impl App {
         Ok(())
     }
 
-    async fn send_room_text(&self, request_id: &str, body: &str) -> Result<bool, String> {
+    async fn send_room_text(
+        &self,
+        request_id: &str,
+        body: &str,
+        guard: &SelectionGuard,
+    ) -> Result<bool, String> {
         if !self.state.borrow().session_active {
             return Ok(false);
         }
         let payload = SendMessageInput { request_id, body };
+        let request_token = self.home_token();
         let headers = self.room_request_headers();
-        let sent: ConversationObjectView =
-            match api_post_session_json(&self.room_api_url("/objects/send"), &payload, &headers)
-                .await
-            {
-                Ok(sent) => sent,
-                Err(err) if is_session_error(&err) => {
+        let response =
+            api_post_session_json(&self.room_api_url("/objects/send"), &payload, &headers).await;
+        if self.home_token() != request_token || !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        let sent: ConversationObjectView = match response {
+            Ok(sent) => sent,
+            Err(err) if is_session_error(&err) => {
+                if self.selection_guard_is_current(guard) {
                     self.handle_session_loss(self.session_loss_detail());
-                    return Ok(false);
                 }
-                Err(err) => return Err(err),
-            };
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
 
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
         let mut state = self.state.borrow_mut();
-        state.latest_seq = sent.seq;
-        state.objects.push(sent);
+        state.latest_seq = state.latest_seq.max(sent.seq);
+        if !state.objects.iter().any(|object| object.seq == sent.seq) {
+            state.objects.push(sent);
+        }
         state.force_message_follow = true;
         Ok(true)
     }
 
     fn open_elastos_uri_from_shell(&self, uri: &str) -> Result<bool, JsValue> {
         let clean_uri = uri.trim();
-        let Some(home_token) = self.config.home_token.as_deref() else {
+        let Some(home_token) = self.home_token() else {
             return Ok(false);
         };
         if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
@@ -2430,7 +2579,7 @@ impl App {
         Reflect::set(
             &message,
             &JsValue::from_str("homeToken"),
-            &JsValue::from_str(home_token),
+            &JsValue::from_str(&home_token),
         )?;
         parent.post_message(&message.into(), &window.location().origin()?)?;
         Ok(true)
@@ -2438,7 +2587,7 @@ impl App {
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
         let clean_attachment_id = attachment_id.trim();
-        let Some(home_token) = self.config.home_token.as_deref() else {
+        let Some(home_token) = self.home_token() else {
             return Err(JsValue::from_str(
                 "Open Chat from Home to open attachments in Documents.",
             ));
@@ -2526,7 +2675,7 @@ impl App {
         Reflect::set(
             &message,
             &JsValue::from_str("homeToken"),
-            &JsValue::from_str(home_token),
+            &JsValue::from_str(&home_token),
         )?;
         parent.post_message(&message.into(), &window.location().origin()?)?;
         Ok(true)
@@ -2537,16 +2686,24 @@ impl App {
     fn select_conversation(self: &Rc<Self>, choice: String) {
         let selection_guard = {
             let mut state = self.state.borrow_mut();
+            if choice != "shared"
+                && selected_conversation(&state.direct.conversations, &choice).is_none()
+            {
+                return;
+            }
+            retain_composer(&mut state, &self.message_input.value());
             state.error_text = None;
             state.error_transient = false;
-            if choice == "shared" {
+            let guard = if choice == "shared" {
                 commit_shared_selection(&mut state)
             } else {
                 let Some(guard) = commit_direct_selection(&mut state, &choice) else {
                     return;
                 };
                 guard
-            }
+            };
+            self.message_input.set_value(&restore_composer(&mut state));
+            guard
         };
         let _ = self.render();
         if choice == "shared" {
@@ -2640,7 +2797,13 @@ impl App {
         let Some((name, card)) = self.participant_card_for(participant_ref) else {
             return;
         };
-        let (state_text, action) = participant_card_copy(&card, self.config.home_token.is_some());
+        let (state_text, action) = participant_card_copy(&card, self.home_token().is_some());
+        self.participant_card_generation
+            .set(self.participant_card_generation.get().wrapping_add(1));
+        *self.participant_card_opener.borrow_mut() = self
+            .document
+            .active_element()
+            .and_then(|element| element.dyn_into::<HtmlElement>().ok());
         let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
             .set_text_content(Some(&participant_initial(&name)));
@@ -2676,10 +2839,24 @@ impl App {
     }
 
     fn close_participant_card(&self) {
+        self.participant_card_generation
+            .set(self.participant_card_generation.get().wrapping_add(1));
         self.participant_card.set_hidden(true);
         let _ = self
             .participant_card
             .remove_attribute("data-participant-ref");
+        if let Some(opener) = self
+            .participant_card_opener
+            .borrow_mut()
+            .take()
+            .filter(|element| element.is_connected())
+        {
+            let _ = opener.focus();
+        } else if !self.message_input.disabled() {
+            let _ = self.message_input.focus();
+        } else {
+            let _ = self.participant_toggle.focus();
+        }
     }
 
     fn run_participant_card_action(self: &Rc<Self>) {
@@ -2706,9 +2883,21 @@ impl App {
             }
             "add-contact" => {
                 self.participant_card_action.set_disabled(true);
+                let generation = self.participant_card_generation.get();
                 let app = Rc::clone(self);
                 spawn_local(async move {
-                    match app.request_contact(&participant_ref).await {
+                    let result = app.request_contact(&participant_ref).await;
+                    if !participant_card_response_is_current(
+                        app.participant_card_generation.get(),
+                        generation,
+                        app.participant_card
+                            .get_attribute("data-participant-ref")
+                            .as_deref(),
+                        &participant_ref,
+                    ) {
+                        return;
+                    }
+                    match result {
                         Ok(()) => {
                             app.participant_card_state
                                 .set_text_content(Some(PARTICIPANT_CARD_REQUEST_SENT));
@@ -2725,7 +2914,7 @@ impl App {
                 self.close_participant_card();
                 let _ = self.post_library_picker_message(serde_json::json!({
                     "type": "home:open-target", "target": action, "query": {},
-                    "homeToken": self.config.home_token,
+                    "homeToken": self.home_token(),
                 }));
             }
             _ => {}
@@ -2801,7 +2990,7 @@ impl App {
     }
 
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
-        if self.config.home_token.is_none() || self.home_parent_origin.is_none() {
+        if self.home_token().is_none() || self.home_parent_origin.is_none() {
             return Ok(false);
         }
         let request = LibraryPickerRequest {
@@ -2810,7 +2999,7 @@ impl App {
             consumed: false,
         };
         self.post_library_picker_message(serde_json::json!({
-            "type": "home:open-target", "target": "library", "homeToken": self.config.home_token,
+            "type": "home:open-target", "target": "library", "homeToken": self.home_token(),
             "query": { "mode": "attach", "returnTarget": "chat-room" },
             "requestId": request.id, "documentNonce": self.picker_document_nonce,
         }))?;
@@ -2850,8 +3039,9 @@ impl App {
             state.session_active
         };
         if session_active {
+            let request_token = self.home_token();
             let headers = self.room_request_headers();
-            let poll: RoomPollView = match api_post_session_json(
+            let response = api_post_session_json(
                 &self.room_api_url("/poll"),
                 &RoomPollInput {
                     since: {
@@ -2861,8 +3051,13 @@ impl App {
                 },
                 &headers,
             )
-            .await
+            .await;
+            if self.home_token() != request_token
+                || guard.is_some_and(|guard| !self.selection_guard_is_current(guard))
             {
+                return Ok(false);
+            }
+            let poll: RoomPollView = match response {
                 Ok(poll) => poll,
                 Err(err) if is_session_error(&err) => {
                     self.handle_session_loss(self.session_loss_detail());
@@ -2972,13 +3167,18 @@ impl App {
             }
         }
 
+        let guard = current_selection_guard(&self.state.borrow());
+        let request_token = self.home_token();
         let headers = self.room_request_headers();
-        let bytes = match api_get_session_bytes(
+        let response = api_get_session_bytes(
             &self.room_api_url(&format!("/attachments/{}", attachment.attachment_id)),
             &headers,
         )
-        .await
-        {
+        .await;
+        if self.home_token() != request_token || !self.selection_guard_is_current(&guard) {
+            return Ok(());
+        }
+        let bytes = match response {
             Ok(bytes) => bytes,
             Err(err) if is_session_error(&err) => {
                 self.handle_session_loss(self.session_loss_detail());
@@ -3039,6 +3239,17 @@ impl App {
             state.show_access_controls,
             !state.pending_requests.is_empty(),
         );
+        let show_reconnect = self.is_shell_mode() && state.session_lost;
+        self.reconnect_row.set_hidden(!show_reconnect);
+        self.reconnect_status.set_hidden(!show_reconnect);
+        self.reconnect_button.set_hidden(!show_reconnect);
+        self.reconnect_button.set_disabled(state.reconnecting);
+        self.reconnect_status
+            .set_text_content(Some(if state.reconnecting {
+                "Opening Chat through Home. Your drafts are kept."
+            } else {
+                "Chat needs to reconnect. Your drafts are kept."
+            }));
         self.participant_count
             .set_text_content(Some(&projection.participant_count));
         self.browser_access_count
@@ -3931,6 +4142,69 @@ fn selection_guard_matches(state: &AppState, guard: &SelectionGuard) -> bool {
         && state.direct.selected_conversation_id == guard.selected_conversation_id
 }
 
+fn record_composer_edit(state: &mut AppState, body: &str) {
+    let draft = state
+        .drafts
+        .entry(state.direct.selected_conversation_id.clone())
+        .or_default();
+    if draft.body != body {
+        draft.body = body.to_string();
+        draft.revision = draft.revision.wrapping_add(1);
+    }
+}
+
+fn retain_composer(state: &mut AppState, body: &str) {
+    record_composer_edit(state, body);
+    state
+        .drafts
+        .get_mut(&state.direct.selected_conversation_id)
+        .unwrap()
+        .pending_direct_send = state.direct.pending_send.take();
+}
+
+fn restore_composer(state: &mut AppState) -> String {
+    let draft = state
+        .drafts
+        .entry(state.direct.selected_conversation_id.clone())
+        .or_default();
+    state.direct.pending_send = draft.pending_direct_send.take();
+    draft.body.clone()
+}
+
+fn composer_send_guard(state: &mut AppState, body: &str) -> ComposerSendGuard {
+    record_composer_edit(state, body);
+    ComposerSendGuard {
+        selection: current_selection_guard(state),
+        revision: state.drafts[&state.direct.selected_conversation_id].revision,
+        body: body.to_string(),
+    }
+}
+
+fn composer_send_is_current(state: &AppState, guard: &ComposerSendGuard) -> bool {
+    selection_guard_matches(state, &guard.selection)
+        && state
+            .drafts
+            .get(&guard.selection.selected_conversation_id)
+            .is_some_and(|draft| draft.revision == guard.revision && draft.body == guard.body)
+}
+
+fn complete_composer_send(state: &mut AppState, guard: &ComposerSendGuard) -> bool {
+    if !composer_send_is_current(state, guard) {
+        return false;
+    }
+    record_composer_edit(state, "");
+    true
+}
+
+fn participant_card_response_is_current(
+    generation: u64,
+    expected: u64,
+    participant_ref: Option<&str>,
+    expected_ref: &str,
+) -> bool {
+    generation == expected && participant_ref == Some(expected_ref)
+}
+
 fn navigation_query_for_guard(
     state: &AppState,
     guard: &SelectionGuard,
@@ -4053,6 +4327,7 @@ fn apply_active_poll_state(
     let previous_collaboration_configured = state.collaboration_configured;
     state.collaboration_configured = poll.transport.configured;
     state.session_active = true;
+    state.session_lost = false;
     state.close_leave_sent = false;
     state.display_name = poll.display_name.clone();
     state.status_badge = "Live".to_string();
@@ -4241,6 +4516,9 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         },
         pending_chat_send: None,
         selection_generation: 0,
+        drafts: BTreeMap::new(),
+        session_lost: false,
+        reconnecting: false,
         room_mode_known: false,
         collaboration_configured: false,
         session_active: false,
@@ -4347,6 +4625,102 @@ mod tests {
         ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
         ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
     };
+
+    #[test]
+    fn send_completion_only_clears_the_unchanged_draft() {
+        let mut state = AppState::default();
+        let sent = super::composer_send_guard(&mut state, "sent text");
+        super::record_composer_edit(&mut state, "new text");
+        assert!(!super::complete_composer_send(&mut state, &sent));
+        assert_eq!(super::restore_composer(&mut state), "new text");
+        // Retyping the same body still creates a different draft revision.
+        super::record_composer_edit(&mut state, "sent text");
+        assert!(!super::complete_composer_send(&mut state, &sent));
+        let current = super::composer_send_guard(&mut state, "sent text");
+        assert!(super::complete_composer_send(&mut state, &current));
+        assert_eq!(super::restore_composer(&mut state), "");
+    }
+
+    #[test]
+    fn conversation_switch_keeps_drafts_and_retry_identity_and_rejects_old_send() {
+        let mut state = AppState::default();
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:a".into(),
+            display_name: "A".into(),
+            removed: false,
+            unread: false,
+        }];
+        super::retain_composer(&mut state, "shared draft");
+        commit_direct_selection(&mut state, "direct:a").unwrap();
+        assert_eq!(super::restore_composer(&mut state), "");
+        let sent = super::composer_send_guard(&mut state, "direct draft");
+        let pending = PendingDirectSend {
+            request_id: "retry-a".into(),
+            conversation_id: "direct:a".into(),
+            text: "direct draft".into(),
+        };
+        state.direct.pending_send = Some(pending.clone());
+        super::retain_composer(&mut state, "direct draft");
+        commit_shared_selection(&mut state);
+        assert_eq!(super::restore_composer(&mut state), "shared draft");
+        assert!(state.direct.pending_send.is_none());
+        super::retain_composer(&mut state, "new shared draft");
+        commit_direct_selection(&mut state, "direct:a").unwrap();
+        assert_eq!(super::restore_composer(&mut state), "direct draft");
+        assert_eq!(state.direct.pending_send, Some(pending));
+        assert!(!super::complete_composer_send(&mut state, &sent));
+        super::retain_composer(&mut state, "direct draft");
+        commit_shared_selection(&mut state);
+        assert_eq!(super::restore_composer(&mut state), "new shared draft");
+    }
+
+    #[test]
+    fn returning_to_shared_or_renewing_authority_rejects_the_old_send_guard() {
+        let mut state = AppState::default();
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:a".into(),
+            display_name: "A".into(),
+            removed: false,
+            unread: false,
+        }];
+        let sent = super::composer_send_guard(&mut state, "shared draft");
+        super::retain_composer(&mut state, "shared draft");
+        commit_direct_selection(&mut state, "direct:a").unwrap();
+        super::restore_composer(&mut state);
+        super::retain_composer(&mut state, "direct draft");
+        commit_shared_selection(&mut state);
+        assert_eq!(super::restore_composer(&mut state), "shared draft");
+        assert!(!super::complete_composer_send(&mut state, &sent));
+        let before_renewal = super::composer_send_guard(&mut state, "shared draft");
+        super::bump_selection_generation(&mut state);
+        assert!(!super::complete_composer_send(&mut state, &before_renewal));
+        assert_eq!(super::restore_composer(&mut state), "shared draft");
+    }
+
+    #[test]
+    fn profile_card_response_requires_the_same_opening_and_person() {
+        assert!(super::participant_card_response_is_current(
+            1,
+            1,
+            Some("a"),
+            "a"
+        ));
+        assert!(!super::participant_card_response_is_current(
+            2,
+            1,
+            Some("b"),
+            "a"
+        ));
+        assert!(!super::participant_card_response_is_current(
+            3,
+            1,
+            Some("a"),
+            "a"
+        ));
+        assert!(!super::participant_card_response_is_current(
+            1, 1, None, "a"
+        ));
+    }
 
     #[test]
     fn navigation_hint_uses_current_verified_selection_without_draft_or_effects() {

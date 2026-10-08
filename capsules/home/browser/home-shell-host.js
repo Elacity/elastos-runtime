@@ -78,7 +78,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "home-agent": new Set(["marketplace", "system", "inbox"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
-  "chat-room": new Set(["library"]),
+  "chat-room": new Set(["library", "people", "inbox"]),
   "gba-emulator": new Set(["library"]),
   "home-cli": "visible-target",
   "home-gui": "visible-target",
@@ -182,6 +182,7 @@ function retireLaunchedAppContext(homeToken) {
     return false;
   }
   cancelBrowserAuthorityRenewalsForToken(homeToken);
+  cancelChatReconnect(context);
   cancelLibraryPicker(context);
   homeClipboardHost.retireFrame(context.clipboardState);
   launchedAppContexts.delete(homeToken);
@@ -191,10 +192,51 @@ function retireLaunchedAppContext(homeToken) {
 function clearLaunchedAppContexts() {
   clearPendingBrowserAuthorityRenewals();
   for (const context of launchedAppContexts.values()) {
+    cancelChatReconnect(context);
     cancelLibraryPicker(context);
     homeClipboardHost.retireFrame(context.clipboardState);
   }
   launchedAppContexts.clear();
+}
+
+function cancelChatReconnect(context) {
+  const record = context.chatReconnectPending;
+  if (!record) return;
+  context.chatReconnectPending = null;
+  window.clearTimeout(record.timeout);
+  if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+}
+
+function settleChatReconnect(old, record, error = null) {
+  if (old.chatReconnectPending !== record) return false;
+  old.chatReconnectPending = null;
+  window.clearTimeout(record.timeout);
+  if (error) {
+    if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+  } else {
+    const fresh = launchedAppContexts.get(record.freshToken);
+    if (launchedAppContexts.get(record.oldToken) !== old || old.source !== record.event.source
+      || fresh?.targetId !== "chat-room" || fresh.source || record.expiresAt <= Date.now()) {
+      if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+      error = new Error("Home could not reopen this Chat window");
+    } else {
+      try {
+        requireHomeGuiActive("reconnect Chat");
+        if (!postToActiveShell({ type: "home:gui-command", command: "renew-chat-authority",
+          phase: "commit", requestId: record.requestId, homeToken: record.oldToken,
+          launched: record.launched, expiresAt: record.expiresAt })) {
+          throw new Error("Home GUI could not reopen Chat");
+        }
+        fresh.source = record.event.source;
+        retireLaunchedAppContext(record.oldToken);
+      } catch (failure) {
+        retireLaunchedAppContext(record.freshToken);
+        error = failure;
+      }
+    }
+  }
+  replyToShellRequest(record.event, record.requestId, error ? null : record.launched, error);
+  return true;
 }
 
 function enterHostAuthGate() {
@@ -1596,9 +1638,70 @@ window.addEventListener("message", (event) => {
     }
     return;
   }
+  if (data.type === "home:chat-authority-renewed") {
+    if (context.kind !== "shell-frame" || context.targetId !== HOME_GUI_SHELL_ID
+      || !hasExactMessageKeys(data, ["type", "requestId", "oldHomeToken", "freshHomeToken", "ok", "homeToken"])) return;
+    const old = launchedAppContexts.get(data.oldHomeToken);
+    const record = old?.chatReconnectPending;
+    if (!record || record.requestId !== data.requestId || record.freshToken !== data.freshHomeToken
+      || !record.launched || typeof data.ok !== "boolean") return;
+    settleChatReconnect(old, record, data.ok ? null : new Error("Home could not reopen this Chat window"));
+    return;
+  }
   if (data.type === "home:launch-target") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const target = typeof data.target === "string" ? data.target.trim() : "";
+    if (context.kind === "app-frame" && context.targetId === "chat-room") {
+      const query = data.query;
+      const keys = query && typeof query === "object" && !Array.isArray(query) ? Object.keys(query) : null;
+      const validQuery = keys && (keys.length === 0 || (keys.length === 1 && keys[0] === "conversation_id"
+        && typeof query.conversation_id === "string" && /^[A-Za-z0-9:._-]{1,512}$/.test(query.conversation_id)));
+      if (!hasExactMessageKeys(data, ["type", "requestId", "target", "query", "homeToken"])
+        || !/^[A-Za-z0-9-]{1,64}$/.test(requestId) || requestId !== data.requestId
+        || target !== "chat-room" || target !== data.target || data.homeToken !== context.homeToken || !validQuery) {
+        replyToShellRequest(event, requestId, null, new Error("Home denied the Chat reconnect"));
+        return;
+      }
+      const old = launchedAppContexts.get(context.homeToken);
+      if (old.chatReconnectPending) {
+        if (old.chatReconnectPending.requestId !== requestId) {
+          replyToShellRequest(event, requestId, null, new Error("Chat is already reconnecting"));
+        }
+        return;
+      }
+      const record = { requestId, oldToken: context.homeToken, event, freshToken: "", launched: null,
+        expiresAt: Date.now() + 20000, timeout: 0 };
+      old.chatReconnectPending = record;
+      record.timeout = window.setTimeout(() => {
+        if (old.chatReconnectPending !== record) return;
+        settleChatReconnect(old, record, new Error("Home could not reopen Chat in time"));
+      }, 25000);
+      let createdToken = "";
+      launchHomeTarget("chat-room", query).then((launched) => {
+        const freshToken = homeLaunchTokenFromRoute(launched?.route || "");
+        createdToken = freshToken;
+        const fresh = launchedAppContexts.get(freshToken);
+        if (launched?.target !== "chat-room" || launched.attach_kind !== "iframe"
+          || (launched.launch_status && launched.launch_status !== "launched")
+          || !fresh || freshToken === context.homeToken || fresh.source
+          || launchedAppContexts.get(context.homeToken) !== old || old.source !== event.source
+          || old.chatReconnectPending !== record) {
+          if (freshToken && freshToken !== context.homeToken) retireLaunchedAppContext(freshToken);
+          throw new Error("Home could not reopen this Chat window");
+        }
+        requireHomeGuiActive("reconnect Chat");
+        record.freshToken = freshToken;
+        record.launched = launched;
+        if (!postToActiveShell({ type: "home:gui-command", command: "renew-chat-authority",
+          phase: "prepare", requestId, homeToken: context.homeToken, launched, expiresAt: record.expiresAt })) {
+          throw new Error("Home GUI could not reopen Chat");
+        }
+      }).catch((error) => {
+        if (createdToken && createdToken !== context.homeToken) retireLaunchedAppContext(createdToken);
+        settleChatReconnect(old, record, error);
+      });
+      return;
+    }
     if (
       context.kind !== "shell-frame" ||
       ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId) ||
@@ -1836,6 +1939,10 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
+  if (context.targetId === "chat-room" && ["people", "inbox"].includes(target)
+    && (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
+      || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
+      || Object.keys(data.query).length !== 0)) return;
   if (["assistant", "home-agent"].includes(context.targetId)) {
     if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])) return;
     const marketplace = data.target === "marketplace" && assistantModelsMarketplaceQuery(data.query);

@@ -829,6 +829,17 @@ button.secondary {
 }
 
 /* Published compact composer and emoji popover. */
+.chat-reconnect-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.chat-reconnect-row p {
+  margin: 0;
+}
+
 .composer {
   display: flex;
   flex: 0 0 auto;

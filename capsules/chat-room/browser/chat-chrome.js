@@ -1,6 +1,6 @@
     (function () {
       const launchParams = new URLSearchParams(window.location.search);
-      const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+      let homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
       const homeParentOrigin = launchParams.get("home_origin") || "";
       const participantToggle = document.getElementById("participant-toggle");
       const roomAccessToggle = document.getElementById("room-access-toggle");
@@ -96,6 +96,13 @@
       announceHomeChrome();
       syncCompactConversationRail();
       syncComposerPresentation();
+
+      window.addEventListener("elastos-chat-authority-renewed", () => {
+        homeToken = globalThis.elastosChatHomeToken();
+        homeReadySent = false;
+        lastMenuManifest = "";
+        announceHomeChrome();
+      });
 
       if (messageInput) {
         messageInput.addEventListener("input", syncComposerPresentation);
