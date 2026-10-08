@@ -377,6 +377,7 @@ async fn replace_media_warm(key: (PathBuf, String), warm: MediaWarm) {
 
 #[cfg(test)]
 struct PreadmitCommitBarrier {
+    key: (PathBuf, String),
     prepared: Arc<tokio::sync::Barrier>,
     release: watch::Sender<bool>,
 }
@@ -386,7 +387,7 @@ static PREADMIT_COMMIT_BARRIER: OnceLock<std::sync::Mutex<Option<Arc<PreadmitCom
     OnceLock::new();
 
 #[cfg(test)]
-async fn await_preadmit_commit_barrier() {
+async fn await_preadmit_commit_barrier(key: &(PathBuf, String)) {
     let barrier = PREADMIT_COMMIT_BARRIER
         .get_or_init(Default::default)
         .lock()
@@ -395,6 +396,9 @@ async fn await_preadmit_commit_barrier() {
     let Some(barrier) = barrier else {
         return;
     };
+    if barrier.key != *key {
+        return;
+    }
     let mut released = barrier.release.subscribe();
     barrier.prepared.wait().await;
     while !*released.borrow() {
@@ -412,7 +416,7 @@ async fn commit_prepared_media<T>(
     into_payload: impl FnOnce(T) -> Result<WarmPayload, String>,
 ) -> bool {
     #[cfg(test)]
-    await_preadmit_commit_barrier().await;
+    await_preadmit_commit_barrier(&key).await;
 
     let ingresses = INGRESS.get_or_init(Default::default).lock().await;
     if ingresses.get(&key).is_none() {
@@ -1130,9 +1134,10 @@ mod tests {
         }
     }
 
-    fn install_preadmit_commit_barrier() -> PreadmitBarrierGuard {
+    fn install_preadmit_commit_barrier(key: (PathBuf, String)) -> PreadmitBarrierGuard {
         let (release, _) = watch::channel(false);
         let barrier = Arc::new(PreadmitCommitBarrier {
+            key,
             prepared: Arc::new(tokio::sync::Barrier::new(2)),
             release,
         });
@@ -1159,43 +1164,77 @@ mod tests {
 
     #[tokio::test]
     async fn late_preadmit_after_close_releases_prepared_stream() {
-        let root = tempfile::tempdir().unwrap();
-        let page = "page:late-preadmit";
-        let key = (root.path().to_owned(), page.into());
-        insert_fast_close_ingress(root.path(), page, "gen").await;
-        let barrier = install_preadmit_commit_barrier();
-        let released = Arc::new(AtomicBool::new(false));
-        let pending = tokio::spawn({
-            let key = key.clone();
-            let released = released.clone();
-            async move {
-                commit_prepared_media(
-                    key,
-                    "gen".into(),
-                    true,
-                    ReleasedPreparedStream(released),
-                    |_| Err("test".into()),
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let page = "page:late-preadmit";
+            let key = (root.path().to_owned(), page.into());
+            insert_fast_close_ingress(root.path(), page, "gen").await;
+            let barrier = install_preadmit_commit_barrier(key.clone());
+            let foreign_root = tempfile::tempdir().unwrap();
+            for (foreign_root, foreign_page) in [
+                (foreign_root.path(), page),
+                (root.path(), "page:foreign-preadmit"),
+            ] {
+                insert_fast_close_ingress(foreign_root, foreign_page, "gen").await;
+                assert!(tokio::time::timeout(
+                    Duration::from_secs(1),
+                    commit_prepared_media(
+                        (foreign_root.to_owned(), foreign_page.into()),
+                        "gen".into(),
+                        true,
+                        (),
+                        |_| Err("foreign".into()),
+                    ),
                 )
                 .await
+                .expect("a foreign page must not join the owned preadmit barrier"));
+                assert!(!*barrier.0.release.borrow());
+                close_ingress(foreign_root, foreign_page, "gen")
+                    .await
+                    .unwrap();
             }
-        });
-        barrier.0.prepared.wait().await;
-        close_ingress(root.path(), page, "gen").await.unwrap();
-        let _ = barrier.0.release.send(true);
-        assert!(!pending.await.unwrap());
-        assert!(released.load(Ordering::SeqCst));
-        assert!(MEDIA_WARMS
-            .get_or_init(Default::default)
-            .lock()
-            .await
-            .get(&key)
-            .is_none());
-        assert!(INGRESS
-            .get_or_init(Default::default)
-            .lock()
-            .await
-            .get(&key)
-            .is_none());
+            let released = Arc::new(AtomicBool::new(false));
+            let pending = tokio::spawn({
+                let key = key.clone();
+                let released = released.clone();
+                async move {
+                    commit_prepared_media(
+                        key,
+                        "gen".into(),
+                        true,
+                        ReleasedPreparedStream(released),
+                        |_| Err("test".into()),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), barrier.0.prepared.wait())
+                .await
+                .expect("the owned prepared stream must reach its barrier");
+            assert!(!pending.is_finished());
+            assert!(!released.load(Ordering::SeqCst));
+            close_ingress(root.path(), page, "gen").await.unwrap();
+            barrier.0.release.send(true).unwrap();
+            assert!(!tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .expect("the retired prepared stream must settle after release")
+                .unwrap());
+            assert!(released.load(Ordering::SeqCst));
+            assert!(MEDIA_WARMS
+                .get_or_init(Default::default)
+                .lock()
+                .await
+                .get(&key)
+                .is_none());
+            assert!(INGRESS
+                .get_or_init(Default::default)
+                .lock()
+                .await
+                .get(&key)
+                .is_none());
+        })
+        .await
+        .expect("late preadmit cleanup must stay bounded");
     }
 
     #[tokio::test]
