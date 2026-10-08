@@ -642,7 +642,7 @@ jobs:
         run: scripts/ci-installed-journeys.sh prepare
       # Only the x86-64 job proves one reply Get from a separate holder Home over Carrier.
       - name: installed Marketplace Get and Assistant reply
-        timeout-minutes: ${{ matrix.os == 'ubuntu-24.04' && 25 || 15 }}
+        timeout-minutes: 15
         env:
           CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
           CI_CARRIER_GET: ${{ matrix.os == 'ubuntu-24.04' }}

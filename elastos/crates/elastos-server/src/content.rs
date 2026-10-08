@@ -2680,34 +2680,102 @@ pub async fn publish_bytes_via_provider(
     content_response_cid(&response)
 }
 
-/// Complete one bounded model read through the existing local Content path.
-/// Preparation owns aggregate accounting, ordering, integrity and settlement.
-pub(crate) async fn fetch_model_part(
+const MODEL_PREPARATION_SOURCE: &str = "runtime-model-preparation";
+
+/// One preparation's read route for its package parts. Parts come from the
+/// local backend until it misses once; every later part of that package goes
+/// straight to Carrier holders, so a package this Home lacks pays one local
+/// miss instead of one per 64 KiB part. Preparation still checks each file's
+/// SHA-256 and the package CID, whichever route served the bytes.
+#[derive(Debug, Default)]
+pub(crate) struct ModelPartReads {
+    holders_only: bool,
+}
+
+impl ModelPartReads {
+    /// Complete one bounded model read. Preparation owns aggregate accounting,
+    /// ordering, integrity and settlement.
+    pub(crate) async fn fetch(
+        &mut self,
+        registry: &ProviderRegistry,
+        cid: &str,
+        path: &str,
+        range: Option<(u64, u64)>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut request = json!({"op":"fetch", "cid":cid, "path":path, "bounded_read":true,
+            "transfer":"stream", "local_only":true});
+        let (limit, byte_range) = if let Some((offset, length)) = range {
+            anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
+            let end = offset
+                .checked_add(length - 1)
+                .ok_or_else(|| anyhow::anyhow!("model range overflow"))?;
+            request["range"] = json!({"start":offset,"end":end});
+            (
+                length,
+                Some(ProviderByteRange {
+                    start: offset,
+                    end: Some(end),
+                }),
+            )
+        } else {
+            anyhow::ensure!(
+                path == CONTENT_OBJECT_MANIFEST_PATH,
+                "complete model index required"
+            );
+            request["max_bytes"] = json!(65536);
+            (65536, None)
+        };
+        let index_read = range.is_none();
+        if !self.holders_only {
+            match read_local_model_part(registry, request).await {
+                Ok(bytes) => return checked_model_part(bytes, limit, range.is_some(), index_read),
+                Err(_) => self.holders_only = true,
+            }
+        }
+        let transfer = ContentFetchTransfer {
+            transfer: ProviderTransfer::Bytes,
+            range: byte_range,
+            progress: None,
+            bounded_read: true,
+            max_bytes: index_read.then_some(limit),
+        };
+        let fetched = ContentProvider::fetch_from_availability_provider(
+            registry,
+            MODEL_PREPARATION_SOURCE,
+            cid,
+            path,
+            &transfer,
+        )
+        .await;
+        if index_read {
+            let outcome = match &fetched {
+                Ok(Some(_)) => "completed",
+                Ok(None) => "unavailable",
+                Err(_) => "failed",
+            };
+            tracing::warn!(target: "elastos::model_index_read", stage = "availability_fallback",
+                outcome, "model index read fallback settled");
+        }
+        let ContentFetchPayload::Bytes(data) = fetched?
+            .ok_or_else(|| anyhow::anyhow!("Carrier availability is unavailable"))?
+            .payload
+        else {
+            anyhow::bail!("availability returned a stream for a bytes read");
+        };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+        checked_model_part(bytes, limit, range.is_some(), index_read)
+    }
+}
+
+/// One part through the local Content path only; a miss never reaches Carrier.
+async fn read_local_model_part(
     registry: &ProviderRegistry,
-    cid: &str,
-    path: &str,
-    range: Option<(u64, u64)>,
+    request: Value,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut request = json!({"op":"fetch", "cid":cid, "path":path,
-        "bounded_read":true, "transfer":"stream"});
-    let limit = if let Some((offset, length)) = range {
-        anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
-        request["range"] = json!({"start":offset,"end":offset.checked_add(length - 1)
-            .ok_or_else(|| anyhow::anyhow!("model range overflow"))?});
-        length
-    } else {
-        anyhow::ensure!(
-            path == CONTENT_OBJECT_MANIFEST_PATH,
-            "complete model index required"
-        );
-        request["max_bytes"] = json!(65536);
-        65536
-    };
-    let index_read = path == CONTENT_OBJECT_MANIFEST_PATH && range.is_none();
-    let opened = registry
+    let mut stream = registry
         .open_provider_stream(
             ProviderInvocation {
-                source: "runtime-model-preparation".into(),
+                source: MODEL_PREPARATION_SOURCE.into(),
                 target: "content".into(),
                 op: "fetch".into(),
                 request,
@@ -2718,18 +2786,16 @@ pub(crate) async fn fetch_model_part(
             },
             ProviderStreamOptions::default(),
         )
-        .await;
-    if index_read && opened.is_err() {
-        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_open",
-            "model index read substage failed");
-    }
-    let mut stream = opened?;
-    let drained = stream.drain_to_vec();
-    if index_read && drained.is_err() {
-        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_drain",
-            "model index read substage failed");
-    }
-    let bytes = drained?;
+        .await?;
+    Ok(stream.drain_to_vec()?)
+}
+
+fn checked_model_part(
+    bytes: Vec<u8>,
+    limit: u64,
+    exact: bool,
+    index_read: bool,
+) -> anyhow::Result<Vec<u8>> {
     if bytes.len() as u64 > limit {
         if index_read {
             tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
@@ -2737,10 +2803,23 @@ pub(crate) async fn fetch_model_part(
         }
         anyhow::bail!("model read exceeds bound");
     }
-    if range.is_some() {
+    if exact {
         anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
     }
     Ok(bytes)
+}
+
+/// One part with a fresh route: local first, then Carrier holders.
+#[cfg(test)]
+pub(crate) async fn fetch_model_part(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: &str,
+    range: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<u8>> {
+    ModelPartReads::default()
+        .fetch(registry, cid, path, range)
+        .await
 }
 
 pub async fn fetch_bytes_via_provider(
@@ -3129,9 +3208,14 @@ impl ContentProvider {
                 }
             }
             Err(local_err) => {
-                let fallback = self
-                    .fetch_from_availability_provider(&registry, cid, path, &transfer)
-                    .await;
+                let fallback = Self::fetch_from_availability_provider(
+                    &registry,
+                    self.name(),
+                    cid,
+                    path,
+                    &transfer,
+                )
+                .await;
                 if model_index {
                     let outcome = match &fallback {
                         Ok(Some(_)) => "completed",
@@ -3224,9 +3308,11 @@ impl ContentProvider {
         })
     }
 
+    /// Read through the availability plane only. Content uses this after a
+    /// local miss; model preparation uses it for a package its backend lacks.
     async fn fetch_from_availability_provider(
-        &self,
         registry: &ProviderRegistry,
+        source: &str,
         cid: &str,
         path: &str,
         transfer: &ContentFetchTransfer,
@@ -3255,8 +3341,17 @@ impl ContentProvider {
             hop.progress = None;
         }
 
-        let response = match self
-            .invoke_provider_with_fetch_transfer(registry, "availability", "fetch", request, &hop)
+        let response = match registry
+            .invoke_provider(ProviderInvocation {
+                source: source.to_string(),
+                target: "availability".to_string(),
+                op: "fetch".to_string(),
+                request,
+                transfer: hop.transfer,
+                range: hop.range,
+                progress: hop.progress.clone(),
+                transport: ProviderInvocationTransport::Local,
+            })
             .await
         {
             Ok(response) => response,
@@ -12522,11 +12617,11 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("outcome=\"failed\""), "{output}");
-        assert!(output.contains("stage=\"runtime_stream_open\""), "{output}");
         assert!(!output.contains("stage=\"runtime_stream_validation\""));
         assert!(!output.contains(TEST_CID));
         assert!(!output.contains("private-fixture-marker"));
-        assert_eq!(ipfs.requests.lock().await.len(), 1);
+        // One local-only read and its single not-ready retry, then one holder read.
+        assert_eq!(ipfs.requests.lock().await.len(), 2);
         assert_eq!(availability.requests.lock().await.len(), 1);
     }
 
