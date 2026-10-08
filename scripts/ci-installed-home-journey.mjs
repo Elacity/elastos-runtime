@@ -171,6 +171,10 @@ try {
     results.installed_runtime_reply = "passed";
     await page.screenshot({ path: join(evidence, "assistant-reply-desktop.png"), fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
+    await assistant.waitForFunction(() =>
+      !document.body.classList.contains("agent-harness-drawer-open") &&
+      document.querySelector("#agent-harness-drawer-open")?.getAttribute("aria-expanded") === "false" &&
+      document.querySelector("#agent-harness-sidebar")?.getBoundingClientRect().right <= 0);
     const phoneReply = assistant.locator(".agent-msg-agent .agent-msg-body").last();
     await phoneReply.scrollIntoViewIfNeeded();
     const bounds = await phoneReply.boundingBox();
