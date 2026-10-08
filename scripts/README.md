@@ -384,7 +384,8 @@ for the explicit simulation boundary and the operator flow it supports.
 ## Signing and publication ownership
 
 Builders prepare inert inputs. The custodian signs their approved hashes. The
-publication host imports that frozen output and announces it through Carrier.
+publication host imports that frozen output and serves it; it does not announce
+it. See [VERSIONING.md](../docs/VERSIONING.md#publishing-a-release).
 Each host has a separate account and role; the publication host receives the
 public DID and signed files.
 
@@ -470,6 +471,6 @@ the prior set if promotion fails. A complete rollback removes the backup links
 and commits the original signed head again, so cached HTTP reads can admit the
 restored set. A restoration, cleanup or final-head failure reports incomplete
 recovery and retains the attempt directory for operator inspection. A committed
-set can be retried to finish its ledger and Carrier announcement. The HTTP
+set can be retried to finish its ledger. The HTTP
 gateway serves each release file when the saved public pin and complete signed
 set agree; `install.sh` stays byte-identical across gateway hosts.

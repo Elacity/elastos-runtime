@@ -20,6 +20,9 @@ from unittest import mock
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 SOURCE = WORKFLOW.read_text()
 CACHE_ACTION = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
+LOCAL_CACHE_ACTION = "./.github/actions/rust-compile-cache"
+UNIT_CACHE_JOBS = {"lint", "test-elastos", "test-capsules"}
+SOURCE_HOME_CACHE_JOBS = {"source-home-linux", "source-home-linux-arm64", "source-home-macos"}
 # Read the fixed job/step indentation used here; actionlint checks YAML syntax.
 def jobs(source):
     return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
@@ -41,7 +44,19 @@ def field(block, name):
 
 
 def steps(job, workflow_jobs=JOBS):
-    return re.split(r"(?m)^      - ", workflow_jobs[job].split("    steps:\n", 1)[1])[1:]
+    block = workflow_jobs[job]
+    header = re.search(r"(?m)^    steps:([^\n]*)\n", block)
+    if not header:
+        raise AssertionError(f"missing steps in {job}")
+    suffix = header[1].strip()
+    if suffix == "*source_home_linux_steps":
+        if job != "source-home-linux-arm64" or not re.search(
+                r"(?m)^    steps: &source_home_linux_steps$", workflow_jobs["source-home-linux"]):
+            raise AssertionError("Linux steps alias requires its known source-home anchor")
+        return steps("source-home-linux", workflow_jobs)
+    if suffix and (job != "source-home-linux" or suffix != "&source_home_linux_steps"):
+        raise AssertionError(f"unknown steps anchor or alias in {job}")
+    return re.split(r"(?m)^      - ", block[header.end():])[1:]
 
 
 def evaluate(expression, context):
@@ -51,12 +66,33 @@ def evaluate(expression, context):
     expression = re.sub(r"!(?!=)", " not ", expression)
     expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
-    return eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith, "true": True, "false": False})
+    return eval(expression, {"__builtins__": {}},
+                {"startsWith": str.startswith, "true": True, "false": False})
+
+
+def validate_action_pins(source, cache_action):
+    commits = {}
+    for index, block in enumerate((source, cache_action)):
+        uses = re.findall(r"(?m)^\s+(?:- )?uses: (\S+)(.*)$", block)
+        if not uses:
+            raise AssertionError("missing action pins")
+        for action, comment in uses:
+            if index == 0 and action == LOCAL_CACHE_ACTION:
+                continue
+            if not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", action):
+                raise AssertionError(f"unrecognized local action or mutable action: {action}")
+            if not re.fullmatch(r" # \S+", comment):
+                raise AssertionError(f"missing version comment: {action}")
+            commits.setdefault((action.split("@")[0], comment), set()).add(action.split("@")[1])
+    # One version comment names one commit, including nested external actions.
+    if any(len(value) > 1 for value in commits.values()):
+        raise AssertionError("action pin drifts under the same version label")
 
 
 def run_compile_cache_fixture(source, mode, download_status=0, server_status=0,
                               platform=("Linux", "X64"), compiler="fixture rustc",
                               lockfile="fixture lock", archive=None, checksum=None):
+    """Execute action shell control flow with local transport/server fixtures."""
     action_steps = re.split(r"(?m)^    - ", source.split("  steps:\n", 1)[1])[1:]
     install = textwrap.dedent(action_steps[0].split("      run: |\n", 1)[1])
     with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +109,7 @@ def run_compile_cache_fixture(source, mode, download_status=0, server_status=0,
             path = shims / name
             path.write_text("#!/bin/bash\n" + body)
             path.chmod(0o700)
-        # Hash compiler inputs for real; only archive verification uses fixture bytes.
+        # Hash compiler inputs for real; the corrupt-archive test checks real verification.
         for name in ("sha256sum", "shasum"):
             path = shims / name
             path.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
@@ -90,10 +126,11 @@ def run_compile_cache_fixture(source, mode, download_status=0, server_status=0,
                "CACHE_RW_MODE": mode,
                "DOWNLOAD_STATUS": str(download_status), "SERVER_STATUS": str(server_status),
                "SERVER_LOG": str(root / "server"), "COMPILER_ID": compiler,
-               "DOWNLOAD_LOG": str(root / "download"), "CHECKSUM_LOG": str(root / "checksum")}
+               "DOWNLOAD_LOG": str(root / "download"),
+               "CHECKSUM_LOG": str(root / "checksum")}
         env.pop("RUSTC_WRAPPER", None)
         result = subprocess.run(["bash", "-e", "-c", install], env=env,
-                                capture_output=True, text=True, cwd=root)
+                                capture_output=True, text=True, cwd=root, timeout=10)
         if archive is not None:
             assert result.returncode == 0, result.stderr
             assert f"/v0.18.0/{archive}.tar.gz" in (root / "download").read_text()
@@ -111,7 +148,7 @@ def run_compile_cache_fixture(source, mode, download_status=0, server_status=0,
                                             "success" if result.returncode == 0 else "failure"}):
                 script = textwrap.dedent(step.split("      run: |\n", 1)[1])
                 subprocess.run(["bash", "-e", "-c", script], env=env, check=True,
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=10)
         return result.returncode, installed_exports, exports(), (root / "server").exists()
 
 
@@ -197,7 +234,7 @@ def validate_cache_guards(source):
 
 
 def validate_jetson_package_lifecycle(source):
-    job_steps = steps("source-home-linux", jobs(source))
+    job_steps = steps("source-home-linux-arm64", jobs(source))
     package, = [step for step in job_steps if step.startswith("name: build and package release binaries\n")]
     verify, = [step for step in job_steps if step.startswith("name: verify Jetson release compatibility\n")]
     if job_steps.index(package) >= job_steps.index(verify):
@@ -219,7 +256,7 @@ def validate_journey_builds(source, release_source):
         if key in release_source or key in source.split("\njobs:\n", 1)[0]:
             raise AssertionError("journey profiles belong only to CI journey jobs")
     for job, block in jobs(source).items():
-        if job not in ("source-home-macos", "source-home-linux"):
+        if job not in SOURCE_HOME_CACHE_JOBS:
             if any(key in block for key in overrides):
                 raise AssertionError(f"journey profile override in {job}")
             continue
@@ -228,16 +265,18 @@ def validate_journey_builds(source, release_source):
         if environment and re.search(r"CARGO_(?:TARGET_DIR|BUILD_BUILD_DIR):|runner\.temp", environment[1]):
             raise AssertionError(f"runner build paths belong in the first step: {job}")
         job_steps = steps(job, jobs(source))
+        step_source = "\n".join(job_steps)
+        directory_job = "source-home-linux" if job == "source-home-linux-arm64" else job
         paths, = [step for step in job_steps if step.startswith("name: set job build directories\n")]
         if paths != job_steps[0] or re.search(r"(?m)^        if:", paths):
             raise AssertionError(f"build paths must be set by the first unconditional step: {job}")
-        for key, value in {"CARGO_TARGET_DIR": "$RUNNER_TEMP/" + job + "-target",
-                           "CARGO_BUILD_BUILD_DIR": "$RUNNER_TEMP/" + job + "-build"}.items():
-            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in paths or block.count(key + "=") != 1:
+        for key, value in {"CARGO_TARGET_DIR": "$RUNNER_TEMP/" + directory_job + "-target",
+                           "CARGO_BUILD_BUILD_DIR": "$RUNNER_TEMP/" + directory_job + "-build"}.items():
+            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in paths or step_source.count(key + "=") != 1:
                 raise AssertionError(f"one shared job build setting required: {job} {key}")
         profile, = [step for step in job_steps if step.startswith("name: use CI journey release profile\n")]
         for key, value in overrides.items():
-            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in profile or block.count(key) != 1:
+            if f'echo "{key}={value}" >> "$GITHUB_ENV"' not in profile or step_source.count(key) != 1:
                 raise AssertionError(f"missing journey profile setting: {job} {key}")
         for event, ref, ref_type, override, _, _ in CASES:
             context = {"github.event_name": event, "github.ref": ref,
@@ -260,6 +299,29 @@ def validate_journey_builds(source, release_source):
         if re.search(r"(?:CARGO_TARGET_DIR|CARGO_BUILD_BUILD_DIR|RUSTFLAGS)=|--target-dir",
                      "\n".join(step for step in job_steps if step != paths)):
             raise AssertionError(f"step changes the shared build environment: {job}")
+
+
+def validate_release_builds_are_hermetic(source):
+    workflow_jobs = jobs(source)
+    if field(source.split("\njobs:\n", 1)[0], "RUSTC_WRAPPER") != "''":
+        raise AssertionError("release jobs must clear any inherited compiler wrapper")
+    if re.search(r"(?i)sccache|rust-compile-cache|RUSTC_WRAPPER\s*[=:]\s*['\"]?\w|CI_SAVE_CACHE", source):
+        raise AssertionError("shipped release builds use no compiler cache")
+    if re.search(r"CARGO_PROFILE_RELEASE_(?:LTO|CODEGEN_UNITS)", source):
+        raise AssertionError("release profile retains its owner")
+    if re.search(r"uses: actions/cache(?:/save)?@|uses: Swatinem/rust-cache|cache-targets: true|restore-keys:", source):
+        raise AssertionError("release workflow permits only exact engine input restore")
+    for job in ("mac", "linux"):
+        build, = [step for step in steps(job, workflow_jobs)
+                  if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
+        for token in ('for build in "N $INSTALL_VERSION" "N1 $UPDATE_VERSION"',
+                      'CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target"',
+                      'CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"',
+                      '[[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]',
+                      '[[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")',
+                      'rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"'):
+            if token not in build:
+                raise AssertionError(f"release builds retain fresh outputs and support parity: {job}")
 
 
 class ReleasePolicyTests(unittest.TestCase):
@@ -295,11 +357,11 @@ class ReleasePolicyTests(unittest.TestCase):
                     self.assertEqual(custody_should_run(SOURCE, context, paths), expected)
 
     def test_sccache_is_scoped_to_test_jobs(self):
-        action = "./.github/actions/rust-compile-cache"
-        expected = {"source-gate", "lint", "test-elastos", "test-capsules"}
-        self.assertEqual({job for job in JOBS if f"uses: {action}" in JOBS[job]}, expected)
-        for job in expected:
-            setup, = [step for step in steps(job) if f"uses: {action}" in step]
+        expected = UNIT_CACHE_JOBS | SOURCE_HOME_CACHE_JOBS
+        self.assertEqual({job for job in JOBS if any(f"uses: {LOCAL_CACHE_ACTION}" in step
+                                                   for step in steps(job))}, expected)
+        for job in UNIT_CACHE_JOBS:
+            setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
             self.assertEqual(field(setup, "if"), "env.CI_USE_CACHE == 'true'")
             self.assertLess(JOBS[job].index(setup), JOBS[job].index("run: cargo")
                             if job != "test-capsules" else JOBS[job].index("name: lint and test"))
@@ -314,14 +376,22 @@ class ReleasePolicyTests(unittest.TestCase):
             self.assertIn(f"core.exportVariable('{name}', process.env.{name}", setup_source)
         uncached = SOURCE.split("\njobs:\n", 1)[0] + "\n".join(
             JOBS[job] for job in JOBS if job not in expected)
-        uncached += (WORKFLOW.parent / "release-package.yml").read_text()
         self.assertNotRegex(uncached, r"(?i)sccache|RUSTC_WRAPPER|rust-compile-cache")
+
+    def test_compile_free_source_gate_keeps_one_nested_installer_suite(self):
+        source_gate = JOBS["source-gate"]
+        self.assertNotRegex(source_gate, r"(?i)sccache|RUSTC_WRAPPER|rust-compile-cache")
+        self.assertNotIn("python3 scripts/install-bootstrap-test.py", source_gate)
+        self.assertEqual(source_gate.count("python3 scripts/release-platform-input-test.py"), 1)
+        nested = (WORKFLOW.parents[2] / "scripts/release-platform-input-test.py").read_text()
+        self.assertIn('"install-bootstrap-test.py"', nested)
+        self.assertIn('[sys.executable, str(script), "--bash", "/bin/bash"]', nested)
 
     def test_ci_actions_and_sccache_release_are_immutable(self):
         action = WORKFLOW.parents[1] / "actions/rust-compile-cache/action.yml"
         for path in (WORKFLOW, WORKFLOW.parent / "release-package.yml", action):
             for uses in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", path.read_text()):
-                if uses == "./.github/actions/rust-compile-cache":
+                if uses == LOCAL_CACHE_ACTION:
                     continue
                 self.assertRegex(uses, r"^[\w./-]+@[0-9a-f]{40}$", str(path))
         setup_source = action.read_text()
@@ -329,6 +399,118 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89", setup_source)
         self.assertLess(setup_source.index('"${checksum[@]}" -c'), setup_source.index("tar -xzf"))
         self.assertLess(setup_source.index("tar -xzf"), setup_source.index("RUSTC_WRAPPER=sccache"))
+
+    def test_release_builds_are_hermetic_with_fresh_outputs(self):
+        source = (WORKFLOW.parent / "release-package.yml").read_text()
+        validate_release_builds_are_hermetic(source)
+        for job in ("mac", "linux"):
+            job_steps = steps(job, jobs(source))
+            parity, = [step for step in job_steps if step.startswith("name: check native versions, source and support parity\n")]
+            for token in ('cmp "$inputs/N1/support-input.json" "$inputs/N/platform-input.json"',
+                          '--version', '$SOURCE_COMMIT $SOURCE_TREE', 'elastos $version'):
+                self.assertIn(token, parity)
+            build, = [step for step in job_steps if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
+            script = textwrap.dedent(build.split("        run: |\n", 1)[1])
+            for existing in (None, "target", "build", "target-link", "build-link"):
+                with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "scripts").mkdir()
+                    (root / "shims").mkdir()
+                    release = root / "release"
+                    release.mkdir()
+                    producer = root / "scripts/prepare-release-platform.sh"
+                    producer.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                        import json, os, pathlib, sys
+                        target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+                        build = pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'])
+                        target.mkdir()
+                        build.mkdir()
+                        output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+                        output.mkdir(parents=True)
+                        with open(os.environ['BUILD_CALLS'], 'a') as log:
+                            log.write(json.dumps({'target': str(target), 'build': str(build),
+                                                  'args': sys.argv[1:]}) + '\\n')
+                        """))
+                    producer.chmod(0o700)
+                    verifier = root / "shims/python3"
+                    verifier.write_text('#!/bin/bash\n[[ "$1 $2 $3 $4" == "-I -S scripts/release-platform-input.py verify" && -d "$5" ]]\n')
+                    verifier.chmod(0o700)
+                    target, build_dir = (root / "release-cargo-target", root / "release-cargo-build")
+                    if existing:
+                        output = target if existing.startswith("target") else build_dir
+                        if existing.endswith("-link"):
+                            output.symlink_to(root / "missing")
+                        else:
+                            output.mkdir()
+                    calls = root / "calls.jsonl"
+                    env = {**os.environ, "PATH": str(root / "shims") + os.pathsep + os.environ["PATH"],
+                           "RUNNER_TEMP": str(root), "RELEASE_ROOT": str(release),
+                           "CARGO_HOME": str(root / "cargo-home"), "RUSTUP_HOME": str(root / "rustup-home"),
+                           "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls)}
+                    result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, existing is None, result.stderr)
+                    if existing:
+                        self.assertFalse(calls.exists())
+                        self.assertTrue(output.exists() or output.is_symlink())
+                    else:
+                        built = [json.loads(line) for line in calls.read_text().splitlines()]
+                        self.assertEqual(len(built), 2)
+                        self.assertEqual({item['target'] for item in built}, {str(target)})
+                        self.assertEqual({item['build'] for item in built}, {str(build_dir)})
+                        self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N')])
+                        self.assertEqual(built[1]['args'], ['--version', '1.2.4', '--output', str(release / 'inputs/N1'),
+                                                          '--reuse-support', str(release / 'inputs/N')])
+                        self.assertFalse(target.exists() or target.is_symlink())
+                        self.assertFalse(build_dir.exists() or build_dir.is_symlink())
+
+    def test_release_policy_rejects_compiler_cache_profile_changes_and_target_reuse(self):
+        source = (WORKFLOW.parent / "release-package.yml").read_text()
+        toolchain = "      - uses: dtolnay/rust-toolchain@"
+        mutations = (
+            source.replace(toolchain, "      - name: configure Rust compile cache\n"
+                           "        uses: ./source/.github/actions/rust-compile-cache\n" + toolchain, 1),
+            source.replace("RUSTC_WRAPPER: ''", "RUSTC_WRAPPER: sccache", 1),
+            source.replace("  RUSTC_WRAPPER: ''\n", "", 1),
+            source.replace('echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"',
+                           'echo "RELEASE_ROOT=$root" >> "$GITHUB_ENV"\n          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"', 1),
+            source.replace('[[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]', "true", 1),
+            source.replace('CARGO_TARGET_DIR="$RUNNER_TEMP/release-cargo-target"', 'CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-$name"', 1),
+            source.replace('CARGO_BUILD_BUILD_DIR="$RUNNER_TEMP/release-cargo-build"', 'CARGO_BUILD_BUILD_DIR="$RELEASE_ROOT/cargo-build-$name"', 1),
+            source.replace('--reuse-support "$inputs/N"', '--reuse-support "$inputs/other"', 1),
+            source + '\nCARGO_PROFILE_RELEASE_LTO=false\n',
+            source.replace("actions/cache/restore@", "actions/cache@", 1),
+        )
+        for index, changed in enumerate(mutations):
+            self.assertNotEqual(changed, source)
+            with self.subTest(mutation=index), self.assertRaises(AssertionError):
+                validate_release_builds_are_hermetic(changed)
+
+    def test_release_engine_restore_matches_ci_recipe_and_always_verifies(self):
+        release_jobs = jobs((WORKFLOW.parent / "release-package.yml").read_text())
+        engine = steps("engine-llama-arm64", release_jobs)
+        recipe, = [step for step in engine if "id: engine-recipe\n" in step]
+        ci_recipe, = [step for step in steps("engine-llama-arm64") if "id: engine-recipe\n" in step]
+        self.assertEqual(recipe.split("        run: |\n", 1)[1],
+                         ci_recipe.split("        run: |\n", 1)[1])
+        for key in ("BUILD_CONTAINER_IMAGE", "ENGINE_BUILD_TOOLS"):
+            self.assertEqual(field(release_jobs["engine-llama-arm64"], key),
+                             field(JOBS["engine-llama-arm64"], key))
+        restore, = [step for step in engine if "actions/cache/restore@" in step]
+        ci_restore, = [step for step in steps("engine-llama-arm64") if "actions/cache/restore@" in step]
+        for key in ("uses", "key", "path"):
+            self.assertEqual(field(restore, key), field(ci_restore, key))
+        self.assertNotIn("restore-keys:", restore)
+        build, = [step for step in engine if "id: engine-build\n" in step]
+        for hit in ("true", "false"):
+            self.assertEqual(evaluate(field(build, "if"), {"steps.engine-cache.outputs.cache-hit": hit}), hit != "true")
+        verify, = [step for step in engine if step.startswith("name: verify accepted ARM64 engine archive\n")]
+        self.assertNotIn("if:", verify)
+        self.assertIn('--verify-archive "$RUNNER_TEMP/llama-arm64-bundle"', verify)
+        upload, = [step for step in engine if "actions/upload-artifact@" in step]
+        self.assertLess(engine.index(restore), engine.index(build))
+        self.assertLess(engine.index(build), engine.index(verify))
+        self.assertLess(engine.index(verify), engine.index(upload))
 
     def test_sccache_namespace_survives_lock_edits_and_changes_with_compiler(self):
         source = CACHE_ACTION.read_text()
@@ -473,7 +655,7 @@ class ReleasePolicyTests(unittest.TestCase):
             validate_journey_builds(SOURCE, release + '\nCARGO_PROFILE_RELEASE_LTO: "false"\n')
 
     def test_fresh_job_directories_refuse_restored_outputs_and_links(self):
-        for job in ("source-home-linux", "source-home-macos"):
+        for job in SOURCE_HOME_CACHE_JOBS:
             paths, = [step for step in steps(job) if step.startswith("name: set job build directories\n")]
             exports = textwrap.dedent(paths.split("        run: |\n", 1)[1])
             fresh, = [step for step in steps(job) if 'test ! -e "$directory"' in step]
@@ -484,9 +666,15 @@ class ReleasePolicyTests(unittest.TestCase):
                     env = {**os.environ, "RUNNER_TEMP": str(root), "GITHUB_ENV": str(root / "env")}
                     subprocess.run(["bash", "-e", "-c", exports], env=env, check=True)
                     env.update(dict(line.split("=", 1) for line in (root / "env").read_text().splitlines()))
+                    self.assertEqual(env["SCCACHE_MULTILEVEL_CHAIN"], "disk,gha")
+                    self.assertEqual(Path(env["SCCACHE_DIR"]), root / "source-home-sccache")
+                    self.assertEqual(env["SCCACHE_CACHE_SIZE"], "2G")
+                    self.assertEqual(env["SCCACHE_LOCAL_RW_MODE"], "READ_WRITE")
+                    self.assertEqual(env["SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"], "l0")
                     target, build = Path(env["CARGO_TARGET_DIR"]), Path(env["CARGO_BUILD_BUILD_DIR"])
-                    self.assertEqual(target, root / (job + "-target"))
-                    self.assertEqual(build, root / (job + "-build"))
+                    directory_job = "source-home-linux" if job == "source-home-linux-arm64" else job
+                    self.assertEqual(target, root / (directory_job + "-target"))
+                    self.assertEqual(build, root / (directory_job + "-build"))
                     self.assertFalse(target.exists())
                     self.assertFalse(build.exists())
                     if existing == "link":
@@ -561,10 +749,50 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotIn("/target/release/", source)
         for target in ("", "/shared job/target"):
             env = {**os.environ, "CARGO_TARGET_DIR": target, "REPO_ROOT": "/checkout"}
-            for workspace, name in (("elastos", "localhost-provider"), ("capsules/custody-provider", "custody-provider")):
+            for workspace, name in (("elastos", "elastos"), ("elastos", "localhost-provider"),
+                                    ("capsules/custody-provider", "custody-provider")):
                 result = subprocess.run(["bash", "-c", function + '\ncargo_release_binary "$1" "$2"', "paths", workspace, name],
                                         env=env, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout.strip(), f"{target or '/checkout/' + workspace + '/target'}/release/{name}")
+
+        prefix = source.split('\nif [[ "$(uname -s)" != "Linux" ]]', 1)[0]
+        runtime_build, = re.findall(r'(?m)^\(cd "\$\{ELASTOS_ROOT\}" && cargo build[^\n]*\)$', source)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "elastos").mkdir()
+            script = root / "scripts/carrier-runtime-fixture.sh"
+            script.parent.mkdir()
+            script.write_text(prefix + '\n' + runtime_build + '\nprintf "%s\\n" "$ELASTOS_BIN"\n')
+            shims = root / "shims"
+            shims.mkdir()
+            cargo = shims / "cargo"
+            cargo.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''\
+                import json, os, pathlib, sys
+                pathlib.Path(os.environ["CARGO_CALLS"]).write_text(json.dumps({
+                    "args": sys.argv[1:], "target": os.environ.get("CARGO_TARGET_DIR")}))
+                sys.exit(int(os.environ.get("CARGO_STATUS", "0")))
+                '''))
+            cargo.chmod(0o755)
+            for target in (None, "/shared job/target", "relative target"):
+                with self.subTest(target=target):
+                    env = {**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+                           "CARGO_CALLS": str(root / "calls")}
+                    env.pop("CARGO_TARGET_DIR", None)
+                    env.pop("CARGO_STATUS", None)
+                    if target is not None:
+                        env["CARGO_TARGET_DIR"] = target
+                    normalized = str(root / target) if target and not target.startswith("/") else target
+                    result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), f"{normalized or str(root / 'elastos/target')}/release/elastos")
+                    calls = json.loads((root / "calls").read_text())
+                    self.assertEqual(calls, {"args": ["build", "--locked", "--release", "-p", "elastos-server"],
+                                             "target": normalized})
+                    # A failed source freshness check must stop before using the binary.
+                    refused = subprocess.run(["bash", str(script)], env={**env, "CARGO_STATUS": "19"},
+                                             capture_output=True, text=True)
+                    self.assertEqual(refused.returncode, 19)
+                    self.assertEqual(refused.stdout, "")
 
     def test_component_build_and_componentizer_share_the_job_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -612,7 +840,7 @@ class ReleasePolicyTests(unittest.TestCase):
         validate_cache_guards(SOURCE)
         caches = [(job, step) for job in JOBS for step in steps(job)
                   if CACHE_RE.search(step) and "type=gha" not in step]
-        self.assertEqual(len(caches), 20)
+        self.assertEqual(len(caches), 27)
         for event, ref, ref_type, override, cached, publish in CASES:
             with self.subTest(event=event, ref=ref, override=override):
                 context = {"github.event_name": event, "github.ref": ref,
@@ -688,7 +916,7 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
-        guard = "if: github.event_name != 'pull_request' || matrix.os == 'ubuntu-22.04-arm'"
+        guard = "if: matrix.os == 'ubuntu-22.04-arm' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'"
         self.assertIn(guard, JOBS["source-home-linux"])
         regressed = SOURCE.replace(guard, "if: github.event_name != 'pull_request'", 1)
         with self.assertRaisesRegex(AssertionError, "lacks its package on pull_request ubuntu-22.04-arm"):
@@ -696,6 +924,28 @@ class ReleasePolicyTests(unittest.TestCase):
         omitted = SOURCE.replace("scripts/package-release-binaries.sh", "echo package omitted", 1)
         with self.assertRaisesRegex(AssertionError, "requires the package producer"):
             validate_jetson_package_lifecycle(omitted)
+
+    def test_package_runs_follow_uploads_except_the_arm_compatibility_gate(self):
+        for job, runner in (("source-home-linux", "ubuntu-24.04"),
+                            ("source-home-linux-arm64", "ubuntu-22.04-arm"),
+                            ("source-home-macos", "macos-14")):
+            package, = [step for step in steps(job) if step.startswith("name: build and package release binaries\n")]
+            upload, = [step for step in steps(job) if step.startswith("name: upload release binaries\n")]
+            for event, ref, ref_type, override, _, _ in CASES:
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override, "matrix.os": runner}
+                expected_upload = ref_type == "tag" or ref == "refs/heads/main" or event == "workflow_dispatch"
+                with self.subTest(job=job, event=event, ref=ref, override=override):
+                    self.assertEqual(evaluate(field(upload, "if"), context), expected_upload)
+                    self.assertEqual(evaluate(field(package, "if"), context),
+                                     expected_upload or job == "source-home-linux-arm64")
+
+    def test_linux_steps_alias_is_exact_and_rejects_other_bindings(self):
+        self.assertEqual(steps("source-home-linux-arm64"), steps("source-home-linux"))
+        for old, new in (("steps: *source_home_linux_steps", "steps: *unknown_steps"),
+                         ("steps: &source_home_linux_steps", "steps: &unknown_steps")):
+            with self.subTest(new=new), self.assertRaises(AssertionError):
+                steps("source-home-linux-arm64", jobs(SOURCE.replace(old, new, 1)))
 
     def test_pull_requests_never_save_shared_caches(self):
         for job in JOBS:
@@ -707,17 +957,115 @@ class ReleasePolicyTests(unittest.TestCase):
                     self.fail(f"{job} uses actions/cache, which also saves from PR runs")
 
     def test_every_action_is_pinned_to_one_commit_with_its_version(self):
-        # Local composite actions live in this commit; only remote actions need pins.
-        uses = re.findall(r"(?m)^\s+(?:- )?uses: (?!\./)(\S+)(.*)$", SOURCE)
-        self.assertTrue(uses)
-        commits = {}
-        for action, comment in uses:
-            with self.subTest(action=action):
-                self.assertRegex(action, r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
-                self.assertRegex(comment, r"^ # \S+$")
-                commits.setdefault((action.split("@")[0], comment), set()).add(action.split("@")[1])
-        # One version comment names one commit, so a pin cannot drift under the same label.
-        self.assertEqual({key: len(value) for key, value in commits.items() if len(value) > 1}, {})
+        validate_action_pins(SOURCE, CACHE_ACTION.read_text())
+
+    def test_action_pins_reject_unknown_local_and_mutable_nested_actions(self):
+        action = CACHE_ACTION.read_text()
+        with self.assertRaisesRegex(AssertionError, "unrecognized local action"):
+            validate_action_pins(SOURCE.replace(LOCAL_CACHE_ACTION, "./.github/actions/unknown"), action)
+        nested = re.sub(r"(uses: actions/github-script)@[0-9a-f]{40}", r"\1@v7", action)
+        with self.assertRaisesRegex(AssertionError, "mutable action"):
+            validate_action_pins(SOURCE, nested)
+
+    def test_source_home_cache_action_and_modes_follow_actual_event_policy(self):
+        action = CACHE_ACTION.read_text()
+        expected_jobs = SOURCE_HOME_CACHE_JOBS
+        self.assertEqual({job for job in JOBS if any(f"uses: {LOCAL_CACHE_ACTION}" in step
+                                                   for step in steps(job))},
+                         UNIT_CACHE_JOBS | expected_jobs)
+        for job in expected_jobs:
+            environment = JOBS[job].split("    steps:", 1)[0]
+            # The shared action owns remote permissions from the actual event policy.
+            self.assertNotIn("SCCACHE_GHA_RW_MODE:", environment)
+            setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
+            job_source = "\n".join(steps(job))
+            self.assertLess(job_source.index("uses: dtolnay/rust-toolchain@"), job_source.index(setup))
+            self.assertLess(job_source.index(setup), job_source.index("scripts/setup-source-home.sh"))
+            statistics, = [step for step in steps(job) if step.startswith("name: Rust compile cache statistics\n")]
+            self.assertEqual(field(statistics, "if"), "always() && env.RUSTC_WRAPPER == 'sccache'")
+            self.assertIn("sccache --show-stats", statistics)
+            self.assertIn("sccache --show-stats --stats-format=json", statistics)
+
+        def verify(candidate):
+            expression = field(candidate, "CACHE_RW_MODE")
+            for event, ref, ref_type, override, cached, _ in CASES:
+                context = {"github.event_name": event, "github.ref": ref,
+                           "github.ref_type": ref_type, "inputs.ref": override}
+                context["env.CI_USE_CACHE"] = str(evaluate(field(SOURCE, "CI_USE_CACHE"), context)).lower()
+                context["env.CI_SAVE_CACHE"] = str(evaluate(field(SOURCE, "CI_SAVE_CACHE"), context)).lower()
+                mode = evaluate(expression, context)
+                expected = "READ_WRITE" if event == "push" and ref in SAVING_REFS else "READ_ONLY"
+                self.assertEqual(mode, expected, f"cache mode on {event} {ref} {override}")
+                for job in expected_jobs:
+                    setup, = [step for step in steps(job) if f"uses: {LOCAL_CACHE_ACTION}" in step]
+                    self.assertEqual(evaluate(field(setup, "if"), context), cached, job)
+                if cached:
+                    _, _, exported, _ = run_compile_cache_fixture(candidate, mode)
+                    self.assertEqual(exported["SCCACHE_GHA_RW_MODE"], expected)
+                    self.assertEqual(exported["RUSTC_WRAPPER"], "sccache")
+                    self.assertEqual(exported["CARGO_INCREMENTAL"], "0")
+        verify(action)
+        forced_write = action.replace(field(action, "CACHE_RW_MODE"), "${{ 'READ_WRITE' }}", 1)
+        forced_write += "\n# " + field(action, "CACHE_RW_MODE") + "\n"
+        with self.assertRaises(AssertionError):
+            verify(forced_write)
+
+    def test_sccache_platform_pins_and_activation_failures(self):
+        action = CACHE_ACTION.read_text()
+        releases = (
+            (("Linux", "X64"), "x86_64-unknown-linux-musl",
+             "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"),
+            (("Linux", "ARM64"), "aarch64-unknown-linux-musl",
+             "2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a"),
+            (("macOS", "ARM64"), "aarch64-apple-darwin",
+             "308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e"),
+        )
+        self.assertEqual(field(action.split("    - name:", 2)[1], "continue-on-error"), "true")
+        for platform, target, checksum in releases:
+            with self.subTest(platform=platform):
+                _, installed, final, started = run_compile_cache_fixture(
+                    action, "READ_ONLY", platform=platform,
+                    archive=f"sccache-v0.18.0-{target}", checksum=checksum)
+                self.assertNotIn("RUSTC_WRAPPER", installed)
+                self.assertTrue(started)
+                self.assertEqual(final["RUSTC_WRAPPER"], "sccache")
+                for download, server in ((22, 0), (0, 1)):
+                    status, _, failed, attempted = run_compile_cache_fixture(
+                        action, "READ_ONLY", download, server, platform=platform)
+                    self.assertEqual(status == 0, download == 0)
+                    self.assertEqual(attempted, download == 0)
+                    self.assertNotIn("RUSTC_WRAPPER", failed)
+        status, _, exported, started = run_compile_cache_fixture(
+            action, "READ_ONLY", platform=("Windows", "X64"))
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("RUSTC_WRAPPER", exported)
+        self.assertFalse(started)
+
+    def test_sccache_corrupt_archive_refuses_extraction_and_activation(self):
+        source = CACHE_ACTION.read_text()
+        script = textwrap.dedent(source.split("      run: |\n", 1)[1].split("    - name:", 1)[0])
+        for platform in (("Linux", "X64"), ("Linux", "ARM64"), ("macOS", "ARM64")):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shims = root / "shims"
+                shims.mkdir()
+                for name, body in {
+                    "curl": '#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\nprintf corrupt > "$2"\n',
+                    "tar": '#!/bin/bash\ntouch "$RUNNER_TEMP/extracted"\n',
+                }.items():
+                    path = shims / name
+                    path.write_text(body)
+                    path.chmod(0o700)
+                result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                                        timeout=10, env={**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+                                                        "RUNNER_OS": platform[0], "RUNNER_ARCH": platform[1], "RUNNER_TEMP": str(root),
+                                                        "GITHUB_PATH": str(root / "path"), "GITHUB_ENV": str(root / "env"),
+                                                        "CACHE_RW_MODE": "READ_ONLY"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAILED", result.stdout)
+                self.assertFalse((root / "extracted").exists())
+                self.assertFalse((root / "path").exists())
+                self.assertFalse((root / "env").exists())
 
     def test_unguarded_cache_paths_are_rejected(self):
         additions = [
@@ -781,7 +1129,8 @@ class ReleasePolicyTests(unittest.TestCase):
             "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
-            "source-home-linux": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
+            "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
+            "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
@@ -790,12 +1139,13 @@ class ReleasePolicyTests(unittest.TestCase):
             self.assertEqual(field(JOBS[job], "name"), name)
             self.assertEqual(field(JOBS[job], "runs-on"), runner)
         self.assertEqual(field(JOBS["source-home-linux"], "os"),
-                         "[ubuntu-24.04, ubuntu-22.04-arm]")
+                         "[ubuntu-24.04]")
+        self.assertEqual(field(JOBS["source-home-linux-arm64"], "os"), "[ubuntu-22.04-arm]")
         self.assertIn("- os: ubuntu-22.04-arm\n            check_name: ubuntu-24.04-arm",
-                      JOBS["source-home-linux"])
+                      JOBS["source-home-linux-arm64"])
         needs = JOBS["release"].split("    needs:\n", 1)[1].split("    permissions:\n", 1)[0]
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
-                         ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-macos"])
+                         ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-linux-arm64", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
 
     def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
@@ -914,17 +1264,18 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotIn("RECIPE_COMMIT: ${{ github.sha }}", JOBS["engine-llama-arm64"])
 
     def test_engine_consumers_gate_the_current_run_input_with_shared_pin(self):
-        self.assertEqual(field(JOBS["source-home-linux"], "needs"),
+        self.assertEqual(field(JOBS["source-home-linux"], "needs"), "source-gate")
+        self.assertEqual(field(JOBS["source-home-linux-arm64"], "needs"),
                          "[source-gate, engine-llama-arm64]")
-        download, = [step for step in steps("source-home-linux") if "actions/download-artifact@" in step]
+        download, = [step for step in steps("source-home-linux-arm64") if "actions/download-artifact@" in step]
         self.assertIn("name: llama-arm64-bundle", download)
         self.assertEqual(field(download, "if"), "matrix.os == 'ubuntu-22.04-arm'")
         self.assertNotIn("run-id:", download)
         self.assertNotIn("36501810782", SOURCE)
         verify = 'bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"'
-        for job in ("engine-llama-arm64", "source-home-linux"):
-            self.assertIn(verify, JOBS[job])
-        consumer_gate, = [step for step in steps("source-home-linux") if verify in step]
+        for job in ("engine-llama-arm64", "source-home-linux-arm64"):
+            self.assertIn(verify, "\n".join(steps(job)))
+        consumer_gate, = [step for step in steps("source-home-linux-arm64") if verify in step]
         self.assertEqual(field(consumer_gate, "if"), "matrix.os == 'ubuntu-22.04-arm'")
         producer = steps("engine-llama-arm64")
         gate = next(i for i, step in enumerate(producer) if verify in step)
