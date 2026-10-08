@@ -23,7 +23,7 @@ use direct::{
     remove_unavailable_conversation, requested_conversation_decision, selected_conversation,
     should_clear_polled_transient_error, valid_direct_send_response, DirectConversationList,
     DirectMessageDirection, DirectMessageList, DirectSendInput, DirectSendResponse, DirectUiState,
-    RequestedConversationDecision, DIRECT_API_BASE,
+    PendingDirectSend, RequestedConversationDecision, DIRECT_API_BASE,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -98,6 +98,21 @@ struct AppState {
     attachment_urls: BTreeMap<String, String>,
     join_invite_url: Option<String>,
     direct: DirectUiState,
+    /// The conversation whose text the composer shows: `None` is the shared
+    /// room, `Some(id)` a direct conversation.
+    composer_conversation: Option<String>,
+    /// Unsent text of the conversations the composer does not show, with the
+    /// revision it had when it left the composer.
+    drafts: BTreeMap<Option<String>, (String, u64)>,
+    /// Names the composer's current content; every change gets a new one from
+    /// `composer_edits`. A finished send clears only the revision it sent, so
+    /// newer typing, even identical text, and a repeated response leave it.
+    composer_revision: u64,
+    composer_edits: u64,
+    /// Direct sends still awaiting a response, kept by conversation while
+    /// another one is open. Sending the restored draft again reuses the
+    /// request ID, so Runtime treats it as the same message.
+    held_direct_sends: BTreeMap<String, PendingDirectSend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1035,6 +1050,7 @@ impl App {
         let message_edit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
             let body = edit_app.message_input.value().trim().to_string();
             let mut state = edit_app.state.borrow_mut();
+            note_composer_edit(&mut state);
             if let Some(conversation_id) = state.direct.selected_conversation_id.clone() {
                 if state.direct.pending_send.as_ref().is_some_and(|pending| {
                     pending.conversation_id != conversation_id || pending.text != body
@@ -1334,6 +1350,7 @@ impl App {
                     format!("{current} {emoji}")
                 };
                 emoji_app.message_input.set_value(&next);
+                note_composer_edit(&mut emoji_app.state.borrow_mut());
                 let _ = emoji_app.message_input.focus();
             }));
             button
@@ -2196,13 +2213,15 @@ impl App {
             return Ok(());
         }
 
-        let request_id = {
+        let (request_id, sent_revision) = {
             let mut state = self.state.borrow_mut();
-            pending_chat_request_id(
+            let sent_revision = state.composer_revision;
+            let request_id = pending_chat_request_id(
                 &mut state.pending_chat_send,
                 &body,
                 new_chat_message_request_id,
-            )?
+            )?;
+            (request_id, sent_revision)
         };
         if self.send_room_text(&request_id, &body).await? {
             let mut state = self.state.borrow_mut();
@@ -2213,8 +2232,11 @@ impl App {
             {
                 state.pending_chat_send = None;
             }
+            let clear = settle_sent_draft(&mut state, &None, sent_revision);
             drop(state);
-            self.message_input.set_value("");
+            if clear {
+                self.message_input.set_value("");
+            }
         }
         Ok(())
     }
@@ -2237,14 +2259,16 @@ impl App {
         if text.is_empty() {
             return Ok(());
         }
-        let request_id = {
+        let (request_id, sent_revision) = {
             let mut state = self.state.borrow_mut();
-            pending_direct_request_id(
+            let sent_revision = state.composer_revision;
+            let request_id = pending_direct_request_id(
                 &mut state.direct.pending_send,
                 &conversation_id,
                 &text,
                 new_chat_message_request_id,
-            )?
+            )?;
+            (request_id, sent_revision)
         };
         let payload = DirectSendInput {
             request_id: &request_id,
@@ -2259,6 +2283,19 @@ impl App {
         .await;
         let current_selection = self.state.borrow().direct.selected_conversation_id.clone();
         if current_selection.as_deref() != Some(conversation_id.as_str()) {
+            if matches!(&response_result, Ok((http_status, response))
+                if valid_direct_send_response(*http_status, response.status))
+            {
+                let mut state = self.state.borrow_mut();
+                if state
+                    .held_direct_sends
+                    .get(&conversation_id)
+                    .is_some_and(|held| held.request_id == request_id)
+                {
+                    state.held_direct_sends.remove(&conversation_id);
+                }
+                settle_sent_draft(&mut state, &Some(conversation_id.clone()), sent_revision);
+            }
             return Ok(());
         }
         let (http_status, response) = match response_result {
@@ -2281,8 +2318,10 @@ impl App {
             }) {
                 state.direct.pending_send = None;
             }
+            if settle_sent_draft(&mut state, &Some(conversation_id.clone()), sent_revision) {
+                self.message_input.set_value("");
+            }
         }
-        self.message_input.set_value("");
         let selection_guard = {
             let state = self.state.borrow();
             current_selection_guard(&state)
@@ -3005,6 +3044,9 @@ impl App {
         let previous_participant_scroll_top = self.participant_list.scroll_top();
         let (state, force_message_follow) = {
             let mut state = self.state.borrow_mut();
+            if let Some(draft) = switch_composer_draft(&mut state, &self.message_input.value()) {
+                self.message_input.set_value(&draft);
+            }
             let force_message_follow = state.force_message_follow;
             state.force_message_follow = false;
             (state.clone(), force_message_follow)
@@ -3905,6 +3947,67 @@ fn bump_selection_generation(state: &mut AppState) {
     }
 }
 
+/// Gives the composer's new content a revision no earlier content had.
+fn note_composer_edit(state: &mut AppState) {
+    state.composer_edits += 1;
+    state.composer_revision = state.composer_edits;
+}
+
+/// Keeps unsent text with its conversation. When the selection has moved, the
+/// composer's text is saved under the conversation it belonged to, and the
+/// draft of the newly selected conversation is returned for the composer.
+fn switch_composer_draft(state: &mut AppState, composer: &str) -> Option<String> {
+    let selected = state.direct.selected_conversation_id.clone();
+    if state.composer_conversation == selected {
+        return None;
+    }
+    let leaving = std::mem::replace(&mut state.composer_conversation, selected.clone());
+    if composer.trim().is_empty() {
+        state.drafts.remove(&leaving);
+    } else {
+        state
+            .drafts
+            .insert(leaving, (composer.to_string(), state.composer_revision));
+    }
+    match state.drafts.remove(&selected) {
+        Some((draft, revision)) => {
+            state.composer_revision = revision;
+            Some(draft)
+        }
+        None => {
+            note_composer_edit(state);
+            Some(String::new())
+        }
+    }
+}
+
+/// After a send is accepted, the composer is cleared only while it still
+/// shows that conversation at the revision that was sent; newer typing, even
+/// the same words, stays, and a second response for the same send finds the
+/// cleared revision gone. A saved draft still at the sent revision is
+/// dropped, so the message does not come back after A -> B -> A.
+fn settle_sent_draft(
+    state: &mut AppState,
+    sent_conversation: &Option<String>,
+    sent_revision: u64,
+) -> bool {
+    if state.composer_conversation == *sent_conversation {
+        if state.composer_revision != sent_revision {
+            return false;
+        }
+        note_composer_edit(state);
+        return true;
+    }
+    if state
+        .drafts
+        .get(sent_conversation)
+        .is_some_and(|(_, revision)| *revision == sent_revision)
+    {
+        state.drafts.remove(sent_conversation);
+    }
+    false
+}
+
 fn current_selection_guard(state: &AppState) -> SelectionGuard {
     SelectionGuard {
         generation: state.selection_generation,
@@ -3998,8 +4101,17 @@ fn append_conversation_choice_content(
 fn clear_selected_direct_conversation(state: &mut AppState) {
     state.direct.selected_conversation_id = None;
     state.direct.messages.clear();
-    state.direct.pending_send = None;
+    hold_pending_direct_send(state);
     state.direct.notice = None;
+}
+
+/// Keeps the open conversation's unanswered send while the person is elsewhere.
+fn hold_pending_direct_send(state: &mut AppState) {
+    if let Some(pending) = state.direct.pending_send.take() {
+        state
+            .held_direct_sends
+            .insert(pending.conversation_id.clone(), pending);
+    }
 }
 
 fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
@@ -4013,9 +4125,10 @@ fn commit_direct_selection(state: &mut AppState, conversation_id: &str) -> Optio
     selected_conversation(&state.direct.conversations, clean_id)?;
     if state.direct.selected_conversation_id.as_deref() != Some(clean_id) {
         bump_selection_generation(state);
+        hold_pending_direct_send(state);
         state.direct.selected_conversation_id = Some(clean_id.to_string());
         state.direct.messages.clear();
-        state.direct.pending_send = None;
+        state.direct.pending_send = state.held_direct_sends.remove(clean_id);
     }
     state.direct.notice = None;
     Some(current_selection_guard(state))
@@ -4264,6 +4377,11 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         attachment_urls: BTreeMap::new(),
         join_invite_url: None,
         direct: DirectUiState::default(),
+        composer_conversation: None,
+        drafts: BTreeMap::new(),
+        composer_revision: 0,
+        composer_edits: 0,
+        held_direct_sends: BTreeMap::new(),
         error_text: None,
     }
 }
@@ -4340,13 +4458,133 @@ mod tests {
         chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,
         commit_requested_direct_selection_if_current, commit_shared_selection,
         conversation_initial, current_selection_guard, decode_query_value, extract_fragment_param,
-        extract_query_param, format_chat_message_request_id, object_sender_name,
-        participant_detail, participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, selection_guard_matches, shell_summary_allows_session,
-        AccessMode, AppConfig, AppState, ConversationObjectKind, ConversationObjectView,
-        ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
-        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+        extract_query_param, format_chat_message_request_id, note_composer_edit,
+        object_sender_name, participant_detail, participant_shown_name, pending_chat_request_id,
+        render_projection, resolve_conversation_choice, selection_guard_matches, settle_sent_draft,
+        shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
+        ConversationObjectKind, ConversationObjectView, ParticipantView, PendingChatSend,
+        RenderProjection, RoomPollView, RoomTransportView, ShellSessionBootstrapFailure,
+        ShellSessionStartOutput, SummaryView,
     };
+
+    fn two_direct_conversations() -> AppState {
+        let mut state = AppState::default();
+        state.direct.conversations = ["a", "b"]
+            .into_iter()
+            .map(|name| DirectConversationView {
+                conversation_id: format!("direct:sha256:{name}"),
+                display_name: name.to_uppercase(),
+                removed: false,
+                unread: false,
+            })
+            .collect();
+        state
+    }
+
+    #[test]
+    fn a_draft_stays_with_its_conversation() {
+        let mut state = two_direct_conversations();
+        assert_eq!(switch_composer_draft(&mut state, "shared words"), None);
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "shared words").as_deref(),
+            Some("")
+        );
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "for A").as_deref(),
+            Some("")
+        );
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "").as_deref(),
+            Some("for A")
+        );
+        commit_shared_selection(&mut state);
+        assert_eq!(
+            switch_composer_draft(&mut state, "for A").as_deref(),
+            Some("shared words")
+        );
+        // B was left empty, so nothing is kept for it.
+        assert!(!state.drafts.contains_key(&Some("direct:sha256:b".into())));
+    }
+
+    #[test]
+    fn resending_a_restored_draft_reuses_its_request_id() {
+        let mut state = two_direct_conversations();
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        let first = super::pending_direct_request_id(
+            &mut state.direct.pending_send,
+            "direct:sha256:a",
+            "hello",
+            || Ok("request-1".to_string()),
+        )
+        .unwrap();
+        // The response is held while the person visits B and comes back.
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        assert!(state.direct.pending_send.is_none());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        let again = super::pending_direct_request_id(
+            &mut state.direct.pending_send,
+            "direct:sha256:a",
+            "hello",
+            || Ok("request-2".to_string()),
+        )
+        .unwrap();
+        assert_eq!(first, again);
+        commit_shared_selection(&mut state);
+        assert!(state.held_direct_sends.contains_key("direct:sha256:a"));
+    }
+
+    #[test]
+    fn an_accepted_send_clears_only_the_text_it_sent() {
+        let mut state = two_direct_conversations();
+        let a = Some("direct:sha256:a".to_string());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "");
+        note_composer_edit(&mut state);
+        let sent = state.composer_revision;
+        assert!(settle_sent_draft(&mut state, &a, sent));
+        // A second response for the same send finds newer content, even when
+        // the person typed the same words again.
+        note_composer_edit(&mut state);
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        // A shared-room send that completes while A is open leaves A alone.
+        let current = state.composer_revision;
+        assert!(!settle_sent_draft(&mut state, &None, current));
+    }
+
+    #[test]
+    fn a_send_accepted_after_a_to_b_to_a_does_not_come_back_or_clear_new_text() {
+        let mut state = two_direct_conversations();
+        let a = Some("direct:sha256:a".to_string());
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "");
+        note_composer_edit(&mut state);
+        let sent = state.composer_revision;
+        // Sent "hello" in A, then moved to B before the response.
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        switch_composer_draft(&mut state, "hello");
+        note_composer_edit(&mut state);
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        assert_eq!(
+            switch_composer_draft(&mut state, "typing to B").as_deref(),
+            Some("")
+        );
+
+        // Moved away again with the draft unsent: a late response for an
+        // older revision keeps the saved newer draft.
+        note_composer_edit(&mut state);
+        let newer = state.composer_revision;
+        commit_direct_selection(&mut state, "direct:sha256:b").unwrap();
+        switch_composer_draft(&mut state, "a newer line");
+        assert!(!settle_sent_draft(&mut state, &a, sent));
+        assert_eq!(
+            state.drafts.get(&a).map(|(_, revision)| *revision),
+            Some(newer)
+        );
+    }
 
     #[test]
     fn navigation_hint_uses_current_verified_selection_without_draft_or_effects() {
