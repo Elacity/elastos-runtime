@@ -561,6 +561,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn model_catalog_accepts_release_signer_output_byte_for_byte() {
+        // Written by `scripts/release-signer.py --model-catalog` with a disposable key.
+        const CATALOG: &[u8] = include_bytes!("../../tests/fixtures/model-catalog.json");
+        let trust = crate::setup::ModelCatalogConfig {
+            head_cid: "bafkreifmbqk5trnjxqfjiop5bzmml6vl5ybrpoujssrmfqce4wrodn4x4y".into(),
+            publisher_dids: vec!["did:key:z6MkoeptPmH1nZnoao7WrcaNW9ZxZ7FteBCXPP8ofMzHE7bk".into()],
+            local_use: None,
+        };
+        let entries = verify_model_catalog(&trust, CATALOG, 1_760_000_000).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+        assert_eq!(entries[0].publisher_did, trust.publisher_dids[0]);
+        for index in 0..CATALOG.len() {
+            let mut changed = CATALOG.to_vec();
+            changed[index] ^= 1;
+            let mut repinned = trust.clone();
+            repinned.head_cid = head_cid(&changed);
+            assert!(verify_model_catalog(&trust, &changed, 1_760_000_000).is_err());
+            assert!(
+                verify_model_catalog(&repinned, &changed, 1_760_000_000).is_err(),
+                "byte {index} changed without breaking the signature"
+            );
+        }
+    }
+
+    #[test]
     fn model_catalog_rejects_invalid_or_incomplete_closures() {
         for (pointer, value) in [
             ("/schema", serde_json::json!("unknown")),
