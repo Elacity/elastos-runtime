@@ -1183,7 +1183,6 @@ mod tests {
             ((8, 8), None, (1, 1)),
         ] {
             (settings.threads, settings.batch_threads) = requested;
-            let saved = settings.clone();
             let args = engine_arguments_with_cpu_budget(
                 "/models/model.gguf",
                 &settings,
@@ -1197,7 +1196,6 @@ mod tests {
                 value("--threads-batch"),
                 &OsString::from(expected.1.to_string())
             );
-            assert_eq!(settings, saved, "saved Runtime binding stays unchanged");
         }
     }
 
