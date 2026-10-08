@@ -223,9 +223,7 @@ async function ensureAccount(side) {
       && response.url().endsWith("/api/auth/passkey/register/complete")
   ), { timeout: 30_000 });
   registered.catch(() => {});
-  await side.page.evaluate(() => {
-    document.querySelector("#home-unlock-primary")?.click();
-  });
+  await side.page.locator("#home-unlock-primary").click();
   const completion = await registered;
   assertOk(completion.ok(), `${side.prefix}: passkey registration failed`, {
     status: completion.status(),
@@ -254,9 +252,12 @@ async function signIn(side) {
       return { done: true, value: state };
     }
     if (state.unlockVisible && /passkey/i.test(state.unlockPrimary)) {
-      await side.page.evaluate(() => {
-        document.querySelector("#home-unlock-primary")?.click();
-      }).catch(() => {});
+      const person = side.page.locator("#home-unlock-person");
+      const primary = side.page.locator("#home-unlock-primary");
+      const action = await person.isVisible() ? person : primary;
+      if (await action.isVisible() && await action.isEnabled()) {
+        await action.click();
+      }
     }
     return { done: false, value: state };
   });
