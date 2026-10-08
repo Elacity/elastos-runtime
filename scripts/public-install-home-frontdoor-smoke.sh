@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/lib/public-install-guards.sh"
 
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
-HOME_DIR="$(mktemp -d /tmp/elastos-public-home-XXXXXX)"
+HOME_DIR="$(smoke_home_dir public-home)"
 DATA_DIR=""
 
 cleanup() {
