@@ -101,7 +101,10 @@ pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<b
     )
 }
 
-fn read_engine_selection(data: &Path, inline: Option<&str>) -> anyhow::Result<Option<serde_json::Value>> {
+fn read_engine_selection(
+    data: &Path,
+    inline: Option<&str>,
+) -> anyhow::Result<Option<serde_json::Value>> {
     if let Some(raw) = inline {
         return Ok(Some(serde_json::from_str(raw)?));
     }
@@ -109,8 +112,7 @@ fn read_engine_selection(data: &Path, inline: Option<&str>) -> anyhow::Result<Op
     match fs::read(&path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && path.symlink_metadata().is_err() =>
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
         {
             Ok(None)
         }
@@ -510,7 +512,8 @@ mod tests {
     fn inline_engine_selection_is_json_and_overrides_the_owner_file() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path();
-        let local = r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/local"}}]}"#;
+        let local =
+            r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/local"}}]}"#;
         fs::create_dir_all(data.join("config")).unwrap();
         let file = data.join("config/browser-engine-adapter.json");
         fs::write(&file, local).unwrap();
