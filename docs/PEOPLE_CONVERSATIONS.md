@@ -470,14 +470,15 @@ Each limit is a constant in the Runtime and refuses only the extra item:
   10 seconds. The sixth gets HTTP 429 with `Retry-After`, Chat shows "Slow
   down", and the draft stays in the composer. A retry of an already accepted
   message is free; the count comes from saved messages, so a send that fails
-  to save does not count. Every receiving Home also accepts at most 10
+  to save does not count. Every receiving Home also accepts at most 5
   messages per sender Profile in 10 seconds, and keeps at most 8 per sender
   waiting for Chat. Past either limit it holds that sender's message and
   retries it itself, since the sender stops resending once any other Home
-  accepts it; other senders' messages in the same batch keep flowing. A Home
-  holds at most 10 messages per sender, and drops a sender's flood beyond
-  that. When its 64 held messages are full, the sender holding the most gives
-  up its newest one first; if every sender holds as few, the Home waits and
+  accepts it; other senders' messages in the same batch keep flowing. Network
+  delay can bunch an honest sender's messages into one window; the Home holds
+  them and lets them in as the window slides. A Home holds at most 5 messages
+  per sender, and drops a sender's flood beyond that. When its 64 held
+  messages are full, the sender holding the most gives up its newest one first; if every sender holds as few, the Home waits and
   retries the batch instead of dropping a message. Receive windows and held
   messages live in memory and reset on restart.
 - Discovery relay: a Home's Carrier endpoint is its signing device, and the

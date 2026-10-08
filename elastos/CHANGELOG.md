@@ -9,7 +9,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 ### Changed
 
 - Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
-  shows "Slow down"), 10 per sender on receiving Homes without holding up other
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
   senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
   per sender and 16 per Home. The relay admits only the signing Home's own
   submissions.

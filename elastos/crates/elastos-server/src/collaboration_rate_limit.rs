@@ -2,7 +2,7 @@
 //!
 //! The sending Home limits each local Profile, so a person sees "Slow down"
 //! before anything leaves the Home. Every receiving Home limits each remote
-//! Profile at a higher rate, so a modified Home that skips its own limit still
+//! Profile at the same rate, so a modified Home that skips its own limit still
 //! cannot flood the room. A receiving Home holds a refused message and retries
 //! it itself, because its sender stops resending once any other Home accepts
 //! it. Receive windows and held messages live in memory and reset on restart.
@@ -17,8 +17,9 @@ use std::sync::{Mutex, PoisonError};
 pub(crate) const COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE: &str = "elastos.chat.message/v1";
 pub(crate) const COMMUNITY_RATE_WINDOW_SECS: u64 = 10;
 pub(crate) const COMMUNITY_SENDS_PER_WINDOW: usize = 5;
-/// Twice the send limit, so an honest Home never meets it.
-pub(crate) const COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW: usize = 10;
+/// Equal to the send limit, as #139 records. Honest messages that network
+/// delay bunches into one window are held and retried by the receiving Home.
+pub(crate) const COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW: usize = 5;
 /// Only accepted messages open a window, and the core's durable backlog caps
 /// how many land in one window, so honest use stays far below this bound.
 const MAX_TRACKED_PROFILES: usize = 4_096;
@@ -364,6 +365,21 @@ mod tests {
                 id += 1;
             }
         }
+        let full_holders = |frames: &HeldFrames| {
+            senders(frames)
+                .iter()
+                .fold(
+                    std::collections::BTreeMap::<String, usize>::new(),
+                    |mut counts, sender| {
+                        *counts.entry(sender.clone()).or_default() += 1;
+                        counts
+                    },
+                )
+                .into_values()
+                .filter(|count| *count == MAX_HELD_FRAMES_PER_SENDER)
+                .count()
+        };
+        let full_before = full_holders(&frames);
         assert_eq!(
             frames.hold(held(id, "did:honest", 200), 100),
             HoldOutcome::Held
@@ -372,37 +388,25 @@ mod tests {
         assert_eq!(held_senders.len(), MAX_HELD_FRAMES);
         assert_eq!(held_senders.last().map(String::as_str), Some("did:honest"));
         // One of the largest holders gave up its newest frame.
-        let per_sender = held_senders.iter().fold(
-            std::collections::BTreeMap::<&str, usize>::new(),
-            |mut counts, sender| {
-                *counts.entry(sender.as_str()).or_default() += 1;
-                counts
-            },
-        );
-        assert_eq!(
-            per_sender
-                .values()
-                .filter(|count| **count == MAX_HELD_FRAMES_PER_SENDER - 1)
-                .count(),
-            1
-        );
-        assert!(per_sender
-            .values()
-            .all(|count| *count <= MAX_HELD_FRAMES_PER_SENDER));
+        assert_eq!(full_holders(&frames), full_before - 1);
     }
 
     #[test]
     fn a_full_byte_budget_takes_room_from_the_largest_holder_first() {
         let frames = HeldFrames::default();
         let large = MAX_COLLABORATION_ENVELOPE_BYTES;
+        // did:a is the one largest holder; the others hold one frame fewer.
         for id in 0..MAX_HELD_BYTES / large {
             let sender = if id < MAX_HELD_FRAMES_PER_SENDER {
-                "did:a"
+                "did:a".to_string()
             } else {
-                "did:b"
+                format!(
+                    "did:b{}",
+                    (id - MAX_HELD_FRAMES_PER_SENDER) / (MAX_HELD_FRAMES_PER_SENDER - 1)
+                )
             };
             assert_eq!(
-                frames.hold(sized(id, sender, 200, large), 100),
+                frames.hold(sized(id, &sender, 200, large), 100),
                 HoldOutcome::Held
             );
         }

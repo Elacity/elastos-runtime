@@ -751,12 +751,17 @@ mod tests {
 
     #[tokio::test]
     async fn held_message_lands_without_the_sender_resending_it() {
+        use crate::collaboration_rate_limit::{
+            COMMUNITY_RATE_WINDOW_SECS, COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
+        };
         let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW.min(backlog);
         let fixture = Fixture::new();
         let core = fixture.core();
         let (sender, _) = generate_keypair();
-        // A delayed worker sees nine honest messages in one batch.
-        let envelopes: Vec<Vec<u8>> = (0..=backlog)
+        // Network delay bunches one more honest message than the Home admits
+        // into one batch.
+        let envelopes: Vec<Vec<u8>> = (0..=limit)
             .map(|index| remote_message(&fixture, sender.clone(), &format!("m{index}")).1)
             .collect();
         let frames = envelopes
@@ -765,22 +770,30 @@ mod tests {
             .collect::<Vec<_>>();
         let carrier = FakeCarrier::new();
         let driver = fixture.driver(core.clone(), carrier.clone()).await;
-        let mut replies = vec![peek(0, frames.len() as u64, frames)];
-        replies.extend((0..backlog).map(|_| send_remote()));
-        replies.push(ack(0, envelopes.len() as u64, true));
+        let end = frames.len() as u64;
+        let mut replies = vec![peek(0, end, frames)];
+        replies.extend((0..limit).map(|_| send_remote()));
+        replies.push(ack(0, end, true));
         // Another Home accepted the last message, so its sender never resends
         // it: the next batch is empty.
-        replies.extend([send_remote(), peek(9, 9, Vec::new()), ack(9, 9, false)]);
+        replies.extend([
+            send_remote(),
+            peek(end, end, Vec::new()),
+            ack(end, end, false),
+        ]);
         carrier.push(replies);
 
         assert_eq!(
             driver.process_incoming_once(NOW).await.unwrap(),
-            summary(1, backlog)
+            summary(1, limit)
         );
         assert!(!pending_contains(&core, envelopes.last().unwrap()));
         project_pending(&core);
         assert_eq!(
-            driver.process_incoming_once(NOW + 5).await.unwrap(),
+            driver
+                .process_incoming_once(NOW + COMMUNITY_RATE_WINDOW_SECS)
+                .await
+                .unwrap(),
             summary(0, 1)
         );
         assert!(pending_contains(&core, envelopes.last().unwrap()));
@@ -788,28 +801,42 @@ mod tests {
 
     #[tokio::test]
     async fn honest_message_keeps_its_place_when_flooders_fill_the_held_queue() {
+        use crate::collaboration_rate_limit::{
+            COMMUNITY_RATE_WINDOW_SECS, COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
+        };
         let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW;
+        assert!(limit < backlog, "the honest sender must reach its backlog");
         let fixture = Fixture::new();
-        let held_bound = 16;
+        let held_bound = 2 * limit + 1;
         let core = Arc::new(
             Arc::into_inner(fixture.core())
                 .unwrap()
                 .with_held_frame_bound_for_test(held_bound),
         );
-        // Two flooding Profiles fill their backlogs and the Home's held queue
-        // (10 + 6 frames). Chat never drains them.
+        let message = |key: &SigningKey, text: String| {
+            let (_, envelope) = remote_message(&fixture, key.clone(), &text);
+            (frame(&transport_frame(key, &envelope)), envelope)
+        };
+        // Chat has not shown the honest sender's earlier messages yet.
+        let (honest, _) = generate_keypair();
+        let (earlier, earlier_envelopes): (Vec<_>, Vec<_>) = (0..limit)
+            .map(|index| message(&honest, format!("honest earlier {index}")))
+            .unzip();
+        // Three flooding Profiles each get one window accepted, and their
+        // refused frames fill the Home's held queue (5 + 5 + 1).
         let mut flood = Vec::new();
-        for (flooder, extra) in [("a", 10), ("b", 6)] {
+        for (flooder, extra) in [("a", limit), ("b", limit), ("c", 1)] {
             let (key, _) = generate_keypair();
-            for index in 0..backlog + extra {
-                let (_, envelope) =
-                    remote_message(&fixture, key.clone(), &format!("flood {flooder}/{index}"));
-                flood.push(frame(&transport_frame(&key, &envelope)));
+            for index in 0..limit + extra {
+                flood.push(message(&key, format!("flood {flooder}/{index}")).0);
             }
         }
-        let (honest, _) = generate_keypair();
-        let honest_envelopes: Vec<Vec<u8>> = (0..=backlog)
-            .map(|index| remote_message(&fixture, honest.clone(), &format!("honest {index}")).1)
+        let flooders_accepted = flood.len() - held_bound;
+        // The honest sender's next messages fill its backlog; the last waits.
+        let fresh = backlog - limit;
+        let honest_envelopes: Vec<Vec<u8>> = (0..=fresh)
+            .map(|index| message(&honest, format!("honest {index}")).1)
             .collect();
         let honest_frames: Vec<_> = honest_envelopes
             .iter()
@@ -818,15 +845,19 @@ mod tests {
 
         let carrier = FakeCarrier::new();
         let driver = fixture.driver(core.clone(), carrier.clone()).await;
-        let flood_end = flood.len() as u64;
+        let earlier_end = earlier.len() as u64;
+        let flood_end = earlier_end + flood.len() as u64;
         let honest_end = flood_end + honest_frames.len() as u64;
-        carrier.push([peek(0, flood_end, flood)]);
-        carrier.push((0..2 * backlog).map(|_| send_remote()));
-        carrier.push([ack(0, flood_end, true)]);
+        carrier.push([peek(0, earlier_end, earlier)]);
+        carrier.push((0..limit).map(|_| send_remote()));
+        carrier.push([ack(0, earlier_end, true)]);
+        carrier.push([peek(earlier_end, flood_end, flood)]);
+        carrier.push((0..flooders_accepted).map(|_| send_remote()));
+        carrier.push([ack(earlier_end, flood_end, true)]);
         carrier.push([peek(flood_end, honest_end, honest_frames)]);
-        carrier.push((0..backlog).map(|_| send_remote()));
+        carrier.push((0..fresh).map(|_| send_remote()));
         carrier.push([ack(flood_end, honest_end, true)]);
-        // The sender never resends the ninth message.
+        // The sender never resends the last honest message.
         carrier.push([
             send_remote(),
             peek(honest_end, honest_end, Vec::new()),
@@ -835,20 +866,27 @@ mod tests {
 
         assert_eq!(
             driver.process_incoming_once(NOW).await.unwrap(),
-            summary(held_bound, 2 * backlog)
+            summary(0, limit)
         );
-        let held = core.take_held_frames(NOW);
+        // A window later, the flooders arrive.
+        let later = NOW + COMMUNITY_RATE_WINDOW_SECS;
+        assert_eq!(
+            driver.process_incoming_once(later).await.unwrap(),
+            summary(held_bound, flooders_accepted)
+        );
+        let held = core.take_held_frames(later);
         assert_eq!(held.len(), held_bound);
         core.restore_held_frames(held);
-        // The ninth honest message takes a slot from the largest holder.
+        // The last honest message takes a slot from a largest holder.
         assert_eq!(
-            driver.process_incoming_once(NOW).await.unwrap(),
-            summary(held_bound + 1, backlog)
+            driver.process_incoming_once(later).await.unwrap(),
+            summary(held_bound + 1, fresh)
         );
 
         // Chat shows the honest messages only; the flooders' stay waiting.
-        let honest_hashes: Vec<String> = honest_envelopes
+        let honest_hashes: Vec<String> = earlier_envelopes
             .iter()
+            .chain(&honest_envelopes)
             .map(|envelope| collaboration_message_envelope_sha256(envelope))
             .collect();
         for handoff in core.pending_product_handoffs().unwrap() {
@@ -857,8 +895,9 @@ mod tests {
                 core.acknowledge_product_handoff(hash).unwrap();
             }
         }
+        // The flooders are still inside their window; the honest message lands.
         assert_eq!(
-            driver.process_incoming_once(NOW + 5).await.unwrap(),
+            driver.process_incoming_once(later + 5).await.unwrap(),
             summary(held_bound - 1, 1)
         );
         assert!(pending_contains(&core, honest_envelopes.last().unwrap()));
@@ -870,6 +909,7 @@ mod tests {
             COMMUNITY_RATE_WINDOW_SECS, COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
         };
         let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
+        let limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW.min(backlog);
         let fixture = Fixture::new();
         let core = fixture.core();
         let (flooder, _) = generate_keypair();
@@ -890,10 +930,11 @@ mod tests {
         frames.push(frame(&transport_frame(&other_key, &other)));
         let end = frames.len() as u64;
         let mut replies = vec![peek(0, end, frames)];
-        replies.extend((0..=backlog).map(|_| send_remote()));
+        replies.extend((0..=limit).map(|_| send_remote()));
         replies.push(ack(0, end, true));
-        // Next cycle: the held frames fit up to the receive limit.
-        let within_limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW - backlog;
+        // Next cycle: once Chat drains the backlog, held frames fit up to the
+        // receive limit.
+        let within_limit = COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW - limit;
         replies.extend((0..within_limit).map(|_| send_remote()));
         replies.extend([peek(end, end, Vec::new()), ack(end, end, false)]);
         // Once the window slides, the last one lands.
@@ -904,10 +945,10 @@ mod tests {
         ]);
         carrier.push(replies);
 
-        let held = flood.len() - backlog;
+        let held = flood.len() - limit;
         assert_eq!(
             driver.process_incoming_once(NOW).await.unwrap(),
-            summary(held, backlog + 1)
+            summary(held, limit + 1)
         );
         assert!(pending_contains(&core, &other));
         project_pending(&core);

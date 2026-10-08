@@ -2753,14 +2753,21 @@ mod tests {
         let capacity_fixture = Fixture::new();
         let capacity_core = capacity_fixture.core();
         let (sender_key, _) = generate_keypair();
-        for _ in 0..MAX_PENDING_INCOMING_PER_SENDER {
-            let (_, frame) = remote_transport_message(&capacity_fixture, sender_key.clone(), NOW);
-            transport_incoming(&capacity_core, &frame, NOW);
+        // Spread over receive windows, so the backlog binds before the rate.
+        let at = |index: usize| {
+            NOW + (index / COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW) as u64
+                * COMMUNITY_RATE_WINDOW_SECS
+        };
+        for index in 0..MAX_PENDING_INCOMING_PER_SENDER {
+            let (_, frame) =
+                remote_transport_message(&capacity_fixture, sender_key.clone(), at(index));
+            transport_incoming(&capacity_core, &frame, at(index));
         }
-        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, NOW);
+        let last = at(MAX_PENDING_INCOMING_PER_SENDER - 1);
+        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, last);
         let before_capacity = fs::read(capacity_core.state_path()).unwrap();
         assert_eq!(
-            transport_rejection(&capacity_core, &over_capacity, NOW),
+            transport_rejection(&capacity_core, &over_capacity, last),
             CollaborationTransportRejection::SenderBacklogFull
         );
         assert_eq!(
