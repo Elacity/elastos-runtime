@@ -85,8 +85,9 @@ if len(records) != expected_runs or engine is None or any(not current(row) or ro
 absence_path = root / "engine-absent-home/installed-journeys.json"
 absence = json.loads(absence_path.read_text()) if absence_path.exists() else {}
 results["engine_absent_home"] = ("passed" if current(absence) and absence.get("engine_absent") is True
+                                and absence.get("dispatch_unavailable_reason") == "source_engine_required"
                                 and all(absence.get("results", {}).get(name) == "passed" for name in
-                                        ("engine_absent_home", "home_screenshots", "process_cleanup", "disk_reserve"))
+                                        ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve"))
                                 else "failed or not run")
 elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_seconds", 0)
 (root / "core-summary.json").write_text(json.dumps({
@@ -101,7 +102,7 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
     summary.write("\nEach run uses fresh Home state and a new engine process on the same host. OS file cache can warm between runs.\n")
-    summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh Home proves ordinary UI with the optional engine absent.\n")
+    summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh signed-fixture Home proves Get, controlled Use refusal, Retry and Home usability with the optional engine absent.\n")
     summary.write(f"\nTiming receipts: {spread['status']} ({spread['recorded_runs']}/{expected_runs} runs).\n")
     if spread["status"] == "complete":
         summary.write("\nEngine readiness starts at endpoint entry; other times start at worker entry. Generation excludes delta Applied waits and includes HTTP/stream handling. Applied waits include coordinator queue, reconciliation and durable storage.\n")

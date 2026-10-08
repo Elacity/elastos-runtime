@@ -9,7 +9,7 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 const [base, evidence, data, mode] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
-const cid = mode ? null : JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
+const cid = JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
 let browser, page;
 let stage = "journey";
 const results = {};
@@ -76,35 +76,65 @@ try {
   await page.screenshot({ path: join(evidence, "home-phone.png"), fullPage: true });
   results.home_screenshots = "passed";
   await page.setViewportSize({ width: 1440, height: 900 });
+  stage = "model_package_admission";
+  const marketplace = await app("marketplace");
+  const initialCatalog = await projection(marketplace, "/api/capsules/catalog");
+  assert.equal(initialCatalog.model_catalog_state, "verified");
+  const initialModel = initialCatalog.capsules.find(row => row.cid === cid);
+  assert.equal(initialModel?.signature_state, "catalog-signature-verified");
+  assert.equal(initialModel?.model_runtime?.dispatch_ready, false, "fresh Home starts before model admission");
+  await marketplace.locator(`[data-action="model-detail"][data-app="model:${cid}"]`).click();
+  const get = marketplace.locator('[data-model-control="use"]');
+  await get.waitFor({ state: "visible", timeout: 30000 });
+  assert.equal((await get.textContent()).trim(), "Get");
+  disk.before_content_use = observeDisk();
+  const useResponse = page.waitForResponse(response => {
+    if (!response.url().endsWith("/api/capsules/interfaces/invoke") || response.request().frame() !== marketplace) return false;
+    const body = response.request().postDataJSON();
+    return body?.capsule === "marketplace" && body?.method === "content.use" && body?.input?.cid === cid;
+  }, { timeout: 60000 });
+  useResponse.catch(() => {});
+  await get.click();
+  const usedResponse = await useResponse;
+  assert(usedResponse.ok(), "Marketplace Get invokes Content Use successfully");
+  assert.equal((await usedResponse.json()).status, "ok");
   if (mode === "--home-only") {
-    const marketplace = await app("marketplace");
-    const catalog = await projection(marketplace, "/api/capsules/catalog");
-    assert.equal(catalog.model_catalog_state, "unconfigured", "fresh ordinary Home needs no model catalogue");
-    results.engine_absent_home = "passed";
-    writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, journey: "fresh Home with optional model engine absent" }, null, 2));
-  } else {
-    stage = "model_package_admission";
-    const marketplace = await app("marketplace");
-    const initialCatalog = await projection(marketplace, "/api/capsules/catalog");
-    assert.equal(initialCatalog.model_catalog_state, "verified");
-    const initialModel = initialCatalog.capsules.find(row => row.cid === cid);
-    assert.equal(initialModel?.signature_state, "catalog-signature-verified");
-    assert.equal(initialModel?.model_runtime?.dispatch_ready, false, "fresh Home starts before model admission");
-    await marketplace.locator(`[data-action="model-detail"][data-app="model:${cid}"]`).click();
-    const get = marketplace.locator('[data-model-control="use"]');
-    await get.waitFor({ state: "visible", timeout: 30000 });
-    assert.equal((await get.textContent()).trim(), "Get");
-    disk.before_content_use = observeDisk();
-    const useResponse = page.waitForResponse(response => {
+    stage = "engine_absent_refusal";
+    const recovery = "This source Home needs its local model engine. Install the engine through source setup, then Retry.";
+    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: 90000 });
+    const unavailable = (await projection(marketplace, "/api/capsules/catalog")).capsules.find(row => row.cid === cid)?.model_runtime;
+    assert.equal(unavailable?.admitted, true, "engine refusal preserves admitted content");
+    assert.equal(unavailable?.dispatch_ready, false);
+    assert.equal(unavailable?.dispatch_unavailable_reason, "source_engine_required");
+    assert.equal(unavailable?.offer_id, null);
+    assert.equal(await marketplace.locator('[data-model-control="open-assistant"]').count(), 0);
+    assert.equal((await get.textContent()).trim(), "Retry");
+    await page.screenshot({ path: join(evidence, "engine-absent-refusal.png"), fullPage: true });
+    const retried = page.waitForResponse(response => {
       if (!response.url().endsWith("/api/capsules/interfaces/invoke") || response.request().frame() !== marketplace) return false;
       const body = response.request().postDataJSON();
       return body?.capsule === "marketplace" && body?.method === "content.use" && body?.input?.cid === cid;
     }, { timeout: 60000 });
-    useResponse.catch(() => {});
+    retried.catch(() => {});
     await get.click();
-    const usedResponse = await useResponse;
-    assert(usedResponse.ok(), "Marketplace Get invokes Content Use successfully");
-    assert.equal((await usedResponse.json()).status, "ok");
+    const retryResponse = await retried;
+    assert(retryResponse.ok());
+    assert.equal((await retryResponse.json()).status, "ok");
+    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: 90000 });
+    const retained = (await projection(marketplace, "/api/capsules/catalog")).capsules.find(row => row.cid === cid)?.model_runtime;
+    assert.equal(retained?.admitted, true);
+    assert.equal(retained?.dispatch_ready, false);
+    assert.equal(retained?.dispatch_unavailable_reason, "source_engine_required");
+    const assistant = await app("assistant");
+    await assistant.locator("#agent-composer-input").waitFor({ state: "visible", timeout: 30000 });
+    assert.equal(await page.getAttribute("body", "data-home-status"), "ready");
+    results.engine_absent_refusal = "passed";
+    results.engine_absent_home = "passed";
+    writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({
+      results, disk, model_cid: cid, dispatch_unavailable_reason: retained.dispatch_unavailable_reason,
+      journey: "signed Get with optional engine absent, clear Use refusal, Retry and usable Home",
+    }, null, 2));
+  } else {
     const openAssistant = marketplace.locator('[data-model-control="open-assistant"]');
     await openAssistant.waitFor({ state: "visible", timeout: 180000 });
     const catalog = await projection(marketplace, "/api/capsules/catalog");

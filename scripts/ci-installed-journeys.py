@@ -213,14 +213,13 @@ def run(home, data, evidence, model=True):
     require_disk_space(data)
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(data.parent),
                        ELASTOS_MODEL_TIMING_DIAGNOSTICS="1")
-    if model:
-        inputs = Path(os.environ.get("CI_MODEL_INPUTS", str(home / "model-inputs/inputs")))
-        # Package, local Kubo blocks and the admitted model cache can each own a copy.
-        needed = 3 * sum(path.stat().st_size for path in inputs.iterdir() if path.is_file())
-        require_disk_space(data, needed)
-        subprocess.run(["node", "scripts/ci-model-package.mjs", str(data), str(inputs), str(evidence)],
-                       env=environment, check=True)
-        record["fixture_package_receipt_sha256"] = digest(evidence / "package.json")
+    inputs = Path(os.environ.get("CI_MODEL_INPUTS", str(home / "model-inputs/inputs")))
+    # Package, local Kubo blocks and the admitted model cache can each own a copy.
+    needed = 3 * sum(path.stat().st_size for path in inputs.iterdir() if path.is_file())
+    require_disk_space(data, needed)
+    subprocess.run(["node", "scripts/ci-model-package.mjs", str(data), str(inputs), str(evidence)],
+                   env=environment, check=True)
+    record["fixture_package_receipt_sha256"] = digest(evidence / "package.json")
     record["fixture_components_sha256"] = digest(data / "components.json")
     require_disk_space(data)
     prior = owned_processes(process_rows(), -1, data)
@@ -259,8 +258,12 @@ def run(home, data, evidence, model=True):
                 record["model_timing"] = observer.receipt()
         else:
             subprocess.run([*command, "--home-only"], env=environment, check=True)
-        record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
+        ui = json.loads((evidence / "home-journey.json").read_text())
+        record["results"].update(ui["results"])
         if not model:
+            assert ui.get("dispatch_unavailable_reason") == "source_engine_required"
+            record["dispatch_unavailable_reason"] = "source_engine_required"
+            assert record["results"].get("engine_absent_refusal") == "passed"
             record["engine_absent_after_ui"] = all(not path.exists() and not path.is_symlink() for path in absent_paths)
             assert record["engine_absent_after_ui"]
             assert record["results"]["home_screenshots"] == "passed"
@@ -286,8 +289,13 @@ def run(home, data, evidence, model=True):
         record["results"]["disk_reserve"] = ("passed" if record["disk_after"]["available_bytes"] >= DISK_RESERVE_BYTES else "failed")
         record["elapsed_seconds"] = round(time.monotonic() - started, 2)
         if (evidence / "home-journey.json").exists():
-            record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
+            ui = json.loads((evidence / "home-journey.json").read_text())
+            record["results"].update(ui["results"])
         if not model:
+            record["results"]["engine_absent_refusal"] = (
+                "passed" if record.get("dispatch_unavailable_reason") == "source_engine_required"
+                and record["engine_absent_after_ui"] and record["results"].get("engine_absent_refusal") == "passed"
+                else "failed")
             record["results"]["engine_absent_home"] = "passed" if record["engine_absent_after_ui"] else "failed"
         (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
 
