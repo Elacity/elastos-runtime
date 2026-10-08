@@ -3931,12 +3931,33 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_parent_tools);
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
-    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o770)).unwrap();
-    assert!(
+    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
+    let refusal =
         prepare_runtime_media_provider_prerequisite(&unsafe_parent_data, &unsafe_parent_tools)
             .unwrap_err()
-            .to_string()
-            .contains("prerequisite parent is unsafe")
+            .to_string();
+    let fix = format!(
+        "chmod go-w '{}'",
+        fs::canonicalize(&unsafe_parent_tools).unwrap().display()
+    );
+    assert!(
+        refusal.contains("prerequisite parent is unsafe"),
+        "{refusal}"
+    );
+    assert!(refusal.contains(&fix), "{refusal}");
+    assert!(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&fix)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        fs::metadata(&unsafe_parent_tools)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
     );
 
     let linked_data = temp.path().join("linked-data");
@@ -4271,30 +4292,6 @@ impl ProtectedStartupProvider {
     }
 }
 
-/// Writes an owner-only mock provider script from a child process. A writer fd
-/// held here could be copied into another test thread's concurrent fork; exec
-/// of the script then fails with ETXTBSY until that child execs, and the mock
-/// never runs.
-#[cfg(unix)]
-fn write_mock_script(path: &Path, script: &str) {
-    use std::io::Write as _;
-
-    let mut writer = Command::new("/bin/sh")
-        .args(["-c", "cat > \"$1\"", "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    writer
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    assert!(writer.wait().unwrap().success());
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-
 #[cfg(unix)]
 fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let binary = root.join("mock-custody-provider.sh");
@@ -4306,7 +4303,7 @@ fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         request_log.display(),
         ProtectedStartupProvider::Custody.status(),
     );
-    write_mock_script(&binary, &script);
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4341,7 +4338,7 @@ fn write_mock_protected_startup_provider_with_shutdown(
         shutdown_response,
         status_response,
     );
-    write_mock_script(&binary, &script);
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4371,7 +4368,7 @@ fn write_blocking_protected_status_provider(
         status_release.display(),
         provider.status(),
     );
-    write_mock_script(&binary, &script);
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log, status_signal, status_release)
 }
 
@@ -4573,7 +4570,7 @@ fn write_mock_protected_content_decrypt_provider(
         expected_issuer,
         status,
     );
-    write_mock_script(&binary, &script);
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 

@@ -24,6 +24,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::host_lock::FileLock;
 use crate::install_transaction::{InstallTransaction, RestartPhase, RestartPlan, RestartRecord};
 use crate::sources::{load_trusted_sources, TrustedSource};
 
@@ -297,25 +298,7 @@ struct OwnerActionReceipt {
     queued: bool,
 }
 
-struct OwnerActionGuard(File);
-
-impl Drop for OwnerActionGuard {
-    fn drop(&mut self) {
-        // A command spawned meanwhile by another thread can retain this
-        // description until its CLOEXEC fd closes at exec. The guard's scope
-        // owns the lock, so release it before closing our fd.
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-#[cfg(test)]
-impl AsRawFd for OwnerActionGuard {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, OwnerActionGuard)> {
+fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, FileLock)> {
     let data_dir = fs::canonicalize(data_dir)?;
     let directory = controller_directory(&data_dir)?;
     let lock = OpenOptions::new()
@@ -327,11 +310,9 @@ fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, OwnerActionGuard)> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("owner-action.lock"))?;
     check_private_file(&lock)?;
-    anyhow::ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "Another Home owner action is in progress."
-    );
-    Ok((directory, OwnerActionGuard(lock)))
+    let lock =
+        FileLock::try_exclusive(lock).context("Another Home owner action is in progress.")?;
+    Ok((directory, lock))
 }
 
 fn check_owner_effect(
@@ -474,7 +455,7 @@ pub(crate) fn queue_owner_update(
 
 struct ControllerBootstrap {
     directory: PathBuf,
-    lease: File,
+    lease: FileLock,
     writer: crate::install_transaction::InstallationGuard,
     signed: Vec<u8>,
     expected: String,
@@ -485,7 +466,7 @@ fn bootstrap_controller(
     binary: &Path,
     source: &TrustedSource,
     directory: impl FnOnce(&Path) -> Result<PathBuf>,
-    lease: impl FnOnce(&Path) -> Result<File>,
+    lease: impl FnOnce(&Path) -> Result<FileLock>,
     writer: impl FnOnce(&Path) -> Result<crate::install_transaction::InstallationGuard>,
 ) -> Result<Option<ControllerBootstrap>> {
     crate::install_transaction::refuse_pending_home_start(data, binary)?;
@@ -1691,7 +1672,7 @@ fn check_controller_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn acquire_lease(directory: &Path) -> Result<File> {
+fn acquire_lease(directory: &Path) -> Result<FileLock> {
     let path = directory.join("controller.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -1706,14 +1687,11 @@ fn acquire_lease(directory: &Path) -> Result<File> {
         file.metadata()?.len() == 0,
         "controller lease file must be empty"
     );
-    anyhow::ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "Home already has an update controller. Keep its terminal open."
-    );
-    Ok(file)
+    FileLock::try_exclusive(file)
+        .context("Home already has an update controller. Keep its terminal open.")
 }
 
-fn inherited_or_new_lease(directory: &Path) -> Result<File> {
+fn inherited_or_new_lease(directory: &Path) -> Result<FileLock> {
     let Ok(value) = std::env::var(LEASE_ENV) else {
         return acquire_lease(directory);
     };
@@ -1735,11 +1713,7 @@ fn inherited_or_new_lease(directory: &Path) -> Result<File> {
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0,
         "protect controller lease descriptor"
     );
-    anyhow::ensure!(
-        unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "controller lease is busy"
-    );
-    Ok(file)
+    FileLock::try_exclusive(file).context("controller lease is busy")
 }
 
 fn copy_controller(binary: &Path, controller: &Path, expected: &str) -> Result<()> {

@@ -94,10 +94,11 @@ GATEWAYS=()
 CLI_GATEWAYS=()
 LAST_SUCCESS_GATEWAY=""
 ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
-BINARY_DOWNLOAD_MAX_TIME="${ELASTOS_BINARY_DOWNLOAD_MAX_TIME:-1800}"
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
+# curl has no pure idle timeout, so a download fails only when it stays below
+# 1 KiB/s for 60 s (the closest rule); there is no total cap.
 BINARY_DOWNLOAD_SPEED_LIMIT="${ELASTOS_BINARY_DOWNLOAD_SPEED_LIMIT:-1024}"
 BINARY_DOWNLOAD_SPEED_TIME="${ELASTOS_BINARY_DOWNLOAD_SPEED_TIME:-60}"
 
@@ -160,6 +161,8 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────
 
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
+# For messages holding %q-quoted paths: print them byte for byte.
+die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
 
 # Colour, the banner and the step layout are for a person at a terminal.
 # Pipes, CI, NO_COLOR and dumb terminals get plain [OK] and [WARN] lines.
@@ -621,7 +624,10 @@ ipfs_fetch() {
     local url
     for gw in ${GATEWAYS[@]+"${GATEWAYS[@]}"}; do
         url="${gw}/ipfs/${cid}"
-        if curl -fsSL --max-time 30 -o "$output" "$url" 2>/dev/null; then
+        if curl -fsSL --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
+            --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
+            --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
+            -o "$output" "$url" 2>/dev/null; then
             LAST_SUCCESS_GATEWAY="$gw"
             return 0
         fi
@@ -1026,6 +1032,59 @@ if [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
     fi
 fi
 
+# ── Admit the installation directories before any download or write ──
+
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
+
+# The installation writer refuses directories others can write. Check the real
+# directory, as the writer does after resolving symlinks; say how to fix it and
+# leave it unchanged.
+require_safe_existing_dir() {
+    local dir="$1" real
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
+    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+    if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
+        die_exact "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+    fi
+}
+# The runtime also refuses media tools under a parent others can write, such
+# as a group-writable ~/.local. Apply that rule to every existing ancestor of
+# the data directory now, before any download: owned by you or root, and not
+# group- or world-writable.
+dir_owner_mode() {
+    # GNU stat -f reports the filesystem, so pick the syntax by what works.
+    if stat -c '%u %a' / >/dev/null 2>&1; then
+        stat -c '%u %a' -- "$1"
+    else
+        stat -f '%u %Lp' -- "$1"
+    fi
+}
+require_safe_parent_chain() {
+    local dir="$1" real owner mode quoted
+    while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
+    while :; do
+        read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+        quoted="$(printf '%q' "$real")"
+        if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
+            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+        fi
+        if (( 8#$mode & 8#022 )); then
+            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
+                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
+            fi
+            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+        fi
+        [[ "$real" != "/" ]] || break
+        real="$(dirname -- "$real")"
+    done
+}
+require_safe_existing_dir "$INSTALL_DIR"
+require_safe_existing_dir "$DATA_DIR"
+require_safe_parent_chain "$DATA_DIR"
+
 # ── Fetch + verify release head ──────────────────────────────────────
 
 step 2 "Verify the release"
@@ -1123,7 +1182,6 @@ if [[ -n "$PUBLISHER_GATEWAY" ]]; then
         --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
         --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
         --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
-        --max-time "${BINARY_DOWNLOAD_MAX_TIME}" \
         -o "${TMPDIR}/elastos" "${PG}/artifacts/elastos-${PLATFORM}" \
         || die "Failed to download binary from ${PG}/artifacts/elastos-${PLATFORM}"
 else
@@ -1136,8 +1194,8 @@ sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
 
 # ── Admit the verified release with the shared installation writer ──
 
-[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
-mkdir -p "$INSTALL_DIR"
+# Directories created here are 0755 whatever the caller's umask.
+(umask 022; mkdir -p "$INSTALL_DIR")
 
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")

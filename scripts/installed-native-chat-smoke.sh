@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/runtime-cleanup.sh"
+
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
 
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-TEST_ROOT="${ELASTOS_NATIVE_CHAT_TEST_ROOT:-$(mktemp -d /tmp/elastos-installed-native-chat.XXXXXX)}"
+TEST_ROOT="${ELASTOS_NATIVE_CHAT_TEST_ROOT:-$(smoke_home_dir installed-native-chat)}"
 SMOKE_ID="$(python3 - <<'PY'
 import uuid
 print(uuid.uuid4().hex[:8])

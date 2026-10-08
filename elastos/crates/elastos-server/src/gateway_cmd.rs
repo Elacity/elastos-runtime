@@ -604,12 +604,11 @@ mod tests {
 
     #[cfg(unix)]
     fn public_gateway_ipfs_fixture() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let path = bin.join("ipfs-provider");
-        std::fs::write(
+        crate::test_support::write_from_child(
             &path,
             br#"#!/usr/bin/env python3
 import json, pathlib, sys
@@ -624,9 +623,8 @@ for line in sys.stdin:
     if request['op'] == 'shutdown':
         break
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let checksum = format!(
             "sha256:{}",
             hex::encode(elastos_runtime::signature::hash_content(

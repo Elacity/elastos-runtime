@@ -491,7 +491,7 @@ build_packaged_capsule_archive() {
             copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}" || return
             [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
             ;;
-        wasm)
+        wasm|web-projection)
             stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}" || return
             ;;
         *)
@@ -527,8 +527,10 @@ for name, component in sorted((components.get("external") or {}).items()):
     if capsule_dir is None:
         continue
     manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
-    if manifest.get("role") != "provider":
-        raise SystemExit(f"{name} capsule manifest role must be provider")
+    honest = (manifest.get("type"), manifest.get("execution"), manifest.get("runtime_abi"), manifest.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+    legacy = manifest.get("type") in ("wasm", "microvm") and manifest.get("execution") is None and manifest.get("runtime_abi") is None and manifest.get("entrypoint") == "rootfs.ext4"
+    if manifest.get("role") != "provider" or not (honest or legacy):
+        raise SystemExit(f"{name} capsule manifest must describe native-provider execution")
     icon_dir = str(manifest.get("icon") or "").strip().strip("/")
     if not icon_dir:
         raise SystemExit(f"{name} provider capsule icon path is missing")
@@ -590,10 +592,16 @@ copy_clean_capsule_tree() {
     local dest="$2"
     mkdir -p "$dest"
     if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
-        local prefix
+        local prefix archive status
         prefix=$(git -C "$src" rev-parse --show-prefix) || return
-        git archive "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" | tar -xf - -C "$dest"
-        return
+        # macOS bsdtar stops reading at the end-of-archive marker, so a pipe can
+        # SIGPIPE git archive while it writes padding (exit 141 under pipefail).
+        archive=$(mktemp "${TMPDIR:-/tmp}/capsule-tree.XXXXXX") || return
+        git archive -o "$archive" "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" &&
+            tar -xf "$archive" -C "$dest"
+        status=$?
+        rm -f "$archive"
+        return "$status"
     fi
     tar \
         --exclude='./target' \
@@ -658,6 +666,13 @@ stage_wasm_capsule() {
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     [[ -n "$entrypoint" ]] || die "${capsule_name} capsule manifest missing entrypoint"
     runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
+    local capsule_type execution
+    capsule_type=$(capsule_manifest_field "$capsule_name" "type")
+    execution=$(capsule_manifest_field "$capsule_name" "execution")
+    if [[ "$runtime_abi" == "elastos.component/v1" && ( "$capsule_type" != "wasm" || "$execution" != "component" ) ]] ||
+       [[ "$runtime_abi" == "elastos.runtime-projection/v1" && ( ( "$capsule_type" != "wasm" && "$capsule_type" != "web-projection" ) || "$execution" != "web-projection" ) ]]; then
+        die "${capsule_name} type contradicts its execution ABI"
+    fi
 
     if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
         ensure_rust_target_installed "wasm32-unknown-unknown" || return

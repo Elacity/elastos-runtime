@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/runtime-cleanup.sh"
+
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
 
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-TEST_ROOT="${ELASTOS_HOME_CHAT_REUSE_TEST_ROOT:-$(mktemp -d /tmp/elastos-home-chat-reuse.XXXXXX)}"
+TEST_ROOT="${ELASTOS_HOME_CHAT_REUSE_TEST_ROOT:-$(smoke_home_dir home-chat-reuse)}"
 HOME_LOG="${TEST_ROOT}/home.txt"
 CHAT_LOG="${TEST_ROOT}/chat.txt"
 INSTALL_LOG="${TEST_ROOT}/install.txt"

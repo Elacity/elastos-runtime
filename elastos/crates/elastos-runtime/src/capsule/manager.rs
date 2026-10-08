@@ -143,6 +143,18 @@ impl CapsuleManager {
         cid: Option<String>,
         trust_level: TrustLevel,
     ) -> Result<CapsuleId> {
+        // Projection and native provider metadata grant no generic execution authority.
+        if matches!(
+            manifest.execution_type(),
+            elastos_common::CapsuleType::WebProjection
+                | elastos_common::CapsuleType::NativeProvider
+                | elastos_common::CapsuleType::NativeHost
+        ) {
+            return Err(ElastosError::Compute(
+                "Web projections and native providers use their existing Runtime-owned host paths"
+                    .to_string(),
+            ));
+        }
         // Check if compute provider supports this type
         if !self.compute.supports(&manifest.capsule_type) {
             return Err(ElastosError::Compute(format!(
@@ -385,6 +397,30 @@ mod tests {
         ));
 
         CapsuleManager::new(compute, capability_manager, metrics, audit_log)
+    }
+
+    #[tokio::test]
+    async fn descriptive_execution_types_refuse_generic_compute() {
+        let manager = create_test_manager();
+        for source in [
+            include_str!("../../../../../templates/capsules/web-app/capsule.json"),
+            include_str!("../../../../../templates/capsules/provider-contract/capsule.json"),
+            include_str!("../../../../../capsules/model-provider/capsule.json"),
+            include_str!("../../../../../capsules/home/capsule.json"),
+            include_str!("../../../../capsules/shell/capsule.json"),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let error = manager
+                .launch_local(Path::new("unused"), manifest, TrustLevel::Untrusted)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Runtime-owned host paths"),
+                "{error}"
+            );
+        }
+        assert!(manager.list_running().await.is_empty());
     }
 
     fn create_test_manifest() -> CapsuleManifest {

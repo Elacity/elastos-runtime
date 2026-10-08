@@ -274,7 +274,7 @@ pub(crate) fn process_identity(pid: u32) -> io::Result<Option<String>> {
     valid_pid(pid)?;
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if process_vanished(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let start = linux_stat_start(&stat)?;
@@ -353,19 +353,27 @@ pub(crate) fn group_descendants(leader: u32) -> io::Result<Vec<u32>> {
         }
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_vanished(&error) => continue,
             Err(error) => return Err(error),
         };
-        if linux_stat_group(&stat)? == leader {
+        if linux_stat_group(&stat)? == leader as libc::pid_t {
             members.push(pid);
         }
     }
     Ok(members)
 }
 
+/// A process can exit between listing and reading its stat: open then reports
+/// ENOENT or ESRCH, and read reports ESRCH.
+#[cfg(target_os = "linux")]
+fn process_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 #[cfg(any(target_os = "linux", test))]
-fn linux_stat_group(stat: &str) -> io::Result<u32> {
-    // A process name can contain spaces and closing parentheses.
+fn linux_stat_group(stat: &str) -> io::Result<libc::pid_t> {
+    // A process name can contain spaces and closing parentheses. A dead task
+    // that is still listed reports group -1.
     let group = stat
         .rsplit_once(')')
         .and_then(|(_, fields)| fields.split_whitespace().nth(2));
@@ -824,6 +832,11 @@ mod tests {
         assert_eq!(
             linux_stat_group("12 (strange ) process) Z 1 17 19 0").unwrap(),
             17
+        );
+        // Captured from a listed task that exited during a /proc scan.
+        assert_eq!(
+            linux_stat_group("304929 (true) X 0 -1 -1 0 -1").unwrap(),
+            -1
         );
         assert!(linux_stat_group("12 (unfinished").is_err());
         assert_eq!(

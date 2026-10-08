@@ -43,6 +43,13 @@ const localCarrierSetup = read("scripts/local-carrier-setup-smoke.sh");
 
 /* ---- typed model contract, in source ------------------------------------- */
 
+assert.ok(
+  readFileSync(new URL("capsules/marketplace/browser/model-contract.js", root)).equals(
+    readFileSync(new URL("capsules/assistant/browser/model-contract.js", root)),
+  ),
+  "Marketplace uses the canonical Assistant model contract; run just vendor-ui",
+);
+
 for (const [name, source] of capsuleScripts) {
   assert.ok(
     !/offer:[a-z0-9-]+:[a-z0-9-]+/i.test(source),

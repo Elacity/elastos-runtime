@@ -8275,26 +8275,16 @@ impl CarrierClient {
     }
 
     pub async fn fetch_file(&self, path: &str) -> Result<Vec<u8>> {
-        self.fetch_file_bounded(path, 200 * 1024 * 1024).await
+        self.fetch_file_bounded(path, MAX_DOWNLOAD_BYTES).await
     }
 
     pub(crate) async fn fetch_file_bounded(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
         let msg = serde_json::json!({"op":"file","path":path});
-        let mut bytes = serde_json::to_vec(&msg)?;
-        bytes.push(b'\n');
-        send.write_all(&bytes).await?;
-        send.finish()?;
-        read_carrier_len_prefixed_bytes(
-            &mut recv,
-            &format!("trusted source file fetch for {path}"),
-            max_bytes,
-        )
-        .await
+        let operation = format!("trusted source file fetch for {path}");
+        self.fetch_bytes(msg, &operation, path, max_bytes).await
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
         let mut msg = serde_json::json!({
             "op": "content_fetch",
             "cid": cid,
@@ -8302,11 +8292,90 @@ impl CarrierClient {
         if let Some(path) = path.filter(|path| !path.is_empty()) {
             msg["path"] = serde_json::Value::String(path.to_string());
         }
+        self.fetch_bytes(msg, "content fetch", cid, MAX_DOWNLOAD_BYTES)
+            .await
+    }
+
+    /// Sends `msg` and reads its length-prefixed reply. Every phase is
+    /// bounded, none by total time: the request and each body read get
+    /// `DOWNLOAD_IDLE_TIMEOUT`, and the source gets `DOWNLOAD_HEADER_WAIT` to
+    /// prepare the file before its length header. A source that trickles one
+    /// byte just inside the idle deadline is still bounded by `max_bytes`.
+    async fn fetch_bytes(
+        &self,
+        msg: serde_json::Value,
+        operation: &str,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let idle = DOWNLOAD_IDLE_TIMEOUT;
+        let stalled =
+            |_| anyhow::anyhow!("no data for {} s while downloading {name}", idle.as_secs());
+        let (mut send, mut recv) = tokio::time::timeout(idle, self.conn.open_bi())
+            .await
+            .map_err(stalled)??;
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
-        send.write_all(&bytes).await?;
+        tokio::time::timeout(idle, send.write_all(&bytes))
+            .await
+            .map_err(stalled)??;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", 200 * 1024 * 1024).await
+        let mut len_buf = [0u8; 8];
+        tokio::time::timeout(DOWNLOAD_HEADER_WAIT, recv.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "trusted source did not start sending {name} within {} s",
+                    DOWNLOAD_HEADER_WAIT.as_secs()
+                )
+            })??;
+        let len = u64::from_be_bytes(len_buf);
+        if len_buf[0] == b'{' {
+            let mut error_bytes = len_buf.to_vec();
+            let tail = tokio::time::timeout(idle, recv.read_to_end(16 * 1024))
+                .await
+                .map_err(stalled)??;
+            error_bytes.extend_from_slice(&tail);
+            if let Ok(text) = String::from_utf8(error_bytes) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                    if json["ok"].as_bool() == Some(false) {
+                        let msg = json["error"]
+                            .as_str()
+                            .unwrap_or("Carrier returned an unknown error");
+                        anyhow::bail!("{operation} failed: {msg}");
+                    }
+                }
+            }
+            anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
+        }
+        anyhow::ensure!(
+            len <= max_bytes as u64,
+            "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
+        );
+        let mut content = vec![0u8; len as usize];
+        // Only a scoped caller (setup's progress line) is told how far the
+        // body has come, at most once per `REPLY_PROGRESS_CHUNK` bytes. The
+        // read itself is unchanged, so the idle rule above still decides.
+        let progress = REPLY_PROGRESS.try_with(std::sync::Arc::clone).ok();
+        if let Some(progress) = &progress {
+            progress(0, len);
+        }
+        let mut filled = 0;
+        let mut reported = 0;
+        while filled < content.len() {
+            let read = tokio::time::timeout(idle, recv.read(&mut content[filled..]))
+                .await
+                .map_err(stalled)??;
+            filled += read
+                .ok_or_else(|| anyhow::anyhow!("{operation} ended early ({filled}/{len} bytes)"))?;
+            if let Some(progress) = &progress {
+                if filled == content.len() || filled - reported >= REPLY_PROGRESS_CHUNK {
+                    reported = filled;
+                    progress(filled as u64, len);
+                }
+            }
+        }
+        Ok(content)
     }
 
     pub async fn invoke_provider(
@@ -8449,85 +8518,34 @@ pub(crate) async fn with_reply_progress<F: std::future::Future>(
     REPLY_PROGRESS.scope(progress, future).await
 }
 
-async fn read_carrier_len_prefixed_bytes(
-    recv: &mut iroh::endpoint::RecvStream,
-    operation: &str,
-    max_bytes: usize,
-) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 8];
-    recv.read_exact(&mut len_buf).await?;
-    let len = u64::from_be_bytes(len_buf);
-    if len_buf[0] == b'{' {
-        let mut error_bytes = len_buf.to_vec();
-        let tail = recv.read_to_end(16 * 1024).await?;
-        error_bytes.extend_from_slice(&tail);
-        if let Ok(text) = String::from_utf8(error_bytes) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                if json["ok"].as_bool() == Some(false) {
-                    let msg = json["error"]
-                        .as_str()
-                        .unwrap_or("Carrier returned an unknown error");
-                    anyhow::bail!("{operation} failed: {msg}");
-                }
-            }
-        }
-        anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
-    }
-    anyhow::ensure!(
-        len <= max_bytes as u64,
-        "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
-    );
-    let mut content = vec![0u8; len as usize];
-    match REPLY_PROGRESS.try_with(std::sync::Arc::clone) {
-        Ok(progress) => {
-            progress(0, len);
-            let mut filled = 0;
-            while filled < content.len() {
-                let end = content.len().min(filled + REPLY_PROGRESS_CHUNK);
-                recv.read_exact(&mut content[filled..end]).await?;
-                filled = end;
-                progress(filled as u64, len);
-            }
-        }
-        Err(_) => recv.read_exact(&mut content).await?,
-    }
-    Ok(content)
-}
+/// A download fails only when no bytes arrive for this long, never on total
+/// time, so a slow but steady link finishes. Unit tests use a short deadline.
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
-async fn fetch_file_with_timeout(
-    client: CarrierClient,
-    path: &str,
-    timeout_secs: u64,
-) -> Result<Vec<u8>> {
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
-        .await
-        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))
-        .and_then(|result| result);
+/// How long a trusted source may prepare a held file (an IPFS `cat` of the
+/// signed CID) before it sends the length header. Measured on the public
+/// seed (8 Oct 2026): at most 1.6 s for 92 MB; bound = max(60 s, 4x worst).
+const DOWNLOAD_HEADER_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
+
+/// Size ceiling for a release download whose signed size is not known.
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
+
+/// Fetches the signed CID when present, else the release name, then closes.
+async fn fetch_and_close(client: CarrierClient, cid: Option<&str>, path: &str) -> Result<Vec<u8>> {
+    let result = match cid {
+        Some(cid) => client.fetch_content(cid, None).await,
+        None => client.fetch_file(path).await,
+    };
     client.close().await;
     result
 }
 
-pub async fn fetch_file_from_trusted_source(
-    source: &TrustedSource,
-    path: &str,
-    connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
-) -> Result<Vec<u8>> {
-    fetch_file_from_trusted_source_bound(
-        source,
-        path,
-        connect_timeout_secs,
-        fetch_timeout_secs,
-        None,
-    )
-    .await
-}
-
 pub(crate) async fn fetch_file_from_trusted_source_bound(
     source: &TrustedSource,
+    cid: Option<&str>,
     path: &str,
     connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<Vec<u8>> {
     let node_id = source_transport_endpoint_id(source)?;
@@ -8537,9 +8555,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("ticket[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
         }
@@ -8550,9 +8568,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("relay[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("relay[{index}] connect failed: {err}")),
         }
@@ -8562,10 +8580,10 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
-        Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_and_close(client, cid, path).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
-                errors.push(format!("direct fetch failed: {err}"));
+                errors.push(format!("direct fetch of {path} failed: {err}"));
                 Err(anyhow::anyhow!(
                     "trusted source Carrier fetch failed: {}",
                     errors.join(" | ")
@@ -10400,7 +10418,12 @@ pub(crate) mod tests {
         assert_eq!(seen.first(), Some(&(0, len)));
         assert_eq!(seen.last(), Some(&(len, len)));
         assert!(seen.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        assert_eq!(seen.len(), 1 + payload.len().div_ceil(REPLY_PROGRESS_CHUNK));
+        // Reports are spaced at least one chunk apart, so they stay few.
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen.len() <= 1 + payload.len().div_ceil(REPLY_PROGRESS_CHUNK));
+        assert!(seen[1..seen.len() - 1]
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 >= REPLY_PROGRESS_CHUNK as u64));
 
         reports.lock().unwrap().clear();
         assert_eq!(fetch(1 << 21).await.unwrap(), payload);
@@ -10457,6 +10480,7 @@ pub(crate) mod tests {
             Duration::from_secs(5),
             crate::setup::fetch_first_party_component_via_carrier(
                 dir.path(),
+                None,
                 "artifact",
                 crate::setup::FirstPartyCarrierContext::Setup,
             ),
@@ -10489,6 +10513,7 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let bytes = crate::setup::fetch_first_party_component_via_carrier(
                 dir.path(),
+                None,
                 "artifact",
                 crate::setup::FirstPartyCarrierContext::Setup,
             )
@@ -10515,6 +10540,94 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn carrier_terminal_install_fetches_signed_cid_before_release_name() {
+        use sha2::Digest;
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = TrustedSource {
+            name: "fixture".into(),
+            publisher_dids: vec![],
+            channel: "stable".into(),
+            discovery_uri: String::new(),
+            connect_ticket: encode_ticket_for(address),
+            gateways: vec![],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: server.id().to_string(),
+            ipns_name: String::new(),
+        };
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.default_source = source.name.clone();
+        sources.sources.push(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+
+        // The seed serves the newest file under a name; the signed CID names the old bytes.
+        for (cid, expected) in [
+            (Some("bafy-signed-old"), b"signed old".as_slice()),
+            (None, b"newest by name".as_slice()),
+        ] {
+            let server_endpoint = server.clone();
+            let serving = tokio::spawn(async move {
+                let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let reply: &[u8] = if request["op"] == "content_fetch" {
+                    assert_eq!(request["cid"], "bafy-signed-old");
+                    b"signed old"
+                } else {
+                    assert_eq!(request["path"], "fixture-tool");
+                    b"newest by name"
+                };
+                send.write_all(&(reply.len() as u64).to_be_bytes())
+                    .await
+                    .unwrap();
+                send.write_all(reply).await.unwrap();
+                send.finish().unwrap();
+                conn.closed().await;
+            });
+            let info: crate::setup::PlatformInfo = serde_json::from_value(serde_json::json!({
+                "cid": cid,
+                "release_path": "fixture-tool",
+                "checksum": format!("sha256:{}", hex::encode(sha2::Sha256::digest(expected))),
+            }))
+            .unwrap();
+            let dest = dir.path().join("bin/fixture-tool");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::setup::install_first_party_component_via_carrier(
+                    dir.path(),
+                    "fixture-tool",
+                    &info,
+                    &dest,
+                    crate::setup::FirstPartyCarrierContext::Setup,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), expected);
+            tokio::time::timeout(Duration::from_secs(5), serving)
+                .await
+                .unwrap()
+                .unwrap();
+        }
         server.close().await;
     }
 
@@ -10761,9 +10874,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_file_with_timeout(client, "artifact", 5)
-                .await
-                .unwrap(),
+            fetch_and_close(client, None, "artifact").await.unwrap(),
             b"fixture"
         );
         assert!(!runtime.is_closed());
@@ -10870,7 +10981,8 @@ pub(crate) mod tests {
                         .unwrap();
                     send.finish().unwrap();
                 }
-                "timeout" => {}
+                // The header arrives, then the body stalls.
+                "timeout" => send.write_all(&7u64.to_be_bytes()).await.unwrap(),
                 _ => unreachable!(),
             }
             conn.closed().await
@@ -10878,7 +10990,7 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let result = fetch_file_with_timeout(client, "artifact", 1).await;
+        let result = fetch_and_close(client, None, "artifact").await;
         let closed_before_return = observer.is_closed();
         observer.close().await;
         let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)
@@ -10902,7 +11014,7 @@ pub(crate) mod tests {
             ),
             "timeout" => assert_eq!(
                 result.unwrap_err().to_string(),
-                "file fetch timed out after 1s"
+                "no data for 1 s while downloading artifact"
             ),
             _ => unreachable!(),
         }
@@ -10921,6 +11033,109 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn carrier_client_owned_fetch_timeout_closes_endpoint() {
         carrier_client_fetch_cleanup_case("timeout").await;
+    }
+
+    /// Serves one fetch whose length header comes after `header_delay`, then
+    /// 5 chunks `gap` apart, and fetches it through `fetch_content` (with a
+    /// CID) or `fetch_file`. Unit tests use a 1 s idle deadline and a 3 s
+    /// header wait.
+    async fn carrier_fetch_slowly(
+        cid: Option<&str>,
+        header_delay: Duration,
+        gap: Duration,
+    ) -> Result<Vec<u8>> {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let expected_cid = cid.map(str::to_string);
+        let serving = tokio::spawn(async move {
+            let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut reader = BufReader::new(recv);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            match expected_cid {
+                Some(cid) => {
+                    assert_eq!(request["op"], "content_fetch");
+                    assert_eq!(request["cid"], cid);
+                    assert!(request.get("path").is_none());
+                }
+                None => assert_eq!(request["path"], "artifact"),
+            }
+            tokio::time::sleep(header_delay).await;
+            send.write_all(&10u64.to_be_bytes()).await.unwrap();
+            for chunk in [b"fi", b"xt", b"ur", b"e-", b"ok"] {
+                send.write_all(chunk).await.unwrap();
+                tokio::time::sleep(gap).await;
+            }
+            let _ = send.finish();
+            conn.closed().await
+        });
+        let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
+            .await
+            .unwrap();
+        let result = match cid {
+            Some(cid) => client.fetch_content(cid, None).await,
+            None => client.fetch_file("artifact").await,
+        };
+        client.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        server.close().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_with_steady_progress_outlives_idle_deadline() {
+        // 5 chunks 400 ms apart: 2 s in total, twice the 1 s idle deadline.
+        for cid in [None, Some("bafy-fixture")] {
+            let bytes = carrier_fetch_slowly(cid, Duration::ZERO, Duration::from_millis(400))
+                .await
+                .unwrap();
+            assert_eq!(bytes, b"fixture-ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_that_stalls_fails_after_idle_deadline() {
+        for (cid, name) in [(None, "artifact"), (Some("bafy-fixture"), "bafy-fixture")] {
+            let started = std::time::Instant::now();
+            let err = carrier_fetch_slowly(cid, Duration::ZERO, Duration::from_secs(3))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("no data for 1 s while downloading {name}")
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_waits_for_source_preparation_within_header_bound() {
+        // The source prepares the file for 2 s (past the 1 s idle deadline).
+        let bytes =
+            carrier_fetch_slowly(Some("bafy-fixture"), Duration::from_secs(2), Duration::ZERO)
+                .await
+                .unwrap();
+        assert_eq!(bytes, b"fixture-ok");
+        // Preparation past the 3 s header bound fails.
+        let err =
+            carrier_fetch_slowly(Some("bafy-fixture"), Duration::from_secs(4), Duration::ZERO)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trusted source did not start sending bafy-fixture within 3 s"
+        );
     }
 
     #[tokio::test]

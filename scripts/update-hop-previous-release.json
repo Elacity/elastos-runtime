@@ -1,7 +1,7 @@
 {
-  "release_cid": "QmXPozwaiWNyxvXjLFbqPbrJiwNWpbw3bZCQpgzpyqHmKh",
-  "release_sha256": "f19dadb52968a0a7f80ee7eab75485763bf042f26db867e75a428a7b3b470221",
+  "release_cid": "QmWMfyHQ3iFKtc2ERUCmhQ8DnWcxQKK7SzME1U2mqQJuYh",
+  "release_sha256": "f474477590d2e84b1761144afb70c1449948b2c61f87aa427e4db5fe9146d04b",
   "schema": "elastos.update-hop.previous-release/v1",
   "signer_did": "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe",
-  "version": "0.8.0-alpha.6"
+  "version": "0.8.0-alpha.8"
 }

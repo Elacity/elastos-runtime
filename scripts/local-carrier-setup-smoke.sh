@@ -334,13 +334,8 @@ kubo_info.pop('strategy', None)
 manifest['external']['kubo']['capsule_metadata'] = {
     'role': 'content', 'type': 'data', 'install_path': 'capsules/kubo',
     'platforms': {platform: receipt['capsule_metadata']}}
-kubo_env = {**os.environ, 'IPFS_PATH': str(data_dir / 'ipfs-repo')}
-subprocess.run([str(data_dir / 'bin/kubo'), 'init', '--profile=test'], env=kubo_env,
-               check=True, stdout=subprocess.DEVNULL)
-cid = subprocess.check_output([str(data_dir / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
-                               '--pin=true', str(kubo_archive)], env=kubo_env, text=True).strip()
-kubo_info['cid'] = cid
-manifest['external']['kubo']['capsule_metadata']['platforms'][platform]['cid'] = cid
+# This local source runs no ipfs-provider, so it serves by name only and its
+# descriptors carry no CID (signed releases fetch by CID; #287).
 
 if platform == "linux-arm64":
     recipe = next(recipe for recipe in json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']

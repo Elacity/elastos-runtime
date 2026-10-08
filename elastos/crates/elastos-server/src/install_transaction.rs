@@ -145,7 +145,7 @@ pub(crate) struct RestartRecord {
 /// Writers resolve the parent once and use the same path for their destinations.
 /// The lock path stays in place after the guard releases the flock and closes its file.
 pub(crate) struct InstallationGuard {
-    _lock: File,
+    _lock: crate::host_lock::FileLock,
     binary_parent: PathBuf,
 }
 
@@ -165,16 +165,8 @@ impl InstallationGuard {
             .open(&lock_path)
             .context("open installation lock")?;
         check_file(&lock, &lock_path, true)?;
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&lock),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("another writer owns the installation lock");
-        }
+        let lock = crate::host_lock::FileLock::try_exclusive(lock)
+            .context("another writer owns the installation lock")?;
         Ok(Self {
             _lock: lock,
             binary_parent: binary_parent.to_path_buf(),
@@ -197,14 +189,6 @@ impl InstallationGuard {
             bail!("installed release writer lock identity changed");
         }
         Ok(())
-    }
-}
-
-impl Drop for InstallationGuard {
-    fn drop(&mut self) {
-        // A forked command can retain this description until its CLOEXEC fd closes.
-        // The guard's scope owns the lock, so release it before closing our fd.
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._lock), libc::LOCK_UN) };
     }
 }
 
@@ -1378,13 +1362,31 @@ impl InstallTransaction {
     }
 }
 
+/// Quote a path so a repair command pastes into a POSIX shell for any path.
+pub(crate) fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 fn check_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        bail!("installation directory is unsafe: {}", path.display());
+    if !metadata.is_dir() {
+        bail!(
+            "installation directory is unsafe: {} is not a directory",
+            path.display()
+        );
+    }
+    let quoted = shell_quote_path(path);
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "installation directory is unsafe: {} is group- or world-writable; fix with: chmod go-w {quoted}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1403,9 +1405,21 @@ fn check_file(file: &File, path: &Path, owner_only: bool) -> anyhow::Result<()> 
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
         || metadata.mode() & 0o6000 != 0
-        || metadata.mode() & if owner_only { 0o077 } else { 0o022 } != 0
     {
         bail!("installation file is unsafe: {}", path.display());
+    }
+    let refused = if owner_only { 0o077 } else { 0o022 };
+    if metadata.mode() & refused != 0 {
+        let fix = if owner_only {
+            "chmod go-rwx"
+        } else {
+            "chmod go-w"
+        };
+        bail!(
+            "installation file is unsafe: {} is accessible to other users; fix with: {fix} {}",
+            path.display(),
+            shell_quote_path(path)
+        );
     }
     Ok(())
 }
@@ -1992,16 +2006,15 @@ pub(crate) mod tests {
                 }
                 let path = &writer.destinations[&id];
                 writer.check_parent(path.parent().unwrap(), true).unwrap();
-                write_new(
+                crate::test_support::write_from_child(
                     path,
-                    &previous(id),
+                    previous(id),
                     if id == ReleaseFile::RuntimeBinary {
                         0o755
                     } else {
                         0o600
                     },
-                )
-                .unwrap();
+                );
             }
         }
 
@@ -2655,6 +2668,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unsafe_directory_refusal_prints_a_working_repair_command() {
+        let fixture = Fixture::new();
+        let dir = fixture._root.path().join("it's a \"bin\" $dir");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let error = InstallationGuard::acquire(&dir).err().unwrap().to_string();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
+        let command = error.split_once("fix with: ").expect(&error).1;
+        let status = std::process::Command::new("sh")
+            .args(["-c", command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
+        assert!(InstallationGuard::acquire(&dir).is_ok());
+    }
+
+    #[test]
     fn every_late_file_failure_restores_complete_previous_release() {
         for absent in [false, true] {
             for fault in ReleaseFile::ALL {
@@ -3029,6 +3060,26 @@ pub(crate) mod tests {
                 b"data written by owner"
             );
         }
+    }
+
+    #[test]
+    fn group_writable_release_file_names_a_working_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("component's list.json");
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let error = check_file(&File::open(&path).unwrap(), &path, false)
+            .unwrap_err()
+            .to_string();
+        let command = format!("chmod go-w {}", shell_quote_path(&path));
+        assert!(error.contains(&format!("fix with: {command}")), "{error}");
+        assert!(std::process::Command::new("sh")
+            .args(["-c", &command])
+            .status()
+            .unwrap()
+            .success());
+        check_file(&File::open(&path).unwrap(), &path, false).unwrap();
     }
 
     #[test]
