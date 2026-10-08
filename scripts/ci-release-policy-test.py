@@ -336,7 +336,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("branches: [main, develop]", triggers)
         context = {"github.event_name": "merge_group", "github.ref": "refs/heads/gh-readonly-queue/develop/pr-1"}
         for job in JOBS:
-            if job == "release":
+            if job in ("release", "cancel-on-failure"):
                 continue
             guard = re.search(r"(?m)^    if: (.*)$", JOBS[job])
             if guard:
@@ -1132,6 +1132,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
             "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
+            "cancel-on-failure": ("cancel-on-failure", "ubuntu-24.04"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
         self.assertEqual(set(JOBS), set(expected))
@@ -1147,6 +1148,59 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-linux-arm64", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+    def run_cancel_watcher(self, polls):
+        """Run the watcher shell against successive job lists; return (status, cancels, polls used)."""
+        step, = steps("cancel-on-failure")
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shims, queue = root / "shims", root / "polls"
+            shims.mkdir()
+            queue.mkdir()
+            for index, poll in enumerate(polls):
+                (queue / f"{index:03}").write_text(json.dumps({"jobs": [
+                    {"name": name, "status": status, "conclusion": conclusion}
+                    for name, status, conclusion in poll]}))
+            (shims / "sleep").write_text("#!/bin/bash\n")
+            (shims / "gh").write_text(textwrap.dedent("""\
+                #!/bin/bash
+                if [ "$2" = -X ]; then echo "$4" >> "$CANCEL_LOG"; exit 0; fi
+                next="$(ls "$POLL_DIR" | sort | sed -n 1p)"
+                [ -n "$next" ] || exit 9
+                jq -r "$4" "$POLL_DIR/$next" && rm "$POLL_DIR/$next"
+                """))
+            for shim in shims.iterdir():
+                shim.chmod(0o700)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                                    env={**os.environ, "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}",
+                                         "GITHUB_REPOSITORY": "Elacity/elastos-runtime", "GITHUB_RUN_ID": "7",
+                                         "GITHUB_RUN_ATTEMPT": "1", "POLL_DIR": str(queue),
+                                         "CANCEL_LOG": str(root / "cancels")})
+            cancels = (root / "cancels").read_text().splitlines() if (root / "cancels").exists() else []
+            return result.returncode, cancels, len(polls) - len(list(queue.iterdir()))
+
+    def test_pull_request_runs_cancel_at_the_first_failed_job(self):
+        watcher = JOBS["cancel-on-failure"]
+        self.assertNotIn("actions/checkout@", watcher)
+        self.assertEqual(watcher.split("    permissions:\n", 1)[1].split("    steps:\n", 1)[0], "      actions: write\n")
+        for event, ref, ref_type, override, _, _ in CASES:
+            for head in ("Elacity/elastos-runtime", "someone/fork"):
+                context = {"github.event_name": event, "github.ref": ref, "github.repository": "Elacity/elastos-runtime",
+                           "github.event.pull_request.head.repo.full_name": head}
+                self.assertEqual(job_runs("cancel-on-failure", context),
+                                 event == "pull_request" and head == "Elacity/elastos-runtime", (event, head))
+        watch = ("cancel-on-failure", "in_progress", None)
+        gate = ("source-gate", "completed", "success")
+        macos = ("source-home-macos", "in_progress", None)
+        for conclusion in ("failure", "timed_out"):
+            status, cancels, used = self.run_cancel_watcher(
+                [[watch, gate, macos], [watch, gate, ("lint", "completed", conclusion), macos]])
+            self.assertEqual((status, cancels, used), (0, ["repos/Elacity/elastos-runtime/actions/runs/7/cancel"], 2))
+        # A completed gate before dependent jobs appear is not the end of the run.
+        done = [watch, gate, ("source-home-macos", "completed", "success"), ("lint", "completed", "cancelled")]
+        status, cancels, used = self.run_cancel_watcher([[watch, gate], [watch, gate, macos], done, done])
+        self.assertEqual((status, cancels, used), (0, [], 4))
 
     def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
         mac_steps = steps("source-home-macos")

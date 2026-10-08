@@ -1026,6 +1026,39 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # A pull request run stops at its first failed job, so the macOS and Linux
+  # journeys do not run on for 30+ minutes after a decisive failure. Pushes,
+  # merge queues and dispatches keep running every job to the end. This job
+  # runs no repository code and is the only one that may cancel the run.
+  cancel-on-failure:
+    name: cancel-on-failure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      actions: write
+    steps:
+      - name: cancel this run after the first failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          run="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done_polls=0
+          # Jobs that wait on needs appear late; two quiet polls confirm the end.
+          while (( done_polls < 2 )); do
+            sleep 20
+            counts="$(gh api "$run/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq \
+              '[.jobs[] | select(.name != "cancel-on-failure")] | "\(map(select(.conclusion == "failure" or .conclusion == "timed_out")) | length) \(map(select(.status != "completed")) | length)"')" || continue
+            read -r failed pending <<< "$counts"
+            if (( failed > 0 )); then
+              echo "A job failed; cancelling the rest of this pull request run."
+              gh api -X POST "$run/cancel"
+              exit
+            fi
+            if (( pending == 0 )); then done_polls=$((done_polls + 1)); else done_polls=0; fi
+          done
+
   # Publish a GitHub Release for v* tags, attaching the per-architecture
   # binary packages built by the source-home jobs. Only runs when every
   # lint/test/source-home job is green.
