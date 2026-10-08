@@ -156,7 +156,7 @@ the version by the contract change (see Meaning) and update the changelog first;
 
 A new model catalogue is signed before release preparation, with the same key:
 `release-signer.py --policy POLICY --input-root DIR --model-catalog payload.json --output-root NEW_DIR`.
-The operator types the DID. The signer refuses a payload the Runtime would refuse, writes
+The policy approves the payload by `model_catalog_sha256`; the operator types the DID. The signer refuses a payload the Runtime would refuse, writes
 `model-catalog.json` for the repository root and prints the CID to pin as `model_catalog.head_cid` in `components.json`.
 Keep that head stable across releases: a new head means every admitted model needs Use again.
 

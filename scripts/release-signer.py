@@ -24,8 +24,9 @@ SHA-256. Outputs are a new read-only publication snapshot, outside input root.
 
 --model-catalog PAYLOAD signs a model catalogue payload (schema, published_at,
 optional expires_at, entries) from the input root with the same policy key, tool
-pins and typed-DID confirmation. It refuses payloads the Runtime would refuse,
-writes canonical model-catalog.json and prints its raw CID (model_catalog.head_cid).
+pins and typed-DID confirmation. The policy approves the exact payload bytes by
+model_catalog_sha256. It refuses payloads the Runtime would refuse before any key
+use, writes canonical model-catalog.json and prints its raw CID (model_catalog.head_cid).
 
 This code neither builds candidates nor runs candidate tools. Production custody,
 real signing and installer integration require separate operator acceptance.
@@ -608,6 +609,58 @@ def sign_publication(prepared, backend):
     return prepared.files + (("release.json", release), ("release-head.json", signed_envelope("elastos.release.head.v1", head, prepared.publisher_did, backend)))
 
 
+def model_path(value):
+    # elastos_common::validate_model_content_path
+    require(type(value) is str and len(value) <= 256
+            and re.fullmatch(r"(?:[A-Za-z0-9._-]*[A-Za-z0-9_-]/)*[A-Za-z0-9._-]*[A-Za-z0-9_-]", value),
+            "model_content path must be a bounded canonical relative path")
+    return value
+
+
+def model_capsule(capsule):
+    """Mirror CapsuleManifest::validate for model content. Only passive fields are
+    admitted; execution, authority and presentation fields are refused."""
+    require(type(capsule) is dict and {"schema", "version", "name", "role", "type", "entrypoint", "model_content"} <= set(capsule)
+            <= {"schema", "version", "name", "description", "author", "role", "type", "projections", "entrypoint",
+                "model_content", "requires", "capabilities", "interfaces"}, "model capsule manifest fields refused")
+    require(capsule["schema"] == "elastos.capsule/v1", "model capsule schema refused")
+    require(capsule["role"] == "content" and capsule["type"] == "data" and capsule.get("projections", []) in ([], ["content"])
+            and all(capsule.get(field, []) == [] for field in ("requires", "capabilities", "interfaces")),
+            "model_content requires passive content/data without execution authority")
+    control = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+    name = capsule["name"]
+    require(type(name) is str and 0 < len(name.encode()) <= 128 and not control.search(name)
+            and not any(char.isspace() for char in name), "model_content name refused")
+    for field, limit in (("version", 32), ("description", 1024), ("author", 128)):
+        value = capsule.get(field)
+        require((value is None and field != "version") or (type(value) is str and len(value.encode()) <= limit and not control.search(value)),
+                "model_content display facts exceed their bounds")
+    require(capsule["version"].strip() != "", "manifest version must not be empty")
+    entrypoint = model_path(capsule["entrypoint"])
+    require(entrypoint.endswith(".gguf") and ".." not in entrypoint, "model_content entrypoint must name its GGUF file")
+    model = capsule["model_content"]
+    require(type(model) is dict and set(model) == {"format", "quantization", "engine", "consumer_interface",
+                                                   "consumer_interface_version", "minimum_memory_mb", "license", "provenance"},
+            "model_content fields refused")
+    require(model["format"] == "gguf" and model["quantization"] in ("Q1_0", "Q4_K_M", "Q8_0") and model["engine"] == "llama.cpp"
+            and model["consumer_interface"] == "elastos.provider.model" and model["consumer_interface_version"] == "0.1.0"
+            and type(model["minimum_memory_mb"]) is int and 1 <= model["minimum_memory_mb"] <= 1_048_576,
+            "unsupported model_content format, engine, interface or resource requirement")
+    provenance = model["provenance"]
+    require(type(provenance) is dict and set(provenance) == {"base_repository", "base_revision", "base_license",
+                                                             "quantized_repository", "quantized_revision", "path"},
+            "model_content provenance fields refused")
+    for license in (model["license"], provenance["base_license"]):
+        require(type(license) is dict and set(license) == {"spdx_id", "path"} and license["spdx_id"] == "Apache-2.0",
+                "model_content first profile requires Apache-2.0 license facts")
+        model_path(license["path"])
+    model_path(provenance["path"])
+    for repository in (provenance["base_repository"], provenance["quantized_repository"]):
+        require(model_path(repository).count("/") == 1, "model_content provenance requires an owner/repository identifier")
+    for revision in (provenance["base_revision"], provenance["quantized_revision"]):
+        require(type(revision) is str and re.fullmatch(r"[0-9a-f]{40}", revision), "model_content provenance requires an exact lowercase Git revision")
+
+
 def model_closure(capsule, closure):
     """Mirror the Runtime's self-contained model closure checks (content.rs)."""
     capsule_bytes = json_bytes(capsule)
@@ -619,9 +672,8 @@ def model_closure(capsule, closure):
     require(type(files) is list and 1 <= len(files) <= 32, "model content closure file count exceeds its limit")
     digest, total, previous, folded = hashlib.sha256(), 0, "", set()
     for item in files:
-        require(type(item) is dict and set(item) == {"path", "sha256", "size"} and type(item["path"]) is str
-                and len(item["path"]) <= 256 and re.fullmatch(r"(?:[A-Za-z0-9._-]*[A-Za-z0-9_-]/)*[A-Za-z0-9._-]*[A-Za-z0-9_-]", item["path"])
-                and item["path"] > previous and item["path"].lower() not in folded and item["path"].lower() != "_elastos_object.json"
+        require(type(item) is dict and set(item) == {"path", "sha256", "size"}, "invalid model content file fields")
+        require(model_path(item["path"]) > previous and item["path"].lower() not in folded and item["path"].lower() != "_elastos_object.json"
                 and type(item["size"]) is int and 0 < item["size"] <= 16 * 1024**3
                 and (item["path"] == capsule["entrypoint"] or item["size"] <= 1024**2)
                 and type(item["sha256"]) is str and HASH.fullmatch(item["sha256"]), "invalid, aliased or unbounded model content file")
@@ -640,7 +692,7 @@ def model_closure(capsule, closure):
 
 
 def check_model_catalog(payload, publisher_did, now):
-    """Refuse a payload the Runtime's verify_model_catalog would refuse."""
+    """Refuse a payload the Runtime's verify_model_catalog would refuse, before any key use."""
     require(type(payload) is dict and {"schema", "published_at", "entries"} <= set(payload) <= {"schema", "published_at", "expires_at", "entries"},
             "model catalog payload fields refused")
     require(payload["schema"] == MODEL_CATALOG_SCHEMA, "model catalog schema refused")
@@ -656,19 +708,20 @@ def check_model_catalog(payload, publisher_did, now):
                 and entry["cid"] not in cids, "model package requires a unique canonical DAG-PB SHA-256 CIDv1")
         cids.add(entry["cid"])
         capsule, closure = entry["capsule_manifest"], entry["object_manifest"]
-        require(type(capsule) is dict and type(capsule.get("name")) is str and type(capsule.get("entrypoint")) is str
-                and type(capsule.get("model_content")) is dict and capsule["name"] not in names, "model capsule manifest refused")
+        model_capsule(capsule)
+        require(capsule["name"] not in names, "model catalog entries require unique capsule names")
         names.add(capsule["name"])
         require(type(closure) is not dict or closure.get("publisher_did") in (None, publisher_did), "model closure publisher must match the catalog signer")
         model_closure(capsule, closure)
+    # The hex signature has a fixed length, so the signed size is known before signing.
+    require(len(json_bytes({"payload": payload, "signature": "0" * 128, "signer_did": publisher_did})) <= MAX_MODEL_CATALOG,
+            "signed model catalog exceeds 128 KiB")
 
 
 def sign_model_catalog(payload, publisher_did, backend, now):
     check_model_catalog(payload, publisher_did, now)
     require(public_did(backend.public_key()) == publisher_did, "custodian public DID differs")
-    catalog = signed_envelope(MODEL_CATALOG_DOMAIN, payload, publisher_did, backend)
-    require(len(catalog) <= MAX_MODEL_CATALOG, "signed model catalog exceeds 128 KiB")
-    return catalog
+    return signed_envelope(MODEL_CATALOG_DOMAIN, payload, publisher_did, backend)
 
 
 def model_catalog_summary(payload):
@@ -783,9 +836,10 @@ def main():
             did = policy["publisher_did"]
             check_did(did)
             data = regular_bytes(args.input_root / relative_path(args.model_catalog), MAX_JSON)
+            require(sha256(data) == checked_hash(policy.get("model_catalog_sha256")), "model catalogue payload differs from policy approval")
             payload = parse_json(data)
             check_model_catalog(payload, did, int(time.time()))
-            subject = f"model catalogue payload sha256:{sha256(data)} with entries\n{model_catalog_summary(payload)}"
+            subject = f"approved model catalogue payload sha256:{sha256(data)} with entries\n{model_catalog_summary(payload)}"
             require(confirmed(did, subject, sys.stdin, sys.stderr), "signing cancelled")
             backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
             try:
