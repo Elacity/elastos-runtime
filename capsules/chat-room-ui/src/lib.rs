@@ -4758,8 +4758,10 @@ mod tests {
 
     #[test]
     fn failed_initial_direct_intent_survives_loss_and_yields_to_a_user_selection() {
-        let mut state = AppState::default();
-        state.pending_direct_launch = Some("direct:a".into());
+        let mut state = AppState {
+            pending_direct_launch: Some("direct:a".into()),
+            ..AppState::default()
+        };
         super::apply_session_loss_state(&mut state, true, "Reconnect through Home.");
         assert_eq!(state.pending_direct_launch.as_deref(), Some("direct:a"));
         state.direct.conversations = vec![DirectConversationView {
