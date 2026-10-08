@@ -7879,7 +7879,10 @@ pub(crate) mod tests {
                 .unwrap();
             let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
             // The descriptor is signed with a CID, so a fetch by release name is refused.
-            assert_eq!(request["op"], "content_fetch", "fetched {release_path} by name");
+            assert_eq!(
+                request["op"], "content_fetch",
+                "fetched {release_path} by name"
+            );
             assert_eq!(request["cid"], served_cid);
             send.write_all(&(bytes.len() as u64).to_be_bytes())
                 .await
