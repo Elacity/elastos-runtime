@@ -180,6 +180,8 @@ def cleanup_runtime(child, data, allow_group=True):
 
 
 def run(home, data, evidence, model=True):
+    if (evidence / "home-journey.json").exists() or (evidence / "home-journey.json").is_symlink():
+        raise RuntimeError("installed journey requires fresh UI evidence")
     preparation_started = time.monotonic()
     evidence.mkdir(parents=True, exist_ok=True)
     installed = data / "bin/elastos"
@@ -295,12 +297,15 @@ def run(home, data, evidence, model=True):
             record["results"]["engine_absent_refusal"] = (
                 "passed" if record.get("dispatch_unavailable_reason") == "source_engine_required"
                 and record["engine_absent_after_ui"] and record["results"].get("engine_absent_refusal") == "passed"
+                and record["process_cleanup"].get("before", {}).get("llama_server") == 0
                 else "failed")
             record["results"]["engine_absent_home"] = "passed" if record["engine_absent_after_ui"] else "failed"
         (evidence / "installed-journeys.json").write_text(json.dumps(record, indent=2) + "\n")
 
     if record["process_cleanup"]["status"] != "passed":
         raise RuntimeError("installed journey left owned processes running")
+    if not model and record["results"]["engine_absent_refusal"] != "passed":
+        raise RuntimeError("installed engine-absence refusal proof is incomplete")
     if model and record["results"]["model_timing_observer"] != "passed":
         raise RuntimeError("installed timing observer did not stop")
     require_disk_space(data)

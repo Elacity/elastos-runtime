@@ -1183,6 +1183,26 @@ class InstalledJourneyTests(unittest.TestCase):
                 self.gateway, self.node, self.stop = gateway, node, stop
         return child
 
+    def test_stale_ui_receipt_is_refused_before_fixture_or_runtime_start(self):
+        for kind in ("receipt", "dangling_link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "linux")
+                old = json.dumps({"results": {"installed_runtime_reply": "passed"}})
+                path = evidence / "home-journey.json"
+                if kind == "receipt":
+                    path.write_text(old)
+                else:
+                    path.symlink_to("never-created.json")
+                with self.assertRaisesRegex(RuntimeError, "requires fresh UI evidence"):
+                    self.execute(home, data, evidence)
+                self.gateway.assert_not_called()
+                self.node.assert_not_called()
+                if kind == "receipt":
+                    self.assertEqual(path.read_text(), old)
+                else:
+                    self.assertTrue(path.is_symlink())
+                    self.assertFalse(path.exists())
+
     def test_gateway_and_node_share_the_installed_fixture_root(self):
         for platform in ("macos", "linux"):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
@@ -1265,7 +1285,7 @@ class InstalledJourneyTests(unittest.TestCase):
 
     def test_engine_absence_receipt_preserves_post_ui_filesystem_failure(self):
         journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
-        for appeared in (None, "alias", "bundle", "capsule", "ui_missing", "reason", "refusal"):
+        for appeared in (None, "alias", "bundle", "capsule", "ui_missing", "reason", "refusal", "engine_process"):
             with self.subTest(appeared=appeared), tempfile.TemporaryDirectory() as temp:
                 home, data, evidence, _ = self.fixture(Path(temp), "linux")
                 target_home = Path(temp) / "absent"
@@ -1303,16 +1323,16 @@ class InstalledJourneyTests(unittest.TestCase):
                         mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
                             "capacity_bytes": 100 * 1024 ** 3, "available_bytes": 20 * 1024 ** 3},
                             "process_rows": lambda: {},
-                            "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}}}):
+                            "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {"llama_server": 1 if appeared == "engine_process" else 0}, "after": {"llama_server": 0}}}):
                     if appeared:
-                        with self.assertRaises((AssertionError, subprocess.CalledProcessError)):
+                        with self.assertRaises((AssertionError, RuntimeError, subprocess.CalledProcessError)):
                             journey["run"](target_home, target, evidence, model=False)
                     else:
                         journey["run"](target_home, target, evidence, model=False)
                 record = json.loads((evidence / "installed-journeys.json").read_text())
                 self.assertTrue(record["engine_absent"])
-                self.assertEqual(record["engine_absent_after_ui"], appeared is None)
-                self.assertEqual(record["results"]["engine_absent_home"], "failed" if appeared else "passed")
+                self.assertEqual(record["engine_absent_after_ui"], appeared in (None, "engine_process"))
+                self.assertEqual(record["results"]["engine_absent_home"], "passed" if appeared in (None, "engine_process") else "failed")
                 self.assertEqual(record["results"]["engine_absent_refusal"], "failed" if appeared else "passed")
                 self.assertNotIn("unknown_reason", json.dumps(record))
                 self.assertEqual(record["results"]["process_cleanup"], "passed")
@@ -1546,7 +1566,7 @@ class InstalledModelTimingTests(unittest.TestCase):
     def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
         shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
         source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
-        for failure in (None, "missing", "candidate", "reply", "absence", "refusal", "refusal_reason"):
+        for failure in (None, "missing", "candidate", "reply", "absence", "refusal", "refusal_reason", "engine_process"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 _, data, _, _ = InstalledJourneyTests().fixture(root, "macos")
@@ -1575,6 +1595,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                     **identities, "candidate": "c" * 40, "source_tree": "d" * 40, "engine_absent": True,
                     "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
                     "dispatch_unavailable_reason": None if failure == "refusal_reason" else "source_engine_required",
+                    "process_cleanup": {"before": {"llama_server": 1 if failure == "engine_process" else 0}},
                     "results": {name: "failed" if (failure == "absence" and name == "engine_absent_home") or (failure == "refusal" and name == "engine_absent_refusal") else "passed"
                                 for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve")}}))
                 with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
@@ -1591,7 +1612,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                                  "incomplete" if failure in ("missing", "candidate", "reply") else "complete")
                 if failure == "reply":
                     self.assertEqual(result["results"]["installed_runtime_reply"], "failed or not run")
-                if failure in ("absence", "refusal", "refusal_reason"):
+                if failure in ("absence", "refusal", "refusal_reason", "engine_process"):
                     self.assertEqual(result["results"]["engine_absent_home"], "failed or not run")
                 summary = (root / "summary.md").read_text()
                 self.assertIn("OS file cache can warm", summary)

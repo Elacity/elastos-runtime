@@ -15,6 +15,8 @@ test("public browser failure keeps launch authority and operator paths private",
 test("public failures accept only owned stages and fixed failure codes", () => {
   assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: "secret" }, "installed_runtime_reply"),
     { failure_stage: "installed_runtime_reply", failure: "assertion_failed" });
+  assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: "secret" }, "engine_absent_refusal"),
+    { failure_stage: "engine_absent_refusal", failure: "assertion_failed" });
   assert.deepEqual(publicJourneyFailure({ name: "secret", message: "secret" }, "secret"),
     { failure_stage: "journey", failure: "journey_failed" });
   assert.deepEqual(publicJourneyFailure(null, null), { failure_stage: "journey", failure: "journey_failed" });

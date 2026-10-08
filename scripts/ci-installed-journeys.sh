@@ -86,6 +86,7 @@ absence_path = root / "engine-absent-home/installed-journeys.json"
 absence = json.loads(absence_path.read_text()) if absence_path.exists() else {}
 results["engine_absent_home"] = ("passed" if current(absence) and absence.get("engine_absent") is True
                                 and absence.get("dispatch_unavailable_reason") == "source_engine_required"
+                                and absence.get("process_cleanup", {}).get("before", {}).get("llama_server") == 0
                                 and all(absence.get("results", {}).get(name) == "passed" for name in
                                         ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve"))
                                 else "failed or not run")
