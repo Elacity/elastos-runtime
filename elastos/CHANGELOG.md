@@ -1,60 +1,70 @@
 # Changelog
 
-All notable changes to the public ElastOS Runtime repository.
+All notable changes to the public ElastOS Runtime repository. System shows a
+release's Added, Changed, Fixed, Removed and Security bullets before you update;
+"Developer detail" is for developers and is not shown.
 
 ## [Unreleased]
 
-### Removed
+## [0.8.0-alpha.9]
 
-- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
-  published models. Removed the model CAR retention and import path from release
-  preparation, signing and publication, `model-package-handoff.py`,
-  `fetch-model.sh` and their tests. Models return later as a separate signed
-  publication.
+Test-channel release. Signed releases show these notes in System before you update.
 
-- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
-  report their own crate version in startup logs and status, so a new release
-  version is no longer a reason for provider bytes and checksums to change;
-  dependencies and the toolchain still can change them (#194).
-- This release publishes `crosvm` and the guest kernel for no platform, so
-  microVM capsules are not available in it; setup skips them and the supervisor
-  says so. Their pinned bytes were unavailable and could not be signed. Release
-  preparation now refuses a checksummed component CID without a release file,
-  before signing.
+### Changed
+
+- Chat is its own signed capsule. A new install downloads it over Carrier, and an
+  update from System or Terminal adds it if it is missing.
+- Media tools are downloaded again only when they actually change.
 
 ### Fixed
 
-- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
-  refuses a larger declared size before reading the body.
+- Undo to an earlier release works again. Before, it received the newest
+  release's parts and was refused.
+- On Ubuntu and Jetson, install.sh no longer refuses the folder it just created.
+  If an existing folder is unsafe, it says how to fix it before downloading
+  anything.
+- Home status no longer shows Content Exchange as "stale install" right after a
+  fresh install.
 
-- Setup accepts passive content capsules from signed releases and checks provider
-  roles and icons. It refuses URL-only downloads and blank release paths, including
-  entries with a CID. Explicit CID-only operator gateways verify checksums before
-  replacing installed bytes.
+### Developer detail
 
-- Fresh setup admits the private signed release pair and binary under the
-  installation writer. It then fetches components and the model catalogue over
-  Carrier and verifies both before writing metadata or components. Signed manifest
-  bytes stay unchanged.
+- Components are fetched by their signed CID, like the Runtime binary and
+  components.json; the release name is used only when a descriptor has no CID
+  (#287).
+- Media tools build with fixed prefixes; the archive is byte-identical across
+  build directories (#194).
+- `elastos update` in Terminal adds missing Home components only on a Home;
+  Terminal and System updates share one support plan.
+- Artifact receipts have one format: the bare sha256 hex digest. Receipts that
+  earlier releases wrote with the `sha256:` prefix are still read.
+- Archive components are verified by their receipt and the recorded hash of
+  the extracted executable, and `elastos home status` reports them that way.
+  Content Exchange status is correct again (#280).
+- One `FileLock` guard unlocks its lock when dropped; `release()` unlocks and
+  reports an unlock failure where callers need it.
+- install.sh creates its directories 0755 under any umask. Before any download it
+  checks the data folder's existing parents with the Runtime's rule (owned by you
+  or root, not group- or other-writable). The installer and the media-tools check
+  name the unsafe folder and the exact repair command (#279).
+- Test fixtures that are executed are written from a child process, so a test
+  no longer fails with ETXTBSY.
+- Process-group scans skip processes that exit during the scan.
+- Runtime and validators accept legacy execution labels and the honest
+  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
+  manifests retain the legacy values so older Runtimes can complete an update.
+  Switch shipped manifests to the honest values in the next release, once every
+  supported Runtime accepts them. Runtime audits and Home display actual
+  execution boundaries during this transition. Third-party executable admission
+  remains gated by publisher, package approval and revocation checks.
 
-- CLI updates check the candidate executable before installation with a bounded
-  version probe. Failed launches, timeouts, excess output, and unexpected version
-  output preserve the previous installation.
+### Isolation status
 
-- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
-  Each step now requires that its own bytes fit in the free space. Update
-  staging, the installer, model and content downloads and Browser image
-  preparation also keep one shared 2 GiB reserve, so a disk is never filled to
-  zero, and refuse with "not enough free space: this needs N GB plus 2 GB kept
-  free". An update that does not fit keeps the previous release. Source-home
-  setup keeps its 16 GiB minimum and the media tools build its 4 GiB minimum.
-
-### Added
-
-- An internal offline update foundation stages and verifies release files with
-  unchanged support assets, an installation lock and journal, and restoration
-  after failed or interrupted activation. The default CLI update flow is preserved.
-  Home restart ownership and integration remain a follow-up.
+- Apps use opaque browser frames and Runtime capability checks. Home retains
+  cross-app capability authority. Providers run as native processes; only the
+  model provider is partly confined. Stored keys and full backups remain
+  accessible to the host operator. A stolen device or profile key requires a
+  new identity. The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+  sets the remaining installed acceptance gates.
 
 ## [0.8.0-alpha.8]
 
@@ -89,6 +99,24 @@ Test-channel release. Signed releases show these notes in System before you upda
 - If an install into another folder is refused, nothing is left behind in that
   folder.
 
+### Developer detail
+
+- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
+- `crosvm` and the guest kernel are published for no platform, so microVM
+  capsules are not available; setup skips them and the supervisor says so. Their
+  pinned bytes were unavailable and could not be signed. Release preparation now
+  refuses a checksummed component CID without a release file, before signing.
+- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
+  Each step requires that its own bytes fit in the free space. Update staging,
+  the installer, model and content downloads and Browser image preparation also
+  keep one shared 2 GiB reserve and refuse with "not enough free space: this
+  needs N GB plus 2 GB kept free". An update that does not fit keeps the previous
+  release. Source-home setup keeps its 16 GiB minimum and the media tools build
+  its 4 GiB minimum.
+
 ## [0.8.0-alpha.7]
 
 Test-channel release. Signed releases show these notes in System before you update.
@@ -112,6 +140,29 @@ in Terminal once. Later updates work from System again.
 
 - Local AI models are no longer part of the release, so Home shows no models for
   now. They will return as a separate signed download.
+
+### Developer detail
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. The model CAR retention and import path,
+  `model-package-handoff.py`, `fetch-model.sh` and their tests are removed from
+  release preparation, signing and publication.
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths,
+  including entries with a CID. Explicit CID-only operator gateways verify
+  checksums before replacing installed bytes.
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer, then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed
+  manifest bytes stay unchanged.
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output and unexpected version
+  output preserve the previous installation.
+- An offline update foundation stages and verifies release files with unchanged
+  support assets, an installation lock and journal, and restoration after failed
+  or interrupted activation.
 
 ## [0.7.1] - 2026-09-30
 

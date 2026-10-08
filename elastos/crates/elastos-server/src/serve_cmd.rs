@@ -69,6 +69,15 @@ pub async fn run_serve(
                 .validate()
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
+            if matches!(
+                manifest.execution_type(),
+                elastos_common::CapsuleType::WebProjection
+                    | elastos_common::CapsuleType::NativeProvider
+                    | elastos_common::CapsuleType::NativeHost
+            ) {
+                anyhow::bail!("Web projections and native helpers use their existing Runtime-owned host paths");
+            }
+
             if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
                 tracing::info!("Launching MicroVM capsule: {}", manifest.name);
 

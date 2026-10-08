@@ -42,8 +42,8 @@ const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === 
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
 // The installed-release CI journey (scripts/update-hop-compare.py): the published release's
-// System refuses a release whose support changed; the runner updates it with its CLI; on the
-// new release System refuses a tampered offer and applies the next one; the runner undoes it.
+// System installs a release whose support changed and Home reconnects; on the new release
+// System refuses a tampered offer and applies the next one; the runner undoes it.
 const SYSTEM_UPDATE_DIR = process.env.HOME_VIRTUAL_AUTH_UPDATE_DIR || "";
 const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = "", SYSTEM_UPDATE_NEXT = ""] =
   (process.env.HOME_VIRTUAL_AUTH_UPDATE_VERSIONS || "").split(" ");
@@ -4427,8 +4427,8 @@ async function checkSystemUpdate(page, passkey) {
     writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(value)}\n`, { mode: 0o600 });
   // System polls every 5 s, Runtime caches a Carrier check for 30 s, and an
   // approved update restarts Home.
-  const reach = async (name, predicate, message) => {
-    const deadline = Date.now() + 150_000;
+  const reach = async (name, predicate, message, seconds = 150) => {
+    const deadline = Date.now() + seconds * 1_000;
     let state = await read();
     while (!predicate(state) && Date.now() < deadline) {
       await delay(1_000);
@@ -4475,18 +4475,15 @@ async function checkSystemUpdate(page, passkey) {
     return sameAccount(message);
   };
   const upToDateCurrent = await reach("up-to-date", upToDate(SYSTEM_UPDATE_CURRENT), "System did not report Home up to date");
-  // Known limit of the published release: its System applies only releases with unchanged
-  // support. It refuses this one plainly and keeps Home on the current version.
-  const frozenOffer = await reach("frozen-offer", offered("new", SYSTEM_UPDATE_CURRENT, SYSTEM_UPDATE_NEW),
+  // The published release's System installs this release although its support changed: it
+  // prepares the update while Home runs, restarts Home once and reconnects the same account.
+  await reach("new-offer", offered("new", SYSTEM_UPDATE_CURRENT, SYSTEM_UPDATE_NEW),
     "System did not offer the new release");
   await approve();
-  const frozenRefused = await reach("frozen-refused", (state) => state.shown && state.can_apply
-    && state.installed_version === SYSTEM_UPDATE_CURRENT && state.status !== "" && state.status !== frozenOffer.status,
-  "System did not show the refusal on the current version");
-  // The supported path: the runner runs `elastos update` with the published release's CLI.
-  await reopen("cli-update", "Home did not sign in again after the CLI update");
-  await openDesktopAppWindow(page, "system");
-  const updated = await reach("updated", upToDate(SYSTEM_UPDATE_NEW), "System did not report the new release up to date");
+  const updated = await reach("updated", upToDate(SYSTEM_UPDATE_NEW),
+    "System did not reconnect on the new release", 300);
+  await waitForSignedHome(page, 60_000);
+  await sameAccount("Home session did not survive the System update to the new release");
   const tampered = await reach("tampered-offer", offered("tampered-binary", SYSTEM_UPDATE_NEW, SYSTEM_UPDATE_NEXT),
     "System did not offer the tampered fixture");
   await approve();
@@ -4515,8 +4512,8 @@ async function checkSystemUpdate(page, passkey) {
   assert(after.ok && after.body?.appearance?.theme === "light", "Undo lost the account preference", after);
   const undone = { theme: after.body.appearance.theme, revision: after.body.appearance.revision, same_account: true };
   record("undone", undone);
-  return { up_to_date: upToDateCurrent, frozen_offer: frozenOffer, frozen_refused: frozenRefused, updated, tampered,
-    refused, next_offer: nextOffer, next_updated: nextUpdated, undone, same_account: true };
+  return { up_to_date: upToDateCurrent, updated, tampered, refused, next_offer: nextOffer, next_updated: nextUpdated,
+    undone, same_account: true };
 }
 
 async function readRecoveryExportDownload(download, expected) {

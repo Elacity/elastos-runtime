@@ -4,9 +4,38 @@ This document describes the intended system architecture. [GitHub issues](https:
 own current status and proof; [COMMAND_MATRIX.md](COMMAND_MATRIX.md) defines
 command expectations and [SECURITY.md](../SECURITY.md) records security findings.
 
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The seed operator can read hosted data, wallet keys and recovery material.
+Passkeys control sign-in; stored data and keys remain accessible to the Runtime
+account and root while Home is locked. Protection against hosted operators and
+root, and against other software or OS users while a self-hosted Home is locked,
+is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+An unlocked self-hosted Home trusts its owner and their host software. Recovery
+from a stolen device or profile key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
+
 ## Architectural direction
 
-ElastOS keeps the trusted Runtime small. Ordinary executable capsules run
+The target keeps the trusted Runtime small. Ordinary executable capsules run
 without ambient authority and request scoped effects through Runtime-owned
 capability checks. Providers implement service and protocol behavior outside
 the trusted core. Content hashes establish integrity, not publisher identity,
@@ -117,7 +146,7 @@ Home front door and active shell projection
     |
 Runtime launch and orchestration authority
     |
-isolated executable capsule instance
+executable capsule instance (boundary depends on substrate)
     |
     +-- Component ----------------> ElastOS Bus ------------+
     |                                                      |
@@ -139,7 +168,8 @@ isolated executable capsule instance
                                            local host adapter or Runtime-selected Carrier route
 ```
 
-Ordinary executable capsules run in isolated environments. Their manifests
+The target isolates ordinary executable capsules from host authority. Their
+manifests
 declare an execution or data contract but grant no authority. Exact fields and
 accepted combinations belong in [CAPSULE_AUTHORING.md](CAPSULE_AUTHORING.md).
 The Capsule Runtime contract binds an artifact, session, capabilities,
@@ -198,16 +228,16 @@ behind the same Runtime and Browser contracts. See [WINDOWS.md](WINDOWS.md).
 
 ### Layer 1: Runtime (`elastos` binary)
 
-The Runtime core is the host-side enforcement authority. It owns isolation,
-signature verification, capability enforcement, trusted object routing, and
-the lifecycle needed to maintain those guarantees. Work that does not need
+The Runtime core is the host-side enforcement authority. It owns capsule
+admission, signature verification, capability enforcement, trusted object routing,
+and the configured execution boundaries and lifecycle. Work that does not need
 that authority belongs in a capsule, provider, or explicit operator service.
 The Capsule Runtime is the per-capsule execution surface, not the host Runtime
 core.
 
 ### Layer 2: Home host and shell projections
 
-Home owns the user-facing sign-in boundary and presents Runtime facts through
+Runtime owns sign-in authority. Home presents sign-in and Runtime facts through
 shell projections. A shell role is descriptive; it grants no authority.
 Runtime admits installed identities and checks each requested effect. See
 [HOME_SHELL_HOST_CONTRACT.md](HOME_SHELL_HOST_CONTRACT.md) for the current
@@ -359,7 +389,7 @@ policy and validate every requested effect.
 |-------|------------|
 | Content hash | Integrity of the referenced bytes |
 | Signature | Control of a signing key; publisher policy identifies the trusted signer |
-| Sandbox | Isolation between executions |
+| Browser sandbox | Opaque app frames; Home still has cross-app capability authority |
 | Capabilities | Authority for a checked resource operation |
 | Encryption | Confidentiality only for content covered by the relevant key contract |
 
@@ -367,7 +397,7 @@ policy and validate every requested effect.
 
 1. Runtime loads its local identity and installed-component metadata. Each
    authority subsystem loads only the state its contract marks durable.
-2. The trusted Runtime core initializes isolation, verification, capability
+2. The trusted Runtime core initializes execution boundaries, verification, capability
    enforcement, object routing, and the provider registry.
 3. Runtime serves the neutral Home front door. Principal and child-app
    authority remain unavailable until their required proofs and scoped grants

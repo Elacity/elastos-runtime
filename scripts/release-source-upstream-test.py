@@ -111,7 +111,8 @@ class SourceUpstreamTests(unittest.TestCase):
         package = self.cache / 'capsules' / receipt['release_path']
         self.assertEqual(receipt['checksum'], 'sha256:' + hashlib.sha256(package.read_bytes()).hexdigest())
         self.assertEqual(receipt['capsule_metadata']['checksum'], receipt['checksum'])
-        self.assertEqual((capsule / '.elastos-artifact-sha256').read_text(), receipt['checksum'] + '\n')
+        self.assertEqual((capsule / '.elastos-artifact-sha256').read_text(),
+                         receipt['checksum'].removeprefix('sha256:') + '\n')
         for source in (self.recipes[0]['source'], self.recipes[0]['license']['files'][0]['source']):
             Path(source['path']).unlink()
         self.assert_ok(self.seed(verify=True))
@@ -167,8 +168,14 @@ class SourceUpstreamTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((bundle / '.elastos-engine.json').stat().st_mode), 0o400)
         self.assertEqual((self.data / 'bin/llama-server').resolve(), bundle / 'llama-server')
         self.assertTrue((self.data / 'capsules/llama-server/LICENSE').is_file())
-        self.assertEqual((self.data / 'capsules/llama-server/.elastos-artifact-sha256').read_text(),
-                         receipt['archive_sha256'] + '\n')
+        marker = self.data / 'capsules/llama-server/.elastos-artifact-sha256'
+        self.assertEqual(marker.read_text(), receipt['archive_sha256'].removeprefix('sha256:') + '\n')
+        # A Home set up by an earlier release keeps its prefixed receipt.
+        marker.parent.chmod(0o700)
+        marker.chmod(0o600)
+        marker.write_text(receipt['archive_sha256'] + '\n')
+        marker.chmod(0o400)
+        marker.parent.chmod(0o500)
         self.assert_ok(self.source_function('install_local_model_engine', {'SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER': '1'}))
         self.assertEqual(len(list(self.cache.glob('sha*'))), 2)
 
@@ -263,20 +270,17 @@ class SourceUpstreamTests(unittest.TestCase):
         artifacts = self.root / 'publisher/artifacts'
         artifacts.mkdir(parents=True, mode=0o700)
         manifest = {'external': {'kubo': {'platforms': {PLATFORM: {'strategy': 'source-build'}}}}}
-        cid = 'bafk' + 'a' * 32
         context = {'pathlib': __import__('pathlib'), 'os': os, 'json': json, 'shutil': shutil,
                    'subprocess': subprocess, 'data_dir': self.data, 'artifacts_dir': artifacts,
                    'upstream': upstream, 'manifest': manifest, 'platform': PLATFORM,
                    'platform_info': lambda name: manifest['external'][name]['platforms'][PLATFORM]}
-        with mock.patch.dict(os.environ, {'KUBO_CACHE_DIR': str(self.cache)}), \
-                mock.patch.object(subprocess, 'run') as initialize, \
-                mock.patch.object(subprocess, 'check_output', return_value=cid + '\n') as publish:
+        with mock.patch.dict(os.environ, {'KUBO_CACHE_DIR': str(self.cache)}):
             exec(compile(staging, 'local-carrier-kubo-fixture', 'exec'), context)
-            self.assertEqual(initialize.call_args.kwargs['env']['IPFS_PATH'], str(self.data / 'ipfs-repo'))
-            self.assertEqual(publish.call_args.args[0][-1], str(artifacts / 'kubo-linux-amd64.tar.gz'))
         info = manifest['external']['kubo']['platforms'][PLATFORM]
         metadata = manifest['external']['kubo']['capsule_metadata']['platforms'][PLATFORM]
-        self.assertEqual((info['cid'], metadata['cid']), (cid, cid))
+        # The local source serves by name only, so its descriptors carry no CID (#287).
+        self.assertNotIn('cid', info)
+        self.assertNotIn('cid', metadata)
         self.assertEqual(info['checksum'], metadata['checksum'])
         self.assertNotIn('strategy', info)
         self.assertEqual(info['checksum'], 'sha256:' + hashlib.sha256((artifacts / info['release_path']).read_bytes()).hexdigest())

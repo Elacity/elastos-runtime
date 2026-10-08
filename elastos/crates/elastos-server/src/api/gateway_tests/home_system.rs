@@ -6400,6 +6400,7 @@ async fn test_home_launch_validates_shell_targets() {
     let projection_manifest_path = dir.path().join("capsules/projection-app/capsule.json");
     let mut projection_manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&projection_manifest_path).unwrap()).unwrap();
+    projection_manifest["type"] = serde_json::json!("web-projection");
     projection_manifest["runtime_abi"] = serde_json::json!("elastos.runtime-projection/v1");
     projection_manifest["bus_contract"] = serde_json::json!("elastos.runtime-projection/v1");
     projection_manifest["execution"] = serde_json::json!("web-projection");
@@ -6718,6 +6719,7 @@ async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
             let path = dir.path().join("capsules").join(name).join("capsule.json");
             let mut manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["type"] = json!("web-projection");
             manifest["runtime_abi"] = json!("elastos.runtime-projection/v1");
             manifest["bus_contract"] = json!("elastos.runtime-projection/v1");
             manifest["execution"] = json!("web-projection");

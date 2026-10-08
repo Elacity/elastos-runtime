@@ -2791,8 +2791,7 @@ fn gather_components(data_dir: &Path) -> Vec<ComponentStatus> {
             let installed = installed_path.is_file();
             let (available, source) = match resolved_path.as_ref() {
                 Some(path) if path == &installed_path => {
-                    if crate::setup::verify_installed_component_binary(data_dir, name, path).is_ok()
-                    {
+                    if crate::setup::verify_installed_component(data_dir, name, path).is_ok() {
                         (true, "installed")
                     } else {
                         (false, "stale")

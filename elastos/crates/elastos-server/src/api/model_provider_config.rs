@@ -388,7 +388,10 @@ pub fn model_provider_bridge_config(
 pub async fn model_provider_config(
     data_dir: &Path,
     registry: &provider::ProviderRegistry,
-) -> anyhow::Result<(provider::BridgeProviderConfig, Option<fs::File>)> {
+) -> anyhow::Result<(
+    provider::BridgeProviderConfig,
+    Option<crate::host_lock::FileLock>,
+)> {
     let config = model_provider_bridge_config(data_dir)?;
     #[cfg(unix)]
     {
