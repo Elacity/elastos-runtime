@@ -2002,8 +2002,13 @@ fn validate_safe_media_source_parent_chain(path: &Path, name: &str) -> anyhow::R
             )));
         }
         if metadata.permissions().mode() & 0o022 != 0 {
+            let sudo = if metadata.uid() == 0 && uid != 0 {
+                "sudo "
+            } else {
+                ""
+            };
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: chmod go-w {quoted}",
+                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
                 parent.display()
             )));
         }

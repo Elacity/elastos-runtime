@@ -160,6 +160,8 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────
 
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
+# For messages holding %q-quoted paths: print them byte for byte.
+die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
 
 # Colour, the banner and the step layout are for a person at a terminal.
 # Pipes, CI, NO_COLOR and dumb terminals get plain [OK] and [WARN] lines.
@@ -1036,27 +1038,40 @@ fi
 require_safe_existing_dir() {
     local dir="$1" real
     [[ -e "$dir" || -L "$dir" ]] || return 0
-    [[ -d "$dir" ]] || die "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
-    real="$(cd -P -- "$dir" && pwd -P)" || die "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+    [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
+    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
     if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
-        die "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+        die_exact "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
     fi
 }
 # The runtime also refuses media tools under a parent others can write, such
 # as a group-writable ~/.local. Apply that rule to every existing ancestor of
 # the data directory now, before any download: owned by you or root, and not
 # group- or world-writable.
+dir_owner_mode() {
+    # GNU stat -f reports the filesystem, so pick the syntax by what works.
+    if stat -c '%u %a' / >/dev/null 2>&1; then
+        stat -c '%u %a' -- "$1"
+    else
+        stat -f '%u %Lp' -- "$1"
+    fi
+}
 require_safe_parent_chain() {
-    local dir="$1" real
+    local dir="$1" real owner mode quoted
     while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
-    real="$(cd -P -- "$dir" && pwd -P)" || die "Cannot resolve directory: $(printf '%q' "$dir")"
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
     while :; do
-        if [[ ! -O "$real" && "$(stat -f %u "$real" 2>/dev/null || stat -c %u "$real")" != 0 ]]; then
-            die "Unsafe parent directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+        read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+        quoted="$(printf '%q' "$real")"
+        if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
+            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
         fi
-        if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
-            die "Unsafe parent directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+        if (( 8#$mode & 8#022 )); then
+            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
+                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
+            fi
+            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
         fi
         [[ "$real" != "/" ]] || break
         real="$(dirname -- "$real")"
