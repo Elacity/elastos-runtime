@@ -6,12 +6,42 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.11]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a local AI model, SmolLM2 135M (145 MB, Apache-2.0). Press
+  Get and Assistant can answer with it on this device; the AI engine downloads
+  the first time a model needs it. Answers from this small model are basic; larger
+  models follow.
+
+### Changed
+
+- Models download several times faster: after the first piece, a Home reads the
+  rest straight from the Homes that hold it.
+
 ### Developer detail
 
+- The first production model catalogue is signed offline with the maintainer key
+  (`release-signer.py --model-catalog`, policy field `model_catalog_sha256`) and
+  pinned in `components.json` (`model_catalog`, head
+  `bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`); the package
+  `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky` is built by
+  `ci-model-package.mjs produce` and pinned on the seed (#84).
+- CI proves Marketplace Get and an Assistant reply on Mac, Linux x86-64 and
+  ARM64; on x86-64 the package lives only on a separate holder Home, so Get
+  crosses Carrier (#150).
+- Model preparation tries the local store only until its first miss, then reads
+  remaining parts from Carrier holders with unchanged per-file SHA-256 and
+  package CID checks (145 MB: 332 s to 42 s locally).
+- CI retries apt with backoff and cancels a pull-request run at its first failed
+  job (#194).
 - `publish-release` no longer sends a release gossip announcement that no Home
   received. Seeds on an older Runtime still print the old announcement error after
-  the commit (#174). INSTALL.md describes how updates
-  reach a Home, and VERSIONING.md describes the seed's role.
+  the commit (#174). INSTALL.md describes how updates reach a Home, and
+  VERSIONING.md describes the seed's role.
 
 ## [0.8.0-alpha.10]
 
