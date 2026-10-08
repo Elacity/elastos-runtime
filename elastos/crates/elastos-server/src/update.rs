@@ -333,8 +333,10 @@ pub async fn fetch_cid_via_gateways(cid: &str, gateway_urls: &[String]) -> anyho
         anyhow::bail!("no gateway URLs configured for CID fetch");
     }
 
+    // Fail only when no bytes arrive for 30 s; a slow, steady link finishes.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let mut failures = Vec::new();

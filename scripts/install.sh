@@ -94,10 +94,11 @@ GATEWAYS=()
 CLI_GATEWAYS=()
 LAST_SUCCESS_GATEWAY=""
 ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
-BINARY_DOWNLOAD_MAX_TIME="${ELASTOS_BINARY_DOWNLOAD_MAX_TIME:-1800}"
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
+# A download fails only when it stays below this speed for this long; a
+# slow but steady link finishes however long the file takes.
 BINARY_DOWNLOAD_SPEED_LIMIT="${ELASTOS_BINARY_DOWNLOAD_SPEED_LIMIT:-1024}"
 BINARY_DOWNLOAD_SPEED_TIME="${ELASTOS_BINARY_DOWNLOAD_SPEED_TIME:-60}"
 
@@ -623,7 +624,10 @@ ipfs_fetch() {
     local url
     for gw in ${GATEWAYS[@]+"${GATEWAYS[@]}"}; do
         url="${gw}/ipfs/${cid}"
-        if curl -fsSL --max-time 30 -o "$output" "$url" 2>/dev/null; then
+        if curl -fsSL --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
+            --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
+            --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
+            -o "$output" "$url" 2>/dev/null; then
             LAST_SUCCESS_GATEWAY="$gw"
             return 0
         fi
@@ -1178,7 +1182,6 @@ if [[ -n "$PUBLISHER_GATEWAY" ]]; then
         --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
         --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
         --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
-        --max-time "${BINARY_DOWNLOAD_MAX_TIME}" \
         -o "${TMPDIR}/elastos" "${PG}/artifacts/elastos-${PLATFORM}" \
         || die "Failed to download binary from ${PG}/artifacts/elastos-${PLATFORM}"
 else

@@ -3692,8 +3692,10 @@ async fn download_component(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Fail only when no bytes arrive for 30 s; a slow, steady link finishes.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
     println!("  Resolving {} from {}...", name, elastos_url);
     let mut last_err = String::new();
