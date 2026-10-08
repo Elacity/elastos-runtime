@@ -1,13 +1,13 @@
 # Collaboration handoff
 
 This document defines the People and Chat boundary and its acceptance sequence.
-Current refs, source evidence and release scope live in [state.md](../state.md).
+Current refs, source evidence and release scope live in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 ## Evidence boundary
 
 Installed acceptance requires matching receipts for the reviewed candidate.
 HTTP 200 and source fixtures do not establish full product acceptance. Record
-each source or installed result in `state.md` or a dated audit record.
+each source or installed result in its GitHub issue.
 
 Use `git rev-parse HEAD HEAD^{tree}` and `git status --short --branch` for the
 exact reviewed commit, tree, and worktree status. Do not copy an old commit ID
@@ -109,7 +109,7 @@ cover:
 - narrow-window People and Chat checks;
 - final Profile-name and identity scans.
 
-Current source and platform CI checkpoints are recorded in [state.md](../state.md).
+Current source and platform CI checkpoints are recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Each final candidate requires its own checks and installed acceptance.
 
 The Carrier dependency-generation check verifies a coordinated transport
@@ -145,8 +145,7 @@ current candidate to implement them during acceptance.
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
-bash scripts/check-wci-alignment.sh
+node scripts/check-product-data.mjs
 cargo test --manifest-path capsules/chat-room-ui/Cargo.toml
 cargo clippy --manifest-path capsules/chat-room-ui/Cargo.toml --all-targets -- -D warnings
 (cd elastos && cargo fmt --all -- --check)

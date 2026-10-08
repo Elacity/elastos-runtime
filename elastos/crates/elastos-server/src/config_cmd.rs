@@ -33,6 +33,11 @@ pub fn run_config(cmd: crate::ConfigCommand) -> anyhow::Result<()> {
 }
 
 fn updated_config(contents: &str, key: &str, value: &str) -> anyhow::Result<String> {
+    if key == "developer_mode" {
+        value
+            .parse::<bool>()
+            .context("developer_mode requires true or false")?;
+    }
     if key == "gateway_public_publisher_bootstrap" {
         value
             .parse::<bool>()
@@ -92,6 +97,25 @@ fn render_config_show(path: &Path, contents: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn developer_mode_update_requires_a_boolean_and_preserves_settings() {
+        for enabled in [true, false] {
+            let updated = super::updated_config(
+                "dev_mode = true\ncarrier_bind_addr = '127.0.0.1:61967'\n",
+                "developer_mode",
+                &enabled.to_string(),
+            )
+            .unwrap();
+            let table: toml::Table = updated.parse().unwrap();
+            assert_eq!(table["developer_mode"].as_bool(), Some(enabled));
+            assert_eq!(table["dev_mode"].as_bool(), Some(true));
+            assert_eq!(table["carrier_bind_addr"].as_str(), Some("127.0.0.1:61967"));
+        }
+        for invalid in ["1", "yes", "True", ""] {
+            assert!(super::updated_config("", "developer_mode", invalid).is_err());
+        }
+    }
+
     #[test]
     fn gateway_hosts_are_explicit_authorities_and_preserve_other_settings() {
         let updated = super::updated_config(

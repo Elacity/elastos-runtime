@@ -174,12 +174,13 @@ requireText(
   /^rust-version = "1\.91"$/m,
   "the workspace MSRV must be Rust 1.91",
 );
+// ci.yml pins actions by commit; the comment names the toolchain branch it came from.
 const ci = requireText(
   ".github/workflows/ci.yml",
-  /dtolnay\/rust-toolchain@1\.91\.0/,
+  /dtolnay\/rust-toolchain@[0-9a-f]{40} # 1\.91\.0$/m,
   "CI must install Rust 1.91.0",
 );
-const ciToolchains = [...ci.matchAll(/dtolnay\/rust-toolchain@([^\s]+)/g)].map(
+const ciToolchains = [...ci.matchAll(/dtolnay\/rust-toolchain@(?:[0-9a-f]{40} # )?([^\s]+)/g)].map(
   (match) => match[1],
 );
 if (

@@ -30,9 +30,8 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use elastos_common::localhost::{
-    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
-    publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
-    publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
+    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_site_releases_dir,
+    rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
 use elastos_common::{CapsuleRole, CapsuleType};
 use elastos_identity::IdentityManager;
@@ -72,6 +71,8 @@ mod gateway_home_system_ai_provider;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_update.rs"]
+mod gateway_home_update;
 #[path = "gateway_home_wallet_connector.rs"]
 mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
@@ -156,6 +157,7 @@ pub(super) use gateway_home_token::{
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+use gateway_home_update::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -731,7 +733,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                     gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
         )
-        .route("/api/apps/system/summary", get(system_summary))
+        .route(
+            "/api/apps/system/summary",
+            get(system_summary)
+                .post(system_update_apply)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/apps/system/appearance/preferences",
             post(system_appearance_preferences_update),
@@ -1212,14 +1219,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/apps/:app/*path",
             get(super::browser_capsules::serve_browser_app_asset),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
+        .layer(Extension(ReleaseReadGate::new()))
         .layer(axum::middleware::from_fn(refuse_content_api_resources))
         .layer(axum::middleware::from_fn_with_state(
             admission_state,
             gateway_frontdoor::gateway_admission,
         ))
         .layer(Extension(frontdoor))
+        // Terminal policy also gates browser preflight before its early response.
+        .layer(axum::middleware::from_fn_with_state(
+            state.data_dir.clone(),
+            home_cli_terminal_access,
+        ))
 }
 
 // ---------------------------------------------------------------------------

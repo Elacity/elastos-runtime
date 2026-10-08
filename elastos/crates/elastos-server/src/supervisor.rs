@@ -16,7 +16,10 @@ use tokio::sync::RwLock;
 
 use crate::carrier_service::CarrierServiceProvider;
 use crate::ownership;
-use crate::setup::{CapsuleEntry, ComponentsManifest};
+use crate::setup::{
+    read_artifact_sha256_receipt, write_artifact_sha256_receipt, CapsuleEntry, ComponentsManifest,
+    CACHED_ARTIFACT_SHA_FILE,
+};
 use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
@@ -27,7 +30,6 @@ use elastos_runtime::session::{SessionRegistry, SessionType};
 /// Carrier-managed control network.
 const VM_PROVIDER_PORT: u16 = 7000;
 const CACHED_CID_FILE: &str = ".elastos-cid";
-const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
 
 fn vm_provider_bridge_enabled() -> bool {
@@ -248,6 +250,25 @@ impl Supervisor {
             .unwrap_or_else(|| data_dir.join(default_relative))
     }
 
+    /// Why this release cannot run microVM capsules on `platform`, if it cannot.
+    fn microvm_unavailable(registry: &ComponentsManifest, platform: &str) -> Option<String> {
+        ["crosvm", "vmlinux"]
+            .into_iter()
+            .find(|name| {
+                registry
+                    .external
+                    .get(*name)
+                    .and_then(|component| crate::setup::resolve_platform_info(component, platform))
+                    .is_none()
+            })
+            .map(|name| {
+                format!(
+                    "microVM capsules are not available on {platform} in this release \
+                     ({name} is not published for it)"
+                )
+            })
+    }
+
     fn verify_host_artifact(&self, component: &str, path: &Path) -> Result<()> {
         let checksum =
             crate::setup::verify_installed_component_binary(&self.data_dir, component, path)
@@ -319,20 +340,18 @@ impl Supervisor {
             }
 
             if !entry.sha256.is_empty() {
-                let cached_sha =
-                    std::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                        .with_context(|| {
-                            format!(
-                                "carrier service '{}' missing cached capsule sha metadata at {}",
-                                name,
-                                capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
-                            )
-                        })?;
-                if cached_sha.trim() != entry.sha256 {
+                let cached_sha = read_artifact_sha256_receipt(capsule_dir).with_context(|| {
+                    format!(
+                        "carrier service '{}' missing cached capsule sha metadata at {}",
+                        name,
+                        capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
+                    )
+                })?;
+                if cached_sha != entry.sha256 {
                     bail!(
                         "carrier service '{}' cached sha mismatch: have {}, expected {}",
                         name,
-                        cached_sha.trim(),
+                        cached_sha,
                         entry.sha256
                     );
                 }
@@ -838,11 +857,7 @@ impl Supervisor {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
-            let cached_sha = tokio::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                .await
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
+            let cached_sha = read_artifact_sha256_receipt(&capsule_dir).unwrap_or_default();
 
             if cached_cid == entry.cid && (entry.sha256.is_empty() || cached_sha == entry.sha256) {
                 return Ok(capsule_dir);
@@ -922,13 +937,7 @@ impl Supervisor {
         archive.unpack(dest)?;
 
         tokio::fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", cid)).await?;
-        if !expected_sha256.is_empty() {
-            tokio::fs::write(
-                dest.join(CACHED_ARTIFACT_SHA_FILE),
-                format!("{}\n", expected_sha256),
-            )
-            .await?;
-        }
+        write_artifact_sha256_receipt(dest, expected_sha256)?;
         let _ = ownership::repair_path_recursive(dest);
 
         println!("  Extracted to {} (via content provider)", dest.display());
@@ -975,6 +984,11 @@ impl Supervisor {
                 .await;
         }
 
+        // VM path — the release must publish crosvm and a guest kernel for this platform
+        let platform = crate::setup::detect_platform();
+        if let Some(reason) = Self::microvm_unavailable(&self.registry, &platform) {
+            bail!("{reason}. Cannot launch capsule '{name}'.");
+        }
         // VM path — hard require KVM
         if !elastos_crosvm::is_supported() {
             bail!("/dev/kvm not available — crosvm requires KVM. Cannot launch capsule '{name}'.");
@@ -1489,6 +1503,7 @@ impl Supervisor {
                 name,
                 platform_info,
                 &dest,
+                crate::setup::FirstPartyCarrierContext::Runtime,
             )
             .await?;
             return Ok(dest);
@@ -1694,6 +1709,99 @@ mod tests {
                 assert_eq!(platform, "linux-amd64");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_demand_chat_home_launch_uses_carrier_and_refuses_checksum_mismatch() {
+        let capsule = include_bytes!("../../../../capsules/chat-room/capsule.json");
+        let page = b"<!doctype html><title>Chat fixture</title>";
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("chat-room/capsule.json", capsule.as_slice()),
+            ("chat-room/browser/index.html", page.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, bytes).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+
+        for mismatch in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let (server, serving, mut info) =
+                crate::setup::tests::carrier_component_download_fixture(
+                    data,
+                    "chat-room.tar.gz",
+                    bytes.clone(),
+                )
+                .await;
+            info.extract_path = Some("chat-room".into());
+            info.install_path = Some("capsules/chat-room".into());
+            if mismatch {
+                info.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+            }
+            let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+                "external": {"chat-room": {
+                    "install_path": "capsules/chat-room", "platforms": {"*": info}
+                }},
+                "capsules": {"chat-room": {
+                    "cid": info.cid, "size": bytes.len(),
+                    "sha256": info.checksum.as_deref().unwrap().strip_prefix("sha256:").unwrap()
+                }},
+                "profiles": {"home": {"components": []}}
+            }))
+            .unwrap();
+            let registry_path = data.join("components.json");
+            let registry_bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(&registry_path, &registry_bytes).unwrap();
+            let supervisor = Supervisor::new(data.to_path_buf(), manifest);
+            let dest = data.join("capsules/chat-room");
+
+            let result =
+                crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room").await;
+            server.close().await;
+            serving.await.unwrap();
+
+            assert_eq!(std::fs::read(&registry_path).unwrap(), registry_bytes);
+            if mismatch {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Checksum mismatch for chat-room"), "{error}");
+                assert!(
+                    !dest.parent().unwrap().exists(),
+                    "refusal left a partial install"
+                );
+            } else {
+                assert_eq!(result.unwrap().status, "materialized");
+                assert_eq!(std::fs::read(dest.join("capsule.json")).unwrap(), capsule);
+                assert_eq!(
+                    std::fs::read(dest.join("browser/index.html")).unwrap(),
+                    page
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_CID_FILE))
+                        .unwrap()
+                        .trim(),
+                    info.cid.as_deref().unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_ARTIFACT_SHA_FILE))
+                        .unwrap()
+                        .trim(),
+                    hex::encode(sha2::Sha256::digest(&bytes))
+                );
+                // A second open uses the verified package even with Carrier stopped.
+                let ensure =
+                    crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
+                        .await
+                        .unwrap();
+                assert_eq!(ensure.status, "installed");
+                assert_eq!(supervisor.ensure_capsule("chat-room").await.unwrap(), dest);
+            }
         }
     }
 
@@ -2128,6 +2236,40 @@ mod tests {
     }
 
     #[test]
+    fn test_microvm_unavailable_when_release_publishes_no_vm_platform() {
+        let manifest = |crosvm: serde_json::Value| -> ComponentsManifest {
+            serde_json::from_value(serde_json::json!({
+                "external": {
+                    "crosvm": {"install_path": "bin/crosvm", "platforms": crosvm},
+                    "vmlinux": {"install_path": "bin/vmlinux", "platforms": {
+                        "linux-amd64": {"release_path": "vmlinux-linux-amd64"}
+                    }}
+                },
+                "profiles": {}
+            }))
+            .unwrap()
+        };
+        let reason =
+            Supervisor::microvm_unavailable(&manifest(serde_json::json!({})), "linux-amd64")
+                .unwrap();
+        assert_eq!(
+            reason,
+            "microVM capsules are not available on linux-amd64 in this release \
+             (crosvm is not published for it)"
+        );
+        let published = manifest(serde_json::json!({
+            "linux-amd64": {"release_path": "crosvm-linux-amd64"}
+        }));
+        assert_eq!(
+            Supervisor::microvm_unavailable(&published, "linux-amd64"),
+            None
+        );
+        assert!(Supervisor::microvm_unavailable(&published, "linux-arm64")
+            .unwrap()
+            .contains("not available on linux-arm64"));
+    }
+
+    #[test]
     fn test_verify_carrier_service_binary_accepts_matching_capsule_artifact_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
@@ -2146,7 +2288,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],
@@ -2191,7 +2333,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],

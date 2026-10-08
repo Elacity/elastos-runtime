@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::Router;
 use serde::{Deserialize, Serialize};
@@ -15,10 +15,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tower_http::services::ServeDir;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -274,7 +271,7 @@ fn status_json(
     .unwrap_or_else(|_| serde_json::json!({ "running": running }))
 }
 
-fn validate_site_root(site_root: &PathBuf) -> Result<(), String> {
+fn validate_site_root(site_root: &Path) -> Result<(), String> {
     if !site_root.exists() {
         return Err(format!("site root does not exist: {}", site_root.display()));
     }
@@ -343,4 +340,53 @@ fn main() {
 
     let _ = provider.stop();
     eprintln!("site-provider: exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "site-provider-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn site_root_needs_an_existing_directory_with_index_html() {
+        let missing = fresh_dir("missing").join("absent");
+        assert!(validate_site_root(&missing)
+            .unwrap_err()
+            .contains("does not exist"));
+
+        let root = fresh_dir("root");
+        assert!(validate_site_root(&root)
+            .unwrap_err()
+            .contains("missing index.html"));
+
+        std::fs::write(root.join("index.html"), b"<p>site</p>").unwrap();
+        assert_eq!(validate_site_root(&root), Ok(()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn local_url_never_advertises_an_unspecified_address() {
+        assert_eq!(
+            local_url("0.0.0.0:8123".parse().unwrap()),
+            "http://127.0.0.1:8123/"
+        );
+        assert_eq!(
+            local_url("[::]:8123".parse().unwrap()),
+            "http://127.0.0.1:8123/"
+        );
+        assert_eq!(
+            local_url("127.0.0.1:9000".parse().unwrap()),
+            "http://127.0.0.1:9000/"
+        );
+    }
 }

@@ -1,0 +1,321 @@
+{
+  "schema": "elastos.release-upstream-recipes/v1",
+  "recipes": [
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "linux-amd64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:86f9c07bca62d09839e53553df0f81bc306364b1467a459d52f3e4505cc948d196ed0c219c03c667cd681e057bb24bbfc0e0eebf4b83bc64a36a0e9923a60e05",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "linux-arm64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "kubo",
+      "platform": "darwin-arm64",
+      "version": "0.40.1",
+      "source": {
+        "checksum": "sha512:13b6d5dc04e661bfde6b8ba469bcf5b19d9d0062fe8ed50c7aadd8a078f500d0bceee4be7c9bfa476b48c4eb84c246ba083605ed1ed24d16b98e6cd0f09140bb",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "kubo",
+      "entrypoint": "ipfs",
+      "extract_path": "kubo/ipfs",
+      "install_path": "bin/kubo",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT AND (MIT OR Apache-2.0)",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/cmd/ipfs/dist/LICENSE",
+              "checksum": "sha256:56335a02b2804431431ae9a268db48d16d959f7ccf927a03e0c8862dcccc46ef",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-MIT",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-MIT",
+              "checksum": "sha256:8f71659370c5268d9a1dc962a46232540e8fca63462586d8efaa95aab492a208",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ipfs/kubo/v0.40.1/LICENSE-APACHE",
+              "checksum": "sha256:30fdfde4dbde73c66123aba24487366771ffc54bba09566b313338199c3eb7dc",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "linux-amd64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/linux-amd64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "linux-arm64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:a92e404708feae91cbede43322e445971450de8a204f4ff51502a7f42f5df8b8",
+        "max_bytes": 536870912,
+        "path": "@llama-arm64-bundle"
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/linux-arm64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "llama-server",
+      "platform": "darwin-arm64",
+      "version": "0.0.10516",
+      "source": {
+        "checksum": "sha256:ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+        "max_bytes": 536870912,
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "tar.gz",
+      "root": "llama-b10516",
+      "entrypoint": "llama-server",
+      "extract_path": "llama-b10516",
+      "install_path": "libexec/llama.cpp/b10516/darwin-arm64",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "MIT",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10516/LICENSE",
+              "checksum": "sha256:94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "binary_path": "llama-server"
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "cloudflared",
+      "platform": "linux-amd64",
+      "version": "2026.2.0",
+      "source": {
+        "checksum": "sha256:176746db3be7dc7bd48f3dd287c8930a4645ebb6e6700f883fddda5a4c307c16",
+        "max_bytes": 536870912,
+        "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "raw",
+      "root": "cloudflared",
+      "entrypoint": "cloudflared",
+      "extract_path": "cloudflared/cloudflared",
+      "install_path": "bin/cloudflared",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/cloudflare/cloudflared/2026.2.0/LICENSE",
+              "checksum": "sha256:58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "cloudflared",
+      "platform": "linux-arm64",
+      "version": "2026.2.0",
+      "source": {
+        "checksum": "sha256:03c5d58e283f521d752dc4436014eb341092edf076eb1095953ab82debe54a8e",
+        "max_bytes": 536870912,
+        "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-arm64",
+        "redirect_hosts": [
+          "release-assets.githubusercontent.com",
+          "objects.githubusercontent.com"
+        ]
+      },
+      "format": "raw",
+      "root": "cloudflared",
+      "entrypoint": "cloudflared",
+      "extract_path": "cloudflared/cloudflared",
+      "install_path": "bin/cloudflared",
+      "max_unpacked_bytes": 2147483648,
+      "license": {
+        "spdx_id": "Apache-2.0",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/cloudflare/cloudflared/2026.2.0/LICENSE",
+              "checksum": "sha256:58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

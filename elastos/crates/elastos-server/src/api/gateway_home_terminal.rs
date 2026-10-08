@@ -10,12 +10,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use rand::RngCore;
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex, Notify};
 
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 
 const HOME_CLI_CAPSULE_ID: &str = "home-cli";
 const HOME_TERMINAL_CONTRACT_SCHEMA: &str = "elastos.home-cli.terminal-contract/v1";
@@ -27,6 +29,7 @@ const HOME_TERMINAL_EVENT_SCHEMA: &str = "elastos.home-cli.terminal-event/v1";
 const HOME_TERMINAL_HOST_INTENT_SCHEMA: &str = "elastos.home.terminal-host-intent/v1";
 const HOME_TERMINAL_INTENT_SCHEMA: &str = "elastos.home-cli.terminal-intent/v1";
 const HOME_TERMINAL_EVENT_KEEPALIVE_SECS: u64 = 15;
+const HOME_TERMINAL_POLICY_CHECK_INTERVAL_SECS: u64 = 1;
 const HOME_TERMINAL_EVENT_DISCONNECT_GRACE_SECS: u64 = 3;
 const HOME_TERMINAL_PENDING_ATTACH_TIMEOUT_SECS: u64 = 20;
 const HOME_TERMINAL_EXIT_AUTH_GRACE_MS: u64 = 2_000;
@@ -54,6 +57,43 @@ static HOME_TERMINAL_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<HomeTerminalSe
     OnceLock::new();
 static HOME_TERMINAL_ARCHIVED_REPLAYS: OnceLock<StdMutex<HomeTerminalArchivedReplayStore>> =
     OnceLock::new();
+
+// Runtime owns this setting outside the app storage roots. The host CLI owns
+// changes to developer_mode; the gateway reads the value for each request.
+fn home_terminal_policy_allows(data_dir: &FsPath) -> bool {
+    let developer_mode = std::fs::read_to_string(data_dir.join("config.toml"))
+        .ok()
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .and_then(|config| config.get("developer_mode").and_then(toml::Value::as_bool))
+        .unwrap_or(false);
+    developer_mode
+        && !crate::auth::guest_registration_enabled(&home_launch_auth_data_dir(data_dir))
+            .unwrap_or(true)
+}
+
+pub(super) async fn home_cli_terminal_access(
+    State(data_dir): State<PathBuf>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request
+        .uri()
+        .path()
+        .starts_with("/api/apps/home-cli/terminal/")
+        && !home_terminal_policy_allows(&data_dir)
+    {
+        return home_terminal_policy_refusal();
+    }
+    next.run(request).await
+}
+
+fn home_terminal_policy_refusal() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "Web terminal requires host developer mode and closed guest registration.",
+    )
+        .into_response()
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct HomeTerminalStreamQuery {
@@ -167,6 +207,7 @@ struct HomeTerminalSession {
     child_pid: Option<u32>,
     created_at_ms: u64,
     input: Mutex<Option<HomeTerminalInput>>,
+    input_closed: watch::Sender<bool>,
     child: Mutex<Child>,
     events: broadcast::Sender<HomeTerminalBroadcastEvent>,
     replay: StdMutex<HomeTerminalReplayLog>,
@@ -178,7 +219,7 @@ struct HomeTerminalSession {
 
 enum HomeTerminalInput {
     #[cfg(unix)]
-    Pty(File),
+    Pty(AsyncFd<File>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +256,7 @@ struct HomeTerminalCleanupTarget {
 }
 
 enum HomeTerminalStartError {
+    PolicyRefused,
     Capacity(HomeTerminalCapacityError),
     Runtime(anyhow::Error),
 }
@@ -380,6 +422,10 @@ pub(super) async fn home_cli_terminal_start(
     headers: HeaderMap,
     start: Option<Json<HomeTerminalStartRequest>>,
 ) -> Response {
+    // Body extraction can wait while the host operator changes the policy.
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
@@ -392,8 +438,17 @@ pub(super) async fn home_cli_terminal_start(
         Ok(size) => size,
         Err(response) => return response,
     };
-    match start_home_terminal_session(context, size, Some(gateway_api_url.0.to_string())).await {
-        Ok(session) => Json(serde_json::json!({
+    match start_home_terminal_session(
+        context,
+        size,
+        Some(gateway_api_url.0.to_string()),
+        &state.data_dir,
+    )
+    .await
+    {
+        Ok(session) => {
+            spawn_home_terminal_policy_watchdog(session.session_id.clone(), state.data_dir);
+            Json(serde_json::json!({
             "schema": HOME_TERMINAL_SESSION_SCHEMA,
             "session_id": session.session_id,
             "transport": "runtime_pty_stream",
@@ -425,7 +480,9 @@ pub(super) async fn home_cli_terminal_start(
                 "principal_id": session.principal_id
             }
         }))
-        .into_response(),
+            .into_response()
+        }
+        Err(HomeTerminalStartError::PolicyRefused) => home_terminal_policy_refusal(),
         Err(HomeTerminalStartError::Capacity(err)) => home_terminal_capacity_response(err),
         Err(HomeTerminalStartError::Runtime(err)) => home_error_response(err),
     }
@@ -499,6 +556,7 @@ pub(super) async fn home_cli_terminal_events(
 }
 
 pub(super) async fn home_cli_terminal_input_socket(
+    State(state): State<GatewayState>,
     Path(session_id): Path<String>,
     Query(query): Query<HomeTerminalStreamQuery>,
     socket: WebSocketUpgrade,
@@ -515,7 +573,9 @@ pub(super) async fn home_cli_terminal_input_socket(
         .input_stream_generation
         .fetch_add(1, Ordering::AcqRel)
         + 1;
-    socket.on_upgrade(move |socket| home_terminal_input_socket(socket, session, generation))
+    socket.on_upgrade(move |socket| {
+        home_terminal_input_socket(socket, session, generation, state.data_dir)
+    })
 }
 
 pub(super) fn home_terminal_input_ticket_matches(presented: Option<&str>, expected: &str) -> bool {
@@ -526,8 +586,13 @@ async fn home_terminal_input_socket(
     mut socket: WebSocket,
     session: Arc<HomeTerminalSession>,
     generation: u64,
+    data_dir: PathBuf,
 ) {
     while let Some(Ok(message)) = socket.recv().await {
+        if !home_terminal_policy_allows(&data_dir) {
+            close_home_terminal_session(&session.session_id, "terminal access disabled").await;
+            break;
+        }
         if session.input_stream_generation.load(Ordering::Acquire) != generation {
             break;
         }
@@ -544,10 +609,15 @@ async fn home_terminal_input_socket(
             break;
         }
         let mut input = session.input.lock().await;
+        if !home_terminal_policy_allows(&data_dir) {
+            drop(input);
+            close_home_terminal_session(&session.session_id, "terminal access disabled").await;
+            break;
+        }
         let Some(input) = input.as_mut() else {
             break;
         };
-        if input.write_all(&data).await.is_err() {
+        if input.write_all(&data, &session.input_closed).await.is_err() {
             break;
         }
     }
@@ -559,6 +629,9 @@ pub(super) async fn home_cli_terminal_resize(
     headers: HeaderMap,
     Json(resize): Json<HomeTerminalResizeRequest>,
 ) -> Response {
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     if let Some(schema) = resize.schema.as_deref() {
         if schema != HOME_TERMINAL_RESIZE_SCHEMA {
             return (
@@ -606,6 +679,9 @@ pub(super) async fn home_cli_terminal_intent(
     headers: HeaderMap,
     Json(intent): Json<HomeTerminalHostIntentRequest>,
 ) -> Response {
+    if !home_terminal_policy_allows(&state.data_dir) {
+        return home_terminal_policy_refusal();
+    }
     cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
@@ -663,6 +739,7 @@ async fn start_home_terminal_session(
     _context: HomeLaunchTokenContext,
     _size: HomeTerminalSize,
     _gateway_api_url: Option<String>,
+    _data_dir: &FsPath,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     Err(HomeTerminalStartError::Runtime(anyhow::anyhow!(
         "Runtime PTY terminal is not supported on this platform"
@@ -674,6 +751,7 @@ async fn start_home_terminal_session(
     context: HomeLaunchTokenContext,
     size: HomeTerminalSize,
     gateway_api_url: Option<String>,
+    data_dir: &FsPath,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     let cleanup = prepare_home_terminal_start(&context, now_unix_ms())
         .await
@@ -715,6 +793,11 @@ async fn start_home_terminal_session(
         });
     }
 
+    // Session planning and cleanup can yield. Check again at the process gate,
+    // with no asynchronous operation between this check and spawn.
+    if !home_terminal_policy_allows(data_dir) {
+        return Err(HomeTerminalStartError::PolicyRefused);
+    }
     let child = command
         .spawn()
         .with_context(|| format!("failed to start terminal process {}", command_spec.label))?;
@@ -730,6 +813,7 @@ async fn start_home_terminal_session(
         child_pid,
         created_at_ms: now_unix_ms(),
         input: Mutex::new(Some(pty.input)),
+        input_closed: watch::channel(false).0,
         child: Mutex::new(child),
         events,
         replay: StdMutex::new(HomeTerminalReplayLog::default()),
@@ -759,7 +843,7 @@ async fn start_home_terminal_session(
 #[cfg(unix)]
 struct HomeTerminalPty {
     input: HomeTerminalInput,
-    reader: File,
+    reader: AsyncFd<File>,
     slave_stdin: File,
     slave_stdout: File,
     slave_stderr: File,
@@ -796,9 +880,33 @@ fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminal
 
     let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    // Runtime owns both original descriptors. Unrelated child processes must
+    // not retain a slave and prevent terminal cleanup from releasing a write.
+    for fd in [master_fd, slave_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            return Err(io::Error::last_os_error()).context("set PTY close-on-exec");
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error()).context("verify PTY close-on-exec");
+        }
+        if flags & libc::FD_CLOEXEC == 0 {
+            return Err(io::Error::other("PTY close-on-exec flag was not retained").into());
+        }
+    }
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error()).context("set PTY master nonblocking");
+    }
     Ok(HomeTerminalPty {
-        input: HomeTerminalInput::Pty(master.try_clone().context("clone PTY master for input")?),
-        reader: master,
+        input: HomeTerminalInput::Pty(AsyncFd::new(
+            master.try_clone().context("clone PTY master for input")?,
+        )?),
+        reader: AsyncFd::new(master)?,
         slave_stdin: slave.try_clone().context("clone PTY slave for stdin")?,
         slave_stdout: slave.try_clone().context("clone PTY slave for stdout")?,
         slave_stderr: slave,
@@ -806,15 +914,28 @@ fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminal
 }
 
 impl HomeTerminalInput {
-    async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+    async fn write_all(&mut self, mut data: &[u8], closed: &watch::Sender<bool>) -> io::Result<()> {
         match self {
             #[cfg(unix)]
             HomeTerminalInput::Pty(file) => {
-                let mut writer = file.try_clone()?;
-                let data = data.to_vec();
-                tokio::task::spawn_blocking(move || writer.write_all(&data))
-                    .await
-                    .map_err(io::Error::other)?
+                let mut closed = closed.subscribe();
+                while !data.is_empty() {
+                    let mut ready = tokio::select! {
+                        biased;
+                        _ = closed.wait_for(|closed| *closed) => {
+                            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal input closed"));
+                        }
+                        ready = file.writable() => ready?,
+                    };
+                    match ready.try_io(|file| file.get_ref().write(data)) {
+                        Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(Ok(written)) => data = &data[written..],
+                        Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Ok(Err(err)) => return Err(err),
+                        Err(_) => continue,
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -900,12 +1021,19 @@ fn home_terminal_command() -> anyhow::Result<HomeTerminalCommand> {
 }
 
 #[cfg(unix)]
-fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader: File) {
-    tokio::task::spawn_blocking(move || {
+fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, reader: AsyncFd<File>) {
+    tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
         let mut decoder = HomeTerminalUtf8Decoder::default();
         loop {
-            match reader.read(&mut buffer) {
+            let read = match reader.readable().await {
+                Ok(mut ready) => match ready.try_io(|reader| reader.get_ref().read(&mut buffer)) {
+                    Ok(read) => read,
+                    Err(_) => continue,
+                },
+                Err(err) => Err(err),
+            };
+            match read {
                 Ok(0) => {
                     if let Some(data) = decoder.flush_lossy() {
                         send_home_terminal_stdout(&session, data);
@@ -917,6 +1045,7 @@ fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader:
                         send_home_terminal_stdout(&session, data);
                     }
                 }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     emit_home_terminal_event(
                         &session,
@@ -1009,6 +1138,7 @@ fn send_home_terminal_stdout(session: &HomeTerminalSession, data: String) {
 fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
     tokio::spawn(async move {
         let status = session.child.lock().await.wait().await;
+        session.input_closed.send_replace(true);
         {
             let mut input_handle = session.input.lock().await;
             input_handle.take();
@@ -1032,6 +1162,24 @@ fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
         tokio::time::sleep(Duration::from_millis(HOME_TERMINAL_EXIT_AUTH_GRACE_MS)).await;
         if let Some(removed) = remove_home_terminal_session(&session.session_id).await {
             store_archived_home_terminal_replay(&removed, now_unix_ms());
+        }
+    });
+}
+
+fn spawn_home_terminal_policy_watchdog(session_id: String, data_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(
+                HOME_TERMINAL_POLICY_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            if home_terminal_session(&session_id).await.is_none() {
+                break;
+            }
+            if !home_terminal_policy_allows(&data_dir) {
+                close_home_terminal_session(&session_id, "terminal access disabled").await;
+                break;
+            }
         }
     });
 }
@@ -1317,6 +1465,11 @@ async fn home_terminal_session(session_id: &str) -> Option<Arc<HomeTerminalSessi
         .cloned()
 }
 
+#[cfg(test)]
+pub(super) async fn home_terminal_process_id(session_id: &str) -> Option<u32> {
+    home_terminal_session(session_id).await?.child_pid
+}
+
 async fn close_home_terminal_session(session_id: &str, message: &str) -> Option<()> {
     let session = remove_home_terminal_session(session_id).await?;
     close_home_terminal_session_handle(session, message).await;
@@ -1325,11 +1478,14 @@ async fn close_home_terminal_session(session_id: &str, message: &str) -> Option<
 
 async fn close_home_terminal_session_handle(session: Arc<HomeTerminalSession>, message: &str) {
     let session_id = session.session_id.clone();
+    // Runtime cancels pending input before waiting for its owner. Slave closure
+    // alone can leave a master write blocked on Linux.
+    session.input_closed.send_replace(true);
+    kill_home_terminal_process(session.child_pid);
     {
         let mut input_handle = session.input.lock().await;
         input_handle.take();
     }
-    kill_home_terminal_process(session.child_pid);
     emit_home_terminal_event(
         &session,
         HomeTerminalEvent {
@@ -1766,6 +1922,260 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_pty_descriptors_are_close_on_exec() {
+        let pty = open_home_terminal_pty(HomeTerminalSize {
+            cols: 100,
+            rows: 32,
+        })
+        .unwrap();
+        let HomeTerminalInput::Pty(input) = &pty.input;
+        for fd in [
+            pty.reader.as_raw_fd(),
+            input.as_raw_fd(),
+            pty.slave_stdin.as_raw_fd(),
+            pty.slave_stdout.as_raw_fd(),
+            pty.slave_stderr.as_raw_fd(),
+        ] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_fixture_cleanup_kills_child_on_panic() {
+        let pty = test_raw_terminal_pty();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut cleanup = TestBlockedPtyCleanup {
+            child_pid: child.id(),
+            writer: None,
+        };
+        let closed = watch::channel(false).0;
+        let mut writer = tokio::spawn(async move {
+            let mut input = pty.input;
+            input
+                .write_all(&vec![b'x'; HOME_TERMINAL_INPUT_MAX_BYTES * 32], &closed)
+                .await
+        });
+        cleanup.writer = Some(writer.abort_handle());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut writer)
+                .await
+                .is_err()
+        );
+        let panic = std::panic::catch_unwind(|| {
+            let _cleanup = cleanup;
+            panic!("exercise terminal fixture assertion cleanup");
+        });
+        assert!(panic.is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("panic cleanup must release the blocked fixture writer")
+            .unwrap_err()
+            .is_cancelled());
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("panic cleanup must terminate and reap the fixture child")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    fn test_raw_terminal_pty() -> HomeTerminalPty {
+        let pty = open_home_terminal_pty(HomeTerminalSize {
+            cols: 100,
+            rows: 32,
+        })
+        .unwrap();
+        unsafe {
+            let mut termios = std::mem::zeroed();
+            assert_eq!(
+                libc::tcgetattr(pty.slave_stdin.as_raw_fd(), &mut termios),
+                0
+            );
+            libc::cfmakeraw(&mut termios);
+            assert_eq!(
+                libc::tcsetattr(pty.slave_stdin.as_raw_fd(), libc::TCSANOW, &termios),
+                0
+            );
+        }
+        pty
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_policy_revocation_releases_blocked_pty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+        let pty = test_raw_terminal_pty();
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::from(pty.slave_stdin))
+            .stdout(Stdio::from(pty.slave_stdout))
+            .stderr(Stdio::from(pty.slave_stderr))
+            .kill_on_drop(true);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(command);
+        let session = test_terminal_session(child, Some(pty.input));
+        let mut cleanup = TestBlockedPtyCleanup {
+            child_pid: session.child_pid,
+            writer: None,
+        };
+        insert_home_terminal_session(session.clone()).await;
+        let writing_session = session.clone();
+        let completed_writes = Arc::new(AtomicU64::new(0));
+        let progress = completed_writes.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut input = writing_session.input.lock().await;
+            let input = input.as_mut().unwrap();
+            locked_tx.send(()).unwrap();
+            // A finite flood reaches backpressure without relying on an I/O
+            // error to stop generating new writes after the slave closes.
+            for _ in 0..32 {
+                if input
+                    .write_all(
+                        &[b'x'; HOME_TERMINAL_INPUT_MAX_BYTES],
+                        &writing_session.input_closed,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                progress.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        cleanup.writer = Some(writer.abort_handle());
+        tokio::time::timeout(Duration::from_secs(2), locked_rx)
+            .await
+            .expect("writer must acquire the input lock")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let before = completed_writes.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if completed_writes.load(Ordering::SeqCst) == before {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("raw PTY input must reach backpressure");
+        assert!(session.input.try_lock().is_err());
+        assert!(!writer.is_finished());
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+        spawn_home_terminal_policy_watchdog(session.session_id.clone(), dir.path().to_path_buf());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // Release the child lock on each poll so cleanup can use it.
+                if session.child.lock().await.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy revocation must terminate the child despite a blocked write");
+        cleanup.child_pid = None;
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("policy revocation must cancel the blocked PTY writer")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.input.lock().await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy revocation must close input after the blocked writer releases it");
+        test_cleanup_terminal_artifacts(&session.session_id).await;
+        drop(pty.reader);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_home_cli_terminal_nonblocking_reader_waits_for_output_and_drains() {
+        let mut pty = test_raw_terminal_pty();
+        let child = Command::new("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let session = test_terminal_session(child, Some(pty.input));
+        session.pty_reader_drained.store(false, Ordering::SeqCst);
+        let mut events = session.events.subscribe();
+        spawn_home_terminal_pty_reader(session.clone(), pty.reader);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(!session.pty_reader_drained.load(Ordering::SeqCst));
+        pty.slave_stdout.write_all(b"terminal output").unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("reader must resume when output arrives")
+            .unwrap();
+        assert_eq!(event.payload.stream, "stdout");
+        assert_eq!(event.payload.data.as_deref(), Some("terminal output"));
+        drop(pty.slave_stdin);
+        drop(pty.slave_stdout);
+        drop(pty.slave_stderr);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.pty_reader_drained.load(Ordering::SeqCst) {
+                session.pty_reader_drained_notify.notified().await;
+            }
+        })
+        .await
+        .expect("reader must drain when the slave closes");
+        session.child.lock().await.wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    struct TestBlockedPtyCleanup {
+        child_pid: Option<u32>,
+        writer: Option<tokio::task::AbortHandle>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestBlockedPtyCleanup {
+        fn drop(&mut self) {
+            // This runs during assertion unwinding, before Tokio shuts down.
+            // Input uses cancellable async I/O, so abort releases its descriptor.
+            // The guard also terminates the fixture's owned child on failure.
+            kill_home_terminal_process(self.child_pid);
+            if let Some(writer) = &self.writer {
+                writer.abort();
+            }
+        }
+    }
 
     #[test]
     fn terminal_utf8_decoder_keeps_split_multibyte_text_intact() {
@@ -2406,9 +2816,16 @@ mod tests {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
+        Ok(test_terminal_session(child, None))
+    }
+
+    fn test_terminal_session(
+        child: Child,
+        input: Option<HomeTerminalInput>,
+    ) -> Arc<HomeTerminalSession> {
         let child_pid = child.id();
         let (events, _receiver) = broadcast::channel(32);
-        Ok(Arc::new(HomeTerminalSession {
+        Arc::new(HomeTerminalSession {
             session_id: format!("term-test-{}", random_hex_token()),
             stream_ticket: format!("ticket-test-{}", random_hex_token()),
             input_ticket: format!("input-test-{}", random_hex_token()),
@@ -2417,7 +2834,8 @@ mod tests {
             grant_id: "grant-test".to_string(),
             child_pid,
             created_at_ms: now_unix_ms(),
-            input: Mutex::new(None),
+            input: Mutex::new(input),
+            input_closed: watch::channel(false).0,
             child: Mutex::new(child),
             events,
             replay: StdMutex::new(HomeTerminalReplayLog::default()),
@@ -2425,6 +2843,6 @@ mod tests {
             input_stream_generation: AtomicU64::new(0),
             pty_reader_drained: AtomicBool::new(true),
             pty_reader_drained_notify: Notify::new(),
-        }))
+        })
     }
 }

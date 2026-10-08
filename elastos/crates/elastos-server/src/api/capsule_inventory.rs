@@ -13,7 +13,7 @@ pub(in crate::api) mod preparation;
 const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
-const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 8;
 
 pub(crate) struct VerifiedModelCatalogEntry {
@@ -115,7 +115,7 @@ pub(crate) fn model_catalog_entries(
     verify_model_catalog(&trust, &bytes, now).map(Some)
 }
 
-fn verify_model_catalog(
+pub(crate) fn verify_model_catalog(
     trust: &crate::setup::ModelCatalogConfig,
     bytes: &[u8],
     now: u64,
@@ -535,6 +535,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn model_catalog_refuses_unknown_publisher_and_invalid_signatures() {
+        let (trust, bytes) = sign_model_catalog(&model_catalog_fixture());
+        assert_eq!(verify_model_catalog(&trust, &bytes, 2).unwrap().len(), 1);
+
+        let fixture_key = elastos_runtime::signature::SigningKey::from_bytes(&[8; 32]);
+        let (_, other_publisher) =
+            crate::crypto::domain_separated_sign(&fixture_key, MODEL_CATALOG_DOMAIN, b"fixture");
+        crate::crypto::decode_did_key(&other_publisher).unwrap();
+        let mut unknown_trust = trust.clone();
+        unknown_trust.publisher_dids = vec![other_publisher];
+        assert!(verify_model_catalog(&unknown_trust, &bytes, 2).is_err());
+
+        for signature in [String::new(), "g".repeat(128), "00".repeat(64)] {
+            let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+            envelope["signature"] = signature.into();
+            let altered = serde_json::to_vec(&envelope).unwrap();
+            let mut repinned = trust.clone();
+            repinned.head_cid = head_cid(&altered);
+            assert!(
+                verify_model_catalog(&repinned, &altered, 2).is_err(),
+                "a matching content pin cannot turn an invalid signature into publisher proof"
+            );
+        }
+    }
+
+    #[test]
     fn model_catalog_rejects_invalid_or_incomplete_closures() {
         for (pointer, value) in [
             ("/schema", serde_json::json!("unknown")),
@@ -833,37 +859,5 @@ pub(crate) mod tests {
             active_capsule_names(data_dir.path()).unwrap(),
             BTreeSet::from(["object-provider".to_string()])
         );
-    }
-
-    #[test]
-    fn checkout_permanent_catalog_matches_components_pin() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let components: crate::setup::ComponentsManifest =
-            serde_json::from_slice(&std::fs::read(root.join("components.json")).unwrap()).unwrap();
-        let trust = components
-            .model_catalog
-            .expect("matching install pins a signed model catalog");
-        let bytes = std::fs::read(root.join(MODEL_CATALOG_FILE)).unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let entries = verify_model_catalog(&trust, &bytes, now).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[0].cid,
-            "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi"
-        );
-        assert_eq!(entries[0].manifest.name, "qwen3-5-9b-q4-k-m-local");
-        assert_eq!(
-            entries[1].cid,
-            "bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y"
-        );
-        assert_eq!(entries[1].manifest.name, "smollm2-135m-instruct-q8-0-local");
-        assert_eq!(
-            entries[0].publisher_did,
-            "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
-        );
-        assert_eq!(entries[1].publisher_did, entries[0].publisher_did);
     }
 }

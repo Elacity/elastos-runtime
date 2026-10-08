@@ -3,12 +3,11 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFileSync, statfsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { MODEL_TEXT_INPUT_SCHEMA } from "../capsules/assistant/browser/model-contract.js";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
-const [base, evidence, data] = process.argv.slice(2);
-const { cid } = JSON.parse(readFileSync(join(evidence, "package.json")));
+const [base, evidence, data, mode] = process.argv.slice(2);
+assert(!mode || mode === "--home-only", "supported installed journey mode required");
+const cid = mode ? null : JSON.parse(readFileSync(join(evidence, "package.json"))).cid;
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 const page = await context.newPage();
@@ -38,13 +37,11 @@ async function app(target) {
   await frame.waitForURL(url => url.pathname.startsWith(`/apps/${target}/`));
   return frame;
 }
-async function request(frame, path, body) {
-  return frame.evaluate(async ({ path, body }) => {
+async function projection(frame, path) {
+  return frame.evaluate(async path => {
     const token = new URLSearchParams(location.hash.slice(1)).get("home_token");
     if (!token) throw new Error("missing capsule launch authority");
-    const response = await fetch(path, { method: body ? "POST" : "GET",
-      headers: { "x-elastos-home-token": token, ...(body ? { "content-type": "application/json" } : {}) },
-      ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(35000) });
+    const response = await fetch(path, { headers: { "x-elastos-home-token": token }, signal: AbortSignal.timeout(35000) });
     if (!response.ok) {
       const failure = await response.json().catch(() => ({}));
       // Retain the public protocol code; response text can contain operator data.
@@ -52,7 +49,7 @@ async function request(frame, path, body) {
       throw new Error(`Runtime request failed: ${path} ${response.status} code=${code}`);
     }
     return response.json();
-  }, { path, body });
+  }, path);
 }
 try {
   assert((await page.goto(`${base}/home/`, { waitUntil: "domcontentloaded" })).ok(), "installed Home frontdoor responds successfully");
@@ -75,50 +72,109 @@ try {
   await page.screenshot({ path: join(evidence, "home-phone.png"), fullPage: true });
   results.home_screenshots = "passed";
   await page.setViewportSize({ width: 1440, height: 900 });
-  stage = "model_package_admission";
-  const marketplace = await app("marketplace");
-  const interfaces = await request(marketplace, "/api/capsules/interfaces");
-  const content = interfaces.interfaces.find(row => row.capsule === "marketplace" && row.bindings.some(b => b.method === "content.use" && b.executable));
-  assert(content, "Marketplace declares Content Use");
-  disk.before_content_use = observeDisk();
-  const used = await request(marketplace, "/api/capsules/interfaces/invoke", {
-    capsule: "marketplace", interface: content.interface.id, method: "content.use",
-    request_id: `ci-use-${randomUUID()}`, input: { cid },
-  });
-  assert.equal(used.status, "ok");
-  let offer;
-  const admissionDeadline = Date.now() + 180000;
-  while (Date.now() < admissionDeadline) {
-    const catalog = await request(marketplace, "/api/capsules/catalog");
-    const row = catalog.capsules.find(row => row.cid === cid);
-    if (row?.model_runtime?.dispatch_ready) { offer = row.model_runtime.offer_id; break; }
-    assert(!["failed", "cancelled"].includes(row?.model_runtime?.preparation?.state), "model preparation settles successfully");
-    await new Promise(resolve => setTimeout(resolve, 500));
+  if (mode === "--home-only") {
+    const marketplace = await app("marketplace");
+    const catalog = await projection(marketplace, "/api/capsules/catalog");
+    assert.equal(catalog.model_catalog_state, "unconfigured", "fresh ordinary Home needs no model catalogue");
+    results.engine_absent_home = "passed";
+    writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, journey: "fresh Home with optional model engine absent" }, null, 2));
+  } else {
+    stage = "model_package_admission";
+    const marketplace = await app("marketplace");
+    const initialCatalog = await projection(marketplace, "/api/capsules/catalog");
+    assert.equal(initialCatalog.model_catalog_state, "verified");
+    const initialModel = initialCatalog.capsules.find(row => row.cid === cid);
+    assert.equal(initialModel?.signature_state, "catalog-signature-verified");
+    assert.equal(initialModel?.model_runtime?.dispatch_ready, false, "fresh Home starts before model admission");
+    await marketplace.locator(`[data-action="model-detail"][data-app="model:${cid}"]`).click();
+    const get = marketplace.locator('[data-model-control="use"]');
+    await get.waitFor({ state: "visible", timeout: 30000 });
+    assert.equal((await get.textContent()).trim(), "Get");
+    disk.before_content_use = observeDisk();
+    const useResponse = page.waitForResponse(response => {
+      if (!response.url().endsWith("/api/capsules/interfaces/invoke") || response.request().frame() !== marketplace) return false;
+      const body = response.request().postDataJSON();
+      return body?.capsule === "marketplace" && body?.method === "content.use" && body?.input?.cid === cid;
+    }, { timeout: 60000 });
+    useResponse.catch(() => {});
+    await get.click();
+    const usedResponse = await useResponse;
+    assert(usedResponse.ok(), "Marketplace Get invokes Content Use successfully");
+    assert.equal((await usedResponse.json()).status, "ok");
+    const openAssistant = marketplace.locator('[data-model-control="open-assistant"]');
+    await openAssistant.waitFor({ state: "visible", timeout: 180000 });
+    const catalog = await projection(marketplace, "/api/capsules/catalog");
+    const readyModel = catalog.capsules.find(row => row.cid === cid);
+    assert.equal(readyModel?.model_runtime?.dispatch_ready, true);
+    const offer = readyModel.model_runtime.offer_id;
+    assert(/^model:[0-9a-f]{64}$/.test(offer));
+    results.model_package_admission = "passed";
+    await page.screenshot({ path: join(evidence, "model-ready.png"), fullPage: true });
+    stage = "installed_runtime_reply";
+    await openAssistant.click();
+    const assistantElement = page.frameLocator("#active-shell-frame").locator("#assistant-space-frame");
+    await assistantElement.waitFor({ state: "visible", timeout: 30000 });
+    const assistant = await (await assistantElement.elementHandle()).contentFrame();
+    await assistant.waitForURL(url => url.pathname.startsWith("/apps/assistant/"));
+    await assistant.locator("#agent-model-picker").click();
+    const selection = assistant.locator(`#agent-model-menu [role="option"][data-model-cid="${cid}"]`);
+    await selection.waitFor({ state: "visible", timeout: 30000 });
+    assert.equal(await selection.getAttribute("data-live-offer-id"), offer);
+    await selection.click();
+    await assistant.locator("#agent-model-menu").waitFor({ state: "hidden", timeout: 40000 });
+    await assistant.locator('[data-sidebar-nav="configure"]').click();
+    await assistant.locator('[data-configure-section="prompt"]').click();
+    await assistant.locator("[data-agent-max-tokens]").fill("16");
+    await assistant.locator("[data-page-close]").click();
+    const createdResponse = page.waitForResponse(response => {
+      if (!response.url().endsWith("/api/provider/model/runs_create") || response.request().frame() !== assistant) return false;
+      const body = response.request().postDataJSON();
+      return body?.offer_id === offer && body?.operation === "text.generate";
+    }, { timeout: 30000 });
+    createdResponse.catch(() => {});
+    const terminalResponse = page.waitForResponse(async response => {
+      if (!response.url().endsWith("/api/provider/model/runs_events") || response.request().frame() !== assistant) return false;
+      const created = await (await createdResponse).json();
+      if (response.request().postDataJSON()?.run_id !== created.data?.run_id) return false;
+      const body = await response.json();
+      return body.data?.events?.some(event => ["completed", "failed", "cancelled", "settlement_unknown"].includes(event.kind));
+    }, { timeout: 150000 });
+    terminalResponse.catch(() => {});
+    await assistant.locator("#agent-composer-input").fill("Say hello in one sentence.");
+    await assistant.locator("#agent-composer-send").click();
+    const acceptedResponse = await createdResponse;
+    assert(acceptedResponse.ok(), "Assistant submits its normal model request");
+    const request = acceptedResponse.request().postDataJSON();
+    assert.equal(request.offer_id, offer);
+    assert.equal(request.operation, "text.generate");
+    assert.equal(request.input?.max_output_tokens, 16, "normal Assistant controls bound the greeting");
+    const assistantToken = await assistant.evaluate(() => new URLSearchParams(location.hash.slice(1)).get("home_token"));
+    assert(Boolean(assistantToken) && acceptedResponse.request().headers()["x-elastos-home-token"] === assistantToken, "Assistant uses its own launch authority");
+    const created = await acceptedResponse.json();
+    assert.equal(created.status, "ok");
+    assert(created.data?.run_id);
+    const finishedResponse = await terminalResponse;
+    assert(finishedResponse.ok());
+    const finished = await finishedResponse.json();
+    const terminal = finished.data.events.find(event => ["completed", "failed", "cancelled", "settlement_unknown"].includes(event.kind));
+    assert.equal(terminal.kind, "completed", "installed Runtime completes the visible Assistant turn");
+    await assistant.locator('.agent-msg-agent [data-regenerate]:enabled').last().waitFor({ state: "visible", timeout: 10000 });
+    const text = (await assistant.locator(".agent-msg-agent .agent-msg-body").last().innerText()).trim();
+    assert(text.length > 0, "Assistant displays the real local reply");
+    results.installed_runtime_reply = "passed";
+    await page.screenshot({ path: join(evidence, "assistant-reply-desktop.png"), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    const phoneReply = assistant.locator(".agent-msg-agent .agent-msg-body").last();
+    await phoneReply.scrollIntoViewIfNeeded();
+    const bounds = await phoneReply.boundingBox();
+    assert(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= 390 && bounds.y + bounds.height <= 844, "phone viewport displays the local reply");
+    assert.equal((await phoneReply.innerText()).trim(), text);
+    await page.screenshot({ path: join(evidence, "assistant-reply-phone.png"), fullPage: true });
+    writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({
+      results, disk, reply_characters: text.length, model_cid: cid, offer_id: offer,
+      max_output_tokens: request.input.max_output_tokens, journey: "Marketplace Get to visible Assistant reply",
+    }, null, 2));
   }
-  assert(offer, "installed Runtime admits the pinned package and publishes its offer");
-  results.model_package_admission = "passed";
-  stage = "installed_runtime_reply";
-  const assistant = await app("assistant");
-  const created = await request(assistant, "/api/provider/model/runs_create", {
-    offer_id: offer, operation: "text.generate", request_id: `ci-reply-${randomUUID()}`,
-    input: { schema: MODEL_TEXT_INPUT_SCHEMA, prompt: "Say hello in one sentence.", max_output_tokens: 8 },
-  });
-  assert.equal(created.status, "ok");
-  const run_id = created.data.run_id;
-  assert(run_id);
-  let terminal;
-  const replyDeadline = Date.now() + 150000;
-  while (Date.now() < replyDeadline) {
-    const got = await request(assistant, "/api/provider/model/runs_get", { run_id, request_id: `ci-get-${randomUUID()}` });
-    if (["completed", "failed", "cancelled", "settlement_unknown"].includes(got.data.status)) { terminal = got.data; break; }
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
-  assert.equal(terminal?.status, "completed", `installed Runtime reply outcome: ${terminal?.terminal?.error?.code || "deadline"}`);
-  const text = terminal.terminal.output.text;
-  assert.equal(typeof text, "string");
-  assert(text.trim().length > 0);
-  results.installed_runtime_reply = "passed";
-  writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, reply_characters: text.length, model_cid: cid }, null, 2));
 } catch (error) {
   results[stage] = "failed";
   disk.at_failure = observeDisk();

@@ -521,6 +521,7 @@ PLATFORM="$(detect_platform)"
 CARGO_BIN="$(find_cargo)"
 NODE_BIN="$(find_node)"
 SOURCE_HOME_KUBO_INSTALLED="0"
+SOURCE_HOME_LLAMA_INSTALLED="0"
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 require_supported_rust "$(command -v rustc)"
@@ -544,6 +545,15 @@ for name, component in manifest.get("external", {}).items():
         raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
     if runtime.get("execution") != "native-provider":
         raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "capsules" / name / "capsule.json"
+    if not capsule_path.is_file():
+        capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "elastos" / "capsules" / name / "capsule.json"
+    if capsule_path.is_file():
+        capsule = json.loads(capsule_path.read_text())
+        honest = (capsule.get("type"), capsule.get("execution"), capsule.get("runtime_abi"), capsule.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+        legacy = capsule.get("type") in ("wasm", "microvm") and capsule.get("execution") is None and capsule.get("runtime_abi") is None and capsule.get("entrypoint") == "rootfs.ext4"
+        if capsule.get("role") != "provider" or not (honest or legacy):
+            raise SystemExit(f"{name} capsule metadata must describe its native provider execution")
     provides = runtime.get("provides")
     if not isinstance(provides, str) or not provides:
         raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
@@ -762,7 +772,12 @@ import pathlib
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(manifest.get("runtime_abi", ""))
+abi = manifest.get("runtime_abi", "")
+if abi == "elastos.runtime-projection/v1" and (manifest.get("type") not in ("wasm", "web-projection") or manifest.get("execution") != "web-projection"):
+    raise SystemExit(f"{sys.argv[1]} projection execution requires type=wasm (legacy) or web-projection")
+if abi == "elastos.component/v1" and (manifest.get("type"), manifest.get("execution")) != ("wasm", "component"):
+    raise SystemExit(f"{sys.argv[1]} component execution requires type=wasm")
+print(abi)
 PY
 }
 
@@ -878,6 +893,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-linux-network.py" \
+        "${DATA_DIR}/scripts/browser-vm-linux-network.py"
     install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
         "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-engine-preflight.sh" \
@@ -1128,6 +1145,7 @@ stamp_source_home_components_manifest() {
     SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}" \
     APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
     SOURCE_HOME_KUBO_INSTALLED="${SOURCE_HOME_KUBO_INSTALLED}" \
+    SOURCE_HOME_LLAMA_INSTALLED="${SOURCE_HOME_LLAMA_INSTALLED}" \
     python3 - <<'PY'
 import hashlib
 import json
@@ -1155,6 +1173,14 @@ if os.environ["SOURCE_HOME_KUBO_INSTALLED"] == "1":
     if not kubo.is_file():
         raise SystemExit("successful Kubo setup did not install bin/kubo")
     source_home_components.append("kubo")
+    host_components.append("kubo")
+    receipt = json.loads((data_dir / "receipts/kubo-build.json").read_bytes())
+    manifest["external"]["kubo"]["capsule_metadata"] = {
+        "role": "content", "type": "data", "install_path": "capsules/kubo",
+        "platforms": {platform: receipt["capsule_metadata"]}}
+if os.environ["SOURCE_HOME_LLAMA_INSTALLED"] == "1":
+    manifest["external"]["llama-server"] = previous["external"]["llama-server"]
+    source_home_components.append("llama-server")
 
 for name in host_components:
     platforms = manifest["external"][name].setdefault("platforms", {})
@@ -1223,49 +1249,115 @@ components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 }
 
-install_signed_model_catalog() {
-    echo "[setup-source-home] install signed model catalog"
-    COMPONENTS_SRC="${ROOT}/model-catalog.json" \
-    COMPONENTS_DEST="${DATA_DIR}/model-catalog.json" \
-    COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-    python3 - <<'PY'
-import base64
-import hashlib
-import json
-import os
-import pathlib
-import stat
-
-src = pathlib.Path(os.environ["COMPONENTS_SRC"])
-dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
-manifest = json.loads(pathlib.Path(os.environ["COMPONENTS_MANIFEST"]).read_bytes())
-pin = manifest.get("model_catalog")
-if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
-    raise SystemExit("source-home components.json is missing model_catalog.head_cid")
-data = src.read_bytes()
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != pin["head_cid"]:
-    raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
-dest.write_bytes(data)
-dest.chmod(stat.S_IRUSR | stat.S_IWUSR)
-PY
-}
-
 install_local_model_engine() {
-    local mode="${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-auto}"
+    local mode="${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-0}"
 
     if [[ "$mode" == "0" ]]; then
         echo "[setup-source-home] skip llama-server install: SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=0"
         return
     fi
-    if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
-        return
+    if [[ "$mode" != "1" ]]; then
+        echo "SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER accepts 0 or 1." >&2
+        exit 1
     fi
 
-    echo "[setup-source-home] install llama-server for local model Use"
-    HOME="${HOME}" \
-    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(source_home_runtime_bin)" setup --with llama-server
+    echo "[setup-source-home] build licensed llama-server prerequisite"
+    python3 - "$ROOT" "$DATA_DIR" "$PLATFORM" "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${ROOT}/target-build/upstream-cache}" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+
+root, data, platform, cache = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+spec = importlib.util.spec_from_file_location('release_upstream', root / 'scripts/release-upstream-input.py')
+upstream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(upstream)
+recipes = json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
+selected = [r for r in recipes if r['component'] == 'llama-server' and r['platform'] == platform]
+if len(selected) != 1:
+    raise SystemExit('llama-server requires one build recipe for the selected platform')
+recipe = selected[0]
+if recipe['source'].get('path') == '@llama-arm64-bundle':
+    recipe['source']['path'] = str(Path(os.environ['ELASTOS_LLAMA_ARM64_BUNDLE']).absolute())
+cache = upstream.directory(cache)
+with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=cache) as temporary:
+    receipt = upstream.package(recipe, cache, Path(temporary))
+    bundle = upstream.directory(data / recipe['install_path'])
+    capsule = upstream.directory(data / 'capsules/llama-server')
+    entries = []
+    with tarfile.open(Path(temporary) / receipt['release_path'], 'r:gz') as archive:
+        for member in archive.getmembers():
+            name = member.name.removeprefix(recipe['root'] + '/')
+            if name == member.name or not member.isfile():
+                raise SystemExit('llama-server capsule contains an unsupported member')
+            if name != '_elastos_object.json':
+                upstream.relative(name)
+            content = archive.extractfile(member).read()
+            for base in (bundle, capsule):
+                destination = base / name
+                upstream.directory(destination.parent)
+                if destination.exists() or destination.is_symlink():
+                    if upstream.regular(destination).read_bytes() != content:
+                        raise SystemExit('Existing llama-server files differ from the selected recipe')
+                else:
+                    destination.write_bytes(content)
+                destination.chmod(0o500 if member.mode & 0o111 else 0o400)
+            entries.append({'path': name, 'sha256': 'sha256:' + upstream.digest(bundle / name), 'type': 'file'})
+    expected_files = {row['path'] for row in entries}
+    for base in (bundle, capsule):
+        for path in base.rglob('*'):
+            name = path.relative_to(base).as_posix()
+            if name == '.elastos-engine.json' and base == bundle:
+                continue
+            if name == '.elastos-artifact-sha256' and base == capsule:
+                # Homes set up by earlier releases keep `sha256:`-prefixed receipts.
+                if (upstream.regular(path).read_text().removeprefix('sha256:')
+                        != receipt['checksum'].removeprefix('sha256:') + '\n'):
+                    raise SystemExit('Existing llama-server capsule receipt differs from its recipe')
+                continue
+            if path.is_symlink() or (not path.is_dir() and name not in expected_files):
+                raise SystemExit('Existing llama-server bundle contains an unexpected file')
+    manifest_path = data / 'components.json'
+    manifest = json.loads(upstream.regular(manifest_path).read_bytes())
+    version = manifest['external']['llama-server']['version']
+    if recipe['root'] != 'llama-' + version or len(entries) > 1024:
+        raise SystemExit('llama-server recipe differs from its installed engine contract')
+    engine_receipt = {'schema': 'elastos.local-model-engine/v2', 'version': version,
+                      'platform': platform, 'archive_sha256': receipt['checksum'],
+                      'entries': sorted(entries, key=lambda row: row['path'])}
+    engine_receipt_path = bundle / '.elastos-engine.json'
+    if engine_receipt_path.exists() or engine_receipt_path.is_symlink():
+        if json.loads(upstream.regular(engine_receipt_path).read_bytes()) != engine_receipt:
+            raise SystemExit('Existing llama-server receipt differs from the selected recipe')
+    else:
+        engine_receipt_path.write_text(json.dumps(engine_receipt, sort_keys=True) + '\n')
+    engine_receipt_path.chmod(0o400)
+    capsule_marker = capsule / '.elastos-artifact-sha256'
+    if not capsule_marker.exists():
+        capsule_marker.write_text(receipt['checksum'].removeprefix('sha256:') + '\n')
+    capsule_marker.chmod(0o400)
+    for base in (bundle, capsule):
+        for directory in sorted((p for p in base.rglob('*') if p.is_dir()), reverse=True):
+            directory.chmod(0o500)
+        base.chmod(0o500)
+    link = upstream.directory(data / 'bin') / 'llama-server'
+    if link.is_symlink():
+        if link.resolve() != bundle / recipe['binary_path']:
+            raise SystemExit('Existing llama-server link differs from the selected bundle')
+    elif link.exists():
+        raise SystemExit('llama-server executable link collides with an existing file')
+    else:
+        link.symlink_to(bundle / recipe['binary_path'])
+    info = manifest['external']['llama-server']['platforms'][platform]
+    info.update({key: receipt[key] for key in ('checksum', 'size', 'release_path', 'extract_path', 'install_path', 'binary_path')})
+    manifest['external']['llama-server']['capsule_metadata'] = {'role': 'content', 'type': 'data', 'install_path': 'capsules/llama-server',
+        'platforms': {platform: receipt['capsule_metadata']}}
+    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+    SOURCE_HOME_LLAMA_INSTALLED="1"
 }
 
 stamp_source_home_capsule_artifacts_manifest() {
@@ -1307,14 +1399,23 @@ install_content_publish_backend() {
         echo "[setup-source-home] skip Kubo install: SETUP_SOURCE_HOME_INSTALL_KUBO=0"
         return
     fi
-    if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
+    if [[ ! -e "${DATA_DIR}/bin/kubo" && ! -L "${DATA_DIR}/bin/kubo" && "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
         return
     fi
 
     echo "[setup-source-home] install Kubo for Library/Documents publish"
-    HOME="${HOME}" \
-    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(source_home_runtime_bin)" setup --with kubo
+    local verify=()
+    if [[ -e "${DATA_DIR}/bin/kubo" || -L "${DATA_DIR}/bin/kubo" ]]; then
+        verify=(--verify-installed)
+    fi
+    # CI seeds this cache before source-home verifies the installed prerequisite.
+    local default_cache="${ROOT}/target-build/upstream-cache"
+    if [[ -n "${RUNNER_TEMP:-}" ]]; then
+        default_cache="${RUNNER_TEMP}/kubo-cache"
+    fi
+    "${ROOT}/scripts/seed-kubo-cache.sh" \
+        "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${KUBO_CACHE_DIR:-${default_cache}}}" \
+        "$DATA_DIR" "$PLATFORM" "${verify[@]}"
     if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
         echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
         exit 1
@@ -1430,7 +1531,6 @@ source_home_binary_names | while IFS= read -r provider; do
     install -m 755 "$(source_home_provider_bin "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
-install_signed_model_catalog
 
 echo "[setup-source-home] install content publish backend before final manifest stamp"
 install_content_publish_backend

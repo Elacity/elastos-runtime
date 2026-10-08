@@ -19,10 +19,7 @@ const GRAPH_ENCODING: &str = "base64-car";
 const DEFAULT_MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct CoordFile {
@@ -486,6 +483,44 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn main() {
+    eprintln!("{PROVIDER_ID}: starting v{PROVIDER_VERSION}");
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut provider = ContentBlockGraphProvider::default();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("{PROVIDER_ID} read error: {err}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = error("invalid_request", &err.to_string());
+                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+        };
+        let is_shutdown = matches!(request, Request::Shutdown);
+        let response = provider.handle(request);
+        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        stdout.flush().unwrap();
+        if is_shutdown {
+            break;
+        }
+    }
+
+    eprintln!("{PROVIDER_ID}: exiting");
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,43 +631,4 @@ mod tests {
         });
         assert_eq!(response["code"], "cid_mismatch");
     }
-}
-
-fn main() {
-    eprintln!("{PROVIDER_ID}: starting v{PROVIDER_VERSION}");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut provider = ContentBlockGraphProvider::default();
-
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => {
-                eprintln!("{PROVIDER_ID} read error: {err}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
-            Err(err) => {
-                let response = error("invalid_request", &err.to_string());
-                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-                stdout.flush().unwrap();
-                continue;
-            }
-        };
-        let is_shutdown = matches!(request, Request::Shutdown);
-        let response = provider.handle(request);
-        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-        stdout.flush().unwrap();
-        if is_shutdown {
-            break;
-        }
-    }
-
-    eprintln!("{PROVIDER_ID}: exiting");
 }

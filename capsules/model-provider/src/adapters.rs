@@ -41,6 +41,7 @@ const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
 const RUNTIME_HOSTED_EFFECT_URL: &str = "http://runtime.invalid/v1/hosted-effect";
 
+#[allow(clippy::too_many_arguments)]
 fn effect_request(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -796,6 +797,7 @@ impl LiveAdapterExecutor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_text_worker(
         &self,
         backend: LocalTextBackend,
@@ -2099,6 +2101,7 @@ async fn run_local_text_worker_with_timing(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_decision_worker(
     api_url: &str,
     api_key: Option<&str>,

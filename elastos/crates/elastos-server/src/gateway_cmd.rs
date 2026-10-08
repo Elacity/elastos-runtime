@@ -372,7 +372,15 @@ async fn register_installed_ipfs_provider(
         )
     })?;
 
-    let bridge = provider::ProviderBridge::spawn(&ipfs_binary, Default::default())
+    // Public startup may already own an IPFS slot from the control plane. Verify
+    // the selected artifact before retiring it, then await the reserved slot's
+    // shutdown before starting one replacement with the Gateway Init role.
+    registry
+        .unregister_sub_provider("ipfs")
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to retire existing IPFS provider: {error}"))?;
+    let config = crate::ipfs::ipfs_provider_config(crate::ipfs::IpfsHostRole::Gateway);
+    let bridge = provider::ProviderBridge::spawn(&ipfs_binary, config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -535,6 +543,204 @@ mod tests {
     use tokio::sync::Mutex;
 
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn browser_home_public_mode_refuses_before_provider_setup() {
+        async fn forbidden_setup() -> anyhow::Result<GatewayControlPlane> {
+            panic!("Browser Home must refuse public mode before provider setup")
+        }
+        let error = run_gateway_direct_with_ready(
+            "127.0.0.1:8090".into(),
+            true,
+            None,
+            None,
+            forbidden_setup,
+            Some(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Home browser launch requires a local gateway"));
+    }
+
+    #[cfg(unix)]
+    struct ExistingGatewayIpfs {
+        retired: std::path::PathBuf,
+        fail_shutdown: bool,
+        shutdown_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Provider for ExistingGatewayIpfs {
+        async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "fixture has no resource operations".into(),
+            ))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["ipfs"]
+        }
+        fn name(&self) -> &'static str {
+            "existing-gateway-ipfs-fixture"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            assert_eq!(request, &serde_json::json!({"op":"fixture_probe"}));
+            Ok(serde_json::json!({"status":"ok", "fixture":"previous-ipfs-slot"}))
+        }
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_shutdown {
+                return Err(ProviderError::Provider("fixture shutdown refused".into()));
+            }
+            std::fs::write(&self.retired, b"settled").unwrap();
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn public_gateway_ipfs_fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.join("ipfs-provider");
+        crate::test_support::write_from_child(
+            &path,
+            br#"#!/usr/bin/env python3
+import json, pathlib, sys
+root = pathlib.Path(__file__).resolve().parent.parent
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['op'] == 'init':
+        assert not (root / 'needs-retirement').exists() or (root / 'old-retired').exists()
+        with (root / 'new-init.jsonl').open('a') as receipt:
+            receipt.write(json.dumps(request) + '\n')
+    print(json.dumps({'status': 'ok'}), flush=True)
+    if request['op'] == 'shutdown':
+        break
+"#,
+            0o700,
+        );
+        let checksum = format!(
+            "sha256:{}",
+            hex::encode(elastos_runtime::signature::hash_content(
+                &std::fs::read(&path).unwrap()
+            ))
+        );
+        let manifest = serde_json::json!({"external":{"ipfs-provider":{
+            "install_path":"bin/ipfs-provider",
+            "provider_runtime":{"role":"provider", "substrate":"native", "execution":"native-provider",
+                "runtime_abi":"elastos.provider-stdio/v1", "provides":"elastos://ipfs/*"},
+            "platforms":{setup::detect_platform():{"install_path":"bin/ipfs-provider", "checksum":checksum}}
+        }}, "profiles":{}, "capsules":{}});
+        std::fs::write(
+            root.path().join("components.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_gateway_ipfs_refresh_verifies_then_settles_before_one_gateway_init() {
+        for populated in [false, true] {
+            let root = public_gateway_ipfs_fixture();
+            let registry = Arc::new(provider::ProviderRegistry::new());
+            let previous = Arc::new(ExistingGatewayIpfs {
+                retired: root.path().join("old-retired"),
+                fail_shutdown: false,
+                shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            if populated {
+                std::fs::write(root.path().join("needs-retirement"), b"owned slot").unwrap();
+                registry
+                    .register_sub_provider("ipfs", previous.clone())
+                    .await
+                    .unwrap();
+            }
+            register_installed_ipfs_provider(root.path(), &registry)
+                .await
+                .unwrap();
+            assert_eq!(
+                previous.shutdown_calls.load(Ordering::SeqCst),
+                usize::from(populated)
+            );
+            let receipt = std::fs::read_to_string(root.path().join("new-init.jsonl")).unwrap();
+            assert_eq!(receipt.lines().count(), 1);
+            let init: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(init["op"], "init");
+            assert_eq!(init["config"]["base_path"], "");
+            assert!(init["config"]["extra"].get("data_dir").is_none());
+            assert_eq!(
+                init["config"]["extra"],
+                serde_json::json!({"runtime_host_role":"gateway"})
+            );
+            assert!(registry
+                .register_sub_provider("ipfs", previous.clone())
+                .await
+                .is_err());
+            registry.unregister_sub_provider("ipfs").await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_gateway_ipfs_refresh_refusals_preserve_custody_and_reservation() {
+        for corrupt in [true, false] {
+            let root = public_gateway_ipfs_fixture();
+            let registry = Arc::new(provider::ProviderRegistry::new());
+            let previous = Arc::new(ExistingGatewayIpfs {
+                retired: root.path().join("old-retired"),
+                fail_shutdown: !corrupt,
+                shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            registry
+                .register_sub_provider("ipfs", previous.clone())
+                .await
+                .unwrap();
+            if corrupt {
+                std::fs::write(
+                    root.path().join("bin/ipfs-provider"),
+                    b"corrupt pinned bytes",
+                )
+                .unwrap();
+            }
+            for _ in 0..2 {
+                assert!(register_installed_ipfs_provider(root.path(), &registry)
+                    .await
+                    .is_err());
+                assert!(!root.path().join("new-init.jsonl").exists());
+                assert!(!root.path().join("old-retired").exists());
+                assert!(registry
+                    .register_sub_provider("ipfs", previous.clone())
+                    .await
+                    .is_err());
+                if corrupt {
+                    let selected = registry
+                        .send_raw("ipfs", &serde_json::json!({"op":"fixture_probe"}))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        selected,
+                        serde_json::json!({"status":"ok", "fixture":"previous-ipfs-slot"})
+                    );
+                    assert_eq!(previous.shutdown_calls.load(Ordering::SeqCst), 0);
+                }
+            }
+            if !corrupt {
+                assert_eq!(previous.shutdown_calls.load(Ordering::SeqCst), 2);
+                assert!(registry
+                    .send_raw("ipfs", &serde_json::json!({"op":"fixture_probe"}))
+                    .await
+                    .is_err());
+            }
+        }
+    }
 
     struct MockContentProvider {
         requests: Mutex<Vec<serde_json::Value>>,

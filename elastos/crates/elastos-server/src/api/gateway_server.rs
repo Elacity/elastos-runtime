@@ -78,7 +78,7 @@ pub(crate) async fn start_gateway_server_with_ready(
         cache_dir,
         data_dir,
         on_ready,
-        shutdown_signal(),
+        shutdown_signal()?,
     )
     .await
 }
@@ -94,23 +94,13 @@ async fn start_gateway_server_with_shutdown(
 ) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let listener = TcpListener::bind(addr).await?;
-    let gateway_local_control = match provider_registry.as_ref() {
-        Some(registry) => Some(
-            crate::api::gateway_local_control::start_gateway_local_control(
-                &data_dir,
-                registry.clone(),
-            )
-            .await?,
-        ),
-        None => None,
-    };
+    let local_control_registry = provider_registry.clone();
     let gateway_api_url = if addr.parse::<axum::http::uri::Authority>()?.port_u16() == Some(0) {
         trusted_gateway_api_url(&listener.local_addr()?.to_string())?
     } else {
         trusted_gateway_api_url(addr)?
     };
     super::gateway_frontdoor::GatewayFrontDoor::load(&data_dir, &gateway_api_url)?;
-    let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let state = GatewayState {
         carrier_endpoint: collaboration.carrier_endpoint,
         provider_registry,
@@ -119,13 +109,35 @@ async fn start_gateway_server_with_shutdown(
         collaboration_discovery_service: collaboration.discovery_service,
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
-        data_dir,
+        data_dir: data_dir.clone(),
     };
     let browser_lifecycle_reconciler =
         super::gateway_browser::start_browser_lifecycle_reconciler(state.clone())
             .map_err(anyhow::Error::msg)?;
     let home_url = format!("{gateway_api_url}/home/");
     let app = gateway_router_with_api_url(state, gateway_api_url);
+    // Publish one complete coordinate identity after Home setup, before children
+    // capture its owner generation. A later mutation would change their owner hash.
+    let gateway_local_control = match local_control_registry {
+        Some(registry) => {
+            match crate::api::gateway_local_control::start_gateway_local_control_with_home_url(
+                &data_dir,
+                registry,
+                home_url.clone(),
+            )
+            .await
+            {
+                Ok(control) => Some(control),
+                Err(error) => {
+                    browser_lifecycle_reconciler.cancel();
+                    let _ = browser_lifecycle_reconciler.join().await;
+                    return Err(error);
+                }
+            }
+        }
+        None => None,
+    };
+    let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
     println!("  Bind:      http://{}", addr);
@@ -282,27 +294,25 @@ fn dedupe_urls(urls: Vec<String>) -> Vec<String> {
     deduped
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()> + Send + 'static> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+        // Register synchronously so TERM during startup remains queued for drain.
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        Ok(async move {
             tokio::select! {
-                _ = ctrl_c => {},
+                _ = interrupt.recv() => {},
                 _ = terminate.recv() => {},
             }
-        } else {
-            ctrl_c.await;
-        }
+        })
     }
-
     #[cfg(not(unix))]
     {
-        ctrl_c.await;
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
     }
 }
 
@@ -336,6 +346,172 @@ mod trusted_gateway_tests {
     fn unused_localhost_address() -> String {
         let listener = std::net::TcpListener::bind("localhost:0").unwrap();
         format!("localhost:{}", listener.local_addr().unwrap().port())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn term_drains_gateway_streams_and_separate_owned_child_groups() {
+        use crate::update_controller::child::OwnedChild;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = format!(
+            "{}::gateway_term_fixture",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &fixture, "--ignored", "--nocapture"])
+            .env("ELASTOS_GATEWAY_TERM_FIXTURE_ROOT", temp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = OwnedChild::spawn(&mut command).unwrap();
+        let pid = child.pid();
+        let root = temp.path().to_path_buf();
+        let journey = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let pids_path = root.join("owned-pids.json");
+            while !pids_path.exists() {
+                assert!(
+                    crate::update_controller::child::observe_exit(pid)
+                        .unwrap()
+                        .is_none(),
+                    "gateway fixture exited before readiness"
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "gateway fixture did not become ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let pids: Vec<u32> =
+                serde_json::from_slice(&std::fs::read(pids_path).unwrap()).unwrap();
+            let home = std::fs::read_to_string(root.join("home-url")).unwrap();
+            let coords_path = crate::runtime_control::gateway_runtime_coord_path(&root);
+            let coords: crate::runtime_control::RuntimeCoords =
+                serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
+            assert_eq!(coords.pid, pid);
+            assert_eq!(coords.home_url, home);
+            let home = url::Url::parse(&home).unwrap();
+            let public_authority = home.authority();
+            let control_authority = coords.api_url.strip_prefix("http://").unwrap();
+            let public = tokio::net::TcpStream::connect(public_authority)
+                .await
+                .unwrap();
+            let control = tokio::net::TcpStream::connect(control_authority)
+                .await
+                .unwrap();
+            let mut streams = [public, control];
+            let requests = [
+                format!("POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {public_authority}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n", home.origin().ascii_serialization()),
+                format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_authority}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"),
+            ];
+            let mut buffer = [0; 128];
+            for (stream, request) in streams.iter_mut().zip(requests) {
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&buffer[..count]).starts_with("HTTP/1.1 100 Continue")
+                );
+                stream.write_all(b"{").await.unwrap();
+            }
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+            let status = loop {
+                if let Some(status) = crate::update_controller::child::observe_exit(pid).unwrap() {
+                    break status;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "TERM did not finish gateway drain"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(status.success(), "gateway TERM fixture failed: {status}");
+            assert!(!coords_path.exists());
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            for stream in &mut streams {
+                let closed =
+                    tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer))
+                        .await
+                        .unwrap();
+                assert!(matches!(closed, Ok(0)) || closed.is_err());
+            }
+        });
+        let result = journey.await;
+        // Keep the child and test Home alive through cleanup, including assertion panic.
+        child.stop().await.unwrap();
+        result.unwrap();
+    }
+
+    #[cfg(unix)]
+    fn gateway_term_ready(url: &str) {
+        let root = PathBuf::from(std::env::var_os("ELASTOS_GATEWAY_TERM_FIXTURE_ROOT").unwrap());
+        std::fs::write(root.join("home-url"), url).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "isolated subprocess fixture for term_drains_gateway_streams_and_separate_owned_child_groups"]
+    async fn gateway_term_fixture() {
+        let root = PathBuf::from(std::env::var_os("ELASTOS_GATEWAY_TERM_FIXTURE_ROOT").unwrap());
+        let shutdown = shutdown_signal().unwrap();
+        crate::update_controller::watch_parent().unwrap();
+        let helper = crate::api::server::HostHelperProcess {
+            name: "TERM drain fixture helper",
+            child: std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        };
+        let helper_pid = helper.child.id();
+        let child_root = root.clone();
+        let managed = tokio::spawn(async move {
+            let coords_path = crate::runtime_control::gateway_runtime_coord_path(&child_root);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            while !coords_path.exists() {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let owner = crate::runtime_control::gateway_children::Owner::read(&child_root).unwrap();
+            let (mut child, descendant_pid) = crate::runtime_control::gateway_children::test_child(
+                &owner,
+                &child_root.join("managed-runtime.json"),
+            )
+            .await;
+            let pid = child.child.id();
+            child.ready();
+            drop(child);
+            let pids_pending = child_root.join("owned-pids.pending");
+            std::fs::write(
+                &pids_pending,
+                serde_json::to_vec(&[helper_pid, pid, descendant_pid]).unwrap(),
+            )
+            .unwrap();
+            // The parent treats this path as readiness; publish only complete JSON.
+            std::fs::rename(pids_pending, child_root.join("owned-pids.json")).unwrap();
+        });
+        start_gateway_server_with_shutdown(
+            "127.0.0.1:0",
+            Some(Arc::new(ProviderRegistry::new())),
+            GatewayCollaborationContext::default(),
+            root.join("cache"),
+            root,
+            Some(gateway_term_ready),
+            shutdown,
+        )
+        .await
+        .unwrap();
+        managed.await.unwrap();
+        drop(helper);
     }
 
     #[tokio::test]
@@ -414,9 +590,11 @@ mod trusted_gateway_tests {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
 
             // A late startup failure after binding must still leave the callback untouched.
+            let owned_coords_path = crate::runtime_control::gateway_runtime_coord_path(&data);
+            let owned_coords = std::fs::read(&owned_coords_path).unwrap();
             let duplicate = start_gateway_server_with_ready(
                 &unused_localhost_address(),
-                None,
+                Some(Arc::new(ProviderRegistry::new())),
                 GatewayCollaborationContext::default(),
                 data.join("cache"),
                 data.clone(),
@@ -427,6 +605,7 @@ mod trusted_gateway_tests {
             assert!(duplicate
                 .to_string()
                 .contains("already running for this data root"));
+            assert_eq!(std::fs::read(&owned_coords_path).unwrap(), owned_coords);
 
             // Expect:100 proves Axum started reading this streaming request body.
             // Keep it incomplete while shutdown begins, as an SSE/WebSocket client
@@ -449,6 +628,11 @@ mod trusted_gateway_tests {
             assert!(coords_path.is_file());
             let coords: crate::runtime_control::RuntimeCoords =
                 serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
+            assert_eq!(coords.home_url, home);
+            assert_eq!(
+                coords.binary_sha256,
+                crate::runtime_control::sha256_file(&std::env::current_exe().unwrap()).unwrap()
+            );
             let control_addr = coords.api_url.strip_prefix("http://").unwrap();
             let mut control_stream = tokio::net::TcpStream::connect(control_addr).await.unwrap();
             control_stream.write_all(format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
@@ -553,6 +737,7 @@ mod trusted_gateway_tests {
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::AddrInUse
         );
+        assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
     }
 
     #[tokio::test]
@@ -575,6 +760,7 @@ mod trusted_gateway_tests {
             error.to_string().contains("failed to parse auth state"),
             "{error}"
         );
+        assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
     }
 
     #[test]

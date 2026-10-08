@@ -1,5 +1,28 @@
 # Installing ElastOS
 
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The [data, keys and backups](#data-keys-and-backups) section explains current
+host access and the protection target for hosted and locked self-hosted Homes.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
+
 ## Install from the publisher
 
 The installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. The signed release determines which binaries exist for a given platform.
@@ -147,8 +170,10 @@ curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
 Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
-The default Home profile omits `crosvm` and `vmlinux`. Use an explicit profile
-or source-home provisioning for microVM and Browser VM work.
+Linux/crosvm Browser has a separate host network setup path that requires
+administrator access. The installed host adapter determines the launch-time
+privileges. The default Home profile omits `crosvm` and `vmlinux`. This release
+publishes them for no platform, so microVM capsules are not available in it.
 
 The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
 maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof
@@ -169,6 +194,75 @@ elastos update --check
 `elastos update` discovers newer signed releases through the trusted source
 created during install.
 
+Runtime consumes the verified signed pair in `installation/release-head.json`
+and `installation/release.json` within its data directory. Publisher owns its
+separate publication files. For an older installation, Runtime migrates the
+signed pair after it verifies the trusted source, binary, components and installed
+support under the installation lock. An interrupted transaction completes its
+original recovery before that migration. If the saved pair requires repair,
+keep the files in place and follow Runtime's operator repair step.
+
+Running `install.sh` again uses the same installation lock and journal. Before it
+stops Runtime, it restores an interrupted install and refuses an older release,
+another channel, a pending Home update, a second writer and an installed Runtime
+without a readable `sources.json`. Until an interrupted install is restored,
+Home does not start and asks you to run `install.sh` again.
+
+### Undo an update
+
+Use Undo if an update causes a problem and you need the previous release. Before
+an update, run `elastos source show` and save the full `Head CID:` value. That
+command shows the current head; after the update, it shows the new head. If it
+shows `unknown`, get the previous signed head CID from the publisher.
+
+To restore the previous release, run:
+
+```bash
+elastos update --rollback-to <previous head CID>
+```
+
+Replace `<previous head CID>` with the saved CID. A plain update to an older
+release is refused. Undo keeps your identity, accounts, and user data, including
+data written after the update.
+
+For a legacy Home, the first update to a new publisher key uses the installer's
+re-trust step. After that step, Undo accepts only heads signed by the current
+trusted key. A head signed by the former key is refused and the installation
+stays unchanged. Ask the publisher for a previous release signed by the current
+key if you need to recover across that first update.
+
+### Recover an interrupted update
+
+If Runtime reports an interrupted command-line update, run `elastos update`
+again before starting Home. Runtime owns the saved transaction and verifies its
+files before recovery. Keep the installation files and data in place.
+
+A Home with an installed update controller keeps its controller Runtime and
+private receipt in the data directory. If restart recovery requires that
+controller, set `ELASTOS_RECOVERY_DATA` to the data directory shown in the local
+message and run:
+
+```bash
+"${ELASTOS_RECOVERY_DATA}/update-controller/runtime" __update-controller \
+  --receipt "${ELASTOS_RECOVERY_DATA}/update-controller/receipt.json"
+```
+
+The controller verifies its signed Runtime, retained launch settings and saved
+release before it starts Home. Keep this terminal open. Initial startup has a
+120-second limit; update and rollback startup have a 30-second limit. A startup
+failure names the private `update-controller/runtime.log` file to inspect
+before trying again. The receipt keeps Home paths, locale, desktop opener settings and Runtime launch
+bindings. It also retains the configured Wallet price API key, which Wallet reads
+from the environment. Other provider and Browser settings stay in their installed
+private configuration files. Keep the receipt's owner-only permissions and
+share only a safe error summary.
+
+Home reuses a verified controller when its signed Runtime already matches.
+If a new controller cannot fit, ordinary Home can open with Home update controls
+unavailable.
+Free disk space before updating. An interrupted update or uncertain controller
+ownership keeps its recovery step.
+
 These overrides are for operators:
 
 ```bash
@@ -177,6 +271,40 @@ elastos update --no-p2p --gateway GATEWAY_URL
 ```
 
 Replace `CID` and `GATEWAY_URL` with the source values.
+
+## Compare and change the release signer
+
+The maintainer release DID is
+`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
+installer's `Maintainer DID:` line with the complete DID in the repository
+[README](../README.md#install-from-the-publisher).
+
+An existing Home with the old source pin refuses a release signed by the new
+maintainer. On the Runtimes that still trust the old key, `elastos update`
+reports one line:
+
+```text
+Error: Signer DID mismatch: trusted set = ["<old DID>"], got did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe
+```
+
+Newer Runtimes add a second line: `This release is signed by a new publisher
+key. Run the publisher's install.sh to trust it; this installation was not
+changed.`
+
+The trusted set shows your Home's current DID. To re-trust once, run the
+publisher's installer over the existing installation, using the same command
+as a fresh install:
+
+```sh
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+```
+
+The installer trusts the new DID, installs the release and keeps your existing
+identity, accounts and user files. Later updates accept release signatures from
+the new DID and refuse signatures from the former DID. Homes that already trust
+this DID can use normal updates.
+Until you re-trust, Home still trusts the old key and remains exposed if a copy
+of that key exists.
 
 ## Installed files
 
@@ -192,8 +320,29 @@ The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [state.md](../state.md) records
-whether exact public-manifest parity evidence has been accepted.
+from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+owns exact public-manifest parity evidence.
+
+## Data, keys and backups
+
+Runtime stores keys next to the data they protect in its data home. A full
+backup of that home contains all keys, including wallet keys. Protect the backup
+with the same care as the running Home. A Recovery Kit is sensitive recovery
+material; keep it under your own control.
+
+Use hosted accounts only for public demos. Keep wallets, private data and
+recovery material on your own device until
+[hosted protection](https://github.com/Elacity/elastos-runtime/issues/209) passes
+its acceptance gate. The seed operator can read hosted data, wallet keys and
+recovery phrases stored on the seed. Host-side encryption with keys stored
+beside the data leaves those secrets accessible to that operator.
+
+Passkeys control sign-in. Locking Home stops UI use; the Runtime account and root
+retain access to stored data and keys. The protection target covers hosted
+operators and root, and other software or OS users while a self-hosted Home is
+locked. An unlocked self-hosted Home trusts its owner and their host software.
+Recovery can restore lost access with valid recovery material. A stolen device
+or profile key requires a new identity.
 
 ## Capability policy
 

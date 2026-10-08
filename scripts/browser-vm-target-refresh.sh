@@ -511,7 +511,8 @@ for required in \
     "$SOURCE_DIR/scripts/browser-vm-engine-supervisor.mjs" \
     "$SOURCE_DIR/scripts/browser-vm-control-service.mjs" \
     "$SOURCE_DIR/scripts/browser-vm-remote-vz-launcher.mjs" \
-    "$SOURCE_DIR/scripts/browser-vm-local-crosvm-launcher.mjs"
+    "$SOURCE_DIR/scripts/browser-vm-local-crosvm-launcher.mjs" \
+    "$SOURCE_DIR/scripts/browser-vm-linux-network.py"
 do
     if [[ ! -f "$required" ]]; then
         echo "required source helper missing: $required" >&2
@@ -575,6 +576,9 @@ install_with_backup "$SOURCE_DIR/scripts/browser-vm-remote-vz-launcher.mjs" \
 install_with_backup "$SOURCE_DIR/scripts/browser-vm-local-crosvm-launcher.mjs" \
     "$DATA_DIR/bin/browser-vm-local-crosvm-launcher.mjs" 755 \
     "browser-vm-local-crosvm-launcher.mjs"
+install_with_backup "$SOURCE_DIR/scripts/browser-vm-linux-network.py" \
+    "$DATA_DIR/scripts/browser-vm-linux-network.py" 755 \
+    "browser-vm-linux-network.py"
 
 write_node_wrapper "$DATA_DIR/bin/browser-vm-engine-supervisor" \
     "$DATA_DIR/bin/browser-vm-engine-supervisor.mjs" \

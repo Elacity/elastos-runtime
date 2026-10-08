@@ -22,7 +22,7 @@ does not describe the later SmolLM2 result.
 A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
 Marketplace and Carrier, then completed a terminal Assistant reply. Its current
 installed readiness regression also passed after Runtime restart; the exact
-local receipt is recorded in [state.md](../state.md#current-model-foundation-23-september-2026-utc).
+local receipt is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Full Qwen, combined retention and failure-path acceptance, and public delivery
 remain open.
 
@@ -127,7 +127,7 @@ workflow, file picker or editable model path. It uses this sequence:
 Off-box catalog and package delivery uses the existing Content and availability
 contracts over Carrier. Runtime applies the same publisher, identity and
 authority checks. A bounded local miss can fetch from an authenticated holder;
-the installed direct-Carrier SmolLM2 result is recorded in [state.md](../state.md).
+the installed direct-Carrier SmolLM2 result is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Independent-holder and wider route acceptance remain open.
 
 The CID proves the closure bytes. The publisher signature proves who made the
@@ -310,8 +310,9 @@ staging enters admission by exclusive same-filesystem rename. Exact-CID reuse
 retains one artifact charge with separate actor/request bindings.
 
 Private native/Registry capacity observation uses the ready backend's actual
-repository and same-volume datastores. It returns bounded facts and enforces the 10%
-free-space floor. Current-owner backend directories may use `0755` with no
+repository and same-volume datastores. It returns bounded facts; Runtime admits
+the work only when its bytes plus the shared 2 GiB free-space reserve fit in the
+available space. Current-owner backend directories may use `0755` with no
 special or group/world write bits; staging remains owner-only `0700`.
 This filesystem observation is separate from the inventory reservation.
 Isolated process tests exercise fresh Use through real Content, Registry,
@@ -322,7 +323,7 @@ unknown settlement when backend stop is unconfirmed. The catalog signer and
 successful revalidation callback belong to the fixture. They do not prove the
 installed Home grant/session path. The installed operator catalog and receipt
 exist. That earlier Qwen Use failed; the later SmolLM2 installed journey passed.
-Their separate evidence and limits are in [state.md](../state.md).
+Their separate evidence and limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
@@ -395,8 +396,9 @@ payload digests before admission; a range receipt alone cannot establish them.
 Runtime owns one private staging operation for the exact package identity and
 admission record. Bound catalog/manifest bytes, file count, each file, total
 bytes and time from validated policy and exact package facts. Account for
-backend pin storage, staging and final placement, preserving at least 10% free
-space on every affected volume before and during preparation. Verify ownership,
+backend pin storage, staging and final placement, and require those bytes plus
+the shared 2 GiB free-space reserve to fit in the available space on every
+affected volume before and during preparation. Verify ownership,
 mode, symlink/hard-link refusal and containment. Atomically admit only the full
 verified closure; restart reconciles the same record and removes only its owned
 partial staging. Retry neither duplicates admission nor repeats a completed
@@ -470,7 +472,8 @@ Implemented source boundaries and remaining acceptance:
    JSON array. Large-model bootstrap must use bounded operator/provider import
    or a separately verified publisher repair. Capacity admission covers the
    complete proof layout, including an additional publisher backend copy when
-   used, while preserving the 10% free-space floor.
+   used, and requires that layout plus the shared 2 GiB reserve to fit in the
+   available space.
    Verify actual
    artifact/receipt parity and human behavior, then publish code/tests/docs/
    manifests only after explicit authorization. Passkey ceremonies require the
@@ -483,7 +486,7 @@ llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
 signed closure size. The local operator package records exact bytes,
 complete-closure CID, publisher signature/trust, licenses, provenance claims,
 resource limits and local availability. Its verified scope and upstream
-provenance limits are in [state.md](../state.md#model-and-assistant-truth).
+provenance limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 That local package proof does not establish off-box distribution. The existing
 engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing

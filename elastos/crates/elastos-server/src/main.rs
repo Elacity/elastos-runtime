@@ -23,6 +23,8 @@ mod server_infra;
 mod share_cmd;
 mod shares_cmd;
 mod site_cmd;
+#[cfg(all(test, unix))]
+mod test_support;
 mod trust_cmd;
 mod webspace_cmd;
 
@@ -69,6 +71,9 @@ fn is_interactive_frontdoor_command(argv: &[String]) -> bool {
 
 #[cfg(unix)]
 fn should_isolate_process_group(argv: &[String]) -> bool {
+    if argv.first().is_some_and(|arg| arg == "__update-controller") {
+        return false;
+    }
     !is_interactive_frontdoor_command(argv)
 }
 
@@ -199,13 +204,36 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         capsules: Vec<String>,
 
-        /// Prepared native input for each release platform (repeat PLATFORM=DIR three times)
+        /// Prepared native inputs (at least two platforms, or one explicit canary preview)
         #[arg(long = "platform-input", value_name = "PLATFORM=DIR",
               conflicts_with_all = &["skip_build", "skip_rootfs", "cross", "capsules"])]
         platform_inputs: Vec<String>,
 
-        /// Override release signing key path
-        #[arg(long)]
+        /// Inspect one Apple silicon Mac input on canary before operator publication
+        #[arg(long, value_name = "PLATFORM", value_parser = ["aarch64-darwin"],
+              requires = "platform_inputs")]
+        preview_platform: Option<String>,
+
+        /// Prepare unsigned native inputs for the separately installed custodian signer
+        #[arg(long, value_name = "DIR", requires_all = &["platform_inputs", "publisher_did"],
+              conflicts_with_all = &["key", "public_url", "public_with_sudo", "signed_publication", "allow_signer_rotation"])]
+        prepare_only: Option<PathBuf>,
+
+        /// Frozen output from the separately installed custodian signer
+        #[arg(long, value_name = "DIR", requires = "publisher_did",
+              conflicts_with_all = &["prepare_only", "key", "platform_inputs", "preview_platform", "skip_build", "skip_rootfs", "cross", "capsules", "public_url", "public_with_sudo"])]
+        signed_publication: Option<PathBuf>,
+
+        /// Independently approved public signer DID
+        #[arg(long, value_name = "DID")]
+        publisher_did: Option<String>,
+
+        /// Confirm an operator-approved change to the saved public signer pin
+        #[arg(long, requires = "signed_publication")]
+        allow_signer_rotation: bool,
+
+        /// Retired: signing belongs to the separate custodian tool
+        #[arg(long, hide = true)]
         key: Option<PathBuf>,
 
         /// Show the publish plan without building or uploading
@@ -236,8 +264,8 @@ enum Commands {
         #[arg(long)]
         ipfs_provider_bin: Option<PathBuf>,
 
-        /// Allow publishing without a stamped trusted-source bootstrap
-        #[arg(long)]
+        /// Retired: the approved signing input owns its public bootstrap
+        #[arg(long, hide = true)]
         allow_no_bootstrap: bool,
     },
 
@@ -299,6 +327,12 @@ enum Commands {
         /// Emit the local Home-state probe as machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+
+    #[command(name = "__update-controller", hide = true)]
+    UpdateController {
+        #[arg(long)]
+        receipt: std::path::PathBuf,
     },
 
     /// Launch an AI agent that joins P2P chat and responds via LLM
@@ -502,6 +536,23 @@ enum Commands {
         backup_dir: PathBuf,
     },
 
+    /// Admit and install the installer's verified release through the shared writer
+    #[command(name = "install-release", hide = true)]
+    InstallRelease {
+        /// Runtime data root of this installation
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Installed Runtime binary path
+        #[arg(long)]
+        binary: PathBuf,
+        /// Verified candidate Runtime, trusted sources, release head and release
+        #[arg(long, num_args = 4, value_names = ["RUNTIME", "SOURCES", "HEAD", "RELEASE"])]
+        candidate: Vec<PathBuf>,
+        /// Admit only; change nothing
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Show runtime version
     Version,
 
@@ -530,6 +581,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Repair an invalid installed version with a verified same or newer release
+        #[arg(long)]
+        force: bool,
     },
 
     /// Check for and install runtime updates
@@ -557,6 +612,10 @@ enum Commands {
         /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
         rollback_to: Option<String>,
+
+        /// Repair an invalid installed version with a verified same or newer release
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1113,7 +1172,7 @@ enum ConfigCommand {
     Show,
     /// Set a configuration value
     Set {
-        /// Key to set (e.g. "dev_mode", "enable_cache")
+        /// Key to set (e.g. "developer_mode", "enable_cache")
         key: String,
         /// Value to set
         value: String,
@@ -1228,13 +1287,12 @@ async fn main() -> anyhow::Result<()> {
             let gateway_lifecycle = argv.first().is_some_and(|arg| arg == "gateway")
                 || (matches!(argv.first().map(String::as_str), None | Some("home"))
                     && argv.iter().any(|arg| arg == "--browser"));
+            // Register both streams before the parent watcher can send TERM.
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::spawn(async move {
-                let mut sigint =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .expect("SIGINT handler");
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("SIGTERM handler");
                 tokio::select! {
                     _ = sigint.recv() => {},
                     _ = sigterm.recv() => {},
@@ -1245,7 +1303,7 @@ async fn main() -> anyhow::Result<()> {
                     libc::kill(0, libc::SIGTERM);
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(if gateway_lifecycle {
-                    10
+                    15
                 } else {
                     2
                 }))
@@ -1257,6 +1315,8 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+
+    elastos_server::update_controller::watch_parent()?;
 
     // Install rustls crypto provider (ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1276,6 +1336,12 @@ async fn main() -> anyhow::Result<()> {
         status: false,
         json: false,
     });
+    if matches!(
+        &command,
+        Commands::Serve { .. } | Commands::Gateway { .. } | Commands::Home { browser: true, .. }
+    ) {
+        elastos_server::host_lock::authorize_host_process_start(&sources::default_data_dir())?;
+    }
 
     match command {
         Commands::Run {
@@ -1343,6 +1409,10 @@ async fn main() -> anyhow::Result<()> {
                 return gateway_entry::run_browser_home().await;
             }
             return home_cmd::run(status, json).await;
+        }
+
+        Commands::UpdateController { receipt } => {
+            return elastos_server::update_controller::run(receipt).await;
         }
 
         Commands::Agent {
@@ -1433,6 +1503,11 @@ async fn main() -> anyhow::Result<()> {
             cross,
             capsules,
             platform_inputs,
+            preview_platform,
+            prepare_only,
+            signed_publication,
+            publisher_did,
+            allow_signer_rotation,
             key,
             dry_run,
             preflight_only,
@@ -1452,6 +1527,11 @@ async fn main() -> anyhow::Result<()> {
                 cross,
                 capsules,
                 platform_inputs,
+                preview_platform,
+                prepare_only,
+                signed_publication,
+                publisher_did,
+                allow_signer_rotation,
                 key,
                 dry_run,
                 preflight_only,
@@ -1533,6 +1613,23 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
 
+        Commands::InstallRelease {
+            data_dir,
+            binary,
+            candidate,
+            check,
+        } => {
+            let [runtime, sources, head, release] = candidate.as_slice() else {
+                anyhow::bail!("install-release requires four candidate files");
+            };
+            elastos_server::update::install_release(
+                &data_dir,
+                &binary,
+                [runtime, sources, head, release].map(PathBuf::as_path),
+                check,
+            )?;
+        }
+
         Commands::Version => {
             release_cmd::run_version(ELASTOS_VERSION);
         }
@@ -1544,6 +1641,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         }
         | Commands::Upgrade {
             check,
@@ -1552,6 +1650,7 @@ async fn main() -> anyhow::Result<()> {
             gateways,
             yes,
             rollback_to,
+            force,
         } => {
             release_cmd::run_update_command(
                 check,
@@ -1560,6 +1659,7 @@ async fn main() -> anyhow::Result<()> {
                 gateways,
                 yes,
                 rollback_to,
+                force,
                 ELASTOS_VERSION,
             )
             .await?;
@@ -2224,6 +2324,67 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn update_cli_accepts_force_only_when_requested() {
+        for command in ["update", "upgrade"] {
+            for requested in [false, true] {
+                let mut args = vec!["elastos", command];
+                if requested {
+                    args.push("--force");
+                }
+                let cli = super::Cli::try_parse_from(args).unwrap();
+                let Some(
+                    super::Commands::Update { force, .. } | super::Commands::Upgrade { force, .. },
+                ) = cli.command
+                else {
+                    panic!("expected update command");
+                };
+                assert_eq!(force, requested);
+            }
+        }
+        let error = super::Cli::try_parse_from([
+            "elastos",
+            "node",
+            "update",
+            "--peer",
+            "did:key:fixture",
+            "--apply",
+            "--yes",
+            "--force",
+        ])
+        .err()
+        .expect("operator update accepted --force");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn source_add_cli_keeps_omitted_channel_distinct_from_explicit_stable() {
+        let args = [
+            "elastos",
+            "source",
+            "add",
+            "--name",
+            "fixture",
+            "--publisher",
+            "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z",
+        ];
+        for (extra, expected) in [
+            (Vec::new(), None),
+            (vec!["--channel", "stable"], Some("stable")),
+        ] {
+            let mut input = args.to_vec();
+            input.extend(extra);
+            let cli = super::Cli::try_parse_from(input).unwrap();
+            let Some(super::Commands::Source(super::sources::SourceCommand::Add {
+                channel, ..
+            })) = cli.command
+            else {
+                panic!("expected source add");
+            };
+            assert_eq!(channel.as_deref(), expected);
+        }
+    }
+
+    #[test]
     fn publish_release_cli_accepts_repeated_platform_inputs() {
         let args = [
             "elastos",
@@ -2265,6 +2426,149 @@ mod tests {
             invalid.extend(conflict);
             assert!(super::Cli::try_parse_from(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn publish_release_cli_accepts_mac_preview_and_refuses_invalid_options() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+            "--dry-run",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            preview_platform,
+            platform_inputs,
+            channel,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(preview_platform.as_deref(), Some("aarch64-darwin"));
+        assert_eq!(platform_inputs, ["aarch64-darwin=/prepared/mac"]);
+        assert_eq!(channel, "canary");
+        assert!(dry_run);
+        for conflict in [
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        let mut unsupported = args;
+        unsupported[7] = "aarch64-linux";
+        assert!(super::Cli::try_parse_from(unsupported).is_err());
+        assert!(super::Cli::try_parse_from([
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--dry-run",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn publish_release_cli_prepares_public_inputs_without_a_key_option() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "1.2.3",
+            "--channel",
+            "canary",
+            "--preview-platform",
+            "aarch64-darwin",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+            "--prepare-only",
+            "/prepared/unsigned",
+            "--publisher-did",
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            prepare_only,
+            publisher_did,
+            key,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(prepare_only.unwrap().to_str(), Some("/prepared/unsigned"));
+        assert!(publisher_did.unwrap().starts_with("did:key:"));
+        assert!(key.is_none());
+        for conflict in [
+            vec!["--key", "/custodian/unopened.pem"],
+            vec!["--public-url"],
+            vec!["--public-with-sudo"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        assert!(super::Cli::try_parse_from(&args[..12]).is_err());
+    }
+
+    #[test]
+    fn publish_release_cli_accepts_only_frozen_publication_options() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "1.2.3",
+            "--channel",
+            "canary",
+            "--signed-publication",
+            "/approved/frozen",
+            "--publisher-did",
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::PublishRelease {
+                signed_publication: Some(_),
+                key: None,
+                ..
+            })
+        ));
+        assert!(super::Cli::try_parse_from(&args[..8]).is_err());
+        for conflict in [
+            vec!["--key", "/custodian/unopened.pem"],
+            vec!["--prepare-only", "/unsigned"],
+            vec!["--platform-input", "aarch64-darwin=/prepared/mac"],
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+            vec!["--public-url"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+        let mut approved_rotation = args.to_vec();
+        approved_rotation.push("--allow-signer-rotation");
+        assert!(super::Cli::try_parse_from(approved_rotation).is_ok());
     }
 
     #[test]

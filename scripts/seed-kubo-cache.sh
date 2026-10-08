@@ -1,72 +1,98 @@
 #!/usr/bin/env bash
-# Seed an installed Kubo into a Runtime data dir from a local tarball cache so
-# `elastos setup` treats the component as already installed and never reaches
-# for dist.ipfs.tech (a single 600s download attempt with no retry, which
-# intermittently times out on GitHub macOS runners — ELACITY-2308).
-#
-# Usage: seed-kubo-cache.sh <cache-dir> <data-dir> <platform>
-#   cache-dir  Directory holding (or receiving) the verified release tarball.
-#   data-dir   Runtime data dir to seed (bin/kubo is written under it).
-#   platform   components.json platform key, e.g. darwin-arm64, linux-arm64.
+# Build-only prerequisite: wrap one pinned Kubo input as a licensed capsule.
+# Consumers install the release capsule through Carrier.
+# Usage: seed-kubo-cache.sh <cache-dir> <data-dir> <platform> [--verify-installed]
 set -euo pipefail
-# Runtime validators require owner-only data-root directories.
 umask 077
 
-if [[ $# -ne 3 ]]; then
-    echo "usage: $0 <cache-dir> <data-dir> <platform>" >&2
+if [[ $# -lt 3 || $# -gt 4 || ( $# -eq 4 && "$4" != --verify-installed ) ]]; then
+    echo "usage: $0 <cache-dir> <data-dir> <platform> [--verify-installed]" >&2
     exit 2
 fi
-
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CACHE_DIR="$1"
-DATA_DIR="$2"
-PLATFORM="$3"
-
-read -r KUBO_URL KUBO_CHECKSUM KUBO_EXTRACT_PATH < <(python3 - "$REPO_ROOT/components.json" "$PLATFORM" <<'PY'
+python3 - "$REPO_ROOT" "$1" "$2" "$3" "${4:-}" <<'PY'
+import importlib.util
 import json
+import os
+from pathlib import Path
+import shutil
 import sys
+import tarfile
+import tempfile
 
-manifest = json.load(open(sys.argv[1]))
-info = manifest["external"]["kubo"]["platforms"][sys.argv[2]]
-for field in ("url", "checksum", "extract_path"):
-    if not info.get(field):
-        raise SystemExit(f"kubo {sys.argv[2]} manifest entry missing {field}")
-print(info["url"], info["checksum"], info["extract_path"])
+root, cache, data = map(Path, sys.argv[1:4])
+platform, verify = sys.argv[4], sys.argv[5] == '--verify-installed'
+spec = importlib.util.spec_from_file_location('release_upstream', root / 'scripts/release-upstream-input.py')
+upstream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(upstream)
+recipes = json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
+selected = [r for r in recipes if r['component'] == 'kubo' and r['platform'] == platform]
+if len(selected) != 1:
+    raise SystemExit('Kubo requires one build recipe for the selected platform')
+recipe = selected[0]
+cache, data = upstream.directory(cache), upstream.directory(data)
+if verify:
+    # Existing source Homes get a local proof against recorded upstream bytes.
+    # Verification has no download path, including separately pinned licences.
+    notices = [*recipe['license']['files'], *recipe.get('notices', [])]
+    for source in [recipe['source'], *(item['source'] for item in notices)]:
+        algorithm, expected = upstream.checksum_parts(source['checksum'])
+        upstream.regular(cache / f'{algorithm}-{expected}')
+with tempfile.TemporaryDirectory(prefix='.kubo-package-', dir=cache) as temporary:
+    receipt = upstream.package(recipe, cache, Path(temporary))
+    archive = Path(temporary) / receipt['release_path']
+    packages = upstream.directory(cache / 'capsules')
+    saved = packages / receipt['release_path']
+    if saved.exists() or saved.is_symlink():
+        if upstream.digest(saved) != receipt['checksum'][7:]:
+            raise SystemExit('Cached Kubo capsule differs from its build recipe')
+    else:
+        shutil.copyfile(archive, saved)
+        saved.chmod(0o600)
+    with tarfile.open(archive, 'r:gz') as bundle:
+        binary = bundle.extractfile(recipe['extract_path']).read()
+        target = upstream.directory(data / 'bin') / 'kubo'
+        if verify:
+            if upstream.regular(target).read_bytes() != binary:
+                raise SystemExit('Installed Kubo differs from the cached recipe input')
+        else:
+            if target.exists() or target.is_symlink():
+                upstream.regular(target)
+            fd, pending = tempfile.mkstemp(prefix='.kubo-', dir=target.parent)
+            try:
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(binary)
+                os.chmod(pending, 0o700)
+                os.replace(pending, target)
+            finally:
+                Path(pending).unlink(missing_ok=True)
+        capsule = upstream.directory(data / 'capsules/kubo')
+        for member in bundle.getmembers():
+            name = member.name.removeprefix(recipe['root'] + '/')
+            if name == member.name or not member.isfile():
+                raise SystemExit('Kubo capsule contains an unsupported member')
+            if name != '_elastos_object.json':
+                upstream.relative(name)
+            destination = capsule / name
+            upstream.directory(destination.parent)
+            content = bundle.extractfile(member).read()
+            if destination.exists() or destination.is_symlink():
+                if upstream.regular(destination).read_bytes() == content:
+                    continue
+                if verify:
+                    raise SystemExit('Installed Kubo capsule differs from its recipe')
+            destination.write_bytes(content)
+            destination.chmod(member.mode & 0o700)
+    marker = capsule / '.elastos-artifact-sha256'
+    if marker.exists() or marker.is_symlink():
+        upstream.regular(marker)
+    marker.write_text(receipt['checksum'].removeprefix('sha256:') + '\n')
+    marker.chmod(0o600)
+    for record in (packages / (receipt['release_path'] + '.json'),
+                   upstream.directory(data / 'receipts') / 'kubo-build.json'):
+        if record.exists() or record.is_symlink():
+            upstream.regular(record)
+        record.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        record.chmod(0o600)
+print('[seed-kubo] verified licensed Kubo capsule and native prerequisite')
 PY
-)
-
-mkdir -p "$CACHE_DIR"
-TARBALL="${CACHE_DIR}/kubo-${PLATFORM}.tar.gz"
-
-if [[ ! -f "$TARBALL" ]]; then
-    echo "[seed-kubo] downloading ${KUBO_URL}"
-    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-        --connect-timeout 30 --max-time 300 \
-        -o "${TARBALL}.partial" "$KUBO_URL"
-    mv "${TARBALL}.partial" "$TARBALL"
-else
-    echo "[seed-kubo] using cached ${TARBALL}"
-fi
-
-python3 - "$TARBALL" "$KUBO_CHECKSUM" <<'PY'
-import hashlib
-import sys
-
-path, expected = sys.argv[1], sys.argv[2]
-algo, _, digest = expected.partition(":")
-if algo not in ("sha256", "sha512") or not digest:
-    raise SystemExit(f"unsupported checksum format: {expected}")
-h = hashlib.new(algo)
-with open(path, "rb") as handle:
-    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-        h.update(chunk)
-if h.hexdigest() != digest:
-    raise SystemExit(f"kubo tarball checksum mismatch: {h.hexdigest()} != {digest}")
-print("[seed-kubo] checksum verified", algo)
-PY
-
-mkdir -p "${DATA_DIR}/bin"
-tar -xOzf "$TARBALL" "$KUBO_EXTRACT_PATH" > "${DATA_DIR}/bin/kubo.partial"
-chmod 700 "${DATA_DIR}/bin/kubo.partial"
-mv "${DATA_DIR}/bin/kubo.partial" "${DATA_DIR}/bin/kubo"
-echo "[seed-kubo] seeded ${DATA_DIR}/bin/kubo"

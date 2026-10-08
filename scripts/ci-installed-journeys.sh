@@ -3,10 +3,11 @@ set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-CI_HOME="${CI_SOURCE_HOME:-${HOME}/.elastos-ci/source-home}"
+CI_HOME="${CI_SOURCE_HOME:?Set CI_SOURCE_HOME to the receipt-bound source Home}"
 EVIDENCE="${RUNNER_TEMP}/source-home-journeys"
 DATA="${CI_HOME}/.local/share/elastos"
 [[ "$(uname -s)" != Darwin ]] || DATA="${CI_HOME}/Library/Application Support/elastos"
+export CI_MODEL_INPUTS="${CI_HOME}/model-inputs/inputs"
 mkdir -p "$EVIDENCE"
 
 case "${1:-}" in
@@ -17,38 +18,27 @@ case "${1:-}" in
             Darwin-arm64) PLATFORM=darwin-arm64 ;;
             *) echo "Unsupported installed journey platform" >&2; exit 1 ;;
         esac
-        # The existing seed contract verifies the declared archive checksum.
-        # Linux source-home skips Kubo by default; macOS reuses its seeded cache.
-        scripts/seed-kubo-cache.sh "${RUNNER_TEMP}/kubo-cache" "$DATA" "$PLATFORM"
-        if [[ "$(uname -s)-$(uname -m)" == Linux-aarch64 ]]; then
-            # #97's Carrier fixture already installs this pinned archive through
-            # Runtime setup. Reuse its complete verified bundle and receipt.
-            python3 - "$DATA" "${HOME}/.elastos-ci/carrier-fixture/xdg-data/elastos" <<'PY'
-import json, shutil, sys
+        # Source Homes prepare the engine through the current licensed recipe.
+        # Kubo is installed before the source installation receipt is written.
+        # Signed-release on-demand acquisition has a separate acceptance proof.
+        python3 - "$DATA" "$PLATFORM" <<'PY'
 from pathlib import Path
 from runpy import run_path
-digest = run_path("scripts/ci-installed-journeys.py")["digest"]
-data, fixture = map(Path, sys.argv[1:])
-info = json.loads((data / "components.json").read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
-bundle = fixture / info["install_path"]
-receipt = json.loads((bundle / ".elastos-engine.json").read_text())
-assert receipt["platform"] == "linux-arm64"
-assert receipt["archive_sha256"] == info["checksum"]
-binary = next(row for row in receipt["entries"] if row["path"] == "llama-server")
-assert "sha256:" + digest(bundle / "llama-server") == binary["sha256"]
-destination = data / info["install_path"]
-destination.parent.mkdir(parents=True, exist_ok=True)
-shutil.copytree(bundle, destination, symlinks=True)
+import sys
+journey = run_path("scripts/ci-installed-journeys.py")
+data = Path(sys.argv[1]).resolve()
+journey["require_disk_space"](data)
+assert journey["engine_receipt"](data)["platform"] == sys.argv[2]
 PY
-        fi
         # The existing verifier owns the pinned weight and license identities.
         scripts/pinned-model-consumer-proof.sh "${CI_HOME}/model-inputs" --fetch --check-inputs
-        node scripts/ci-model-package.mjs "$DATA" "${CI_HOME}/model-inputs/inputs" "$EVIDENCE"
         ;;
     home)
+        python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/engine-absent-home" --home-only
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE"
         ;;
     home-repeat)
+        python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/engine-absent-home" --home-only
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --repeat 3
         ;;
     summary)
@@ -60,9 +50,18 @@ journey = run_path("scripts/ci-installed-journeys.py")
 digest = journey["digest"]
 root, data = map(Path, sys.argv[1:])
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
 runtime = data / "bin/elastos"
 sha = digest(runtime) if runtime.is_file() else "unavailable: installation did not complete"
-results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run"}
+provider = data / "bin/model-provider"
+provider_sha = digest(provider) if provider.is_file() else "unavailable: provider installation did not complete"
+source_manifest_sha = digest(data / "components.json") if (data / "components.json").is_file() else "unavailable"
+try:
+    engine = journey["engine_receipt"](data)
+except (OSError, ValueError, AssertionError, KeyError, RuntimeError):
+    engine = None
+results = {name: "failed or not run" for name in (
+    "home_screenshots", "model_package_admission", "installed_runtime_reply", "process_cleanup", "disk_reserve")}
 elapsed = 0
 records = []
 paths = sorted(root.glob("run-*/installed-journeys.json")) or [root / "installed-journeys.json"]
@@ -70,18 +69,31 @@ for path in paths:
     if path.exists():
         row = json.loads(path.read_text())
         records.append(row)
-        elapsed += row.get("elapsed_seconds", 0)
+        elapsed += row.get("elapsed_seconds", 0) + row.get("fixture_preparation_seconds", 0)
 expected_runs = 3 if sys.platform == "darwin" else 1
 for name in results:
     if len(records) == expected_runs and all(row.get("results", {}).get(name) == "passed" for row in records):
         results[name] = "passed"
-spread = journey["TIMING"]["timing_spread"](records, expected_runs)
-if any(row.get("candidate") != commit or row.get("installed_runtime_sha256") != sha for row in records):
+spread = (journey["TIMING"]["timing_spread"](records, expected_runs) if sys.platform == "darwin" else
+          {"status": "unavailable_with_confined_provider_stderr", "expected_runs": expected_runs, "recorded_runs": len(records)})
+current = lambda row: (row.get("candidate") == commit and row.get("source_tree") == tree
+                       and row.get("installed_runtime_sha256") == sha
+                       and row.get("installed_model_provider_sha256") == provider_sha
+                       and row.get("source_components_sha256") == source_manifest_sha)
+if len(records) != expected_runs or engine is None or any(not current(row) or row.get("installed_engine") != engine for row in records):
     spread = {"status": "incomplete", "expected_runs": expected_runs, "recorded_runs": len(records)}
+absence_path = root / "engine-absent-home/installed-journeys.json"
+absence = json.loads(absence_path.read_text()) if absence_path.exists() else {}
+results["engine_absent_home"] = ("passed" if current(absence) and absence.get("engine_absent") is True
+                                and all(absence.get("results", {}).get(name) == "passed" for name in
+                                        ("engine_absent_home", "home_screenshots", "process_cleanup", "disk_reserve"))
+                                else "failed or not run")
+elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_seconds", 0)
 (root / "core-summary.json").write_text(json.dumps({
-    "candidate": commit, "installed_runtime_sha256": sha,
+    "candidate": commit, "source_tree": tree, "installed_runtime_sha256": sha,
     "results": results, "elapsed_seconds": elapsed, "model_timing_spread": spread,
-    "fixture_policy": "fresh Home state and engine per run; same host with potentially warm OS file cache",
+    "fixture_policy": "fresh Home state and engine process per run; verified source engine prerequisite; same host with potentially warm OS file cache",
+    "engine_absent_home": absence,
 }, indent=2) + "\n")
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
@@ -89,9 +101,10 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
     summary.write("\nEach run uses fresh Home state and a new engine process on the same host. OS file cache can warm between runs.\n")
+    summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh Home proves ordinary UI with the optional engine absent.\n")
     summary.write(f"\nTiming receipts: {spread['status']} ({spread['recorded_runs']}/{expected_runs} runs).\n")
-    summary.write("\nEngine readiness starts at endpoint entry; other times start at worker entry. Generation excludes delta Applied waits and includes HTTP/stream handling. Applied waits include coordinator queue, reconciliation and durable storage.\n")
     if spread["status"] == "complete":
+        summary.write("\nEngine readiness starts at endpoint entry; other times start at worker entry. Generation excludes delta Applied waits and includes HTTP/stream handling. Applied waits include coordinator queue, reconciliation and durable storage.\n")
         summary.write("\n| Duration (ms) | Each run | Min | Max | Spread |\n| --- | --- | --- | --- | --- |\n")
         for name, item in spread["durations_ms"].items():
             summary.write(f"| {name} | {', '.join(map(str, item['values']))} | {item['min']} | {item['max']} | {item['spread']} |\n")
@@ -100,8 +113,8 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
             item = row["model_timing"]["durations"]
             summary.write(f"| {index} | {item['delta_acknowledgement_count']} | {item['delta_acknowledgement_max_ms']} | {item['terminal_acknowledgement_count']} |\n")
     summary.write(f"\nRecorded journey execution time: {elapsed} seconds. Package identity and screenshots are in the journey artifact.\n")
-if spread["status"] != "complete":
-    raise SystemExit("installed journey timing series is incomplete")
+if spread["status"] == "incomplete" or any(result != "passed" for result in results.values()):
+    raise SystemExit("installed journey acceptance is incomplete")
 PY
         ;;
     *) echo "Usage: $0 prepare|home|home-repeat|summary" >&2; exit 2 ;;

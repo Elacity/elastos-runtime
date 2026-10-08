@@ -4,13 +4,13 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync } from "node:fs";
-import { resolve, join, sep } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, lstatSync, openSync, readSync, closeSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const [dataArg, inputsArg, outputArg] = process.argv.slice(2);
-const data = resolve(dataArg), inputs = resolve(inputsArg), output = resolve(outputArg);
+const root = fileURLToPath(new URL("../", import.meta.url));
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
-const canonical = value => JSON.stringify(sort(value));
+export const canonical = value => JSON.stringify(sort(value));
 function sort(value) {
   if (Array.isArray(value)) return value.map(sort);
   if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(k => [k, sort(value[k])]));
@@ -31,57 +31,177 @@ function encode(bytes, alphabet, bits) {
   for (const byte of bytes) { if (byte) break; result = alphabet[0] + result; }
   return result;
 }
-const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), Buffer.from(sha(bytes), "hex")]), "abcdefghijklmnopqrstuvwxyz234567", 5);
-const entry = JSON.parse(readFileSync("model-catalog.json")).payload.entries.find(row => row.capsule_manifest.name.startsWith("smollm2-"));
-assert(entry, "source catalog supplies SmolLM2 provenance");
-const model = join(inputs, "SmolLM2-135M-Instruct-Q8_0.gguf");
-const license = readFileSync(join(inputs, "LICENSE"));
-assert.equal(sha(readFileSync(model)), "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a");
-assert.equal(sha(license), "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30");
-const packageDir = join(output, "package");
-mkdirSync(packageDir, { recursive: true, mode: 0o700 });
-const files = {
-  "LICENSE": license, "LICENSE.base": license,
-  "PROVENANCE.md": Buffer.from("Isolated CI publisher attestation. Weights match the pinned unsloth Q8_0 quantization of HuggingFaceTB/SmolLM2-135M-Instruct. The source catalog records repository revisions and Apache-2.0 licensing. This fixture uses its own temporary publisher key.\n"),
-  "capsule.json": Buffer.from(canonical(entry.capsule_manifest)),
+export const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), Buffer.from(sha(bytes), "hex")]), "abcdefghijklmnopqrstuvwxyz234567", 5);
+
+// Fixture provenance belongs to this producer, independently of any production
+// catalog. The build-only input proof uses these same immutable byte pins.
+export const SMOL_FIXTURE = {
+  model: { name: "SmolLM2-135M-Instruct-Q8_0.gguf", size: 144811072, sha256: "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a" },
+  license: { name: "LICENSE", size: 11358, sha256: "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" },
+  capsule_manifest: {
+    schema: "elastos.capsule/v1", name: "smollm2-135m-instruct-q8-0-local", role: "content", type: "data",
+    projections: ["content"], version: "0.1.0", entrypoint: "weights.gguf",
+    model_content: {
+      consumer_interface: "elastos.provider.model", consumer_interface_version: "0.1.0", engine: "llama.cpp",
+      format: "gguf", quantization: "Q8_0", minimum_memory_mb: 512,
+      license: { path: "LICENSE", spdx_id: "Apache-2.0" },
+      provenance: {
+        base_license: { path: "LICENSE.base", spdx_id: "Apache-2.0" },
+        base_repository: "HuggingFaceTB/SmolLM2-135M-Instruct", base_revision: "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+        quantized_repository: "unsloth/SmolLM2-135M-Instruct-GGUF", quantized_revision: "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
+        path: "PROVENANCE.md",
+      },
+    },
+  },
 };
-for (const [name, bytes] of Object.entries(files)) writeFileSync(join(packageDir, name), bytes, { mode: 0o400 });
-copyFileSync(model, join(packageDir, "weights.gguf"));
-chmodSync(join(packageDir, "weights.gguf"), 0o400);
-const digest = createHash("sha256");
-for (const file of entry.object_manifest.files) {
-  if (files[file.path]) { file.size = files[file.path].length; file.sha256 = sha(files[file.path]); }
-  digest.update(`${file.path}\0${file.sha256}\0${file.size}\0`);
+
+function regular(path) {
+  for (let current = resolve(path);; current = dirname(current)) {
+    assert(!lstatSync(current).isSymbolicLink(), "fixture input path contains a symlink");
+    if (current === dirname(current)) break;
+  }
+  const stat = lstatSync(path);
+  assert(stat.isFile() && stat.nlink === 1, "fixture input must be a single-link regular file");
+  return stat;
 }
-entry.object_manifest.content_digest = `sha256:${digest.digest("hex")}`;
-writeFileSync(join(packageDir, "_elastos_object.json"), canonical(entry.object_manifest), { mode: 0o400 });
-const manifestBytes = readFileSync(join(data, "components.json"));
-const components = JSON.parse(manifestBytes);
-const host = ({ "linux-x64": "linux-amd64", "linux-arm64": "linux-arm64", "darwin-arm64": "darwin-arm64" })[`${process.platform}-${process.arch}`];
-assert(host, "supported installed Kubo platform required");
-const component = components.external.kubo, info = component.platforms[host];
-assert(info, "installed manifest declares Kubo for this platform");
-const sourceManifestBytes = readFileSync("components.json");
-const sourceInfo = JSON.parse(sourceManifestBytes).external.kubo.platforms[host];
-for (const field of ["url", "checksum", "extract_path"]) assert.equal(info[field], sourceInfo[field], `Kubo ${field} matches the archive-verifying seed contract`);
-// seed-kubo-cache.sh installs the archive-verified executable at this path.
-const installPath = "bin/kubo";
-const kubo = resolve(data, installPath), repo = join(data, "ipfs-repo");
-assert(kubo.startsWith(data + sep), "seeded Kubo executable stays inside the data root");
-const kuboReceipt = { platform: host, install_path: installPath, archive_checksum: info.checksum, executable_sha256: `sha256:${sha(readFileSync(kubo))}`, components_sha256: `sha256:${sha(manifestBytes)}`, source_components_sha256: `sha256:${sha(sourceManifestBytes)}` };
-const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024 }).trim();
-run(["init", "--empty-repo"]);
-for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
-run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
-entry.cid = run(["add", "--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false", packageDir]).split("\n").at(-1);
-assert.match(entry.cid, /^bafy[a-z2-7]+$/);
-const payload = { schema: "elastos.model.catalog/v1", published_at: Math.floor(Date.now() / 1000), entries: [entry] };
-const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
-const signer_did = "did:key:z" + encode(Buffer.concat([Buffer.from([0xed, 1]), publicBytes]), "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz");
-const message = createHash("sha256").update("elastos.model.catalog.v1\0").update(canonical(payload)).digest();
-const catalog = Buffer.from(canonical({ payload, signer_did, signature: sign(null, message, privateKey).toString("hex") }));
-writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
-components.model_catalog = { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: 1024 ** 3, max_model_memory_bytes: 4 * 1024 ** 3 } };
-writeFileSync(join(data, "components.json"), JSON.stringify(components), { mode: 0o600 });
-writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: entry.object_manifest.files.find(f => f.path === "weights.gguf").sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
+
+export function fileRecord(path, name, expected) {
+  const stat = regular(path);
+  if (expected) assert.equal(stat.size, expected.size, `${name} differs from its pinned size`);
+  const fd = openSync(path, "r"), value = createHash("sha256"), chunk = Buffer.alloc(1024 * 1024);
+  try {
+    for (let count; (count = readSync(fd, chunk)) > 0;) value.update(chunk.subarray(0, count));
+  } finally { closeSync(fd); }
+  const record = { path: name, size: stat.size, sha256: value.digest("hex") };
+  if (expected) assert.equal(record.sha256, expected.sha256, `${name} differs from its pinned checksum`);
+  return record;
+}
+
+export function contentManifest(files) {
+  const sorted = [...files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  const digest = createHash("sha256");
+  for (const file of sorted) digest.update(`${file.path}\0${file.sha256}\0${file.size}\0`);
+  return { schema: "elastos.content.object.manifest/v1", kind: "capsule", files: sorted, content_digest: `sha256:${digest.digest("hex")}` };
+}
+
+export function buildSmolEntry(inputs, packageDir) {
+  const model = join(inputs, SMOL_FIXTURE.model.name);
+  fileRecord(model, "weights.gguf", SMOL_FIXTURE.model);
+  fileRecord(join(inputs, "LICENSE"), "LICENSE", SMOL_FIXTURE.license);
+  const license = readFileSync(join(inputs, "LICENSE"));
+  const provenance = SMOL_FIXTURE.capsule_manifest.model_content.provenance;
+  const files = {
+    LICENSE: license, "LICENSE.base": license,
+    "PROVENANCE.md": Buffer.from(`Isolated CI publisher attestation. Apache-2.0 base: ${provenance.base_repository} at ${provenance.base_revision}. Q8_0 weights: ${provenance.quantized_repository} at ${provenance.quantized_revision}. Weights SHA-256: ${SMOL_FIXTURE.model.sha256}. This fixture uses an in-memory disposable publisher key.\n`),
+    "capsule.json": Buffer.from(canonical(SMOL_FIXTURE.capsule_manifest)),
+  };
+  mkdirSync(packageDir, { mode: 0o700 });
+  for (const [name, bytes] of Object.entries(files)) writeFileSync(join(packageDir, name), bytes, { mode: 0o400, flag: "wx" });
+  copyFileSync(model, join(packageDir, "weights.gguf"));
+  chmodSync(join(packageDir, "weights.gguf"), 0o400);
+  // Check the copied bytes before committing their complete closure metadata.
+  const weights = fileRecord(join(packageDir, "weights.gguf"), "weights.gguf", SMOL_FIXTURE.model);
+  const object_manifest = contentManifest([
+    ...Object.entries(files).map(([path, bytes]) => ({ path, size: bytes.length, sha256: sha(bytes) })), weights,
+  ]);
+  writeFileSync(join(packageDir, "_elastos_object.json"), canonical(object_manifest), { mode: 0o400, flag: "wx" });
+  return { capsule_manifest: structuredClone(SMOL_FIXTURE.capsule_manifest), object_manifest };
+}
+
+export function verifyInstalledKubo(data, components, host, recipe) {
+  const component = components.external?.kubo, info = component?.platforms?.[host];
+  assert(info, "installed manifest declares Kubo for this platform");
+  const receiptPath = join(data, "receipts/kubo-build.json");
+  regular(receiptPath);
+  const receiptBytes = readFileSync(receiptPath), receipt = JSON.parse(receiptBytes);
+  assert.equal(receipt.schema, "elastos.release-upstream-input/v1");
+  assert.equal(receipt.component, "kubo");
+  assert.equal(receipt.platform, host);
+  for (const field of ["extract_path", "install_path"]) assert.equal(receipt[field], recipe[field], `Kubo receipt ${field} matches the build recipe`);
+  assert.equal(receipt.release_path, `kubo-${host}.tar.gz`);
+  assert.match(receipt.checksum, /^sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(component.capsule_metadata?.platforms?.[host], receipt.capsule_metadata, "installed Kubo capsule metadata matches its build receipt");
+  assert.equal(component.capsule_metadata.install_path, "capsules/kubo");
+  assert.equal(receipt.capsule_metadata.checksum, receipt.checksum);
+  assert.equal(receipt.capsule_metadata.install_path, "capsules/kubo");
+  assert.equal(receipt.capsule_metadata.extract_path, recipe.root);
+  assert.equal(receipt.capsule_metadata.release_path, receipt.release_path);
+  assert.equal(receipt.capsule_metadata.size, receipt.size);
+  const capsule = join(data, "capsules/kubo");
+  regular(join(capsule, ".elastos-artifact-sha256"));
+  assert.equal(readFileSync(join(capsule, ".elastos-artifact-sha256"), "utf8"), receipt.checksum.slice(7) + "\n", "Kubo artifact marker matches its build receipt");
+  const indexPath = join(capsule, "_elastos_object.json");
+  regular(indexPath);
+  assert.deepEqual(JSON.parse(readFileSync(indexPath)), receipt.object_manifest, "Kubo closure matches its build receipt");
+  const files = receipt.object_manifest.files;
+  assert(Array.isArray(files) && files.length > 0 && files.length <= 4096, "Kubo closure has a bounded file set");
+  const names = new Set();
+  for (const file of files) {
+    assert(/^[A-Za-z0-9][A-Za-z0-9._+-]*(\/[A-Za-z0-9][A-Za-z0-9._+-]*)*$/.test(file.path) && !names.has(file.path), "Kubo closure requires unique portable file paths");
+    names.add(file.path);
+    fileRecord(join(capsule, file.path), file.path, file);
+  }
+  assert.deepEqual(contentManifest(files), receipt.object_manifest, "Kubo closure digest matches its complete file records");
+  assert.deepEqual(JSON.parse(readFileSync(join(capsule, "capsule.json"))), receipt.capsule_manifest, "Kubo capsule manifest matches its build receipt");
+  assert.deepEqual(receipt.capsule_manifest, {
+    schema: "elastos.capsule/v1", name: recipe.component, version: recipe.version,
+    role: "content", type: "data", projections: ["content"], entrypoint: recipe.entrypoint,
+  }, "Kubo passive capsule manifest matches its build recipe");
+  const provenance = JSON.parse(readFileSync(join(capsule, "PROVENANCE.json")));
+  assert.equal(provenance.recipe_sha256, sha(Buffer.from(canonical(recipe) + "\n")), "Kubo provenance binds the current pinned build recipe");
+  assert.deepEqual(provenance.upstream, recipe.source);
+  for (const notice of [...recipe.license.files, ...(recipe.notices || [])]) {
+    const file = files.find(file => file.path === notice.name);
+    assert(file, "Kubo closure includes each pinned license notice");
+    assert.equal(`sha256:${file.sha256}`, notice.source.checksum, "Kubo license bytes match the build recipe");
+  }
+  const installPath = "bin/kubo";
+  assert.equal(info.install_path, installPath);
+  const executable = fileRecord(join(data, installPath), recipe.entrypoint);
+  const capsuleExecutable = files.find(file => file.path === recipe.entrypoint);
+  assert(capsuleExecutable, "Kubo closure includes its executable");
+  assert.deepEqual(executable, capsuleExecutable, "installed Kubo executable matches its licensed capsule");
+  assert.equal(info.checksum, `sha256:${executable.sha256}`, "installed Kubo native checksum matches components");
+  assert.equal(info.size, executable.size);
+  return { platform: host, install_path: installPath, archive_checksum: receipt.checksum, executable_sha256: info.checksum, build_receipt_sha256: `sha256:${sha(receiptBytes)}` };
+}
+
+export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)) {
+  const payload = { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries: [entry] };
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  const signer_did = "did:key:z" + encode(Buffer.concat([Buffer.from([0xed, 1]), publicBytes]), "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz");
+  const message = createHash("sha256").update("elastos.model.catalog.v1\0").update(canonical(payload)).digest();
+  const catalog = Buffer.from(canonical({ payload, signer_did, signature: sign(null, message, privateKey).toString("hex") }));
+  return { catalog, trust: { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: 1024 ** 3, max_model_memory_bytes: 4 * 1024 ** 3 } } };
+}
+
+function main(args) {
+  assert.equal(args.length, 3, "usage: ci-model-package.mjs <isolated-data> <pinned-inputs> <fixture-output>");
+  const [data, inputs, output] = args.map(arg => resolve(arg));
+  const manifestPath = join(data, "components.json");
+  regular(manifestPath);
+  const manifestBytes = readFileSync(manifestPath), components = JSON.parse(manifestBytes);
+  const host = ({ "linux-x64": "linux-amd64", "linux-arm64": "linux-arm64", "darwin-arm64": "darwin-arm64" })[`${process.platform}-${process.arch}`];
+  assert(host, "supported installed Kubo platform required");
+  const recipes = JSON.parse(readFileSync(join(root, "scripts/release-upstream-recipes.json"))).recipes.filter(row => row.component === "kubo" && row.platform === host);
+  assert.equal(recipes.length, 1, "Kubo requires one pinned build recipe for this platform");
+  const kuboReceipt = verifyInstalledKubo(data, components, host, recipes[0]);
+  kuboReceipt.components_sha256 = `sha256:${sha(manifestBytes)}`;
+  mkdirSync(output, { recursive: true, mode: 0o700 });
+  const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir);
+  const kubo = join(data, "bin/kubo"), repo = join(data, "ipfs-repo");
+  const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120000 }).trim();
+  run(["init", "--empty-repo"]);
+  for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
+  run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
+  entry.cid = run(["add", "--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false", packageDir]).split("\n").at(-1);
+  assert.match(entry.cid, /^bafy[a-z2-7]+$/);
+  const { catalog, trust } = signedCatalog(entry);
+  writeFileSync(join(data, "model-catalog.json"), catalog, { mode: 0o600 });
+  components.model_catalog = trust;
+  writeFileSync(manifestPath, JSON.stringify(components), { mode: 0o600 });
+  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: "local pinned Kubo package; Runtime Use admission", kubo: kuboReceipt }, null, 2));
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));

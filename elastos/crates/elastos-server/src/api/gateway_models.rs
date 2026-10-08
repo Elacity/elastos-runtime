@@ -495,6 +495,8 @@ struct SystemSummaryResponse {
     app: SystemCapsuleIdentity,
     appearance: HomeAppearanceSummary,
     source: SystemSourceSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_update: Option<serde_json::Value>,
     runtime: HomeRuntimeSummary,
     wallet_accounts: SystemWalletAccountsSummary,
     wallet_approvals: SystemWalletApprovalsSummary,
