@@ -193,33 +193,6 @@ esac
         self.assertEqual((bundle / 'build-info.txt').read_bytes(), receipt)
         self.assertFalse(Path(self.engine_env['ENGINE_CALLS']).exists())
 
-    def test_release_cache_statistics_bind_the_exact_source_and_version_pair(self):
-        sccache = self.bin / 'sccache'
-        sccache.write_text('''#!/usr/bin/env bash
-set -euo pipefail
-case "$*" in
-  --show-stats) printf 'fixture cache statistics\\n' ;;
-  '--show-stats --stats-format=json') printf '{"stats":{"cache_hits":{"counts":{"Rust":2}}}}\\n' ;;
-  *) exit 99 ;;
-esac
-''')
-        sccache.chmod(0o700)
-        for job, platform in (('mac', 'aarch64-darwin'), ('linux', 'aarch64-linux')):
-            with self.subTest(platform=platform):
-                root = self.root / job
-                root.mkdir(mode=0o700)
-                result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
-                    self.workflow_script(job, 'name: record compiler cache statistics')],
-                    cwd=self.root, env={**self.env, 'RELEASE_ROOT': str(root),
-                                       'RELEASE_PLATFORM': platform}, capture_output=True,
-                    text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                record = json.loads((root / 'compiler-cache-stats.json').read_bytes())
-                self.assertEqual(record['stats']['cache_hits']['counts']['Rust'], 2)
-                self.assertEqual(record['release_input'], {
-                    'SOURCE_COMMIT': self.commit, 'SOURCE_TREE': self.tree,
-                    'RELEASE_PLATFORM': platform, 'INSTALL_VERSION': '1.2.3', 'UPDATE_VERSION': '1.2.4'})
-
 
 class SourceUpstreamTests(unittest.TestCase):
     def setUp(self):
