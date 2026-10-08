@@ -52,6 +52,14 @@ const RAW_IDENTITY_RE = /(?:did:(?:key|elastos):|\bz6Mk[1-9A-HJ-NP-Za-km-z]{20,}
 
 export class AcceptanceEvidenceError extends Error {}
 
+export function assertFreshOwnerEnrollmentPrecondition(aStoredCredentials, bStoredCredentials) {
+  if (aStoredCredentials !== 0 || bStoredCredentials !== 0) {
+    throw new AcceptanceEvidenceError(
+      "fresh owner enrollment requires empty credential stores on both sides; reset the issue-owned fixture Homes and browser profiles before this run",
+    );
+  }
+}
+
 function exactObjectKeys(value, keys, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new AcceptanceEvidenceError(`${label} must be an object`);

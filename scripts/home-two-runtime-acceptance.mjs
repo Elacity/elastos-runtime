@@ -9,7 +9,7 @@
 // way that normal UI never shows a raw DID.
 //
 // Each fresh Home enrolls its first owner passkey with a virtual authenticator.
-// A persisted credential can also be loaded from the fixture browser profile.
+// Both fixture profiles must have empty credential stores before this run.
 // This run proves owner enrollment; guest account enrollment is a separate leg.
 //
 //   ELASTOS_A_BASE_URL=<fixture-a-origin> \
@@ -33,6 +33,7 @@ import {
   assertDistinctRuntimeEvidence,
   assertExactDirectConversation,
   assertFreshFixturePrecondition,
+  assertFreshOwnerEnrollmentPrecondition,
   assertIdentityFrame,
   assertRestartTransition,
   createAcceptanceReport,
@@ -44,7 +45,13 @@ import {
 
 const CONFIG = (() => {
   try {
-    return loadAcceptanceConfig(process.env);
+    const config = loadAcceptanceConfig(process.env);
+    // Admit both sides before either browser starts or enrolls a passkey.
+    assertFreshOwnerEnrollmentPrecondition(
+      readCredentialStore(config.a.profile).length,
+      readCredentialStore(config.b.profile).length,
+    );
+    return config;
   } catch (error) {
     console.error("FAIL home-two-runtime-acceptance configuration");
     console.log(JSON.stringify({
@@ -135,9 +142,13 @@ async function persistCredentials(side) {
     { mode: 0o600 },
   );
   chmodSync(credentialStorePath(side.profile), 0o600);
+  return credentials.length;
 }
 
 async function openSide(side) {
+  const stored = readCredentialStore(side.profile);
+  // Recheck before launch if fixture state changed after configuration admission.
+  assertFreshOwnerEnrollmentPrecondition(stored.length, 0);
   const context = await chromium.launchPersistentContext(side.profile, {
     acceptDownloads: true,
     headless: true,
@@ -182,7 +193,6 @@ async function openSide(side) {
       automaticPresenceSimulation: true,
     },
   });
-  const stored = readCredentialStore(side.profile);
   for (const credential of stored) {
     await cdp.send("WebAuthn.addCredential", { authenticatorId, credential });
   }
@@ -201,7 +211,7 @@ async function openSide(side) {
 async function ensureAccount(side) {
   if (side.hasStoredCredential) {
     await signIn(side);
-    return;
+    return { enrollment: "resumed" };
   }
   // First passkey on a fresh Home becomes the admin.
   await side.page.goto(`${side.base}/apps/home/`, { waitUntil: "domcontentloaded" });
@@ -220,9 +230,11 @@ async function ensureAccount(side) {
   assertOk(completion.ok(), `${side.prefix}: passkey registration failed`, {
     status: completion.status(),
   });
-  await persistCredentials(side);
+  const credentials = await persistCredentials(side);
+  assertOk(credentials === 1, `${side.prefix}: fresh enrollment did not create exactly one passkey`, { credential_count: credentials });
   side.hasStoredCredential = true;
   await signIn(side);
+  return { enrollment: "enrolled", credential_count: credentials };
 }
 
 async function signIn(side) {
@@ -1156,9 +1168,11 @@ async function main() {
     };
 
     await runLeg(report, "provisioning_and_sign_in", "provision and sign in both fixture Homes", async () => {
-      await ensureAccount(a);
-      await ensureAccount(b);
-      return { a: "signed", b: "signed", enrollment_surface: "fresh_home_owner_passkey" };
+      const aEnrollment = await ensureAccount(a);
+      const bEnrollment = await ensureAccount(b);
+      assertOk(aEnrollment.enrollment === "enrolled" && bEnrollment.enrollment === "enrolled",
+        "signup proof requires fresh owner enrollment on both fixture Homes");
+      return { a: aEnrollment, b: bEnrollment, enrollment_surface: "home_owner_passkey" };
     });
 
     let aDeviceDid;

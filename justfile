@@ -204,6 +204,7 @@ verify-ci: ci-test-capsules ci-test-elastos
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs
+    node scripts/home-shell-bridge-smoke.mjs
     node scripts/people-discovery-smoke.mjs
     node scripts/inbox-product-behavior-smoke.mjs
     node scripts/archive-product-behavior-smoke.mjs

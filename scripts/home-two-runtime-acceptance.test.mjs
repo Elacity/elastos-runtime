@@ -17,6 +17,7 @@ import {
   assertDistinctRuntimeEvidence,
   assertExactDirectConversation,
   assertFreshFixturePrecondition,
+  assertFreshOwnerEnrollmentPrecondition,
   assertIdentityFrame,
   assertRecoverySetupEvidence,
   assertRestartTransition,
@@ -156,6 +157,13 @@ test("a loopback Home without launcher-owned fixture manifests is rejected", (t)
   delete nonFixture.ELASTOS_A_FIXTURE_MANIFEST;
   delete nonFixture.ELASTOS_B_FIXTURE_MANIFEST;
   assert.throws(() => loadAcceptanceConfig(nonFixture), /ELASTOS_A_FIXTURE_MANIFEST is required/);
+});
+
+test("signup proof refuses a stored credential on either fixture before enrollment", () => {
+  assert.doesNotThrow(() => assertFreshOwnerEnrollmentPrecondition(0, 0));
+  for (const counts of [[1, 0], [0, 1], [1, 1], [undefined, 0], [0, "0"]]) {
+    assert.throws(() => assertFreshOwnerEnrollmentPrecondition(...counts), /reset the issue-owned fixture Homes and browser profiles/);
+  }
 });
 
 test("System evidence must prove two distinct manifest-bound Runtime instances", (t) => {

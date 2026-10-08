@@ -67,6 +67,7 @@ jobs:
         run: |
           node --version
           node scripts/home-shell-regression-smoke.mjs
+          node scripts/home-shell-bridge-smoke.mjs
           node scripts/home-agent-shell-smoke.mjs
           node scripts/people-discovery-smoke.mjs
           node --test scripts/chat-room-reconnect.test.mjs
