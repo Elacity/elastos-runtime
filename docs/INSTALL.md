@@ -225,6 +225,12 @@ Replace `<previous head CID>` with the saved CID. A plain update to an older
 release is refused. Undo keeps your identity, accounts, and user data, including
 data written after the update.
 
+Undo also keeps Community. If this Home joined the release Community network,
+it stays joined after Undo: Runtime never drops a network it has accepted. An
+older release with no network, or with an older version of the same network,
+leaves the joined one in place. To keep a Home out of Community, choose that
+before its first start with `elastos setup --isolated`.
+
 For a legacy Home, the first update to a new publisher key uses the installer's
 re-trust step. After that step, Undo accepts only heads signed by the current
 trusted key. A head signed by the former key is refused and the installation

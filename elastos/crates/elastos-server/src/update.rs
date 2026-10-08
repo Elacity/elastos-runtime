@@ -5090,6 +5090,26 @@ mod tests {
         binary: &Path,
         published: &PublishedRelease,
     ) -> (anyhow::Result<()>, Vec<(String, bool)>) {
+        install_published(data, binary, published, false).await
+    }
+
+    /// `elastos update --rollback-to <head>` (Undo) to a published release.
+    #[cfg(unix)]
+    async fn undo_to_published(
+        data: &Path,
+        binary: &Path,
+        published: &PublishedRelease,
+    ) -> anyhow::Result<()> {
+        install_published(data, binary, published, true).await.0
+    }
+
+    #[cfg(unix)]
+    async fn install_published(
+        data: &Path,
+        binary: &Path,
+        published: &PublishedRelease,
+        rollback: bool,
+    ) -> (anyhow::Result<()>, Vec<(String, bool)>) {
         let previous_binary = std::fs::read(binary).unwrap();
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = requests.clone();
@@ -5118,7 +5138,7 @@ mod tests {
             vec![],
             "0.7.0",
             true,
-            false,
+            rollback,
             false,
         )
         .await;
@@ -5174,6 +5194,49 @@ mod tests {
             components
         );
         assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    /// Undo installs an older release. A Home that joined the release network
+    /// keeps it: a release without a pin leaves it alone, and an older pin
+    /// never replaces the newer accepted chain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undo_to_an_older_release_keeps_the_joined_network() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(2);
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        let joined = published_release(
+            NEXT_EXECUTABLE,
+            &components_pinning_network(&chain[1]),
+            Some(&chain[1]),
+        );
+        update_from_published(&data, &binary, &joined)
+            .await
+            .0
+            .unwrap();
+        assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[1]);
+
+        let unpinned_executable = b"#!/bin/sh
+printf 'elastos 0.7.1\n'
+# unpinned
+";
+        let unpinned = published_release(unpinned_executable, EMPTY_COMPONENTS, None);
+        undo_to_published(&data, &binary, &unpinned).await.unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), unpinned_executable);
+        assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[1]);
+
+        let older_executable = b"#!/bin/sh
+printf 'elastos 0.7.1\n'
+# older pin
+";
+        let older_pin = published_release(
+            older_executable,
+            &components_pinning_network(&chain[0]),
+            Some(&chain[0]),
+        );
+        undo_to_published(&data, &binary, &older_pin).await.unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), older_executable);
+        assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[1]);
     }
 
     #[cfg(unix)]
