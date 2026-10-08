@@ -9,8 +9,8 @@ for (const capsule of ["system", "marketplace"]) {
 }
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
-  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT }; window.ElastosModelManagement = {"), context);
-const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT } = context.window.testFailure;
+  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT }; window.ElastosModelManagement = {"), context);
+const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT } = context.window.testFailure;
 const cid = `bafybei${"a".repeat(52)}`;
 const preparation = { operation_id: "fixture", cid, state: "failed", total_bytes: 1024,
   completed_bytes: 512, cancel_requested: false, admitted: false, activation_pending: false };
@@ -37,6 +37,24 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   preparation.failure_class = invalid;
   assert.throws(() => parseRuntime(runtime, cid), /Invalid model response/);
 }
+preparation.failure_class = null;
+const admitted = { ...preparation, state: "admitted", admitted: true, failure_class: null, activation_pending: true };
+const unavailable = { ...runtime, admitted: true, preparation: admitted };
+for (const reason of ["unsupported_host", "source_engine_required"]) {
+  const value = { ...unavailable, dispatch_unavailable_reason: reason };
+  assert.equal(parseRuntime(value, cid).dispatch_unavailable_reason, reason);
+  assert.equal(operationRuntime({ ...value, ...admitted }, cid).dispatch_unavailable_reason, reason);
+  assert.throws(() => parseRuntime({ ...value, dispatch_ready: true, offer_id: `model:${"b".repeat(64)}` }, cid), /Invalid model response/);
+  assert.throws(() => parseRuntime({ ...runtime, dispatch_unavailable_reason: reason }, cid), /Invalid model response/);
+}
+for (const invalid of ["/private/provider?credential=secret", "__proto__", "constructor", ["unsupported_host"], { toString: () => "unsupported_host" }, {}, 7]) {
+  assert.throws(() => parseRuntime({ ...unavailable, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+  assert.throws(() => operationRuntime({ ...unavailable, ...admitted, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+}
+assert.deepEqual(Object.fromEntries(Object.entries(DISPATCH_UNAVAILABLE_TEXT)), {
+  unsupported_host: "Keep this model on this device. To run it, use a supported device.",
+  source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
+});
 const otherCid = `bafybei${"c".repeat(51)}e`;
 const catalogRow = (id, title) => ({
   name: title, title, role: "content", source: "signed-model-catalog", installed: false, launchable: false,

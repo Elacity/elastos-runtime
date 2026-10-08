@@ -2288,7 +2288,7 @@ fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Val
         // Jetson uses the pinned ARMv8.2 bundle on CPU. Runtime checks CPU
         // features and host library loading before it admits the engine.
         "linux-arm64" => (4, 0),
-        _ => anyhow::bail!("admitted model host profile is unavailable"),
+        _ => anyhow::bail!(crate::setup::LocalModelExecutionUnavailable::UnsupportedHost),
     };
     Ok(serde_json::json!({
         "context_size":ADMITTED_MODEL_CONTEXT_SIZE, "parallel":1, "threads":threads, "batch_threads":threads,
@@ -2492,7 +2492,7 @@ fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value)
 /// inventory and signed catalog remain the owners; this projection stores nothing.
 pub(in crate::api) fn unavailable_model_runtime_projection() -> serde_json::Value {
     serde_json::json!({"admitted":false,"kept":false,
-        "dispatch_ready":false,"offer_id":null,"preparation":null})
+        "dispatch_ready":false,"dispatch_unavailable_reason":null,"offer_id":null,"preparation":null})
 }
 
 #[derive(PartialEq)]
@@ -2593,6 +2593,12 @@ pub(in crate::api) async fn model_runtime_projection(
             })
         })()
         .map_err(|error| {
+            if let Some(reason) =
+                error.downcast_ref::<crate::setup::LocalModelExecutionUnavailable>()
+            {
+                projection["dispatch_unavailable_reason"] =
+                    serde_json::json!(reason.public_class());
+            }
             tracing::debug!(%error, "model readiness binding unavailable");
             error
         })
@@ -2627,6 +2633,7 @@ pub(in crate::api) async fn model_runtime_projection(
                 .collect();
             if matching.len() == 1 && model_offer_matches(matching[0], &expected.offer) {
                 projection["dispatch_ready"] = serde_json::json!(true);
+                projection["dispatch_unavailable_reason"] = serde_json::Value::Null;
                 projection["offer_id"] = expected.offer["id"].clone();
             } else {
                 tracing::debug!(matches = matching.len(), "model readiness offer differs");
@@ -3433,8 +3440,10 @@ mod tests {
             local_model_startup_profile("linux-amd64").unwrap()
         );
         for platform in ["darwin-amd64", "linux-x86_64", "Linux-amd64", "*", ""] {
-            assert!(
-                local_model_startup_profile(platform).is_err(),
+            let error = local_model_startup_profile(platform).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::setup::LocalModelExecutionUnavailable>(),
+                Some(&crate::setup::LocalModelExecutionUnavailable::UnsupportedHost),
                 "{platform:?} has no proved host profile"
             );
         }
@@ -4080,6 +4089,7 @@ mod tests {
                     response["output"].clone()
                 };
                 assert_eq!(value["dispatch_ready"], true, "{response}");
+                assert!(value["dispatch_unavailable_reason"].is_null());
                 assert_eq!(value["kept"], true);
                 assert!(!value.to_string().contains("inference_ready"));
             }
@@ -4155,6 +4165,130 @@ mod tests {
                 model_runtime_projection(root.path(), None, &other, &record.package_cid, None)
                     .await;
             assert_eq!(unavailable["dispatch_ready"], false);
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_explains_only_missing_source_engine_and_preserves_content()
+        {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+            let platform = crate::setup::detect_platform();
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"] = serde_json::json!({
+                    "version":"fixture-v1", "platforms":{platform.clone():{
+                        "install_path":"libexec/fixture-engine", "binary_path":"llama-server",
+                        "checksum":format!("sha256:{}", "a".repeat(64))
+                    }}
+                });
+            });
+            let before = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+            let calls = backend.calls.lock().unwrap().clone();
+            let (app, token) = readiness_catalog_app(root.path(), registry.clone(), &context());
+            for (strategy, expected) in [
+                ("source-build", serde_json::json!("source_engine_required")),
+                ("local-copy", serde_json::json!("source_engine_required")),
+                ("prebuilt", serde_json::Value::Null),
+            ] {
+                change_config(root.path(), |config| {
+                    config["external"]["llama-server"]["platforms"][&platform]["strategy"] =
+                        serde_json::json!(strategy);
+                });
+                for method in ["catalog.list", "content.status"] {
+                    let input = if method == "catalog.list" {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"operation_id":record.operation_id})
+                    };
+                    let (status, response) = readiness_catalog_request(&app, &token, Some(serde_json::json!({
+                        "request_id":"engine-unavailable-status", "capsule":"marketplace",
+                        "interface":"elastos.marketplace.catalog", "method":method, "input":input
+                    }))).await;
+                    assert_eq!(status, axum::http::StatusCode::OK, "{response}");
+                    let value = if method == "catalog.list" {
+                        response["output"]["catalog"]["capsules"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["cid"] == record.package_cid)
+                            .unwrap()["model_runtime"]
+                            .clone()
+                    } else {
+                        response["output"].clone()
+                    };
+                    assert_eq!(value["admitted"], true);
+                    assert_eq!(value["kept"], true);
+                    assert_eq!(value["dispatch_ready"], false);
+                    assert_eq!(value["dispatch_unavailable_reason"], expected);
+                    assert!(!value.to_string().contains(root.path().to_str().unwrap()));
+                    assert!(!value.to_string().contains("No such file"));
+                }
+            }
+            // A present invalid receipt stays a general unavailable result. It
+            // cannot claim the missing-only source prerequisite or fetch a repair.
+            std::fs::create_dir_all(root.path().join("libexec/fixture-engine")).unwrap();
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"]["platforms"][&platform]["strategy"] =
+                    serde_json::json!("source-build");
+            });
+            let invalid = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(invalid["admitted"], true);
+            assert_eq!(invalid["dispatch_ready"], false);
+            assert!(invalid["dispatch_unavailable_reason"].is_null());
+            let mut other = context();
+            other.principal_id = "person:other-reader".into();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &other,
+                    &record.package_cid,
+                    None
+                )
+                .await,
+                unavailable_model_runtime_projection()
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+                before
+            );
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            let ready = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(ready["dispatch_ready"], true);
+            assert!(ready["dispatch_unavailable_reason"].is_null());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"]["platforms"][&platform]["checksum"] =
+                    serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+            });
+            let changed_pin = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(changed_pin["admitted"], true);
+            assert_eq!(changed_pin["dispatch_ready"], false);
+            assert!(changed_pin["dispatch_unavailable_reason"].is_null());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
         }
 
         #[tokio::test]

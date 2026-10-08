@@ -626,7 +626,13 @@ async fn dispatch_capsule_affordance(
                 if operation.is_some() && projection["preparation"].is_object() {
                     output = projection["preparation"].clone();
                 }
-                for field in ["admitted", "kept", "dispatch_ready", "offer_id"] {
+                for field in [
+                    "admitted",
+                    "kept",
+                    "dispatch_ready",
+                    "dispatch_unavailable_reason",
+                    "offer_id",
+                ] {
                     output[field] = projection[field].clone();
                 }
                 Ok(output)
