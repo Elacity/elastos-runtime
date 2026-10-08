@@ -2166,6 +2166,7 @@ pub(crate) async fn ensure_local_model_engine(
     verify_arm64_model_host(&platform)?;
     let bytes = fetch_first_party_component_via_carrier(
         data_dir,
+        info.cid.as_deref().filter(|cid| !cid.is_empty()),
         release_path,
         FirstPartyCarrierContext::Runtime,
     )
@@ -3270,25 +3271,25 @@ pub(crate) async fn stage_update_support(
             crate::install_transaction::validate_support_path(&relative)?;
             required_release_artifact_checksum(name, asset)?
                 .ok_or_else(|| anyhow::anyhow!("signed support checksum missing"))?;
-            let key =
-                if let Some(path) = asset.release_path.as_ref().filter(|path| !path.is_empty()) {
-                    anyhow::ensure!(
-                        !Path::new(path).is_absolute()
-                            && Path::new(path)
-                                .components()
-                                .all(|part| matches!(part, std::path::Component::Normal(_))),
-                        "unsafe signed support release path"
-                    );
-                    format!("release-path:{path}")
-                } else {
-                    let cid = asset
-                        .cid
-                        .as_ref()
-                        .filter(|cid| !cid.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("signed support source missing"))?;
-                    cid::Cid::try_from(cid.as_str())?;
-                    cid.clone()
-                };
+            // A signed CID names exact bytes; a release name may serve newer ones.
+            let key = if let Some(cid) = asset.cid.as_ref().filter(|cid| !cid.is_empty()) {
+                cid::Cid::try_from(cid.as_str())?;
+                cid.clone()
+            } else {
+                let path = asset
+                    .release_path
+                    .as_ref()
+                    .filter(|path| !path.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("signed support source missing"))?;
+                anyhow::ensure!(
+                    !Path::new(path).is_absolute()
+                        && Path::new(path)
+                            .components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_))),
+                    "unsafe signed support release path"
+                );
+                format!("release-path:{path}")
+            };
             owner.progress("downloading", &crate::update::download_message(asset.size))?;
             let bytes = fetch(key, Vec::new()).await?;
             owner.progress(
@@ -3532,6 +3533,7 @@ fn first_party_carrier_bind_addr(
 
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
+    cid: Option<&str>,
     release_path: &str,
     context: FirstPartyCarrierContext,
 ) -> anyhow::Result<Vec<u8>> {
@@ -3540,8 +3542,15 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    crate::carrier::fetch_file_from_trusted_source_bound(&source, release_path, 15, 30, bind_addr)
-        .await
+    crate::carrier::fetch_file_from_trusted_source_bound(
+        &source,
+        cid,
+        release_path,
+        15,
+        30,
+        bind_addr,
+    )
+    .await
 }
 
 fn require_component_not_model(name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -3574,7 +3583,9 @@ pub(crate) async fn install_first_party_component_via_carrier(
     let release_path = platform_info.release_path.as_deref().ok_or_else(|| {
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
-    let bytes = fetch_first_party_component_via_carrier(data_dir, release_path, context).await?;
+    let cid = platform_info.cid.as_deref().filter(|cid| !cid.is_empty());
+    let bytes =
+        fetch_first_party_component_via_carrier(data_dir, cid, release_path, context).await?;
 
     verify_checksum(name, &bytes, platform_info)?;
 
@@ -6858,44 +6869,66 @@ pub(crate) mod tests {
         }
 
         let _guard = ENV_LOCK.lock().await;
-        let (_tmp, data_dir, bytes, manifest) = archive_component_home_without_executable_record();
-        let platform = detect_platform();
-        let binary = data_dir.join("bin/kubo");
-        let plan = |data_dir: &Path| {
-            plan_update_support(data_dir, &manifest, &manifest, &platform, true)
-                .into_iter()
-                .map(|item| (item.name.to_string(), item.artifact, item.metadata))
-                .collect::<Vec<_>>()
-        };
-        assert!(verify_installed_component(&data_dir, "kubo", &binary).is_err());
-        assert_eq!(plan(&data_dir), [("kubo".to_string(), false, true)]);
+        // A signed CID wins over the release name, which may serve newer bytes;
+        // without a CID the release name is the source.
+        for signed_cid in [false, true] {
+            let (_tmp, data_dir, bytes, manifest) =
+                archive_component_home_without_executable_record();
+            let platform = detect_platform();
+            let binary = data_dir.join("bin/kubo");
+            let plan = |data_dir: &Path| {
+                plan_update_support(data_dir, &manifest, &manifest, &platform, true)
+                    .into_iter()
+                    .map(|item| (item.name.to_string(), item.artifact, item.metadata))
+                    .collect::<Vec<_>>()
+            };
+            assert!(verify_installed_component(&data_dir, "kubo", &binary).is_err());
+            assert_eq!(plan(&data_dir), [("kubo".to_string(), false, true)]);
 
-        // The System update stages the metadata from the verified archive; the
-        // release transaction then publishes the staged tree.
-        let components = fs::read(data_dir.join("components.json")).unwrap();
-        let fetch: crate::update::FetchFn = Box::new(move |key, _| {
-            assert_eq!(key, "release-path:kubo.tar.gz");
-            let bytes = bytes.clone();
-            Box::pin(async move { Ok(bytes) })
-        });
-        let (_stage, paths) = stage_update_support(
-            &data_dir,
-            &components,
-            &components,
-            &platform,
-            &fetch,
-            &mut Owner,
-        )
-        .await
-        .unwrap();
-        assert_eq!(paths.len(), 1);
-        let (relative, staged) = &paths[0];
-        assert_eq!(relative, Path::new("capsules/kubo"));
-        fs::remove_dir_all(data_dir.join(relative)).unwrap();
-        fs::rename(staged, data_dir.join(relative)).unwrap();
+            // The System update stages the metadata from the verified archive; the
+            // release transaction then publishes the staged tree.
+            let mut components: serde_json::Value =
+                serde_json::from_slice(&fs::read(data_dir.join("components.json")).unwrap())
+                    .unwrap();
+            let expected_key = if signed_cid {
+                let digest = sha2::Sha256::digest(&bytes);
+                let hash = cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap();
+                let cid = cid::Cid::new_v1(0x55, hash).to_string();
+                components["external"]["kubo"]["capsule_metadata"]["platforms"][&platform]["cid"] =
+                    serde_json::json!(cid);
+                cid
+            } else {
+                "release-path:kubo.tar.gz".to_string()
+            };
+            let components = serde_json::to_vec(&components).unwrap();
+            let fetch: crate::update::FetchFn = Box::new(move |key, _| {
+                let bytes = if key == expected_key {
+                    bytes.clone()
+                } else {
+                    assert_eq!(key, "release-path:kubo.tar.gz");
+                    b"newer bytes under the same name".to_vec()
+                };
+                Box::pin(async move { Ok(bytes) })
+            });
+            let (_stage, paths) = stage_update_support(
+                &data_dir,
+                &components,
+                &components,
+                &platform,
+                &fetch,
+                &mut Owner,
+            )
+            .await
+            .unwrap();
+            assert_eq!(paths.len(), 1);
+            let (relative, staged) = &paths[0];
+            assert_eq!(relative, Path::new("capsules/kubo"));
+            fs::remove_dir_all(data_dir.join(relative)).unwrap();
+            fs::rename(staged, data_dir.join(relative)).unwrap();
 
-        verify_installed_component(&data_dir, "kubo", &binary).unwrap();
-        assert!(plan(&data_dir).is_empty());
+            verify_installed_component(&data_dir, "kubo", &binary).unwrap();
+            assert!(plan(&data_dir).is_empty());
+        }
     }
 
     #[test]
