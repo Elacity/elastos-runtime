@@ -243,7 +243,8 @@ sudo -v; [ -x $RELEASE_SEED_RUNTIME ]; [ -x $RELEASE_SEED_DATA/bin/ipfs-provider
 sudo systemctl stop $RELEASE_SEED_UNIT
 trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
 publish --preflight-only
-publish
+# Seeds on a Runtime older than the announcement removal still end with the old announcement error after commit; remove this once the seed runs a newer Runtime (#174).
+publish 2>&1 | tee import.log || grep -q 'committed; retry publication to announce its head: No running runtime found' import.log
 trap - EXIT; sudo systemctl start $RELEASE_SEED_UNIT
 EOF
 }

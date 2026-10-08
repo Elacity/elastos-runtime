@@ -184,8 +184,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every
    hash, stop the service, run the preflight, import, and start the service.
-   The import does not announce the release. Homes find it when they next
-   check.
+   The import sends no gossip. Older seed Runtimes still print `No running
+   runtime found` after the commit; that is expected, and the sequence accepts
+   only that error.
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull
