@@ -4312,8 +4312,9 @@ fn apply_reconnect_failure(state: &mut AppState, error: String) {
 /// message only while Community is open: a response that arrives after they
 /// moved to a direct conversation leaves that conversation's reading place.
 fn record_own_shared_send(state: &mut AppState, sent: ConversationObjectView) {
-    state.latest_seq = sent.seq;
+    state.latest_seq = state.latest_seq.max(sent.seq);
     state.objects.push(sent);
+    dedupe_objects(&mut state.objects);
     if state.direct.selected_conversation_id.is_none() {
         state.force_message_follow = true;
     }
@@ -4870,6 +4871,61 @@ mod tests {
         super::record_own_shared_send(&mut state, sent());
         assert!(!state.force_message_follow);
         assert_eq!(state.latest_seq, 7);
+    }
+
+    #[test]
+    fn a_late_community_receipt_keeps_one_object_and_the_newer_poll_cursor() {
+        let object = |seq, sender: &str, body: &str| ConversationObjectView {
+            seq,
+            sender: sender.into(),
+            sender_ref: None,
+            sender_profile_verified: Some(true),
+            from_current_session: sender == "Me",
+            kind: ConversationObjectKind::Text,
+            body: Some(body.into()),
+            emoji: None,
+            link: None,
+            attachment: None,
+            created_at: 1,
+        };
+        let sent = object(7, "Me", "accepted message");
+        let newer_peer = object(9, "Peer", "newer message");
+        let mut state = two_direct_conversations();
+        note_composer_edit(&mut state);
+        let sent_revision = state.composer_revision;
+        commit_direct_selection(&mut state, "direct:sha256:a").unwrap();
+        switch_composer_draft(&mut state, "accepted message");
+        note_composer_edit(&mut state);
+        commit_shared_selection(&mut state);
+        switch_composer_draft(&mut state, "direct draft");
+        note_composer_edit(&mut state);
+        let drafts = state.drafts.clone();
+        let revisions = (state.composer_revision, state.composer_edits);
+
+        let poll = RoomPollView {
+            objects: vec![sent.clone(), newer_peer],
+            ..shared_poll(9)
+        };
+        apply_active_poll_state(&mut state, poll);
+        // Polling has already admitted the accepted send and later traffic
+        // before its held HTTP response reaches the composer.
+        super::record_own_shared_send(&mut state, sent.clone());
+        super::record_own_shared_send(&mut state, sent);
+
+        assert_eq!(state.latest_seq, 9);
+        assert_eq!(state.objects.len(), 2);
+        assert_eq!(
+            state
+                .objects
+                .iter()
+                .filter(|object| object.seq == 7)
+                .count(),
+            1
+        );
+        assert_eq!(state.objects[1].body.as_deref(), Some("newer message"));
+        assert!(!settle_sent_draft(&mut state, &None, sent_revision));
+        assert_eq!(state.drafts, drafts);
+        assert_eq!((state.composer_revision, state.composer_edits), revisions);
     }
 
     #[test]
