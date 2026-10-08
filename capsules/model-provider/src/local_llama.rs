@@ -449,6 +449,27 @@ fn engine_arguments(
     target: &EngineTarget,
     alias: &str,
 ) -> Vec<OsString> {
+    engine_arguments_with_cpu_budget(
+        model_path,
+        settings,
+        target,
+        alias,
+        std::thread::available_parallelism().ok(),
+    )
+}
+
+fn engine_arguments_with_cpu_budget(
+    model_path: &str,
+    settings: &LocalLlamaSettings,
+    target: &EngineTarget,
+    alias: &str,
+    available_parallelism: Option<std::num::NonZeroUsize>,
+) -> Vec<OsString> {
+    // Runtime owns the saved thread ceilings. Reduce the actual worker count
+    // to this host's CPU budget without changing the activation binding.
+    let available_threads = available_parallelism
+        .map(|count| u32::try_from(count.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1);
     let mut args: Vec<OsString> = [
         "-m".into(),
         model_path.into(),
@@ -469,9 +490,13 @@ fn engine_arguments(
         "--parallel".into(),
         settings.parallel.to_string().into(),
         "--threads".into(),
-        settings.threads.to_string().into(),
+        settings.threads.min(available_threads).to_string().into(),
         "--threads-batch".into(),
-        settings.batch_threads.to_string().into(),
+        settings
+            .batch_threads
+            .min(available_threads)
+            .to_string()
+            .into(),
         "--gpu-layers".into(),
         settings.gpu_layers.to_string().into(),
         "--alias".into(),
@@ -1118,22 +1143,62 @@ mod tests {
         .collect();
 
         assert_eq!(
-            engine_arguments(
+            engine_arguments_with_cpu_budget(
                 "/models/model.gguf",
                 &settings,
                 &EngineTarget::Tcp(11434),
-                "private-alias"
+                "private-alias",
+                std::num::NonZeroUsize::new(8),
             ),
             expected
         );
-        let unix_args = engine_arguments(
+        let unix_args = engine_arguments_with_cpu_budget(
             "/models/model.gguf",
             &settings,
             &EngineTarget::Unix("/tmp/private-model.sock".into()),
             "private-alias",
+            std::num::NonZeroUsize::new(8),
         );
         assert_eq!(unix_args[3], OsString::from("/tmp/private-model.sock"));
         assert!(!unix_args.contains(&OsString::from("--port")));
+    }
+
+    #[test]
+    fn engine_threads_stay_within_host_budget_and_runtime_ceilings() {
+        let mut settings = LocalLlamaSettings {
+            context_size: 256,
+            parallel: 1,
+            threads: 8,
+            batch_threads: 8,
+            gpu_layers: 99,
+            health_timeout_ms: 120_000,
+            shutdown_timeout_ms: 5_000,
+            enable_thinking: false,
+        };
+        for (requested, available, expected) in [
+            ((8, 8), Some(3), (3, 3)),
+            ((4, 4), Some(2), (2, 2)),
+            ((8, 8), Some(16), (8, 8)),
+            ((3, 4), Some(16), (3, 4)),
+            ((8, 8), None, (1, 1)),
+        ] {
+            (settings.threads, settings.batch_threads) = requested;
+            let saved = settings.clone();
+            let args = engine_arguments_with_cpu_budget(
+                "/models/model.gguf",
+                &settings,
+                &EngineTarget::Tcp(11434),
+                "private-alias",
+                available.and_then(std::num::NonZeroUsize::new),
+            );
+            let value = |flag: &str| &args[args.iter().position(|arg| arg == flag).unwrap() + 1];
+            assert_eq!(value("--threads"), &OsString::from(expected.0.to_string()));
+            assert_eq!(
+                value("--threads-batch"),
+                &OsString::from(expected.1.to_string())
+            );
+            assert_eq!(settings, saved, "saved Runtime binding stays unchanged");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
