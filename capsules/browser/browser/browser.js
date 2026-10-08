@@ -47,7 +47,7 @@ const GUARANTEE_OPERATOR_RBI = "operator_rbi";
 const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
 const LOCAL_EXIT_LABEL = "This device";
 const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
-const DEFAULT_ENGINE_LABEL = "Automatic";
+const DEFAULT_ENGINE_LABEL = "Local VM";
 const DEFAULT_ENGINE_SUMMARY = "Runtime chooses a compatible Browser Engine.";
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";

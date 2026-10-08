@@ -25,6 +25,12 @@ pub(super) fn looks_like_bridge_provider_config(config: &Value) -> bool {
 }
 
 pub(super) fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
+    validate_product_engine(adapter.kind, cfg!(any(test, feature = "test-engine")))?;
+    if adapter.kind == AdapterKind::ChromiumMicrovm
+        && adapter.display_modes != vec![BrowserDisplayMode::WebrtcRemoteDisplay]
+    {
+        return Err("The VM Browser Engine requires webrtc_remote_display".to_string());
+    }
     if !is_safe_id(&adapter.id) {
         return Err("adapter id must be a safe identifier".to_string());
     }
@@ -55,6 +61,36 @@ pub(super) fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_product_engine(kind: AdapterKind, test_engine: bool) -> Result<(), String> {
+    if kind != AdapterKind::ChromiumMicrovm && !test_engine {
+        return Err("Browser uses the VM Engine. Select a compatible local VM or an approved remote Engine. Host-native and Playwright engines are test-only.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod product_engine_tests {
+    use super::*;
+
+    #[test]
+    fn production_accepts_only_the_vm_engine() {
+        assert!(validate_product_engine(AdapterKind::ChromiumMicrovm, false).is_ok());
+        for kind in [
+            AdapterKind::Cef,
+            AdapterKind::ChromiumHeadless,
+            AdapterKind::SelkiesGstreamer,
+            AdapterKind::HostedRemoteBrowser,
+            AdapterKind::ContractProof,
+            AdapterKind::Webview2,
+            AdapterKind::Geckoview,
+            AdapterKind::Wkwebview,
+        ] {
+            assert!(validate_product_engine(kind, false).is_err());
+            assert!(validate_product_engine(kind, true).is_ok());
+        }
+    }
 }
 
 pub(super) fn validate_supervisor(supervisor: &EngineSupervisorConfig) -> Result<(), String> {

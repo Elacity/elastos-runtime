@@ -66,6 +66,15 @@ pub(in crate::api::gateway) struct BrowserVzTransportLaunchBinding<'a> {
     pub(in crate::api::gateway) egress_runtime_socket_path: &'a str,
 }
 
+pub(in crate::api::gateway) fn browser_vz_transport_ready(data_dir: &Path) -> bool {
+    read_browser_vz_transport_config(data_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|config| {
+            config.enabled && validate_browser_vz_transport_config(&config).is_ok()
+        })
+}
+
 pub(in crate::api::gateway) fn prepare_browser_vz_transport_launch(
     data_dir: &Path,
     binding: BrowserVzTransportLaunchBinding<'_>,
@@ -1182,6 +1191,24 @@ mod tests {
         .unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn remote_engine_offer_requires_enabled_valid_transport() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
+        write_config(root.path());
+        assert!(browser_vz_transport_ready(root.path()));
+        let path = root.path().join("config/browser-vz-vsock-transport.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["enabled"] = serde_json::json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
+        config["enabled"] = serde_json::json!(true);
+        config["schema"] = serde_json::json!("invalid");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
     }
 
     fn effect_receipt(authority: &serde_json::Value) -> serde_json::Value {

@@ -80,7 +80,8 @@ def script_sources(template, platform, native_components=()):
         outputs.add(release)
         installs.add(install)
         result[name] = source
-    if not result and not native_components:
+    if not result and not native_components and any(
+            platform in external[name]["platforms"] for name in names):
         raise ValueError("Browser host role has no script helpers for " + platform)
     return result
 

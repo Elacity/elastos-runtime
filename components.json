@@ -426,66 +426,6 @@
         }
       }
     },
-    "browser-engine-supervisor": {
-      "install_path": "bin/browser-engine-supervisor",
-      "description": "Linux Browser Engine supervisor helper that launches native engines with Runtime-only network handoff",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-engine-supervisor-linux-amd64",
-          "install_path": "bin/browser-engine-supervisor"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-engine-supervisor-linux-arm64",
-          "install_path": "bin/browser-engine-supervisor"
-        }
-      }
-    },
-    "browser-native-proxy-engine": {
-      "install_path": "bin/browser-native-proxy-engine",
-      "description": "Native Chromium/CEF browser wrapper with loopback proxy and Runtime Exit relay networking",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-native-proxy-engine-linux-amd64",
-          "install_path": "bin/browser-native-proxy-engine"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-native-proxy-engine-linux-arm64",
-          "install_path": "bin/browser-native-proxy-engine"
-        }
-      }
-    },
-    "browser-stream-bridge": {
-      "install_path": "bin/browser-stream-bridge",
-      "description": "Linux Browser Engine Unix stream bridge for Runtime-owned byte transport",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-stream-bridge-linux-amd64",
-          "install_path": "bin/browser-stream-bridge"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-stream-bridge-linux-arm64",
-          "install_path": "bin/browser-stream-bridge"
-        }
-      }
-    },
     "browser-local-exit": {
       "install_path": "bin/browser-local-exit",
       "description": "Browser local Exit relay that dials allowlisted public TCP targets behind Runtime-owned Browser streams",
@@ -1460,13 +1400,13 @@
       "platforms": {
         "darwin-arm64": {
           "strategy": "browser-vm-image",
-          "release_path": "browser-vm-image-darwin-arm64.tar.gz",
+          "release_path": "browser-vm-image-arm64.tar.gz",
           "install_path": "browser-vm/image-set",
           "extract_path": "browser-vm-image"
         },
         "linux-arm64": {
           "strategy": "browser-vm-image",
-          "release_path": "browser-vm-image-linux-arm64.tar.gz",
+          "release_path": "browser-vm-image-arm64.tar.gz",
           "install_path": "browser-vm/image-set",
           "extract_path": "browser-vm-image"
         }
@@ -1484,11 +1424,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-host-node-launcher.sh",
           "release_path": "browser-vm-engine-supervisor-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-engine-supervisor-linux-amd64"
         }
       }
     },
@@ -1504,11 +1439,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-engine-supervisor.mjs",
           "release_path": "browser-vm-engine-supervisor-module-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-engine-supervisor.mjs",
-          "release_path": "browser-vm-engine-supervisor-module-linux-amd64"
         }
       }
     },
@@ -1524,11 +1454,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-host-node-launcher.sh",
           "release_path": "browser-vm-control-service-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-control-service-linux-amd64"
         }
       }
     },
@@ -1544,11 +1469,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-control-service.mjs",
           "release_path": "browser-vm-control-service-module-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-control-service.mjs",
-          "release_path": "browser-vm-control-service-module-linux-amd64"
         }
       }
     },
@@ -1564,11 +1484,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-artifact-preflight.sh",
           "release_path": "browser-vm-artifact-preflight-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-artifact-preflight.sh",
-          "release_path": "browser-vm-artifact-preflight-linux-amd64"
         }
       }
     },
@@ -1589,11 +1504,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-host-node-launcher.sh",
           "release_path": "browser-vm-local-crosvm-launcher-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-local-crosvm-launcher-linux-amd64"
         }
       }
     },
@@ -1604,11 +1514,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-local-crosvm-launcher.mjs",
           "release_path": "browser-vm-local-crosvm-launcher-module-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-local-crosvm-launcher.mjs",
-          "release_path": "browser-vm-local-crosvm-launcher-module-linux-amd64"
         }
       }
     },
@@ -1619,11 +1524,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-host-node-launcher.sh",
           "release_path": "browser-vm-prepare-rootfs-pool-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-prepare-rootfs-pool-linux-amd64"
         }
       }
     },
@@ -1634,11 +1534,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-prepare-rootfs-pool.mjs",
           "release_path": "browser-vm-prepare-rootfs-pool-module-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-prepare-rootfs-pool.mjs",
-          "release_path": "browser-vm-prepare-rootfs-pool-module-linux-amd64"
         }
       }
     },
@@ -1649,11 +1544,6 @@
           "strategy": "source-build",
           "source": "scripts/browser-vm-linux-network.py",
           "release_path": "browser-vm-linux-network-linux-arm64"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-linux-network.py",
-          "release_path": "browser-vm-linux-network-linux-amd64"
         }
       }
     },
@@ -1677,13 +1567,6 @@
           "install_path": "libexec/browser/turnserver/4.13.1/darwin-arm64",
           "binary_path": "bin/turnserver"
         },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "release_path": "turnserver-linux-amd64.tar.gz",
-          "extract_path": "coturn-4.13.1",
-          "install_path": "libexec/browser/turnserver/4.13.1/linux-amd64",
-          "binary_path": "bin/turnserver"
-        },
         "linux-arm64": {
           "strategy": "source-build",
           "release_path": "turnserver-linux-arm64.tar.gz",
@@ -1702,13 +1585,6 @@
           "release_path": "node-darwin-arm64.tar.gz",
           "extract_path": "node-v24.21.0-darwin-arm64",
           "install_path": "libexec/browser/node/24.21.0/darwin-arm64",
-          "binary_path": "bin/node"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "release_path": "node-linux-amd64.tar.gz",
-          "extract_path": "node-v24.21.0-linux-x64",
-          "install_path": "libexec/browser/node/24.21.0/linux-amd64",
           "binary_path": "bin/node"
         },
         "linux-arm64": {
@@ -1737,13 +1613,6 @@
           "extract_path": "python",
           "install_path": "libexec/browser/python3/3.12.14/linux-arm64",
           "binary_path": "bin/python3.12"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "release_path": "python3-linux-amd64.tar.gz",
-          "extract_path": "python",
-          "install_path": "libexec/browser/python3/3.12.14/linux-amd64",
-          "binary_path": "bin/python3.12"
         }
       }
     },
@@ -1763,13 +1632,6 @@
           "release_path": "debugfs-linux-arm64.tar.gz",
           "extract_path": "e2fsprogs-1.47.3",
           "install_path": "libexec/browser/e2fsprogs/1.47.3/linux-arm64",
-          "binary_path": "bin/debugfs"
-        },
-        "linux-amd64": {
-          "strategy": "source-build",
-          "release_path": "debugfs-linux-amd64.tar.gz",
-          "extract_path": "e2fsprogs-1.47.3",
-          "install_path": "libexec/browser/e2fsprogs/1.47.3/linux-amd64",
           "binary_path": "bin/debugfs"
         }
       }
@@ -1793,9 +1655,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1839,9 +1698,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1919,9 +1775,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1967,9 +1820,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
         "home-cli",
@@ -2016,9 +1866,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
         "object-provider",

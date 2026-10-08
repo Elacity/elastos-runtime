@@ -531,7 +531,10 @@ if mode == "--host-readiness":
     host_id = {("Darwin", "arm64"): "darwin-arm64", ("Linux", "x86_64"): "linux-amd64",
                ("Linux", "aarch64"): "linux-arm64", ("Linux", "arm64"): "linux-arm64"}.get(
                    (host_platform.system(), host_platform.machine()))
-    if platform != host_id:
+    if platform not in {"darwin-arm64", "linux-arm64"}:
+        reason = "host_unsupported"
+        message = "This computer uses an approved remote Browser Engine. The local guest requires ARM64 virtualization."
+    elif platform != host_id:
         reason = "host_unsupported"
     elif platform.startswith("linux-") and not os.path.exists("/dev/kvm"):
         reason = "host_unsupported"

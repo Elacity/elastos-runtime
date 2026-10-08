@@ -161,7 +161,7 @@ node -e 'const fs=require("fs"); const config=JSON.parse(fs.readFileSync(process
 
 node -e 'const fs=require("fs"); const config=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log(JSON.stringify({op:"init", config})); console.log(JSON.stringify({op:"status"})); console.log(JSON.stringify({op:"shutdown"}));' \
   "$out_dir/browser-engine-adapter.json" \
-  | cargo run --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml >/dev/null
+  | cargo run --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml --features test-engine >/dev/null
 
 smoke_output="$(scripts/browser-native-supervisor-proxy-smoke.sh)"
 if [[ "$smoke_output" == *'"skipped":true'* ]]; then

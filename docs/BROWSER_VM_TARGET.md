@@ -125,7 +125,7 @@ scripts/build/stage-browser-vm-target.sh \
   --control-service /path/to/browser-selkies-control-service.mjs \
   --node-bin /path/to/node \
   --chromium-bin /path/to/chromium \
-  --target-platform linux-amd64
+  --target-platform linux-arm64
 ```
 
 The staging script intentionally does not install Chromium or claim a bootable
@@ -163,8 +163,8 @@ scripts/build/build-browser-vm-rootfs.sh \
   --target-platform linux-arm64
 ```
 
-This script builds the Linux guest binaries for the requested architecture,
-assembles a Debian Browser filesystem with arm64/amd64 Chromium, Node, Xvfb,
+This script builds the locked Linux ARM64 guest binaries and assembles a Debian
+Browser filesystem with ARM64 Chromium, Node, Xvfb,
 Python, GStreamer, PipeWire, WirePlumber, and Selkies through `debootstrap`,
 overlays the ElastOS Browser VM contract, preserves Chromium launcher arguments,
 patches the Selkies caps/relay policy needed by the Runtime-owned WebRTC path,
@@ -471,7 +471,7 @@ call the exact setup command above as its approved root step.
 
 ### Linux operator proof
 
-Run this proof on both a suitable Linux x86-64 host and the Jetson. Stage the
+Run this proof on both a suitable Linux ARM64 host and the Jetson. Stage the
 candidate launcher, network helper, control service and preflight helper at
 their stable installed paths; record their source tree and SHA-256 parity.
 Use an isolated test Home on an unused port such as `18091`.

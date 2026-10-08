@@ -107,9 +107,6 @@ SUPPORT_BINARY_ASSETS=(
     net-provider
     exit-provider
     browser-engine-adapter
-    browser-engine-supervisor
-    browser-native-proxy-engine
-    browser-stream-bridge
     browser-local-exit
     webspace-provider
     object-provider

@@ -421,97 +421,6 @@
       },
       "format": "tar.gz",
       "entrypoint": "bin/turnserver",
-      "install_path": "libexec/browser/turnserver/4.13.1/linux-amd64",
-      "binary_path": "bin/turnserver",
-      "license": {
-        "spdx_id": "BSD-3-Clause AND Apache-2.0",
-        "files": [
-          {
-            "name": "LICENSE",
-            "source": {
-              "url": "https://raw.githubusercontent.com/coturn/coturn/4.13.1/LICENSE",
-              "checksum": "sha256:9add1798fa67dba2172d7b160dae18e190470a0ff7f4938fe5aad4122c19dc1f",
-              "max_bytes": 1048576
-            }
-          },
-          {
-            "name": "licenses/openssl.txt",
-            "source": {
-              "url": "https://raw.githubusercontent.com/openssl/openssl/openssl-3.6.3/LICENSE.txt",
-              "checksum": "sha256:7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
-              "max_bytes": 1048576
-            }
-          },
-          {
-            "name": "licenses/libevent.txt",
-            "source": {
-              "url": "https://raw.githubusercontent.com/libevent/libevent/release-2.1.13-stable/LICENSE",
-              "checksum": "sha256:ff02effc9b331edcdac387d198691bfa3e575e7d244ad10cb826aa51ef085670",
-              "max_bytes": 1048576
-            }
-          }
-        ]
-      },
-      "schema": "elastos.release-upstream-input/v1",
-      "root": "coturn-4.13.1",
-      "extract_path": "coturn-4.13.1",
-      "max_unpacked_bytes": 536870912,
-      "build": {
-        "kind": "coturn-static-v1",
-        "dependencies": [
-          {
-            "name": "openssl",
-            "root": "openssl-3.6.3",
-            "source": {
-              "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.3/openssl-3.6.3.tar.gz",
-              "checksum": "sha256:243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1",
-              "max_bytes": 536870912,
-              "redirect_hosts": [
-                "codeload.github.com",
-                "release-assets.githubusercontent.com"
-              ]
-            }
-          },
-          {
-            "name": "libevent",
-            "root": "libevent-release-2.1.13-stable",
-            "source": {
-              "url": "https://github.com/libevent/libevent/archive/refs/tags/release-2.1.13-stable.tar.gz",
-              "checksum": "sha256:1a0885e17dc78afbaeddf13cf849f9238bbc24acdc178464a0d1934d7c5ffbd5",
-              "max_bytes": 536870912,
-              "redirect_hosts": [
-                "codeload.github.com",
-                "release-assets.githubusercontent.com"
-              ]
-            }
-          }
-        ]
-      },
-      "notices": [
-        {
-          "name": "sources/browser-upstream-build.py",
-          "source": {
-            "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:3a1c786ef75ff525cb90222071a3ea7451e553e993a7449b6a1c984164ca005b",
-            "max_bytes": 1048576
-          }
-        }
-      ],
-      "platform": "linux-amd64"
-    },
-    {
-      "component": "turnserver",
-      "version": "4.13.1",
-      "source": {
-        "url": "https://github.com/coturn/coturn/archive/refs/tags/4.13.1.tar.gz",
-        "checksum": "sha256:c8f8db0e2d2d04d20535b2c928f9792ed5aa8cfd0af34f323a61749b2c7baba6",
-        "max_bytes": 536870912,
-        "redirect_hosts": [
-          "codeload.github.com"
-        ]
-      },
-      "format": "tar.gz",
-      "entrypoint": "bin/turnserver",
       "install_path": "libexec/browser/turnserver/4.13.1/linux-arm64",
       "binary_path": "bin/turnserver",
       "license": {
@@ -606,37 +515,6 @@
       "entrypoint": "bin/node",
       "extract_path": "node-v24.21.0-darwin-arm64",
       "install_path": "libexec/browser/node/24.21.0/darwin-arm64",
-      "binary_path": "bin/node",
-      "max_unpacked_bytes": 536870912,
-      "license": {
-        "spdx_id": "MIT",
-        "files": [
-          {
-            "name": "LICENSE",
-            "from_archive": "LICENSE"
-          }
-        ]
-      },
-      "payload_members": [
-        "bin/node"
-      ]
-    },
-    {
-      "schema": "elastos.release-upstream-input/v1",
-      "component": "node",
-      "platform": "linux-amd64",
-      "version": "24.21.0",
-      "source": {
-        "url": "https://nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-x64.tar.gz",
-        "checksum": "sha256:6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff",
-        "max_bytes": 134217728,
-        "redirect_hosts": []
-      },
-      "format": "tar.gz",
-      "root": "node-v24.21.0-linux-x64",
-      "entrypoint": "bin/node",
-      "extract_path": "node-v24.21.0-linux-x64",
-      "install_path": "libexec/browser/node/24.21.0/linux-amd64",
       "binary_path": "bin/node",
       "max_unpacked_bytes": 536870912,
       "license": {
@@ -825,76 +703,6 @@
     },
     {
       "source": {
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "checksum": "sha256:72748da13197c1fb161e3afeef20a6a385ff24f2165e6e2758e47008e7faba4c",
-        "max_bytes": 268435456,
-        "redirect_hosts": [
-          "release-assets.githubusercontent.com"
-        ]
-      },
-      "root": "python",
-      "entrypoint": "bin/python3.12",
-      "extract_path": "python",
-      "install_path": "libexec/browser/python3/3.12.14/linux-amd64",
-      "binary_path": "bin/python3.12",
-      "license": {
-        "spdx_id": "Python-2.0 AND LicenseRef-Python-Standalone",
-        "files": [
-          {
-            "name": "LICENSE",
-            "source": {
-              "url": "https://raw.githubusercontent.com/python/cpython/v3.12.14/LICENSE",
-              "checksum": "sha256:3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
-              "max_bytes": 1048576
-            }
-          },
-          {
-            "name": "licenses/LICENSE.zlib-ng.txt",
-            "source": {
-              "url": "https://raw.githubusercontent.com/python/cpython-source-deps/zlib-ng-2.2.4/LICENSE.md",
-              "checksum": "sha256:6c9f0d975b41afaa34d22f55bb8986ce69e5cb7ad327cb2b28820cd425edf5ee",
-              "max_bytes": 16384,
-              "redirect_hosts": []
-            }
-          }
-        ]
-      },
-      "schema": "elastos.release-upstream-input/v1",
-      "component": "python3",
-      "platform": "linux-amd64",
-      "version": "3.12.14",
-      "format": "tar.gz",
-      "max_unpacked_bytes": 2147483648,
-      "build": {
-        "kind": "python-standalone-v1",
-        "dependencies": [
-          {
-            "name": "python-licenses",
-            "root": "python",
-            "source": {
-              "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-pgo%2Blto-full.tar.zst",
-              "checksum": "sha256:f2e7bf187eaa66f88432b13cc560528c328b51d452de2fd0875561c82f7168e7",
-              "max_bytes": 268435456,
-              "redirect_hosts": [
-                "release-assets.githubusercontent.com"
-              ]
-            }
-          }
-        ]
-      },
-      "notices": [
-        {
-          "name": "sources/browser-upstream-build.py",
-          "source": {
-            "path": "scripts/browser-upstream-build.py",
-            "max_bytes": 1048576,
-            "checksum": "sha256:3a1c786ef75ff525cb90222071a3ea7451e553e993a7449b6a1c984164ca005b"
-          }
-        }
-      ]
-    },
-    {
-      "source": {
         "url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.3/e2fsprogs-1.47.3.tar.gz",
         "checksum": "sha256:7d4612f4e4f7ca6c2f669679028bcb02763e3b6280c9c19b2cf168eaf65e88af",
         "max_bytes": 33554432
@@ -969,51 +777,6 @@
       "schema": "elastos.release-upstream-input/v1",
       "component": "debugfs",
       "platform": "linux-arm64",
-      "version": "1.47.3",
-      "format": "tar.gz",
-      "max_unpacked_bytes": 2147483648,
-      "notices": [
-        {
-          "name": "sources/browser-upstream-build.py",
-          "source": {
-            "path": "scripts/browser-upstream-build.py",
-            "max_bytes": 1048576,
-            "checksum": "sha256:3a1c786ef75ff525cb90222071a3ea7451e553e993a7449b6a1c984164ca005b"
-          }
-        }
-      ]
-    },
-    {
-      "source": {
-        "url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.3/e2fsprogs-1.47.3.tar.gz",
-        "checksum": "sha256:7d4612f4e4f7ca6c2f669679028bcb02763e3b6280c9c19b2cf168eaf65e88af",
-        "max_bytes": 33554432
-      },
-      "root": "e2fsprogs-1.47.3",
-      "entrypoint": "bin/debugfs",
-      "extract_path": "e2fsprogs-1.47.3",
-      "install_path": "libexec/browser/e2fsprogs/1.47.3/linux-amd64",
-      "binary_path": "bin/debugfs",
-      "build": {
-        "kind": "e2fsprogs-static-v1",
-        "dependencies": []
-      },
-      "license": {
-        "spdx_id": "GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT",
-        "files": [
-          {
-            "name": "LICENSE",
-            "source": {
-              "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.3/NOTICE",
-              "checksum": "sha256:5da5ef153e559c1d990d4c3eedbedd4442db892d37eae1f35fff069de8ec9020",
-              "max_bytes": 1048576
-            }
-          }
-        ]
-      },
-      "schema": "elastos.release-upstream-input/v1",
-      "component": "debugfs",
-      "platform": "linux-amd64",
       "version": "1.47.3",
       "format": "tar.gz",
       "max_unpacked_bytes": 2147483648,

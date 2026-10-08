@@ -204,12 +204,12 @@ export function validateContracts(manifests) {
 
 const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
-  "browser-engine-adapter", "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "browser-local-exit",
+  "browser-engine-adapter", "browser-local-exit",
   "webspace-provider", "object-provider", "wallet-provider", "model-provider",
   "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
-const obsolete = ["chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
+const obsolete = ["browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
 const archiveAssets = ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"];
 
 export function parsePublishData(shellSource, rustSource) {

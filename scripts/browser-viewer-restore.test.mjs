@@ -243,7 +243,7 @@ test('restored page becomes visible to Home after its fresh address is applied',
   assert.ok(connect >= 0);
 });
 
-test('Automatic Engine and local Exit remain the Runtime-selected empty values', async () => {
+test('Local VM Engine and local Exit remain the Runtime-selected empty values', async () => {
   const h = harness(), value = summary(); value.sessions.recoverable_page.service_selection.engine_id = '';
   value.sessions.recoverable_page.service_selection.exit_id = '';
   await h.restore(value);

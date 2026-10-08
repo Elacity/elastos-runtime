@@ -318,8 +318,11 @@ pub(super) async fn invoke(
         );
         let mut projected = project_response(operation, &provider_request, response)?;
         if operation == "status" {
-            projected["data"]["remote_page_binding_supported"] = json!(true);
-            projected["data"]["launch_available"] = json!(grant.execution_allowed);
+            let transport_ready =
+                crate::api::gateway::browser_remote_provider_transport_ready(data_dir);
+            projected["data"]["remote_page_binding_supported"] = json!(transport_ready);
+            projected["data"]["launch_available"] =
+                json!(grant.execution_allowed && transport_ready);
         }
         Ok(projected)
     };

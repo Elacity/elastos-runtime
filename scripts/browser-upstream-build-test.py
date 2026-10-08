@@ -74,7 +74,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                 builder.audit_libraries(output, mac)
 
     def test_native_build_packages_sources_licenses_and_relocation_audit(self):
-        for platform in ('darwin-arm64', 'linux-amd64', 'linux-arm64'):
+        for platform in ('darwin-arm64', 'linux-arm64'):
             with self.subTest(platform=platform):
                 self.native_build(platform)
 
@@ -161,8 +161,8 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
     def test_official_node_archives_pin_each_platform_and_include_license(self):
         inventory = json.loads(assets.RECIPE_FILE.read_text())
         recipes = [r for r in inventory["recipes"] if r["component"] == "node"]
-        self.assertEqual({r["platform"] for r in recipes}, {"darwin-arm64", "linux-amd64", "linux-arm64"})
-        self.assertEqual(len({r["source"]["checksum"] for r in recipes}), 3)
+        self.assertEqual({r["platform"] for r in recipes}, {"darwin-arm64", "linux-arm64"})
+        self.assertEqual(len({r["source"]["checksum"] for r in recipes}), 2)
         for recipe in recipes:
             upstream.validate_recipe(recipe)
             self.assertTrue(recipe["source"]["url"].startswith("https://nodejs.org/download/release/v24.21.0/"))
@@ -180,7 +180,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch).resolve()
             for present in (True, False):
-                recipe = copy.deepcopy(next(r for r in assets.selected_recipes('linux-amd64') if r['component'] == 'node'))
+                recipe = copy.deepcopy(next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == 'node'))
                 archive_path = root / ('node-' + str(present) + '.tar.gz')
                 with tarfile.open(archive_path, 'w:gz', format=tarfile.GNU_FORMAT) as archive:
                     for name, data, mode in [('bin/node', b'inert node fixture', 0o755),

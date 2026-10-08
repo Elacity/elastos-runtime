@@ -572,12 +572,7 @@ PY
 
 source_home_helper_binary_names() {
     printf '%s\n' "browser-local-exit"
-    if [[ "$(uname -s)" == "Linux" ]]; then
-        printf '%s\n' \
-            browser-engine-supervisor \
-            browser-native-proxy-engine \
-            browser-stream-bridge
-    fi
+
 }
 
 source_home_binary_names() {

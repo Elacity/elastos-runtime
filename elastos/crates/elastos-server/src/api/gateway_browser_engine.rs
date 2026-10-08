@@ -62,6 +62,9 @@ where
         .iter()
         .filter(|adapter| adapter.supports(display_mode, guarantee_level))
         .filter(|adapter| requested_adapter.is_none_or(|id| adapter.id == id))
+        .filter(|adapter| {
+            requested_adapter.is_some() || adapter.backing_substrate != "remote_operator_vm"
+        })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|adapter| !adapter.default);
     let mut readiness_budget = std::time::Duration::from_secs(12);
@@ -791,7 +794,7 @@ mod tests {
                     image_adapter("remote", "remote_operator_vm", true),
                     image_adapter("local", "local_microvm", false),
                 ],
-                None,
+                Some("remote"),
                 "remote",
             ),
             (
@@ -859,11 +862,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_acquisition_failure_allows_only_an_unrequested_ready_alternative() {
+    async fn image_acquisition_failure_keeps_remote_execution_explicit() {
         let dir = tempfile::tempdir().unwrap();
         write_image_config(dir.path());
         for (requested, expected) in [
-            (None, Ok("remote".into())),
+            (
+                None,
+                Err(BrowserCompatibilityError::EngineNotReady {
+                    reason: BrowserEngineReadinessReason::PreparationRequired,
+                }),
+            ),
             (
                 Some("local"),
                 Err(BrowserCompatibilityError::EngineNotReady {
@@ -894,13 +902,31 @@ mod tests {
             )
             .await;
             assert_eq!(result, expected);
-            let expected_calls = if requested.is_some() {
-                vec!["status", "prepare"]
-            } else {
-                vec!["status", "prepare", "readiness"]
-            };
-            assert_eq!(*calls.lock().unwrap(), expected_calls);
+            assert_eq!(*calls.lock().unwrap(), ["status", "prepare"]);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_default_waits_for_explicit_owner_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = image_registry(
+            "capsule-provider",
+            vec![image_adapter("remote", "remote_operator_vm", true)],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let result = resolve_browser_engine_adapter_with_preparation(
+            &registry,
+            dir.path(),
+            "person:test",
+            None,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+            || async { panic!("remote Engine acquired a local image") },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), ["status"]);
     }
 
     #[test]

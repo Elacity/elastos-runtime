@@ -89,7 +89,7 @@ if [[ -z "$adapter_config" ]]; then
 fi
 
 cd "$repo_root"
-cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml
+cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml --features test-engine
 adapter_bin="${CARGO_TARGET_DIR:-capsules/browser-engine-adapter/target}/debug/browser-engine-adapter"
 
 args=(

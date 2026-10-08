@@ -706,6 +706,20 @@ function main() {
     validateAbsolute("--data-dir", args.dataDir);
     const outDir = args.outDir || path.join(args.dataDir, "config");
     validateAbsolute("--out-dir", outDir);
+    if (args.platform === "linux-amd64") {
+      if (args.vmControlLauncher || args.vmRootfs || args.releaseImage) {
+        throw new Error("This host uses an approved remote Engine; the local guest is ARM64.");
+      }
+      writeJson(path.join(outDir, "browser-engine-adapter.json"), { adapters: [] });
+      writeOwnerOnlyJson(path.join(outDir, "browser-viewer-ingress.json"), {
+        schema: "elastos.browser.viewer-ingress-config/v1",
+        listen_host: "127.0.0.1", advertised_host: "127.0.0.1",
+        port_start: 48100, port_end: 48131,
+      });
+      console.log(JSON.stringify({ ok: true, engine_mode: "remote", platform: args.platform,
+        files: ["browser-engine-adapter.json", "browser-viewer-ingress.json"] }));
+      return;
+    }
     const adapterSocket = runtimeSocketPath(args, "exit-adapter");
     const relaySocket = runtimeSocketPath(args, "exit-relay");
     const sourceEnv = runtimeTurnEnv(args);

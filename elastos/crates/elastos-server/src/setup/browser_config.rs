@@ -20,6 +20,10 @@ pub(super) async fn ensure_host_components(
     platform: &str,
     context: super::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
+    ensure_viewer_ingress(data)?;
+    if !local_vm_selected(data, platform)? {
+        return configure(data, platform, false);
+    }
     let Some(profile) = manifest.profiles.get("browser-host") else {
         return Ok(()); // Source Homes and older releases own their existing helpers.
     };
@@ -87,6 +91,54 @@ pub(super) async fn ensure_host_components(
     )
 }
 
+pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<bool> {
+    if !matches!(platform, "darwin-arm64" | "linux-arm64") {
+        return Ok(false);
+    }
+    let path = std::env::var_os("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data.join("config/browser-engine-adapter.json"));
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(config["adapters"].as_array().is_some_and(|adapters| {
+        adapters.iter().any(|adapter| {
+            let supervisor = &adapter["supervisor"];
+            let launcher = supervisor["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
+                .as_str()
+                .or_else(|| supervisor["program"].as_str())
+                .unwrap_or_default();
+            adapter["kind"] == "chromium_microvm"
+                && !Path::new(launcher)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("browser-vm-remote-vz-launcher"))
+        })
+    }))
+}
+
+fn ensure_viewer_ingress(data: &Path) -> anyhow::Result<()> {
+    let path = data.join("config/browser-viewer-ingress.json");
+    if path.symlink_metadata().is_ok() {
+        return Ok(()); // The Home owner keeps any approved off-device viewer route.
+    }
+    let config = serde_json::json!({
+        "schema": "elastos.browser.viewer-ingress-config/v1",
+        "listen_host": "127.0.0.1",
+        "advertised_host": "127.0.0.1",
+        "port_start": 48100,
+        "port_end": 48131,
+    });
+    fs::create_dir_all(data.join("config"))?;
+    super::atomic_write_file(&path, &serde_json::to_vec_pretty(&config)?)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -106,6 +158,7 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
         return Ok(());
     }
     let config = data.join("config");
+    ensure_viewer_ingress(data)?;
     // Existing Engine/Exit selection belongs to the Home owner, including a
     // remote Engine. Setup initializes a fresh selection only.
     if config
@@ -113,6 +166,23 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
         .symlink_metadata()
         .is_ok()
     {
+        let existing: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.join("browser-engine-adapter.json"))?)?;
+        if existing["adapters"].as_array().is_some_and(|adapters| {
+            adapters
+                .iter()
+                .any(|adapter| adapter["kind"] != "chromium_microvm")
+        }) {
+            println!("The selected Browser Engine is retired. Select the VM Engine or an approved remote Engine. Your Browser profile remains with its owner.");
+        }
+        return Ok(());
+    }
+    if !matches!(platform, "darwin-arm64" | "linux-arm64") {
+        super::atomic_write_file(
+            &config.join("browser-engine-adapter.json"),
+            b"{\"adapters\": []}\n",
+        )?;
+        println!("Browser uses a remote Engine on this computer. Select an approved Engine in Home Services.");
         return Ok(());
     }
     let mut required = vec![
@@ -247,12 +317,12 @@ mod tests {
                     .all(|name| name == "crosvm" || !names.contains(name)));
             }
         }
-        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+        for platform in ["darwin-arm64", "linux-arm64"] {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path();
             fs::create_dir_all(data.join("capsules/browser")).unwrap();
             configure(data, platform, true).unwrap();
-            assert!(!data.join("config").exists());
+            assert!(!data.join("config/browser-engine-adapter.json").exists());
             for name in &names {
                 let component = manifest.external.get_mut(name).unwrap();
                 let Some(info) = component.platforms.get_mut(platform) else {
@@ -397,10 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn x86_setup_prepares_remote_viewer_without_host_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        fs::create_dir_all(data.join("capsules/browser")).unwrap();
+        configure(data, "linux-amd64", true).unwrap();
+        assert!(!local_vm_selected(data, "linux-amd64").unwrap());
+        let config: Value = serde_json::from_slice(
+            &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["adapters"], serde_json::json!([]));
+        assert!(crate::carrier::browser_engine_media::configuration_ready(data).is_ok());
+        assert!(!data.join("bin").exists());
+    }
+
+    #[test]
     fn normal_browser_setup_reuses_generator_for_each_host() {
         let node = host_program(Path::new("/nonexistent"), "node")
             .expect("Node is required for setup configuration tests");
-        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+        for platform in ["darwin-arm64", "linux-arm64"] {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path();
             generate(data, platform, true, &node, Path::new("/host/turnserver")).unwrap();
@@ -484,12 +570,13 @@ mod tests {
         let data = temp.path();
         fs::create_dir_all(data.join("capsules/browser")).unwrap();
         configure(data, "darwin-arm64", true).unwrap();
-        assert!(!data.join("config").exists());
+        assert!(!data.join("config/browser-engine-adapter.json").exists());
         fs::create_dir_all(data.join("config")).unwrap();
         let selection = data.join("config/browser-engine-adapter.json");
-        fs::write(&selection, b"owner's remote selection").unwrap();
+        let owner_selection = b"{\"adapters\": []}";
+        fs::write(&selection, owner_selection).unwrap();
         configure(data, "darwin-arm64", true).unwrap();
-        assert_eq!(fs::read(selection).unwrap(), b"owner's remote selection");
+        assert_eq!(fs::read(selection).unwrap(), owner_selection);
         assert!(!data.join("config/exit-provider.json").exists());
     }
 

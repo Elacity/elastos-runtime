@@ -567,7 +567,9 @@ async fn run_with_data_dir(
             FirstPartyCarrierContext::Setup,
         )
         .await?;
-        if manifest.external.contains_key(browser_vm_image::NAME) {
+        if browser_config::local_vm_selected(&data_dir, &platform)?
+            && manifest.external.contains_key(browser_vm_image::NAME)
+        {
             println!("Preparing Browser Engine image...");
             ensure_browser_vm_image_in_context(&data_dir, FirstPartyCarrierContext::Setup).await?;
         }
@@ -5118,12 +5120,7 @@ pub(crate) mod tests {
 
         assert_eq!(actual, expected);
 
-        for helper in [
-            "browser-engine-supervisor",
-            "browser-local-exit",
-            "browser-native-proxy-engine",
-            "browser-stream-bridge",
-        ] {
+        for helper in ["browser-local-exit"] {
             let component = components.external.get(helper).unwrap();
             assert!(component.provider_runtime.is_none(), "{helper}");
         }

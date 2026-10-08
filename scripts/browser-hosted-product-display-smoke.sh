@@ -59,7 +59,7 @@ cd "$repo_root"
 
 adapter_bin="${ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_BIN:-}"
 if [[ -z "$adapter_bin" ]]; then
-  cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml
+  cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml --features test-engine
   adapter_bin="${CARGO_TARGET_DIR:-capsules/browser-engine-adapter/target}/debug/browser-engine-adapter"
 elif [[ "$adapter_bin" != /* || ! -x "$adapter_bin" || -z "${ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_SHA256:-}" ]]; then
   echo "fixture binary override requires an absolute executable and its SHA-256" >&2

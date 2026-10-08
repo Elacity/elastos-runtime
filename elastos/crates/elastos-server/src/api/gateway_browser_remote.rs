@@ -2,6 +2,11 @@
 //! the existing Engine adapter owns native effects and terminal receipts.
 
 use super::*;
+
+pub(crate) fn provider_transport_ready(data_dir: &std::path::Path) -> bool {
+    browser_vz_transport_ready(data_dir)
+}
+
 use crate::carrier::{
     browser_engine_binding::{self, RemoteEngineOwner},
     BrowserEngineGrant,

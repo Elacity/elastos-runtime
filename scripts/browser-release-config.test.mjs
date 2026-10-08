@@ -11,7 +11,7 @@ const root = path.resolve(import.meta.dirname, "..");
 test("release configuration binds every host to the image set and Runtime profile", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "browser-release-config-"));
   try {
-    for (const platform of ["darwin-arm64", "linux-arm64", "linux-amd64"]) {
+    for (const platform of ["darwin-arm64", "linux-arm64"]) {
       const data = path.join(temp, platform);
       execFileSync(process.execPath, [path.join(root, "scripts/browser-source-home-config.mjs"),
         "--data-dir", data, "--platform", platform, "--release-image"], { env: {
@@ -57,4 +57,19 @@ test("Linux launcher selects the image kernel while the capsule kernel retains o
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
+});
+
+
+test("x86 prepares an explicit remote consumer and refuses a local image selection", () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), "browser-remote-config-"));
+  const script = path.join(root, "scripts/browser-source-home-config.mjs");
+  try {
+    execFileSync(process.execPath, [script, "--data-dir", data, "--platform", "linux-amd64"]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(data, "config/browser-engine-adapter.json"))).adapters, []);
+    const ingress = JSON.parse(fs.readFileSync(path.join(data, "config/browser-viewer-ingress.json")));
+    assert.equal(ingress.listen_host, "127.0.0.1");
+    assert.equal(fs.existsSync(path.join(data, "browser-vm")), false);
+    assert.throws(() => execFileSync(process.execPath, [script, "--data-dir", data,
+      "--platform", "linux-amd64", "--release-image"], { stdio: "pipe" }));
+  } finally { fs.rmSync(data, { recursive: true, force: true }); }
 });
