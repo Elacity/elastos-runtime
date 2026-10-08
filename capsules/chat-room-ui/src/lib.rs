@@ -2503,10 +2503,7 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        let mut state = self.state.borrow_mut();
-        state.latest_seq = sent.seq;
-        state.objects.push(sent);
-        state.force_message_follow = true;
+        record_own_shared_send(&mut self.state.borrow_mut(), sent);
         Ok(())
     }
 
