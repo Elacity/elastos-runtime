@@ -666,18 +666,25 @@ async fn admit_installed_setup_metadata(
         } else {
             None
         };
+        // The pinned CID names exact bytes; the release name could serve
+        // newer ones, so setup fetches by CID as update does.
         let network = crate::collaboration_release_network::fetch_release_network(
             data_dir,
             manifest.collaboration_network.as_ref(),
-            |_| async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.fetch_file(
-                        crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE,
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("Community network Carrier fetch timed out"))?
+            |pin| {
+                let cid = pin.head_cid.clone();
+                let client = &client;
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.fetch_content_bounded(
+                            &cid,
+                            crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Community network Carrier fetch timed out"))?
+                }
             },
         )
         .await?;
@@ -7407,7 +7414,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn installed_setup_fetches_the_pinned_network_by_name_and_joins_it() {
+    async fn installed_setup_fetches_the_pinned_network_by_cid_and_joins_it() {
         signed_setup_carrier_fixture("network fresh", false).await;
     }
 
@@ -7853,6 +7860,9 @@ pub(crate) mod tests {
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
         let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
+        let network_cid = network
+            .as_deref()
+            .map(|network| catalog_head_cid(network).unwrap());
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -7865,12 +7875,23 @@ pub(crate) mod tests {
                         .await
                         .unwrap();
                     let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    // The signed component CID is fetched by CID, not by its release name.
+                    // Signed CIDs (the component and the pinned network) are
+                    // fetched by CID, not by their release names.
                     if request["op"] == "content_fetch" {
-                        assert_eq!(request["cid"], effect_cid);
-                        request["path"] = "effect".into();
+                        request["path"] = if request["cid"] == effect_cid {
+                            "effect".into()
+                        } else {
+                            assert_eq!(request["cid"].as_str(), network_cid.as_deref());
+                            crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                                .into()
+                        };
                     } else {
                         assert_ne!(request["path"], "effect", "signed CID fetched by name");
+                        assert_ne!(
+                            request["path"],
+                            crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE,
+                            "pinned network fetched by name"
+                        );
                     }
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)

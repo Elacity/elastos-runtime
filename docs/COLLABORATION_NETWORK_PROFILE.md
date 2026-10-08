@@ -101,10 +101,11 @@ itself still reads only `collaboration-network-v1.json`.
 The release delivers that file the same way it delivers `model-catalog.json`.
 Release staging and the custodian signer bind it to the pin, and release
 publication admits it only when its bytes match the pin and pass the startup
-validator. Installed setup fetches it by name from the trusted source over
-Carrier. `elastos update` and Home's System update both fetch it by its pinned
-CID with the Runtime and `components.json`, while Home still runs and before the
-new Runtime replaces the old one. `elastos update` installs it as its last
+validator. Installed setup fetches it by its pinned CID from the trusted
+source over Carrier, refusing more than 3 MiB. `elastos update` and Home's
+System update also fetch it by its pinned CID with the Runtime and
+`components.json`, while Home still runs and before the new Runtime replaces
+the old one. `elastos update` installs it as its last
 update step; System update installs it right after activation, before Home
 restarts. A refusal before or during that step restores the previous release
 files. A release rolled back after the network was joined keeps the network,
