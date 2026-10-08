@@ -147,9 +147,17 @@ and its configuration bytes that a release then pins.
 startup file and is never called by the installer or Runtime. Key creation,
 profile generation, and verification are offline. The separate explicit local
 bootstrap export attaches only to the selected running Runtime. The
-configuration authority is a dedicated raw 32-byte Ed25519 key at an explicit
-operator path; it is not a Runtime device key, Carrier identity, release
-publisher, Wallet/passkey identity, or host identity.
+configuration authority is never a Runtime device key, Carrier identity,
+Wallet/passkey identity, or host identity.
+
+The production Community network's profile signer is the release maintainer
+DID. One key is safe because profile signatures use their own domain,
+`elastos.collaboration-network.profile.v1`, and the signed release pins the
+file's CID and its signer set. Production profiles are signed by the offline
+release custodian, not by a key file on an operator machine; that custodian
+operation is prepared when this network ships. The commands below use a raw
+32-byte Ed25519 key at an explicit operator path, for disposable test and
+fixture networks.
 
 Create the key as a separate explicit action:
 
