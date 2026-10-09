@@ -7314,7 +7314,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_owned_profile_refresh_keeps_live_session_authority() {
+    async fn runtime_owned_profile_refresh_keeps_receiving_durable_and_sync_session_bound() {
         let temp = tempfile::tempdir().unwrap();
         let pair = durable_profile_peer_pair(temp.path()).await;
         let root_a = temp.path().join("a");
@@ -7341,7 +7341,7 @@ pub(crate) mod tests {
         let before = pair.service_a.registered_context_snapshot_for_test();
         assert_eq!(
             first_registered_context(&before, "direct")["authority"]["kind"],
-            "session"
+            "runtime_owned"
         );
         assert_eq!(
             first_registered_context(&before, "profile_updates")["authority"]["kind"],
@@ -7368,7 +7368,7 @@ pub(crate) mod tests {
         let after = pair.service_a.registered_context_snapshot_for_test();
         assert_eq!(
             first_registered_context(&after, "direct")["authority"]["kind"],
-            "session"
+            "runtime_owned"
         );
         assert_eq!(
             first_registered_context(&after, "profile_updates")["authority"]["kind"],
@@ -7383,8 +7383,8 @@ pub(crate) mod tests {
             grant.grant_id
         );
         assert_eq!(
-            first_registered_context(&after, "direct")["authority"]["session_id"],
-            grant.session_id
+            first_registered_context(&after, "direct")["authority"]["proof_binding_id"],
+            pair.identity_a.proof_binding_id
         );
         assert_eq!(
             first_registered_context(&after, "profile_updates")["authority"]["session_id"],

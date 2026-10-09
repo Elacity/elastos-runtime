@@ -93,6 +93,7 @@ struct DirectServiceInner {
     network: VerifiedCollaborationNetworkProfile,
     registry: Arc<ProviderRegistry>,
     contexts: Mutex<BTreeMap<String, DirectContext>>,
+    retry_offsets: Mutex<BTreeMap<String, usize>>,
 }
 
 #[derive(Clone)]
@@ -382,6 +383,58 @@ impl DirectMessageStore {
         })
     }
 
+    /// Claim a send intent and its original signed bytes in one durable mutation.
+    /// Preparing and persisting a new identity happens only after the locked
+    /// lookup proves this request has no existing claim.
+    fn claim_outgoing_intent(
+        &self,
+        request_id: &str,
+        conversation_id: &str,
+        recipient_profile_did: &str,
+        text: &str,
+        now: u64,
+        prepare: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> Result<Vec<u8>, DirectApiError> {
+        self.mutate(|state| {
+            for entry in state.messages.iter().filter(|entry| !entry.incoming) {
+                let bytes = decode(&entry.envelope, "direct message")?;
+                let envelope: SignedCollaborationMessage = serde_json::from_slice(&bytes)?;
+                let payload: DirectMessagePayload =
+                    serde_json::from_value(envelope.payload.payload.clone())?;
+                if payload.request_id != request_id {
+                    continue;
+                }
+                if envelope.payload.conversation_id != conversation_id
+                    || envelope.payload.recipient.id != recipient_profile_did
+                    || payload.text != text
+                {
+                    return Err(DirectApiError::IntentConflict.into());
+                }
+                return Ok(bytes);
+            }
+            let bytes = prepare()?;
+            self.validate_persisted_message(&bytes, false)?;
+            state.messages.push(StoredMessage {
+                envelope: encode(&bytes),
+                incoming: false,
+                recorded_at: now,
+            });
+            self.prune_for_capacity(
+                state,
+                now,
+                MAX_DIRECT_MESSAGES,
+                MAX_DIRECT_MESSAGE_STATE_BYTES,
+            )?;
+            Ok(bytes)
+        })
+        .map_err(|error| {
+            error
+                .downcast_ref::<DirectApiError>()
+                .copied()
+                .unwrap_or(DirectApiError::Internal)
+        })
+    }
+
     fn prune_for_capacity(
         &self,
         state: &mut DirectMessageState,
@@ -636,7 +689,9 @@ impl DirectMessageStore {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| anyhow::anyhow!("direct message mutation lock is poisoned"))?;
-        let mut state = self.load()?.unwrap_or(DirectMessageState {
+        let loaded = self.load()?;
+        let previous_bytes = loaded.as_ref().map(serde_json::to_vec).transpose()?;
+        let mut state = loaded.unwrap_or(DirectMessageState {
             schema: DIRECT_MESSAGE_STATE_SCHEMA.to_string(),
             network_id: self.network.profile().network_id.clone(),
             local_profile_did: self.local_profile.document().profile_did.clone(),
@@ -648,6 +703,9 @@ impl DirectMessageStore {
         let bytes = serde_json::to_vec(&state)?;
         if bytes.len() > MAX_DIRECT_MESSAGE_STATE_BYTES {
             anyhow::bail!("direct message store exceeds its byte limit");
+        }
+        if previous_bytes.as_deref() == Some(bytes.as_slice()) {
+            return Ok(result);
         }
         let path = self.object_path()?;
         write_protected_principal_root_object(
@@ -745,6 +803,7 @@ impl CollaborationDirectMessageService {
             network,
             registry: registry.clone(),
             contexts: Mutex::new(BTreeMap::new()),
+            retry_offsets: Mutex::new(BTreeMap::new()),
         });
         let provider: Arc<dyn Provider> = Arc::new(CollaborationDirectMessageProvider {
             inner: inner.clone(),
@@ -777,40 +836,16 @@ impl CollaborationDirectMessageService {
             grant_id,
             now,
         )?;
-        let message_store = Arc::new(DirectMessageStore::new(
-            contact_store.data_root(),
-            contact_store.principal_id(),
-            contact_store.localhost_root(),
-            self.inner.network.clone(),
-            profile.clone(),
-            contact_store.local_device_did(),
-        )?);
-        let key = profile.document().profile_did.clone();
-        let mut contexts = self
-            .inner
-            .contexts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("direct message context lock is poisoned"))?;
-        if !contexts.contains_key(&key) && contexts.len() >= MAX_DIRECT_CONTEXTS {
-            anyhow::bail!("direct message context limit reached");
-        }
-        if let Some(existing) = contexts.get(&key) {
-            Self::compare_registered_profile(&existing.profile, &profile)?;
-        }
-        contexts.insert(
-            key,
-            DirectContext {
-                contact_store,
-                message_store,
-                profile,
-                authority: DirectContextAuthority::Session {
-                    session_id: session_id.to_string(),
-                    proof_binding_id: proof_binding_id.map(ToOwned::to_owned),
-                    grant_id: grant_id.to_string(),
-                },
-            },
-        );
-        Ok(())
+        // This validated Home session proves the durable owner and Profile.
+        // Keep receiving under that proof; the send API and sync worker check
+        // their own session authority before acting on the person's behalf.
+        self.register_runtime_owned_context(
+            contact_store,
+            profile,
+            proof_binding_id.ok_or_else(|| {
+                anyhow::anyhow!("direct message context requires a proof binding")
+            })?,
+        )
     }
 
     /// Register the receiving side for a Home's owner without a session.
@@ -847,36 +882,19 @@ impl CollaborationDirectMessageService {
         if !contexts.contains_key(&key) && contexts.len() >= MAX_DIRECT_CONTEXTS {
             anyhow::bail!("direct message context limit reached");
         }
-        // A context carries the Profile it was registered with, and the
-        // owner editing their own Profile makes that copy stale — which
-        // then refuses incoming mail from contacts who did nothing wrong.
-        // Refresh the stored Profile when it advances, but never let a
-        // Runtime-owned refresh weaken a live session authority.
+        // Profile refresh and browser registration both keep this receiving
+        // context Runtime-owned. The current durable proof is rechecked on
+        // every receive; browser sign-out only ends the sender's authority.
         if let Some(existing) = contexts.get_mut(&key) {
-            let ordering = Self::compare_registered_profile(&existing.profile, &profile)?;
-            match &existing.authority {
-                DirectContextAuthority::Session { .. } => {
-                    if ordering == std::cmp::Ordering::Greater {
-                        existing.contact_store = contact_store;
-                        existing.message_store = message_store;
-                        existing.profile = profile;
-                    }
-                    return Ok(());
+            Self::compare_registered_profile(&existing.profile, &profile)?;
+            #[cfg(test)]
+            if matches!(existing.authority, DirectContextAuthority::VerifiedForTest) {
+                if profile.document().revision > existing.profile.document().revision {
+                    existing.contact_store = contact_store;
+                    existing.message_store = message_store;
+                    existing.profile = profile;
                 }
-                DirectContextAuthority::RuntimeOwned { .. } => {
-                    if ordering != std::cmp::Ordering::Greater {
-                        return Ok(());
-                    }
-                }
-                #[cfg(test)]
-                DirectContextAuthority::VerifiedForTest => {
-                    if ordering == std::cmp::Ordering::Greater {
-                        existing.contact_store = contact_store;
-                        existing.message_store = message_store;
-                        existing.profile = profile;
-                    }
-                    return Ok(());
-                }
+                return Ok(());
             }
         }
         contexts.insert(
@@ -1053,59 +1071,27 @@ impl CollaborationDirectMessageService {
             .find(|contact| contact.conversation_id() == conversation_id)
             .cloned()
             .ok_or(DirectApiError::ForbiddenConversation)?;
-        let mut existing_intent = None;
-        for record in context
-            .message_store
-            .records()
-            .map_err(|_| DirectApiError::Internal)?
-            .into_iter()
-            .filter(|record| !record.incoming)
-        {
-            let envelope: SignedCollaborationMessage =
-                serde_json::from_slice(&record.envelope_bytes)
-                    .map_err(|_| DirectApiError::Internal)?;
-            let payload: DirectMessagePayload =
-                serde_json::from_value(envelope.payload.payload.clone())
-                    .map_err(|_| DirectApiError::Internal)?;
-            if payload.request_id == request_id {
-                existing_intent = Some((record, envelope, payload));
-                break;
-            }
-        }
-        if let Some((existing, envelope, payload)) = existing_intent {
-            if envelope.payload.conversation_id != conversation_id
-                || payload.text != text
-                || envelope.payload.recipient.id != contact.remote_profile_did()
-            {
-                return Err(DirectApiError::IntentConflict);
-            }
-            return self
-                .deliver(
-                    context,
-                    &existing.envelope_bytes,
-                    contact.remote_presence_device_did(),
+        let bytes = context.message_store.claim_outgoing_intent(
+            request_id,
+            conversation_id,
+            contact.remote_profile_did(),
+            text,
+            now,
+            || {
+                prepare_direct_message(
+                    &self.inner.signing_key,
+                    &self.inner.network,
+                    &context.profile,
+                    DirectMessageIntent {
+                        request_id,
+                        conversation_id,
+                        recipient_profile_did: contact.remote_profile_did(),
+                        text,
+                    },
                     now,
                 )
-                .await
-                .map_err(|_| DirectApiError::Internal);
-        }
-        let bytes = prepare_direct_message(
-            &self.inner.signing_key,
-            &self.inner.network,
-            &context.profile,
-            DirectMessageIntent {
-                request_id,
-                conversation_id,
-                recipient_profile_did: contact.remote_profile_did(),
-                text,
             },
-            now,
-        )
-        .map_err(|_| DirectApiError::Internal)?;
-        context
-            .message_store
-            .persist_message(&bytes, false, now)
-            .map_err(|_| DirectApiError::Internal)?;
+        )?;
         self.deliver(context, &bytes, contact.remote_presence_device_did(), now)
             .await
             .map_err(|_| DirectApiError::Internal)
@@ -1263,8 +1249,25 @@ impl CollaborationDirectMessageService {
                 envelope: record.envelope_bytes,
                 recipient_endpoint_did: recipient,
             });
-            if pending.len() == 4 {
-                break;
+        }
+        // Rotate through eligible records across passes. The cursor is Runtime
+        // scheduling state, while every attempted envelope remains the exact
+        // protected durable claim. Filtering above happens before the budget.
+        {
+            let mut offsets = self
+                .inner
+                .retry_offsets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("direct retry cursor lock is poisoned"))?;
+            let offset = offsets.entry(local_profile_did.to_string()).or_default();
+            if pending.is_empty() {
+                *offset = 0;
+            } else {
+                let start = *offset % pending.len();
+                let count = pending.len().min(4);
+                *offset = (start + count) % pending.len();
+                pending.rotate_left(start);
+                pending.truncate(count);
             }
         }
         // An unacknowledged message stops at its envelope lifetime and reads
