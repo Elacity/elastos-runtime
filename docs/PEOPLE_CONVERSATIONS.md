@@ -250,8 +250,9 @@ Privacy constraints:
 
 ## QR, Code, and Link Flow
 
-QR/code/link remains an explicit alternate onboarding and invite path and
-should ship first.
+QR/code/link is an alternate onboarding and invite path. The current Chat
+journey uses Community Profiles, a contact request and recipient Inbox approval.
+The owning GitHub invite issue records when the alternate path is implemented.
 
 Use it for:
 

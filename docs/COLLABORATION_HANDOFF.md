@@ -121,8 +121,11 @@ two-Runtime acceptance below.
 1. Complete final candidate review and CI, preserving the reviewed history.
 2. Complete one-Runtime Profile, People, Chat, Inbox, Clipboard, restart, and layout
    behavior with the existing local data preserved.
-3. If localhost passes, install the same exact commit on the public seed.
-4. Run the real two-Runtime journey between localhost and the public seed.
+3. Install the same exact candidate on the approved isolated acceptance Homes.
+   Keep the install/release seed in its assigned role.
+4. Run the complete journey with three separate web accounts and two self-hosted
+   Homes, including a Home behind a router. Use the approved Community bootstrap
+   and relay placement recorded in the owning issue.
 5. Record each target's source/artifact identity and product verdict before
    making release or installed-acceptance claims.
 
