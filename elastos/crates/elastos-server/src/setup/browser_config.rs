@@ -172,12 +172,75 @@ fn executable(path: &Path) -> bool {
 }
 
 fn host_program(data: &Path, name: &str) -> Option<PathBuf> {
-    std::iter::once(data.join("bin").join(name))
-        .chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|dir| dir.join(name)),
+    let path = data.join("bin").join(name);
+    executable(&path).then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn require_kvm(path: &Path) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileTypeExt;
+    let file = fs::OpenOptions::new().read(true).write(true).open(path)
+        .map_err(|error| anyhow::anyhow!("Browser virtualization is unavailable to this Home user: {error}. Complete the installer host-access step, or choose another approved Engine"))?;
+    anyhow::ensure!(
+        file.metadata()?.file_type().is_char_device(),
+        "Browser virtualization requires a KVM character device"
+    );
+    // KVM_GET_API_VERSION has no pointer argument and returns the stable API version.
+    let version = unsafe { libc::ioctl(file.as_raw_fd(), 0xAE00) };
+    anyhow::ensure!(
+        version == 12,
+        "Browser virtualization requires an accessible KVM API (version 12)"
+    );
+    Ok(())
+}
+
+/// Browser preparation can be repaired later without withholding the Home.
+pub(super) async fn prepare_home(
+    data: &Path,
+    manifest: &super::ComponentsManifest,
+    platform: &str,
+    browser_selected: bool,
+) {
+    let result: anyhow::Result<()> = async {
+        if browser_selected && manifest.profiles.contains_key("browser-host") {
+            println!("Preparing Browser Engine helpers...");
+            ensure_host_components(
+                data,
+                manifest,
+                platform,
+                super::FirstPartyCarrierContext::Setup,
+            )
+            .await?;
+            if local_vm_selected(data, platform)?
+                && manifest
+                    .external
+                    .contains_key(super::browser_vm_image::NAME)
+            {
+                #[cfg(target_os = "linux")]
+                if platform == "linux-arm64" {
+                    require_kvm(Path::new("/dev/kvm"))?;
+                }
+                println!("Preparing Browser Engine image...");
+                super::ensure_browser_vm_image_in_context(
+                    data,
+                    super::FirstPartyCarrierContext::Setup,
+                )
+                .await?;
+            }
+        }
+        configure(
+            data,
+            platform,
+            manifest
+                .external
+                .contains_key(super::browser_vm_image::NAME),
         )
-        .find(|path| executable(path))
+    }
+    .await;
+    if let Err(error) = result {
+        println!("Browser preparation is incomplete: {error}. Home setup continues. Repair Browser with elastos setup, or select another approved Engine.");
+    }
 }
 
 pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> anyhow::Result<()> {
@@ -328,6 +391,57 @@ mod tests {
     use serde_json::Value;
     use sha2::Digest;
 
+    fn fixture_node() -> PathBuf {
+        let output = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+    }
+
+    #[test]
+    fn host_helpers_require_the_managed_installation() {
+        for name in ["node", "turnserver"] {
+            assert!(host_program(Path::new("/nonexistent"), name).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kvm_admission_refuses_missing_regular_and_non_kvm_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm");
+        assert!(require_kvm(&path).is_err());
+        fs::write(&path, "ordinary file").unwrap();
+        assert!(require_kvm(&path).is_err());
+        assert!(require_kvm(Path::new("/dev/null")).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_browser_preparation_preserves_home_and_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        fs::create_dir_all(data.join("capsules/browser")).unwrap();
+        fs::create_dir_all(data.join("config")).unwrap();
+        fs::write(
+            data.join("config/browser-engine-adapter.json"),
+            b"invalid selection",
+        )
+        .unwrap();
+        fs::write(data.join("profile.ext4"), b"owner state").unwrap();
+        let manifest = serde_json::from_str::<super::super::ComponentsManifest>(
+            r#"{"external":{},"profiles":{}}"#,
+        )
+        .unwrap();
+        prepare_home(data, &manifest, "linux-arm64", true).await;
+        assert_eq!(fs::read(data.join("profile.ext4")).unwrap(), b"owner state");
+        assert_eq!(
+            fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
+            b"invalid selection"
+        );
+    }
+
     #[tokio::test]
     async fn browser_host_profile_is_on_demand_and_setup_uses_admitted_helpers() {
         use std::os::unix::fs::PermissionsExt;
@@ -368,7 +482,7 @@ mod tests {
                 if name == "node" {
                     // The fixture delegates execution to the test runner's Node;
                     // the managed bundle and link still follow installed setup.
-                    let node = host_program(Path::new("/nonexistent"), "node").unwrap();
+                    let node = fixture_node();
                     fs::write(
                         &path,
                         format!(
@@ -532,8 +646,7 @@ mod tests {
 
     #[test]
     fn normal_browser_setup_reuses_generator_for_each_host() {
-        let node = host_program(Path::new("/nonexistent"), "node")
-            .expect("Node is required for setup configuration tests");
+        let node = fixture_node();
         for platform in ["darwin-arm64", "linux-arm64"] {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path();
@@ -585,7 +698,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path();
         fs::create_dir_all(data.join("capsules/browser")).unwrap();
-        let node = host_program(Path::new("/nonexistent"), "node").unwrap();
+        let node = fixture_node();
         for name in [
             "bin/browser-engine-adapter",
             "bin/exit-provider",
@@ -638,7 +751,7 @@ mod tests {
             b"owner exit configuration",
         )
         .unwrap();
-        let node = host_program(Path::new("/nonexistent"), "node").unwrap();
+        let node = fixture_node();
         generate(
             data,
             "darwin-arm64",

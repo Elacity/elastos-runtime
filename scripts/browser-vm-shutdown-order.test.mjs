@@ -24,13 +24,14 @@ function stubbornChild(events) {
 test('Runtime shutdown flushes the guest profile before terminating crosvm and its bridges', async () => {
   const events = [];
   const context = vm.createContext({
+    profileShutdownCommitted: false,
     exiting: false,
     deferredRootfsPoolRefill: null,
     SESSION_KEEP_ENV: "KEEP",
     guestControlSocket: '/fixture/control.sock',
     children: new Set([stubbornChild(events)]),
     servers: new Set([{ server: { close: () => events.push('bridge closed') } }]),
-    cleanupFns: [],
+    cleanupFns: [() => events.push('lock released')],
     launchSucceeded: true,
     httpJsonUnix: async (_socket, route, options) => {
       assert.equal(route, '/shutdown');
@@ -38,16 +39,16 @@ test('Runtime shutdown flushes the guest profile before terminating crosvm and i
       events.push('profile flushed');
       return { ok: true, profile_disk_flushed: true, profile_disk_unmounted: true };
     },
-    process: { env: {}, exit: () => {} },
+    process: { env: {}, exit: (code) => { assert.equal(code, 0); events.push("exit"); } },
     globalThis: {},
     setTimeout: (callback) => callback(),
     logPhase: (text) => { throw new Error(text); },
   });
   vm.runInContext(cleanup, context);
   await context.cleanupAndExit('SIGTERM');
-  assert.deepEqual(events, ['profile flushed', 'bridge closed', 'SIGTERM', 'SIGKILL']);
+  assert.deepEqual(events, ['profile flushed', 'bridge closed', 'SIGTERM', 'SIGKILL', 'lock released', 'exit']);
   await context.cleanupAndExit('SIGTERM');
-  assert.equal(events.length, 4, 'repeated signal must share one shutdown');
+  assert.equal(events.length, 6, 'repeated signal must share one shutdown');
 });
 
 test('launcher awaits a slow pool refill after VM teardown, outside the killed children', async (t) => {
@@ -64,6 +65,7 @@ test('launcher awaits a slow pool refill after VM teardown, outside the killed c
   const refill = source.slice(source.lastIndexOf('\n', refillStart) + 1,
                               source.indexOf('\nfunction refillPreparedRootfsPoolSync('));
   const context = vm.createContext({
+    profileShutdownCommitted: false,
     exiting: false, deferredRootfsPoolRefill: { dataDir: directory, poolDir: directory,
       rootfs: refillScript, sessionDir: directory, scriptPath: refillScript },
     ROOTFS_POOL_REFILL_COUNT_ENV: 'COUNT', SESSION_KEEP_ENV: 'KEEP',
@@ -85,4 +87,20 @@ test('launcher awaits a slow pool refill after VM teardown, outside the killed c
   await context.cleanupAndExit('SIGTERM');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'ready');
   assert.deepEqual(events, ['SIGTERM', 'SIGKILL', 'exit']);
+});
+
+
+test('failed profile flush reports failure after reaping crosvm and releasing its lock', async () => {
+  const events = [];
+  const context = vm.createContext({ profileShutdownCommitted: false, exiting: false,
+    deferredRootfsPoolRefill: null, SESSION_KEEP_ENV: 'KEEP', guestControlSocket: '/fixture/control.sock',
+    children: new Set([stubbornChild(events)]), servers: new Set(),
+    cleanupFns: [() => events.push('lock released')], launchSucceeded: true,
+    httpJsonUnix: async () => ({ ok: true, profile_disk_flushed: true, profile_disk_unmounted: false }),
+    process: { env: {}, exit: code => { assert.equal(code, 1); events.push('failed exit'); } }, globalThis: {},
+    setTimeout: callback => callback(), logPhase: () => events.push('flush failed'),
+  });
+  vm.runInContext(cleanup, context);
+  await context.cleanupAndExit('SIGTERM');
+  assert.deepEqual(events, ['flush failed', 'SIGTERM', 'SIGKILL', 'lock released', 'failed exit']);
 });

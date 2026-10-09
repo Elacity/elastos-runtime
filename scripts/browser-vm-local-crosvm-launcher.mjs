@@ -11,7 +11,6 @@ import { fileURLToPath } from "node:url";
 const OPEN_REQUEST_ENV = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const DATA_DIR_ENV = "ELASTOS_BROWSER_VM_DATA_DIR";
 const ROOT_ENV = "ELASTOS_BROWSER_VM_ROOT";
-const PROFILE_ROOT_ENV = "ELASTOS_BROWSER_PROFILE_ROOT";
 const SESSION_KEEP_ENV = "ELASTOS_BROWSER_VM_KEEP_SESSIONS";
 const ROOTFS_POOL_DIR_ENV = "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR";
 const ROOTFS_COPY_MODE_ENV = "ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE";
@@ -39,6 +38,7 @@ const cleanupFns = [];
 let exiting = false;
 let guestControlSocket = null;
 let launchSucceeded = false;
+let profileShutdownCommitted = false;
 const launchedAtMs = Date.now();
 
 function logPhase(message) {
@@ -294,11 +294,71 @@ function sessionSuffix(value) {
   return `bvm-${hash.slice(0, 16)}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
-function profileKey(launch) {
-  const subject = typeof launch.principal_id === "string" && launch.principal_id.trim()
-    ? launch.principal_id.trim()
-    : launch.stream_id;
-  return `principal-${crypto.createHash("sha256").update(subject).digest("hex").slice(0, 32)}`;
+function profileFailure(code, message) {
+  return new Error(JSON.stringify({ schema: "elastos.browser.engine.launch-error/v1", code, message }));
+}
+
+function prepareProfileDisk(profile, dataDir) {
+  if (profile?.schema !== "elastos.browser.profile/v1" || profile.scope !== "active_principal" ||
+      profile.storage !== "principal_owned_profile_disk" || !/^profile-[0-9a-f]{64}$/i.test(profile.profile_key || "")) {
+    throw new Error("Browser requires the Runtime principal profile disk descriptor");
+  }
+  const diskPath = profile.disk_path;
+  validateAbsolutePath(diskPath, "Browser profile disk_path");
+  if (diskPath.split("/").includes("..") || diskPath.includes(",") ||
+      !diskPath.endsWith("/BrowserProfiles/default/profile.ext4")) {
+    throw new Error("Browser profile disk_path must name the active principal profile disk");
+  }
+  fs.mkdirSync(path.dirname(diskPath), { recursive: true, mode: 0o700 });
+  const lockFd = fs.openSync(`${diskPath}.lifetime.lock`, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    const lockStat = fs.fstatSync(lockFd);
+    if (!lockStat.isFile() || lockStat.nlink !== 1) throw new Error("Browser profile lock must be a regular file with one link");
+    fs.fchmodSync(lockFd, 0o600);
+    const python = path.join(dataDir, "bin/python3");
+    requireFile(python, "admitted Browser Python");
+    // flock belongs to the shared open-file description. This process retains
+    // it after Python exits, and passes the same descriptor to the VM writer.
+    const locked = spawnSync(python, ["-I", "-c", "import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)"],
+      { stdio: ["ignore", "pipe", "pipe", lockFd], encoding: "utf8", timeout: 5000 });
+    if (locked.error || locked.status !== 0) {
+      if (/BlockingIOError|Resource temporarily unavailable/.test(locked.stderr || "")) {
+        throw profileFailure("resources_in_use", "The Browser profile is already attached to another active VM. Close it before reopening.");
+      }
+      throw new Error(`Browser profile lock failed: ${locked.error?.message || locked.stderr || locked.status}`);
+    }
+    const sizeMiB = Number(process.env.ELASTOS_BROWSER_VM_PROFILE_DISK_MIB || "2048");
+    if (!Number.isInteger(sizeMiB) || sizeMiB < 128 || sizeMiB > 65536) throw new Error("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB must be 128..65536");
+    const marker = Buffer.from(`ELASTOS_BROWSER_PROFILE_NEW_V1:${profile.profile_key}`);
+    let initialize = false;
+    let diskFd;
+    try {
+      diskFd = fs.openSync(diskPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      initialize = true;
+      fs.ftruncateSync(diskFd, sizeMiB * 1024 * 1024);
+      fs.writeSync(diskFd, marker, 0, marker.length, 0);
+      fs.fsyncSync(diskFd);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const before = fs.lstatSync(diskPath);
+      diskFd = fs.openSync(diskPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const opened = fs.fstatSync(diskFd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino) {
+        throw new Error("Browser profile disk must retain one regular-file identity");
+      }
+      const header = Buffer.alloc(marker.length);
+      const read = fs.readSync(diskFd, header, 0, header.length, 0);
+      if (read === marker.length && header.equals(marker)) {
+        throw profileFailure("profile_recovery_required", "Browser profile initialization did not finish. Existing state is preserved; Reset requires explicit confirmation.");
+      }
+    } finally {
+      if (diskFd !== undefined) fs.closeSync(diskFd);
+    }
+    return { profileKey: profile.profile_key, diskPath, initialize, lockFd };
+  } catch (error) {
+    fs.closeSync(lockFd);
+    throw error;
+  }
 }
 
 function requireFile(file, label) {
@@ -421,13 +481,10 @@ async function startUnixToTcpBridge(unixPath, host, port) {
 }
 
 function turnserverBin() {
-  const configured = process.env[TURNSERVER_BIN_ENV];
-  if (configured) {
-    validateAbsolutePath(configured, TURNSERVER_BIN_ENV);
-    requireFile(configured, TURNSERVER_BIN_ENV);
-    return configured;
-  }
-  return "turnserver";
+  const configured = process.env[TURNSERVER_BIN_ENV] || path.join(defaultDataDir(fileURLToPath(import.meta.url)), "bin/turnserver");
+  validateAbsolutePath(configured, TURNSERVER_BIN_ENV);
+  requireFile(configured, TURNSERVER_BIN_ENV);
+  return configured;
 }
 
 function tcpListenerVisible(host, port) {
@@ -775,7 +832,9 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "init=/opt/elastos/bin/browser-vm-init",
     "random.trust_cpu=on",
     `elastos.browser_epoch=${Math.floor(Date.now() / 1000)}`,
-    `elastos.browser_profile=${profile}`,
+    `elastos.browser_profile=${profile.profileKey}`,
+    "elastos.browser_profile_disk=required",
+    ...(profile.initialize ? ["elastos.browser_profile_initialize=new"] : []),
     `elastos.browser_display_mode=${launch.display_mode}`,
     "elastos.browser_transport=private_tcp",
     `elastos.browser_host_ip=${network.hostIp}`,
@@ -795,6 +854,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     `type=file,path=${serialLog},hardware=serial,num=1`,
     "--block",
     `path=${rootfs},root=true`,
+    "--block",
+    `path=${profile.diskPath}`,
     "--net",
     `tap-name=${network.tapName},mac=${network.mac}`,
     "--pivot-root",
@@ -807,7 +868,7 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
   ];
   fs.mkdirSync(process.env.ELASTOS_BROWSER_VM_CROSVM_PIVOT_ROOT || "/tmp/elastos/crosvm-empty", { recursive: true });
   const child = spawnTracked(crosvm, args, {
-    stdio: ["ignore", crosvmFd, crosvmFd],
+    stdio: ["ignore", crosvmFd, crosvmFd, profile.lockFd],
   });
   child.once("exit", () => {
     try {
@@ -1060,6 +1121,7 @@ async function cleanupAndExit(signal = null) {
       if (result.ok !== true || result.profile_disk_flushed !== true || result.profile_disk_unmounted !== true) {
         throw new Error("guest profile disk flush was unproved");
       }
+      profileShutdownCommitted = true;
     } catch (error) {
       logPhase(`guest clean shutdown failed: ${error.message}`);
     }
@@ -1114,7 +1176,7 @@ async function cleanupAndExit(signal = null) {
   for (const cleanup of cleanupFns.reverse()) {
     try { cleanup(); } catch {}
   }
-  process.exit(launchSucceeded ? 0 : 1);
+  process.exit(launchSucceeded && profileShutdownCommitted ? 0 : 1);
 }
 
 async function main() {
@@ -1137,6 +1199,9 @@ async function main() {
   requireFile(kernel, "Browser VM kernel");
   requireFile(initrd, "Browser VM initrd");
   requireFile(crosvm, "crosvm");
+  requireLinuxNetwork(scriptPath);
+  const profile = prepareProfileDisk(request.profile, dataDir);
+  cleanupFns.push(() => fs.closeSync(profile.lockFd));
   const network = await acquireLinuxNetwork(scriptPath);
   const iceConfig = vmIceEnv(network);
   const mediaPorts = turnServerPorts(iceConfig, network);
@@ -1188,7 +1253,7 @@ async function main() {
     sessionDir,
     network,
     launch,
-    profile: profileKey(launch),
+    profile,
     iceConfig,
   });
   let vmExited = false;

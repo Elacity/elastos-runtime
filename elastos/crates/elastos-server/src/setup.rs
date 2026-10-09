@@ -554,30 +554,13 @@ async fn run_with_data_dir(
         stamped
     };
 
-    if components.iter().any(|name| name == "browser")
-        && manifest.profiles.contains_key("browser-host")
-    {
-        println!("Preparing Browser Engine helpers...");
-        browser_config::ensure_host_components(
-            &data_dir,
-            &manifest,
-            &platform,
-            FirstPartyCarrierContext::Setup,
-        )
-        .await?;
-        if browser_config::local_vm_selected(&data_dir, &platform)?
-            && manifest.external.contains_key(browser_vm_image::NAME)
-        {
-            println!("Preparing Browser Engine image...");
-            ensure_browser_vm_image_in_context(&data_dir, FirstPartyCarrierContext::Setup).await?;
-        }
-    }
-
-    browser_config::configure(
+    browser_config::prepare_home(
         &data_dir,
+        &manifest,
         &platform,
-        manifest.external.contains_key(browser_vm_image::NAME),
-    )?;
+        components.iter().any(|name| name == "browser"),
+    )
+    .await;
 
     println!();
     if !stamped.is_empty() {

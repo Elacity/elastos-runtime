@@ -191,89 +191,30 @@ require_supported_rust() {
 }
 
 find_node() {
-    if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_NODE_BIN}"
-        return
-    fi
-    if command -v node >/dev/null 2>&1; then
-        command -v node
-        return
-    fi
-    for candidate in \
-        /opt/homebrew/bin/node \
-        /usr/local/bin/node
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    local candidate
-    candidate="$(find "${HOME}/.elastos/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return
-    fi
-    candidate="$(find "${HOME}/.nvm/versions/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return
-    fi
-    echo "node not found. Install Node or set ELASTOS_NODE_BIN to an executable node binary." >&2
-    exit 1
+    local candidate="${ELASTOS_NODE_BIN:-${DATA_DIR}/bin/node}"
+    [[ "$candidate" == /* && -x "$candidate" ]] || {
+        echo "Browser needs its managed Node component, or an explicit executable ELASTOS_NODE_BIN." >&2
+        return 1
+    }
+    printf '%s\n' "$candidate"
 }
 
 find_turnserver() {
-    if [[ -n "${ELASTOS_BROWSER_VM_TURNSERVER_BIN:-}" && -x "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}"
-        return
-    fi
-    if [[ -n "${ELASTOS_TURNSERVER_BIN:-}" && -x "${ELASTOS_TURNSERVER_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_TURNSERVER_BIN}"
-        return
-    fi
-    if command -v turnserver >/dev/null 2>&1; then
-        command -v turnserver
-        return
-    fi
-    for candidate in \
-        /usr/bin/turnserver \
-        /usr/local/bin/turnserver \
-        /opt/homebrew/bin/turnserver
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    return 1
+    local candidate="${ELASTOS_BROWSER_VM_TURNSERVER_BIN:-${ELASTOS_TURNSERVER_BIN:-${DATA_DIR}/bin/turnserver}}"
+    [[ "$candidate" == /* && -x "$candidate" ]] || return 1
+    printf '%s\n' "$candidate"
 }
 
 find_vz_turn_program() {
     if [[ -n "${ELASTOS_BROWSER_VM_TURN_PROGRAM:-}" ]]; then
-        if [[ ! -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]]; then
-            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM is not executable: ${ELASTOS_BROWSER_VM_TURN_PROGRAM}" >&2
+        [[ "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" == /* && -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]] || {
+            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM must be an explicit executable path." >&2
             return 2
-        fi
+        }
         printf '%s\n' "${ELASTOS_BROWSER_VM_TURN_PROGRAM}"
-        return
+    else
+        find_turnserver
     fi
-    if command -v turnserver >/dev/null 2>&1; then
-        command -v turnserver
-        return
-    fi
-    local candidate
-    for candidate in \
-        /usr/bin/turnserver \
-        /usr/local/bin/turnserver \
-        /opt/homebrew/bin/turnserver
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    return 1
 }
 
 browser_vm_target_platform() {

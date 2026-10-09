@@ -889,6 +889,7 @@ show_ready() {
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
 prepare_browser_linux_host() {
+    BROWSER_LINUX_HOST_READY=false
     [[ "$(uname -s)" == Linux ]] || return 0
     local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user
     [[ -f "$helper" ]] || return 0
@@ -903,10 +904,13 @@ prepare_browser_linux_host() {
         info "Browser needs one-time administrator setup for KVM access and its private network devices."
         info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
         sudo /usr/bin/python3 -I "$helper" setup --user "$user" </dev/tty || return $?
+        /usr/bin/python3 -I "$helper" check >/dev/null 2>&1 || return $?
     else
         info "Browser needs one-time administrator setup. Run from a terminal:"
         printf '  sudo /usr/bin/python3 -I %q setup --user %q\n' "$helper" "$user"
+        return 0
     fi
+    BROWSER_LINUX_HOST_READY=true
     info "To remove Browser host access after closing Browser:"
     printf '  sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user %q\n' "$user"
 }
@@ -920,7 +924,13 @@ finish_install() {
     step 5 "Set up Home"
     info "Setting up Home..."
     "$runtime_bin" setup </dev/null || return $?
-    prepare_browser_linux_host || return $?
+    if ! prepare_browser_linux_host; then
+        warn "Browser host preparation is incomplete. Home is ready. Run the installer from a terminal to complete Browser host access, then run elastos setup."
+    elif [[ "${BROWSER_LINUX_HOST_READY:-false}" == true ]]; then
+        # The first setup prepared the admitted helpers before host access.
+        # Resume ordinary-user image preparation after the installer grants it.
+        "$runtime_bin" setup </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
+    fi
     show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."

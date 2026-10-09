@@ -1164,7 +1164,7 @@ class DataPathTests(unittest.TestCase):
 DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
 uname() { printf '%s\\n' "$SYSTEM"; }
 fixture_python() { [[ "$READY" == yes ]]; }
-sudo() { printf 'ROOT_STEP:%s\\n' "$*"; return "$ROOT_RESULT"; }
+sudo() { printf 'ROOT_STEP:%s\\n' "$*"; [[ "$ROOT_RESULT" != 0 ]] || READY=yes; return "$ROOT_RESULT"; }
 prepare_browser_linux_host
 '''
             for case, system, ready, device_present, terminal_present, root_result in [
@@ -1190,6 +1190,29 @@ prepare_browser_linux_host
                         self.assertIn('Run from a terminal', result.stdout)
                     if case == 'unavailable':
                         self.assertIn('virtualization is unavailable', result.stdout)
+
+    def test_browser_setup_resumes_after_installer_host_access_and_home_survives_browser_failure(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            runtime = root / 'elastos'
+            runtime.write_text("#!/bin/bash\n" +
+                               'printf "SETUP:%s\\n" "$*" >> "$CALLS"\n' +
+                               '[[ -f "$HOST_READY" ]] || exit 0\n' +
+                               'exit "${BROWSER_SETUP_RESULT:-0}"\n')
+            runtime.chmod(0o755)
+            script = HELPERS + """
+INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data"
+export CALLS="$1/calls" HOST_READY="$1/host-ready" BROWSER_SETUP_RESULT="$2"
+prepare_browser_linux_host() { touch "$HOST_READY"; BROWSER_LINUX_HOST_READY=true; printf 'HOST_READY\\n' >> "$CALLS"; }
+show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
+finish_install
+"""
+            for browser_result in [0, 7]:
+                calls, ready = root / 'calls', root / 'host-ready'
+                calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
+                result = shell(script, root, browser_result)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY'])
 
     def test_three_platform_release_keys(self):
         for system, machine, expected in [("Linux", "x86_64", "x86_64-linux"),
