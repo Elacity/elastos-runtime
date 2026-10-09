@@ -1901,3 +1901,78 @@ code {
   outline: 1.5px dotted currentColor;
   outline-offset: 2px;
 }
+
+/* Phone stage: no traffic lights to clear, so the menu button takes the
+   leading edge as a 44 px target and shares the first line with the page
+   title. The sidebar is the shared push drawer (elastos-drawer.js) at every
+   phone width, a phone held sideways too, so the button shows at every width
+   and stays above the open drawer to close it. */
+:root[data-el-form-factor="phone"] {
+  --system-phone-menu: var(--el-touch-target);
+  --system-phone-title-line: 32px;
+}
+
+:root[data-el-form-factor="phone"] .settings-search {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .settings-sidebar-item {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .sidebar-toggle {
+  display: inline-grid !important;
+  left: max(4px, env(safe-area-inset-left, 0px));
+  top: 4px;
+}
+
+/* The shared drawer toggle draws the sidebar icon every other capsule uses. */
+:root[data-el-form-factor="phone"] .sidebar-toggle .sidebar-toggle-button {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .settings-sidebar {
+  display: flex;
+  padding: calc(var(--system-phone-menu) + 12px) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  box-shadow: none;
+}
+
+/* .settings shows at the pushed-aside view's rounded corners: the drawer's
+   fill, made opaque on both so the two read as one surface. */
+:root[data-el-form-factor="phone"] .settings,
+:root[data-el-form-factor="phone"] .settings-sidebar {
+  --system-drawer-fill: color-mix(in srgb, var(--color-settings-sidebar) 78%, transparent);
+  background: linear-gradient(var(--system-drawer-fill), var(--system-drawer-fill)) var(--color-settings-bg);
+}
+
+:root[data-el-form-factor="phone"][data-el-theme="light"] .settings,
+:root[data-el-form-factor="phone"][data-el-theme="light"] .settings-sidebar {
+  --system-drawer-fill: color-mix(in srgb, var(--color-settings-sidebar) 86%, transparent);
+}
+
+:root[data-el-form-factor="phone"] .settings-content-container {
+  padding: calc(4px + (var(--system-phone-menu) - var(--system-phone-title-line)) / 2) max(16px, env(safe-area-inset-right, 0px)) calc(24px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+
+:root[data-el-form-factor="phone"] .settings-content h1,
+:root[data-el-form-factor="phone"] .settings-content h1.pc2-section-title {
+  min-height: var(--system-phone-title-line);
+  margin-left: calc(var(--system-phone-menu) - 8px);
+  font-size: 28px;
+  line-height: var(--system-phone-title-line);
+}
+
+:root[data-el-form-factor="phone"] .settings-content .pc2-btn,
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  min-height: var(--el-touch-target);
+}
+
+/* Under 16px, iOS zooms the page when a field takes focus. */
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] [data-settings="models"] summary {
+  line-height: var(--el-touch-target);
+}

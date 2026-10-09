@@ -67,6 +67,8 @@ const elements = {
   newButton: document.getElementById("new-document"),
   modeWrite: document.getElementById("mode-write"),
   modeSplit: document.getElementById("mode-split"),
+  toolbarMore: document.querySelector(".toolbar-more"),
+  moreButton: document.getElementById("more-button"),
   modeRead: document.getElementById("mode-read"),
   panePreview: document.getElementById("pane-preview"),
   paneOutline: document.getElementById("pane-outline"),
@@ -2052,6 +2054,7 @@ function wireShellEvents() {
   elements.unpublishButton.addEventListener("click", unpublishCurrent);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
   elements.sidebarToggle.addEventListener("click", () => setSidebarCollapsed(!state.sidebarCollapsed));
+  wireMoreMenu();
   elements.sidebarSearch.addEventListener("input", () => {
     state.filterQuery = elements.sidebarSearch.value || "";
     renderDocumentsList();
@@ -2204,6 +2207,35 @@ function wireShellEvents() {
     }
     event.preventDefault();
     event.returnValue = "";
+  });
+}
+
+function setMoreMenuOpen(open) {
+  elements.toolbarMore.dataset.open = String(open);
+  elements.moreButton.setAttribute("aria-expanded", String(open));
+}
+
+// Phone-only disclosure for the secondary actions; the actions keep their own
+// handlers, so picking one also closes the menu.
+function wireMoreMenu() {
+  elements.moreButton.addEventListener("click", () => {
+    setMoreMenuOpen(elements.toolbarMore.dataset.open !== "true");
+  });
+  document.getElementById("more-menu").addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("button")) {
+      setMoreMenuOpen(false);
+    }
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!elements.toolbarMore.contains(event.target)) {
+      setMoreMenuOpen(false);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && elements.toolbarMore.dataset.open === "true") {
+      setMoreMenuOpen(false);
+      elements.moreButton.focus();
+    }
   });
 }
 

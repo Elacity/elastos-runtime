@@ -22,6 +22,7 @@ import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
 } from "./home-gui-authority.js?v=home-20260813a";
+import { relayKeyboardInset } from "./shell-form-factor.js?v=home-20260813a";
 import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
@@ -385,6 +386,10 @@ window.addEventListener("message", (event) => {
   }
   if (message.type === "home:shell-response") {
     settleRequest(message);
+    return;
+  }
+  if (message.type === "home:keyboard-inset") {
+    relayKeyboardInset(message.inset);
     return;
   }
   if (message.type === "home:link-status") {

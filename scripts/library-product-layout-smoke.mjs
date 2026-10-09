@@ -4,6 +4,12 @@ import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
+
+const PHONE_SCREENSHOT = "/tmp/library-phone-390x844.png";
+const PHONE_SEARCH_SCREENSHOT = "/tmp/library-phone-search-390x844.png";
+// Longer than the 160 ms search field width transition.
+const SEARCH_SETTLE_MS = 250;
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -429,6 +435,62 @@ async function run() {
     }));
     assert(narrowState.resizerHidden, "Sidebar resizer must hide on narrow layouts.");
     assert(Number.parseFloat(narrowState.searchWidth) > 0, "Search must keep a bounded width on narrow layouts.");
+
+    await page.setViewportSize(PHONE_VIEWPORT);
+    await setPhoneFormFactor(page);
+    await page.locator("#search-toggle-button").click();
+    await page.locator("#toolbar-search:not(.open)").waitFor();
+    await page.waitForTimeout(SEARCH_SETTLE_MS);
+    await assertNoHorizontalOverflow(page, "phone list");
+    await page.screenshot({ path: PHONE_SCREENSHOT });
+    const phoneChrome = await page.evaluate(() => {
+      const rect = (node) => node.getBoundingClientRect();
+      const places = document.getElementById("places");
+      const chips = [...places.querySelectorAll(".place")].map(rect);
+      const controls = [...document.querySelectorAll(".toolbar .navbar-btn, .toolbar .layout-toggle-segment")]
+        .filter((node) => getComputedStyle(node).display !== "none")
+        .map((node) => ({ id: node.id, width: Math.round(rect(node).width), height: Math.round(rect(node).height) }));
+      return {
+        toolbarTop: Math.round(rect(document.querySelector(".toolbar")).top),
+        chipsTop: Math.round(rect(places).top),
+        toolbarBottom: Math.round(rect(document.querySelector(".toolbar")).bottom),
+        contentTop: Math.round(rect(document.getElementById("content")).top),
+        placesBottom: Math.round(rect(places).bottom),
+        chipRows: new Set(chips.map((chip) => Math.round(chip.top))).size,
+        chipHeight: Math.round(Math.min(...chips.map((chip) => chip.height))),
+        placesScrolls: getComputedStyle(places).overflowX === "auto",
+        controls,
+        visibleCrumbs: [...document.querySelectorAll("#breadcrumbs .crumb")].filter((node) => getComputedStyle(node).display !== "none").length,
+        rowHeight: Math.round(Math.min(...[...document.querySelectorAll('.content[data-view="list"] .item')].map((node) => rect(node).height))),
+      };
+    });
+    assert(
+      phoneChrome.toolbarTop === 0 && phoneChrome.chipsTop >= phoneChrome.toolbarBottom && phoneChrome.contentTop >= phoneChrome.placesBottom,
+      `Library phone: navigation row, then Favorites, then the list. Got ${JSON.stringify(phoneChrome)}`,
+    );
+    assert(
+      phoneChrome.contentTop <= 120 && phoneChrome.chipRows === 1 && phoneChrome.placesScrolls && phoneChrome.chipHeight >= 44,
+      `Library phone: Favorites must be one sliding row of 44 px chips and the list must start high. Got ${JSON.stringify(phoneChrome)}`,
+    );
+    assert(
+      phoneChrome.controls.every((control) => control.width >= 44 && control.height >= 44) && phoneChrome.visibleCrumbs === 1 && phoneChrome.rowHeight >= 48,
+      `Library phone: 44 px toolbar controls, 48 px rows, and the current folder as the title. Got ${JSON.stringify(phoneChrome)}`,
+    );
+
+    await page.locator("#search-toggle-button").click();
+    await page.locator("#toolbar-search.open").waitFor();
+    await page.waitForTimeout(SEARCH_SETTLE_MS);
+    await assertNoHorizontalOverflow(page, "phone search-open");
+    const phoneSearch = await page.evaluate(() => {
+      const search = document.getElementById("search");
+      return { width: Math.round(search.getBoundingClientRect().width), fontSize: getComputedStyle(search).fontSize };
+    });
+    await page.screenshot({ path: PHONE_SEARCH_SCREENSHOT });
+    assert(
+      phoneSearch.width >= 240 && phoneSearch.fontSize === "16px",
+      `Library phone: Search takes the navigation row at 16 px. Got ${JSON.stringify(phoneSearch)}`,
+    );
+    await setPhoneFormFactor(page, false);
 
     console.log("PASS Library product layout smoke");
   } finally {

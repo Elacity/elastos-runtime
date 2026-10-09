@@ -183,7 +183,15 @@ verify:
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
+    node --test scripts/home-form-factor.test.mjs
+    node --test scripts/home-keyboard-inset.test.mjs
+    node --test scripts/home-capsule-layout.test.mjs
+    node --test scripts/home-phone-dock.test.mjs
+    node --test scripts/home-phone-stage.test.mjs
+    node --test scripts/home-sheet-handle.test.mjs
     node --test scripts/home-link-status.test.mjs
+    node --test scripts/home-touch-long-press.test.mjs
+    node --test scripts/home-phone-home.test.mjs
     node --test scripts/chat-room-enter.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
@@ -223,7 +231,10 @@ product-ui-browser:
     node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
+    node scripts/browser-product-layout-smoke.mjs
+    node scripts/system-uiux-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
+    node scripts/home-phone-layout-smoke.mjs
 
 product-ui-virtual-auth:
     HOME_VIRTUAL_AUTH_APP_MATRIX=1 node scripts/home-passkey-virtual-auth-smoke.mjs
