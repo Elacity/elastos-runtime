@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::sleep;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -22,12 +22,16 @@ const MAX_GUARD_CONFIG_BYTES: usize = 12 * 1024;
 #[cfg(not(test))]
 const GUARD_START_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARD_EXIT_GRACE: Duration = Duration::from_secs(1);
+/// An engine with no request for this long is stopped to give its memory back.
+const IDLE_RELEASE_DELAY: Duration = Duration::from_secs(60);
 pub(crate) const INTERNAL_GUARD_ARG: &str = "--internal-local-llama-guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalLlamaFault {
     Failed,
     Timeout,
+    /// Free memory does not cover this model; nothing was started.
+    MemoryUnavailable,
 }
 
 pub(crate) enum LocalTimingStage {
@@ -103,10 +107,34 @@ impl LocalTiming {
     }
 }
 
-#[derive(Clone, Default)]
+/// Local engines, at most one running at a time. Runs are serialized; an
+/// engine is stopped after `idle_delay` without a run and restarted on demand.
+#[derive(Clone)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
     runtime_sockets: Arc<RwLock<BTreeMap<String, String>>>,
+    execution: Arc<Semaphore>,
+    idle_release: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    idle_delay: Duration,
+    read_host_memory: crate::local_memory::HostMemoryReader,
+}
+
+impl Default for LocalLlamaEngines {
+    fn default() -> Self {
+        Self::with_runtime_sockets(BTreeMap::new())
+    }
+}
+
+/// Held for the whole of one local run. Dropping it arms the idle release.
+pub(crate) struct LocalRun {
+    engines: LocalLlamaEngines,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for LocalRun {
+    fn drop(&mut self) {
+        self.engines.schedule_idle_release();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,11 +177,74 @@ impl LocalLlamaEngines {
         Self {
             engines: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_sockets: Arc::new(RwLock::new(sockets)),
+            execution: Arc::new(Semaphore::new(1)),
+            idle_release: Arc::new(std::sync::Mutex::new(None)),
+            idle_delay: IDLE_RELEASE_DELAY,
+            #[cfg(not(test))]
+            read_host_memory: crate::local_memory::host_memory,
+            #[cfg(test)]
+            read_host_memory: crate::local_memory::test_host_memory,
         }
     }
 
     pub(crate) async fn update_runtime_sockets(&self, sockets: BTreeMap<String, String>) {
         *self.runtime_sockets.write().await = sockets;
+    }
+
+    /// Waits for the single local execution slot and cancels any pending idle
+    /// release, so the engine stays up for this run.
+    pub(crate) async fn begin_run(&self) -> Result<LocalRun, LocalLlamaFault> {
+        let permit = self
+            .execution
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| LocalLlamaFault::Failed)?;
+        self.cancel_idle_release();
+        Ok(LocalRun {
+            engines: self.clone(),
+            _permit: permit,
+        })
+    }
+
+    fn cancel_idle_release(&self) {
+        if let Some(task) = self
+            .idle_release
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    fn schedule_idle_release(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut idle_release = self
+            .idle_release
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(task) = idle_release.take() {
+            task.abort();
+        }
+        let engines = self.engines.clone();
+        let execution = self.execution.clone();
+        let delay = self.idle_delay;
+        *idle_release = Some(runtime.spawn(async move {
+            sleep(delay).await;
+            // A run that started meanwhile keeps its engine.
+            let Ok(_permit) = execution.try_acquire() else {
+                return;
+            };
+            let mut engines = engines.lock().await;
+            let ids: Vec<_> = engines.keys().cloned().collect();
+            for id in ids {
+                // An unconfirmed close keeps the child for the next exact retry.
+                let _ = close_engine(&mut engines, &id).await;
+            }
+        }));
     }
 
     pub(crate) async fn retains_artifacts(&self) -> bool {
@@ -189,7 +280,7 @@ impl LocalLlamaEngines {
         timing.record(match &result {
             Ok(_) => LocalTimingStage::EngineReady,
             Err(LocalLlamaFault::Timeout) => LocalTimingStage::EngineTimeout,
-            Err(LocalLlamaFault::Failed) => LocalTimingStage::EngineFailed,
+            Err(_) => LocalTimingStage::EngineFailed,
         });
         result
     }
@@ -207,6 +298,15 @@ impl LocalLlamaEngines {
         let mut engines = tokio::time::timeout(timeout, self.engines.lock())
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
+        // One model engine at a time: opening another model stops the previous.
+        let others: Vec<_> = engines
+            .keys()
+            .filter(|id| id.as_str() != offer_id)
+            .cloned()
+            .collect();
+        for id in others {
+            close_engine(&mut engines, &id).await?;
+        }
         let stale = match engines.get_mut(offer_id) {
             Some(running) if running.closing => true,
             Some(running) => match running_engine_is_ready(running, deadline).await? {
@@ -226,6 +326,12 @@ impl LocalLlamaEngines {
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
+        crate::local_memory::admit(
+            std::path::Path::new(&model.path),
+            settings.context_size,
+            settings.parallel,
+            self.read_host_memory,
+        )?;
         let sockets = self.runtime_sockets.read().await;
         let (target, broker_socket) = if sockets.is_empty() {
             (EngineTarget::Tcp(reserve_loopback_port()?), None)
@@ -313,6 +419,7 @@ impl LocalLlamaEngines {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), LocalLlamaFault> {
+        self.cancel_idle_release();
         let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
@@ -489,6 +596,13 @@ fn engine_arguments_with_cpu_budget(
         "--no-context-shift".into(),
         "--parallel".into(),
         settings.parallel.to_string().into(),
+        "--batch-size".into(),
+        crate::local_memory::BATCH_SIZE.to_string().into(),
+        "--ubatch-size".into(),
+        crate::local_memory::UBATCH_SIZE.to_string().into(),
+        // Admission covers the live context only, without cached prompts.
+        "--cache-ram".into(),
+        "0".into(),
         "--threads".into(),
         settings.threads.min(available_threads).to_string().into(),
         "--threads-batch".into(),
@@ -1105,6 +1219,85 @@ mod tests {
         (unsafe { libc::kill(pid, 0) }) == 0
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn scarce_memory() -> Result<crate::local_memory::HostMemory, LocalLlamaFault> {
+        Ok(crate::local_memory::HostMemory {
+            total: 8 * GIB,
+            available: GIB,
+            pressure_normal: false,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insufficient_free_memory_refuses_before_spawn() {
+        let (mut engines, engine, model, settings, events) = fixture("healthy");
+        engines.read_host_memory = scarce_memory;
+        assert_eq!(
+            engines.endpoint("offer", &engine, &model, &settings).await,
+            Err(LocalLlamaFault::MemoryUnavailable)
+        );
+        assert_eq!(event_count(&events, "start:"), 0);
+        assert!(!engines.retains_artifacts().await);
+
+        engines.read_host_memory = crate::local_memory::test_host_memory;
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        assert_eq!(event_count(&events, "start:"), 1);
+        engines.shutdown().await.unwrap();
+    }
+
+    async fn answers(endpoint: &LocalLlamaEndpoint) -> bool {
+        reqwest::Client::new()
+            .post(&endpoint.api_url)
+            .json(&serde_json::json!({
+                "model": endpoint.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false},
+            }))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_engine_is_released_and_next_request_restarts_it() {
+        let (mut engines, engine, model, settings, events) = fixture("healthy");
+        engines.idle_delay = Duration::from_millis(50);
+        let run = engines.begin_run().await.unwrap();
+        let endpoint = engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let first_pid = recorded_pid(&events);
+        // An active run keeps its engine past the idle delay.
+        engines.schedule_idle_release();
+        sleep(Duration::from_millis(200)).await;
+        assert!(process_exists(first_pid));
+        assert!(answers(&endpoint).await);
+        drop(run);
+
+        tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+            while engines.retains_artifacts().await {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!process_exists(first_pid));
+
+        let _run = engines.begin_run().await.unwrap();
+        let endpoint = engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        assert_eq!(event_count(&events, "start:"), 2);
+        assert!(answers(&endpoint).await);
+        engines.shutdown().await.unwrap();
+    }
+
     #[test]
     fn engine_argument_vector_is_exact() {
         let settings = LocalLlamaSettings {
@@ -1129,6 +1322,12 @@ mod tests {
             "--no-context-shift",
             "--parallel",
             "2",
+            "--batch-size",
+            "128",
+            "--ubatch-size",
+            "128",
+            "--cache-ram",
+            "0",
             "--threads",
             "3",
             "--threads-batch",
@@ -1200,28 +1399,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn exact_close_reaps_only_selected_engine_and_repeats_safely() {
+    async fn opening_second_model_closes_first_and_close_repeats_safely() {
         let (engines, engine, model, settings, events) = fixture("healthy");
         let (_, other_engine, other_model, other_settings, other_events) = fixture("healthy");
         engines
             .endpoint("first", &engine, &model, &settings)
             .await
             .unwrap();
+        let first_pid = recorded_pid(&events);
         let other = engines
             .endpoint("second", &other_engine, &other_model, &other_settings)
             .await
             .unwrap();
-        let first_pid = recorded_pid(&events);
         let second_pid = recorded_pid(&other_events);
-        {
-            let mut owned = engines.engines.lock().await;
-            close_engine(&mut owned, "first").await.unwrap();
-            close_engine(&mut owned, "first").await.unwrap();
-            assert!(!owned.contains_key("first"));
-            assert!(owned.contains_key("second"));
-        }
         assert!(!process_exists(first_pid));
         assert!(process_exists(second_pid));
+        {
+            let mut owned = engines.engines.lock().await;
+            assert!(!owned.contains_key("first"));
+            close_engine(&mut owned, "first").await.unwrap();
+            close_engine(&mut owned, "first").await.unwrap();
+            assert!(owned.contains_key("second"));
+        }
         assert!(engines.retains_artifacts().await);
         assert_eq!(
             engines
