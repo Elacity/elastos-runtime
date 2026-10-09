@@ -154,6 +154,19 @@ the version by the contract change (see Meaning) and update the changelog first;
 `scripts/publish-release.sh` checks the version format with
 [`scripts/check-versioning.sh`](../scripts/check-versioning.sh).
 
+A new model catalogue is produced, signed and pinned before release preparation, with the same key.
+`components.json` carries no `model_catalog` until then: the release refuses a pin without `model-catalog.json`.
+(1) Prepare the pinned Kubo with `scripts/seed-kubo-cache.sh CACHE KUBO_DATA PLATFORM`, then run
+`node scripts/ci-model-package.mjs produce OUT DID KUBO_DATA`; it downloads and checks the pinned weights, builds `OUT/package`,
+prints its CID and writes the unsigned `OUT/payload.json`.
+(2) Sign: `release-signer.py --policy POLICY --input-root DIR --model-catalog OUT/payload.json --output-root NEW_DIR`.
+The policy approves the payload by `model_catalog_sha256`; the operator types the DID. The signer refuses a payload the Runtime would refuse,
+writes `model-catalog.json` and prints its CID.
+(3) Pin `OUT/package` in the seed's Kubo with `ipfs add` and the `KUBO_ADD_FLAGS` from `scripts/ci-model-package.mjs`; the printed CID must equal the package CID.
+(4) Put `model-catalog.json` at the repository root and add `model_catalog` to `components.json`: `head_cid` (the signer's CID),
+`publisher_dids` (the signing DID) and `local_use` (`max_cache_bytes` 1 GiB, `max_model_memory_bytes` 4 GiB).
+Keep that head stable across releases: a new head means every admitted model needs Use again.
+
 1. **Build.** Run the `Release package` workflow
    ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
    with the source commit, the install version N and the update version N+1.

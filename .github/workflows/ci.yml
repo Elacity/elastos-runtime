@@ -70,6 +70,7 @@ jobs:
           node --test scripts/chat-room-reconnect.test.mjs
       - name: release artifact source proofs
         run: |
+          node --test scripts/ci-model-package.test.mjs scripts/ci-installed-home-failure.test.mjs
           python3 scripts/ci-release-policy-test.py
           python3 scripts/ci-download-cache-test.py
           python3 scripts/components-release-integrity-check.py --self-test
@@ -581,9 +582,21 @@ jobs:
         with:
           path: ${{ steps.kubo-pin.outputs.paths }}
           key: ${{ steps.kubo-pin.outputs.key }}
+      - name: download pinned ARM64 engine input
+        if: matrix.os == 'ubuntu-22.04-arm'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: llama-arm64-bundle
+          path: ${{ runner.temp }}/llama-arm64-bundle
+      - name: verify pinned ARM64 engine input
+        if: matrix.os == 'ubuntu-22.04-arm'
+        run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: '1'
+          SETUP_SOURCE_HOME_INSTALL_KUBO: '1'
+          ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
@@ -604,15 +617,6 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
-      - name: download pinned ARM64 engine input
-        if: matrix.os == 'ubuntu-22.04-arm'
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: llama-arm64-bundle
-          path: ${{ runner.temp }}/llama-arm64-bundle
-      - name: verify pinned ARM64 engine input
-        if: matrix.os == 'ubuntu-22.04-arm'
-        run: bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
       - name: local-carrier setup smoke
         env:
           ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
@@ -620,6 +624,47 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: prepare installed Home browser
+        timeout-minutes: 10
+        run: |
+          npm ci --ignore-scripts --prefix elastos/tools/browser-playwright-engine
+          export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/installed-home-browser"
+          npx --prefix elastos/tools/browser-playwright-engine playwright install chromium --with-deps --only-shell
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26'
+      - name: prepare signed SmolLM2 fixture
+        timeout-minutes: 20
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
+        run: scripts/ci-installed-journeys.sh prepare
+      # Only the x86-64 job proves one reply Get from a separate holder Home over Carrier.
+      - name: installed Marketplace Get and Assistant reply
+        timeout-minutes: 15
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
+          CI_CARRIER_GET: ${{ matrix.os == 'ubuntu-24.04' }}
+        run: scripts/ci-installed-journeys.sh home
+      - name: summarize installed model journey
+        if: always()
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-source-home
+          CI_CARRIER_GET: ${{ matrix.os == 'ubuntu-24.04' }}
+        run: scripts/ci-installed-journeys.sh summary
+      - name: upload installed model journey
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: source-home-journeys-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/source-home-journeys/**/*.json
+            ${{ runner.temp }}/source-home-journeys/**/*.png
+          retention-days: 7
+          if-no-files-found: error
       # ARM needs the package for the Jetson compatibility gate on every event.
       - name: build and package release binaries
         if: matrix.os == 'ubuntu-22.04-arm' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
@@ -780,6 +825,8 @@ jobs:
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+          SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER: '1'
+          SETUP_SOURCE_HOME_INSTALL_KUBO: '1'
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
@@ -819,6 +866,31 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
+      - name: prepare signed SmolLM2 fixture
+        timeout-minutes: 20
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
+        run: scripts/ci-installed-journeys.sh prepare
+      - name: installed Marketplace Get and Assistant reply
+        timeout-minutes: 15
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
+        run: scripts/ci-installed-journeys.sh home-repeat
+      - name: summarize installed model journey
+        if: always()
+        env:
+          CI_SOURCE_HOME: ${{ runner.temp }}/elastos-mac-test-home
+        run: scripts/ci-installed-journeys.sh summary
+      - name: upload installed model journey
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: source-home-journeys-macos-14
+          path: |
+            ${{ runner.temp }}/source-home-journeys/**/*.json
+            ${{ runner.temp }}/source-home-journeys/**/*.png
+          retention-days: 7
+          if-no-files-found: error
       # The hop starts from the published release the pin names. Its signed bytes are
       # cached by the pin; only a miss reads them from the public seed.
       - name: restore the pinned published release
@@ -958,6 +1030,39 @@ jobs:
           path: ${{ runner.temp }}/source-home-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+  # A pull request run stops at its first failed job, so the macOS and Linux
+  # journeys do not run on for 30+ minutes after a decisive failure. Pushes,
+  # merge queues and dispatches keep running every job to the end. This job
+  # runs no repository code and is the only one that may cancel the run.
+  cancel-on-failure:
+    name: cancel-on-failure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      actions: write
+    steps:
+      - name: cancel this run after the first failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          run="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done_polls=0
+          # Jobs that wait on needs appear late; two quiet polls confirm the end.
+          while (( done_polls < 2 )); do
+            sleep 20
+            counts="$(gh api "$run/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq \
+              '[.jobs[] | select(.name != "cancel-on-failure")] | "\(map(select(.conclusion == "failure" or .conclusion == "timed_out")) | length) \(map(select(.status != "completed")) | length)"')" || continue
+            read -r failed pending <<< "$counts"
+            if (( failed > 0 )); then
+              echo "A job failed; cancelling the rest of this pull request run."
+              gh api -X POST "$run/cancel"
+              exit
+            fi
+            if (( pending == 0 )); then done_polls=$((done_polls + 1)); else done_polls=0; fi
+          done
 
   # Publish a GitHub Release for v* tags, attaching the per-architecture
   # binary packages built by the source-home jobs. Only runs when every

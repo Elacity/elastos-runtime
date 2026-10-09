@@ -1850,6 +1850,53 @@ fn arm64_model_elf_compatible(header: &[u8]) -> bool {
         && u16::from_le_bytes([header[18], header[19]]) == 183
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalModelExecutionUnavailable {
+    UnsupportedHost,
+    SourceEngineRequired,
+}
+
+impl LocalModelExecutionUnavailable {
+    pub(crate) fn public_class(self) -> &'static str {
+        match self {
+            Self::UnsupportedHost => "unsupported_host",
+            Self::SourceEngineRequired => "source_engine_required",
+        }
+    }
+}
+
+impl std::fmt::Display for LocalModelExecutionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedHost => "admitted model host profile is unavailable",
+            Self::SourceEngineRequired => "This source-checkout Home has no local AI engine. Rerun scripts/setup-source-home.sh with SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 to build it.",
+        })
+    }
+}
+
+impl std::error::Error for LocalModelExecutionUnavailable {}
+
+fn local_model_engine_acquisition_refusal(
+    info: &PlatformInfo,
+) -> Option<LocalModelExecutionUnavailable> {
+    matches!(
+        info.strategy.as_deref(),
+        Some("source-build") | Some("local-copy")
+    )
+    .then_some(LocalModelExecutionUnavailable::SourceEngineRequired)
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+fn require_arm64_model_cpu_features(hwcap: u64) -> anyhow::Result<()> {
+    if !arm64_model_cpu_features_available(hwcap) {
+        return Err(anyhow::anyhow!(
+            "ARM64 llama-server requires dot product and FP16 CPU features"
+        )
+        .context(LocalModelExecutionUnavailable::UnsupportedHost));
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_arm64_model_host(platform: &str) -> anyhow::Result<()> {
     if platform != "linux-arm64" {
         return Ok(());
@@ -1857,10 +1904,7 @@ pub(crate) fn verify_arm64_model_host(platform: &str) -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         let available = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
-        anyhow::ensure!(
-            arm64_model_cpu_features_available(available),
-            "ARM64 llama-server requires dot product and FP16 CPU features"
-        );
+        require_arm64_model_cpu_features(available)?;
     }
     Ok(())
 }
@@ -2089,7 +2133,14 @@ pub(crate) fn local_model_engine_receipt_identity(
     let mut bundle = data_dir.canonicalize()?;
     for part in relative.components() {
         bundle.push(part.as_os_str());
-        let metadata = fs::symlink_metadata(&bundle)?;
+        let metadata = fs::symlink_metadata(&bundle).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                if let Some(refusal) = local_model_engine_acquisition_refusal(info) {
+                    return anyhow::Error::new(error).context(refusal);
+                }
+            }
+            error.into()
+        })?;
         anyhow::ensure!(
             !metadata.file_type().is_symlink()
                 && metadata.is_dir()
@@ -2182,10 +2233,9 @@ pub(crate) async fn ensure_local_model_engine(
         })?;
     // Source-checkout Homes build the engine during setup; only signed releases
     // carry a prebuilt bundle that Assistant can fetch on demand.
-    anyhow::ensure!(
-        !matches!(info.strategy.as_deref(), Some("source-build") | Some("local-copy")),
-        "This source-checkout Home has no local AI engine. Rerun scripts/setup-source-home.sh with SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 to build it."
-    );
+    if let Some(refusal) = local_model_engine_acquisition_refusal(info) {
+        return Err(refusal.into());
+    }
     anyhow::ensure!(
         matches!(info.strategy.as_deref(), None | Some("prebuilt")) && info.extract_path.is_some(),
         "on-demand llama-server requires a signed prebuilt bundle"
@@ -4241,6 +4291,7 @@ pub(crate) mod tests {
     #[test]
     fn arm64_model_profile_requires_dot_product_and_both_fp16_features() {
         assert!(arm64_model_cpu_features_available(ARM64_MODEL_HWCAP));
+        assert!(require_arm64_model_cpu_features(ARM64_MODEL_HWCAP).is_ok());
         assert!(arm64_model_cpu_features_available(
             ARM64_MODEL_HWCAP | (1 << 0)
         ));
@@ -4248,6 +4299,11 @@ pub(crate) mod tests {
             assert!(!arm64_model_cpu_features_available(
                 ARM64_MODEL_HWCAP & !bit
             ));
+            let error = require_arm64_model_cpu_features(ARM64_MODEL_HWCAP & !bit).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LocalModelExecutionUnavailable>(),
+                Some(&LocalModelExecutionUnavailable::UnsupportedHost)
+            );
         }
     }
 
@@ -7473,7 +7529,7 @@ pub(crate) mod tests {
         let mut components: serde_json::Value =
             serde_json::from_slice(&fs::read(data.join("components.json")).unwrap()).unwrap();
         components["external"]["llama-server"] = serde_json::json!({
-            "version":"fixture", "platforms":{platform:{
+            "version":"fixture", "platforms":{platform.clone():{
                 "release_path": if fault == "url-only" { None } else { Some("llama-fixture.tar.gz") },
                 "url":"http://127.0.0.1:1/refused-upstream",
                 "checksum":format!("sha256:{:x}", sha2::Sha256::digest(&bytes)),
@@ -7481,6 +7537,10 @@ pub(crate) mod tests {
                 "install_path":relative
             }}
         });
+        if matches!(fault, "source-build" | "local-copy") {
+            components["external"]["llama-server"]["platforms"][&platform]["strategy"] =
+                serde_json::json!(fault);
+        }
         let mut components = serde_json::to_vec(&components).unwrap();
         let binary = data.join("elastos");
         fs::write(&binary, b"signed fixture runtime").unwrap();
@@ -7631,6 +7691,16 @@ pub(crate) mod tests {
             ),
             ("pending", "A signed update requires recovery", 0),
             ("tampered", "Checksum mismatch for llama-server", 1),
+            (
+                "source-build",
+                "This source-checkout Home has no local AI engine",
+                0,
+            ),
+            (
+                "local-copy",
+                "This source-checkout Home has no local AI engine",
+                0,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             fs::write(
@@ -7647,6 +7717,12 @@ pub(crate) mod tests {
                 format!("{error:#}").contains(expected),
                 "{fault}: {error:#}"
             );
+            if matches!(fault, "source-build" | "local-copy") {
+                assert_eq!(
+                    error.downcast_ref::<LocalModelExecutionUnavailable>(),
+                    Some(&LocalModelExecutionUnavailable::SourceEngineRequired)
+                );
+            }
             assert!(
                 !bundle.exists(),
                 "{fault}: engine bundle must not be activated"
