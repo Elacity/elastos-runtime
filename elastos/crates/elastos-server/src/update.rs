@@ -30,6 +30,14 @@ pub type FetchFn = Box<
         + Sync,
 >;
 
+/// Builds a large future on the heap from inside this small frame. An unoptimized
+/// build otherwise reserves room for every awaited future in its caller's poll
+/// frame, and the nested update chain then nears a 2 MiB thread stack.
+#[inline(never)]
+pub(crate) fn on_heap<F: Future>(build: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(build())
+}
+
 /// Async callback for attempting P2P release discovery.
 /// An unavailable connection returns None; discovery errors remain terminal.
 pub type TryP2pFn = Box<
@@ -1027,22 +1035,24 @@ async fn run_update_for_data_dir_with_mode(
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
 ) -> anyhow::Result<()> {
-    run_update_with_restart(
-        data_dir,
-        fetch_fn,
-        try_p2p_fn,
-        check_only,
-        head_cid_override,
-        no_p2p,
-        cli_gateways,
-        version,
-        auto_confirm,
-        force,
-        repair_invalid_version,
-        carrier_context,
-        apply_mode,
-        None,
-    )
+    on_heap(|| {
+        run_update_with_restart(
+            data_dir,
+            fetch_fn,
+            try_p2p_fn,
+            check_only,
+            head_cid_override,
+            no_p2p,
+            cli_gateways,
+            version,
+            auto_confirm,
+            force,
+            repair_invalid_version,
+            carrier_context,
+            apply_mode,
+            None,
+        )
+    })
     .await
 }
 
@@ -1215,28 +1225,30 @@ async fn run_update_with_restart(
     let release_cid = head["payload"]["latest_release_cid"].as_str().unwrap_or("");
     let release_object_cid = optional_release_object_cid(&head)?;
 
-    run_upgrade_with_restart(
-        fetch_fn,
-        &head,
-        &head_bytes,
-        resolved_head_cid.as_deref(),
-        head_version,
-        release_cid,
-        release_object_cid,
-        &current_version,
-        &source,
-        data_dir,
-        check_only,
-        &ordered_gateways,
-        auto_confirm,
-        force,
-        repair_invalid_version,
-        discovery_method,
-        working_gateway.as_deref(),
-        carrier_context,
-        apply_mode,
-        restart_owner,
-    )
+    on_heap(|| {
+        run_upgrade_with_restart(
+            fetch_fn,
+            &head,
+            &head_bytes,
+            resolved_head_cid.as_deref(),
+            head_version,
+            release_cid,
+            release_object_cid,
+            &current_version,
+            &source,
+            data_dir,
+            check_only,
+            &ordered_gateways,
+            auto_confirm,
+            force,
+            repair_invalid_version,
+            discovery_method,
+            working_gateway.as_deref(),
+            carrier_context,
+            apply_mode,
+            restart_owner,
+        )
+    })
     .await
 }
 
@@ -1425,13 +1437,8 @@ async fn run_upgrade_with_restart(
     match version_order {
         Ordering::Equal if !force && !repair_version => {
             if !check_only && apply_mode == ApplyMode::Normal {
-                Box::pin(repair_current_release(
-                    data_dir,
-                    source,
-                    fetch_fn,
-                    carrier_context,
-                ))
-                .await?;
+                on_heap(|| repair_current_release(data_dir, source, fetch_fn, carrier_context))
+                    .await?;
             }
             println!();
             println!("  Installed release is up to date.");
@@ -1625,14 +1632,16 @@ async fn run_upgrade_with_restart(
             transaction.uses_consumed_layout(),
             "Legacy recovery finished. Run the update again before preparing its new release."
         );
-        Box::pin(crate::setup::repair_installed_support(
-            transaction.data_dir(),
-            transaction.binary_path(),
-            source,
-            repair_version,
-            crate::setup::CatalogueRepair::Required(fetch_fn),
-            carrier_context,
-        ))
+        on_heap(|| {
+            crate::setup::repair_installed_support(
+                transaction.data_dir(),
+                transaction.binary_path(),
+                source,
+                repair_version,
+                crate::setup::CatalogueRepair::Required(fetch_fn),
+                carrier_context,
+            )
+        })
         .await?;
         let previous = crate::installed_release::read_without_migration_for_update(
             transaction.data_dir(),
@@ -1647,12 +1656,14 @@ async fn run_upgrade_with_restart(
             changed_capsule_names(old_components.as_deref(), &comp_data).unwrap_or_default();
         let new_manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
         let catalog_stage = tempfile::tempdir_in(data_dir)?;
-        let catalog = crate::setup::stage_model_catalog(
-            data_dir,
-            &new_manifest,
-            catalog_stage.path(),
-            fetch_fn,
-        )
+        let catalog = on_heap(|| {
+            crate::setup::stage_model_catalog(
+                data_dir,
+                &new_manifest,
+                catalog_stage.path(),
+                fetch_fn,
+            )
+        })
         .await?;
         // Prepare all five original backups before the first live artifact changes.
         // Build gateway list with working gateway first (if discovered via gateway)
@@ -1699,7 +1710,7 @@ async fn run_upgrade_with_restart(
             (ReleaseFile::ReleaseManifest, release_bytes.as_slice()),
         ];
         transaction.preflight_prepare(&files, &previous.head, &previous.release)?;
-        verify_candidate_before_migration(&transaction, &binary_data, version).await?;
+        on_heap(|| verify_candidate_before_migration(&transaction, &binary_data, version)).await?;
         crate::installed_release::load_or_migrate_for_update(
             data_dir,
             &bin_path,
@@ -1724,7 +1735,7 @@ async fn run_upgrade_with_restart(
         // Existing support refresh remains inside the same writer guard. Complete
         // support staging/rollback is still required by the release activation gate.
         let support_result: anyhow::Result<()> = async {
-            let refreshed_components =
+            let refreshed_components = on_heap(|| {
                 crate::setup::refresh_installed_components_for_update_in_context(
                     data_dir,
                     old_components.as_deref(),
@@ -1732,7 +1743,8 @@ async fn run_upgrade_with_restart(
                     &component_platform,
                     carrier_context,
                 )
-                .await?;
+            })
+            .await?;
             if refreshed_components.is_empty() {
                 println!("  Installed support assets unchanged");
             } else {
@@ -1819,14 +1831,16 @@ async fn run_upgrade_with_restart(
         transaction.uses_consumed_layout(),
         "Legacy recovery finished. Run the update again before preparing its new release."
     );
-    Box::pin(crate::setup::repair_installed_support(
-        transaction.data_dir(),
-        transaction.binary_path(),
-        source,
-        repair_version,
-        crate::setup::CatalogueRepair::Required(fetch_fn),
-        carrier_context,
-    ))
+    on_heap(|| {
+        crate::setup::repair_installed_support(
+            transaction.data_dir(),
+            transaction.binary_path(),
+            source,
+            repair_version,
+            crate::setup::CatalogueRepair::Required(fetch_fn),
+            carrier_context,
+        )
+    })
     .await?;
     let previous = crate::installed_release::read_without_migration_for_update(
         transaction.data_dir(),
@@ -1839,14 +1853,16 @@ async fn run_upgrade_with_restart(
     let old_components = std::fs::read(data_dir.join("components.json"))?;
     let staged_support = if let Some(owner) = restart_owner.as_mut() {
         Some(
-            crate::setup::stage_update_support(
-                data_dir,
-                &old_components,
-                &comp_data,
-                &component_platform,
-                fetch_fn,
-                *owner,
-            )
+            on_heap(|| {
+                crate::setup::stage_update_support(
+                    data_dir,
+                    &old_components,
+                    &comp_data,
+                    &component_platform,
+                    fetch_fn,
+                    *owner,
+                )
+            })
             .await?,
         )
     } else {
@@ -1903,7 +1919,7 @@ async fn run_upgrade_with_restart(
         (ReleaseFile::ReleaseManifest, release_bytes.as_slice()),
     ];
     transaction.preflight_prepare(&files, &previous.head, &previous.release)?;
-    verify_candidate_before_migration(&transaction, &binary_data, version).await?;
+    on_heap(|| verify_candidate_before_migration(&transaction, &binary_data, version)).await?;
     crate::installed_release::load_or_migrate_for_update(
         data_dir,
         bin_path,
