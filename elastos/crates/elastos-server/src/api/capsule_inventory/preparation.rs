@@ -648,6 +648,11 @@ fn reserve_at(
         }
         return Ok(existing.clone());
     }
+    // Persist expiry (and its settled_at) before any refusal below, so a
+    // refused Use does not restart an overdue attempt's history clock.
+    if expired {
+        inventory.save(&state)?;
+    }
     ensure!(
         !state.retirement.as_ref().is_some_and(|retirement| {
             state.records.iter().any(|record| {
@@ -12188,6 +12193,62 @@ server.serve_forever()
         assert_eq!(replay.state, PreparationState::Reserved);
         assert_eq!(replay.created_at, late(120));
         assert_ne!(replay.operation_id, ids[0]);
+    }
+
+    /// A refused Use still saves the expiry of an overdue reservation, so its
+    /// hour of history runs from that expiry and a later Use gets through.
+    #[tokio::test]
+    async fn model_preparation_refused_use_keeps_an_overdue_reservations_expiry() {
+        let (root, mut owner, _backend, _registry) = staged_fixture(now().unwrap(), true).await;
+        let t0 = owner.created_at;
+        owner.state = PreparationState::Admitted;
+        let overdue_id;
+        {
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            state.records = vec![owner.clone()];
+            // 62 admitted copies that own nothing but are never pruned.
+            for number in 0..MAX_RECORDS - 2 {
+                let mut alias = owner.clone();
+                alias.request_binding.request_id = format!("alias-{number}");
+                alias.request_binding = binding(&alias);
+                alias.operation_id = operation_id(&alias).unwrap();
+                alias.admission_id = owner.operation_id.clone();
+                alias.reserved_bytes = 0;
+                state.records.push(alias);
+            }
+            // One reservation that was never started and is now overdue.
+            let mut overdue = owner.clone();
+            overdue.request_binding.request_id = "overdue".into();
+            overdue.request_binding = binding(&overdue);
+            overdue.operation_id = operation_id(&overdue).unwrap();
+            overdue.admission_id = overdue.operation_id.clone();
+            overdue.state = PreparationState::Reserved;
+            overdue.index_bytes = 0;
+            overdue.completed_bytes = 0;
+            overdue_id = overdue.operation_id.clone();
+            state.records.push(overdue);
+            inventory.save(&state).unwrap();
+        }
+        let context = context();
+        let use_method = method("use");
+        let t1 = t0 + RESERVATION_SECONDS;
+        let reserve_then = |request: &str, at: u64| {
+            reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                request,
+                &owner.package_cid,
+                at,
+            )
+        };
+        assert!(reserve_then("blocked", t1).is_err());
+        let expired = load_operation(root.path(), &overdue_id).unwrap();
+        assert_eq!(expired.state, PreparationState::Expired);
+        assert_eq!(expired.settled_at, Some(t1));
+        let next = reserve_then("an-hour-later", t1 + TERMINAL_HISTORY_SECONDS).unwrap();
+        assert_eq!(next.state, PreparationState::Reserved);
+        assert!(load_operation(root.path(), &overdue_id).is_err());
     }
 
     /// After 100 retries spread over more than an hour a Use still starts, and
