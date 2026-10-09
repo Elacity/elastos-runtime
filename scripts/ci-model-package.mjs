@@ -35,9 +35,22 @@ function encode(bytes, alphabet, bits) {
 }
 export const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), Buffer.from(sha(bytes), "hex")]), "abcdefghijklmnopqrstuvwxyz234567", 5);
 
-// The producer and build-only input proof share this fixture's byte pins and
-// provenance independently of any production catalog.
-export const SMOL_FIXTURE = JSON.parse(readFileSync(new URL("./pinned-smollm2-fixture.json", import.meta.url), "utf8"));
+// A fixture pins one model's bytes, license and catalogue capsule manifest.
+// The producer and build-only input proof share SmolLM2's fixture independently
+// of any production catalog.
+export function loadFixture(path) {
+  const fixture = JSON.parse(readFileSync(path, "utf8"));
+  const manifest = fixture.capsule_manifest, provenance = manifest?.model_content?.provenance;
+  assert(provenance, "fixture requires capsule_manifest.model_content.provenance");
+  for (const revision of [provenance.base_revision, provenance.quantized_revision]) assert.match(revision, /^[0-9a-f]{40}$/, "fixture revisions must be full commit hashes");
+  assert.equal(fixture.model.url, `https://huggingface.co/${provenance.quantized_repository}/resolve/${provenance.quantized_revision}/${fixture.model.name}`,
+    "fixture weights must come from the pinned quantized repository revision");
+  // Runtime titles a catalogue model by its base repository name (read_model.rs).
+  assert.equal(provenance.base_repository.split("/").at(-1).replaceAll("-", " "), fixture.display_name,
+    "fixture display_name must be the title Runtime derives from base_repository");
+  return fixture;
+}
+export const SMOL_FIXTURE = loadFixture(new URL("./pinned-smollm2-fixture.json", import.meta.url));
 
 function regular(path) {
   for (let current = resolve(path);; current = dirname(current)) {
@@ -70,17 +83,17 @@ export function contentManifest(files) {
 
 // The publisher named in PROVENANCE.md is the closure's attesting publisher:
 // the CI fixture uses a disposable key; production names the maintainer DID.
-export function buildSmolEntry(inputs, packageDir, publisher = null, fixture = SMOL_FIXTURE) {
+export function buildEntry(inputs, packageDir, publisher, fixture) {
   const model = join(inputs, fixture.model.name);
   fileRecord(model, "weights.gguf", fixture.model);
   fileRecord(join(inputs, "LICENSE"), "LICENSE", fixture.license);
   const license = readFileSync(join(inputs, "LICENSE"));
-  const provenance = fixture.capsule_manifest.model_content.provenance;
+  const model_content = fixture.capsule_manifest.model_content, provenance = model_content.provenance;
   const attestation = publisher ? `Publisher attestation by ${publisher}.` : "Isolated CI publisher attestation.";
   const keyNote = publisher ? "" : " This fixture uses an in-memory disposable publisher key.";
   const files = {
     LICENSE: license, "LICENSE.base": license,
-    "PROVENANCE.md": Buffer.from(`${attestation} Apache-2.0 base: ${provenance.base_repository} at ${provenance.base_revision}. Q8_0 weights: ${provenance.quantized_repository} at ${provenance.quantized_revision}. Weights SHA-256: ${fixture.model.sha256}.${keyNote}\n`),
+    "PROVENANCE.md": Buffer.from(`${attestation} ${provenance.base_license.spdx_id} base: ${provenance.base_repository} at ${provenance.base_revision}. ${model_content.quantization} weights: ${provenance.quantized_repository} at ${provenance.quantized_revision}. Weights SHA-256: ${fixture.model.sha256}.${keyNote}\n`),
     "capsule.json": Buffer.from(canonical(fixture.capsule_manifest)),
   };
   mkdirSync(packageDir, { mode: 0o700 });
@@ -154,8 +167,18 @@ export function verifyInstalledKubo(data, components, host, recipe) {
   return { platform: host, install_path: installPath, archive_checksum: receipt.checksum, executable_sha256: info.checksum, build_receipt_sha256: `sha256:${sha(receiptBytes)}` };
 }
 
+// The catalogue payload the Runtime and release-signer.py accept: 1-8 entries
+// with unique package CIDs and capsule names, in the given order.
+export function catalogPayload(entries, publishedAt = Math.floor(Date.now() / 1000)) {
+  assert(entries.length >= 1 && entries.length <= 8, "model catalog requires 1 to 8 entries");
+  for (const key of [entry => entry.cid, entry => entry.capsule_manifest.name]) {
+    assert.equal(new Set(entries.map(key)).size, entries.length, "model catalog entries require unique package CIDs and capsule names");
+  }
+  return { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries };
+}
+
 export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)) {
-  const payload = { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries: [entry] };
+  const payload = catalogPayload([entry], publishedAt);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
   const signer_did = "did:key:z" + encode(Buffer.concat([Buffer.from([0xed, 1]), publicBytes]), "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz");
@@ -178,15 +201,22 @@ export function kuboAdd(kubo, repo, dir) {
   return cid;
 }
 
-// Unsigned production payload for `release-signer.py --model-catalog`.
-export function produceCatalogPayload({ inputs, output, publisher, add, fixture = SMOL_FIXTURE, publishedAt = Math.floor(Date.now() / 1000) }) {
+// One model package and its catalogue entry; `catalog` combines entries into
+// the unsigned payload for `release-signer.py --model-catalog`.
+export function producePackage({ inputs, output, publisher, add, fixture }) {
   assert.match(publisher, /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/, "publisher must be a did:key");
   mkdirSync(output, { recursive: true, mode: 0o700 });
-  const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir, publisher, fixture);
+  const packageDir = join(output, "package"), entry = buildEntry(inputs, packageDir, publisher, fixture);
   entry.cid = add(packageDir);
-  const payload = { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries: [entry] };
+  writeFileSync(join(output, "entry.json"), canonical(entry) + "\n", { mode: 0o600, flag: "wx" });
+  const bytes = entry.object_manifest.files.reduce((total, file) => total + file.size, 0);
+  return { cid: entry.cid, bytes, packageDir, entry };
+}
+
+export function writeCatalogPayload({ output, entries, publishedAt }) {
+  const payload = catalogPayload(entries, publishedAt);
   writeFileSync(join(output, "payload.json"), canonical(payload) + "\n", { mode: 0o600, flag: "wx" });
-  return { cid: entry.cid, packageDir, payload };
+  return payload;
 }
 
 // Creates `path` (and parents, 0700) with the install.sh/Runtime rule checked
@@ -228,28 +258,37 @@ export async function download(source, path, get = fetch) {
   }
 }
 
-// usage: produce <output-dir> <publisher-did> <kubo-data>
+// usage: produce <fixture.json> <output-dir> <publisher-did> <kubo-data>
 // <kubo-data> is a data dir prepared by scripts/seed-kubo-cache.sh (pinned recipe Kubo).
 async function produce(args) {
-  assert.equal(args.length, 3, "usage: ci-model-package.mjs produce <output-dir> <publisher-did> <kubo-data>");
-  const output = resolve(args[0]), publisher = args[1], data = resolve(args[2]);
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs produce <fixture.json> <output-dir> <publisher-did> <kubo-data>");
+  const fixture = loadFixture(resolve(args[0])), output = resolve(args[1]), publisher = args[2], data = resolve(args[3]);
   const receipt = JSON.parse(readFileSync(join(data, "receipts/kubo-build.json")));
   const entrypoint = receipt.object_manifest.files.find(file => file.path === receipt.capsule_manifest.entrypoint);
   const kubo = join(data, "bin/kubo");
   assert.deepEqual(fileRecord(kubo, entrypoint.path), entrypoint, "Kubo binary matches its pinned recipe build");
   const inputs = ownedDirectory(join(ownedDirectory(output), "inputs"));
-  await download(SMOL_FIXTURE.model, join(inputs, SMOL_FIXTURE.model.name));
-  await download(SMOL_FIXTURE.license, join(inputs, "LICENSE"));
+  await download(fixture.model, join(inputs, fixture.model.name));
+  await download(fixture.license, join(inputs, "LICENSE"));
   const repo = mkdtempSync(join(output, ".ipfs-repo-"));
   try {
-    const { cid, packageDir } = produceCatalogPayload({ inputs, output, publisher, add: dir => kuboAdd(kubo, repo, dir) });
-    console.log(`package_cid ${cid}\npackage_dir ${packageDir}\npayload ${join(output, "payload.json")}`);
+    const { cid, bytes, packageDir } = producePackage({ inputs, output, publisher, fixture, add: dir => kuboAdd(kubo, repo, dir) });
+    console.log(`package_cid ${cid}\npackage_bytes ${bytes}\npackage_dir ${packageDir}\nentry ${join(output, "entry.json")}`);
   } finally { rmSync(repo, { recursive: true, force: true }); }
+}
+
+// usage: catalog <output-dir> <entry.json>... (catalogue order)
+function catalogCommand(args) {
+  assert(args.length >= 2, "usage: ci-model-package.mjs catalog <output-dir> <entry.json>...");
+  const output = ownedDirectory(resolve(args[0]));
+  writeCatalogPayload({ output, entries: args.slice(1).map(path => JSON.parse(readFileSync(resolve(path), "utf8"))) });
+  console.log(`payload ${join(output, "payload.json")}`);
 }
 
 function main(args) {
   if (args[0] === "produce") return produce(args.slice(1));
-  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <output-dir> <publisher-did> <kubo-data>");
+  if (args[0] === "catalog") return catalogCommand(args.slice(1));
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <fixture.json> <output-dir> <publisher-did> <kubo-data> | catalog <output-dir> <entry.json>...");
   // The package Home's Kubo holds the package; the consumer receives the signed catalogue.
   // A separate package Home is a Carrier holder, so the consumer's Get crosses Carrier.
   const [data, consumer, inputs, output] = args.map(arg => resolve(arg));
@@ -266,7 +305,7 @@ function main(args) {
   regular(consumerManifestPath);
   const consumerComponents = JSON.parse(readFileSync(consumerManifestPath));
   mkdirSync(output, { recursive: true, mode: 0o700 });
-  const packageDir = join(output, "package"), entry = buildSmolEntry(inputs, packageDir);
+  const packageDir = join(output, "package"), entry = buildEntry(inputs, packageDir, null, SMOL_FIXTURE);
   entry.cid = kuboAdd(join(data, "bin/kubo"), join(data, "ipfs-repo"), packageDir);
   const { catalog, trust } = signedCatalog(entry);
   writeFileSync(join(consumer, "model-catalog.json"), catalog, { mode: 0o600 });

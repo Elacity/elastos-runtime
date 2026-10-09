@@ -1718,7 +1718,7 @@ fn current_entry(
     let trust = config.model_catalog.context("catalog unavailable")?;
     ensure!(
         trust.head_cid == record.catalog_head_cid,
-        "catalog changed during preparation"
+        crate::setup::LocalModelExecutionUnavailable::CatalogUpdated
     );
     let grant = trust.local_use.as_ref().context("local use revoked")?;
     let entry = super::verify_model_catalog(
@@ -9501,6 +9501,22 @@ server.serve_forever()
             current_entry(root.path(), &admitted).is_err(),
             "the original admission stays bound to the previous head"
         );
+        let stale =
+            model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                .await;
+        assert_eq!(
+            (
+                &stale["admitted"],
+                &stale["dispatch_ready"],
+                &stale["dispatch_unavailable_reason"]
+            ),
+            (
+                &serde_json::json!(true),
+                &serde_json::json!(false),
+                &serde_json::json!("catalog_updated")
+            ),
+            "an admission bound to the previous head asks for one Use"
+        );
         assert_eq!(
             load_operation(root.path(), &record.operation_id).unwrap(),
             admitted
@@ -9560,6 +9576,16 @@ server.serve_forever()
             model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
                 .await;
         assert_eq!(projection["admitted"], true);
+        let rebound = model_runtime_projection(
+            root.path(),
+            None,
+            &context(),
+            &record.package_cid,
+            Some(&alias.operation_id),
+        )
+        .await;
+        assert_eq!(rebound["admitted"], true);
+        assert_ne!(rebound["dispatch_unavailable_reason"], "catalog_updated");
     }
 
     #[tokio::test]

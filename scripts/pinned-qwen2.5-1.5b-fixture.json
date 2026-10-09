@@ -1,0 +1,49 @@
+{
+  "id": "qwen2.5-1.5b",
+  "display_name": "Qwen2.5 1.5B Instruct",
+  "model": {
+    "name": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    "size": 1117320736,
+    "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+  },
+  "license": {
+    "name": "LICENSE",
+    "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/LICENSE",
+    "size": 11343,
+    "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e"
+  },
+  "capsule_manifest": {
+    "schema": "elastos.capsule/v1",
+    "name": "qwen2.5-1.5b-instruct-q4-k-m-local",
+    "description": "Larger model for better answers. Needs about 2 GB of free memory.",
+    "role": "content",
+    "type": "data",
+    "projections": ["content"],
+    "version": "0.1.0",
+    "entrypoint": "weights.gguf",
+    "model_content": {
+      "consumer_interface": "elastos.provider.model",
+      "consumer_interface_version": "0.1.0",
+      "engine": "llama.cpp",
+      "format": "gguf",
+      "quantization": "Q4_K_M",
+      "minimum_memory_mb": 2048,
+      "license": {
+        "path": "LICENSE",
+        "spdx_id": "Apache-2.0"
+      },
+      "provenance": {
+        "base_license": {
+          "path": "LICENSE.base",
+          "spdx_id": "Apache-2.0"
+        },
+        "base_repository": "Qwen/Qwen2.5-1.5B-Instruct",
+        "base_revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+        "quantized_repository": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "quantized_revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+        "path": "PROVENANCE.md"
+      }
+    }
+  }
+}
