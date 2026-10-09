@@ -1,5 +1,6 @@
 {
   "id": "smollm2",
+  "display_name": "SmolLM2 135M Instruct",
   "model": {
     "name": "SmolLM2-135M-Instruct-Q8_0.gguf",
     "url": "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-Q8_0.gguf",

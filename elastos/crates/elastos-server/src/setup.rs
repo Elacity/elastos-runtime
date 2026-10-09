@@ -1812,10 +1812,15 @@ fn arm64_model_elf_compatible(header: &[u8]) -> bool {
         && u16::from_le_bytes([header[18], header[19]]) == 183
 }
 
+/// Public reasons an admitted model cannot run now. Each keeps the admitted
+/// bytes; the UI names the next action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalModelExecutionUnavailable {
     UnsupportedHost,
     SourceEngineRequired,
+    /// The admission is bound to an earlier catalogue head; one Use rebinds it
+    /// to the current head without a new download.
+    CatalogUpdated,
 }
 
 impl LocalModelExecutionUnavailable {
@@ -1823,6 +1828,7 @@ impl LocalModelExecutionUnavailable {
         match self {
             Self::UnsupportedHost => "unsupported_host",
             Self::SourceEngineRequired => "source_engine_required",
+            Self::CatalogUpdated => "catalog_updated",
         }
     }
 }
@@ -1832,6 +1838,7 @@ impl std::fmt::Display for LocalModelExecutionUnavailable {
         f.write_str(match self {
             Self::UnsupportedHost => "admitted model host profile is unavailable",
             Self::SourceEngineRequired => "This source-checkout Home has no local AI engine. Rerun scripts/setup-source-home.sh with SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 to build it.",
+            Self::CatalogUpdated => "catalog changed during preparation",
         })
     }
 }

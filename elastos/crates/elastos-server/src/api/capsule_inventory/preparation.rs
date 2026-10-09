@@ -1716,10 +1716,6 @@ fn current_entry(
         &super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?,
     )?;
     let trust = config.model_catalog.context("catalog unavailable")?;
-    ensure!(
-        trust.head_cid == record.catalog_head_cid,
-        "catalog changed during preparation"
-    );
     let grant = trust.local_use.as_ref().context("local use revoked")?;
     let entry = super::verify_model_catalog(
         &trust,
@@ -1743,6 +1739,13 @@ fn current_entry(
             && preparation_charge(entry.size_bytes)? <= grant.max_cache_bytes
             && u64::from(model.minimum_memory_mb) * 1024 * 1024 <= grant.max_model_memory_bytes,
         "model policy changed"
+    );
+    // Only a model the current trusted catalogue still offers under the same
+    // package CID and grant reports a catalogue update; revocation, removal and
+    // policy changes fail above with their own errors.
+    ensure!(
+        trust.head_cid == record.catalog_head_cid,
+        crate::setup::LocalModelExecutionUnavailable::CatalogUpdated
     );
     Ok(entry)
 }
@@ -9501,6 +9504,22 @@ server.serve_forever()
             current_entry(root.path(), &admitted).is_err(),
             "the original admission stays bound to the previous head"
         );
+        let stale =
+            model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                .await;
+        assert_eq!(
+            (
+                &stale["admitted"],
+                &stale["dispatch_ready"],
+                &stale["dispatch_unavailable_reason"]
+            ),
+            (
+                &serde_json::json!(true),
+                &serde_json::json!(false),
+                &serde_json::json!("catalog_updated")
+            ),
+            "an admission bound to the previous head asks for one Use"
+        );
         assert_eq!(
             load_operation(root.path(), &record.operation_id).unwrap(),
             admitted
@@ -9560,6 +9579,62 @@ server.serve_forever()
             model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
                 .await;
         assert_eq!(projection["admitted"], true);
+        let rebound = model_runtime_projection(
+            root.path(),
+            None,
+            &context(),
+            &record.package_cid,
+            Some(&alias.operation_id),
+        )
+        .await;
+        assert_eq!(rebound["admitted"], true);
+        assert_ne!(rebound["dispatch_unavailable_reason"], "catalog_updated");
+    }
+
+    #[tokio::test]
+    async fn catalog_updated_reason_requires_the_current_trusted_offer_and_grant() {
+        let (root, record, _backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry).await;
+        let (data_dir, cid) = (root.path(), record.package_cid.as_str());
+        let reason = || async move {
+            let projection = model_runtime_projection(data_dir, None, &context(), cid, None).await;
+            assert_eq!(projection["admitted"], true);
+            assert_eq!(projection["dispatch_ready"], false);
+            projection["dispatch_unavailable_reason"].clone()
+        };
+
+        // A new head that no longer offers this package is not a list update.
+        let (mut removed, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        removed.as_object_mut().unwrap().remove("expires_at");
+        let next_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
+        assert_ne!(next_cid, record.package_cid);
+        removed["entries"][0]["cid"] = serde_json::json!(next_cid);
+        write_preparation_catalog(root.path(), &removed);
+        assert!(reason().await.is_null());
+
+        // Still offered under a new head, but local use is revoked.
+        let (mut offered, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        offered.as_object_mut().unwrap().remove("expires_at");
+        write_preparation_catalog(root.path(), &offered);
+        change_config(root.path(), |config| {
+            config["model_catalog"]
+                .as_object_mut()
+                .unwrap()
+                .remove("local_use");
+        });
+        assert!(reason().await.is_null());
+
+        // Offered and granted, but the catalogue bytes no longer match the pin.
+        write_preparation_catalog(root.path(), &offered);
+        let catalog = root.path().join(super::super::MODEL_CATALOG_FILE);
+        let mut bytes = std::fs::read(&catalog).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&catalog, bytes).unwrap();
+        assert!(reason().await.is_null());
+
+        // Offered and granted under the new head: one Use rebinds it.
+        write_preparation_catalog(root.path(), &offered);
+        assert_eq!(reason().await, "catalog_updated");
     }
 
     #[tokio::test]

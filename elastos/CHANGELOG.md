@@ -13,6 +13,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   choose a smaller model." instead of a model failure.
 - A local model stops after a minute without use to give its memory back, and
   starts again on your next message. Only one local model runs at a time.
+- When the model list is updated, a model already on this device now says
+  "Model list updated. Press Use to keep using this model." with a Use button,
+  instead of "Model service unavailable." Use keeps the files; nothing downloads
+  again.
+- Marketplace shows a model's own description from the signed model list when
+  it has one.
 
 ### Fixed
 
@@ -36,6 +42,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   opening another model closes the previous engine. llama-server now gets
   `--batch-size 128 --ubatch-size 128 --cache-ram 0` (all accepted by b10516).
 - `elastos setup` drops `llama-server` on an `UnsupportedHost` instead of aborting.
+- `ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` builds one package
+  from a pinned fixture and writes `OUT/entry.json`; PROVENANCE.md takes its
+  license, quantization and repositories from the fixture, whose names, repos,
+  revisions and URLs are checked before any download. The new `catalog CAT DID
+  ENTRY...` step writes one unsigned payload with 1-8 entries only after
+  `release-signer.py`'s own catalogue check accepts it. Rebuilding SmolLM2 still gives
+  `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky`.
+- New fixture `scripts/pinned-qwen2.5-1.5b-fixture.json`: Qwen2.5 1.5B Instruct
+  Q4_K_M (`Qwen/Qwen2.5-1.5B-Instruct-GGUF` at `91cad511…`, 1,117,320,736 B,
+  Apache-2.0, `minimum_memory_mb` 2048).
+- The model projection reports `dispatch_unavailable_reason: "catalog_updated"`
+  only for an admission bound to an earlier catalogue head whose package the
+  current trusted catalogue still offers under a current local-use grant.
 
 ## [0.8.0-alpha.12]
 

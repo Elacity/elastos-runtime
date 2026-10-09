@@ -16,6 +16,7 @@
   const DISPATCH_UNAVAILABLE_TEXT = Object.freeze({
     unsupported_host: "Local AI is not supported on this device.",
     source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
+    catalog_updated: "Model list updated. Press Use to keep using this model.",
   });
   // One phase per Runtime projection. The full view (System) and the compact
   // Marketplace detail read their copy from the same phase.
@@ -331,7 +332,9 @@
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
         }
         const controls = element("div", "", "model-controls");
-        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download", () => void act("use"), active(p) || reconcileRequired);
+        const useLabel = r.dispatch_unavailable_reason === "catalog_updated" ? "Use"
+          : (p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download";
+        const use = button(useLabel, () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
