@@ -267,6 +267,16 @@ async fn run_with_data_dir(
     } else {
         crate::install_transaction::acquire_installed_writer(&data_dir)?
     };
+    // A setup with no installed release still excludes other writers of its data
+    // root while it removes leftovers and replaces support.
+    let _fresh = if list || _writer.is_some() {
+        None
+    } else {
+        fs::create_dir_all(&data_dir)?;
+        Some(crate::install_transaction::InstallationGuard::acquire(
+            &fs::canonicalize(&data_dir)?,
+        )?)
+    };
     let signed_setup = if list {
         None
     } else {
@@ -3283,6 +3293,7 @@ pub(crate) fn admit_release_components(
     manifest: &ComponentsManifest,
     platform: &str,
 ) -> anyhow::Result<()> {
+    refuse_reserved_install_targets(manifest, platform)?;
     for (name, component) in &manifest.external {
         let assets = [
             resolve_platform_info(component, platform),
@@ -4417,13 +4428,37 @@ fn atomic_copy_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+const REPLACEMENT_SUFFIX: &str = ".elastos-replace";
+
 /// Beside an installed tree: its staged copy before the exchange, the previous tree
 /// after it. One fixed name per target, so any later writer finds what a crash left.
 fn replacement_scratch(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let mut scratch = std::ffi::OsString::from(".");
     scratch.push(name);
-    scratch.push(".elastos-replace");
+    scratch.push(REPLACEMENT_SUFFIX);
     parent.join(scratch)
+}
+
+/// Removes a leftover replacement only when it is a real directory owned by `owner`.
+/// Anything else under that name is left in place and reported; returns whether the
+/// name is free.
+fn remove_replacement_leftover(path: &Path, owner: u32) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.is_dir() && metadata.uid() == owner => {
+            fs::remove_dir_all(path)?;
+            Ok(true)
+        }
+        Ok(_) => {
+            eprintln!(
+                "Left in place: {} is not an interrupted replacement of this installation.",
+                path.display()
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Publishes a complete copy of `src` at `dest`. The previous tree stays in place
@@ -4434,7 +4469,11 @@ fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
     };
     fs::create_dir_all(parent)?;
     let scratch = replacement_scratch(parent, name);
-    remove_path(&scratch)?;
+    anyhow::ensure!(
+        remove_replacement_leftover(&scratch, unsafe { libc::geteuid() })?,
+        "cannot stage {}: its replacement name is taken",
+        dest.display()
+    );
     let swapped = (|| {
         copy_dir_recursive(src, &scratch)?;
         sync_tree(&scratch)?;
@@ -4448,51 +4487,79 @@ fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
     swapped.and(removed)
 }
 
+/// Every installed path this manifest names on `platform`.
+fn manifest_install_targets<'a>(manifest: &'a ComponentsManifest, platform: &str) -> Vec<&'a str> {
+    let mut targets = Vec::new();
+    for component in manifest.external.values() {
+        targets.extend(resolve_install_path(
+            component,
+            resolve_platform_info(component, platform),
+        ));
+        targets.extend(component.capsule_metadata.as_ref().and_then(|metadata| {
+            resolve_component_capsule_metadata_install_path(
+                metadata,
+                resolve_component_capsule_metadata_platform_info(metadata, platform),
+            )
+        }));
+    }
+    targets
+}
+
+/// Replacement scratch names are reserved; no installed target may take one.
+fn refuse_reserved_install_targets(
+    manifest: &ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<()> {
+    for target in manifest_install_targets(manifest, platform) {
+        anyhow::ensure!(
+            !Path::new(target)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(REPLACEMENT_SUFFIX)),
+            "install path {target} uses the reserved replacement suffix {REPLACEMENT_SUFFIX}"
+        );
+    }
+    Ok(())
+}
+
 /// Removes what an interrupted replacement left beside the installed trees this
-/// manifest names. Only real directories under the data root are visited.
+/// manifest names. Only owned real directories under the data root are visited
+/// or removed, and never a path the manifest itself names. The caller holds the
+/// installation writer.
 fn remove_replacement_leftovers(
     data_dir: &Path,
     manifest: &ComponentsManifest,
     platform: &str,
 ) -> anyhow::Result<()> {
-    for component in manifest.external.values() {
-        let metadata_path = component.capsule_metadata.as_ref().and_then(|metadata| {
-            resolve_component_capsule_metadata_install_path(
-                metadata,
-                resolve_component_capsule_metadata_platform_info(metadata, platform),
-            )
-        });
-        for relative in [
-            resolve_install_path(component, resolve_platform_info(component, platform)),
-            metadata_path,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let relative = Path::new(relative);
-            let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
-                continue;
+    refuse_reserved_install_targets(manifest, platform)?;
+    let targets = manifest_install_targets(manifest, platform);
+    let named: std::collections::BTreeSet<_> =
+        targets.iter().map(|target| data_dir.join(target)).collect();
+    let owner = unsafe { libc::geteuid() };
+    for relative in targets {
+        let relative = Path::new(relative);
+        let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
+            continue;
+        };
+        let mut directory = data_dir.to_path_buf();
+        let mut real = true;
+        for part in parent.components() {
+            let std::path::Component::Normal(part) = part else {
+                real = false;
+                break;
             };
-            let mut directory = data_dir.to_path_buf();
-            let mut real = true;
-            for part in parent.components() {
-                let std::path::Component::Normal(part) = part else {
-                    real = false;
-                    break;
-                };
-                directory.push(part);
-                // Owned real directories only; a symlinked or foreign parent is left alone.
-                if !fs::symlink_metadata(&directory).is_ok_and(|meta| {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.is_dir() && meta.uid() == unsafe { libc::geteuid() }
-                }) {
-                    real = false;
-                    break;
-                }
+            directory.push(part);
+            // Owned real directories only; a symlinked or foreign parent is left alone.
+            if !fs::symlink_metadata(&directory).is_ok_and(|meta| {
+                use std::os::unix::fs::MetadataExt;
+                meta.is_dir() && meta.uid() == owner
+            }) {
+                real = false;
+                break;
             }
-            if real {
-                remove_path(&replacement_scratch(&directory, name))?;
-            }
+        }
+        let leftover = replacement_scratch(&directory, name);
+        if real && !named.contains(&leftover) {
+            remove_replacement_leftover(&leftover, owner)?;
         }
     }
     Ok(())
@@ -4611,6 +4678,81 @@ pub(crate) mod tests {
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
     use elastos_common::{CapsuleManifest, CapsuleRole};
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn replacement_manifest(targets: &[(&str, &str)]) -> ComponentsManifest {
+        let external: serde_json::Map<_, _> = targets
+            .iter()
+            .map(|(name, path)| {
+                (
+                    name.to_string(),
+                    serde_json::json!({"install_path":path, "platforms":{"*":{}}}),
+                )
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "external":external, "capsules":{}, "profiles":{}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn replacement_leftovers_remove_only_owned_real_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let outside = root.path().join("owner-files");
+        fs::create_dir_all(data.join("tools")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"owner data").unwrap();
+        let manifest = replacement_manifest(&[
+            ("staged", "tools/staged"),
+            ("linked", "tools/linked"),
+            ("file", "tools/file"),
+        ]);
+        let staged = data.join("tools/.staged.elastos-replace");
+        let linked = data.join("tools/.linked.elastos-replace");
+        let file = data.join("tools/.file.elastos-replace");
+        fs::create_dir_all(staged.join("partial")).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        fs::write(&file, b"not a staged tree").unwrap();
+
+        remove_replacement_leftovers(&data, &manifest, &detect_platform()).unwrap();
+
+        assert!(!staged.exists());
+        assert!(fs::symlink_metadata(&linked).unwrap().is_symlink());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"owner data");
+        assert_eq!(fs::read(&file).unwrap(), b"not a staged tree");
+
+        // A tree another account owns stays where it is.
+        fs::create_dir_all(staged.join("partial")).unwrap();
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(1);
+        assert!(!remove_replacement_leftover(&staged, foreign).unwrap());
+        assert!(staged.join("partial").is_dir());
+        // Staging refuses a replacement name it cannot reclaim.
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        assert!(atomic_copy_dir(&source, &data.join("tools/linked")).is_err());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"owner data");
+    }
+
+    #[test]
+    fn replacement_suffix_is_reserved_for_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let manifest = replacement_manifest(&[
+            ("bundle", "tools/bundle"),
+            ("collides", "tools/.bundle.elastos-replace"),
+        ]);
+        let named = data.join("tools/.bundle.elastos-replace");
+        fs::create_dir_all(named.join("installed")).unwrap();
+
+        let error = remove_replacement_leftovers(data, &manifest, &detect_platform()).unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+        assert!(named.join("installed").is_dir());
+        assert!(admit_release_components(&manifest, &detect_platform())
+            .unwrap_err()
+            .to_string()
+            .contains("reserved"));
+    }
 
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
