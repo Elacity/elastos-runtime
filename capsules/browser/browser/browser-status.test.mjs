@@ -246,7 +246,7 @@ test("WebRTC diagnostics expose only selected pair types and inbound counters", 
 test("readiness failures explain the repair while cleanup retains priority", () => {
   const expected = new Map([
     ["artifact_invalid", /files need repair/],
-    ["host_unsupported", /needs a compatible host/],
+    ["host_unsupported", /Browser virtualization is unavailable on the selected host/],
     ["readiness_unsupported", /update to report readiness/],
     ["control_unavailable", /Restore its connection/],
     ["preparation_required", /needs preparation/],
