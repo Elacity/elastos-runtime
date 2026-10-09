@@ -2342,7 +2342,7 @@ mod tests {
         let worker = tokio::spawn(run_collaboration_periodic(
             shutdown_rx,
             COLLABORATION_BOOTSTRAP_CADENCE,
-            || std::future::pending::<()>(),
+            std::future::pending::<()>,
         ));
         tokio::task::yield_now().await;
         shutdown.send(true).unwrap();
