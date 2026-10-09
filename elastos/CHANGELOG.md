@@ -13,12 +13,16 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
-- A model part read that fails with a provider error (holder answer deadline,
-  failed Carrier invocation, lost connection) is repeated up to 3 times after
-  0.5 s, 1 s and 2 s, in the same in-flight slot. Each repeat first rechecks
-  cancellation, expiry and authority. SHA-256, CID, authority and capacity
-  failures are never repeated. The client sends the 8 reads as parallel streams
-  on one Carrier connection with no lock of its own, but the seed's
+- A model part read that every holder failed only in transit (answer deadline,
+  connect failure, lost stream) is repeated up to 3 times after 0.5 s, 1 s and
+  2 s, in the same in-flight slot. Carrier marks such bounded reads as typed I/O
+  errors and availability reports them as `carrier_fetch_in_transit`; holder
+  refusals and malformed or oversized answers stay provider errors and are never
+  repeated, nor are SHA-256, CID, authority or capacity failures. Each repeat
+  first passes the same checks as a first read (cancellation, expiry, authority,
+  capacity, and any refusal another part already met). The client sends the 8
+  reads as parallel streams on one Carrier connection with no lock of its own,
+  but the seed's
   `ipfs-provider` bridge holds one I/O lock per request until the answer arrives,
   so one slow read there (or one stalled connection) runs every queued read's
   5 s budget out together, as the alpha.12 Jetson burst of 8 showed (#84).
