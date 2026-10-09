@@ -14,6 +14,33 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   per sender and 16 per Home. The relay admits only the signing Home's own
   submissions.
 
+## [0.8.0-alpha.12]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Models download several times faster: Home now fetches up to eight parts at
+  once instead of one after another.
+
+### Fixed
+
+- Getting a model on a slower connection no longer stops after about ten minutes
+  with "Storage capacity is unavailable". Home was shutting down its storage
+  service as idle while the model was still downloading.
+
+### Developer detail
+
+- Model preparation keeps up to 8 part reads in flight across the package; each
+  part's authority and capacity checks run in package order just before its read,
+  results arriving after a revocation are discarded, and per-file SHA-256 and the
+  package CID check are unchanged. Real installs spent ~200-600 ms per part on
+  round trips while the seed's own read takes ~2.5 ms (#84).
+- `ipfs-provider` counts a successful private capacity check (run once per MiB of
+  model download) and staged-directory hash as Kubo use, refreshing
+  `ipfs-coords.json` `last_used` like bounded reads do, so the 600 s idle stop no
+  longer ends Kubo during a long model download (#97).
+
 ## [0.8.0-alpha.11]
 
 Test-channel release. Signed releases show these notes in System before you update.
