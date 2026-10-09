@@ -915,19 +915,33 @@ mod tests {
 
     struct FakeCarrier {
         requests: Mutex<Vec<serde_json::Value>>,
-        replies: Mutex<VecDeque<FakeReply>>,
+        replies: Mutex<VecDeque<(Option<&'static str>, FakeReply)>>,
+        pending_ops: Mutex<Vec<String>>,
+        pending_message: Mutex<Option<String>>,
     }
 
     impl FakeCarrier {
         fn new(replies: impl IntoIterator<Item = FakeReply>) -> Arc<Self> {
             Arc::new(Self {
                 requests: Mutex::new(Vec::new()),
-                replies: Mutex::new(replies.into_iter().collect()),
+                replies: Mutex::new(replies.into_iter().map(|reply| (None, reply)).collect()),
+                pending_ops: Mutex::new(Vec::new()),
+                pending_message: Mutex::new(None),
             })
         }
 
         fn push(&self, replies: impl IntoIterator<Item = FakeReply>) {
-            self.replies.lock().unwrap().extend(replies);
+            self.replies
+                .lock()
+                .unwrap()
+                .extend(replies.into_iter().map(|reply| (None, reply)));
+        }
+
+        fn push_for(&self, operation: &'static str, replies: impl IntoIterator<Item = FakeReply>) {
+            self.replies
+                .lock()
+                .unwrap()
+                .extend(replies.into_iter().map(|reply| (Some(operation), reply)));
         }
 
         fn requests(&self) -> Vec<serde_json::Value> {
@@ -959,7 +973,28 @@ mod tests {
             request: &serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
             self.requests.lock().unwrap().push(request.clone());
-            let reply = self.replies.lock().unwrap().pop_front();
+            let blocked = {
+                let pending = self.pending_message.lock().unwrap();
+                request["op"] == "gossip_send"
+                    && pending
+                        .as_deref()
+                        .is_some_and(|message| request["message"].as_str() == Some(message))
+            };
+            if blocked {
+                self.pending_ops
+                    .lock()
+                    .unwrap()
+                    .push("gossip_send".to_string());
+                return std::future::pending().await;
+            }
+            let reply = {
+                let mut replies = self.replies.lock().unwrap();
+                let next = replies.iter().position(|(operation, _)| {
+                    operation.is_none() || *operation == request["op"].as_str()
+                });
+                next.and_then(|index| replies.remove(index))
+                    .map(|(_, reply)| reply)
+            };
             match reply {
                 Some(FakeReply::JoinEcho) => Ok(serde_json::json!({
                     "status": "ok",
@@ -969,7 +1004,13 @@ mod tests {
                 Some(FakeReply::Error(message)) => {
                     Err(ProviderError::Provider(message.to_string()))
                 }
-                Some(FakeReply::Pending) => std::future::pending().await,
+                Some(FakeReply::Pending) => {
+                    self.pending_ops
+                        .lock()
+                        .unwrap()
+                        .push(request["op"].as_str().unwrap().to_string());
+                    std::future::pending().await
+                }
                 None => Err(ProviderError::Provider(
                     "fake Carrier has no queued response".to_string(),
                 )),
@@ -1276,12 +1317,11 @@ mod tests {
         let configuration =
             load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
         let (device_key, _) = generate_keypair();
-        let carrier = FakeCarrier::new([
-            FakeReply::JoinEcho,
-            send_remote(),
-            peek(0, 0, Vec::new()),
-            ack(0, 0, false),
-        ]);
+        let carrier = FakeCarrier::new([]);
+        carrier.push_for("gossip_join_exact", [FakeReply::JoinEcho]);
+        carrier.push_for("gossip_send", [send_remote()]);
+        carrier.push_for("gossip_peek", [peek(0, 0, Vec::new())]);
+        carrier.push_for("gossip_ack", [ack(0, 0, false)]);
         let mut service = start_collaboration_runtime_service(
             temp.path(),
             device_key,
@@ -1369,15 +1409,38 @@ mod tests {
 
         wait_for_requests(&carrier, 4).await;
         service.shutdown().await.unwrap();
+        let requests = carrier.requests();
+        let operations = request_ops(&carrier);
+        assert_eq!(operations[0], "gossip_join_exact");
         assert_eq!(
-            request_ops(&carrier),
-            [
-                "gossip_join_exact",
-                "gossip_send",
-                "gossip_peek",
-                "gossip_ack"
-            ]
+            operations
+                .iter()
+                .filter(|op| *op == "gossip_join_exact")
+                .count(),
+            1
         );
+        for operation in ["gossip_send", "gossip_peek", "gossip_ack"] {
+            assert!(operations.iter().any(|op| op == operation));
+        }
+        let consumers: std::collections::HashSet<_> = requests
+            .iter()
+            .filter(|request| matches!(request["op"].as_str(), Some("gossip_peek" | "gossip_ack")))
+            .map(|request| request["consumer_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(consumers.len(), 1);
+        assert!(consumers.iter().all(|consumer| !consumer.is_empty()));
+        for (index, request) in requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| request["op"] == "gossip_ack")
+        {
+            assert!(
+                requests[..index].iter().any(|peek| {
+                    peek["op"] == "gossip_peek" && peek["consumer_id"] == request["consumer_id"]
+                }),
+                "the same joined consumer must peek before acknowledging"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2161,7 +2224,7 @@ mod tests {
         assert!(service.history_task.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_projects_received_chat_while_outgoing_or_receipt_send_is_blocked() {
         for blocked_outgoing in [true, false] {
             let (temp, _) = configured_root(true);
@@ -2233,17 +2296,27 @@ mod tests {
                 .await
                 .unwrap();
             if blocked_outgoing {
-                carrier.push([FakeReply::Pending]);
-            }
-            carrier.push([peek(
-                0,
-                1,
-                vec![gossip_frame(&remote, incoming.envelope_bytes())],
-            )]);
-            if blocked_outgoing {
-                carrier.push([send_remote(), ack(0, 1, true)]);
+                // Bind the blocked send to this exact local message so an
+                // earlier receipt send cannot consume its pending response.
+                let pending = core.pending_outgoing_product_projections(now).unwrap();
+                let frame = core
+                    .prepare_transport_frame(pending[0].outgoing().envelope_bytes())
+                    .unwrap();
+                *carrier.pending_message.lock().unwrap() = Some(String::from_utf8(frame).unwrap());
+                carrier.push_for("gossip_send", [send_remote()]);
             } else {
-                carrier.push([FakeReply::Pending]);
+                carrier.push_for("gossip_send", [FakeReply::Pending]);
+            }
+            carrier.push_for(
+                "gossip_peek",
+                [peek(
+                    0,
+                    1,
+                    vec![gossip_frame(&remote, incoming.envelope_bytes())],
+                )],
+            );
+            if blocked_outgoing {
+                carrier.push_for("gossip_ack", [ack(0, 1, true)]);
             }
             let driver = CollaborationTransportDriver::new(core.clone(), joined);
             let session = crate::room_service::start_local_runtime_session(
@@ -2283,6 +2356,7 @@ mod tests {
             .await
             .expect("received row waited for a blocked transport send");
             assert!(!worker.is_finished());
+            assert_eq!(*carrier.pending_ops.lock().unwrap(), ["gossip_send"]);
             assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
             assert_eq!(core.summary().unwrap().replay_tombstones, 1);
             let requests = carrier.requests();
