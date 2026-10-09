@@ -670,7 +670,8 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
   if (args.platform.startsWith("linux-") && !remoteVzControlLauncher) {
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR = path.join(args.dataDir, "browser-vm/rootfs-pool");
     env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
-    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "2";
+    // Keep one spare image so a closed Browser leaves room for update staging.
+    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "1";
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
   }
   if (args.releaseImage) {

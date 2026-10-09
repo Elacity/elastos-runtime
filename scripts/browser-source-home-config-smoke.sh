@@ -316,8 +316,8 @@ if (!adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR?.endsWith("/vm
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE !== "pool-required") {
   throw new Error("Linux source-home Browser config must require prepared rootfs pool copies");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "2") {
-  throw new Error("Linux source-home Browser config must request prepared rootfs pool refill after launch");
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "1") {
+  throw new Error("Linux source-home Browser config must keep one prepared rootfs spare for bounded update capacity");
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-prepare-rootfs-pool")) {
   throw new Error("Linux source-home Browser config must point at the rootfs pool refill wrapper");
