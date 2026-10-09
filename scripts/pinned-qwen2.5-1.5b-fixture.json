@@ -16,7 +16,7 @@
   "capsule_manifest": {
     "schema": "elastos.capsule/v1",
     "name": "qwen2.5-1.5b-instruct-q4-k-m-local",
-    "description": "Larger model for better answers. Needs about 2 GB of free memory.",
+    "description": "Larger model for better answers. Needs about 3 GB of free memory.",
     "role": "content",
     "type": "data",
     "projections": ["content"],

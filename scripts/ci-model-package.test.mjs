@@ -174,7 +174,7 @@ test("production packages are deterministic and combine into one ordered payload
   const publisher = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
   // Stand-in for Kubo: each fixture's real package CID.
   const add = cid => () => cid;
-  const QWEN_CID = "bafybeibijmrzexz5wumwq6e2kcnf7mxvoej3npgbjbhcmveqmz4yj54tlu", SMOL_CID = "bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky";
+  const QWEN_CID = "bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe", SMOL_CID = "bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky";
   const runs = ["a", "b"].map(name => producePackage({ inputs, output: join(root, name), publisher, add: add(QWEN_CID), fixture: qwen }));
   assert.equal(runs[0].cid, runs[1].cid);
   assert.deepEqual(readFileSync(join(root, "a/entry.json")), readFileSync(join(root, "b/entry.json")));
