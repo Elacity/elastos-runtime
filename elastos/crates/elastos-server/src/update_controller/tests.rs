@@ -3538,6 +3538,122 @@ async fn staged_support_replaces_a_component_left_by_an_interrupted_undo() {
     assert_eq!(fs::read(&paths[0].1).unwrap(), signed);
 }
 
+/// An installed release whose Home profile needs one signed provider and whose
+/// components pin a signed catalogue; neither is installed yet.
+fn release_with_provider_and_catalogue(
+    fixture: &PrivateFixture,
+) -> (TrustedSource, Vec<u8>, String, Vec<u8>) {
+    let provider = b"this release provider".to_vec();
+    let mut payload = crate::api::capsule_inventory::tests::model_catalog_fixture();
+    payload["published_at"] = json!(1);
+    let (trust, catalogue) = crate::api::capsule_inventory::tests::sign_model_catalog(&payload);
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "model_catalog":trust,
+        "profiles":{"home":{"components":["fixture-provider"]}},
+        "external":{"fixture-provider":{"install_path":"bin/fixture-provider","platforms":{"*":{
+            "release_path":"fixture-provider","cid":raw_cid(&provider),
+            "checksum":format!("sha256:{}", digest(&provider)),"size":provider.len()}}}}
+    }))
+    .unwrap();
+    fs::create_dir(fixture.data.join("bin")).unwrap();
+    let source = fixture.publish_installed_release_with_components(&components);
+    (source, provider, trust.head_cid, catalogue)
+}
+
+#[tokio::test]
+async fn system_update_and_undo_repair_the_installed_release_before_admission() {
+    for case in ["catalogue", "component", "catalogue offline"] {
+        let fixture = PrivateFixture::new();
+        let (mut source, provider, catalogue_cid, catalogue) =
+            release_with_provider_and_catalogue(&fixture);
+        let mut server = None;
+        if case == "component" {
+            // An Undo stopped halfway left the other release's provider.
+            fixture.file(
+                &fixture.data.join("bin/fixture-provider"),
+                b"other release provider",
+                0o755,
+            );
+            fixture.file(&fixture.data.join("model-catalog.json"), &catalogue, 0o600);
+            let (reachable, endpoint, serving) = crate::setup::tests::carrier_cid_source(
+                &fixture.data,
+                &source,
+                std::collections::HashMap::from([(raw_cid(&provider), provider.clone())]),
+            )
+            .await;
+            source = reachable;
+            server = Some((endpoint, serving));
+        } else {
+            // An older updater installed this release without its catalogue.
+            fixture.file(&fixture.data.join("bin/fixture-provider"), &provider, 0o755);
+        }
+        let served = (catalogue_cid.clone(), catalogue.clone());
+        let offline = case == "catalogue offline";
+        let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+            let bytes = if offline {
+                Err(anyhow::Error::from(crate::update::UpdateSourceUnavailable))
+            } else {
+                assert_eq!(cid, served.0);
+                Ok(served.1.clone())
+            };
+            Box::pin(async move { bytes })
+        });
+        let result = admit_for_update(&fixture.data, &fixture.binary, &source, &fetch).await;
+        if let Some((endpoint, serving)) = server {
+            endpoint.close().await;
+            assert_eq!(serving.await.unwrap(), [raw_cid(&provider)]);
+        }
+        if offline {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("Connect to the internet and try again"),
+                "{error:#}"
+            );
+            assert!(matches!(
+                classify_apply_failure(&error),
+                ApplyFailure::SourceUnavailable
+            ));
+            assert!(!fixture.data.join("model-catalog.json").exists());
+            continue;
+        }
+        assert_eq!(
+            result.unwrap(),
+            digest(&fs::read(&fixture.binary).unwrap()),
+            "{case}"
+        );
+        assert_eq!(
+            fs::read(fixture.data.join("bin/fixture-provider")).unwrap(),
+            provider
+        );
+        assert_eq!(
+            fs::read(fixture.data.join("model-catalog.json")).unwrap(),
+            catalogue
+        );
+    }
+}
+
+#[tokio::test]
+async fn home_starts_offline_without_its_catalogue_and_local_ai_reports_it() {
+    let fixture = PrivateFixture::new();
+    let (source, provider, _, _) = release_with_provider_and_catalogue(&fixture);
+    fixture.file(&fixture.data.join("bin/fixture-provider"), &provider, 0o755);
+    // The fixture source has no reachable Carrier address.
+    repair_installed_support(&fixture.data, &fixture.binary, &source)
+        .await
+        .unwrap();
+    assert!(!fixture.data.join("model-catalog.json").exists());
+    crate::installed_release::read_without_migration(&fixture.data, &fixture.binary, &source)
+        .unwrap();
+    let error = crate::setup::retry_model_catalog(&fixture.data)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Connect to the internet and try again"),
+        "{error:#}"
+    );
+    assert!(crate::api::capsule_inventory::model_catalog_entries(&fixture.data).is_err());
+}
+
 #[tokio::test]
 async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restarts_once() {
     for outcome in [

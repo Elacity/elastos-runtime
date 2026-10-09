@@ -1424,6 +1424,9 @@ async fn run_upgrade_with_restart(
     let version_order = compare_release_versions(&installed_version, version)?;
     match version_order {
         Ordering::Equal if !force && !repair_version => {
+            if !check_only && apply_mode == ApplyMode::Normal {
+                repair_current_release(data_dir, source, fetch_fn, carrier_context).await?;
+            }
             println!();
             println!("  Installed release is up to date.");
             return Ok(());
@@ -1621,7 +1624,7 @@ async fn run_upgrade_with_restart(
             transaction.binary_path(),
             source,
             repair_version,
-            fetch_fn,
+            crate::setup::CatalogueRepair::Required(fetch_fn),
             carrier_context,
         )
         .await?;
@@ -1815,7 +1818,7 @@ async fn run_upgrade_with_restart(
         transaction.binary_path(),
         source,
         repair_version,
-        fetch_fn,
+        crate::setup::CatalogueRepair::Required(fetch_fn),
         carrier_context,
     )
     .await?;
@@ -2014,6 +2017,31 @@ async fn run_upgrade_with_restart(
     println!();
 
     Ok(())
+}
+
+/// `elastos update` completes the installed release even when it is the newest.
+async fn repair_current_release(
+    data_dir: &Path,
+    source: &TrustedSource,
+    fetch_fn: &FetchFn,
+    carrier_context: crate::setup::FirstPartyCarrierContext,
+) -> anyhow::Result<()> {
+    let bin_path = if source.install_path.is_empty() {
+        default_install_path()
+    } else {
+        PathBuf::from(&source.install_path)
+    };
+    let transaction = InstallTransaction::acquire(data_dir, &bin_path)?;
+    transaction.recover()?;
+    crate::setup::repair_installed_support(
+        transaction.data_dir(),
+        transaction.binary_path(),
+        source,
+        false,
+        crate::setup::CatalogueRepair::Required(fetch_fn),
+        carrier_context,
+    )
+    .await
 }
 
 /// A ready host is accepted only while the frozen support still matches its durable plan.
@@ -3543,6 +3571,97 @@ mod tests {
         );
         assert_eq!(std::fs::read(&binary).unwrap(), executable);
         admit_installed(&data, &binary);
+    }
+
+    /// What an older updater, an interrupted Undo or a replacement cut short can
+    /// leave: no catalogue, another release's provider, a required bundle missing
+    /// beside its unfinished scratch copy, and no Home document to infer a Home from.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_update_repairs_the_installed_release_on_same_version_and_newer() {
+        use sha2::Digest;
+        let sha = |bytes: &[u8]| format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+        let provider = b"this release provider".to_vec();
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(14);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "fixture-bundle/runner",
+                b"bundle runner\n".as_slice(),
+            )
+            .unwrap();
+        let bundle = archive.into_inner().unwrap().finish().unwrap();
+        let (catalogue_cid, trust, catalogue) = signed_catalogue(1);
+        let components = serde_json::to_vec(&serde_json::json!({
+            "schema":"elastos.components/v1", "capsules":{}, "model_catalog":trust,
+            "profiles":{"home":{"components":["fixture-provider","fixture-bundle"]}},
+            "external":{
+                "fixture-provider":{"install_path":"bin/fixture-provider","platforms":{"*":{
+                    "release_path":"fixture-provider","cid":raw_cid(&provider),
+                    "checksum":sha(&provider),"size":provider.len()}}},
+                "fixture-bundle":{"install_path":"tools/fixture-bundle","platforms":{"*":{
+                    "release_path":"fixture-bundle.tar.gz","cid":raw_cid(&bundle),
+                    "checksum":sha(&bundle),"size":bundle.len(),"extract_path":"fixture-bundle"}}}
+            }
+        }))
+        .unwrap();
+        for version in ["0.7.0", "0.7.1"] {
+            let (_fixture, data, binary, source) = default_apply_fixture(&components);
+            std::fs::create_dir_all(data.join("bin")).unwrap();
+            std::fs::write(
+                data.join("bin/fixture-provider"),
+                b"previous release provider",
+            )
+            .unwrap();
+            std::fs::create_dir_all(data.join("tools/.fixture-bundle.tmp-1/partial")).unwrap();
+            let (_source, server, serving) = crate::setup::tests::carrier_cid_source(
+                &data,
+                &source,
+                std::collections::HashMap::from([
+                    (raw_cid(&provider), provider.clone()),
+                    (raw_cid(&bundle), bundle.clone()),
+                ]),
+            )
+            .await;
+            apply_signed_fixture_serving(
+                &data,
+                format!("#!/bin/sh\nprintf 'elastos {version}\\n'\n").as_bytes(),
+                &components,
+                ApplyMode::Normal,
+                version,
+                false,
+                false,
+                vec![(catalogue_cid.clone(), catalogue.clone())],
+            )
+            .await
+            .unwrap();
+            server.close().await;
+            serving.await.unwrap();
+            assert_eq!(
+                std::fs::read(data.join("bin/fixture-provider")).unwrap(),
+                provider,
+                "{version}"
+            );
+            assert_eq!(
+                std::fs::read(data.join("tools/fixture-bundle/runner")).unwrap(),
+                b"bundle runner\n",
+                "{version}"
+            );
+            assert_eq!(
+                std::fs::read(data.join("model-catalog.json")).unwrap(),
+                catalogue,
+                "{version}"
+            );
+            admit_installed(&data, &binary);
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+        }
     }
 
     #[cfg(unix)]

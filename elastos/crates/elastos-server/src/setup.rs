@@ -5,11 +5,12 @@
 //! bounded preparation path, not this archive installer.
 
 use crate::api::capsule_inventory::MAX_MODEL_CATALOG_BYTES;
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -2783,16 +2784,80 @@ async fn fetch_pinned_model_catalog(
     Ok(bytes)
 }
 
+/// How repair obtains a missing or mismatched pinned catalogue.
+pub(crate) enum CatalogueRepair<'a> {
+    /// Update and Undo require it, from their own fetch.
+    Required(&'a crate::update::FetchFn),
+    /// Home starts without it; Local AI reports it unavailable until a fetch succeeds.
+    Optional,
+}
+
+const MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI: &str = "The signed model catalogue for Local AI could not be fetched from the trusted source over Carrier. Home starts without it. Connect to the internet and try again.";
+
+/// The pinned catalogue by CID, verified and written owner-only. The caller holds
+/// the installation writer.
+async fn restore_model_catalog(data_dir: &Path, trust: &ModelCatalogConfig) -> anyhow::Result<()> {
+    let bytes = fetch_model_catalog_via_carrier(data_dir, &trust.head_cid).await?;
+    verify_pinned_model_catalog(trust, &bytes)?;
+    write_model_catalog_file(&data_dir.join(MODEL_CATALOG_FILE), &bytes)
+}
+
+/// Local AI retries an unavailable pinned catalogue at most this often.
+const MODEL_CATALOG_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Local AI's retry after Home started without the pinned catalogue. A busy
+/// installation writer, such as a running update, defers the retry.
+pub(crate) async fn retry_model_catalog(data_dir: &Path) -> anyhow::Result<()> {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(components) = crate::api::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    ) else {
+        return Ok(());
+    };
+    let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    let Some(trust) = &manifest.model_catalog else {
+        return Ok(());
+    };
+    if installed_model_catalog_matches(&data_dir.join(MODEL_CATALOG_FILE), trust) {
+        return Ok(());
+    }
+    {
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|at| at.elapsed() < MODEL_CATALOG_RETRY) {
+            anyhow::bail!(MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI);
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let Some(_writer) = crate::install_transaction::acquire_installed_writer(data_dir)? else {
+        return Ok(());
+    };
+    // The writer now excludes updates; the pin is re-read under it.
+    if crate::api::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    )? != components
+    {
+        return Ok(());
+    }
+    restore_model_catalog(data_dir, trust)
+        .await
+        .map_err(|error| error.context(MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI))
+}
+
 /// Completes the installed release's own support before admission: an older updater
-/// left out its pinned catalogue or kept the previous one, or an interrupted Undo left
-/// another release's component. Only the signed components name what is fetched, by
-/// CID from the trusted source. The caller holds the installation writer.
+/// left out its pinned catalogue or kept the previous one, or an interrupted Undo or
+/// replacement left another release's component, or none. Only the signed components
+/// name what is fetched, by CID from the trusted source. The caller holds the
+/// installation writer.
 pub(crate) async fn repair_installed_support(
     data_dir: &Path,
     binary: &Path,
     source: &crate::sources::TrustedSource,
     repair_version: bool,
-    fetch: &crate::update::FetchFn,
+    catalogue: CatalogueRepair<'_>,
     carrier_context: FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     let components =
@@ -2801,20 +2866,36 @@ pub(crate) async fn repair_installed_support(
     if let Some(trust) = &manifest.model_catalog {
         let dest = data_dir.join(MODEL_CATALOG_FILE);
         if !installed_model_catalog_matches(&dest, trust) {
-            let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
-            write_model_catalog_file(&dest, &bytes)?;
-            println!(
-                "  Restored the signed model catalogue for this release: {}",
-                dest.display()
-            );
+            let restored = match catalogue {
+                CatalogueRepair::Required(fetch) => {
+                    let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
+                    write_model_catalog_file(&dest, &bytes)?;
+                    true
+                }
+                CatalogueRepair::Optional => match restore_model_catalog(data_dir, trust).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("  {MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI} ({error:#})");
+                        false
+                    }
+                },
+            };
+            if restored {
+                println!(
+                    "  Restored the signed model catalogue for this release: {}",
+                    dest.display()
+                );
+            }
         }
     }
+    // Admission requires the Home profile on every installation, so repair does too.
     // Boxed: the update state machine already carries the target's own refresh.
-    let repaired = Box::pin(refresh_installed_components_for_update_in_context(
+    let repaired = Box::pin(refresh_support(
         data_dir,
-        Some(&components),
-        &components,
+        &manifest,
+        &manifest,
         &detect_platform(),
+        true,
         carrier_context,
     ))
     .await?;
@@ -3315,12 +3396,30 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
         return Ok(Vec::new());
     };
     let old_manifest: ComponentsManifest = serde_json::from_slice(old_bytes)?;
-
-    let gateways = build_gateway_list(data_dir);
     // An operator or bootstrap-only installation has no Home to complete.
     let home = crate::api::browser_capsules::installed_home_document(data_dir).is_some();
+    refresh_support(
+        data_dir,
+        &old_manifest,
+        &new_manifest,
+        platform,
+        home,
+        carrier_context,
+    )
+    .await
+}
+
+async fn refresh_support(
+    data_dir: &Path,
+    old_manifest: &ComponentsManifest,
+    new_manifest: &ComponentsManifest,
+    platform: &str,
+    home: bool,
+    carrier_context: FirstPartyCarrierContext,
+) -> anyhow::Result<Vec<String>> {
+    let gateways = build_gateway_list(data_dir);
     let mut refreshed = Vec::new();
-    for item in plan_update_support(data_dir, &old_manifest, &new_manifest, platform, home) {
+    for item in plan_update_support(data_dir, old_manifest, new_manifest, platform, home) {
         let SupportUpdate {
             name,
             component,
@@ -3360,7 +3459,7 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
                     carrier_context,
                 )
                 .await?;
-                write_cache_metadata(&new_manifest, Some(info), platform, name, &dest)?;
+                write_cache_metadata(new_manifest, Some(info), platform, name, &dest)?;
             }
             refreshed.push(name.to_string());
         }
@@ -3718,8 +3817,44 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    crate::carrier::fetch_file_from_trusted_source_bound(&source, cid, release_path, 15, bind_addr)
-        .await
+    crate::carrier::fetch_file_from_trusted_source_bound(
+        &source,
+        cid,
+        release_path,
+        15,
+        bind_addr,
+        crate::carrier::MAX_DOWNLOAD_BYTES,
+    )
+    .await
+}
+
+/// The whole catalogue fetch, every transport attempt included.
+const MODEL_CATALOG_FETCH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 2 } else { 30 });
+
+/// The pinned catalogue by CID from the trusted source: 128 KiB and one total deadline.
+pub(crate) async fn fetch_model_catalog_via_carrier(
+    data_dir: &Path,
+    cid: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let source = crate::sources::load_trusted_sources(data_dir)?
+        .default_source()
+        .cloned()
+        .ok_or_else(missing_trusted_source_error)?;
+    let bind_addr = first_party_carrier_bind_addr(data_dir, FirstPartyCarrierContext::Runtime)?;
+    tokio::time::timeout(
+        MODEL_CATALOG_FETCH_DEADLINE,
+        crate::carrier::fetch_file_from_trusted_source_bound(
+            &source,
+            Some(cid),
+            MODEL_CATALOG_FILE,
+            15,
+            bind_addr,
+            MAX_MODEL_CATALOG_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("model catalogue fetch exceeded its deadline"))?
 }
 
 fn require_component_not_model(name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -4224,12 +4359,12 @@ fn ensure_bundle_executable_link(
     anyhow::bail!("component '{name}' bundle executable links are unsupported on this platform")
 }
 
-fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
+/// A scratch name beside `dest`, so the final rename stays on one filesystem.
+fn sibling_scratch(dest: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let parent = dest
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
     fs::create_dir_all(parent)?;
-
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
         dest.file_name()
@@ -4237,54 +4372,116 @@ fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
             .unwrap_or("elastos"),
         std::process::id()
     ));
+    Ok((parent.to_path_buf(), tmp))
+}
 
-    fs::write(&tmp, data)?;
+fn sync_path(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+/// Flushes a staged tree, files before their directories, before it is published.
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            sync_tree(&entry?.path())?;
+        }
+        sync_path(path)
+    } else if metadata.is_file() {
+        sync_path(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let (parent, tmp) = sibling_scratch(dest)?;
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, dest)?;
+    sync_path(&parent)?;
     Ok(())
 }
 
 fn atomic_copy_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
-    fs::create_dir_all(parent)?;
-
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("elastos"),
-        std::process::id()
-    ));
-
+    let (parent, tmp) = sibling_scratch(dest)?;
     fs::copy(src, &tmp)?;
+    sync_path(&tmp)?;
     fs::rename(&tmp, dest)?;
+    sync_path(&parent)?;
     Ok(())
 }
 
+/// Publishes a complete copy of `src` at `dest`. The previous tree stays in place
+/// until one atomic exchange, so an interruption leaves either tree, never neither.
 fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
-    fs::create_dir_all(parent)?;
-
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("elastos"),
-        std::process::id()
-    ));
-
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp)?;
-    }
+    let (parent, tmp) = sibling_scratch(dest)?;
+    remove_path(&tmp)?;
     copy_dir_recursive(src, &tmp)?;
-    if dest.exists() {
-        fs::remove_dir_all(dest)?;
+    sync_tree(&tmp)?;
+    sync_path(&parent)?;
+    replace_directory(&tmp, dest)?;
+    sync_path(&parent)?;
+    // The scratch name now holds the previous tree, when there was one.
+    remove_path(&tmp)
+}
+
+fn remove_path(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// Moves `staged` to `dest` in one step: a rename when `dest` is absent, else an
+/// exchange that leaves the previous entry at `staged`.
+fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
+    if fs::symlink_metadata(dest).is_err() {
+        fs::rename(staged, dest)?;
+        return Ok(());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
+        let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
+        // Both paths name owned entries on the same filesystem. An unsupported
+        // exchange fails with the previous installation still in place.
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                staged.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                staged.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("atomic replacement failed; previous files preserved");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("atomic replacement is unsupported on this host")
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -8060,6 +8257,75 @@ pub(crate) mod tests {
             };
             assert_eq!(requests.load(Ordering::SeqCst), expected_requests, "{case}");
         }
+    }
+
+    /// `source` reachable over Carrier, serving exactly `items` by CID, never by
+    /// name. Returns the saved source and the CIDs requested once the server closes.
+    pub(crate) async fn carrier_cid_source(
+        data_dir: &Path,
+        source: &TrustedSource,
+        items: HashMap<String, Vec<u8>>,
+    ) -> (
+        TrustedSource,
+        iroh::Endpoint,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![b"elastos/carrier/1".to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = crate::carrier::tests::wait_for_direct_endpoint_addr(&server).await;
+        let mut reachable = source.clone();
+        reachable.connect_ticket = crate::carrier::tests::encode_ticket_for(address);
+        reachable.publisher_node_id = server.id().to_string();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(reachable.clone());
+        save_trusted_sources(data_dir, &sources).unwrap();
+        fs::write(
+            data_dir.join("config.toml"),
+            "carrier_bind_addr = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            let mut requested = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(connection) = incoming.await else {
+                    break;
+                };
+                while let Ok((mut send, recv)) = connection.accept_bi().await {
+                    let mut request = String::new();
+                    tokio::io::BufReader::new(recv)
+                        .read_line(&mut request)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    assert_eq!(
+                        request["op"], "content_fetch",
+                        "signed input fetched by name"
+                    );
+                    let cid = request["cid"].as_str().unwrap().to_owned();
+                    requested.push(cid.clone());
+                    let Some(bytes) = items.get(&cid) else {
+                        continue;
+                    };
+                    send.write_all(&(bytes.len() as u64).to_be_bytes())
+                        .await
+                        .unwrap();
+                    send.write_all(bytes).await.unwrap();
+                    send.finish().unwrap();
+                }
+            }
+            requested
+        });
+        (reachable, server, serving)
     }
 
     pub(crate) async fn carrier_component_download_fixture(

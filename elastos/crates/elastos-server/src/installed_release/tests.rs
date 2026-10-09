@@ -513,8 +513,9 @@ fn native_provider_outside_home_profile_is_verified_when_present_and_never_requi
 }
 
 #[test]
-fn installed_catalogue_keeps_pinned_custody_after_offer_expiry() {
+fn home_admission_does_not_depend_on_the_catalogue_that_local_ai_verifies() {
     for case in [
+        "missing",
         "expired valid",
         "wrong signer",
         "wrong cid",
@@ -542,10 +543,13 @@ fn installed_catalogue_keeps_pinned_custody_after_offer_expiry() {
             serde_json::to_vec(&components).unwrap(),
         )
         .unwrap();
-        fs::write(fixture.data.join("model-catalog.json"), catalogue).unwrap();
+        if case != "missing" {
+            fs::write(fixture.data.join("model-catalog.json"), catalogue).unwrap();
+        }
         fixture.bind_components();
-        assert_eq!(fixture.load().is_ok(), case == "expired valid", "{case}");
-        // Current model discovery retains the real-time expiry gate.
+        // Home starts offline after an older updater left the catalogue out.
+        assert!(fixture.load().is_ok(), "{case}");
+        // Local AI alone reports it, with the real-time expiry gate.
         assert!(
             crate::api::capsule_inventory::model_catalog_entries(&fixture.data).is_err(),
             "{case}"

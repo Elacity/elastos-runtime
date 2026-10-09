@@ -495,10 +495,8 @@ fn admit_support(data: &Path, binary: &Path, components: &[u8]) -> Result<()> {
             }
         }
     }
-    if let Some(trust) = &manifest.model_catalog {
-        let bytes = read_regular(&data.join("model-catalog.json"), 128 * 1024, false)?;
-        crate::setup::verify_pinned_model_catalog(trust, &bytes)?;
-    }
+    // The pinned catalogue is not Home's to require: Local AI verifies it on every
+    // read, and Update/Undo repair it before admission.
     if manifest.external.contains_key("home") || manifest.capsules.contains_key("home") {
         let document = crate::api::browser_capsules::installed_home_document(data)
             .context("Installed Home document is unavailable")?;
