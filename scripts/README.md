@@ -202,6 +202,10 @@ projects; a missing lockfile stops preparation before a native build.
 The Browser guest is one ARM64 Chromium/Selkies image shared by Mac and Linux
 ARM64. Its release artifact is `browser-vm-image-arm64.tar.gz`; both platform
 rows bind the same bytes. Linux x86-64 is a remote Engine consumer.
+The guest builder defaults to a 4 GiB root disk (`--rootfs-size 4096M`). Linux
+preparation keeps one spare root image. Capacity proof includes the compressed
+archive, extraction, profile, launch copies and update staging plus the Runtime
+reserve; image qualification runs on both hosts.
 
 The guest builder hashes its recipe, pinned Selkies inputs, guest helper sources
 and build options. Running it again with the same output directory reuses an

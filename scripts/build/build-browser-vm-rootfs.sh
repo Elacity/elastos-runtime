@@ -22,7 +22,7 @@ contract, then emits plain artifacts consumed by crosvm or Apple VZ:
 Options:
   --out-dir PATH              Build output directory
   --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest)
-  --rootfs-size SIZE          mke2fs image size (default: 8192M)
+  --rootfs-size SIZE          mke2fs image size (default: 4096M)
   --debian-suite SUITE        Debian suite (default: bookworm)
   --debian-mirror URL         Debian mirror (default: https://deb.debian.org/debian)
 USAGE
@@ -35,7 +35,7 @@ die() {
 
 out_dir=""
 target_platform="${ELASTOS_BROWSER_VM_TARGET_PLATFORM:-linux-arm64}"
-rootfs_size="${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-8192M}"
+rootfs_size="${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-4096M}"
 debian_suite="${ELASTOS_BROWSER_VM_DEBIAN_SUITE:-bookworm}"
 debian_mirror="${ELASTOS_BROWSER_VM_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
 

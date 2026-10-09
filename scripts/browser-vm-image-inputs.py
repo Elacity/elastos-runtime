@@ -27,7 +27,7 @@ REQUIRED_FILES = INPUTS[:8] + ("rust-toolchain.toml",) + tuple(
     tool + "/" + name for tool in INPUTS[9:12] for name in ("Cargo.toml", "Cargo.lock", "src/main.rs")
 )
 
-DEFAULT_OPTIONS = {"target_platform": "linux-arm64", "rootfs_size": "8192M",
+DEFAULT_OPTIONS = {"target_platform": "linux-arm64", "rootfs_size": "4096M",
                    "debian_suite": "bookworm", "debian_mirror": "https://deb.debian.org/debian",
                    "cdp_timeout_ms": "20000"}
 
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-ref")
     parser.add_argument("--target-platform", default="linux-arm64")
-    parser.add_argument("--rootfs-size", default="8192M")
+    parser.add_argument("--rootfs-size", default="4096M")
     parser.add_argument("--debian-suite", default="bookworm")
     parser.add_argument("--debian-mirror", default="https://deb.debian.org/debian")
     parser.add_argument("--image-dir", type=Path)
