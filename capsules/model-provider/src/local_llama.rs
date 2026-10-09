@@ -1225,6 +1225,7 @@ mod tests {
         Ok(crate::local_memory::HostMemory {
             total: 8 * GIB,
             available: GIB,
+            pressure_normal: false,
         })
     }
 

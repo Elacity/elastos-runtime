@@ -13,12 +13,22 @@ pub(crate) const UBATCH_SIZE: u64 = 128;
 const BASE_SCRATCH: u64 = 512 * MIB;
 const MIN_HEADROOM: u64 = 1024 * MIB;
 
-/// Host memory as seen right now: total RAM and memory the OS can hand out
-/// without swapping.
+/// Host memory as seen right now: total RAM, memory the OS can hand out
+/// without compressing or swapping, and whether the kernel reports normal
+/// memory pressure (macOS only; always false elsewhere).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostMemory {
     pub total: u64,
     pub available: u64,
+    pub pressure_normal: bool,
+}
+
+impl HostMemory {
+    /// Fits when free memory covers `required`, or, under normal pressure,
+    /// when physical RAM does: macOS then compresses or evicts to make room.
+    fn fits(&self, required: u64) -> bool {
+        required <= self.available || (self.pressure_normal && required <= self.total)
+    }
 }
 
 pub(crate) type HostMemoryReader = fn() -> Result<HostMemory, LocalLlamaFault>;
@@ -40,8 +50,8 @@ impl MemoryPlan {
     }
 }
 
-/// Refuses with `MemoryUnavailable` unless free memory covers the model
-/// weights, its KV cache at `context`, compute scratch, and a headroom of
+/// Refuses with `MemoryUnavailable` unless the host fits the model weights,
+/// its KV cache at `context`, compute scratch, and a headroom of
 /// max(10% of RAM, 1 GiB) left for the rest of the device.
 pub(crate) fn admit(
     model: &Path,
@@ -54,7 +64,7 @@ pub(crate) fn admit(
     let weights = file.metadata().map_err(|_| LocalLlamaFault::Failed)?.len();
     let plan = memory_plan(file, weights, context, parallel, host.total)?;
     match plan.required() {
-        Some(required) if required <= host.available => Ok(()),
+        Some(required) if host.fits(required) => Ok(()),
         _ => Err(LocalLlamaFault::MemoryUnavailable),
     }
 }
@@ -304,6 +314,7 @@ pub(crate) fn host_memory() -> Result<HostMemory, LocalLlamaFault> {
         return Ok(HostMemory {
             total: bytes,
             available: bytes,
+            pressure_normal: false,
         });
     }
     #[cfg(target_os = "linux")]
@@ -323,6 +334,7 @@ pub(crate) fn host_memory() -> Result<HostMemory, LocalLlamaFault> {
         Ok(HostMemory {
             total: host.total,
             available,
+            pressure_normal: false,
         })
     }
     #[cfg(target_os = "macos")]
@@ -350,7 +362,11 @@ fn parse_meminfo(text: &str) -> Result<HostMemory, LocalLlamaFault> {
     if total == 0 || available > total {
         return Err(LocalLlamaFault::Failed);
     }
-    Ok(HostMemory { total, available })
+    Ok(HostMemory {
+        total,
+        available,
+        pressure_normal: false,
+    })
 }
 
 /// Lowers `available` to the tightest `memory.max - memory.current` among the
@@ -436,9 +452,24 @@ fn macos_host_memory() -> Result<HostMemory, LocalLlamaFault> {
         page as u64,
     )
     .ok_or(fail)?;
+    // kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical.
+    // Unreadable counts as not normal.
+    let mut level: libc::c_int = 0;
+    let mut level_len = std::mem::size_of_val(&level);
+    // SAFETY: the sysctl is an int and `level_len` is its size.
+    let pressure = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&mut level as *mut libc::c_int).cast(),
+            &mut level_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
     Ok(HostMemory {
         total,
         available: available.min(total),
+        pressure_normal: pressure == 0 && level == 1,
     })
 }
 
@@ -466,6 +497,7 @@ pub(crate) fn test_host_memory() -> Result<HostMemory, LocalLlamaFault> {
     Ok(HostMemory {
         total: 8 * 1024 * MIB,
         available: 6 * 1024 * MIB,
+        pressure_normal: false,
     })
 }
 
@@ -518,13 +550,32 @@ mod tests {
             parse_meminfo(text),
             Ok(HostMemory {
                 total: 8_000_000 * 1024,
-                available: 3_000_000 * 1024
+                available: 3_000_000 * 1024,
+                pressure_normal: false,
             })
         );
         assert_eq!(
             parse_meminfo("MemTotal: 8000000 kB\n"),
             Err(LocalLlamaFault::Failed)
         );
+    }
+
+    #[test]
+    fn normal_pressure_admits_from_ram_when_free_estimate_is_low() {
+        let required = 4 * GIB;
+        let host = |available, total, pressure_normal| HostMemory {
+            total,
+            available,
+            pressure_normal,
+        };
+        // Low conservative estimate, normal pressure, enough RAM: admitted.
+        assert!(host(2 * GIB, 24 * GIB, true).fits(required));
+        // Warning or critical pressure (or unknown): the estimate decides.
+        assert!(!host(2 * GIB, 24 * GIB, false).fits(required));
+        // RAM below the need is refused even under normal pressure.
+        assert!(!host(2 * GIB, 3 * GIB, true).fits(required));
+        // Enough free memory admits regardless of pressure.
+        assert!(host(5 * GIB, 24 * GIB, false).fits(required));
     }
 
     #[test]
