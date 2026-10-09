@@ -917,7 +917,7 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_jetson_package_exists_before_verification_on_every_event(self):
         validate_jetson_package_lifecycle(SOURCE)
-        guard = "if: matrix.os == 'ubuntu-22.04-arm' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'"
+        guard = "if: matrix.os == 'ubuntu-22.04-arm' || github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'"
         self.assertIn(guard, JOBS["source-home-linux"])
         regressed = SOURCE.replace(guard, "if: github.event_name != 'pull_request'", 1)
         with self.assertRaisesRegex(AssertionError, "lacks its package on pull_request ubuntu-22.04-arm"):
@@ -936,6 +936,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 context = {"github.event_name": event, "github.ref": ref,
                            "github.ref_type": ref_type, "inputs.ref": override, "matrix.os": runner}
                 expected_upload = ref_type == "tag" or ref == "refs/heads/main" or event == "workflow_dispatch"
+                expected_upload |= job != "source-home-macos" and event in ("pull_request", "merge_group")
                 with self.subTest(job=job, event=event, ref=ref, override=override):
                     self.assertEqual(evaluate(field(upload, "if"), context), expected_upload)
                     self.assertEqual(evaluate(field(package, "if"), context),
