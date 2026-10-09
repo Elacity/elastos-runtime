@@ -10,11 +10,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 Test-channel release. Signed releases show these notes in System before you update.
 
-### Added
-
-- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
-  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
-  of free memory.
+If your Home is on 0.8.0-alpha.10 or older, update it once from Terminal with
+`elastos update`; the System page in those releases cannot install this one.
 
 ### Changed
 
@@ -30,11 +27,17 @@ Test-channel release. Signed releases show these notes in System before you upda
   starts again on your next message. Only one local model runs at a time.
 - When the model list is updated, a model already on this device says "Model
   list updated. Press Use to keep using this model." Use keeps the files; nothing
-  downloads again. This release updates the list, so press Use once for SmolLM2.
+  downloads again.
 - Marketplace shows a model's own description from the signed model list.
 
 ### Fixed
 
+- After updating into a release with a model list, Undo and later updates no
+  longer refuse with "Installed release inputs require repair". Home, Update and
+  Undo now restore any missing or wrong release file from the signed release
+  first, including after an interrupted update or Undo.
+- Updates now install the model list of the release you update to, and Undo puts
+  the previous one back.
 - A brief network stall no longer stops a model download. Home tries a part
   that timed out up to three more times before it stops.
 - After about 64 model downloads, retries or cancels, Home could no longer get
@@ -45,11 +48,16 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Developer detail
 
-- Signed model catalogue 3 is pinned in `components.json` (head
-  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
-  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
-  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, built
-  reproducibly locally and on the seed, pinned there) (#84).
+- Home start, `elastos update`, System update and Undo first repair the installed
+  release from its signed components: a missing or wrong-head pinned model
+  catalogue is fetched by CID over Carrier and checked for CID and publisher
+  signature; a component with the wrong bytes is re-fetched by CID. Both update
+  paths install the target's catalogue as journaled support. Setup fetches
+  components and the catalogue by the release's signed CID instead of by name.
+  The catalogue pin stays at alpha.11's head
+  (`bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`) so alpha.11 and
+  alpha.12 updaters, which do not install catalogues, can update to this release
+  (#113).
 - `model-provider` admits a local engine right before spawn when free memory
   covers GGUF weights once, the f16 KV cache at the configured context, batch
   scratch and headroom of max(10% RAM, 1 GiB). Free memory is Linux
