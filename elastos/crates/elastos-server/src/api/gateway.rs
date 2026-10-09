@@ -1476,7 +1476,9 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         || text.contains("belongs to a different principal")
     {
         StatusCode::FORBIDDEN
-    } else if profile_required.is_some() {
+    } else if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         StatusCode::CONFLICT
     } else if text.contains("service access request delivery failed") {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1547,7 +1549,9 @@ fn home_error_response(err: anyhow::Error) -> Response {
     if text.contains("share terms") || text.contains("hosted connection is required") {
         return (StatusCode::BAD_REQUEST, text).into_response();
     }
-    if profile_required.is_some() {
+    if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         return (StatusCode::CONFLICT, text).into_response();
     }
     if appearance_request.is_some() {

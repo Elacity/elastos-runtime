@@ -1648,6 +1648,11 @@ pub(super) async fn chat_room_contact_request(
         Ok(status) => status,
         Err(err) => return room_service_error_response(err),
     };
+    if status.community_paused() {
+        return room_service_error_response(anyhow::anyhow!(
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+        ));
+    }
     let Some(advertisement_id) = status
         .visible_people()
         .iter()

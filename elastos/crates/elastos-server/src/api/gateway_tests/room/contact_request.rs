@@ -119,20 +119,33 @@ impl ContactRequestHome {
     }
 
     async fn request(&self, token: Option<&str>, participant_ref: &str) -> (StatusCode, String) {
+        self.post(
+            CONTACT_REQUEST_PATH,
+            token,
+            serde_json::json!({ "participant_ref": participant_ref }),
+        )
+        .await
+    }
+
+    async fn post(
+        &self,
+        path: &str,
+        token: Option<&str>,
+        payload: serde_json::Value,
+    ) -> (StatusCode, String) {
         let mut request = Request::builder()
             .method("POST")
-            .uri(CONTACT_REQUEST_PATH)
+            .uri(path)
             .header(HOST, "localhost:61180")
             .header("origin", "null")
             .header(CONTENT_TYPE, "application/json");
         if let Some(token) = token {
             request = request.header("x-elastos-home-token", token);
         }
-        let body = serde_json::json!({ "participant_ref": participant_ref }).to_string();
         let response = self
             .app
             .clone()
-            .oneshot(request.body(Body::from(body)).unwrap())
+            .oneshot(request.body(Body::from(payload.to_string())).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -147,6 +160,63 @@ impl ContactRequestHome {
             .outgoing_pending_requests(self.now)
             .unwrap()
             .len()
+    }
+
+    fn incoming_request(&self) -> String {
+        let advertisement = self
+            .store
+            .published_local_advertisement(self.now)
+            .unwrap()
+            .unwrap();
+        let (key, _) = generate_keypair();
+        let key = SigningKey::from_bytes(&key.to_bytes());
+        let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &key,
+            "Requester",
+            None,
+            1,
+            None,
+            self.now,
+            vec![crate::crypto::encode_signing_key_did(&key)],
+        )
+        .unwrap();
+        let request = signed_discovery_message_for_test(
+            &key,
+            &profile.document().profile_did,
+            TestCollaborationMessageScope {
+                network_id: NETWORK,
+                conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_ID,
+            },
+            elastos_common::collaboration_protocol::CollaborationRecipient {
+                kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Profile,
+                id: self.local_profile.document().profile_did.clone(),
+            },
+            crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+            serde_json::to_value(crate::collaboration_discovery::CollaborationContactRequestPayload {
+                advertisement_envelope_sha256:
+                    elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                        &advertisement,
+                    ),
+                signed_profile: profile.signed_envelope().clone(),
+            })
+            .unwrap(),
+            self.now..self.now
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS,
+        );
+        self.store
+            .record_incoming_contact_request(&request, self.now)
+            .unwrap();
+        elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(&request)
+    }
+
+    fn contact_bytes(&self) -> Vec<u8> {
+        let uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            self.store.localhost_root()
+        );
+        let path =
+            elastos_common::localhost::rooted_localhost_fs_path(self.dir.path(), &uri).unwrap();
+        std::fs::read(path).unwrap()
     }
 }
 
@@ -262,5 +332,96 @@ async fn test_chat_contact_request_queues_one_request_for_a_visible_person() {
     // Asking again reuses the stored request.
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(home.outgoing_requests(), 1);
+}
+
+#[tokio::test]
+async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_mutation() {
+    let mut home = ContactRequestHome::new().await;
+    let membership = Arc::new(
+        crate::collaboration_release_network::CommunityMembership::load(home.dir.path(), NETWORK)
+            .unwrap(),
+    );
+    home.service = home
+        .service
+        .clone()
+        .with_community_membership(membership.clone());
+    let mut state = test_state(home.dir.path());
+    state.collaboration_discovery_service = Some(home.service.clone());
+    home.app = gateway_router(state);
+    home.show(vec![home.remote_advertisement.clone()]);
+    let participant_ref = home_people_contact_id(&home.remote_profile_did);
+    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(home.outgoing_requests(), 1);
+    let incoming = home.incoming_request();
+    let inbox_token = issue_home_projection_launch_token_with_context(
+        home.dir.path(),
+        INBOX_CAPSULE_ID,
+        INBOX_CAPSULE_ID,
+        &home.chat_context,
+    )
+    .unwrap();
+    let before = home.contact_bytes();
+    membership.set_joined(false).unwrap();
+    let expected = crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL;
+
+    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, expected);
+    assert_eq!(home.contact_bytes(), before);
+
+    let advertisement_id =
+        elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+            &home.remote_advertisement,
+        );
+    let (status, body) = home
+        .post(
+            "/api/apps/people/discovery/requests",
+            Some(&home.authority.people_token),
+            serde_json::json!({ "advertisement_id": advertisement_id }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, expected);
+    assert_eq!(home.contact_bytes(), before);
+
+    for prefix in ["contact-accept-request:", "contact-decline-request:"] {
+        let (status, body) = home
+            .post(
+                "/api/apps/inbox/actions",
+                Some(&inbox_token),
+                serde_json::json!({ "action_id": format!("{prefix}{incoming}") }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, expected);
+        assert_eq!(home.contact_bytes(), before);
+        assert_eq!(home.store.pending_incoming_requests().unwrap().len(), 1);
+        assert!(home
+            .store
+            .stored_contact_decision_receipt(&incoming)
+            .unwrap()
+            .is_none());
+    }
+    assert!(home.store.discovery_enabled().unwrap());
+    assert_eq!(home.outgoing_requests(), 1);
+
+    membership.set_joined(true).unwrap();
+    let (status, body) = home
+        .post(
+            "/api/apps/inbox/actions",
+            Some(&inbox_token),
+            serde_json::json!({ "action_id": format!("contact-accept-request:{incoming}") }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(home.store.pending_incoming_requests().unwrap().is_empty());
+    assert!(home
+        .store
+        .stored_contact_decision_receipt(&incoming)
+        .unwrap()
+        .is_some());
+    assert_eq!(home.store.snapshot().unwrap().contacts().len(), 1);
     assert_eq!(home.outgoing_requests(), 1);
 }

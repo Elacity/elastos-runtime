@@ -78,6 +78,15 @@ impl CommunityMembership {
         Ok(())
     }
 
+    /// Holds the current Community choice during synchronous durable intent
+    /// admission. Transport work starts after this guard is released.
+    pub(crate) fn lock_joined(&self) -> anyhow::Result<crate::host_lock::FileLock> {
+        let choice = lock_network_choice(&self.data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("Community data directory is missing"))?;
+        self.require_joined()?;
+        Ok(choice)
+    }
+
     /// System checks the current admin before calling this shared operation.
     /// The network-choice lock also serializes this with setup and startup.
     pub(crate) fn set_joined(&self, joined: bool) -> anyhow::Result<()> {
@@ -626,6 +635,41 @@ pub(crate) mod tests {
         assert!(CommunityMembership::load(other_home.path(), "network-one")
             .unwrap()
             .joined());
+    }
+
+    #[test]
+    fn community_intent_guard_serializes_leave_and_rechecks_the_choice() {
+        let data = private_data_dir();
+        let membership =
+            std::sync::Arc::new(CommunityMembership::load(data.path(), "network-one").unwrap());
+        let admission = membership.lock_joined().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker_membership = membership.clone();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            worker_membership.set_joined(false).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(finished_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(membership.joined());
+        drop(admission);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            membership.lock_joined().unwrap_err().to_string(),
+            COMMUNITY_LEFT_DETAIL
+        );
+        assert!(!CommunityMembership::load(data.path(), "network-one")
+            .unwrap()
+            .joined());
+        membership.set_joined(true).unwrap();
+        membership.lock_joined().unwrap();
     }
 
     #[test]

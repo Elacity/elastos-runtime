@@ -1235,6 +1235,11 @@ impl CollaborationDiscoveryService {
                 .intent_mutex
                 .lock()
                 .map_err(|_| anyhow::anyhow!("discovery intent lock is poisoned"))?;
+            let _community_choice = self
+                .community_membership
+                .as_ref()
+                .map(|membership| membership.lock_joined())
+                .transpose()?;
             match store.stored_outgoing_contact_request(
                 advertisement.verified.message().envelope_sha256(),
                 advertisement.verified.profile_did(),
@@ -1271,6 +1276,11 @@ impl CollaborationDiscoveryService {
                 .intent_mutex
                 .lock()
                 .map_err(|_| anyhow::anyhow!("discovery intent lock is poisoned"))?;
+            let _community_choice = self
+                .community_membership
+                .as_ref()
+                .map(|membership| membership.lock_joined())
+                .transpose()?;
             match store.stored_contact_decision_receipt(request_hash)? {
                 Some(receipt) => {
                     let stored_receipt: SignedCollaborationContactDecisionReceipt =
