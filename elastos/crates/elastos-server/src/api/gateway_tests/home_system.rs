@@ -7921,8 +7921,6 @@ async fn test_home_browser_state_drops_unknown_targets() {
             "obsolete-wallet": "Old Wallet"
         },
         "taskbar": ["system", "people", "obsolete-wallet"],
-        "homeDock": ["obsolete-wallet", "people", "people"],
-        "homePages": [["system", "obsolete-wallet"], ["obsolete-wallet"], ["people", "system"], "system"],
         "desktopIconsVisible": true
     });
     {
@@ -7982,8 +7980,6 @@ async fn test_home_browser_state_drops_unknown_targets() {
     assert!(json["layout"]["desktopLabels"].get("people").is_some());
     assert_eq!(json["layout"]["desktopHidden"], json!(["system", "people"]));
     assert_eq!(json["layout"]["taskbar"], json!(["system", "people"]));
-    assert_eq!(json["layout"]["homeDock"], json!(["people"]));
-    assert_eq!(json["layout"]["homePages"], json!([["system"], ["people"]]));
     assert_eq!(json["session"]["windows"].as_array().unwrap().len(), 2);
     assert_eq!(json["session"]["windows"][0]["target"], "people");
     assert_eq!(json["session"]["windows"][1]["target"], "system");

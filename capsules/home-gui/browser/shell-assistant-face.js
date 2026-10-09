@@ -34,7 +34,6 @@ import {
   isAgentSpace,
   setActiveStage,
 } from "./shell-stages.js?v=home-20260813a";
-import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
 import {
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
@@ -56,10 +55,6 @@ const RETURN_MS = 160;
 const ROOM_MS = 720;
 const FACE_MIN_W = 320;
 const FACE_MAX_W = 720;
-/* Side gutters of .taskbar.is-assistant-face's max-width. The phone gutter is
-   the Dock's and the Apps face's, so the stretch never narrows the pill. */
-const FACE_GUTTER = 48;
-const FACE_GUTTER_PHONE = 20;
 
 let deps = null;
 let generation = 0;
@@ -138,17 +133,13 @@ function setFaceOpen(open) {
   toggle?.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
-function faceViewportWidth() {
-  return window.innerWidth - (isPhone() ? FACE_GUTTER_PHONE : FACE_GUTTER);
-}
-
 /* Default geometry is the composer's idle pill; the capsule reports the live
    one as soon as its pill lays out, and again whenever it grows. */
 function lockFaceGeometry(taskbar) {
   if (taskbar.style.getPropertyValue("--assistant-face-w")) {
     return;
   }
-  const maxW = Math.max(FACE_MIN_W, faceViewportWidth());
+  const maxW = Math.max(FACE_MIN_W, window.innerWidth - 48);
   taskbar.style.setProperty("--assistant-face-w", `${Math.round(Math.min(maxW, FACE_MAX_W))}px`);
 }
 
@@ -157,7 +148,7 @@ function lockFaceGeometry(taskbar) {
 function faceTargetWidth(taskbar) {
   const locked = parseFloat(taskbar.style.getPropertyValue("--assistant-face-w"));
   const width = Number.isFinite(locked) && locked >= FACE_MIN_W ? locked : FACE_MAX_W;
-  return Math.round(Math.min(width, faceViewportWidth()));
+  return Math.round(Math.min(width, window.innerWidth - 48));
 }
 
 function applyFaceMetrics(metrics) {

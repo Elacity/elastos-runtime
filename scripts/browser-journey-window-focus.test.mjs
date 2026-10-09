@@ -28,7 +28,6 @@ const evidence = window.evidence = { actions: [], closes: [], contextClicks: [] 
 const rememberRecentTarget = () => {}, fitLaunchedWindow = () => {}, refreshWindowUi = () => {}, persistBrowserSession = () => {};
 const supportsMenuNewWindow = () => true, browserWindowDisplayTitle = entry => entry.id;
 const taskbarPinMenuItem = () => ({ action: "pin-taskbar", label: "Keep in Shelf" }), appendTargetGroupManagementItems = () => {};
-const targetTitle = (summary, targetId) => targetId, isPhone = () => false;
 const contextMenuItems = target => targetContextMenuItems(target);
 const hideDesktopContextMenu = () => { desktopContextMenu.hidden = true; };
 ${["browserWindowEntries", "browserWindowEntriesForTarget", "sortWindowEntriesByZOrder", "focusWindow", "focusWindowControl"].map(name => declaration(windows, name)).join("\n")}

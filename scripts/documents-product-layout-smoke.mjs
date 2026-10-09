@@ -6,12 +6,6 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
-
-const PHONE_SCREENSHOT = "/tmp/documents-phone-390x844.png";
-const PHONE_DRAWER_SCREENSHOT = "/tmp/documents-phone-drawer-390x844.png";
-const PHONE_MORE_SCREENSHOT = "/tmp/documents-phone-more-390x844.png";
-const PHONE_TOUCH_TARGET_PX = 44;
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
@@ -319,76 +313,6 @@ function createAppServer() {
   });
 }
 
-// Phone keeps view and Save in the row; the secondary actions live behind More.
-async function assertPhoneMoreMenu(page) {
-  const readMenu = () => page.evaluate(() => {
-    const visible = (node) => node instanceof HTMLElement && node.getClientRects().length > 0;
-    const row = document.querySelector(".toolbar-actions");
-    const menu = document.getElementById("more-menu");
-    const menuRect = menu.getBoundingClientRect();
-    const items = [...menu.querySelectorAll("button")].filter(visible).map((button) => ({
-      id: button.id,
-      height: Math.round(button.getBoundingClientRect().height),
-      label: getComputedStyle(button, "::after").content.replace(/^"|"$/g, ""),
-    }));
-    return {
-      rowOverflow: row.scrollWidth - row.clientWidth,
-      rowTargets: [...row.querySelectorAll("button")].filter(visible).filter((button) => !menu.contains(button))
-        .map((button) => ({ id: button.id, height: Math.round(button.getBoundingClientRect().height) })),
-      titleHeight: Math.round(document.getElementById("title-input").getBoundingClientRect().height),
-      expanded: document.getElementById("more-button").getAttribute("aria-expanded"),
-      menuOpen: visible(menu) && menuRect.height > 0,
-      menuOnTop: menu.contains(document.elementFromPoint(menuRect.left + menuRect.width / 2, menuRect.top + menuRect.height / 2)),
-      clippedBy: (() => {
-        const chain = [];
-        for (let node = menu.parentElement; node; node = node.parentElement) {
-          const style = getComputedStyle(node);
-          if (style.overflow !== "visible" || style.zIndex !== "auto") {
-            chain.push(`${node.tagName}.${node.className} overflow=${style.overflow} z=${style.zIndex}`);
-          }
-        }
-        return chain;
-      })(),
-      menuInViewport: menuRect.left >= 0 && menuRect.right <= window.innerWidth,
-      items,
-    };
-  });
-  const closed = await readMenu();
-  assert(
-    closed.rowOverflow <= 1 && !closed.menuOpen && closed.expanded === "false"
-      && closed.rowTargets.map((target) => target.id).join(",") === "mode-write,mode-read,save-button,more-button",
-    `Documents phone: the row holds Write, Read, Save and More without scrolling; the rest waits in More. Got ${JSON.stringify(closed)}`,
-  );
-  assert(
-    closed.titleHeight >= PHONE_TOUCH_TARGET_PX && closed.rowTargets.every((target) => target.height >= PHONE_TOUCH_TARGET_PX),
-    `Documents phone: the title, Write, Read, Save and More must be 44 px targets. Got ${JSON.stringify(closed)}`,
-  );
-
-  await page.locator("#more-button").click();
-  const open = await readMenu();
-  await page.screenshot({ path: PHONE_MORE_SCREENSHOT });
-  const ids = open.items.map((item) => item.id);
-  assert(
-    open.menuOpen && open.menuOnTop && open.expanded === "true" && open.menuInViewport
-      && ["save-as-button", "publish-button", "unpublish-button", "delete-button"].every((id) => ids.includes(id)),
-    `Documents phone: More must open on screen with Save as, Publish, Unpublish and Delete. Got ${JSON.stringify(open)}`,
-  );
-  assert(
-    open.items.every((item) => item.height >= PHONE_TOUCH_TARGET_PX && item.label.length > 0),
-    `Documents phone: each More action must be a labelled 44 px row. Got ${JSON.stringify(open.items)}`,
-  );
-
-  await page.keyboard.press("Escape");
-  const escaped = await readMenu();
-  const focused = await page.evaluate(() => document.activeElement?.id || "");
-  assert(!escaped.menuOpen && escaped.expanded === "false" && focused === "more-button", `Documents phone: Escape must close More and return focus. Got ${JSON.stringify({ escaped, focused })}`);
-
-  await page.locator("#more-button").click();
-  await page.locator("#editor").click();
-  const dismissed = await readMenu();
-  assert(!dismissed.menuOpen && dismissed.expanded === "false", `Documents phone: tapping outside must close More. Got ${JSON.stringify(dismissed)}`);
-}
-
 async function assertNoHorizontalOverflow(page, label) {
   const overflow = await page.evaluate(() => ({
     body: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -623,55 +547,8 @@ async function run() {
     assert(readMode.highlights >= 2, "Documents read view must keep preview find highlights visible.");
 
     await assertNoHorizontalOverflow(page, "wide");
-    // A list hidden on the desktop must still fill the phone drawer.
-    await page.locator("#sidebar-toggle").click();
-    await page.setViewportSize(PHONE_VIEWPORT);
+    await page.setViewportSize({ width: 390, height: 844 });
     await assertNoHorizontalOverflow(page, "narrow");
-
-    await page.locator("#mode-write").click();
-    await setPhoneFormFactor(page);
-    await page.waitForTimeout(DRAWER_SETTLE_MS);
-    await assertNoHorizontalOverflow(page, "phone");
-    const phoneList = await page.evaluate(() => ({
-      collapsed: document.querySelector(".documents-shell")?.dataset.sidebarCollapsed || "",
-      list: getComputedStyle(document.getElementById("documents-list")).display,
-      search: getComputedStyle(document.querySelector(".sidebar-search")).display,
-    }));
-    assert(
-      phoneList.collapsed === "true" && phoneList.list !== "none" && phoneList.search !== "none",
-      `Documents phone: a list hidden on the desktop must still fill the drawer. Got ${JSON.stringify(phoneList)}`,
-    );
-    const phoneEditor = await page.evaluate(() => {
-      const editor = document.getElementById("editor").getBoundingClientRect();
-      const hidden = (id) => getComputedStyle(document.getElementById(id)).display === "none";
-      return {
-        editorWidth: Math.round(editor.width),
-        editorHeight: Math.round(editor.height),
-        editorFont: getComputedStyle(document.getElementById("editor")).fontSize,
-        splitHidden: hidden("mode-split"),
-        hideListHidden: hidden("sidebar-toggle"),
-      };
-    });
-    await page.screenshot({ path: PHONE_SCREENSHOT });
-    assert(
-      phoneEditor.editorWidth >= PHONE_VIEWPORT.width - 40 && phoneEditor.editorHeight >= PHONE_VIEWPORT.height * 0.6,
-      `Documents phone: the editor must take the whole stage. Got ${JSON.stringify(phoneEditor)}`,
-    );
-    assert(
-      phoneEditor.editorFont === "16px" && phoneEditor.splitHidden && phoneEditor.hideListHidden,
-      `Documents phone: 16 px editor (no iOS focus zoom), no Split or Hide list controls. Got ${JSON.stringify(phoneEditor)}`,
-    );
-    await assertPhoneMoreMenu(page);
-    await assertPhoneDrawer(page, page, {
-      label: "Documents",
-      drawer: "#documents-sidebar",
-      room: ".documents-main",
-      closeTarget: '.document-list-item[data-doc-did="doc-beta"]',
-      screenshot: PHONE_DRAWER_SCREENSHOT,
-    });
-    await setPhoneFormFactor(page, false);
-    const desktopList = await page.evaluate(() => getComputedStyle(document.getElementById("documents-list")).display);
-    assert(desktopList === "none", `Documents desktop: Hide list must still hide the list after the phone layout. Got ${desktopList}`);
 
     await page.close();
     resetDocumentsFixture();

@@ -6,15 +6,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/people/browser");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
-const PHONE_SCREENSHOT = "/tmp/people-phone-390x844.png";
-const PHONE_DRAWER_SCREENSHOT = "/tmp/people-phone-drawer-390x844.png";
 
 function assert(condition, message, details = undefined) {
   if (!condition) {
@@ -722,39 +719,6 @@ async function assertProfileFailureScenario(frame, width) {
   await assertNoOverflow(frame, `profile failure recovered at ${width}px`);
 }
 
-// Signed in, the page is short: the sections must not take the spare height.
-async function assertPhoneScenario(page, port) {
-  const frame = await openPeople(page, port, "ready-off", PHONE_VIEWPORT.width);
-  await page.setViewportSize(PHONE_VIEWPORT);
-  await setPhoneFormFactor(frame);
-  await page.waitForTimeout(DRAWER_SETTLE_MS);
-  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "My Profile"));
-  const head = await frame.evaluate(() => {
-    const rect = (selector) => document.querySelector(selector).getBoundingClientRect();
-    const title = rect(".people-page-title");
-    const toggle = rect(".el-drawer-toggle");
-    return {
-      titleTop: Math.round(title.top),
-      titleMiddle: Math.round(title.top + title.height / 2),
-      toggleMiddle: Math.round(toggle.top + toggle.height / 2),
-      toggleLeft: Math.round(toggle.left),
-    };
-  });
-  assert(
-    head.titleTop <= 40 && Math.abs(head.titleMiddle - head.toggleMiddle) <= 4 && head.toggleLeft <= 16,
-    "People phone: content must start at the top with the drawer toggle leading the page title",
-    head,
-  );
-  await page.screenshot({ path: PHONE_SCREENSHOT });
-  await assertPhoneDrawer(page, frame, {
-    label: "People",
-    drawer: "#people-sidebar",
-    room: ".people-main",
-    closeTarget: '[data-section-target="people"]',
-    screenshot: PHONE_DRAWER_SCREENSHOT,
-  });
-}
-
 async function assertRemoveConfirmationScenario(frame, page, width, trace) {
   const beforePosts = trace.removalTargets.length;
   const remove = frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]');
@@ -797,6 +761,7 @@ async function assertRemoveConfirmationScenario(frame, page, width, trace) {
 }
 
 async function runScenario(page, port, scenario, width, trace) {
+
   const frame = await openPeople(page, port, scenario, width);
   if (scenario === "first-run") {
     await assertFirstRunScenario(frame, width);
@@ -832,7 +797,6 @@ async function main() {
   });
   const page = context.pages()[0] || await context.newPage();
   try {
-    await assertPhoneScenario(page, port);
     for (const width of [375, 1280]) {
       await runScenario(page, port, "first-run", width);
       await runScenario(page, port, "ready-off", width);

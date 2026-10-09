@@ -1,3 +1,4 @@
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
 import {
   desktop,
   desktopBackdrop,
@@ -150,11 +151,6 @@ import {
   retireConnectorSheet,
   showConnectorSheet,
 } from "./shell-connector-sheet.js?v=home-20260813a";
-import { bindFormFactor } from "./shell-form-factor.js?v=home-20260813a";
-import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
-import { bindPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
-import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
-import { bindTouchLongPress } from "./shell-touch.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -168,6 +164,8 @@ bindSetupSheet();
 bindQuickLook();
 bindExpose();
 bindSpacePager();
+const unbindCapsuleLayout = bindCapsuleLayout();
+window.addEventListener("beforeunload", unbindCapsuleLayout, { once: true });
 bindSpaceEdgePeek();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
@@ -1217,19 +1215,6 @@ export function bindHomeGuiInteractions(options = {}) {
     : null;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
 
-  // Size class, pointer class and soft-keyboard inset before any surface
-  // binds, so CSS keyed on body[data-form-factor] is right on first paint.
-  bindFormFactor();
-  // Phone Dock tuck/peek handle; a no-op on tablet and desktop.
-  bindPhoneDock();
-  // Phone system-back history and the title-bar swipe to the switcher.
-  bindPhoneStage();
-  // Capsule frames learn the size class so they can take their phone layout.
-  bindCapsuleLayout();
-  // A held finger opens the same menus a right-click does; desktop icons
-  // keep their own long-press, which also arms the touch drag.
-  const touchLongPress = bindTouchLongPress(document, { skip: ".desktop-shortcut" });
-
   // The brand button itself toggles the ElastOS menu (bound in
   // bindIdentityMenu); the go-home action lives inside it as Show desktop.
   identityMenuShowDesktopButton?.addEventListener("click", () => {
@@ -1365,10 +1350,6 @@ export function bindHomeGuiInteractions(options = {}) {
       now >= shellState.contextMenuIgnoreOutsideUntil &&
       !event.target.closest("#desktop-context-menu")
     ) {
-      // The phone menu sheet covers the Dock; a tap beside it only dismisses.
-      if (desktopContextMenu?.classList.contains("context-menu-sheet")) {
-        touchLongPress.swallowNextClick();
-      }
       hideDesktopContextMenu();
     }
     if (launcher.hidden) {

@@ -25,8 +25,7 @@ PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`j
 # Entries are the browser-serving dir relative to capsules/ — most apps serve
 # from a browser/ subdir; viewer-style capsules serve straight from their root.
 # home/browser is the shell host (unlock surface); home-gui/browser is the GUI
-# shell package; assistant/browser is the Assistant room Home frames like any
-# capsule. home-cli stays out: its terminal surface is capsule-local xterm
+# shell package. home-cli stays out: its terminal surface is capsule-local xterm
 # rendering by contract. The vendored theme runtime owns no browser-profile
 # storage, so it is safe in an opaque capsule; only the host installs a
 # persistence adapter, in its own non-vendored file.
@@ -34,7 +33,6 @@ TARGETS=(
   browser/browser
   home/browser
   home-gui/browser
-  assistant/browser
   system/browser
   services/browser
   people/browser
@@ -136,19 +134,6 @@ if [[ "$MODE" == "--check" ]]; then
 else
   cp "$model_facts_source" "$model_facts_target"
 fi
-
-# The phone push drawer ships only to capsules whose sidebar uses it.
-for target_dir in marketplace/browser documents/browser system/browser people/browser; do
-  drawer_target="capsules/$target_dir/elastos-drawer.js"
-  if [[ "$MODE" == "--check" ]]; then
-    if ! cmp -s capsules/_shared/elastos-drawer.js "$drawer_target"; then
-      echo "[vendor-ui] DRIFT: $drawer_target" >&2
-      FAILED=1
-    fi
-  else
-    cp capsules/_shared/elastos-drawer.js "$drawer_target"
-  fi
-done
 
 for target_dir in assistant/browser; do
   model_target="capsules/$target_dir/model-selection.js"

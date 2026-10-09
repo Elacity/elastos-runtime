@@ -46,10 +46,7 @@
   /* Stage contract: windows (incl. maximize/snap) live between the system bar
      and the dock clearance — system chrome is never covered. */
   --stage-top: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
-  --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
-  /* Soft-keyboard height on coarse-pointer hosts; shell-form-factor.js writes
-     it from visualViewport so the stage ends above the keyboard. 0 on desktop. */
-  --keyboard-inset: 0px;
+  --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px));
   /* Shelf scale: slightly larger than the original 60/50/40 for XDR density. */
   --taskbar-h: 72px;
   --taskbar-offset: 12px;
@@ -77,8 +74,6 @@ body {
   margin: 0;
   min-height: 100%;
   overflow: hidden;
-  /* The shell is not a page: no rubber-band or pull-to-refresh on it. */
-  overscroll-behavior: none;
   background: var(--bg);
   color: var(--text);
   font-family: var(--el-font);
@@ -99,34 +94,6 @@ button {
   padding: 0;
   background: transparent;
   color: inherit;
-}
-
-/* Touch truth for shell controls: no 300 ms double-tap delay, no grey tap
-   flash. Drag surfaces (.desktop-shortcut, .taskbar-item) keep their own
-   `touch-action: none` further down and win. */
-button,
-a,
-[role="button"],
-.launcher-card {
-  touch-action: manipulation;
-  -webkit-tap-highlight-color: transparent;
-}
-
-/* Shell chrome only — never capsule frames — so a long-press reaches our
-   menus instead of the browser's link/image callout. */
-.toolbar,
-.taskbar,
-.window-head,
-.launcher {
-  -webkit-touch-callout: none;
-}
-
-/* A held finger opens the app menu (shell-touch.js), so it must not start a
-   text selection on the name first. */
-.taskbar-item,
-.launcher-card {
-  user-select: none;
-  -webkit-user-select: none;
 }
 
 img {
@@ -236,8 +203,7 @@ img {
   justify-content: flex-start;
   gap: 0;
   height: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
-  /* Landscape notches: keep the bar's ends clear of the rounded corners. */
-  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
+  padding: env(safe-area-inset-top, 0px) 12px 0;
   background-color: var(--chrome-fill);
   box-shadow:
     inset 0 -0.5px 0 var(--hairline),
@@ -808,7 +774,6 @@ img {
   gap: 0;
   width: min(300px, calc(100vw - 16px));
   max-height: calc(100vh - var(--stage-top) - var(--stage-bottom) - 24px);
-  max-height: calc(100dvh - var(--stage-top) - var(--stage-bottom) - 24px);
   overflow-x: hidden;
   overflow-y: auto;
   padding: var(--bar-menu-pad);
@@ -2057,11 +2022,6 @@ body[data-home-link="reconnecting"] .notification-center-link {
   display: none;
 }
 
-/* The phone Home screen; the phone layer below shows it. */
-.phone-home {
-  display: none;
-}
-
 .desktop-marquee {
   position: absolute;
   z-index: 40;
@@ -3107,12 +3067,7 @@ body.expose-active .window.expose-card-active {
   position: absolute;
   left: 50%;
   bottom: -26px;
-  /* The card is scaled; the caption reads at its natural size regardless. */
-  transform: translateX(-50%) scale(calc(1 / var(--expose-card-scale, 1)));
-  transform-origin: 50% 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  transform: translateX(-50%);
   max-width: min(220px, 90%);
   padding: 3px 10px;
   border-radius: 8px;
@@ -3126,56 +3081,6 @@ body.expose-active .window.expose-card-active {
   text-overflow: ellipsis;
   pointer-events: none;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
-}
-
-.expose-caption-icon {
-  flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
-  border-radius: 4px;
-}
-
-.expose-caption-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Touch shells: a real Close on each card (the scaled title bar's own Close is
-   no longer a target). Counter-scaled like the caption; 44 px hit box. */
-.expose-close {
-  display: none;
-  position: absolute;
-  top: -10px;
-  left: -10px;
-  z-index: 2;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E") center / 18px 18px no-repeat,
-    color-mix(in srgb, var(--el-surface, #1c1c1e) 92%, transparent);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--hairline);
-  transform: scale(calc(1 / var(--expose-card-scale, 1)));
-  transform-origin: 0 0;
-  cursor: pointer;
-}
-
-:root[data-el-theme="light"] .expose-close {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d2438' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
-}
-
-/* Touch cards let the caption and Close hang outside the scaled window;
-   .window otherwise clips (overflow + contain: paint). */
-body[data-pointer="coarse"].expose-active .window.expose-card {
-  overflow: visible;
-  contain: none;
-}
-
-body[data-pointer="coarse"].expose-active .window.expose-card .expose-close {
-  display: block;
 }
 
 .expose-empty {
@@ -3519,52 +3424,6 @@ body.dock-autohide::after {
   bottom: 0;
   height: 6px;
   z-index: 100099;
-}
-
-/* Phone Dock handle + peek scrim (shell-phone-dock.js). Inert everywhere but
-   the phone size class, which sets --phone-dock-handle-h and the tuck rules. */
-.phone-dock-handle,
-.phone-dock-scrim {
-  display: none;
-  position: fixed;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  font: inherit;
-  cursor: pointer;
-}
-
-.phone-dock-handle {
-  left: 50%;
-  bottom: env(safe-area-inset-bottom, 0px);
-  z-index: 100101;
-  width: 180px;
-  height: var(--phone-dock-handle-h, 24px);
-  place-items: center;
-  transform: translateX(-50%);
-  touch-action: none;
-}
-
-.phone-dock-handle:focus-visible {
-  outline: 2px solid var(--brand-focus);
-  outline-offset: -2px;
-  border-radius: 8px;
-}
-
-/* Reads over any app: light bar, dark keyline. */
-.phone-dock-handle-bar {
-  width: 96px;
-  height: 5px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.78);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
-}
-
-.phone-dock-scrim {
-  inset: 0;
-  z-index: 100099;
-  background: rgba(0, 0, 0, 0.28);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -4541,9 +4400,6 @@ body.dragging-target {
   .launcher,
   .launcher-header,
   .launcher-scroll,
-  .taskbar.is-launcher-face .launcher,
-  .taskbar.is-launcher-face .launcher-header,
-  .taskbar.is-launcher-face .launcher-scroll,
   .taskbar {
     transition: none;
   }
@@ -4721,11 +4577,9 @@ body.dragging-target {
    menubar fade away; the frame is shown at once and the room inside it does
    its own breathe, exactly as it always did. The frame is the capsule,
    launched as the wallet rail launches the wallet. */
-/* The room ends above the soft keyboard, so the Assistant's composer (the
-   bottom of its frame) rises with it; the capsule needs no keyboard code. */
 .assistant-space {
   position: fixed;
-  inset: 0 0 var(--keyboard-inset, 0px);
+  inset: 0;
   z-index: 100085;
   overflow: hidden;
   background: transparent;
@@ -5224,11 +5078,6 @@ body.assistant-space-active #inbox-rail {
 
 .spotlight-item[aria-selected="true"] .spotlight-detail {
   color: rgba(22, 23, 27, 0.72);
-}
-
-/* Sheet grab handles are a phone affordance (shell-sheet-handle.js). */
-.sheet-handle {
-  display: none;
 }
 
 .launcher-empty {
@@ -5863,342 +5712,35 @@ body.assistant-space-active #inbox-rail {
   }
 }
 
-/* Phone size class. Mirrors classifyFormFactor() in shell-form-factor.js
-   (PHONE_MAX_WIDTH / coarse-pointer landscape) so a rotated phone keeps the
-   phone shell instead of becoming a 390 px-tall desktop. */
-@media (max-width: 640px), (pointer: coarse) and (max-height: 640px), (hover: none) and (max-height: 640px) {
-  /* Phone bar: 44 px tall; every control is a 44×44 hit box around the same
-     22 px glyph. Wallet and Overview leave the bar — Control Centre keeps
-     them one tap away (Quick open / Overview) — so brand · inbox · search ·
-     status · clock fit a 390 px bar. The clock never hides. */
-  :root {
-    --toolbar-h: 44px;
-  }
-
+@media (max-width: 640px) {
+  /* Phone shell: bar keeps brand · identity · clock; the focused-window title
+     and identity name yield the space. The clock never hides. */
   .toolbar {
-    padding-right: max(2px, env(safe-area-inset-right, 0px));
+    padding-right: 8px;
   }
 
   .toolbar-btn {
-    width: var(--toolbar-h);
-    height: var(--toolbar-h);
-    margin-left: 0;
-    padding: 11px;
-    border-radius: 10px;
-  }
-
-  .toolbar-brand {
-    width: auto;
-    padding: 11px 0;
-  }
-
-  /* The ≤820 px 90 px wordmark reads undersized on the 44 px phone bar. */
-  .toolbar-brand img {
-    width: 104px;
-  }
-
-  .toolbar-clock {
-    min-height: var(--toolbar-h);
-    margin-left: 0;
-    padding: 0 10px;
-    line-height: var(--toolbar-h);
-  }
-
-  .toolbar-inbox-count {
-    top: 5px;
-    right: 5px;
-    min-width: 16px;
-    height: 16px;
-    font-size: 12px;
+    margin-left: 7px;
   }
 
   .toolbar-active-title,
-  .toolbar-menubar,
-  #toolbar-mission-control,
-  .toolbar-clock-date {
+  .toolbar-menubar {
     display: none;
-  }
-
-  /* Below 360 px the Wallet button would crowd the clock off the bar; Wallet
-     stays one tap away in Control Centre's Quick open. */
-  @media (max-width: 359.98px) {
-    #toolbar-wallet {
-      display: none;
-    }
-  }
-
-  /* The phone bar has room for the dot only; the words stay for screen
-     readers and Notification Centre explains. */
-  .toolbar-link-status-text {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
   }
 
   .control-centre-quick-open {
     display: block;
   }
 
-  .control-centre-section.control-centre-quick-open {
-    display: flex;
+  .launcher-popover {
+    height: min(48vh, 380px);
+    margin-bottom: 0;
   }
 
-  /* Status sheets span the phone with the same margin on both sides; a
-     300–340 px card hung off the right edge left a ragged strip on the left. */
-  .control-centre,
-  .notification-center {
-    left: max(8px, env(safe-area-inset-left, 0px));
-    right: max(8px, env(safe-area-inset-right, 0px));
-    width: auto;
-    transform-origin: top center;
-  }
-
-  /* Control Centre on the phone: 48 px rows with iOS-size switches, 12 px
-     section labels, 44 px appearance segments, and 44 px hit boxes around
-     28 px accent dots in one sliding row (nine do not fit across a phone). */
-  .control-centre-row {
-    min-height: 48px;
-    font-size: 16px;
-  }
-
-  .control-centre-label {
-    padding-top: 10px;
-    font-size: 12px;
-  }
-
-  .control-centre-segment-option {
-    min-height: var(--el-touch-target);
-    font-size: 14px;
-  }
-
-  .control-centre-switch {
-    width: 51px;
-    height: 31px;
-  }
-
-  .control-centre-switch::after {
-    width: 27px;
-    height: 27px;
-  }
-
-  .control-centre-row[aria-checked="true"] .control-centre-switch::after {
-    transform: translateX(20px);
-  }
-
-  .control-centre-accents {
-    flex-wrap: nowrap;
-    gap: 0;
-    padding: 0 calc(0.85rem - 8px);
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .control-centre-accents .control-centre-accent-swatch {
-    flex: 0 0 var(--el-touch-target);
-    width: var(--el-touch-target);
-    height: var(--el-touch-target);
-    border: 8px solid transparent;
-    background-clip: padding-box;
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
-  }
-
-  .control-centre-accents .control-centre-accent-swatch:hover {
-    transform: none;
-  }
-
-  /* A negative offset draws the ring around the dot, not the hit box. */
-  .control-centre-accents .control-centre-accent-swatch[aria-checked="true"] {
-    outline: 2px solid currentColor;
-    outline-offset: -6px;
-  }
-
-  .control-centre-accents .control-centre-accent-swatch:focus-visible {
-    outline: 2px solid var(--el-accent, #4f7fff);
-    outline-offset: -6px;
-  }
-
-  .control-centre-accent-custom-hex input {
-    min-height: var(--el-touch-target);
-    font-size: 16px;
-  }
-
-  /* Notification Centre on the phone: calendar and metadata read at 12 px
-     or more, and Clear history is a 44 px target. */
-  .nc-cal-weekday {
-    font-size: 12px;
-  }
-
-  .nc-cal-day {
-    width: 34px;
-    height: 34px;
-    font-size: 15px;
-  }
-
-  .notification-center-clear {
-    min-height: var(--el-touch-target);
-    padding: 0 12px;
-    font-size: 14px;
-  }
-
-  .notification-center-section,
-  .notification-center-item-time {
-    font-size: 12px;
-  }
-
-  /* Spotlight hangs 8 px under the bar and grows down to the Dock or the
-     soft keyboard (--stage-bottom carries both), so no result sits under it. */
-  .spotlight {
-    padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
-  }
-
-  .spotlight-panel {
-    max-height: 100%;
-  }
-
-  .spotlight-section {
-    font-size: 12px;
-  }
-
-  .spotlight-item {
-    grid-template-columns: 28px minmax(0, 1fr) auto;
-    gap: 12px;
-    min-height: 48px;
-  }
-
-  .spotlight-glyph {
-    width: 28px;
-    height: 28px;
-  }
-
-  .spotlight-title {
-    font-size: 16px;
-  }
-
-  .spotlight-detail {
-    font-size: 13px;
-  }
-
-  /* Grab handles: a 36 × 5 pill. On the bar sheets it sits at the thumb end
-     and is also the 44 px Close button; Control Centre scrolls as a whole, so
-     its handle sticks to the bottom over the rows. */
-  .sheet-handle {
-    display: grid;
-    place-items: center;
-    flex: 0 0 auto;
-    width: 100%;
-    height: var(--el-touch-target);
-    padding: 0;
-    border: 0;
-    border-radius: 12px;
-    background: transparent;
-    color: var(--soft);
-    cursor: grab;
-    touch-action: none;
-  }
-
-  .sheet-handle::before {
-    content: "";
-    width: 36px;
-    height: 5px;
-    border-radius: 3px;
-    background: currentColor;
-    opacity: 0.7;
-  }
-
-  .sheet-handle:focus-visible {
-    outline: 2px solid var(--el-accent, #4f7fff);
-    outline-offset: -4px;
-  }
-
-  .control-centre {
-    padding-bottom: 0;
-  }
-
-  .control-centre .sheet-handle {
-    position: sticky;
-    bottom: 0;
-    background: var(--menu-fill);
-  }
-
-  /* Menus (right-click or long-press) rise as a bottom sheet over a dimmed
-     shell (openDesktopContextMenu sets .context-menu-sheet): full width at
-     the thumb, 48 px rows at 16 px. A tap beside it only dismisses. */
-  .context-menu.context-menu-sheet {
-    left: max(8px, env(safe-area-inset-left, 0px));
-    right: max(8px, env(safe-area-inset-right, 0px));
-    top: auto;
-    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
-    min-width: 0;
-    max-width: none;
-    max-height: calc(100dvh - var(--stage-top) - 16px - env(safe-area-inset-bottom, 0px));
-    padding: 6px;
-    border-radius: 16px;
-    box-shadow: var(--shadow-soft), 0 0 0 100vmax rgba(0, 0, 0, 0.32);
-    transform-origin: bottom center;
-    animation-name: context-menu-sheet-enter;
-  }
-
-  .context-menu-sheet .context-menu-item {
-    min-height: 48px;
-    padding: 0 14px;
-    border-radius: 10px;
-    font-size: 16px;
-  }
-
-  .context-menu-sheet .context-menu-divider {
-    margin: 4px 14px;
-  }
-
-  .context-menu-title {
-    padding: 8px 14px 4px;
-    color: var(--soft);
-    font-size: 13px;
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .context-menu.context-menu-sheet.bar-menu-leaving {
-    animation-name: context-menu-sheet-leave;
-  }
-
-  @keyframes context-menu-sheet-enter {
-    from {
-      opacity: 0;
-      transform: translateY(16px);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
-
-  @keyframes context-menu-sheet-leave {
-    from {
-      opacity: 1;
-      transform: none;
-    }
-    to {
-      opacity: 0;
-      transform: translateY(16px);
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .context-menu.context-menu-sheet,
-    .context-menu.context-menu-sheet.bar-menu-leaving {
-      animation: none;
-    }
-  }
-
-  /* Windows fill the stage between bar and dock — apps read as full-screen.
-     Left/right insets keep capsule content out of landscape notches. */
+  /* Windows fill the stage between bar and dock — apps read as full-screen. */
   .window {
     position: fixed !important;
-    inset: var(--stage-top) env(safe-area-inset-right, 0px) var(--stage-bottom) env(safe-area-inset-left, 0px) !important;
+    inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;
     width: auto !important;
     height: auto !important;
     max-width: none !important;
@@ -6210,515 +5752,17 @@ body.assistant-space-active #inbox-rail {
     display: none;
   }
 
-  /* Phone title bar: one 44 px presentation of .window-head for every chrome
-     mode — leading Close, centred icon + title, trailing Minimise (go home;
-     the capsule keeps running). Fullscreen has no meaning on a phone stage.
-     Unified modes keep the head as an overlay across the capsule's own
-     52 px safe-top; standard and continuous keep it in flow above the body.
-     Chrome modes themselves are untouched (shell-core.js). */
-  :root {
-    --phone-window-head-h: 44px;
-  }
-
-  .window .window-head {
-    position: relative;
-    display: grid;
-    grid-template-columns: var(--phone-window-head-h) minmax(0, 1fr) var(--phone-window-head-h);
-    align-items: center;
-    width: 100%;
-    height: var(--phone-window-head-h);
-    min-height: var(--phone-window-head-h);
-    margin-bottom: 0;
-    padding: 0;
-    border-radius: 0;
-    filter: none;
-    /* The title bar is the swipe-down surface for the switcher. */
-    touch-action: none;
-  }
-
-  /* One opaque fill in every chrome mode: the desktop head and
-     --panel-strong are translucent and show the Home screen through. The
-     !important pair answers the desktop unified-sidebar rules, which are
-     !important. */
-  .window .window-head,
-  .window.window-chrome-unified-sidebar .window-head,
-  .window.window-chrome-unified-toolbar .window-head {
-    background: linear-gradient(var(--panel-strong), var(--panel-strong)) var(--frame-fill) !important;
-    box-shadow: inset 0 -1px 0 var(--hairline) !important;
-  }
-
-  /* Unified modes float the head over the capsule's safe-top on the desktop;
-     on a phone the capsule's main column starts at the very top, so the head
-     goes in flow here too. */
-  .window.window-chrome-unified-sidebar .window-head,
-  .window.window-chrome-unified-toolbar .window-head {
-    position: relative;
-    width: 100%;
-    height: var(--phone-window-head-h);
-    min-height: var(--phone-window-head-h);
-    padding: 0;
-    align-items: center;
-    border-radius: 0;
-  }
-
-  .window .window-body,
-  .window.window-chrome-unified-sidebar .window-body {
-    height: calc(100% - var(--phone-window-head-h)) !important;
-  }
-
-  .window .window-traffic-lights {
-    display: contents;
-  }
-
-  .window .window-action-btn {
-    grid-row: 1;
-    width: var(--phone-window-head-h);
-    height: var(--phone-window-head-h);
-    border: 0;
-    border-radius: 10px;
-    background-color: transparent;
-  }
-
-  .window .window-action-btn[data-action="close"] {
-    grid-column: 1;
-  }
-
-  .window .window-action-btn[data-action="minimize"] {
-    grid-column: 3;
-  }
-
-  .window .window-action-btn[data-action="maximize"],
-  .window .window-head-balance {
-    display: none;
-  }
-
-  .window .window-action-btn img {
-    width: 18px;
-    height: 18px;
-    opacity: 0.9;
-  }
-
-  /* The control glyphs are black strokes drawn for coloured discs. */
-  :root:not([data-el-theme="light"]) .window .window-action-btn img {
-    filter: invert(1);
-  }
-
-  /* Minimise means "go home" here: a chevron reads as dismiss where the
-     desktop's dash reads as nothing at all. */
-  .window .window-action-btn[data-action="minimize"] img {
-    display: none;
-  }
-
-  .window .window-action-btn[data-action="minimize"] {
-    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / 20px 20px no-repeat;
-    opacity: 0.9;
-  }
-
-  :root[data-el-theme="light"] .window .window-action-btn[data-action="minimize"] {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d2438' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-  }
-
-  .window .window-head-draggable,
-  .window.window-chrome-unified-sidebar .window-head-draggable,
-  .window.window-chrome-unified-toolbar .window-head-draggable {
-    grid-column: 2;
-    grid-row: 1;
-    min-height: 0;
-    justify-content: center;
-    align-self: center;
-  }
-
-  .window .window-head-icon,
-  .window .window-head-title,
-  .window.window-chrome-unified-sidebar .window-head-icon,
-  .window.window-chrome-unified-sidebar .window-head-title,
-  .window.window-chrome-unified-toolbar .window-head-icon,
-  .window.window-chrome-unified-toolbar .window-head-title {
-    display: block;
-  }
-
-  .window .window-head-icon {
-    width: 20px;
-    height: 20px;
-    margin: 0;
-    border-radius: 6px;
-  }
-
-  .window .window-head-title {
-    margin-left: 8px;
-    font-size: 16px;
-    font-weight: 600;
-  }
-
-  /* The title bar is on screen the instant the window opens; this hairline
-     under it says the capsule is still booting, and goes with the skeleton
-     the moment the frame is ready. */
-  .window .window-head::after {
-    content: "";
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 2px;
-    background: linear-gradient(90deg, transparent, var(--el-accent, #4f7fff), transparent) 0 0 / 40% 100% no-repeat;
-    animation: phone-window-progress 1.2s ease-in-out infinite;
-    pointer-events: none;
-  }
-
-  .window:has(.window-frame.is-ready) .window-head::after,
-  .window:not(:has(.window-body-frame)) .window-head::after {
-    display: none;
-  }
-
-  @keyframes phone-window-progress {
-    from {
-      background-position: -40% 0;
-    }
-    to {
-      background-position: 140% 0;
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .window .window-head::after {
-      animation: none;
-      background-size: 100% 100%;
-      opacity: 0.6;
-    }
-  }
-
-  /* Open: the window rises from the Dock (compositor-only, 200 ms). */
-  .window.window-enter {
-    transform-origin: 50% 100%;
-    animation: phone-window-enter 200ms cubic-bezier(0.2, 0, 0, 1);
-  }
-
-  @keyframes phone-window-enter {
-    from {
-      opacity: 0;
-      transform: scale(0.88) translateY(32px);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .window.window-enter {
-      animation: none;
-    }
-  }
-
-  /* Home screen (shell-phone-home.js): the app grid is the resting screen.
-     Desktop files and the first-run hint stand down (Library has the Desktop
-     and the Bin), the Apps button goes (the grid is the apps), and the Dock
-     keeps only its phone slots: no Bin, no running apps (the switcher has
-     them). */
-  .desktop-shortcuts,
-  .desktop-first-run-hint,
-  .taskbar-item-launcher,
-  .taskbar-sortable > .taskbar-separator,
-  .taskbar-entry[data-phone-dock="off"] {
-    display: none;
-  }
-
-  /* Page geometry, read by shell-phone-home-pager.js to size a page: a tile
-     is the 60 px icon, a 6 px gap and two 15 px lines of name. */
-  .phone-home {
-    position: fixed;
-    top: var(--stage-top);
-    right: 0;
-    bottom: var(--stage-bottom);
-    left: 0;
-    z-index: 1;
-    display: flex;
-    flex-direction: column;
-    --phone-home-cols: 4;
-    --phone-home-tile-h: 96px;
-    --phone-home-row-gap: 20px;
-    --phone-home-pad-top: 20px;
-    --phone-home-pad-bottom: 8px;
-  }
-
-  /* Sideways the columns are wide enough for names on one line, which buys
-     a second row. */
-  @media (orientation: landscape) {
-    .phone-home {
-      --phone-home-cols: 6;
-      --phone-home-tile-h: 81px;
-      --phone-home-row-gap: 10px;
-      --phone-home-pad-top: 8px;
-      --phone-home-pad-bottom: 0px;
-    }
-
-    .phone-home-app .phone-home-title {
-      -webkit-line-clamp: 1;
-    }
-  }
-
-  /* Pages turn one per swipe under the thumb (native scroll snap). */
-  .phone-home-pages {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: flex;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scroll-snap-type: x mandatory;
-    overscroll-behavior-x: contain;
-    scrollbar-width: none;
-  }
-
-  .phone-home-pages::-webkit-scrollbar {
-    display: none;
-  }
-
-  .phone-home-page {
-    position: relative;
-    flex: 0 0 100%;
-    min-width: 0;
-    display: grid;
-    grid-template-columns: repeat(var(--phone-home-cols), minmax(0, 1fr));
-    grid-auto-rows: var(--phone-home-tile-h);
-    align-content: start;
-    gap: var(--phone-home-row-gap) 4px;
-    padding: var(--phone-home-pad-top) max(12px, env(safe-area-inset-right, 0px)) var(--phone-home-pad-bottom) max(12px, env(safe-area-inset-left, 0px));
-    overflow: hidden;
-    scroll-snap-align: start;
-    scroll-snap-stop: always;
-  }
-
-  /* Page dots: an adjustable control (tap a dot, or arrow keys) over a
-     44 px row that stays reserved on one page so the grid never jumps. */
-  .phone-home-dots {
-    flex: 0 0 auto;
-    align-self: center;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 9px;
-    min-width: 44px;
-    height: 44px;
-    padding: 0 14px;
-    border-radius: 22px;
-  }
-
-  .phone-home-dots[data-single="true"] {
-    visibility: hidden;
-  }
-
-  .phone-home-dots:focus-visible {
-    outline: 2px solid var(--el-accent, #4f7fff);
-    outline-offset: -4px;
-  }
-
-  .phone-home-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.4);
-    transition: background-color 0.2s ease;
-  }
-
-  .phone-home-dot.is-current {
-    background: #fff;
-  }
-
-  /* The Assistant page, left of page 1: settling on it opens the Assistant. */
-  .phone-home-assistant-page {
-    display: grid;
-    grid-template-columns: 1fr;
-    place-items: center;
-  }
-
-  .phone-home-assistant-open {
-    display: grid;
-    justify-items: center;
-    gap: 10px;
-    min-width: 200px;
-    padding: 24px;
-    border: 0;
-    border-radius: 24px;
-    background: rgba(0, 0, 0, 0.28);
-    color: #fff;
-    -webkit-backdrop-filter: blur(18px);
-    backdrop-filter: blur(18px);
-  }
-
-  .phone-home-assistant-icon {
-    width: 72px;
-    height: 72px;
-  }
-
-  .phone-home-assistant-title {
-    font-size: 20px;
-    font-weight: 600;
-  }
-
-  .phone-home-assistant-hint {
-    font-size: 14px;
-    opacity: 0.8;
-  }
-
-  .phone-home-app {
-    display: grid;
-    grid-template-rows: 60px auto;
-    justify-items: center;
-    align-content: start;
-    gap: 6px;
-    min-width: 0;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: #fff;
-    transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
-    -webkit-touch-callout: none;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-
-  /* Edit mode (shell-phone-home-edit.js): the bar gives way to Done, icons
-     jiggle, and a touch on an icon moves it instead of the page. */
-  .phone-home-editbar {
-    display: none;
-  }
-
-  body.phone-home-editing .phone-home-editbar {
-    position: fixed;
-    top: 0;
-    right: 0;
-    left: 0;
-    z-index: 100050;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    height: var(--stage-top);
-    padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
-  }
-
-  body.phone-home-editing header.toolbar {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .phone-home-done {
-    min-width: 72px;
-    height: 44px;
-    padding: 0 18px;
-    border: 0;
-    border-radius: 22px;
-    background: rgba(255, 255, 255, 0.24);
-    color: #fff;
-    font-size: 16px;
-    font-weight: 600;
-    -webkit-backdrop-filter: blur(18px);
-    backdrop-filter: blur(18px);
-  }
-
-  body.phone-home-editing .phone-home-app,
-  body.phone-home-editing .taskbar-entry[data-phone-dock="slot"] > .taskbar-item {
-    touch-action: none;
-  }
-
-  body.phone-home-editing .phone-home-icon,
-  body.phone-home-editing .taskbar-entry[data-phone-dock="slot"] .taskbar-item-icon {
-    animation: phone-home-jiggle 0.3s ease-in-out infinite alternate;
-  }
-
-  body.phone-home-editing .phone-home-app:nth-child(odd) .phone-home-icon,
-  body.phone-home-editing .taskbar-entry[data-phone-dock="slot"]:nth-child(odd) .taskbar-item-icon {
-    animation-delay: -0.15s;
-  }
-
-  @keyframes phone-home-jiggle {
-    from {
-      transform: rotate(-1.6deg);
-    }
-    to {
-      transform: rotate(1.6deg);
-    }
-  }
-
-  .phone-home-app.is-lifted,
-  .taskbar-entry.is-lifted {
-    display: none;
-  }
-
-  .phone-home-spacer {
-    height: var(--phone-home-tile-h);
-  }
-
-  .phone-home-ghost {
-    position: fixed;
-    top: 0;
-    left: 0;
-    z-index: 100100;
-    pointer-events: none;
-    filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.35));
-    scale: 1.12;
-  }
-
-  .phone-home-ghost > * {
-    width: 100%;
-    height: 100%;
-    animation: none;
-    transform: none;
-  }
-
-  .taskbar.phone-home-drop {
-    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.55), var(--taskbar-shadow, 0 8px 24px rgba(0, 0, 0, 0.25));
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    body.phone-home-editing .phone-home-icon,
-    body.phone-home-editing .taskbar-entry[data-phone-dock="slot"] .taskbar-item-icon {
-      animation: none;
-    }
-
-    .phone-home-app {
-      transition: none;
-    }
-  }
-
-  .phone-home-icon {
-    width: 60px;
-    height: 60px;
-    border-radius: 14px;
-  }
-
-  .phone-home-app:focus-visible {
-    outline: none;
-  }
-
-  .phone-home-app:focus-visible .phone-home-icon {
-    outline: 2px solid var(--el-accent, #4f7fff);
-    outline-offset: 3px;
-  }
-
-  /* Names wrap to two lines over the wallpaper, white in both themes as the
-     desktop's icon labels are. */
-  .phone-home-title {
-    width: 100%;
-    display: -webkit-box;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    font-size: 12px;
-    font-weight: 500;
-    line-height: 1.25;
-    text-align: center;
-    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
-    overflow-wrap: anywhere;
-  }
-
   /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
      magnification code also gates itself off below 641px / non-hover). */
   .taskbar {
-    /* Landscape notch: the pill stays clear of the rounded corners on the
-       side that carries the sensor housing. */
-    max-width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+    max-width: calc(100vw - 20px);
     padding-left: 8px;
     padding-right: 8px;
+  }
+
+  .taskbar.is-launcher-face {
+    width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
   }
 
   .taskbar.is-assistant-face {
@@ -6726,103 +5770,22 @@ body.assistant-space-active #inbox-rail {
     max-width: calc(100vw - 20px);
   }
 
-  /* The pinned row scrolls with the thumb: icons snap to slots, and the pill
-     fades its edges only where more icons are hiding (scroll-driven). */
+  .taskbar-inner {
+    gap: 8px;
+  }
+
   .taskbar-sortable {
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
-    scroll-snap-type: x proximity;
-    scroll-padding-inline: 2px;
-    -webkit-overflow-scrolling: touch;
-    mask-image: linear-gradient(
-      to right,
-      transparent,
-      #000 var(--dock-fade-start, 0px),
-      #000 calc(100% - var(--dock-fade-end, 0px)),
-      transparent
-    );
   }
 
   .taskbar-sortable::-webkit-scrollbar {
     display: none;
   }
 
-  .taskbar-item,
-  .taskbar-entry {
-    scroll-snap-align: center;
-  }
-
-  /* The Assistant keeps a full tile; only the app row gives way when the
-     pill reaches its width limit. */
-  .taskbar-item-assistant {
-    flex-shrink: 0;
-  }
-
-  .taskbar-sortable {
-    min-width: 0;
-  }
-
-  /* The Assistant's plate-free .assistant-mark fills 58.6% of its square;
-     app plates fill 87.9% of theirs (measured from the 256 px PNGs). 1.5×
-     would match the plates' height exactly, which reads too heavy beside them
-     on a phone; 1.15× keeps the mark visibly lighter than the plates. A plate
-     raster in the Assistant slot already fills its square and takes no scale.
-     The Assistant scales its icon node so the mark's own layer animation is
-     untouched. */
-  :root {
-    --phone-dock-glyph-scale: 1.15;
-  }
-
-  /* The Assistant morph reads slightly rushed at desktop's 950 ms when the
-     pill grows into a phone-height face. */
-  :root {
-    --shelf-face-ms: 1100ms;
-  }
-
-  .taskbar-item-assistant .taskbar-item-icon.assistant-mark {
-    transform: scale(var(--phone-dock-glyph-scale));
-  }
-
-  /* Running indicator grows to a legible 4 px pill under the 58 px tile. */
-  .active-taskbar-indicator {
-    width: 14px;
-    height: 4px;
-  }
-
-  /* The thumb scrolls the row; reordering waits for long-press (M5). */
-  .taskbar-item {
-    touch-action: pan-x;
-  }
-
-  /* Dock under an open window (shell-phone-dock.js): the app takes the stage
-     down to a 24 px handle above the home indicator. Tap or swipe the handle
-     to peek the Dock over the app; tap the app (scrim) or Escape tucks it
-     again. Mission Control and keyboard focus always show the Dock. */
-  :root {
-    --phone-dock-handle-h: 24px;
-  }
-
-  body.phone-dock-tucked {
-    --stage-bottom: calc(var(--phone-dock-handle-h) + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
-  }
-
-  body.phone-dock-tucked:not(.phone-dock-peek):not(.expose-active) .taskbar:not(:focus-within) {
-    transform: translateY(calc(100% + var(--taskbar-offset) + 8px + env(safe-area-inset-bottom, 0px)));
-    pointer-events: none;
-  }
-
-  /* A peek wins over the desktop auto-hide preference too. */
-  body.phone-dock-peek .taskbar {
-    transform: translateY(0);
-  }
-
-  body.phone-dock-tucked:not(.phone-dock-peek) .phone-dock-handle:not([hidden]) {
-    display: grid;
-  }
-
-  body.phone-dock-peek .phone-dock-scrim {
-    display: block;
+  .taskbar.is-launcher-face .launcher {
+    max-height: min(48vh, 380px);
   }
 
   .dock-tooltip {

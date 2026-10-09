@@ -24,7 +24,6 @@ import { showSpotlight } from "./shell-spotlight.js?v=home-20260813a";
 import { openTarget } from "./shell-windows.js?v=home-20260813a";
 import { openExpose } from "./shell-expose.js?v=home-20260813a";
 import { summaryDisplayName } from "./shell-chrome.js?v=home-20260813a";
-import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20260813a";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus
@@ -102,12 +101,6 @@ export function bindControlCentre() {
   }
 
   buildAccentRow();
-  bindSheetHandle(document.querySelector("#control-centre-handle"), {
-    sheet: panel,
-    direction: SHEET_DRAG_UP,
-    close: () => hideControlCentre(),
-    tapCloses: true,
-  });
 
   button.addEventListener("click", () => {
     toggleControlCentre();

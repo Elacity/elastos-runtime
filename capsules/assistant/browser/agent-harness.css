@@ -2856,15 +2856,6 @@ html[data-agent-reasoning="off"] .agent-thinking {
   }
 }
 
-/* Phone: the composer keeps Home's Dock gutter, so the Dock → composer morph
-   holds its width end to end. */
-@media (max-width: 640px) {
-  .taskbar.is-agent-face {
-    width: min(720px, calc(100vw - 20px));
-    max-width: calc(100vw - 20px);
-  }
-}
-
 /* Composer toolbar — one shared 32px control box on every viewport.
    (Was mobile-only; desktop showed mixed 28/30px heights = "raised" chips.) */
 .taskbar.is-agent-face .agent-composer-toolbar {
@@ -3760,74 +3751,4 @@ html[data-agent-reasoning="off"] .agent-thinking {
   .agent-home-drop-canvas {
     display: none !important;
   }
-}
-
-/* Phone stage (data-el-form-factor from the shell): every control is a 44 px
-   target. Composer chips grow by a transparent border outside the painted
-   chip, so the row keeps its 32 px look; the gaps inside each group go so the
-   row still fits a 390 px phone. */
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-toolbar {
-  min-height: var(--el-touch-target);
-}
-
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-tools-left,
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-tools-right {
-  height: var(--el-touch-target);
-  gap: 0;
-}
-
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {
-  height: var(--el-touch-target);
-  min-height: var(--el-touch-target);
-  max-height: var(--el-touch-target);
-  border: solid transparent;
-  border-width: 6px 0;
-  background-clip: padding-box;
-}
-
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-tool-btn, .agent-mic-btn, .agent-send-btn) {
-  width: var(--el-touch-target);
-  flex: 0 0 var(--el-touch-target);
-  height: var(--el-touch-target);
-  min-height: var(--el-touch-target);
-  max-height: var(--el-touch-target);
-  border: 6px solid transparent;
-  background-clip: padding-box;
-}
-
-:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-input {
-  min-height: var(--el-touch-target);
-  padding-block: 11px;
-}
-
-:root[data-el-form-factor="phone"] :is(.agent-harness-icon-btn, .agent-harness-drawer-toggle, .agent-projects-add) {
-  width: var(--el-touch-target);
-  height: var(--el-touch-target);
-}
-
-:root[data-el-form-factor="phone"] :is(.agent-harness-new-chat, .agent-harness-home, .agent-harness-nav-row) {
-  min-height: var(--el-touch-target);
-}
-
-:root[data-el-form-factor="phone"] .agent-harness-page-close {
-  width: var(--el-touch-target);
-  height: var(--el-touch-target);
-  border: 7px solid transparent;
-  background-clip: padding-box;
-}
-
-:root[data-el-form-factor="phone"] :is(.agent-configure-chip, .agent-prompt-reset) {
-  min-height: var(--el-touch-target);
-  border: solid transparent;
-  border-width: 8px 0;
-  background-clip: padding-box;
-}
-
-:root[data-el-form-factor="phone"] :is(.agent-prompt-check, .agent-prompt-param input) {
-  min-height: var(--el-touch-target);
-}
-
-/* Under 16px, iOS zooms the page when a field takes focus. */
-:root[data-el-form-factor="phone"] :is(.agent-prompt-textarea, .agent-prompt-param input) {
-  font-size: 16px;
 }

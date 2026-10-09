@@ -9,7 +9,6 @@ import {
   makeSystemSummary,
   startSystemFixtureServer,
 } from "./system-uiux-fixture.mjs";
-import { assertPhoneDrawer } from "./lib/phone-drawer-assert.mjs";
 
 function appearanceRecord() {
   return makeAppearanceRecord({
@@ -326,56 +325,6 @@ async function assertScenario(page, width, height, screenshotPath) {
   await frame.locator("body").screenshot({ path: screenshotPath });
 }
 
-// Phone stage: the menu button sits on the leading edge, on the same line as
-// the page title, as a 44 px target.
-async function assertPhoneTitleRow(page, screenshotPath) {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto(page.url(), { waitUntil: "networkidle" });
-  const frame = await waitForSystemFrame(page);
-  await frame.evaluate(() => document.documentElement.setAttribute("data-el-form-factor", "phone"));
-  const row = await frame.evaluate(() => {
-    const box = (selector) => document.querySelector(selector).getBoundingClientRect();
-    const toggle = box(".sidebar-toggle");
-    const title = box("#accounts-title");
-    return {
-      toggleLeft: Math.round(toggle.left),
-      toggleWidth: Math.round(toggle.width),
-      toggleHeight: Math.round(toggle.height),
-      toggleCenter: Math.round(toggle.top + toggle.height / 2),
-      titleCenter: Math.round(title.top + title.height / 2),
-      titleLeft: Math.round(title.left),
-      toggleRight: Math.round(toggle.right),
-      sharedIcon: getComputedStyle(document.querySelector(".sidebar-toggle"), "::before").maskImage !== "none",
-      hamburgerHidden: getComputedStyle(document.querySelector(".sidebar-toggle-button")).display === "none",
-    };
-  });
-  await frame.locator("body").screenshot({ path: screenshotPath });
-  assert(
-    row.toggleLeft <= 8 && row.toggleWidth >= 44 && row.toggleHeight >= 44,
-    "System phone menu button must be a 44 px target on the leading edge",
-    row,
-  );
-  assert(
-    Math.abs(row.toggleCenter - row.titleCenter) <= 2 && row.titleLeft >= row.toggleRight - 6,
-    "System phone menu button must share the page title's line",
-    row,
-  );
-  assert(
-    row.sharedIcon && row.hamburgerHidden,
-    "System phone menu button must draw the shared drawer icon, as the other capsules do",
-    row,
-  );
-  await assertPhoneDrawer(page, frame, {
-    label: "System",
-    drawer: "#system-sidebar",
-    room: ".settings-content-container",
-    closeTarget: '.settings-sidebar-item[data-settings="personalization"]',
-    screenshot: "/tmp/system-uiux-phone-drawer-390x844.png",
-  });
-  const activeTab = await frame.evaluate(() => document.querySelector(".settings-content.active")?.dataset.settings);
-  assert(activeTab === "personalization", "System phone: picking a section in the drawer must open it", { activeTab });
-}
-
 async function main() {
   const server = await startServer();
   const pageErrors = [];
@@ -409,10 +358,8 @@ async function main() {
     await page.goto(`${server.baseUrl}/fixture`, { waitUntil: "networkidle" });
     const desktopScreenshot = "/tmp/system-uiux-desktop-1280x900.png";
     const narrowScreenshot = "/tmp/system-uiux-narrow-640x900.png";
-    const phoneScreenshot = "/tmp/system-uiux-phone-390x844.png";
     await assertScenario(page, 1280, 900, desktopScreenshot);
     await assertScenario(page, 640, 900, narrowScreenshot);
-    await assertPhoneTitleRow(page, phoneScreenshot);
 
     assert(
       server.requestFailures.length === 0,
@@ -437,7 +384,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          screenshots: [desktopScreenshot, narrowScreenshot, phoneScreenshot],
+          screenshots: [desktopScreenshot, narrowScreenshot],
         },
         null,
         2,

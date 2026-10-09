@@ -16,7 +16,6 @@ import {
   dismissWithMotion,
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
-import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20260813a";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything
@@ -37,7 +36,6 @@ import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-2
 let spotlight = null;
 let spotlightInput = null;
 let spotlightResults = null;
-let spotlightButton = null;
 
 const DOCUMENTS_CACHE_MS = 60_000;
 
@@ -220,19 +218,9 @@ function renderResults() {
     detail.className = "spotlight-detail";
     detail.textContent = item.detail;
     row.append(glyph, title, detail);
-    let pressedBy = "";
     row.addEventListener("pointerdown", (event) => {
       event.preventDefault();
-      pressedBy = event.pointerType;
-      // A finger landing on a row may be starting a scroll; touch opens on click.
-      if (pressedBy !== "touch") {
-        activateResult(index);
-      }
-    });
-    row.addEventListener("click", () => {
-      if (pressedBy === "touch") {
-        activateResult(index);
-      }
+      activateResult(index);
     });
     row.addEventListener("pointerenter", () => {
       setSelection(index);
@@ -317,7 +305,6 @@ export function showSpotlight() {
   spotlight.hidden = false;
   spotlight.inert = false;
   spotlight.setAttribute("aria-hidden", "false");
-  spotlightButton?.setAttribute("aria-expanded", "true");
   spotlightInput.value = "";
   runSearch("");
   spotlightInput.focus();
@@ -328,7 +315,6 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
   if (!spotlight || spotlight.hidden) {
     return;
   }
-  spotlightButton?.setAttribute("aria-expanded", "false");
   const panel = spotlight.querySelector(".spotlight-panel");
   const finish = () => {
     spotlight.hidden = true;
@@ -375,18 +361,11 @@ export function bindSpotlight() {
   spotlight = document.querySelector("#spotlight");
   spotlightInput = document.querySelector("#spotlight-input");
   spotlightResults = document.querySelector("#spotlight-results");
-  spotlightButton = document.querySelector("#toolbar-spotlight");
   if (!spotlight || !spotlightInput) {
     return;
   }
   spotlightInput.addEventListener("input", () => {
     runSearch(spotlightInput.value);
-  });
-  bindSheetHandle(document.querySelector("#spotlight-handle"), {
-    sheet: spotlight.querySelector(".spotlight-panel"),
-    direction: SHEET_DRAG_UP,
-    close: () => hideSpotlight(),
-    tapCloses: true,
   });
   spotlight.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
