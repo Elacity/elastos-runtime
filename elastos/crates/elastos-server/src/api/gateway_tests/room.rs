@@ -741,7 +741,11 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
     );
     let summary: serde_json::Value = serde_json::from_slice(&summary_body).unwrap();
     assert_eq!(summary["transport"]["configured"], true);
-    assert_eq!(summary["transport"]["available"], true);
+    assert_eq!(summary["transport"]["available"], false);
+    assert_eq!(
+        summary["transport"]["status"],
+        "Community is unreachable. Retained messages stay available."
+    );
     assert!(summary["transport"].get("connected_peer_count").is_none());
     assert!(summary["transport"].get("topic").is_none());
     assert_eq!(summary["browser_access_allowed"], false);
@@ -886,6 +890,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
     assert_eq!(conflicting.status(), StatusCode::BAD_REQUEST);
     assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
 
+    port.set_community_connected(true);
     let poll = app
         .clone()
         .oneshot(

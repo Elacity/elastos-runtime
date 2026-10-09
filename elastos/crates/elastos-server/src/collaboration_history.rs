@@ -771,6 +771,7 @@ mod tests {
     async fn unavailable_history_keeps_live_transport_available_and_rotates_past_four_peers() {
         let now = now_secs();
         let a = fixture("history-fair", "community", now).await;
+        a.product.set_community_connected(true);
         a.service.fetch_once(now).await.unwrap();
         assert!(a.product.conversation_transport_view().available);
         assert_eq!(
@@ -833,6 +834,7 @@ mod tests {
     async fn stalled_history_has_a_per_peer_deadline() {
         let now = now_secs();
         let a = fixture("history-stalled", "community", now).await;
+        a.product.set_community_connected(true);
         let b = fixture("history-stalled", "community", now).await;
         observe(&a, &b, now);
         let plane = Arc::new(Plane {

@@ -476,6 +476,13 @@ async fn run_collaboration_worker(
                 if driver.process_incoming_once(now_secs()).await.is_err() {
                     tracing::warn!("collaboration incoming cycle failed");
                 }
+                let connected =
+                    tokio::time::timeout(COLLABORATION_LIVE_CADENCE, driver.has_remote_peers())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                product_port.set_community_connected(connected);
             }
         ),
         run_community_periodic(
@@ -1059,7 +1066,8 @@ mod tests {
             let reply = {
                 let mut replies = self.replies.lock().unwrap();
                 let next = replies.iter().position(|(operation, _)| {
-                    operation.is_none() || *operation == request["op"].as_str()
+                    *operation == request["op"].as_str()
+                        || (operation.is_none() && request["op"] != "list_topic_peers")
                 });
                 next.and_then(|index| replies.remove(index))
                     .map(|(_, reply)| reply)
@@ -1080,6 +1088,9 @@ mod tests {
                         .push(request["op"].as_str().unwrap().to_string());
                     std::future::pending().await
                 }
+                None if request["op"] == "list_topic_peers" => Ok(serde_json::json!({
+                    "status": "ok", "data": {"topic": request["topic"], "peers": []},
+                })),
                 None => Err(ProviderError::Provider(
                     "fake Carrier has no queued response".to_string(),
                 )),
@@ -1228,17 +1239,19 @@ mod tests {
         }))
     }
 
+    // Delivery assertions exclude the read-only connection status queries.
     fn request_ops(carrier: &FakeCarrier) -> Vec<String> {
         carrier
             .requests()
             .iter()
+            .filter(|request| request["op"] != "list_topic_peers")
             .map(|request| request["op"].as_str().unwrap().to_string())
             .collect()
     }
 
     async fn wait_for_requests(carrier: &FakeCarrier, count: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while carrier.requests().len() < count {
+            while request_ops(carrier).len() < count {
                 tokio::task::yield_now().await;
             }
         })
@@ -2083,7 +2096,11 @@ mod tests {
         .unwrap();
         wait_for_requests(&carrier, 3).await;
         service.shutdown().await.unwrap();
-        let requests = carrier.requests();
+        let requests = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] != "list_topic_peers")
+            .collect::<Vec<_>>();
         assert_eq!(
             request_ops(&carrier),
             ["gossip_join_exact", "gossip_peek", "gossip_ack"]
@@ -2092,7 +2109,7 @@ mod tests {
             requests[1]["consumer_id"], requests[2]["consumer_id"],
             "one worker must retain one joined Carrier consumer"
         );
-        let stopped_count = requests.len();
+        let stopped_count = carrier.requests().len();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(carrier.requests().len(), stopped_count);
         assert!(!temp.path().join("identity").exists());
@@ -2121,6 +2138,96 @@ mod tests {
             request_ops(&restart_carrier),
             ["gossip_join_exact", "gossip_peek", "gossip_ack"]
         );
+    }
+
+    #[tokio::test]
+    async fn community_connection_status_refreshes_with_the_incoming_cycle() {
+        let (temp, _) = configured_root(true);
+        let configuration =
+            load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
+        let (device_key, _) = generate_keypair();
+        let carrier = FakeCarrier::new([FakeReply::JoinEcho]);
+        let mut service = start_collaboration_runtime_service(
+            temp.path(),
+            device_key,
+            configuration,
+            Some(carrier.clone()),
+            Arc::new(ProviderRegistry::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let product = service.chat_product_port();
+        assert!(!product.conversation_transport_view().available);
+        let peer_reply = FakeReply::Value(serde_json::json!({
+            "status": "ok", "data": {
+                "topic": carrier.requests()[0]["topic"], "peers": ["11".repeat(32)],
+            },
+        }));
+        for (reply, available) in [(peer_reply, true), (FakeReply::Error("offline"), false)] {
+            carrier.push_for("list_topic_peers", [reply]);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while product.conversation_transport_view().available != available {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_connection_status_allows_the_next_incoming_cycle() {
+        let (temp, _) = configured_root(true);
+        let configuration =
+            load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
+        let (device_key, _) = generate_keypair();
+        let carrier = FakeCarrier::new([]);
+        carrier.push_for("gossip_join_exact", [FakeReply::JoinEcho]);
+        carrier.push_for(
+            "gossip_peek",
+            [peek(0, 0, Vec::new()), peek(0, 0, Vec::new())],
+        );
+        carrier.push_for("gossip_ack", [ack(0, 0, false), ack(0, 0, false)]);
+        carrier.push_for("list_topic_peers", [FakeReply::Pending, FakeReply::Pending]);
+        let mut service = start_collaboration_runtime_service(
+            temp.path(),
+            device_key,
+            configuration,
+            Some(carrier.clone()),
+            Arc::new(ProviderRegistry::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let progressed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let acknowledgements = carrier
+                    .requests()
+                    .iter()
+                    .filter(|request| request["op"] == "gossip_ack")
+                    .count();
+                let status_stalled = carrier
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|operation| operation == "list_topic_peers");
+                if acknowledgements >= 2 && status_stalled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let available = service
+            .chat_product_port()
+            .conversation_transport_view()
+            .available;
+        service.shutdown().await.unwrap();
+        progressed.unwrap();
+        assert!(!available);
     }
 
     struct StalledHistoryInvoker {

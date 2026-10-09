@@ -421,11 +421,10 @@ Scope:
   - device signature proves the sending endpoint;
   - the retained signed Profile document proves that device is currently
     authorized for the participant Profile DID.
-- The selected Carrier session already provides encrypted peer confidentiality:
-  the current `PeerDid` path uses Iroh QUIC/TLS, relays forward encrypted bytes
-  only, and Runtime binds delivery to the accepted Profile's current authorized
-  endpoint before admitting the message. The seed/bootstrap path receives no
-  direct-message plaintext and no direct-message authority.
+- Carrier connects the two Homes directly over encrypted Iroh QUIC/TLS.
+  Runtime binds delivery to the accepted Profile's current authorized endpoint
+  before admitting the message. The sender and recipient own Direct plaintext
+  and authority; the Community bootstrap node supplies network discovery.
 - Plaintext direct-message content exists only in the sender's and recipient's
   protected principal-root direct-message store under
   `.AppData/ElastOS/Chat/direct-messages.json`.

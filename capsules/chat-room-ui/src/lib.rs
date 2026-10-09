@@ -171,6 +171,7 @@ struct App {
     session_storage: Option<Storage>,
     status_badge: Option<HtmlElement>,
     status_detail: Option<HtmlElement>,
+    community_status: HtmlElement,
     error_text: HtmlElement,
     reconnect_button: HtmlButtonElement,
     gateway_ui: Option<GatewayUi>,
@@ -593,6 +594,7 @@ pub fn start() -> Result<(), JsValue> {
         session_storage,
         status_badge: optional_element_by_id(&document, "status-badge"),
         status_detail: optional_element_by_id(&document, "status-detail"),
+        community_status: element_by_id(&document, "community-status")?,
         error_text: element_by_id(&document, "error-text")?,
         reconnect_button: button_by_id(&document, "reconnect-button")?,
         gateway_ui,
@@ -3503,6 +3505,7 @@ impl App {
         let projection = render_projection(&state, self.is_shell_mode());
         let session_active = projection.session_active;
         let direct_mode = projection.direct_mode;
+        set_hidden(&self.community_status, !projection.community_unreachable)?;
         let direct_send_enabled = direct_mode
             && state
                 .direct
@@ -4857,6 +4860,8 @@ fn apply_active_poll_state(
     state.display_name = poll.display_name.clone();
     state.status_badge = if state.community_left {
         "Left Community"
+    } else if poll.transport.configured && !poll.transport.available {
+        "Community unreachable"
     } else {
         "Live"
     }
@@ -4944,6 +4949,7 @@ fn apply_direct_refresh_if_current(
 struct RenderProjection {
     session_active: bool,
     direct_mode: bool,
+    community_unreachable: bool,
     participant_count: String,
 }
 
@@ -4953,6 +4959,10 @@ fn render_projection(state: &AppState, shell_mode: bool) -> RenderProjection {
     RenderProjection {
         session_active: state.session_active,
         direct_mode,
+        community_unreachable: state.session_active
+            && state.collaboration_configured
+            && !state.community_left
+            && state.status_badge == "Community unreachable",
         participant_count: if loading_room {
             "Opening conversation".to_string()
         } else {
@@ -5403,6 +5413,54 @@ mod tests {
             assert!(state.session_active);
             assert!(!state.reconnect_needed);
             assert_eq!(state.status_badge, "Live");
+        }
+    }
+
+    #[test]
+    fn community_unreachable_keeps_session_drafts_and_direct_selection() {
+        let mut state = two_direct_conversations();
+        state.session_active = true;
+        state.drafts.insert(None, ("saved Shared draft".into(), 1));
+        state.direct.selected_conversation_id = Some("direct:sha256:a".into());
+        state.direct.pending_send = Some(PendingDirectSend {
+            request_id: "uncertain-send".into(),
+            conversation_id: "direct:sha256:a".into(),
+            text: "sent Direct draft".into(),
+        });
+        let direct = state.direct.clone();
+        let drafts = state.drafts.clone();
+        for (configured, available, joined, badge) in [
+            (true, false, Some(true), "Community unreachable"),
+            (true, true, Some(true), "Live"),
+            (true, true, Some(false), "Left Community"),
+            (false, false, None, "Live"),
+        ] {
+            let mut poll = shared_poll(0);
+            poll.transport.configured = configured;
+            poll.transport.available = available;
+            poll.transport.community_joined = joined;
+            apply_active_poll_state(&mut state, poll);
+            assert_eq!(state.status_badge, badge);
+            assert!(state.session_active);
+            assert!(!state.reconnect_needed);
+            assert_eq!(state.direct, direct);
+            assert_eq!(state.drafts, drafts);
+            for shell_mode in [false, true] {
+                let projection = render_projection(&state, shell_mode);
+                assert_eq!(
+                    projection.community_unreachable,
+                    badge == "Community unreachable"
+                );
+                assert!(projection.direct_mode);
+                let mut shared = state.clone();
+                shared.direct.selected_conversation_id = None;
+                let projection = render_projection(&shared, shell_mode);
+                assert_eq!(
+                    projection.community_unreachable,
+                    badge == "Community unreachable"
+                );
+                assert!(!projection.direct_mode);
+            }
         }
     }
 
@@ -6222,6 +6280,7 @@ mod tests {
             RenderProjection {
                 session_active: true,
                 direct_mode: false,
+                community_unreachable: false,
                 participant_count: super::format_participant_count(1),
             }
         );
@@ -6265,6 +6324,7 @@ mod tests {
             RenderProjection {
                 session_active: false,
                 direct_mode: false,
+                community_unreachable: false,
                 participant_count: "Opening conversation".to_string(),
             }
         );

@@ -73,9 +73,9 @@ impl DirectDeliveryState {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Received => "Received",
-            Self::Pending => "Waiting for delivery",
+            Self::Pending => "Sending",
             Self::ReceiptSettled => "Sent",
-            Self::Expired => "Delivery unconfirmed",
+            Self::Expired => "Expired",
         }
     }
 }
@@ -377,10 +377,7 @@ mod tests {
             state.messages[0].delivery_state,
             DirectDeliveryState::Expired
         );
-        assert_eq!(
-            state.messages[0].delivery_state.label(),
-            "Delivery unconfirmed"
-        );
+        assert_eq!(state.messages[0].delivery_state.label(), "Expired");
     }
 
     #[test]
@@ -396,10 +393,7 @@ mod tests {
             messages.messages[0].request_id.as_deref(),
             Some("chat-message:one")
         );
-        assert_eq!(
-            messages.messages[0].delivery_state.label(),
-            "Waiting for delivery"
-        );
+        assert_eq!(messages.messages[0].delivery_state.label(), "Sending");
         let legacy: DirectConversationList =
             serde_json::from_value(serde_json::json!({"conversations":[]})).unwrap();
         assert_eq!(legacy.community_unread, None);

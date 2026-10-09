@@ -85,6 +85,31 @@ Every Home joins the shared Community room by default. The signed release
 names that network, and setup installs it; a Home stays isolated only when its
 person chooses isolation.
 
+### Availability
+
+The release network lists one bootstrap peer: the Community node on the seed
+host. This node runs its own Runtime with its own account, data root, Carrier
+port and resource limits, apart from the release and update service. Carrier
+connects Homes directly; it has no transport relay.
+
+The release availability contract while this node is unreachable is:
+
+- Homes already connected keep exchanging Community messages and catch-up.
+- A Home that starts or restarts cannot join Community.
+- Discovery and new contact requests stop.
+- New Direct messages show **Sending**. Runtime retries them for up to
+  24 hours, then shows **Expired**.
+- Homes keep all messages they already received.
+
+Chat states **Community unreachable** when its Community connection is
+unavailable.
+
+An address change requires the next signed network revision in a release.
+More bootstrap peers and participant Homes acting as bootstrap are tracked in
+[#324](https://github.com/Elacity/elastos-runtime/issues/324).
+
+### Release pin
+
 The release pins the network in `components.json` as `collaboration_network`:
 
 - `head_cid`, the raw SHA-256 CIDv1 of the exact startup configuration bytes;

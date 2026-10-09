@@ -11,12 +11,15 @@ and [Carrier](CARRIER.md).
 
 ### `Carrier provider connect failed ticket_index=0 error=connect timed out`
 
-A Home logs this every 25 seconds, and Discovery, contact requests and direct
-messages stop. Chat messages sent before the break may still show; new direct
-messages stay **Sending**, and an accepted contact appears on one side only.
+A Home logs this when it cannot reach the Community bootstrap Runtime at the
+address recorded in its network file. The release availability contract keeps
+connected Homes exchanging Community messages and catch-up. A Home that starts
+or restarts cannot join Community. Discovery and new contact requests stop.
+New Direct messages show **Sending**, retry for up to 24 hours, then show
+**Expired**. Each Home keeps the messages it already received.
 
-The Home cannot reach the bootstrap Runtime at the address recorded in its
-network file.
+See [Community availability](COLLABORATION_NETWORK_PROFILE.md#availability)
+for the node's role and the behavior while it is unreachable.
 
 1. Read the bootstrap address from the network file. `profile_chain_base64`
    holds the signed profile; its `bootstrap_peers` carry a connect ticket that

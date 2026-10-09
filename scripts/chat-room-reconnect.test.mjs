@@ -9,6 +9,14 @@ const read = path => readFileSync(new URL(`../${path}`, import.meta.url), "utf8"
 const launched = token => ({ target: "chat-room", attach_kind: "iframe", launch_status: "launched",
   route: `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}#home_token=${token}` });
 
+test("Community status stays outside the access panel hidden by active Chat", () => {
+  const html = read("capsules/chat-room/browser/index.html");
+  const accessPanel = html.match(/<section\b[^>]*id="browser-access-stage"[^>]*>[\s\S]*?<\/section>/);
+  assert.ok(accessPanel);
+  assert.match(html, /<p id="community-status"[^>]*role="status"[^>]*hidden>Community unreachable<\/p>/);
+  assert.doesNotMatch(accessPanel[0], /id="community-status"/);
+});
+
 function chatFixture() {
   const listeners = new Map(), timers = new Map(), messages = [], clipboard = [];
   let sequence = 0;

@@ -205,6 +205,27 @@ pub async fn join_collaboration_network(
 }
 
 impl JoinedCollaborationNetwork {
+    async fn topic_peers(&self) -> anyhow::Result<TopicPeersData> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "list_topic_peers",
+                "topic": self.topic,
+            }))
+            .await
+            .context("Carrier peer lookup failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let connected: TopicPeersData = require_ok_response(response, "list_topic_peers")?;
+        if connected.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration topic");
+        }
+        Ok(connected)
+    }
+
+    pub(crate) async fn has_remote_peers(&self) -> anyhow::Result<bool> {
+        Ok(!self.topic_peers().await?.peers.is_empty())
+    }
+
     /// Repair only missing peers from the verified profile. The Runtime owns
     /// the retry cadence; a healthy mesh never receives another Join here.
     pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
@@ -223,19 +244,7 @@ impl JoinedCollaborationNetwork {
             connect_ticket: local.ticket,
         })
         .context("Carrier local endpoint identity is inconsistent")?;
-        let response = self
-            .carrier
-            .send_raw(&serde_json::json!({
-                "op": "list_topic_peers",
-                "topic": self.topic,
-            }))
-            .await
-            .context("Carrier peer lookup failed for collaboration recovery")?;
-        require_bounded_response(&response)?;
-        let connected: TopicPeersData = require_ok_response(response, "list_topic_peers")?;
-        if connected.topic != self.topic {
-            anyhow::bail!("Carrier returned a mismatched collaboration recovery topic");
-        }
+        let connected = self.topic_peers().await?;
         let missing = self
             .bootstrap_node_ids
             .iter()
@@ -710,6 +719,50 @@ mod tests {
                 "peers": [],
             })]
         );
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_availability_uses_any_current_topic_peer() {
+        let (signer, _) = generate_keypair();
+        let bootstrap = ticket_for(20);
+        let remaining_peer = ticket_for(21);
+        let profile = verified_profile(
+            &signer,
+            "community-availability",
+            1,
+            None,
+            vec![bootstrap.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            topic_peers(&topic, &[]),
+            topic_peers(&topic, &[&remaining_peer.node_id]),
+            topic_peers(&topic, &[]),
+            topic_peers("foreign-topic", &[&remaining_peer.node_id]),
+            FakeReply::Error("unavailable"),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(!joined.has_remote_peers().await.unwrap());
+        assert!(joined.has_remote_peers().await.unwrap());
+        assert!(!joined.has_remote_peers().await.unwrap());
+        assert!(joined.has_remote_peers().await.is_err());
+        assert!(joined.has_remote_peers().await.is_err());
+        assert_eq!(
+            carrier
+                .requests()
+                .iter()
+                .filter(|request| request["op"] == "gossip_join_exact")
+                .count(),
+            1
+        );
+        assert!(!carrier
+            .requests()
+            .iter()
+            .any(|request| request["op"] == "gossip_join_peers"));
     }
 
     #[tokio::test]

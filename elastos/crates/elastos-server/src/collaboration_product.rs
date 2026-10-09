@@ -1,6 +1,7 @@
 //! Typed product boundary for the verified default collaboration conversation.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -24,6 +25,7 @@ const CHAT_MESSAGE_TTL_SECS: u64 = 300;
 pub struct CollaborationChatProductPort {
     core: Arc<CollaborationCore>,
     history_status: Arc<Mutex<crate::room_service::RoomHistoryView>>,
+    community_connected: Arc<AtomicBool>,
 }
 
 /// Read-only result of durably preparing one outgoing Chat message.
@@ -68,6 +70,7 @@ impl CollaborationChatProductPort {
         }
         Ok(Self {
             core,
+            community_connected: Arc::new(AtomicBool::new(false)),
             history_status: Arc::new(Mutex::new(crate::room_service::RoomHistoryView {
                 status: "searching".to_string(),
                 detail: "Checking recent Community history from online participants.".to_string(),
@@ -106,14 +109,17 @@ impl CollaborationChatProductPort {
 
     pub(crate) fn conversation_transport_view(&self) -> crate::room_service::RoomTransportView {
         let joined = self.community_membership().joined();
+        let connected = self.community_connected.load(Ordering::Relaxed);
         crate::room_service::RoomTransportView {
             configured: true,
-            available: joined,
+            available: joined && connected,
             community_joined: Some(joined),
-            status: Some(if joined {
-                "Collaboration is configured.".to_string()
-            } else {
+            status: Some(if !joined {
                 crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string()
+            } else if connected {
+                "Community is connected.".to_string()
+            } else {
+                "Community is unreachable. Retained messages stay available.".to_string()
             }),
             history: self.history_status.lock().ok().map(|status| status.clone()),
         }
@@ -126,7 +132,13 @@ impl CollaborationChatProductPort {
     }
 
     pub(crate) fn set_community_joined(&self, joined: bool) -> anyhow::Result<()> {
-        self.core.set_community_joined(joined)
+        self.core.set_community_joined(joined)?;
+        self.set_community_connected(false);
+        Ok(())
+    }
+
+    pub(crate) fn set_community_connected(&self, connected: bool) {
+        self.community_connected.store(connected, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -756,6 +768,11 @@ mod tests {
 
     fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut fixture = fixture_at(temp.path(), NETWORK, CONVERSATION);
         fixture._temp = Some(temp);
         fixture
@@ -857,6 +874,35 @@ mod tests {
             &fixture.person_profile,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn community_availability_tracks_current_peers_and_left_takes_priority() {
+        let fixture = fixture();
+        let other_port = fixture.port.clone();
+        assert!(!fixture.port.conversation_transport_view().available);
+        assert_eq!(
+            fixture.port.conversation_transport_view().community_joined,
+            Some(true)
+        );
+        fixture.port.set_community_connected(true);
+        assert!(other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(false);
+        assert!(!other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(true);
+        fixture.port.set_community_joined(false).unwrap();
+        fixture.port.set_community_connected(true);
+        let left = other_port.conversation_transport_view();
+        assert!(!left.available);
+        assert_eq!(left.community_joined, Some(false));
+        assert_eq!(
+            left.status.as_deref(),
+            Some(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL)
+        );
+        fixture.port.set_community_joined(true).unwrap();
+        assert!(!other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(true);
+        assert!(other_port.conversation_transport_view().available);
     }
 
     #[test]
