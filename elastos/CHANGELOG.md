@@ -19,20 +19,25 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
-- A model part read that fails with a provider error (holder answer deadline,
-  failed Carrier invocation, lost connection) is repeated up to 3 times after
-  0.5 s, 1 s and 2 s, in the same in-flight slot. Each repeat first rechecks
-  cancellation, expiry and authority. SHA-256, CID, authority and capacity
-  failures are never repeated. The client sends the 8 reads as parallel streams
-  on one Carrier connection with no lock of its own, but the seed's
+- A model part read that every holder failed only in transit (answer deadline,
+  connect failure, lost stream) is repeated up to 3 times after 0.5 s, 1 s and
+  2 s, in the same in-flight slot. Carrier marks such bounded reads as typed I/O
+  errors and availability reports them as `carrier_fetch_in_transit`; holder
+  refusals and malformed or oversized answers stay provider errors and are never
+  repeated, nor are SHA-256, CID, authority or capacity failures. Each repeat
+  first passes the same checks as a first read (cancellation, expiry, authority,
+  capacity, and any refusal another part already met). The client sends the 8
+  reads as parallel streams on one Carrier connection with no lock of its own,
+  but the seed's
   `ipfs-provider` bridge holds one I/O lock per request until the answer arrives,
   so one slow read there (or one stalled connection) runs every queued read's
   5 s budget out together, as the alpha.12 Jetson burst of 8 showed (#84).
 - Download resume: `settle_failure` keeps the preparation stage (inventory
-  field `kept_stage`, owned by the Failed/Expired record) after a read or
-  transport failure, a stopping Home, a passed deadline, or restart
-  reconciliation. It removes the stage on cancel and on any integrity, header,
-  authority, policy or storage failure. The next Use takes over the stage only
+  field `kept_stage`, owned by the Failed/Expired record) after a read that
+  failed in transit (`ProviderError::Io`), a stopping Home, a passed deadline,
+  or restart reconciliation. It removes the stage on cancel, on holder refusals
+  and malformed answers, and on any integrity, header, authority, policy or
+  storage failure. The next Use takes over the stage only
   if its `_elastos_object.json` equals the signed `object_manifest`. It
   re-hashes complete files, cuts a partial file to a 64 KiB boundary, hashes
   that prefix into the running digest, and fetches only the remaining parts.

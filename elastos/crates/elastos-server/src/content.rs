@@ -3370,9 +3370,14 @@ impl ContentProvider {
                 .get("message")
                 .and_then(|value| value.as_str())
                 .unwrap_or("Carrier availability fetch failed");
-            return Err(ProviderError::Provider(format!(
-                "availability fetch failed ({code}): {message}"
-            )));
+            let message = format!("availability fetch failed ({code}): {message}");
+            // Only failures in transit stay typed as I/O, so a bounded reader
+            // can repeat them; refusals and bad answers stay provider errors.
+            return Err(if code == crate::carrier::CARRIER_FETCH_IN_TRANSIT_CODE {
+                ProviderError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+            } else {
+                ProviderError::Provider(message)
+            });
         }
         if transfer.bounded_read {
             check_bounded_availability_payload(&response, transfer)?;

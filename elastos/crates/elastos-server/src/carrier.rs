@@ -4024,6 +4024,9 @@ impl CarrierAvailabilityProvider {
         let deadline = tokio::time::Instant::now() + self.discovery_wait;
         let mut tried = HashSet::new();
         let mut errors = Vec::new();
+        // Every holder failed in transit (deadline, connect, lost stream) and
+        // none refused or answered badly: the caller may try the read again.
+        let mut only_transit_failures = true;
         loop {
             let (messages, self_did) = {
                 let state = self.state.lock().await;
@@ -4097,6 +4100,7 @@ impl CarrierAvailabilityProvider {
                             "Carrier availability fetch from holder failed"
                         );
                         let mut final_err = err.to_string();
+                        let mut in_transit = carrier_read_failed_in_transit(&err);
                         if let Some(data_dir) = self.data_dir.as_deref() {
                             match refresh_trusted_source_replica_ticket(
                                 data_dir,
@@ -4144,6 +4148,7 @@ impl CarrierAvailabilityProvider {
                                                 "Carrier availability fetch after bootstrap refresh failed"
                                             );
                                             final_err = retry_err.to_string();
+                                            in_transit = carrier_read_failed_in_transit(&retry_err);
                                         }
                                     }
                                 }
@@ -4151,12 +4156,14 @@ impl CarrierAvailabilityProvider {
                                     final_err = format!(
                                         "{final_err}; trusted-source bootstrap refresh rejected"
                                     );
+                                    in_transit = false;
                                 }
                                 TrustedSourceBootstrapRefresh::Current
                                 | TrustedSourceBootstrapRefresh::NotConfigured => {}
                             }
                         }
                         self.record_peer_reputation(&replica.node_did, false).await;
+                        only_transit_failures &= in_transit;
                         errors.push(final_err);
                         continue;
                     }
@@ -4175,7 +4182,11 @@ impl CarrierAvailabilityProvider {
         }
 
         Ok(carrier_availability_error(
-            "carrier_fetch_failed",
+            if only_transit_failures {
+                CARRIER_FETCH_IN_TRANSIT_CODE
+            } else {
+                "carrier_fetch_failed"
+            },
             format!("Carrier content fetch failed: {}", errors.join(" | ")),
         ))
     }
@@ -4253,6 +4264,19 @@ impl BoundedContentRead {
     }
 }
 
+/// The availability error code for a read that every holder failed only in
+/// transit; Content reports it as a typed I/O error the caller may repeat.
+pub(crate) const CARRIER_FETCH_IN_TRANSIT_CODE: &str = "carrier_fetch_in_transit";
+
+/// A holder read failed on the way (answer deadline, connect failure, lost
+/// stream), not because the holder refused it or answered badly.
+fn carrier_read_failed_in_transit(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ProviderError>(),
+        Some(ProviderError::Io(_))
+    )
+}
+
 /// The announcement's verified signer is the peer the ticket must reach. The
 /// invoker rejects a ticket whose endpoint is another key before connecting,
 /// so a holder is credited only for bytes its own authenticated peer served.
@@ -4296,7 +4320,11 @@ async fn fetch_content_via_carrier_provider_invocation(
             }),
         })
         .await
-        .map_err(|err| anyhow::anyhow!("Carrier provider invocation failed: {err}"))?;
+        // Keep the typed cause so availability can tell transit from refusal.
+        .map_err(|err| {
+            let message = format!("Carrier provider invocation failed: {err}");
+            anyhow::Error::new(err).context(message)
+        })?;
 
     if response.get("status").and_then(|status| status.as_str()) == Some("error") {
         let message = response
@@ -7802,6 +7830,10 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                 }
 
                 let mut errors = Vec::new();
+                // An effect-free bounded read whose every endpoint failed only
+                // in transit reports a typed I/O error, so its caller may repeat it.
+                let bounded = bounded_content_fetch(invocation, &request);
+                let mut transit_kind = Some(std::io::ErrorKind::ConnectionAborted);
                 for (index, endpoint) in endpoints.into_iter().enumerate() {
                     let peer = endpoint.id;
                     match self
@@ -7815,7 +7847,7 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             // yields to the next one. Every other operation keeps its
                             // open-ended answer: cutting it could discard a receipt for
                             // an effect that is still running on the peer.
-                            let result = if bounded_content_fetch(invocation, &request) {
+                            let result = if bounded {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(timeout_secs),
                                     invoke,
@@ -7828,6 +7860,8 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                         errors.push(format!(
                                             "ticket[{index}] response deadline of {timeout_secs}s passed"
                                         ));
+                                        transit_kind =
+                                            transit_kind.map(|_| std::io::ErrorKind::TimedOut);
                                         continue;
                                     }
                                 }
@@ -7839,6 +7873,9 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                 Err(err) => {
                                     self.forget_peer(peer).await;
                                     errors.push(carrier_provider_public_invoke_error(index, &err));
+                                    if err.downcast_ref::<CarrierTransportFailure>().is_none() {
+                                        transit_kind = None;
+                                    }
                                     // A lost create reply may hide accepted work. A later
                                     // endpoint's refusal cannot settle that first attempt.
                                     if invocation.target == "model"
@@ -7853,10 +7890,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                     }
                 }
 
-                Err(ProviderError::Provider(format!(
-                    "Carrier provider invocation failed: {}",
-                    errors.join(" | ")
-                )))
+                let message = format!("Carrier provider invocation failed: {}", errors.join(" | "));
+                Err(match transit_kind.filter(|_| bounded) {
+                    Some(kind) => ProviderError::Io(std::io::Error::new(kind, message)),
+                    None => ProviderError::Provider(message),
+                })
             }
             ProviderCarrierRoute::PeerDid { peer_did, .. } => {
                 let public_key = did_to_public_key(peer_did).ok_or_else(|| {
@@ -8083,6 +8121,17 @@ impl CarrierProviderDecision {
 impl std::fmt::Display for CarrierProviderDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.code)
+    }
+}
+
+/// Marks a Carrier stream that could not be opened, written or read to its
+/// end: a failure in transit, not an answer from the peer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CarrierTransportFailure;
+
+impl std::fmt::Display for CarrierTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carrier stream failed in transit")
     }
 }
 
@@ -8370,12 +8419,14 @@ impl CarrierClient {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let bounded = request.get("bounded_read") == Some(&serde_json::Value::Bool(true));
-        let (mut send, recv) = self.conn.open_bi().await?;
+        let (mut send, recv) = self.conn.open_bi().await.context(CarrierTransportFailure)?;
         let msg = carrier_provider_invoke_message(invocation, request);
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
-        send.write_all(&bytes).await?;
-        send.finish()?;
+        send.write_all(&bytes)
+            .await
+            .context(CarrierTransportFailure)?;
+        send.finish().context(CarrierTransportFailure)?;
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
@@ -8383,13 +8434,19 @@ impl CarrierClient {
             // A bounded read holds at most 64 KiB of base64 plus its envelope;
             // a holder that sends more is refused before it is buffered.
             let mut limited = (&mut reader).take(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES);
-            limited.read_line(&mut line).await?;
+            limited
+                .read_line(&mut line)
+                .await
+                .context(CarrierTransportFailure)?;
             anyhow::ensure!(
                 line.ends_with('\n'),
                 "bounded Carrier provider response exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
             );
         } else {
-            reader.read_line(&mut line).await?;
+            reader
+                .read_line(&mut line)
+                .await
+                .context(CarrierTransportFailure)?;
         }
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
@@ -11249,11 +11306,15 @@ pub(crate) mod tests {
         pub(crate) serialized: bool,
         /// Range starts whose first read stalls past the 5 s answer budget.
         pub(crate) stall_once: std::collections::BTreeSet<u64>,
-        /// Range starts whose every read fails.
-        pub(crate) fail_always: std::collections::BTreeSet<u64>,
+        /// Range starts whose every read stalls past the answer budget.
+        pub(crate) stall_always: std::collections::BTreeSet<u64>,
         /// While it holds a value below `u64::MAX`, every read of a range
-        /// starting at or after that offset fails.
-        pub(crate) fail_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        /// starting at or after that offset stalls past the answer budget.
+        pub(crate) stall_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        /// Range starts whose every read the holder refuses.
+        pub(crate) refuse_always: std::collections::BTreeSet<u64>,
+        /// Range starts answered with one byte more than asked.
+        pub(crate) oversize: std::collections::BTreeSet<u64>,
     }
 
     /// A holder's local IPFS backend for one synthetic closure. It answers only
@@ -11264,8 +11325,10 @@ pub(crate) mod tests {
         pub(crate) delay: Duration,
         pub(crate) serial: Option<tokio::sync::Mutex<()>>,
         pub(crate) stall_once: StdMutex<std::collections::BTreeSet<u64>>,
-        pub(crate) fail_always: std::collections::BTreeSet<u64>,
-        pub(crate) fail_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        pub(crate) stall_always: std::collections::BTreeSet<u64>,
+        pub(crate) stall_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        pub(crate) refuse_always: std::collections::BTreeSet<u64>,
+        pub(crate) oversize: std::collections::BTreeSet<u64>,
     }
 
     #[async_trait::async_trait]
@@ -11299,16 +11362,17 @@ pub(crate) mod tests {
             self.requests.lock().unwrap().push(logged);
             tokio::time::sleep(self.delay).await;
             let start = request["_runtime_invocation"]["range"]["start"].as_u64();
-            if start.is_some_and(|start| self.stall_once.lock().unwrap().remove(&start)) {
+            let stalls = start.is_some_and(|start| {
+                self.stall_always.contains(&start)
+                    || self.stall_from.as_ref().is_some_and(|from| {
+                        start >= from.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    || self.stall_once.lock().unwrap().remove(&start)
+            });
+            if stalls {
                 tokio::time::sleep(Duration::from_secs(7)).await;
             }
-            let failing_from = self
-                .fail_from
-                .as_ref()
-                .map(|from| from.load(std::sync::atomic::Ordering::Acquire));
-            if start.is_some_and(|start| {
-                self.fail_always.contains(&start) || failing_from.is_some_and(|from| start >= from)
-            }) {
+            if start.is_some_and(|start| self.refuse_always.contains(&start)) {
                 return Err(ProviderError::Provider("fixture holder read failed".into()));
             }
             if request["op"] != "cat" || request["bounded_read"] != true {
@@ -11336,8 +11400,9 @@ pub(crate) mod tests {
                     return Ok(serde_json::json!({"status":"error","code":"range",
                         "message":"fixture range exceeds the file"}));
                 }
+                let extra = usize::from(self.oversize.contains(&(start as u64)));
                 (
-                    file[start..=end].to_vec(),
+                    file[start..=end + extra].to_vec(),
                     serde_json::json!({"_runtime_applied_range":{
                         "schema":"elastos.provider.applied-range/v1", "cid":request["cid"],
                         "path":path, "start":start, "end":end
@@ -11500,8 +11565,10 @@ pub(crate) mod tests {
                     delay: behavior.delay,
                     serial: behavior.serialized.then(|| tokio::sync::Mutex::new(())),
                     stall_once: StdMutex::new(behavior.stall_once),
-                    fail_always: behavior.fail_always,
-                    fail_from: behavior.fail_from,
+                    stall_always: behavior.stall_always,
+                    stall_from: behavior.stall_from,
+                    refuse_always: behavior.refuse_always,
+                    oversize: behavior.oversize,
                 }),
             )
             .await
