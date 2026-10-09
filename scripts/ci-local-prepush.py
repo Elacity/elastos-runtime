@@ -28,6 +28,10 @@ def run(args, cwd, capture=False, lease=None):
         target = str(Path(cwd).resolve() / "target")
         environment["CARGO_TARGET_DIR"] = target
         environment["CARGO_BUILD_TARGET_DIR"] = target
+        # Use the same flags as CI. Caller lint caps, individual allows and
+        # encoded flags can otherwise weaken -D warnings or change the source.
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        environment["RUSTFLAGS"] = "-D warnings"
     if args[0] != "git":
         for name in GIT_LOCAL_ENV_VARS:
             environment.pop(name, None)
@@ -329,7 +333,25 @@ def touched_workspaces(root, paths, lease):
         if manifest not in known:
             workspace, packages = metadata(root, manifest, lease)
             workspaces[workspace] = packages
-    checked = set(workspaces)
+    for workspace, packages in workspaces.items():
+        if workspace == runtime:
+            continue
+        owners = external_input_owners(root, packages, paths)
+        input_owners.update(owners)
+        relative = workspace.relative_to(root).as_posix()
+        workspace_input = broad or any(path in {
+            relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml"
+        } for path in paths)
+        for package in packages:
+            folder = Path(package["manifest_path"]).parent.resolve()
+            if workspace_input or folder in owners or any(
+                    (root / path).is_relative_to(folder) and Path(path).suffix not in {".md", ".txt"}
+                    for path in paths):
+                seeds.add(folder)
+    # A generic tooling/doc change has no Rust consumer. Keep formatting in
+    # the basic gate without cleaning and rebuilding an unrelated workspace.
+    checked = {workspace for workspace in workspaces if workspace != runtime}
+    related = set(seeds)
     if seeds:
         # --no-deps retains all declared path edges, including dev/build,
         # optional and target-specific dependencies. Discover each workspace
@@ -347,7 +369,6 @@ def touched_workspaces(root, paths, lease):
                 for dependency in package.get("dependencies", []):
                     if dependency.get("path"):
                         consumers.setdefault(Path(dependency["path"]).resolve(), set()).add(consumer)
-        related = set(seeds)
         pending = list(seeds)
         while pending:
             for consumer in consumers.get(pending.pop(), set()) - related:
@@ -364,12 +385,19 @@ def touched_workspaces(root, paths, lease):
             relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",
         } for path in paths)
         selected = []
+        units = []
         for package in packages:
             prefix = Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
-            if workspace_change or Path(package["manifest_path"]).parent.resolve() in input_owners or any(
-                    path.startswith(prefix) for path in paths):
+            direct = workspace_change or Path(package["manifest_path"]).parent.resolve() in input_owners or any(
+                path.startswith(prefix) and Path(path).suffix not in {".md", ".txt"} for path in paths)
+            if direct or Path(package["manifest_path"]).parent.resolve() in related:
                 selected.append(package)
-        touched[workspace] = selected
+            if direct:
+                units.append(package)
+        # Dependent crates need lint checks for changed interfaces. Unit tests
+        # keep their existing direct-input scope, including product consumers.
+        if selected or units:
+            touched[workspace] = {"lint": selected, "units": units}
     return touched
 
 
@@ -503,20 +531,25 @@ def gates(root, paths, lease):
                     "scripts/ci-local-prepush.py", "scripts/ci-local-prepush-test.py"}
            for path in paths):
         run(["python3", "scripts/ci-local-prepush-test.py"], root)
+    if any(path.startswith("scripts/release-") or path in {
+            "scripts/install.sh", "scripts/publish-release.sh"} for path in paths):
+        run(["python3", "scripts/release-platform-input-test.py"], root)
+        run(["python3", "scripts/ci-release-policy-test.py"], root)
     workspaces = touched_workspaces(root, paths, lease)
     formats = {root / "elastos", root / "capsules/chain-provider", *workspaces}
     for workspace in sorted(formats):
         run(["cargo", "fmt", "--all", "--", "--check"], workspace, lease=lease)
     for workspace in sorted(workspaces):
         clean_repository_packages(root, workspace, lease)
-    for workspace, packages in sorted(workspaces.items()):
+    for workspace, scope in sorted(workspaces.items()):
         run(["cargo", "check", "--workspace", "--all-targets"], workspace, lease=lease)
+        packages = scope["lint"]
         if packages:
             args = ["cargo", "clippy", "--all-targets"]
             for package in packages:
                 args.extend(["-p", package["name"]])
             run([*args, "--", "-D", "warnings"], workspace, lease=lease)
-        for package in packages:
+        for package in scope["units"]:
             crate_units(root, workspace, package, paths, lease)
 
 

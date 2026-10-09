@@ -69,6 +69,9 @@ class PrepushTests(unittest.TestCase):
                           "capsules/protected-content-decrypt-provider", "capsules/custody-provider"):
             self.write(workspace + "/Cargo.lock", "version = 4\n# committed fixture lock\n")
         self.write("README.md", "Fixture\n")
+        for name in ("release-platform-input-test.py", "ci-release-policy-test.py"):
+            self.write("scripts/" + name, "import os,sys\n"
+                       "raise SystemExit(1 if os.environ.get('PREPUSH_RELEASE_FAIL') else 0)\n")
         self.write(".gitignore", "**/target/\n/target-build/\n")
         self.commit()
         self.git("remote", "add", "origin", str(self.origin))
@@ -88,6 +91,8 @@ class PrepushTests(unittest.TestCase):
                                       "cwd": os.getcwd(), "build_dir": os.environ.get("CARGO_BUILD_BUILD_DIR"),
                                       "target_dir": os.environ.get("CARGO_TARGET_DIR"),
                                       "build_target_dir": os.environ.get("CARGO_BUILD_TARGET_DIR"),
+                                      "rustflags": os.environ.get("RUSTFLAGS"),
+                                      "encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS"),
                                       "git_env": [k for k in os.environ if k.startswith("GIT_")],
                                       "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
             if pathlib.Path(sys.argv[0]).name == "node":
@@ -153,6 +158,10 @@ class PrepushTests(unittest.TestCase):
                 print(json.dumps({"workspace_root": str(workspace), "workspace_members": members,
                                   "packages": packages}))
             elif args[0] == "check":
+                flags = os.environ.get("CARGO_ENCODED_RUSTFLAGS", os.environ.get("RUSTFLAGS", "")).replace(chr(31), " ")
+                if (os.environ.get("PREPUSH_WARNING") and "-D warnings" in flags
+                        and "--cap-lints allow" not in flags and "-A unused-imports" not in flags):
+                    sys.exit("warning denied")
                 if os.environ.get("PREPUSH_PRODUCT_SENTINEL"):
                     subprocess.run(["git", "-C", os.environ["PREPUSH_PRODUCT_SENTINEL"],
                                     "commit", "--allow-empty", "-qm", "owned product-child fixture"], check=True)
@@ -168,6 +177,10 @@ class PrepushTests(unittest.TestCase):
                     subprocess.run(["git", "-C", remote, "update-ref", "refs/heads/develop", commit], check=True)
                 if os.environ.get("PREPUSH_FAIL"):
                     sys.exit(1)
+            elif args[0] == "clippy":
+                dependent = os.environ.get("PREPUSH_CLIPPY_WARNING")
+                if dependent and any(args[i:i+2] == ["-p", dependent] for i in range(len(args))):
+                    sys.exit("dependent lint denied")
             elif args[0] == "build":
                 binary = pathlib.Path(os.getcwd()) / "target/release" / pathlib.Path(os.getcwd()).name
                 binary.parent.mkdir(parents=True, exist_ok=True)
@@ -373,9 +386,13 @@ class PrepushTests(unittest.TestCase):
         checks = [c for c in commands if c["args"] == ["check", "--workspace", "--all-targets"]]
         self.assertEqual({c["cwd"] for c in checks}, {str(self.root / "elastos"),
                          str(self.root / "capsules/chain-provider"), str(self.root / "capsules/wallet-provider")})
-        clippy, = [c for c in commands if c["args"][0] == "clippy"]
-        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "common", "--", "-D", "warnings"])
-        self.assertTrue(all(c["args"][2] == "common" for c in commands if c["args"][0] == "test"))
+        clippy, = [c for c in commands if c["args"][0] == "clippy" and c["cwd"] == str(self.root / "elastos")]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "common", "--", "-D", "warnings"])
+        self.assertEqual({c["cwd"] for c in commands if c["args"][0] == "clippy"},
+                         {str(self.root / "elastos"), str(self.root / "capsules/chain-provider"),
+                          str(self.root / "capsules/wallet-provider")})
+        self.assertTrue(all(c["args"][2] == "common" for c in commands
+                            if c["args"][0] == "test" and c["cwd"] == str(self.root / "elastos")))
         metadata = [c for c in commands if c["args"][0] == "metadata"]
         self.assertEqual(len(metadata), len({tuple(c["args"]) for c in metadata}))
 
@@ -386,9 +403,68 @@ class PrepushTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         metadata = [c for c in self.commands() if c["args"][0] == "metadata"]
-        self.assertEqual(len(metadata), 2)
+        self.assertEqual(len(metadata), 1)
         self.assertTrue(all(c["args"][-1] == str(self.root / "elastos/Cargo.toml") for c in metadata))
         self.assertEqual(sum("--no-deps" in c["args"] for c in metadata), 1)
+        self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                             for c in self.commands()))
+        self.assertEqual(sum(c["args"][0] == "fmt" for c in self.commands()), 2)
+
+    def test_local_rust_warnings_fail_with_plain_and_encoded_caller_flags(self):
+        for extra in ({"RUSTFLAGS": "-A warnings"},
+                      {"RUSTFLAGS": "--cap-lints allow"},
+                      {"RUSTFLAGS": "-A unused-imports"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "-A\x1fwarnings"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "--cap-lints\x1fallow"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "-A\x1funused-imports"},
+                      {"CARGO_ENCODED_RUSTFLAGS": ""}):
+            with self.subTest(extra=extra):
+                result = self.invoke(extra={**extra, "PREPUSH_WARNING": "1"})
+                self.assert_stopped(result, "cargo check")
+                checked = [c for c in self.commands() if c["args"][0] == "check"][-1]
+                self.assertIsNone(checked["encoded_rustflags"])
+                self.assertEqual(checked["rustflags"], "-D warnings")
+
+    def test_capsule_documentation_skips_build_unless_rust_embeds_it(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("capsules/chain-provider/README.md", "Changed documentation\n")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                             for c in self.commands()))
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("capsules/chain-provider/src/main.rs", 'const DOC: &str = include_str!("../README.md");\n')
+        self.write("capsules/chain-provider/README.md", "Original embedded input\n")
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write("capsules/chain-provider/README.md", "Changed embedded input\n")
+        self.commit()
+        self.log.unlink()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "test"
+                            for c in self.commands()))
+
+    def test_same_workspace_dependent_lint_fails_locally(self):
+        graph = {"elastos/crates/other": ["elastos/crates/server"]}
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph), "PREPUSH_CLIPPY_WARNING": "other"})
+        self.assert_stopped(result, "cargo clippy")
+        lint = [c for c in self.commands() if c["args"][0] == "clippy"][-1]
+        self.assertIn("other", lint["args"])
+
+    def test_release_tool_change_runs_self_tests_and_refuses_failure(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("scripts/release-example.py", "# changed release tool\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_RELEASE_FAIL": "1"})
+        self.assert_stopped(result, "release-platform-input-test.py")
+        self.log.unlink()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c["args"][0] == "check" for c in self.commands()))
+        self.assertIn("+ python3 scripts/release-platform-input-test.py", result.stdout)
+        self.assertIn("+ python3 scripts/ci-release-policy-test.py", result.stdout)
 
     def test_shared_runtime_input_seeds_all_members(self):
         self.git("reset", "--hard", "HEAD~1")
@@ -399,10 +475,11 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "check"
                             for c in self.commands()))
-        clippy, = [c for c in self.commands() if c["args"][0] == "clippy"]
+        clippy, = [c for c in self.commands() if c["args"][0] == "clippy" and c["cwd"] == str(self.root / "elastos")]
         self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "other",
                                         "-p", "common", "--", "-D", "warnings"])
-        self.assertEqual({c["args"][2] for c in self.commands() if c["args"][0] == "test"},
+        self.assertEqual({c["args"][2] for c in self.commands()
+                          if c["args"][0] == "test" and c["cwd"] == str(self.root / "elastos")},
                          {"server", "other", "common"})
 
     def test_template_data_and_source_select_runtime_consumer_units(self):
@@ -731,18 +808,21 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         cleans = [c for c in commands if c["args"][0] == "clean"]
-        self.assertEqual(len(cleans), 2)
+        self.assertEqual(len(cleans), 3)
         by_workspace = {c["cwd"]: c["args"] for c in cleans}
         self.assertEqual(by_workspace[str(self.root / "elastos")],
                          ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common",
                           "-p", "custody-provider", "-p", "other", "-p", "server"])
         self.assertEqual(by_workspace[str(self.root / "capsules/chain-provider")],
                          ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common"])
+        self.assertEqual(by_workspace[str(self.root / "capsules/custody-provider")],
+                         ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common",
+                          "-p", "custody-provider"])
         first_build = next(index for index, c in enumerate(commands)
                            if c["args"][0] in {"check", "clippy", "test", "build"})
         self.assertTrue(all(commands.index(c) < first_build for c in cleans))
         resolved = [c for c in commands if c["args"][0] == "metadata" and "--no-deps" not in c["args"]]
-        self.assertEqual(len(resolved), 2)
+        self.assertEqual(len(resolved), 3)
         self.assertTrue(all("--locked" in c["args"] and "--offline" not in c["args"] for c in resolved))
         self.assertTrue(all(c["args"][-1] == str(Path(c["cwd"]) / "Cargo.toml") for c in resolved))
 
