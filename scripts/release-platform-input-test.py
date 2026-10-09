@@ -206,7 +206,12 @@ class PlatformInputTest(unittest.TestCase):
         package = self.browser_image_package()
         args = SimpleNamespace(root=stage, platform="aarch64-darwin", package=str(package),
                                sha256=inputs.digest(package), output=stage / "overlay.json")
-        inputs.stage_browser_image(args)
+        installer = (inputs.SCRIPT_ROOT / "install.sh").read_text()
+        reserve = int(installer.split("FREE_SPACE_RESERVE_BYTES=", 1)[1].splitlines()[0])
+        self.assertEqual(inputs.BROWSER_IMAGE_RESERVE_BYTES, reserve)
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(
+                total=1000 * 1024**3, free=package.stat().st_size + reserve)):
+            inputs.stage_browser_image(args)
         info = json.loads(args.output.read_bytes())["external"][inputs.BROWSER_IMAGE]["platforms"]["darwin-arm64"]
         self.assertEqual(info["strategy"], "browser-vm-image")
         self.assertEqual(info["install_path"], "browser-vm/image-set")
@@ -219,9 +224,11 @@ class PlatformInputTest(unittest.TestCase):
         self.assertEqual(staged.read_bytes(), package.read_bytes())
         staged.unlink()
         args.output.unlink()
-        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=1000, free=0)):
-            with self.assertRaisesRegex(ValueError, "free disk space"):
-                inputs.stage_browser_image(args)
+        for free in (0, package.stat().st_size + reserve - 1):
+            with self.subTest(free=free), patch.object(inputs.shutil, "disk_usage",
+                    return_value=SimpleNamespace(total=1000 * 1024**3, free=free)):
+                with self.assertRaisesRegex(ValueError, "free disk space"):
+                    inputs.stage_browser_image(args)
         self.assertFalse(staged.exists())
         for concern in ("missing", "pin", "guest", "payload", "truncated", "symlink"):
             with self.subTest(concern=concern):

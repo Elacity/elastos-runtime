@@ -68,6 +68,8 @@ def regular_file(root, relative):
 
 BROWSER_IMAGE = "browser-vm-image"
 BROWSER_IMAGE_INSTALL = "browser-vm/image-set"
+# Match the installer and elastos-common user-facing write reserve.
+BROWSER_IMAGE_RESERVE_BYTES = 2 * 1024**3
 
 
 def check_browser_image_archive(path, platform):
@@ -134,8 +136,8 @@ def stage_browser_image(args):
     if not 0 < size <= 64 * 1024**3:
         raise ValueError("Browser image package exceeds its archive size bound")
     usage = shutil.disk_usage(args.root)
-    if usage.free - size < usage.total // 10:
-        raise ValueError("Browser image staging must keep 10 percent free disk space")
+    if usage.free < size + BROWSER_IMAGE_RESERVE_BYTES:
+        raise ValueError("Browser image staging needs free disk space for its bytes plus 2 GiB kept free")
     relative = info["release_path"]
     if "/" in relative or "\\" in relative or not relative.endswith(".tar.gz"):
         raise ValueError("Browser image release path must be a tar.gz filename")
