@@ -6,6 +6,23 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Fixed
+
+- A brief network stall no longer stops a model download. Home tries a part
+  that timed out up to three more times before it stops.
+
+### Developer detail
+
+- A model part read that fails with a provider error (holder answer deadline,
+  failed Carrier invocation, lost connection) is repeated up to 3 times after
+  0.5 s, 1 s and 2 s, in the same in-flight slot. Each repeat first rechecks
+  cancellation, expiry and authority. SHA-256, CID, authority and capacity
+  failures are never repeated. The client sends the 8 reads as parallel streams
+  on one Carrier connection with no lock of its own, but the seed's
+  `ipfs-provider` bridge holds one I/O lock per request until the answer arrives,
+  so one slow read there (or one stalled connection) runs every queued read's
+  5 s budget out together, as the alpha.12 Jetson burst of 8 showed (#84).
+
 ## [0.8.0-alpha.12]
 
 Test-channel release. Signed releases show these notes in System before you update.

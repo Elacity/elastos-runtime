@@ -2685,7 +2685,7 @@ impl CarrierAvailabilityProvider {
     }
 
     #[cfg(test)]
-    fn with_discovery_wait(mut self, wait: Duration) -> Self {
+    pub(crate) fn with_discovery_wait(mut self, wait: Duration) -> Self {
         self.discovery_wait = wait;
         self
     }
@@ -11239,16 +11239,29 @@ pub(crate) mod tests {
         panic!("carrier test endpoint never published a direct address");
     }
 
+    /// How a fixture holder answers reads.
+    #[derive(Default)]
+    pub(crate) struct HolderBehavior {
+        /// Fixed wait before every answer, standing in for one network round trip.
+        pub(crate) delay: Duration,
+        /// Answer reads one at a time, the delay included, like a provider
+        /// bridge that serializes its requests.
+        pub(crate) serialized: bool,
+        /// Range starts whose first read stalls past the 5 s answer budget.
+        pub(crate) stall_once: std::collections::BTreeSet<u64>,
+        /// Range starts whose every read fails.
+        pub(crate) fail_always: std::collections::BTreeSet<u64>,
+    }
+
     /// A holder's local IPFS backend for one synthetic closure. It answers only
     /// bounded reads with the Runtime receipts a real ipfs-provider returns.
     pub(crate) struct BoundedClosureBackend {
         pub(crate) files: std::collections::BTreeMap<String, Vec<u8>>,
         pub(crate) requests: Arc<StdMutex<Vec<serde_json::Value>>>,
-        /// Fixed wait before every answer, standing in for one network round trip.
         pub(crate) delay: Duration,
-        /// When set, reads are answered one at a time, the delay included,
-        /// like a provider bridge that serializes its requests.
         pub(crate) serial: Option<tokio::sync::Mutex<()>>,
+        pub(crate) stall_once: StdMutex<std::collections::BTreeSet<u64>>,
+        pub(crate) fail_always: std::collections::BTreeSet<u64>,
     }
 
     #[async_trait::async_trait]
@@ -11281,6 +11294,13 @@ pub(crate) mod tests {
                 as u64);
             self.requests.lock().unwrap().push(logged);
             tokio::time::sleep(self.delay).await;
+            let start = request["_runtime_invocation"]["range"]["start"].as_u64();
+            if start.is_some_and(|start| self.stall_once.lock().unwrap().remove(&start)) {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+            }
+            if start.is_some_and(|start| self.fail_always.contains(&start)) {
+                return Err(ProviderError::Provider("fixture holder read failed".into()));
+            }
             if request["op"] != "cat" || request["bounded_read"] != true {
                 return Ok(serde_json::json!({"status":"error","code":"unbounded",
                     "message":"fixture holder serves bounded reads only"}));
@@ -11439,17 +11459,15 @@ pub(crate) mod tests {
         files: std::collections::BTreeMap<String, Vec<u8>>,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     ) -> HolderRuntime {
-        start_slow_content_holder_runtime(seed, files, requests, Duration::ZERO, false).await
+        start_slow_content_holder_runtime(seed, files, requests, HolderBehavior::default()).await
     }
 
-    /// As `start_content_holder_runtime`, answering each read after `delay`,
-    /// one read at a time when `serialized`.
+    /// As `start_content_holder_runtime`, answering reads as `behavior` says.
     pub(crate) async fn start_slow_content_holder_runtime(
         seed: u8,
         files: std::collections::BTreeMap<String, Vec<u8>>,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
-        delay: Duration,
-        serialized: bool,
+        behavior: HolderBehavior,
     ) -> HolderRuntime {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(ProviderRegistry::new());
@@ -11469,8 +11487,10 @@ pub(crate) mod tests {
                 Arc::new(BoundedClosureBackend {
                     files,
                     requests,
-                    delay,
-                    serial: serialized.then(|| tokio::sync::Mutex::new(())),
+                    delay: behavior.delay,
+                    serial: behavior.serialized.then(|| tokio::sync::Mutex::new(())),
+                    stall_once: StdMutex::new(behavior.stall_once),
+                    fail_always: behavior.fail_always,
                 }),
             )
             .await
