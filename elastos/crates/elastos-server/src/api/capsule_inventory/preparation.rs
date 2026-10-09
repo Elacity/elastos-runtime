@@ -649,6 +649,14 @@ fn reserve_at(
         }),
         "model retirement pending"
     );
+    // The record cap bounds live work, not history: the oldest finished
+    // attempts that own nothing make room for this one.
+    while state.records.len() >= MAX_RECORDS {
+        let Some(oldest) = prunable_record(&state) else {
+            break;
+        };
+        state.records.remove(oldest);
+    }
     ensure!(
         state.records.len() < MAX_RECORDS,
         "preparation inventory is full"
@@ -723,6 +731,37 @@ fn reserve_at(
     }
     inventory.save(&state)?;
     Ok(record)
+}
+
+/// The oldest Failed, Expired or Cancelled record that owns nothing: no kept
+/// stage, no retirement, no other record's admission and no reclaimed history
+/// (which keeps a reclaimed request from becoming a fresh preparation).
+fn prunable_record(state: &PreparationInventory) -> Option<usize> {
+    state
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            matches!(
+                record.state,
+                PreparationState::Failed | PreparationState::Expired | PreparationState::Cancelled
+            ) && state
+                .kept_stage
+                .as_ref()
+                .is_none_or(|kept| kept.operation_id != record.operation_id)
+                && state.retirement.as_ref().is_none_or(|retirement| {
+                    retirement.operation_id != record.operation_id
+                        && retirement.admission_id != record.operation_id
+                })
+                && !state.records.iter().any(|other| {
+                    other.operation_id != record.operation_id
+                        && (other.admission_id == record.operation_id
+                            || (record.admission_id == other.operation_id
+                                && other.state == PreparationState::Reclaimed))
+                })
+        })
+        .min_by_key(|(_, record)| record.created_at)
+        .map(|(index, _)| index)
 }
 
 fn set_retention(
@@ -12024,12 +12063,12 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_preparation_record_bound_and_serialization_corruption_fail_closed() {
+    fn model_preparation_serialization_corruption_fails_closed() {
         let (root, cid) = fixture();
         let context = context();
         let use_method = method("use");
         let caller = caller(&context, &use_method);
-        let record = reserve(root.path(), &caller, "req-1", &cid).unwrap();
+        reserve(root.path(), &caller, "req-1", &cid).unwrap();
         let state_path = root.path().join("model-preparation/state.json");
         let original = std::fs::read(&state_path).unwrap();
         for corrupt in [b"{".to_vec(), b"null".to_vec(), vec![b' '; 256 * 1024 + 1]] {
@@ -12050,28 +12089,79 @@ server.serve_forever()
             assert!(reserve(root.path(), &caller, "req-2", &cid).is_err());
             assert_eq!(std::fs::read(&state_path).unwrap(), corrupt);
         }
-        std::fs::write(&state_path, original).unwrap();
-        // The bounded history below contains only cancelled records. Release
-        // the live reservation's Keep claim before constructing that history.
-        retention_intent(root.path(), &context, &cid, false).unwrap();
-        let inventory = Inventory::open(root.path(), false).unwrap();
-        let mut state = inventory.load().unwrap();
-        state.records.clear();
-        for number in 0..MAX_RECORDS {
-            let mut terminal = record.clone();
-            terminal.request_binding.request_id = format!("req-{number}");
-            terminal.request_binding = binding(&terminal);
-            terminal.operation_id = operation_id(&terminal).unwrap();
-            terminal.admission_id = terminal.operation_id.clone();
-            terminal.state = PreparationState::Cancelled;
-            terminal.reserved_bytes = 0;
-            state.records.push(terminal);
+    }
+
+    /// The record cap bounds live work, not history: after 100 retries a Use
+    /// still starts, and a record owning admitted bytes or a kept stage stays.
+    #[tokio::test]
+    async fn model_preparation_record_cap_prunes_only_ownerless_finished_attempts() {
+        for owner_kind in ["kept_stage", "admitted"] {
+            let (root, owner) = if owner_kind == "kept_stage" {
+                let (root, record, _registry, _) = kept_stage_fixture().await;
+                (root, record)
+            } else {
+                let (root, mut record, _backend, _registry) =
+                    staged_fixture(now().unwrap(), true).await;
+                record.state = PreparationState::Admitted;
+                let inventory = Inventory::open(root.path(), false).unwrap();
+                let mut state = inventory.load().unwrap();
+                state.records[0] = record.clone();
+                inventory.save(&state).unwrap();
+                (root, record)
+            };
+            let context = context();
+            let (use_method, cancel_method) = (method("use"), method("cancel"));
+            for cycle in 0..100 {
+                let attempt = reserve(
+                    root.path(),
+                    &caller(&context, &use_method),
+                    &format!("retry-{cycle}"),
+                    &owner.package_cid,
+                )
+                .unwrap();
+                // A failed successor would replace the kept stage, so that
+                // case cycles through Cancel only.
+                if owner_kind == "kept_stage" || cycle % 2 == 0 {
+                    cancel(
+                        root.path(),
+                        &caller(&context, &cancel_method),
+                        &attempt.operation_id,
+                    )
+                    .unwrap();
+                } else {
+                    settle_failure(root.path(), &attempt.operation_id, true, false).unwrap();
+                }
+            }
+            let next = reserve(
+                root.path(),
+                &caller(&context, &use_method),
+                "after-100-retries",
+                &owner.package_cid,
+            )
+            .unwrap();
+            assert_eq!(next.state, PreparationState::Reserved, "{owner_kind}");
+            let state = Inventory::open(root.path(), false).unwrap().load().unwrap();
+            assert!(state.records.len() <= MAX_RECORDS);
+            let kept_owner = state
+                .records
+                .iter()
+                .find(|r| r.operation_id == owner.operation_id)
+                .unwrap_or_else(|| panic!("{owner_kind} owner was pruned"));
+            if owner_kind == "kept_stage" {
+                assert_eq!(kept_owner.state, PreparationState::Failed);
+                assert_eq!(
+                    kept_stage_owner(root.path()),
+                    Some(owner.operation_id.clone())
+                );
+                assert!(stage_weights(root.path()).exists());
+            } else {
+                assert_eq!(kept_owner.state, PreparationState::Admitted);
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .admitted(&owner.operation_id)
+                    .is_ok());
+            }
         }
-        inventory.save(&state).unwrap();
-        drop(inventory);
-        let prior = std::fs::read(&state_path).unwrap();
-        assert!(reserve(root.path(), &caller, "req-over-limit", &cid).is_err());
-        assert_eq!(std::fs::read(&state_path).unwrap(), prior);
     }
 
     #[test]

@@ -18,6 +18,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - A brief network stall no longer stops a model download. Home tries a part
   that timed out up to three more times before it stops.
+- After about 64 model downloads, retries or cancels, Home could no longer
+  get any model. Old finished attempts no longer use up that limit.
 
 ### Developer detail
 
@@ -52,6 +54,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   non-shared preparation takes it over (its own charge replaces the stage's),
   Cancel on the failed attempt removes it, or model-provider startup removes
   it after 7 days or when the current trusted catalogue no longer offers it.
+- Model preparation's 64-record cap now bounds live work only: before refusing
+  a reservation, `reserve_at` prunes the oldest Failed, Expired or Cancelled
+  records that own nothing (no kept stage, no retirement, no other record's
+  admission, no reclaimed history). Admitted, Reclaimed and live records are
+  never pruned.
 
 ## [0.8.0-alpha.12]
 
