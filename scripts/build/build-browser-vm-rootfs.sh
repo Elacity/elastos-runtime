@@ -24,7 +24,7 @@ Options:
   --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest)
   --rootfs-size SIZE          mke2fs image size (default: 4096M)
   --debian-suite SUITE        Debian suite (default: bookworm)
-  --debian-mirror URL         Debian mirror (default: https://deb.debian.org/debian)
+  --debian-mirror URL         Debian mirror (default: https://snapshot.debian.org/archive/debian/20261008T203843Z/)
 USAGE
 }
 
@@ -37,7 +37,7 @@ out_dir=""
 target_platform="${ELASTOS_BROWSER_VM_TARGET_PLATFORM:-linux-arm64}"
 rootfs_size="${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-4096M}"
 debian_suite="${ELASTOS_BROWSER_VM_DEBIAN_SUITE:-bookworm}"
-debian_mirror="${ELASTOS_BROWSER_VM_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
+debian_mirror="${ELASTOS_BROWSER_VM_DEBIAN_MIRROR:-https://snapshot.debian.org/archive/debian/20261008T203843Z/}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +74,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$out_dir" ]] || { usage >&2; exit 2; }
+
+python3 "$repo_root/scripts/build/browser-vm-debian.py" validate "$debian_suite" "$debian_mirror"
 
 image_inputs_args=(--target-platform "$target_platform" --rootfs-size "$rootfs_size"
   --debian-suite "$debian_suite" --debian-mirror "$debian_mirror" --image-dir "$out_dir")
@@ -210,12 +212,18 @@ as_root mkdir -p "$rootfs_dir"
 as_root "$debootstrap_bin" \
   --arch="$deb_arch" \
   --variant=minbase \
+  --include=ca-certificates,debian-archive-keyring \
   "$debian_suite" \
   "$rootfs_dir" \
   "$debian_mirror"
 
 as_root mkdir -p "$rootfs_dir/opt"
 as_root cp -a "$selkies_source_dir/source" "$rootfs_dir/opt/selkies-build"
+# APT authenticates the frozen indexes with Debian archive keys.
+python3 "$repo_root/scripts/build/browser-vm-debian.py" sources | as_root tee "$rootfs_dir/etc/apt/sources.list" > /dev/null
+as_root rm -f "$rootfs_dir/etc/apt/sources.list.d/"*
+chromium_packages=$(python3 "$repo_root/scripts/build/browser-vm-debian.py" packages)
+python3 "$repo_root/scripts/build/browser-vm-debian.py" python-requirements | as_root tee "$rootfs_dir/opt/elastos-python-requirements.txt" > /dev/null
 
 as_root mount -t proc proc "$rootfs_dir/proc"
 as_root mount -t sysfs sysfs "$rootfs_dir/sys"
@@ -243,13 +251,14 @@ echo "[browser-vm-rootfs] install Browser guest packages"
 as_root chroot "$rootfs_dir" /usr/bin/env \
   DEBIAN_FRONTEND=noninteractive \
   KERNEL_PACKAGE="$kernel_package" \
+  CHROMIUM_PACKAGES="$chromium_packages" \
   /bin/sh <<'SH'
 set -eu
 apt-get update -qq
-apt-get install --no-install-recommends -y -qq \
+set -- \
   busybox-static \
   ca-certificates \
-  chromium \
+  $CHROMIUM_PACKAGES \
   dbus \
   fontconfig \
   fonts-dejavu-core \
@@ -301,9 +310,20 @@ apt-get install --no-install-recommends -y -qq \
   xvfb \
   wireplumber \
   "$KERNEL_PACKAGE"
-# Preserve the former Selkies dependency set as a separate freezing step.
-CC=gcc python3 -m pip install --break-system-packages --no-cache-dir -q \
-  websockets basicauth gputil prometheus_client msgpack pynput psutil watchdog Pillow python-xlib
+printf '%s\n' "$@" > /opt/elastos-apt-packages
+apt-get install --download-only --no-install-recommends -y -qq "$@"
+SH
+# Verify the exact Chromium payloads before dpkg executes their contents.
+python3 "$repo_root/scripts/build/browser-vm-debian.py" verify-cache "$rootfs_dir/var/cache/apt/archives"
+as_root chroot "$rootfs_dir" /usr/bin/env DEBIAN_FRONTEND=noninteractive /bin/sh <<'SH'
+set -eu
+xargs apt-get install --no-download --no-install-recommends -y -qq < /opt/elastos-apt-packages
+rm /opt/elastos-apt-packages
+# Source archives use the Debian-pinned compiler/setuptools; dependency resolution
+# is explicit and every accepted wheel/source archive has a committed checksum.
+CC=gcc python3 -m pip install --break-system-packages --no-cache-dir --no-build-isolation \
+  --require-hashes --no-deps -q -r /opt/elastos-python-requirements.txt
+rm /opt/elastos-python-requirements.txt
 CC=gcc python3 -m pip install --break-system-packages --no-cache-dir -q \
   --no-index --no-deps --no-build-isolation /opt/selkies-build
 mv /opt/selkies-build/gst-web /opt/gst-web

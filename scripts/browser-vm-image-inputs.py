@@ -22,13 +22,16 @@ INPUTS = (
     "elastos/tools/browser-vm-runtime-relay",
     "elastos/tools/browser-vm-guest-control-bridge",
     "rust-toolchain.toml",
+    "scripts/build/browser-vm-debian-lock.json",
+    "scripts/build/browser-vm-debian.py",
+    "scripts/build/browser-vm-python-lock.json",
 )
-REQUIRED_FILES = INPUTS[:8] + ("rust-toolchain.toml",) + tuple(
+REQUIRED_FILES = INPUTS[:8] + INPUTS[12:] + tuple(
     tool + "/" + name for tool in INPUTS[9:12] for name in ("Cargo.toml", "Cargo.lock", "src/main.rs")
 )
 
 DEFAULT_OPTIONS = {"target_platform": "linux-arm64", "rootfs_size": "4096M",
-                   "debian_suite": "bookworm", "debian_mirror": "https://deb.debian.org/debian",
+                   "debian_suite": "bookworm", "debian_mirror": "https://snapshot.debian.org/archive/debian/20261008T203843Z/",
                    "cdp_timeout_ms": "20000"}
 
 
@@ -86,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-platform", default="linux-arm64")
     parser.add_argument("--rootfs-size", default="4096M")
     parser.add_argument("--debian-suite", default="bookworm")
-    parser.add_argument("--debian-mirror", default="https://deb.debian.org/debian")
+    parser.add_argument("--debian-mirror", default="https://snapshot.debian.org/archive/debian/20261008T203843Z/")
     parser.add_argument("--image-dir", type=Path)
     args = parser.parse_args()
     try:
