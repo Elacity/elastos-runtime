@@ -81,10 +81,11 @@ configuration authority is the signer explicitly named in
 host identities keep their separate roles.
 
 The production Community network's profile signer is the release maintainer
-DID. Runtime checks each signing role separately: the signed release pins the
-file's CID and its signer set, and profile signatures use their own domain,
-`elastos.collaboration-network.profile.v1`. Production profiles are signed by
-the approved offline release custodian outside CI.
+DID. Profile signatures use their own domain,
+`elastos.collaboration-network.profile.v1`. After the separately reviewed
+Community network-pin support is integrated, Runtime checks the startup file's
+CID and approved signer set through the signed release. The approved offline
+release custodian signs production profiles outside CI.
 
 The existing release-signing interface, `scripts/release-signer.py`, uses the
 custodian's Ed25519 PEM key through OpenSSL. The `collaboration-config` file
