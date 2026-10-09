@@ -151,10 +151,10 @@ elastos collaboration-config verify \
   --input /path/to/new-community-output/collaboration-network-release-v1.json
 ```
 
-After that check, include the exact startup file and pin in unsigned release
-preparation. The existing release operation binds those bytes into the signed
-release. Profile signing creates inert files; publication and activation use
-their own explicit operator approval.
+After that check, release preparation requires the separately reviewed
+Community network-pin support to bind the exact startup file and pin into
+the signed release. Profile signing creates inert files; publication and
+activation use their own explicit operator approval.
 
 For an isolated test fixture, create a disposable authority key as a separate
 explicit action. Give the fixture an owner and cleanup condition, keep its trust
