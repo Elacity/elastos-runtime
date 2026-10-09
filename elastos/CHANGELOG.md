@@ -6,26 +6,6 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
-### Fixed
-
-- An update made by an older version could leave out the release's signed model
-  list, or keep the previous one, after which Home, Undo and later updates stopped
-  with "Installed release inputs require repair". Home, Update and Undo now fetch
-  the release's own signed model list from your trusted source and continue.
-  Without a connection, Home still starts and Local AI says the list could not be
-  fetched; Update and Undo say so and change nothing. Connect and try again.
-- Update and Undo now carry the signed model list with the release's other
-  files, in Terminal and in System, so a release with a new model list installs
-  cleanly and Undo puts back the previous list.
-- An Undo that stopped halfway could leave one component from the other release,
-  or none, after which Update, Undo and `elastos setup` refused to continue.
-  Home, Update and Undo now put back this release's signed copy, and
-  `elastos update` does so even when no newer release exists. Replacing a
-  component folder no longer removes the old one first.
-- `elastos setup` fetched the newest release's components and model list by
-  name, so setting up an older release failed. It now fetches that release's own
-  files by their signed IDs.
-
 ## [0.8.0-alpha.13]
 
 Test-channel release. Signed releases show these notes in System before you update.
@@ -52,12 +32,23 @@ If your Home is on 0.8.0-alpha.10 or older, update it once from Terminal with
 
 ### Fixed
 
-- After updating into a release with a model list, Undo and later updates no
-  longer refuse with "Installed release inputs require repair". Home, Update and
-  Undo now restore any missing or wrong release file from the signed release
-  first, including after an interrupted update or Undo.
-- Updates now install the model list of the release you update to, and Undo puts
-  the previous one back.
+- An update made by an older version could leave out the release's signed model
+  list, after which Home, Undo and later updates stopped with "Installed release
+  inputs require repair". Home, Update and Undo now fetch the release's own
+  signed model list from your trusted source and continue. Without a connection,
+  Home still starts and Local AI says the list could not be fetched; Update and
+  Undo say so and change nothing.
+- Update and Undo now carry the signed model list with the release's other
+  files, in Terminal and in System, so a release with a new model list installs
+  cleanly and Undo puts back the previous list.
+- An Undo that stopped halfway could leave one component from the other release,
+  after which Update, Undo and `elastos setup` refused to continue. Home, Update
+  and Undo now put back this release's signed copy, and `elastos update` does so
+  even when no newer release exists. Replacing a component folder no longer
+  removes the old one first.
+- `elastos setup` fetched the newest release's components by name, so setting up
+  an older release failed. It now fetches that release's own files by their
+  signed IDs.
 - A brief network stall no longer stops a model download. Home tries a part
   that timed out up to three more times before it stops.
 - After about 64 model downloads, retries or cancels, Home could no longer get
