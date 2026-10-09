@@ -581,15 +581,7 @@ impl SignedSetupMetadata {
     fn install(&self, data_dir: &Path) -> anyhow::Result<()> {
         // Admission of both inputs precedes the first metadata or component write.
         if let Some(bytes) = &self.catalog {
-            atomic_write_file(&data_dir.join(MODEL_CATALOG_FILE), bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    data_dir.join(MODEL_CATALOG_FILE),
-                    fs::Permissions::from_mode(0o600),
-                )?;
-            }
+            write_model_catalog_file(&data_dir.join(MODEL_CATALOG_FILE), bytes)?;
         }
         atomic_write_file(&data_dir.join("components.json"), &self.components)
     }
@@ -621,16 +613,13 @@ async fn admit_installed_setup_metadata(
         .as_u64()
         .filter(|size| (1..=4 * 1024 * 1024).contains(size))
         .ok_or_else(|| anyhow::anyhow!("signed components size is missing or exceeds its bound"))?;
-    let path = format!(
-        "components-{}.json",
-        crate::update::detect_release_platform()
-    );
+    let cid = descriptor["cid"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("signed components CID is missing"))?;
+    // The live source names only its newest release; a signed CID names this one.
     let client = crate::carrier::CarrierClient::connect_trusted_source(source, 15).await?;
     let result = async {
-        let mut components = Vec::with_capacity(size as usize);
-        client
-            .fetch_file_to(&path, &mut components, size, &mut |_, _| Ok(()))
-            .await?;
+        let components = client.fetch_content_bounded(cid, size as usize).await?;
         crate::installed_release::admit_descriptor(
             descriptor,
             &hex::encode(sha2::Sha256::digest(&components)),
@@ -639,12 +628,9 @@ async fn admit_installed_setup_metadata(
         let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
         let catalog = if let Some(trust) = &manifest.model_catalog {
             let bytes = client
-                .fetch_file_bounded(MODEL_CATALOG_FILE, MAX_MODEL_CATALOG_BYTES)
+                .fetch_content_bounded(&trust.head_cid, MAX_MODEL_CATALOG_BYTES)
                 .await?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            crate::api::capsule_inventory::verify_model_catalog(trust, &bytes, now)?;
+            verify_pinned_model_catalog(trust, &bytes)?;
             Some(bytes)
         } else {
             None
@@ -2754,6 +2740,117 @@ pub(crate) fn install_signed_model_catalog(
     Ok(())
 }
 
+const MODEL_CATALOG_UNAVAILABLE: &str = "The signed model catalogue for this release could not be fetched from the trusted source over Carrier. Nothing was changed. Connect to the internet and try again.";
+
+/// Installed custody keeps the pinned signed snapshot; offer discovery checks expiry
+/// at the current time.
+pub(crate) fn verify_pinned_model_catalog(
+    trust: &ModelCatalogConfig,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let envelope: serde_json::Value = serde_json::from_slice(bytes)?;
+    let published_at = envelope["payload"]["published_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("model catalog publication time is missing"))?;
+    crate::api::capsule_inventory::verify_model_catalog(trust, bytes, published_at)?;
+    Ok(())
+}
+
+fn installed_model_catalog_matches(path: &Path, trust: &ModelCatalogConfig) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_MODEL_CATALOG_BYTES as u64)
+        && fs::read(path).is_ok_and(|bytes| verify_catalog_head(&trust.head_cid, &bytes).is_ok())
+}
+
+fn write_model_catalog_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_file(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+async fn fetch_pinned_model_catalog(
+    trust: &ModelCatalogConfig,
+    fetch: &crate::update::FetchFn,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = fetch(trust.head_cid.clone(), Vec::new())
+        .await
+        .map_err(|error| error.context(MODEL_CATALOG_UNAVAILABLE))?;
+    verify_pinned_model_catalog(trust, &bytes)?;
+    Ok(bytes)
+}
+
+/// Completes the installed release's own support before admission: an older updater
+/// left out its pinned catalogue or kept the previous one, or an interrupted Undo left
+/// another release's component. Only the signed components name what is fetched, by
+/// CID from the trusted source. The caller holds the installation writer.
+pub(crate) async fn repair_installed_support(
+    data_dir: &Path,
+    binary: &Path,
+    source: &crate::sources::TrustedSource,
+    repair_version: bool,
+    fetch: &crate::update::FetchFn,
+    carrier_context: FirstPartyCarrierContext,
+) -> anyhow::Result<()> {
+    let components =
+        crate::installed_release::read_signed_components(data_dir, binary, source, repair_version)?;
+    let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    if let Some(trust) = &manifest.model_catalog {
+        let dest = data_dir.join(MODEL_CATALOG_FILE);
+        if !installed_model_catalog_matches(&dest, trust) {
+            let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
+            write_model_catalog_file(&dest, &bytes)?;
+            println!(
+                "  Restored the signed model catalogue for this release: {}",
+                dest.display()
+            );
+        }
+    }
+    // Boxed: the update state machine already carries the target's own refresh.
+    let repaired = Box::pin(refresh_installed_components_for_update_in_context(
+        data_dir,
+        Some(&components),
+        &components,
+        &detect_platform(),
+        carrier_context,
+    ))
+    .await?;
+    if !repaired.is_empty() {
+        println!(
+            "  Repaired installed support from this release: {}",
+            repaired.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The target release's catalogue joins its staged support, so Undo restores the
+/// previous file. A target without a pin removes a present file.
+pub(crate) async fn stage_model_catalog(
+    data_dir: &Path,
+    new: &ComponentsManifest,
+    stage: &Path,
+    fetch: &crate::update::FetchFn,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let relative = PathBuf::from(MODEL_CATALOG_FILE);
+    let installed = data_dir.join(MODEL_CATALOG_FILE);
+    let Some(trust) = &new.model_catalog else {
+        return Ok(fs::symlink_metadata(&installed)
+            .is_ok()
+            .then(|| (relative, PathBuf::new())));
+    };
+    if installed_model_catalog_matches(&installed, trust) {
+        return Ok(None);
+    }
+    let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
+    let dest = stage.join(MODEL_CATALOG_FILE);
+    write_model_catalog_file(&dest, &bytes)?;
+    Ok(Some((relative, dest)))
+}
+
 // ── List mode ───────────────────────────────────────────────────────
 
 fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &str) {
@@ -3155,20 +3252,19 @@ fn plan_update_support<'a>(
                 .profiles
                 .get("home")
                 .is_some_and(|profile| profile.components.contains(name));
-        let installed = !matches!(
-            component_install_state_for_name(
-                old,
-                data_dir,
-                name,
-                old_component.unwrap_or(component),
-                old_component.and_then(|old| resolve_platform_info(old, platform))
-            ),
-            InstallState::Missing
+        let state = component_install_state_for_name(
+            old,
+            data_dir,
+            name,
+            old_component.unwrap_or(component),
+            old_component.and_then(|old| resolve_platform_info(old, platform)),
         );
-        if !installed && !required {
+        if matches!(state, InstallState::Missing) && !required {
             continue;
         }
-        let artifact = !installed
+        // An interrupted Undo can leave another release's bytes under an unchanged
+        // description; those are replaced like a changed component.
+        let artifact = !matches!(state, InstallState::Installed)
             || component_signature(old_component, platform)
                 != component_signature(Some(component), platform);
         let metadata = component.capsule_metadata.is_some()
@@ -3482,6 +3578,11 @@ pub(crate) async fn stage_update_support(
         fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", entry.cid))?;
         write_artifact_sha256_receipt(&dest, &entry.sha256)?;
         paths.insert(relative, dest);
+    }
+    if let Some((relative, source)) =
+        stage_model_catalog(data_dir, &new, stage.path(), fetch).await?
+    {
+        paths.insert(relative, source);
     }
     // Journal the first absent parent as one tree. Recovery then removes a new
     // bundle's directories as well as its files, preserving the old support set.
@@ -7865,7 +7966,24 @@ pub(crate) mod tests {
         let endpoint = server.clone();
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
-        let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
+        // Every signed input is fetched by its CID; the source's newest names never apply.
+        let names = HashMap::from([
+            (
+                catalog_head_cid(b"Carrier component").unwrap(),
+                "effect".to_owned(),
+            ),
+            (
+                catalog_head_cid(&components).unwrap(),
+                format!(
+                    "components-{}.json",
+                    crate::update::detect_release_platform()
+                ),
+            ),
+            (
+                catalog_head_cid(&catalog).unwrap(),
+                MODEL_CATALOG_FILE.to_owned(),
+            ),
+        ]);
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -7878,13 +7996,11 @@ pub(crate) mod tests {
                         .await
                         .unwrap();
                     let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    // The signed component CID is fetched by CID, not by its release name.
-                    if request["op"] == "content_fetch" {
-                        assert_eq!(request["cid"], effect_cid);
-                        request["path"] = "effect".into();
-                    } else {
-                        assert_ne!(request["path"], "effect", "signed CID fetched by name");
-                    }
+                    assert_eq!(
+                        request["op"], "content_fetch",
+                        "signed input fetched by name"
+                    );
+                    request["path"] = names[request["cid"].as_str().unwrap()].clone().into();
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
                             .is_err(),

@@ -3486,6 +3486,59 @@ async fn staged_support_skips_linux_only_home_component_on_darwin() {
 }
 
 #[tokio::test]
+async fn staged_support_replaces_a_component_left_by_an_interrupted_undo() {
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release();
+    publish_retained_receipt(&fixture);
+    let mut owner = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: None,
+        request: None,
+        previous_binary_sha256: digest(b"signed fixture Runtime"),
+        previous_version: "0.7.0".into(),
+        generation: String::new(),
+        host_ready: false,
+        carrier: None,
+        carrier_close: None,
+        test_readiness: None,
+    };
+    // The description is unchanged; the installed bytes are another release's.
+    fs::create_dir(fixture.data.join("bin")).unwrap();
+    fixture.file(
+        &fixture.data.join("bin/fixture-provider"),
+        b"previous release support",
+        0o755,
+    );
+    let signed = b"this release support";
+    let cid = raw_cid(signed);
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
+        "external":{"fixture-provider":{"install_path":"bin/fixture-provider", "platforms":{
+            (crate::setup::detect_platform()): {"cid":cid, "checksum":format!("sha256:{}", digest(signed)), "size":signed.len()}
+        }}}
+    }))
+    .unwrap();
+    let fetch: crate::update::FetchFn = Box::new(move |key, _| {
+        assert_eq!(key, cid);
+        Box::pin(async move { Ok(signed.to_vec()) })
+    });
+    let (_stage, paths) = crate::setup::stage_update_support(
+        &fixture.data,
+        &components,
+        &components,
+        &crate::setup::detect_platform(),
+        &fetch,
+        &mut owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].0, Path::new("bin/fixture-provider"));
+    assert_eq!(fs::read(&paths[0].1).unwrap(), signed);
+}
+
+#[tokio::test]
 async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restarts_once() {
     for outcome in [
         "head fetch",
@@ -3515,6 +3568,9 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         "restored",
         "optional restored",
         "optional moved restored",
+        "catalogue",
+        "catalogue restored",
+        "catalogue fetch",
     ] {
         let fixture = PrivateFixture::new();
         fs::create_dir(fixture.data.join("bin")).unwrap();
@@ -3627,6 +3683,22 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 "platforms":{"*":{"strategy":"local-copy", "checksum":format!("sha256:{}", digest(b"metadata"))}}
             });
         }
+        let [old_catalogue, catalogue] = [1, 2].map(|published_at| {
+            let mut payload = crate::api::capsule_inventory::tests::model_catalog_fixture();
+            payload["published_at"] = json!(published_at);
+            crate::api::capsule_inventory::tests::sign_model_catalog(&payload)
+        });
+        let catalogue_cid = catalogue.0.head_cid.clone();
+        if outcome.starts_with("catalogue") {
+            // The next release pins a new signed catalogue.
+            old_value["model_catalog"] = serde_json::to_value(&old_catalogue.0).unwrap();
+            value["model_catalog"] = serde_json::to_value(&catalogue.0).unwrap();
+            fixture.file(
+                &fixture.data.join("model-catalog.json"),
+                &old_catalogue.1,
+                0o600,
+            );
+        }
         let old_components = serde_json::to_vec(&old_value).unwrap();
         let components = serde_json::to_vec(&value).unwrap();
         fixture.publish_installed_release_with_components(&old_components);
@@ -3707,6 +3779,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             (raw_cid(&components), components),
             (support_cid.clone(), support),
             (app_cid.clone(), app),
+            (catalogue_cid.clone(), catalogue.1.clone()),
         ]);
         let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
             if [
@@ -3736,6 +3809,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                 "binary" => binary_fetch,
                 "support" => support_fetch,
                 "app" => app_fetch,
+                "catalogue" => cid == catalogue_cid,
                 _ => false,
             };
             Box::pin(async move {
@@ -3780,7 +3854,8 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         .await;
         owner.controller.publish_apply_result(&result).unwrap();
         let status = status(&fixture.data).unwrap().unwrap();
-        if ["updated", "support path", "moved", "bundle"].contains(&outcome) {
+        let updated = ["updated", "support path", "moved", "bundle", "catalogue"];
+        if updated.contains(&outcome) {
             result.unwrap();
             assert_eq!(
                 fs::read(fixture.data.join("capsules/fixture-app/capsule.json")).unwrap(),
@@ -3894,7 +3969,19 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             "{outcome}"
         );
         assert!(!fixture.data.join(".elastos.update-support").exists());
-        if !["updated", "support path", "moved", "bundle"].contains(&outcome) {
+        if outcome.starts_with("catalogue") {
+            // The catalogue moves with the release; a refused or restored update keeps the old one.
+            assert_eq!(
+                &fs::read(fixture.data.join("model-catalog.json")).unwrap(),
+                if outcome == "catalogue" {
+                    &catalogue.1
+                } else {
+                    &old_catalogue.1
+                },
+                "{outcome}"
+            );
+        }
+        if !updated.contains(&outcome) {
             assert_eq!(
                 fs::read(fixture.data.join("capsules/fixture-app/capsule.json")).unwrap(),
                 b"old app"

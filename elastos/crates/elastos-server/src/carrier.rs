@@ -8369,6 +8369,15 @@ impl CarrierClient {
             .await
     }
 
+    pub(crate) async fn fetch_content_bounded(
+        &self,
+        cid: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let msg = serde_json::json!({"op": "content_fetch", "cid": cid});
+        self.fetch_bytes(msg, "content fetch", cid, max_bytes).await
+    }
+
     /// Sends `msg` and reads its length-prefixed reply. Every phase is
     /// bounded, none by total time: the request and each body read get
     /// `DOWNLOAD_IDLE_TIMEOUT`, and the source gets `DOWNLOAD_HEADER_WAIT` to

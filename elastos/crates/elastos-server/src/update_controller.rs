@@ -564,7 +564,7 @@ fn first_start_without_controller_authority(data: &Path) -> Result<bool> {
 }
 
 /// Used by the existing Home browser entry. Source Homes keep their current launcher.
-pub fn enter_browser_home() -> Result<()> {
+pub async fn enter_browser_home() -> Result<()> {
     if std::env::var(HOST_ENV).as_deref() == Ok("1") {
         return Ok(());
     }
@@ -578,6 +578,9 @@ pub fn enter_browser_home() -> Result<()> {
     }
     let data = fs::canonicalize(data)?;
     let binary = fs::canonicalize(current)?;
+    if !crate::install_transaction::InstallTransaction::has_pending_recovery(&binary) {
+        repair_installed_support(&data, &binary, &source).await?;
+    }
     let Some(ControllerBootstrap {
         directory,
         lease,
@@ -641,6 +644,42 @@ pub fn enter_browser_home() -> Result<()> {
         libc::close(inherited);
     }
     Err(error.into())
+}
+
+/// An older updater or an interrupted Undo can leave this release's support
+/// incomplete; Home would refuse to start. The installation writer owns the repair.
+async fn repair_installed_support(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+) -> Result<()> {
+    let _writer = crate::install_transaction::InstallationGuard::acquire(
+        binary
+            .parent()
+            .context("installed Runtime parent missing")?,
+    )?;
+    let owned = data.to_path_buf();
+    let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+        let data = owned.clone();
+        Box::pin(async move {
+            crate::setup::fetch_first_party_component_via_carrier(
+                &data,
+                Some(&cid),
+                "model-catalog.json",
+                crate::setup::FirstPartyCarrierContext::Runtime,
+            )
+            .await
+        })
+    });
+    crate::setup::repair_installed_support(
+        data,
+        binary,
+        source,
+        false,
+        &fetch,
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .await
 }
 
 pub async fn run(receipt_path: PathBuf) -> Result<()> {

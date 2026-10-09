@@ -1616,6 +1616,15 @@ async fn run_upgrade_with_restart(
             transaction.uses_consumed_layout(),
             "Legacy recovery finished. Run the update again before preparing its new release."
         );
+        crate::setup::repair_installed_support(
+            transaction.data_dir(),
+            transaction.binary_path(),
+            source,
+            repair_version,
+            fetch_fn,
+            carrier_context,
+        )
+        .await?;
         let previous = crate::installed_release::read_without_migration_for_update(
             transaction.data_dir(),
             transaction.binary_path(),
@@ -1627,6 +1636,15 @@ async fn run_upgrade_with_restart(
         let old_components = std::fs::read(data_dir.join("components.json")).ok();
         let changed_capsules =
             changed_capsule_names(old_components.as_deref(), &comp_data).unwrap_or_default();
+        let new_manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
+        let catalog_stage = tempfile::tempdir_in(data_dir)?;
+        let catalog = crate::setup::stage_model_catalog(
+            data_dir,
+            &new_manifest,
+            catalog_stage.path(),
+            fetch_fn,
+        )
+        .await?;
         // Prepare all five original backups before the first live artifact changes.
         // Build gateway list with working gateway first (if discovered via gateway)
         let save_gateways = if ordered_gateways.is_empty() && working_gateway.is_none() {
@@ -1681,6 +1699,12 @@ async fn run_upgrade_with_restart(
             repair_version,
         )?;
         transaction.prepare(&files)?;
+        if let Some(entry) = &catalog {
+            if let Err(error) = transaction.prepare_support(std::slice::from_ref(entry)) {
+                transaction.abort()?;
+                return Err(error);
+            }
+        }
         let activation = transaction.activate_artifacts_for_support()?;
         println!("  Installed binary: {}", bin_path.display());
         println!("  Installed binary verified (version ✓)");
@@ -1786,6 +1810,15 @@ async fn run_upgrade_with_restart(
         transaction.uses_consumed_layout(),
         "Legacy recovery finished. Run the update again before preparing its new release."
     );
+    crate::setup::repair_installed_support(
+        transaction.data_dir(),
+        transaction.binary_path(),
+        source,
+        repair_version,
+        fetch_fn,
+        carrier_context,
+    )
+    .await?;
     let previous = crate::installed_release::read_without_migration_for_update(
         transaction.data_dir(),
         transaction.binary_path(),
@@ -3209,6 +3242,32 @@ mod tests {
         repair_invalid_version: bool,
         rollback: bool,
     ) -> anyhow::Result<()> {
+        apply_signed_fixture_serving(
+            data_dir,
+            executable,
+            components,
+            mode,
+            version,
+            repair_invalid_version,
+            rollback,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// `support` adds CID-named bytes the source holds; other CIDs are unavailable.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_signed_fixture_serving(
+        data_dir: &Path,
+        executable: &[u8],
+        components: &[u8],
+        mode: ApplyMode,
+        version: &str,
+        repair_invalid_version: bool,
+        rollback: bool,
+        support: Vec<(String, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
         use sha2::Digest;
 
         let binary_cid = raw_cid(executable);
@@ -3234,16 +3293,20 @@ mod tests {
         head["version"] = serde_json::json!(version);
         let head_bytes = binding_envelope(head, "elastos.release.head.v1");
         let head_cid = raw_cid(&head_bytes);
-        let artifacts = std::collections::HashMap::from([
+        let mut artifacts = std::collections::HashMap::from([
             (head_cid.clone(), head_bytes),
             (release_cid.clone(), release),
             (binary_cid, executable.to_vec()),
             (components_cid, components.to_vec()),
         ]);
+        artifacts.extend(support);
         let fetch: FetchFn = Box::new(move |cid, gateways| {
             assert!(gateways.is_empty(), "fixture must use only its CID fetcher");
-            let bytes = artifacts.get(&cid).expect("unexpected fixture CID").clone();
-            Box::pin(async move { Ok(bytes) })
+            let bytes = artifacts
+                .get(&cid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("source unavailable for {cid}"));
+            Box::pin(async move { bytes })
         });
         run_update_for_data_dir_with_mode(
             data_dir,
@@ -3329,6 +3392,157 @@ mod tests {
         save_trusted_sources(&data, &sources).unwrap();
         publish_installed_fixture(&data, &binary, &source, components);
         (fixture, data, binary, source)
+    }
+
+    #[cfg(unix)]
+    fn signed_catalogue(published_at: u64) -> (String, serde_json::Value, Vec<u8>) {
+        let mut payload = crate::api::capsule_inventory::tests::model_catalog_fixture();
+        payload["published_at"] = serde_json::json!(published_at);
+        let (trust, bytes) = crate::api::capsule_inventory::tests::sign_model_catalog(&payload);
+        (
+            trust.head_cid.clone(),
+            serde_json::to_value(trust).unwrap(),
+            bytes,
+        )
+    }
+
+    #[cfg(unix)]
+    fn components_pinning(trust: Option<&serde_json::Value>) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "schema":"elastos.components/v1","external":{},"profiles":{},"capsules":{}
+        });
+        if let Some(trust) = trust {
+            value["model_catalog"] = trust.clone();
+        }
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn admit_installed(data: &Path, binary: &Path) {
+        let installed = load_trusted_sources(data)
+            .unwrap()
+            .default_source()
+            .unwrap()
+            .clone();
+        crate::installed_release::read_without_migration(
+            data,
+            &binary.canonicalize().unwrap(),
+            &installed,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_update_installs_the_target_catalogue_and_undo_restores_the_previous_one() {
+        let (a_cid, a_trust, a) = signed_catalogue(1);
+        let (b_cid, b_trust, b) = signed_catalogue(2);
+        let pinned_a = components_pinning(Some(&a_trust));
+        let (_fixture, data, binary, _source) = default_apply_fixture(&pinned_a);
+        let catalogue = data.join("model-catalog.json");
+        std::fs::write(&catalogue, &a).unwrap();
+
+        // The next release pins a new catalogue.
+        apply_signed_fixture_serving(
+            &data,
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n",
+            &components_pinning(Some(&b_trust)),
+            ApplyMode::Normal,
+            "0.7.1",
+            false,
+            false,
+            vec![(b_cid, b.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&catalogue).unwrap(), b);
+        admit_installed(&data, &binary);
+
+        // Undo across the pin change.
+        apply_signed_fixture_serving(
+            &data,
+            b"#!/bin/sh\nprintf 'elastos 0.6.9\\n'\n",
+            &pinned_a,
+            ApplyMode::Normal,
+            "0.6.9",
+            false,
+            true,
+            vec![(a_cid, a.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&catalogue).unwrap(), a);
+        admit_installed(&data, &binary);
+
+        // Undo to a release without a pin leaves no catalogue behind.
+        apply_signed_fixture_serving(
+            &data,
+            b"#!/bin/sh\nprintf 'elastos 0.6.8\\n'\n",
+            &components_pinning(None),
+            ApplyMode::Normal,
+            "0.6.8",
+            false,
+            true,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!catalogue.exists());
+        admit_installed(&data, &binary);
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_restores_a_missing_pinned_catalogue_and_offline_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cid, trust, bytes) = signed_catalogue(1);
+        let components = components_pinning(Some(&trust));
+        // An older updater installed this release without its pinned catalogue.
+        let (_fixture, data, binary, _source) = default_apply_fixture(&components);
+        let catalogue = data.join("model-catalog.json");
+        let executable = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
+        let previous = std::fs::read(&binary).unwrap();
+
+        let error = apply_signed_fixture_serving(
+            &data,
+            executable,
+            &components,
+            ApplyMode::Normal,
+            "0.7.1",
+            false,
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Connect to the internet and try again"),
+            "{error:#}"
+        );
+        assert!(!catalogue.exists());
+        assert_eq!(std::fs::read(&binary).unwrap(), previous);
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+
+        apply_signed_fixture_serving(
+            &data,
+            executable,
+            &components,
+            ApplyMode::Normal,
+            "0.7.1",
+            false,
+            false,
+            vec![(cid, bytes.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&catalogue).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&catalogue).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&binary).unwrap(), executable);
+        admit_installed(&data, &binary);
     }
 
     #[cfg(unix)]

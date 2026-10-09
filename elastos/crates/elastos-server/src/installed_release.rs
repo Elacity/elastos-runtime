@@ -161,6 +161,47 @@ pub(crate) fn read_without_migration_for_update(
     }
 }
 
+/// The installed signed components, before their support is admitted. Repair of a
+/// missing catalogue or a mismatched component trusts only these bytes.
+pub(crate) fn read_signed_components(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    repair_version: bool,
+) -> Result<Vec<u8>> {
+    require_no_pending(binary)?;
+    require_current_source(data, source)?;
+    let private = consumed_present(data)?;
+    let (head, release) = if private {
+        (
+            installation_release_head_path(data),
+            installation_release_manifest_path(data),
+        )
+    } else {
+        (
+            publisher_release_head_path(data),
+            publisher_release_manifest_path(data),
+        )
+    };
+    let (_, release) = read_pair_and_binary(
+        data,
+        binary,
+        source,
+        &head,
+        &release,
+        private,
+        repair_version,
+    )?;
+    let components = read_regular(&data.join("components.json"), MAX_COMPONENTS, false)?;
+    admit_descriptor(
+        &release["payload"]["platforms"][crate::update::detect_release_platform()]["components"],
+        &hex::encode(Sha256::digest(&components)),
+        components.len() as u64,
+    )
+    .context(REPAIR)?;
+    Ok(components)
+}
+
 /// Setup holds this guard while it obtains signed support for an installed binary.
 /// Its authority starts with Runtime's private pair, before support is present.
 pub(crate) fn read_for_setup(
@@ -456,13 +497,7 @@ fn admit_support(data: &Path, binary: &Path, components: &[u8]) -> Result<()> {
     }
     if let Some(trust) = &manifest.model_catalog {
         let bytes = read_regular(&data.join("model-catalog.json"), 128 * 1024, false)?;
-        let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let published_at = envelope["payload"]["published_at"]
-            .as_u64()
-            .context("Installed catalogue publication time is missing")?;
-        // Installed custody retains the signed snapshot. Current offer discovery
-        // continues to enforce its expiry at the current time.
-        crate::api::capsule_inventory::verify_model_catalog(trust, &bytes, published_at)?;
+        crate::setup::verify_pinned_model_catalog(trust, &bytes)?;
     }
     if manifest.external.contains_key("home") || manifest.capsules.contains_key("home") {
         let document = crate::api::browser_capsules::installed_home_document(data)
