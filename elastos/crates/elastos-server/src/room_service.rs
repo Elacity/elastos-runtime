@@ -2950,9 +2950,9 @@ pub(crate) fn collaboration_room_poll(
     since: u64,
 ) -> anyhow::Result<RoomPollView> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
-    with_locked_state(data_dir, |_, state| {
+    with_expired_read_state(data_dir, |state| {
         let (display_name, expires_at, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session_for_read(state, token)?;
             (
                 session.display_name.clone(),
                 session.expires_at,
@@ -3333,6 +3333,25 @@ fn validate_session<'a>(
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     ensure_session_actor_id(session);
+    if !session
+        .capabilities
+        .iter()
+        .any(|capability| capability == ROOM_ACCESS_CAPABILITY)
+    {
+        anyhow::bail!("session is not approved for room access");
+    }
+    Ok(session)
+}
+
+fn validate_session_for_read<'a>(
+    state: &'a RoomState,
+    token: &str,
+) -> anyhow::Result<&'a SessionRecord> {
+    let session = state
+        .sessions
+        .iter()
+        .find(|item| item.token == token && item.expires_at > now_ts())
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     if !session
         .capabilities
         .iter()
@@ -5342,6 +5361,29 @@ mod tests {
             }
         }
         snapshot
+    }
+
+    fn room_state_file_metadata(data_dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = storage_paths(data_dir).unwrap();
+        [
+            paths.room_meta_path,
+            paths.control_path,
+            paths.members_path,
+            paths.invites_path,
+            paths.key_epochs_path,
+            paths.pair_requests_path,
+            paths.sessions_path,
+            paths.objects_path,
+            paths.uploads_path,
+        ]
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).unwrap();
+            (path, metadata.ino(), metadata.modified().unwrap())
+        })
+        .collect()
     }
 
     fn assert_meaningful_bootstrap_state_rejects_adoption(
@@ -7692,6 +7734,148 @@ mod tests {
         assert!(empty_state.invites.is_empty());
         assert!(empty_state.sessions.is_empty());
         assert_eq!(empty_state.objects.len(), 1);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_preserves_store_bytes_and_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = start_configured_collaboration_principal_session(
+            tmp.path(),
+            "did:key:z6configured",
+            "principal-one",
+            "Alice",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "did:key:z6configured".to_string(),
+            display_name: "Alice".to_string(),
+            handle: None,
+            updated_at: now_ts(),
+        };
+        let object = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &profile,
+            "configured message",
+            now_ts(),
+            Some(&session.token),
+        )
+        .unwrap();
+        let before = room_state_snapshot(tmp.path());
+        let metadata_before = room_state_file_metadata(tmp.path());
+        assert_eq!(metadata_before.len(), 9);
+        // Keep the original inodes allocated while the poll runs.
+        let _retained_store_files = metadata_before
+            .iter()
+            .map(|(path, _, _)| fs::File::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        for _ in 0..8 {
+            let feed = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap();
+            assert_eq!(feed.display_name, "Alice");
+            assert_eq!(feed.expires_at, session.expires_at);
+            assert_eq!(feed.latest_seq, object.seq);
+            assert_eq!(feed.objects.len(), 1);
+            assert_eq!(feed.objects[0].body.as_deref(), Some("configured message"));
+            assert!(feed.objects[0].from_current_session);
+            assert_eq!(feed.participants.len(), 1);
+            assert_eq!(feed.participants[0].display_name, "Alice");
+        }
+
+        assert_eq!(room_state_snapshot(tmp.path()), before);
+        assert_eq!(room_state_file_metadata(tmp.path()), metadata_before);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_rechecks_session_authority_without_writes() {
+        for refusal in ["expired", "unapproved", "left"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = start_configured_collaboration_principal_session(
+                tmp.path(),
+                "did:key:z6configured",
+                "principal-one",
+                "Alice",
+                "ElastOS shell",
+            )
+            .unwrap();
+            assert!(collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .is_ok());
+            if refusal == "left" {
+                leave_configured_collaboration_principal_session(
+                    tmp.path(),
+                    "did:key:z6configured",
+                    "principal-one",
+                )
+                .unwrap();
+            } else {
+                with_locked_state(tmp.path(), |_, state| {
+                    let stored = state
+                        .sessions
+                        .iter_mut()
+                        .find(|item| item.token == session.token)
+                        .unwrap();
+                    if refusal == "expired" {
+                        stored.expires_at = now_ts();
+                    } else {
+                        stored.capabilities.clear();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let before = room_state_snapshot(tmp.path());
+            let metadata_before = room_state_file_metadata(tmp.path());
+            let error = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(if refusal == "unapproved" {
+                    "session is not approved for room access"
+                } else {
+                    "invalid or expired session"
+                }),
+                "{refusal}: {error}"
+            );
+            assert_eq!(room_state_snapshot(tmp.path()), before, "{refusal}");
+            assert_eq!(
+                room_state_file_metadata(tmp.path()),
+                metadata_before,
+                "{refusal}"
+            );
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(collaboration_room_poll(
+            empty.path(),
+            "unknown-token",
+            "network-one",
+            "conversation-one",
+            0,
+        )
+        .is_err());
+        assert!(!storage_paths(empty.path()).unwrap().root_dir.exists());
     }
 
     #[test]
