@@ -335,7 +335,8 @@ async fn run_with_data_dir(
         }
     }
 
-    let components = resolve_components(&manifest, selected_profile, &with, &without)?;
+    let mut components = resolve_components(&manifest, selected_profile, &with, &without)?;
+    skip_unsupported_local_engine(&mut components, || verify_arm64_model_host(&platform))?;
 
     if components.iter().any(|name| name == browser_vm_image::NAME) {
         browser_vm_image::component_info(&manifest, &platform)?;
@@ -369,9 +370,6 @@ async fn run_with_data_dir(
     for name in &components {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
-        if name == "llama-server" {
-            verify_arm64_model_host(&platform)?;
-        }
         let status = match effective_component_install_state_for_name(
             &manifest,
             &data_dir,
@@ -1814,10 +1812,15 @@ fn arm64_model_elf_compatible(header: &[u8]) -> bool {
         && u16::from_le_bytes([header[18], header[19]]) == 183
 }
 
+/// Public reasons an admitted model cannot run now. Each keeps the admitted
+/// bytes; the UI names the next action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalModelExecutionUnavailable {
     UnsupportedHost,
     SourceEngineRequired,
+    /// The admission is bound to an earlier catalogue head; one Use rebinds it
+    /// to the current head without a new download.
+    CatalogUpdated,
 }
 
 impl LocalModelExecutionUnavailable {
@@ -1825,6 +1828,7 @@ impl LocalModelExecutionUnavailable {
         match self {
             Self::UnsupportedHost => "unsupported_host",
             Self::SourceEngineRequired => "source_engine_required",
+            Self::CatalogUpdated => "catalog_updated",
         }
     }
 }
@@ -1834,6 +1838,7 @@ impl std::fmt::Display for LocalModelExecutionUnavailable {
         f.write_str(match self {
             Self::UnsupportedHost => "admitted model host profile is unavailable",
             Self::SourceEngineRequired => "This source-checkout Home has no local AI engine. Rerun scripts/setup-source-home.sh with SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 to build it.",
+            Self::CatalogUpdated => "catalog changed during preparation",
         })
     }
 }
@@ -1859,6 +1864,29 @@ fn require_arm64_model_cpu_features(hwcap: u64) -> anyhow::Result<()> {
         .context(LocalModelExecutionUnavailable::UnsupportedHost));
     }
     Ok(())
+}
+
+/// A host without the engine's CPU profile still gets a working Home: setup
+/// drops the local engine and Marketplace reports `unsupported_host` instead.
+fn skip_unsupported_local_engine(
+    components: &mut Vec<String>,
+    verify_host: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !components.iter().any(|name| name == "llama-server") {
+        return Ok(());
+    }
+    match verify_host() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.downcast_ref::<LocalModelExecutionUnavailable>()
+                == Some(&LocalModelExecutionUnavailable::UnsupportedHost) =>
+        {
+            println!("Local AI is not supported on this device; skipping llama-server.");
+            components.retain(|name| name != "llama-server");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn verify_arm64_model_host(platform: &str) -> anyhow::Result<()> {
@@ -4220,6 +4248,28 @@ pub(crate) mod tests {
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn unsupported_model_host_skips_engine_without_aborting_setup() {
+        let selected = || vec!["kubo".to_string(), "llama-server".to_string()];
+        let mut components = selected();
+        skip_unsupported_local_engine(&mut components, || {
+            require_arm64_model_cpu_features(ARM64_MODEL_HWCAP & !(1 << 20))
+        })
+        .unwrap();
+        assert_eq!(components, vec!["kubo".to_string()]);
+
+        let mut components = selected();
+        skip_unsupported_local_engine(&mut components, || Ok(())).unwrap();
+        assert_eq!(components, selected());
+
+        // Other host failures still stop setup.
+        let mut components = selected();
+        assert!(skip_unsupported_local_engine(&mut components, || {
+            Err(anyhow::anyhow!("hwcap unreadable"))
+        })
+        .is_err());
+    }
 
     #[test]
     fn arm64_model_profile_requires_dot_product_and_both_fp16_features() {

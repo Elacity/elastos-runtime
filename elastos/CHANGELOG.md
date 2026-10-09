@@ -6,6 +6,88 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.13]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
+  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
+  of free memory.
+
+### Changed
+
+- A model download that stops because the network failed, or because Home
+  restarted, now continues from where it stopped the next time you press Use,
+  instead of starting over. Cancel on the stopped download discards the part
+  already downloaded; Home also discards it after 7 days, or when the model is no
+  longer offered.
+- A local model now starts only when the device has enough free memory for it.
+  Otherwise you see "Not enough free memory for this model. Close other apps or
+  choose a smaller model." instead of a model failure.
+- A local model stops after a minute without use to give its memory back, and
+  starts again on your next message. Only one local model runs at a time.
+- When the model list is updated, a model already on this device says "Model
+  list updated. Press Use to keep using this model." Use keeps the files; nothing
+  downloads again. This release updates the list, so press Use once for SmolLM2.
+- Marketplace shows a model's own description from the signed model list.
+
+### Fixed
+
+- A brief network stall no longer stops a model download. Home tries a part
+  that timed out up to three more times before it stops.
+- After about 64 model downloads, retries or cancels, Home could no longer get
+  any model. Old finished attempts no longer use up that limit.
+- Setting up Home on an ARM64 device without the CPU features local AI needs no
+  longer fails. Home installs without the local model engine, and Marketplace
+  shows "Local AI is not supported on this device."
+
+### Developer detail
+
+- Signed model catalogue 3 is pinned in `components.json` (head
+  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
+  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
+  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, built
+  reproducibly locally and on the seed, pinned there) (#84).
+- `model-provider` admits a local engine right before spawn when free memory
+  covers GGUF weights once, the f16 KV cache at the configured context, batch
+  scratch and headroom of max(10% RAM, 1 GiB). Free memory is Linux
+  `MemAvailable` capped by every cgroup v2 ancestor's `memory.max -
+  memory.current` (cgroup v1: `MemAvailable` only), or macOS free (minus
+  speculative) + purgeable + file-backed pages. When that estimate is short,
+  macOS still admits if `kern.memorystatus_vm_pressure_level` is normal and the
+  need is at most 40% of RAM. Refusal is `model_memory_unavailable` (#98).
+- Local runs share one execution slot; an engine idle for 60 s is stopped and
+  opening another model closes the previous engine. llama-server gets
+  `--batch-size 128 --ubatch-size 128 --cache-ram 0`. `elastos setup` drops
+  `llama-server` on an `UnsupportedHost` instead of aborting.
+- A model part read that every holder failed only in transit (answer deadline,
+  connect failure, lost stream; `carrier_fetch_in_transit`, mapped to
+  `ProviderError::Io`) is repeated up to 3 times after 0.5, 1 and 2 s in the same
+  in-flight slot, after the same per-part checks as a first read. Refusals,
+  malformed or oversized answers and integrity, authority or capacity failures
+  are never repeated. The seed's `ipfs-provider` bridge serializes requests, so
+  one slow read there runs every queued read's 5 s budget out together.
+- Download resume: `settle_failure` keeps the stage (`kept_stage`) after an
+  in-transit read failure, a stopping Home, a passed deadline or restart
+  reconciliation, and removes it on cancel and on any refusal, integrity,
+  authority, policy or storage failure. The next Use adopts it only if its
+  `_elastos_object.json` equals the signed `object_manifest`, re-hashes complete
+  files, truncates a partial file to a 64 KiB boundary and fetches only the
+  remaining parts; per-file SHA-256 and package CID checks are unchanged. A kept
+  stage stays charged against the cache budget until adopted, cancelled, or
+  removed at startup after 7 days or when no longer offered.
+- The 64-record preparation cap bounds live work only: `reserve_at` prunes
+  ownerless Failed, Expired or Cancelled records settled at least an hour ago
+  (`settled_at`) before refusing; expiry is saved before any refusal.
+- `ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` builds one package from
+  a pinned, validated fixture; `catalog CAT DID ENTRY...` writes an unsigned
+  payload only after `release-signer.py`'s own catalogue check accepts it.
+- The model projection reports `dispatch_unavailable_reason: "catalog_updated"`
+  only for an admission bound to an earlier head whose package the current
+  trusted catalogue still offers under a current local-use grant.
+
 ## [0.8.0-alpha.12]
 
 Test-channel release. Signed releases show these notes in System before you update.
