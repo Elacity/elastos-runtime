@@ -764,6 +764,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(system_guest_registration_update),
         )
         .route(
+            "/api/apps/system/community",
+            get(system_community_membership_get).post(system_community_membership_update),
+        )
+        .route(
             "/api/apps/system/ai-provider",
             get(gateway_home_system_ai_provider::system_ai_provider_get)
                 .post(gateway_home_system_ai_provider::system_ai_provider_save)

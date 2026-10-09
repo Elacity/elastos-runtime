@@ -1123,9 +1123,12 @@ fn configured_people_discovery_summary(
         .filter(|deadline| *deadline > now);
     let remote_visibility_remaining_seconds =
         remote_visibility_may_remain_until.map(|deadline| deadline.saturating_sub(now));
-    let (status_code, status_message) = if !status.enabled()
-        && remote_visibility_may_remain_until.is_some()
-    {
+    let (status_code, status_message) = if status.community_paused() {
+        (
+            "community_left",
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string(),
+        )
+    } else if !status.enabled() && remote_visibility_may_remain_until.is_some() {
         let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
         (
             "off_pending_expiry",
@@ -7425,6 +7428,68 @@ pub(super) async fn system_guest_registration_update(
     match crate::auth::set_guest_registration_enabled(&state.data_dir, req.enabled, now_ts()) {
         Ok(_) => Json(system_access_summary(&state.data_dir, &context)).into_response(),
         Err(err) => system_error_response(err),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemCommunityMembershipRequest {
+    joined: bool,
+}
+
+fn system_community_membership_summary(state: &GatewayState) -> serde_json::Value {
+    let membership = state
+        .collaboration_chat_product_port
+        .as_ref()
+        .map(|port| port.community_membership());
+    let joined = membership.is_some_and(|membership| membership.joined());
+    serde_json::json!({
+        "schema": "elastos.community-membership/v1",
+        "configured": membership.is_some(),
+        "joined": joined,
+        "detail": if membership.is_none() {
+            "Community is not configured on this Home."
+        } else if joined {
+            "This Home joins Community. Its owner can leave while keeping contacts, Direct messages and history."
+        } else {
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+        },
+    })
+}
+
+pub(super) async fn system_community_membership_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        Ok(_) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
+    }
+}
+
+pub(super) async fn system_community_membership_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<SystemCommunityMembershipRequest>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return system_error_response(error),
+        };
+    if let Err(error) = require_admin_principal(&state.data_dir, &context) {
+        return system_error_response(error);
+    }
+    let Some(port) = state.collaboration_chat_product_port.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            "Community is not configured on this Home.",
+        )
+            .into_response();
+    };
+    match port.community_membership().set_joined(body.joined) {
+        Ok(()) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
     }
 }
 

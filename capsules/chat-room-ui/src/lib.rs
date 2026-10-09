@@ -80,6 +80,7 @@ struct AppState {
     selection_generation: u64,
     room_mode_known: bool,
     collaboration_configured: bool,
+    community_left: bool,
     session_active: bool,
     close_leave_sent: bool,
     poll_loop_started: bool,
@@ -417,6 +418,8 @@ struct RoomTransportView {
     configured: bool,
     #[serde(default)]
     available: bool,
+    #[serde(default)]
+    community_joined: Option<bool>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -2431,7 +2434,7 @@ impl App {
         if self.is_direct_mode() {
             return self.send_direct_message().await;
         }
-        if !self.state.borrow().session_active {
+        if !self.state.borrow().session_active || self.state.borrow().community_left {
             return Ok(());
         }
         let body = self.message_input.value().trim().to_string();
@@ -3515,7 +3518,7 @@ impl App {
             state.room_mode_known,
             state.collaboration_configured,
             self.is_shell_mode(),
-            session_active,
+            session_active && !state.community_left,
             state.show_access_controls,
             !state.pending_requests.is_empty(),
         );
@@ -3630,8 +3633,14 @@ impl App {
             state.community_unread,
         )?;
         set_hidden(&self.presence_card, direct_mode)?;
-        set_hidden(&self.participant_toggle, direct_mode || !session_active)?;
-        set_hidden(&self.participant_close, direct_mode || !session_active)?;
+        set_hidden(
+            &self.participant_toggle,
+            direct_mode || !session_active || state.community_left,
+        )?;
+        set_hidden(
+            &self.participant_close,
+            direct_mode || !session_active || state.community_left,
+        )?;
         set_hidden(
             &self.room_access_toggle,
             direct_mode || !controls.show_room_access_toggle,
@@ -4833,7 +4842,9 @@ fn apply_active_poll_state(
     let previous_status_detail = state.status_detail.clone();
     let previous_history = state.history.clone();
     let previous_collaboration_configured = state.collaboration_configured;
+    let previous_community_left = state.community_left;
     state.collaboration_configured = poll.transport.configured;
+    state.community_left = poll.transport.community_joined == Some(false);
     if !was_session_active
         && (state.reconnect_needed
             || state.error_text.as_deref() == Some(SHELL_SESSION_LOST_DETAIL))
@@ -4844,12 +4855,21 @@ fn apply_active_poll_state(
     state.session_active = true;
     state.close_leave_sent = false;
     state.display_name = poll.display_name.clone();
-    state.status_badge = "Live".to_string();
+    state.status_badge = if state.community_left {
+        "Left Community"
+    } else {
+        "Live"
+    }
+    .to_string();
     state.status_detail = transport_summary;
     state.history = poll.transport.history;
     state.latest_seq = state.latest_seq.max(poll.latest_seq);
     state.objects.extend(poll.objects);
     state.participants = poll.participants;
+    if state.community_left {
+        state.show_participants = false;
+        state.participants.clear();
+    }
     dedupe_objects(&mut state.objects);
     if state.collaboration_configured {
         state.objects.retain(configured_shared_object_visible);
@@ -4865,6 +4885,7 @@ fn apply_active_poll_state(
     }
 
     let changed = previous_collaboration_configured != state.collaboration_configured
+        || previous_community_left != state.community_left
         || was_session_active != state.session_active
         || previous_display_name != state.display_name
         || previous_latest_seq != state.latest_seq
@@ -4947,6 +4968,7 @@ fn apply_summary_state(
 ) -> bool {
     let previous_room_mode_known = state.room_mode_known;
     let previous_collaboration_configured = state.collaboration_configured;
+    let previous_community_left = state.community_left;
     let previous_browser_access_allowed = state.browser_access_allowed;
     let previous_browser_access_block_reason = state.browser_access_block_reason.clone();
     let previous_pending_requests = state.pending_requests.clone();
@@ -4956,6 +4978,7 @@ fn apply_summary_state(
     let previous_status_detail = state.status_detail.clone();
     state.room_mode_known = true;
     state.collaboration_configured = summary.transport.configured;
+    state.community_left = summary.transport.community_joined == Some(false);
     if state.collaboration_configured {
         state.browser_access_allowed = summary.browser_access_allowed;
         state.browser_access_block_reason = summary.browser_access_block_reason.clone();
@@ -5004,6 +5027,7 @@ fn apply_summary_state(
     }
     previous_room_mode_known != state.room_mode_known
         || previous_collaboration_configured != state.collaboration_configured
+        || previous_community_left != state.community_left
         || previous_browser_access_allowed != state.browser_access_allowed
         || previous_browser_access_block_reason != state.browser_access_block_reason
         || previous_pending_requests != state.pending_requests
@@ -5038,6 +5062,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         selection_generation: 0,
         room_mode_known: false,
         collaboration_configured: false,
+        community_left: false,
         session_active: false,
         close_leave_sent: false,
         poll_loop_started: false,
@@ -5379,6 +5404,65 @@ mod tests {
             assert!(!state.reconnect_needed);
             assert_eq!(state.status_badge, "Live");
         }
+    }
+
+    #[test]
+    fn community_leave_gates_only_shared_controls_and_keeps_drafts_and_direct_selection() {
+        let mut state = two_direct_conversations();
+        state.drafts.insert(None, ("saved Shared draft".into(), 1));
+        state.session_active = true;
+        state.show_participants = true;
+        let mut left = shared_poll(0);
+        left.transport.community_joined = Some(false);
+        assert!(apply_active_poll_state(&mut state, left).1);
+        assert!(state.community_left);
+        assert!(!state.show_participants);
+        assert_eq!(
+            state.drafts.get(&None).map(|(text, _)| text.as_str()),
+            Some("saved Shared draft")
+        );
+        assert!(
+            !chat_control_policy(
+                true,
+                true,
+                true,
+                state.session_active && !state.community_left,
+                false,
+                false
+            )
+            .enable_text_send
+        );
+        let selected = state.direct.conversations[0].conversation_id.clone();
+        state.direct.selected_conversation_id = Some(selected.clone());
+        assert!(render_projection(&state, true).direct_mode);
+        assert!(state.session_active);
+        assert_eq!(
+            state.direct.selected_conversation_id.as_deref(),
+            Some(selected.as_str())
+        );
+        let mut joined = shared_poll(0);
+        joined.transport.community_joined = Some(true);
+        assert!(apply_active_poll_state(&mut state, joined).1);
+        assert!(!state.community_left);
+        assert!(
+            chat_control_policy(
+                true,
+                true,
+                true,
+                state.session_active && !state.community_left,
+                false,
+                false
+            )
+            .enable_text_send
+        );
+        assert_eq!(
+            state.drafts.get(&None).map(|(text, _)| text.as_str()),
+            Some("saved Shared draft")
+        );
+        assert_eq!(
+            state.direct.selected_conversation_id.as_deref(),
+            Some(selected.as_str())
+        );
     }
 
     #[test]
@@ -5963,6 +6047,7 @@ mod tests {
             transport: RoomTransportView {
                 configured: true,
                 available: true,
+                community_joined: None,
                 status: None,
                 history: None,
             },

@@ -259,7 +259,8 @@ pub async fn start_collaboration_runtime_service(
         (*profile).clone(),
         provider_registry.clone(),
     )
-    .await?;
+    .await?
+    .with_community_membership(core.community_membership().clone());
     let product_port = CollaborationChatProductPort::new(core.clone())?;
     let presence_port = CollaborationPresenceProductPort::new(core.clone())?;
     let history_service = CollaborationHistoryService::new(
@@ -451,30 +452,84 @@ async fn run_collaboration_worker(
     data_root: PathBuf,
     shutdown: watch::Receiver<bool>,
 ) {
+    let membership = product_port.community_membership();
     // These futures share one Runtime task and one consumer. Outgoing work or
     // receipt broadcasts can wait while accepted rows still reach the product.
     tokio::join!(
-        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
-            let now = now_secs();
-            project_collaboration_outgoing(&product_port, &presence_port, &data_root, now);
-            if driver.retry_outgoing_once(now).await.is_err() {
-                tracing::warn!("collaboration outgoing retry cycle failed");
+        run_community_periodic(
+            shutdown.clone(),
+            membership.subscribe(),
+            COLLABORATION_LIVE_CADENCE,
+            || async {
+                let now = now_secs();
+                project_collaboration_outgoing(&product_port, &presence_port, &data_root, now);
+                if driver.retry_outgoing_once(now).await.is_err() {
+                    tracing::warn!("collaboration outgoing retry cycle failed");
+                }
             }
-        }),
-        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
-            if driver.process_incoming_once(now_secs()).await.is_err() {
-                tracing::warn!("collaboration incoming cycle failed");
+        ),
+        run_community_periodic(
+            shutdown.clone(),
+            membership.subscribe(),
+            COLLABORATION_LIVE_CADENCE,
+            || async {
+                if driver.process_incoming_once(now_secs()).await.is_err() {
+                    tracing::warn!("collaboration incoming cycle failed");
+                }
             }
-        }),
-        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
-            project_collaboration_handoffs(&product_port, &presence_port, &data_root, now_secs());
-        }),
-        run_collaboration_periodic(shutdown, COLLABORATION_BOOTSTRAP_CADENCE, || async {
-            if driver.restore_missing_bootstrap_peers().await.is_err() {
-                tracing::warn!("collaboration bootstrap recovery cycle failed");
+        ),
+        run_community_periodic(
+            shutdown.clone(),
+            membership.subscribe(),
+            COLLABORATION_LIVE_CADENCE,
+            || async {
+                project_collaboration_handoffs(
+                    &product_port,
+                    &presence_port,
+                    &data_root,
+                    now_secs(),
+                );
             }
-        }),
+        ),
+        run_community_periodic(
+            shutdown,
+            membership.subscribe(),
+            COLLABORATION_BOOTSTRAP_CADENCE,
+            || async {
+                if driver.restore_missing_bootstrap_peers().await.is_err() {
+                    tracing::warn!("collaboration bootstrap recovery cycle failed");
+                }
+            }
+        ),
     );
+}
+
+/// Cancels a pending Community cycle when its Home leaves. Direct has its own
+/// Runtime lifecycle and never uses this gate.
+async fn run_community_periodic<F, Fut>(
+    shutdown: watch::Receiver<bool>,
+    joined: watch::Receiver<bool>,
+    cadence: Duration,
+    mut cycle: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    run_collaboration_periodic(shutdown, cadence, || {
+        let mut joined = joined.clone();
+        let work = cycle();
+        async move {
+            if !*joined.borrow_and_update() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = joined.changed() => {},
+                _ = work => {},
+            }
+        }
+    })
+    .await;
 }
 
 async fn run_collaboration_periodic<F, Fut>(
@@ -584,6 +639,7 @@ async fn run_collaboration_history_worker(
     service: CollaborationHistoryService,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut joined = service.community_membership().subscribe();
     loop {
         if *shutdown.borrow() {
             return;
@@ -593,7 +649,14 @@ async fn run_collaboration_history_worker(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { return; }
             }
-            result = service.fetch_once(now_secs()) => {
+            result = async {
+                if !*joined.borrow_and_update() { return Ok(()); }
+                tokio::select! {
+                    biased;
+                    _ = joined.changed() => Ok(()),
+                    result = service.fetch_once(now_secs()) => result,
+                }
+            } => {
                 if result.is_err() { tracing::debug!("Community history refresh is unavailable"); }
             }
         }
@@ -613,6 +676,9 @@ fn project_collaboration_outgoing(
     data_root: &Path,
     now: u64,
 ) {
+    if !product_port.community_membership().joined() {
+        return;
+    }
     match product_port.pending_outgoing_messages(now) {
         Ok(messages) => {
             for message in &messages {
@@ -652,6 +718,9 @@ fn project_collaboration_handoffs(
     data_root: &Path,
     now: u64,
 ) {
+    if !product_port.community_membership().joined() {
+        return;
+    }
     match product_port.pending_messages() {
         Ok(handoffs) => {
             for handoff in &handoffs {
@@ -2424,6 +2493,62 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_leave_cancels_pending_work_and_rejoin_resumes_one_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct InFlight(Arc<AtomicUsize>);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let (membership, joined) = watch::channel(true);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let work_calls = calls.clone();
+        let work_active = active.clone();
+        let worker = tokio::spawn(run_community_periodic(
+            shutdown_rx,
+            joined,
+            COLLABORATION_LIVE_CADENCE,
+            move || {
+                let calls = work_calls.clone();
+                let active = work_active.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _pending = InFlight(active);
+                    std::future::pending::<()>().await;
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        membership.send_replace(false);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "Leave cancels the actual pending cycle"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "left Community remains idle"
+        );
+        membership.send_replace(true);
+        tokio::time::advance(COLLABORATION_LIVE_CADENCE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        shutdown.send(true).unwrap();
+        worker.await.unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

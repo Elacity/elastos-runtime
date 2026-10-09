@@ -544,8 +544,9 @@ test("Home update polling binds host messages, stops at auth refusal, and closes
 
 test("Home update summary refreshes share one bounded request", async () => {
   const f = updateFixture();
-  let finish, reads = 0;
+  let finish, reads = 0, communityReads = 0;
   f.context.fetchJson = () => { reads++; return new Promise(resolve => { finish = resolve; }); };
+  f.context.refreshCommunityMembership = async () => { communityReads++; };
   f.context.renderSystemSummary = value => { f.context.renderRuntimeUpdate(value.runtime_update); };
   const refresh = source.slice(source.indexOf("async function refreshSystemSummary() {"), source.indexOf("async function fetchJson("));
   vm.runInContext(refresh, f.context);
@@ -555,6 +556,7 @@ test("Home update summary refreshes share one bounded request", async () => {
   assert([...f.timers.values()].some(timer => timer.delay === 10_000));
   finish({ runtime_update: f.offer });
   await Promise.all([first, second]);
+  assert.equal(communityReads, 1, "one shared summary refresh also reads current Community membership once");
   assert.equal(f.context.systemSummaryInFlight, null);
   assert(![...f.timers.values()].some(timer => timer.delay === 10_000));
   f.context.fetchJson = (_url, init) => new Promise((_resolve, reject) => {
@@ -587,7 +589,7 @@ test("System startup and recovery stay ready while the background Carrier check 
       refreshCapsuleCatalog: async () => calls.push("catalogue"),
     });
     for (const name of ["configureSettingsTabs", "configureSettingsSearch", "activateSettingsTab",
-      "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess",
+      "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess", "configureCommunityMembership",
       "configureAiProvider", "configurePasskeyAccess", "configureRecoveryAccess", "configureChainAccess",
       "configureActiveShell", "configureCapsuleCatalog", "configureTechnicalDetails", "configureDeviceDidCopy",
       "configureRuntimeUpdate", "configureHomeRecoverySave"]) context[name] = () => {};
@@ -657,5 +659,78 @@ test("a slow update keeps polling while Home reports the approved download", asy
   for (let poll = 0; poll < 100; poll += 1) await f.context.pollRuntimeUpdate();
   assert.equal(f.status.textContent, message);
   assert.equal(f.context.runtimeUpdatePending.polls, 0);
+  assert.equal(f.button.disabled, true);
+});
+
+function communityFixture(role = "admin") {
+  const section = { hidden: true }, button = { disabled: true, textContent: "" };
+  const fields = new Map(), hidden = new Map(), requests = [], timers = new Map();
+  let nextTimer = 0;
+  const context = vm.createContext({
+    communitySection: section, communityButton: button,
+    currentAccess: { role }, hasShellAccess: () => true,
+    readText: value => typeof value === "string" ? value.trim() : "",
+    setTextFields: (key, value) => fields.set(key, value),
+    setHiddenFields: (key, value) => hidden.set(key, value),
+    shellHeaders: value => value || {}, publicSystemError: (_, fallback) => fallback,
+    AbortController, runtimeUpdateRequests: new Set(),
+    window: { setTimeout: (handler, delay) => { const id = ++nextTimer; timers.set(id, { handler, delay }); return id; }, clearTimeout: id => timers.delete(id) },
+    fetchJson: async (path, init) => {
+      requests.push({ path, ...init });
+      return { schema: "elastos.community-membership/v1", configured: true, joined: false, detail: "Left" };
+    },
+  });
+  const start = source.indexOf("function renderCommunityMembership(");
+  const end = source.indexOf("async function onGuestRegistrationChange", start);
+  const fetchStart = source.indexOf("async function fetchRuntimeUpdateJson(");
+  const fetchEnd = source.indexOf("async function onRuntimeUpdateApply(", fetchStart);
+  vm.runInContext(`let communityMembership = null; let communityBusy = false; ${source.slice(start, end)} ${source.slice(fetchStart, fetchEnd)}`, context);
+  context.renderCommunityMembership({ schema: "elastos.community-membership/v1", configured: true, joined: true, detail: "Joined" });
+  return { context, section, button, fields, hidden, requests, timers };
+}
+
+test("Community uses one owner request and a visible Rejoin control", async () => {
+  const f = communityFixture();
+  let finish;
+  f.context.fetchJson = async (path, init) => {
+    f.requests.push({ path, ...init });
+    return new Promise(resolve => { finish = resolve; });
+  };
+  const pending = f.context.updateCommunityMembership();
+  assert.equal(f.button.disabled, true);
+  await f.context.updateCommunityMembership();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].path, "/api/apps/system/community");
+  assert.equal(JSON.parse(f.requests[0].body).joined, false);
+  assert.equal([...f.timers.values()][0].delay, 10_000, "the local owner choice has a bounded response wait");
+  finish({ schema: "elastos.community-membership/v1", configured: true, joined: false, detail: "Left" });
+  await pending;
+  assert.equal(f.button.textContent, "Rejoin Community");
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.fields.get("community-detail"), "Left");
+  assert.equal(f.section.hidden, false);
+  assert.equal(f.timers.size, 0);
+});
+
+test("Community guests cannot dispatch and refused owner changes retain the last accepted state", async () => {
+  const guest = communityFixture("guest");
+  await guest.context.updateCommunityMembership();
+  assert.equal(guest.requests.length, 0);
+  assert.equal(guest.button.disabled, true);
+  const owner = communityFixture();
+  owner.context.fetchJson = async () => { throw new Error("request failed: 401"); };
+  await owner.context.updateCommunityMembership();
+  assert.equal(owner.button.textContent, "Leave Community");
+  assert.equal(owner.button.disabled, false);
+  assert.equal(owner.fields.get("community-detail"), "Joined");
+  assert.equal(owner.hidden.get("community-status"), false);
+});
+
+test("Community missing configuration stays hidden and malformed state cannot enable its control", () => {
+  const f = communityFixture();
+  f.context.renderCommunityMembership({ schema: "elastos.community-membership/v1", configured: false, joined: false });
+  assert.equal(f.section.hidden, true);
+  assert.equal(f.button.disabled, true);
+  assert.throws(() => f.context.renderCommunityMembership({ schema: "foreign", configured: true, joined: true }));
   assert.equal(f.button.disabled, true);
 });

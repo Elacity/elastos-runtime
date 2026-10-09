@@ -105,12 +105,24 @@ impl CollaborationChatProductPort {
     }
 
     pub(crate) fn conversation_transport_view(&self) -> crate::room_service::RoomTransportView {
+        let joined = self.community_membership().joined();
         crate::room_service::RoomTransportView {
             configured: true,
-            available: true,
-            status: Some("Collaboration is configured.".to_string()),
+            available: joined,
+            community_joined: Some(joined),
+            status: Some(if joined {
+                "Collaboration is configured.".to_string()
+            } else {
+                crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string()
+            }),
             history: self.history_status.lock().ok().map(|status| status.clone()),
         }
+    }
+
+    pub(crate) fn community_membership(
+        &self,
+    ) -> &Arc<crate::collaboration_release_network::CommunityMembership> {
+        self.core.community_membership()
     }
 
     #[cfg(test)]
@@ -841,6 +853,84 @@ mod tests {
             &fixture.person_profile,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn leaving_community_keeps_original_history_and_refuses_new_shared_intent() {
+        let fixture = fixture();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &fixture.person_profile.document().profile_did,
+            "Reader",
+            "Community membership test",
+        )
+        .unwrap();
+        let now = now_secs();
+        let prepared = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "before-leave", "retained history"),
+                "retained history",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, Some(&session.token))
+            .unwrap();
+        let original_history = fixture.core.conversation_history(now).unwrap();
+        let original_core = fixture.core.summary().unwrap();
+        fixture
+            .port
+            .community_membership()
+            .set_joined(false)
+            .unwrap();
+        assert!(fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "after-leave", "refused"),
+                "refused",
+                &fixture.person_profile,
+                now,
+            )
+            .is_err());
+        assert_eq!(fixture.core.summary().unwrap(), original_core);
+        assert_eq!(
+            fixture.core.conversation_history(now).unwrap(),
+            original_history
+        );
+        let view = fixture.port.conversation_transport_view();
+        assert_eq!(view.community_joined, Some(false));
+        assert!(!view.available);
+        let poll = fixture
+            .port
+            .conversation_poll(&fixture.data_root, &session.token, 0)
+            .unwrap();
+        assert_eq!(poll.objects.len(), 1);
+        assert_eq!(poll.objects[0].body.as_deref(), Some("retained history"));
+        fixture
+            .port
+            .community_membership()
+            .set_joined(true)
+            .unwrap();
+        assert_eq!(
+            fixture.port.conversation_transport_view().community_joined,
+            Some(true)
+        );
+        assert_eq!(
+            fixture.core.conversation_history(now).unwrap(),
+            original_history
+        );
+        fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "after-rejoin", "joined again"),
+                "joined again",
+                &fixture.person_profile,
+                now + 1,
+            )
+            .unwrap();
     }
 
     fn remote_authority(

@@ -73,6 +73,12 @@ struct HistoryResponse {
 }
 
 impl CollaborationHistoryService {
+    pub(crate) fn community_membership(
+        &self,
+    ) -> &Arc<crate::collaboration_release_network::CommunityMembership> {
+        self.inner.product.community_membership()
+    }
+
     pub(crate) async fn new(
         product: CollaborationChatProductPort,
         presence: CollaborationPresenceProductPort,
@@ -117,6 +123,7 @@ impl CollaborationHistoryService {
         source: &str,
         now: u64,
     ) -> anyhow::Result<HistoryResponse> {
+        self.inner.product.community_membership().require_joined()?;
         let (network, conversation) = self.inner.product.history_scope();
         if request.schema != REQUEST_SCHEMA
             || request.op != HISTORY_OP
@@ -187,6 +194,9 @@ impl CollaborationHistoryService {
     /// Independently scheduled from live gossip. Four unavailable peers cannot
     /// monopolize a pass or starve later available participants across passes.
     pub(crate) async fn fetch_once(&self, now: u64) -> anyhow::Result<()> {
+        if !self.inner.product.community_membership().joined() {
+            return Ok(());
+        }
         let peers = match self.inner.presence.history_participants(now) {
             Ok(peers) => peers,
             Err(error) => {

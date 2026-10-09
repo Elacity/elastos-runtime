@@ -91,6 +91,7 @@ const MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC: usize = 4;
 
 #[derive(Clone)]
 pub struct CollaborationDiscoveryService {
+    community_membership: Option<Arc<crate::collaboration_release_network::CommunityMembership>>,
     authority: Arc<CollaborationDiscoveryAuthority>,
     registry: Arc<ProviderRegistry>,
     bootstrap_peers: Arc<Vec<CollaborationBootstrapPeer>>,
@@ -104,6 +105,7 @@ pub struct CollaborationDiscoveryService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CollaborationDiscoveryStatus {
+    community_paused: bool,
     available: bool,
     connecting: bool,
     enabled: bool,
@@ -325,6 +327,7 @@ impl CollaborationDiscoveryService {
             )
             .await?;
         Ok(Self {
+            community_membership: None,
             authority: Arc::new(CollaborationDiscoveryAuthority::new(
                 signing_key,
                 profile.clone(),
@@ -342,6 +345,20 @@ impl CollaborationDiscoveryService {
 
     pub(crate) fn network_profile(&self) -> VerifiedCollaborationNetworkProfile {
         self.authority.profile.clone()
+    }
+
+    pub(crate) fn with_community_membership(
+        mut self,
+        membership: Arc<crate::collaboration_release_network::CommunityMembership>,
+    ) -> Self {
+        self.community_membership = Some(membership);
+        self
+    }
+
+    pub(crate) fn community_joined(&self) -> bool {
+        self.community_membership
+            .as_ref()
+            .is_none_or(|membership| membership.joined())
     }
 
     /// Services runs in a blocking Home projection after owner/contact checks.
@@ -894,7 +911,7 @@ impl CollaborationDiscoveryService {
     ) -> anyhow::Result<CollaborationDiscoveryStatus> {
         let store = snapshot.store();
         let profile_did = self.require_profile_store_match(store, profile)?;
-        let enabled = snapshot.discovery_enabled()?;
+        let enabled = snapshot.discovery_enabled()? && self.community_joined();
         let stored_current =
             self.cached_published_advertisement(snapshot.published_local_advertisement(now)?, now)?;
         let states = self
@@ -903,7 +920,13 @@ impl CollaborationDiscoveryService {
             .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
         let mut state = states.get(profile_did).cloned().unwrap_or_default();
         normalize_client_state_for_status(&mut state, enabled, stored_current.as_ref(), now);
-        project_discovery_status(&state, enabled, snapshot.pending_incoming_requests()?)
+        let mut status =
+            project_discovery_status(&state, enabled, snapshot.pending_incoming_requests()?)?;
+        status.community_paused = !self.community_joined();
+        if status.community_paused {
+            status.available = false;
+        }
+        Ok(status)
     }
 
     /// Leaves this principal's Discovery as a finished relay pass would: on,
@@ -1021,6 +1044,26 @@ impl CollaborationDiscoveryService {
     }
 
     pub(crate) async fn refresh(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<CollaborationDiscoveryStatus> {
+        let Some(membership) = self.community_membership.as_ref() else {
+            return self.refresh_joined(store, profile, now).await;
+        };
+        let mut joined = membership.subscribe();
+        if !*joined.borrow_and_update() {
+            return self.local_status(store, profile, now);
+        }
+        tokio::select! {
+            biased;
+            _ = joined.changed() => self.local_status(store, profile, now),
+            result = self.refresh_joined(store, profile, now) => result,
+        }
+    }
+
+    async fn refresh_joined(
         &self,
         store: &CollaborationContactStore,
         profile: &VerifiedCollaborationProfileDocument,
@@ -1165,6 +1208,9 @@ impl CollaborationDiscoveryService {
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
     ) -> anyhow::Result<()> {
+        if let Some(membership) = self.community_membership.as_ref() {
+            membership.require_joined()?;
+        }
         let profile_did = profile.document().profile_did.as_str();
         let advertisement = {
             let states = self
@@ -1634,7 +1680,7 @@ impl CollaborationDiscoveryService {
         store: &CollaborationContactStore,
         now: u64,
     ) -> anyhow::Result<CollaborationDiscoveryStatus> {
-        let enabled = store.discovery_enabled()?;
+        let enabled = store.discovery_enabled()? && self.community_joined();
         let stored_current = self.stored_published_local_advertisement(store, now)?;
         let mut states = self
             .state
@@ -1642,7 +1688,13 @@ impl CollaborationDiscoveryService {
             .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
         let state = client_state_mut(&mut states, store.local_profile_did())?;
         normalize_client_state_for_status(state, enabled, stored_current.as_ref(), now);
-        project_discovery_status(state, enabled, store.pending_incoming_requests()?)
+        let mut status =
+            project_discovery_status(state, enabled, store.pending_incoming_requests()?)?;
+        status.community_paused = !self.community_joined();
+        if status.community_paused {
+            status.available = false;
+        }
+        Ok(status)
     }
 
     async fn invoke_bootstrap(
@@ -1772,6 +1824,7 @@ fn project_discovery_status(
         Vec::new()
     };
     Ok(CollaborationDiscoveryStatus {
+        community_paused: false,
         available: state.transport_available,
         connecting: enabled && state.connecting,
         enabled,
@@ -1909,6 +1962,10 @@ fn ensure_profile_context_authorized(
 }
 
 impl CollaborationDiscoveryStatus {
+    pub(crate) fn community_paused(&self) -> bool {
+        self.community_paused
+    }
+
     pub(crate) fn available(&self) -> bool {
         self.available
     }
@@ -1959,6 +2016,7 @@ impl CollaborationDiscoveryStatus {
         incoming_requests: Vec<PendingIncomingContactRequest>,
     ) -> Self {
         Self {
+            community_paused: false,
             available,
             connecting: false,
             enabled,
@@ -7654,6 +7712,100 @@ pub(crate) mod tests {
                 .find(|record| record.envelope_bytes == offline_envelope)
                 .unwrap()
                 .receipt_settled
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_community_pauses_discovery_but_retains_contacts_and_direct_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let pair = direct_peer_pair(temp.path()).await;
+        let membership = Arc::new(
+            crate::collaboration_release_network::CommunityMembership::load(
+                &temp.path().join("a"),
+                NETWORK,
+            )
+            .unwrap(),
+        );
+        let service = pair
+            .service_a
+            .clone()
+            .with_community_membership(membership.clone());
+        let now = current_timestamp();
+        service
+            .set_enabled(pair.store_a.as_ref(), &pair.profile_a, true, now)
+            .await
+            .unwrap();
+        let contacts = pair
+            .store_a
+            .snapshot()
+            .unwrap()
+            .contacts()
+            .iter()
+            .map(|contact| contact.conversation_id().to_string())
+            .collect::<Vec<_>>();
+        membership.set_joined(false).unwrap();
+        let status = service
+            .refresh(pair.store_a.as_ref(), &pair.profile_a, now)
+            .await
+            .unwrap();
+        assert!(status.community_paused());
+        assert!(!status.enabled());
+        assert!(!status.available());
+        assert!(status.visible_people().is_empty());
+        assert!(
+            pair.store_a.discovery_enabled().unwrap(),
+            "Leave preserves the saved opt-in"
+        );
+        assert!(
+            pair.service_b.community_joined(),
+            "another Home's choice stays independent"
+        );
+        let direct = service.direct_message_service();
+        direct
+            .send_text(
+                &pair.profile_a.document().profile_did,
+                "left-home-direct",
+                &pair.conversation_id,
+                "Direct remains available",
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(direct
+            .records_for_test(&pair.profile_a.document().profile_did, now)
+            .unwrap()
+            .iter()
+            .any(|record| record.receipt_settled));
+        assert_eq!(
+            pair.service_b
+                .direct_message_service()
+                .records_for_test(&pair.profile_b.document().profile_did, now)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            pair.store_a
+                .snapshot()
+                .unwrap()
+                .contacts()
+                .iter()
+                .map(|contact| contact.conversation_id().to_string())
+                .collect::<Vec<_>>(),
+            contacts
+        );
+        membership.set_joined(true).unwrap();
+        assert!(service
+            .local_status(pair.store_a.as_ref(), &pair.profile_a, now)
+            .unwrap()
+            .enabled());
+        assert_eq!(
+            pair.service_b
+                .direct_message_service()
+                .records_for_test(&pair.profile_b.document().profile_did, now)
+                .unwrap()
+                .len(),
+            1
         );
     }
 

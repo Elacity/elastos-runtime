@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,97 @@ pub const COLLABORATION_ISOLATED_MARKER_FILE: &str = "collaboration-isolated-v1"
 const COLLABORATION_NETWORK_CHOICE_LOCK_FILE: &str = ".collaboration-network-choice.lock";
 /// Source-home setup owns collaboration through its own explicit mode.
 const SOURCE_HOME_COLLABORATION_MODE_ENV: &str = "ELASTOS_COLLABORATION_STARTUP_MODE";
+
+const COMMUNITY_MEMBERSHIP_FILE: &str = "collaboration-community-membership-v1.json";
+const COMMUNITY_MEMBERSHIP_SCHEMA: &str = "elastos.collaboration.community-membership/v1";
+pub(crate) const COMMUNITY_LEFT_DETAIL: &str =
+    "This Home left Community. Rejoin in System. Contacts, Direct messages and history remain available.";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommunityMembershipRecord {
+    schema: String,
+    network_id: String,
+    joined: bool,
+}
+
+/// One Home-wide choice, separate from the admitted network and product state.
+/// Runtime keeps the Carrier endpoint for Direct messages while Community is off.
+pub(crate) struct CommunityMembership {
+    data_dir: PathBuf,
+    network_id: String,
+    joined: tokio::sync::watch::Sender<bool>,
+}
+
+impl CommunityMembership {
+    pub(crate) fn load(data_dir: &Path, network_id: &str) -> anyhow::Result<Self> {
+        let joined = read_community_membership(data_dir, network_id)?;
+        let (joined, _) = tokio::sync::watch::channel(joined);
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            network_id: network_id.to_string(),
+            joined,
+        })
+    }
+
+    pub(crate) fn joined(&self) -> bool {
+        *self.joined.borrow()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.joined.subscribe()
+    }
+
+    pub(crate) fn require_joined(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.joined(), COMMUNITY_LEFT_DETAIL);
+        Ok(())
+    }
+
+    /// System checks the current admin before calling this shared operation.
+    /// The network-choice lock also serializes this with setup and startup.
+    pub(crate) fn set_joined(&self, joined: bool) -> anyhow::Result<()> {
+        crate::collaboration_core::ensure_owner_only_directory(&self.data_dir)?;
+        let _choice = lock_network_choice(&self.data_dir)?;
+        read_community_membership(&self.data_dir, &self.network_id)?;
+        let bytes = serde_json::to_vec(&CommunityMembershipRecord {
+            schema: COMMUNITY_MEMBERSHIP_SCHEMA.to_string(),
+            network_id: self.network_id.clone(),
+            joined,
+        })?;
+        let temporary = self.data_dir.join(format!(
+            ".community-membership.{}.tmp",
+            crate::collaboration_core::random_hex_128()?
+        ));
+        let result = (|| -> anyhow::Result<()> {
+            create_owner_only_file(&temporary, &bytes, "Community membership")?;
+            fs::rename(&temporary, self.data_dir.join(COMMUNITY_MEMBERSHIP_FILE))?;
+            fs::File::open(&self.data_dir)?.sync_all()?;
+            self.joined.send_replace(joined);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn read_community_membership(data_dir: &Path, network_id: &str) -> anyhow::Result<bool> {
+    let path = data_dir.join(COMMUNITY_MEMBERSHIP_FILE);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).context("failed to inspect Community membership"),
+        Ok(_) => {}
+    }
+    let bytes =
+        crate::collaboration_config::read_owner_only_file(&path, 1024, "Community membership")?;
+    let record: CommunityMembershipRecord = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        record.schema == COMMUNITY_MEMBERSHIP_SCHEMA && record.network_id == network_id,
+        "Community membership belongs to another network or schema"
+    );
+    Ok(record.joined)
+}
 
 /// The release pin for the default collaboration network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +551,81 @@ pub(crate) mod tests {
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn community_leave_survives_restart_update_and_rejoin_keeps_the_accepted_head() {
+        let (_, chain) = signed_profile_chain_config(2);
+        let network = pin_for(&chain[0]).expected_network_id;
+        let data = private_data_dir();
+        let (_release, release_path) = release_dir_with(&chain[0]);
+        install_release_network(data.path(), Some(&pin_for(&chain[0])), &release_path).unwrap();
+        crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+            data.path(),
+        )
+        .unwrap();
+        let membership = CommunityMembership::load(data.path(), &network).unwrap();
+        assert!(membership.joined());
+        membership.set_joined(false).unwrap();
+        assert!(!membership.joined());
+        assert!(!CommunityMembership::load(data.path(), &network)
+            .unwrap()
+            .joined());
+        assert!(membership.require_joined().is_err());
+
+        // Update advances the existing signed chain while keeping the choice.
+        let (_next, next_path) = release_dir_with(&chain[1]);
+        install_release_network(data.path(), Some(&pin_for(&chain[1])), &next_path).unwrap();
+        crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+            data.path(),
+        )
+        .unwrap();
+        let restarted = CommunityMembership::load(data.path(), &network).unwrap();
+        assert!(!restarted.joined());
+        restarted.set_joined(true).unwrap();
+        assert!(restarted.joined());
+        assert_eq!(
+            fs::read(data.path().join(COLLABORATION_STARTUP_CONFIG_FILE)).unwrap(),
+            chain[1]
+        );
+        // Rejoin cannot reset the accepted-head witness to the older revision.
+        replace_owner_only_file(
+            data.path(),
+            &data.path().join(COLLABORATION_STARTUP_CONFIG_FILE),
+            &chain[0],
+        )
+        .unwrap();
+        assert!(
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                data.path()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn community_membership_refuses_foreign_malformed_and_public_state() {
+        let data = private_data_dir();
+        let membership = CommunityMembership::load(data.path(), "network-one").unwrap();
+        membership.set_joined(false).unwrap();
+        assert!(CommunityMembership::load(data.path(), "network-two").is_err());
+        let path = data.path().join(COMMUNITY_MEMBERSHIP_FILE);
+        let good = fs::read(&path).unwrap();
+        fs::write(&path, b"{}").unwrap();
+        assert!(CommunityMembership::load(data.path(), "network-one").is_err());
+        assert!(membership.set_joined(true).is_err());
+        assert!(!membership.joined());
+        fs::write(&path, &good).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(CommunityMembership::load(data.path(), "network-one").is_err());
+        }
+        let other_home = private_data_dir();
+        assert!(CommunityMembership::load(other_home.path(), "network-one")
+            .unwrap()
+            .joined());
     }
 
     #[test]

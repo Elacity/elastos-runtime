@@ -343,6 +343,8 @@ pub struct RoomTransportView {
     pub configured: bool,
     #[serde(default)]
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_joined: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

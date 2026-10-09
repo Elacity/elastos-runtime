@@ -1448,6 +1448,7 @@ fn room_transport_view(state: &GatewayState) -> crate::room_service::RoomTranspo
         .unwrap_or_else(|| crate::room_service::RoomTransportView {
             configured: false,
             available: false,
+            community_joined: None,
             status: Some("Collaboration is isolated on this Runtime.".to_string()),
             history: None,
         })
@@ -2303,7 +2304,9 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
         || text.contains("home launch token")
     {
         StatusCode::UNAUTHORIZED
-    } else if profile_required.is_some() {
+    } else if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         StatusCode::CONFLICT
     } else if text.contains("not an active member")
         || text.contains("not part of this conversation")

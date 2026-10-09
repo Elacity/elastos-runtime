@@ -60,6 +60,7 @@ pub(crate) struct CollaborationCore {
     operation_capsule: String,
     data_root: PathBuf,
     state_dir: PathBuf,
+    community_membership: std::sync::Arc<crate::collaboration_release_network::CommunityMembership>,
     mutation_mutex: Mutex<()>,
     /// Counted from stored outgoing messages, so only a saved message counts.
     sends_per_window: usize,
@@ -309,11 +310,18 @@ impl CollaborationCore {
         let state_dir = data_root
             .join(CORE_STATE_DIR)
             .join(state_namespace(&authority));
+        let community_membership = std::sync::Arc::new(
+            crate::collaboration_release_network::CommunityMembership::load(
+                data_root,
+                authority.network_id(),
+            )?,
+        );
         Ok(Self {
             authority,
             operation_capsule: operation_capsule.to_string(),
             data_root: data_root.to_path_buf(),
             state_dir,
+            community_membership,
             mutation_mutex: Mutex::new(()),
             sends_per_window: COMMUNITY_SENDS_PER_WINDOW,
             receive_rate: ProfileRateLimiter::new(
@@ -328,6 +336,12 @@ impl CollaborationCore {
 
     pub(crate) fn sender_service(&self) -> &str {
         self.authority.sender_service()
+    }
+
+    pub(crate) fn community_membership(
+        &self,
+    ) -> &std::sync::Arc<crate::collaboration_release_network::CommunityMembership> {
+        &self.community_membership
     }
 
     pub(crate) fn conversation_scope(&self) -> (&str, &str) {
@@ -533,6 +547,9 @@ impl CollaborationCore {
         frame: &[u8],
         now: u64,
     ) -> Result<CollaborationTransportIngestion, CollaborationTransportRetryableError> {
+        if !self.community_membership.joined() {
+            return Err(CollaborationTransportRetryableError);
+        }
         let verified_transport = match verify_collaboration_transport_frame(frame) {
             Ok(verified) => verified,
             Err(_) => {
@@ -764,6 +781,7 @@ impl CollaborationCore {
         now: u64,
         ttl_secs: u64,
     ) -> anyhow::Result<DurableOutgoingMessage> {
+        self.community_membership.require_joined()?;
         let authenticated_payload =
             crate::collaboration_default_conversation::profile_authenticated_conversation_payload(
                 sender_profile,
@@ -780,6 +798,7 @@ impl CollaborationCore {
         let rate_limited_sender = (payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
             .then(|| sender_profile.document().profile_did.as_str());
         self.with_mutation(Some(now), |state| {
+            self.community_membership.require_joined()?;
             if let Some(existing) = state
                 .outgoing
                 .iter()

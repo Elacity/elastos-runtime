@@ -46,9 +46,13 @@ impl CollaborationTransportDriver {
         &self,
         now: u64,
     ) -> anyhow::Result<CollaborationOutgoingRetrySummary> {
+        if !self.core.community_membership().joined() {
+            return Ok(CollaborationOutgoingRetrySummary::default());
+        }
         let pending = self.core.pending_outgoing(now)?;
         let mut summary = CollaborationOutgoingRetrySummary::default();
         for outgoing in pending {
+            self.core.community_membership().require_joined()?;
             summary.attempted += 1;
             let frame = self
                 .core
@@ -73,6 +77,9 @@ impl CollaborationTransportDriver {
         now: u64,
     ) -> anyhow::Result<CollaborationIncomingOnceOutcome> {
         let mut summary = CollaborationIncomingOnceSummary::default();
+        if !self.core.community_membership().joined() {
+            return Ok(CollaborationIncomingOnceOutcome::Acknowledged(summary));
+        }
 
         // Frames this Home refused under a per-sender limit come first. Their
         // senders may never resend them, so this Home owns the retry.
@@ -86,8 +93,14 @@ impl CollaborationTransportDriver {
         }
 
         let batch = self.network.peek().await?;
+        if !self.core.community_membership().joined() {
+            return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
+        }
         summary.carrier_rejected_frames = batch.rejected_frames();
         for envelope in batch.envelopes() {
+            if !self.core.community_membership().joined() {
+                return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
+            }
             if !self.ingest_frame(envelope, now, &mut summary).await {
                 return Ok(CollaborationIncomingOnceOutcome::RetryRequired(summary));
             }

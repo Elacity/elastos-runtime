@@ -339,10 +339,11 @@ function renderDiscovery(discovery) {
     discoveryToggleButton.hidden = !configured;
     discoveryToggleButton.dataset.enabled = enabled ? "true" : "false";
     discoveryToggleButton.textContent = enabled ? "Turn Off" : "Turn On";
+    discoveryToggleButton.disabled = !configured || safeDiscovery.status === "community_left";
   }
   if (discoveryRefreshButton) {
     discoveryRefreshButton.hidden = !configured;
-    discoveryRefreshButton.disabled = !configured;
+    discoveryRefreshButton.disabled = !configured || safeDiscovery.status === "community_left";
   }
 
   discoveryList.innerHTML = safeDiscovery.discoveredPeers.length

@@ -115,6 +115,18 @@ Leaving Community is a separate action. A Home that stays isolated
 fetches nothing. An offline update hop refuses a changed pin, like other support
 changes.
 
+The Home's owner can select **Leave Community** in System. This choice applies
+to the whole Home. Runtime stops Community messages, presence and Discovery,
+while it keeps the admitted network, accepted-head witness, contacts, Direct
+messages and stored history. Other Homes keep their own choices. A guest can
+see the setting; the current owner controls it.
+
+The owner can select **Rejoin Community** to reverse the choice. Runtime uses
+the current admitted network head and the saved Discovery preferences. Restart
+and update preserve the owner-only membership record separately from the
+network configuration and product state. Previously published Discovery
+announcements keep their signed expiry; leaving stops their renewal.
+
 Setup and update apply the release network to the data root:
 
 - A new Home receives `collaboration-network-v1.json` from the release copy

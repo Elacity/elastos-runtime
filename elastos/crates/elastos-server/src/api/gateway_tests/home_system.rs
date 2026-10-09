@@ -5523,6 +5523,108 @@ async fn test_system_guest_registration_requires_admin_passkey() {
         .starts_with("localhost://Users/"));
 }
 
+#[tokio::test]
+async fn system_community_membership_is_home_wide_and_requires_current_owner_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "membership-network",
+        "community",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let marker = dir
+        .path()
+        .join("collaboration-community-membership-v1.json");
+    let mut denied_tokens = vec![
+        system_app_token(dir.path()),
+        projection_launch_token_for_authority_context(dir.path(), PEOPLE_CAPSULE_ID, &authority),
+    ];
+    for index in 0..3 {
+        let guest = passkey_authority_with_profile_role_credential(
+            dir.path(),
+            &format!("Guest {index}"),
+            crate::auth::RuntimePrincipalRole::Guest,
+            &format!("membership-guest-{index}"),
+        );
+        denied_tokens.push(guest.system_token);
+    }
+    for token in denied_tokens {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"joined":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(port.community_membership().joined());
+        assert!(!marker.exists());
+    }
+    for joined in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", &authority.system_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"joined": joined}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["joined"], joined);
+        assert_eq!(port.community_membership().joined(), joined);
+    }
+    let before = std::fs::read(&marker).unwrap();
+    let mut principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    principal.role = crate::auth::RuntimePrincipalRole::Guest;
+    let mut auth = crate::auth::load_auth_state(dir.path()).unwrap();
+    *auth
+        .principals
+        .iter_mut()
+        .find(|entry| entry.principal_id == principal.principal_id)
+        .unwrap() = principal;
+    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/system/community")
+                .header("x-elastos-home-token", authority.system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"joined":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an earlier owner token cannot retain a removed admin role"
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), before);
+}
+
 #[test]
 fn system_runtime_activity_filters_attach_noise() {
     use elastos_runtime::primitives::audit::AuditEvent;
