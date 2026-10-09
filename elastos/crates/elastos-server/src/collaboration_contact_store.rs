@@ -458,6 +458,75 @@ impl CollaborationContactReadSnapshot<'_> {
         Ok(requested)
     }
 
+    /// Chains whose terminal decision was Declined, in either direction.
+    /// These are the People "declined" rows; a pair later accepted or removed
+    /// is not declined.
+    pub(crate) fn declined_relationships(
+        &self,
+    ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut current_state: HashMap<String, CollaborationRelationshipEvent> = HashMap::new();
+        let mut settled: HashSet<String> = HashSet::new();
+        for chain in accepted_chains(loaded)? {
+            settled.insert(
+                remote_presentation(&chain, &self.store.local_profile_did)?.remote_profile_did,
+            );
+        }
+        settled.extend(loaded.removed_contacts.keys().cloned());
+        for (request_hash, decision) in &loaded.decisions {
+            if decision.envelope().payload.decision != CollaborationContactDecision::Declined {
+                continue;
+            }
+            let Some(request) = loaded.requests.get(request_hash) else {
+                continue;
+            };
+            let Some(advertisement) = loaded
+                .advertisements
+                .get(request.advertisement_envelope_sha256())
+            else {
+                continue;
+            };
+            let (remote_profile_did, display_name, handle) =
+                if request.requester_profile_did() == self.store.local_profile_did {
+                    (
+                        advertisement.profile_did().to_string(),
+                        advertisement.display_name().to_string(),
+                        advertisement.handle().map(str::to_string),
+                    )
+                } else {
+                    (
+                        request.requester_profile_did().to_string(),
+                        request.display_name().to_string(),
+                        request.handle().map(str::to_string),
+                    )
+                };
+            if settled.contains(&remote_profile_did) {
+                continue;
+            }
+            let event = CollaborationRelationshipEvent {
+                remote_profile_did: remote_profile_did.clone(),
+                display_name,
+                handle,
+                occurred_at: decision.envelope().payload.decided_at,
+            };
+            match current_state.get(&remote_profile_did) {
+                Some(existing) if existing.occurred_at >= event.occurred_at => {}
+                _ => {
+                    current_state.insert(remote_profile_did, event);
+                }
+            }
+        }
+        let mut declined: Vec<_> = current_state.into_values().collect();
+        declined.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.remote_profile_did.cmp(&right.remote_profile_did))
+        });
+        Ok(declined)
+    }
+
     pub(crate) fn pending_incoming_requests(
         &self,
     ) -> anyhow::Result<Vec<PendingIncomingContactRequest>> {
@@ -655,74 +724,6 @@ impl CollaborationContactStore {
         now: u64,
     ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
         self.read_only_snapshot()?.outgoing_pending_requests(now)
-    }
-
-    /// Chains whose terminal decision was Declined, in either direction.
-    /// These are the People "declined" rows; a pair later accepted or removed
-    /// is not declined.
-    pub(crate) fn declined_relationships(
-        &self,
-    ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
-        let Some(loaded) = self.load_state()? else {
-            return Ok(Vec::new());
-        };
-        let mut current_state: HashMap<String, CollaborationRelationshipEvent> = HashMap::new();
-        let mut settled: HashSet<String> = HashSet::new();
-        for chain in accepted_chains(&loaded)? {
-            settled
-                .insert(remote_presentation(&chain, &self.local_profile_did)?.remote_profile_did);
-        }
-        settled.extend(loaded.removed_contacts.keys().cloned());
-        for (request_hash, decision) in &loaded.decisions {
-            if decision.envelope().payload.decision != CollaborationContactDecision::Declined {
-                continue;
-            }
-            let Some(request) = loaded.requests.get(request_hash) else {
-                continue;
-            };
-            let Some(advertisement) = loaded
-                .advertisements
-                .get(request.advertisement_envelope_sha256())
-            else {
-                continue;
-            };
-            let (remote_profile_did, display_name, handle) =
-                if request.requester_profile_did() == self.local_profile_did {
-                    (
-                        advertisement.profile_did().to_string(),
-                        advertisement.display_name().to_string(),
-                        advertisement.handle().map(str::to_string),
-                    )
-                } else {
-                    (
-                        request.requester_profile_did().to_string(),
-                        request.display_name().to_string(),
-                        request.handle().map(str::to_string),
-                    )
-                };
-            if settled.contains(&remote_profile_did) {
-                continue;
-            }
-            let event = CollaborationRelationshipEvent {
-                remote_profile_did: remote_profile_did.clone(),
-                display_name,
-                handle,
-                occurred_at: decision.envelope().payload.decided_at,
-            };
-            match current_state.get(&remote_profile_did) {
-                Some(existing) if existing.occurred_at >= event.occurred_at => {}
-                _ => {
-                    current_state.insert(remote_profile_did, event);
-                }
-            }
-        }
-        let mut declined: Vec<_> = current_state.into_values().collect();
-        declined.sort_by(|left, right| {
-            left.occurred_at
-                .cmp(&right.occurred_at)
-                .then_with(|| left.remote_profile_did.cmp(&right.remote_profile_did))
-        });
-        Ok(declined)
     }
 
     pub(crate) fn pending_incoming_requests(

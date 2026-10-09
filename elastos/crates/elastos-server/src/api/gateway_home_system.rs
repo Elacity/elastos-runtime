@@ -404,24 +404,33 @@ pub(super) async fn home_summary(
                 Ok(authority) => authority,
                 Err(err) => return home_error_response(err),
             };
-            if let Err(err) = apply_profile_people_authority(
+            let contact_read = match contact_authority
+                .as_ref()
+                .map(|authority| authority.store.read_only_snapshot())
+                .transpose()
+            {
+                Ok(read) => read,
+                Err(err) => return home_error_response(err),
+            };
+            if let Err(err) = apply_profile_people_authority_from_snapshot(
                 &mut home_state.people,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_read.as_ref(),
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_contact_request_notification_projection(
+            if let Err(err) = apply_contact_request_notification_projection_from_snapshot(
                 &state.data_dir,
                 contact_authority.as_ref(),
+                contact_read.as_ref(),
                 state.collaboration_chat_product_port.as_ref(),
                 &mut home_state.notifications,
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_services_peer_authority(
+            if let Err(err) = apply_services_peer_authority_from_snapshot(
                 &state.data_dir,
                 context,
-                state.collaboration_discovery_service.as_ref(),
+                contact_read.as_ref(),
                 &mut home_state.services,
             ) {
                 return home_error_response(err);
@@ -754,7 +763,13 @@ pub(super) async fn people_contact_remove(
 fn configured_people_summary_from_contact_store(
     store: &crate::collaboration_contact_store::CollaborationContactStore,
 ) -> anyhow::Result<HomePeopleSummary> {
-    let snapshot = store.snapshot()?;
+    configured_people_summary_from_snapshot(&store.read_only_snapshot()?)
+}
+
+fn configured_people_summary_from_snapshot(
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+) -> anyhow::Result<HomePeopleSummary> {
+    let snapshot = read.snapshot()?;
     let now = now_ts();
     let mut contacts = snapshot
         .contacts()
@@ -783,7 +798,7 @@ fn configured_people_summary_from_contact_store(
         .iter()
         .map(|contact| contact.remote_profile_did().to_string())
         .collect();
-    for requested in store.outgoing_pending_requests(now)? {
+    for requested in read.outgoing_pending_requests(now)? {
         if !seen.insert(requested.remote_profile_did.clone()) {
             continue;
         }
@@ -825,7 +840,7 @@ fn configured_people_summary_from_contact_store(
             reachable: None,
         });
     }
-    for declined in store.declined_relationships()? {
+    for declined in read.declined_relationships()? {
         if !seen.insert(declined.remote_profile_did.clone()) {
             continue;
         }
@@ -867,9 +882,34 @@ pub(super) fn apply_contact_request_notification_projection(
     community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
     notifications: &mut HomeNotificationsSummary,
 ) -> anyhow::Result<()> {
-    let contact_store = contact_authority.map(|authority| &authority.store);
-    let pending = match contact_store {
-        Some(store) => store
+    let read = contact_authority
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_contact_request_notification_projection_from_snapshot(
+        data_dir,
+        contact_authority,
+        read.as_ref(),
+        community,
+        notifications,
+    )
+}
+
+fn apply_contact_request_notification_projection_from_snapshot(
+    data_dir: &std::path::Path,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
+    notifications: &mut HomeNotificationsSummary,
+) -> anyhow::Result<()> {
+    let contact_store = match (contact_authority, read) {
+        (Some(authority), Some(read)) if std::ptr::eq(authority.store.as_ref(), read.store()) => {
+            Some(read.store())
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("Home notification snapshot does not match its contact authority"),
+    };
+    let pending = match read {
+        Some(read) => read
             .pending_incoming_requests()?
             .iter()
             .map(
@@ -1786,6 +1826,27 @@ mod discovery_summary_tests {
             .unwrap();
 
         assert_eq!(fixture.store.snapshot().unwrap().contacts().len(), 1);
+        let response_read = fixture.store.read_only_snapshot().unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: fixture.store.principal_id().to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        let authority = ConfiguredContactAuthority {
+            profile: fixture.local_profile.clone(),
+            store: fixture.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        let original_notifications = serde_json::to_value(&notifications).unwrap();
         let revocation = signed_discovery_message(
             &fixture.local_key,
             &fixture.local_profile.document().profile_did,
@@ -1820,6 +1881,35 @@ mod discovery_summary_tests {
             .record_local_contact_revocation(&revocation, &fixture.local_profile, now + 3)
             .unwrap();
 
+        // The already started response retains one view across the real revocation.
+        let response_people = configured_people_summary_from_snapshot(&response_read).unwrap();
+        assert_eq!(response_people.contacts[0].relationship, "connected");
+        assert_eq!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&response_read))
+                .unwrap()
+                .contacts
+                .len(),
+            1
+        );
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&notifications).unwrap(),
+            original_notifications
+        );
+        let next_read = fixture.store.read_only_snapshot().unwrap();
+        assert!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&next_read))
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
         let snapshot = fixture.store.snapshot().unwrap();
         assert!(snapshot.contacts().is_empty());
         assert_eq!(snapshot.removed().len(), 1);
@@ -1841,6 +1931,56 @@ mod discovery_summary_tests {
             resendable[0].remote_profile_did,
             remote_profile.document().profile_did
         );
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            fixture.store.localhost_root()
+        );
+        let path = rooted_localhost_fs_path(fixture.store.data_root(), &object_uri).unwrap();
+        crate::auth::write_protected_principal_root_object(
+            fixture.store.data_root(),
+            fixture.store.principal_id(),
+            fixture.store.localhost_root(),
+            &object_uri,
+            &path,
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_people_summary_from_snapshot(&next_read)
+                .unwrap()
+                .contacts[0]
+                .relationship,
+            "removed"
+        );
+        assert!(fixture.store.read_only_snapshot().is_err());
+        assert!(configured_people_summary_from_contact_store(&fixture.store).is_err());
+    }
+
+    #[test]
+    fn home_contact_read_refuses_foreign_authority_and_principal_root() {
+        let fixture = configured_people_fixture();
+        let foreign = configured_people_fixture();
+        let read = fixture.store.read_only_snapshot().unwrap();
+        let authority = ConfiguredContactAuthority {
+            profile: foreign.local_profile.clone(),
+            store: foreign.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        assert!(apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&read),
+            None,
+            &mut notifications,
+        )
+        .is_err());
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:foreign-home-reader".to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        assert!(home_services_peer_contacts_state_from_snapshot(&context, Some(&read)).is_err());
     }
 
     #[test]
@@ -1968,6 +2108,18 @@ fn apply_profile_people_authority(
     Ok(())
 }
 
+fn apply_profile_people_authority_from_snapshot(
+    people: &mut HomePeopleSummary,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<()> {
+    if let Some(read) = read {
+        *people = configured_people_summary_from_snapshot(read)?;
+        return Ok(());
+    }
+    *people = HomePeopleSummary::default();
+    Ok(())
+}
+
 fn apply_services_peer_authority(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -1976,7 +2128,22 @@ fn apply_services_peer_authority(
     >,
     services: &mut HomeServicesSummary,
 ) -> anyhow::Result<()> {
-    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_services_peer_authority_from_snapshot(data_dir, context, read.as_ref(), services)
+}
+
+fn apply_services_peer_authority_from_snapshot(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    services: &mut HomeServicesSummary,
+) -> anyhow::Result<()> {
+    let contacts = home_services_peer_contacts_state_from_snapshot(context, read)?;
     let mut remote_offers = contacts
         .contacts
         .values()
@@ -5202,13 +5369,20 @@ async fn home_realtime_snapshot(
         context,
         state.collaboration_discovery_service.as_ref(),
     );
-    let mut contact_authority_unavailable = contact_authority.is_err();
-    if apply_contact_request_notification_projection(
+    let contact_read = contact_authority
+        .as_ref()
+        .ok()
+        .and_then(|authority| authority.as_ref())
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose();
+    let mut contact_authority_unavailable = contact_authority.is_err() || contact_read.is_err();
+    if apply_contact_request_notification_projection_from_snapshot(
         &state.data_dir,
         contact_authority
             .as_ref()
             .ok()
             .and_then(|authority| authority.as_ref()),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
         state.collaboration_chat_product_port.as_ref(),
         &mut home_state.notifications,
     )
@@ -5216,25 +5390,23 @@ async fn home_realtime_snapshot(
     {
         contact_authority_unavailable = true;
     }
-    if apply_profile_people_authority(
+    if apply_profile_people_authority_from_snapshot(
         &mut home_state.people,
-        contact_authority
-            .as_ref()
-            .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
     )
     .is_err()
     {
         home_state.people = HomePeopleSummary::default();
     }
-    if apply_services_peer_authority(
-        &state.data_dir,
-        context,
-        state.collaboration_discovery_service.as_ref(),
-        &mut home_state.services,
-    )
-    .is_err()
+    if contact_authority.is_err()
+        || contact_read.is_err()
+        || apply_services_peer_authority_from_snapshot(
+            &state.data_dir,
+            context,
+            contact_read.as_ref().ok().and_then(|read| read.as_ref()),
+            &mut home_state.services,
+        )
+        .is_err()
     {
         home_state.services = HomeServicesSummary::default();
     }
@@ -6557,16 +6729,32 @@ fn home_services_peer_contacts_state(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
 ) -> anyhow::Result<HomeServicesPeerContactsState> {
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    home_services_peer_contacts_state_from_snapshot(context, read.as_ref())
+}
+
+fn home_services_peer_contacts_state_from_snapshot(
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<HomeServicesPeerContactsState> {
     let mut state = default_home_services_peer_contacts_state(context);
-    let Some(authority) =
-        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?
-    else {
+    let Some(read) = read else {
         return Ok(state);
     };
+    if read.store().principal_id() != state.principal_id
+        || read.store().localhost_root() != state.localhost_root
+    {
+        anyhow::bail!("Home Services snapshot does not match its principal root");
+    }
     // A contact permits a request. The provider's separate approval grants use.
     // Delivery follows the endpoint in the current verified Profile chain;
     // legacy peer files remain migration evidence, never contact authority.
-    for contact in authority.store.snapshot()?.contacts() {
+    for contact in read.snapshot()?.contacts() {
         let endpoint_did = contact.remote_presence_device_did();
         let peer_id = crate::carrier::did_to_public_key(endpoint_did)
             .ok_or_else(|| {
