@@ -1745,7 +1745,7 @@ fn configured_attachment_unsupported_response() -> Response {
         .into_response()
 }
 
-fn configured_legacy_room_control_unsupported_response() -> Response {
+pub(super) fn configured_legacy_room_control_unsupported_response() -> Response {
     (
         StatusCode::CONFLICT,
         "Legacy room controls are unavailable in configured collaboration Chat.",

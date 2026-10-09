@@ -1468,6 +1468,7 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token")
+        || text.contains("admin passkey required")
         || text.contains("fresh passkey")
         || text.contains("passkey step-up")
         || text.contains("auth session is not active")

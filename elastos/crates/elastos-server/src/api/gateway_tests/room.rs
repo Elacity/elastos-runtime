@@ -2683,3 +2683,165 @@ async fn test_chat_room_configured_send_asks_a_fast_sender_to_slow_down() {
     let replay = app.clone().oneshot(send(0)).await.unwrap();
     assert_eq!(replay.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn configured_inbox_refuses_legacy_room_decisions_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port =
+        Some(crate::collaboration_product::test_chat_product_port(
+            dir.path(),
+            "inbox-configured-network",
+            "inbox-configured-conversation",
+        ));
+    let app = gateway_router(state);
+    let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    for action in ["room-approve-request:", "room-deny-request:"] {
+        let request = crate::room_service::request_browser_access(
+            dir.path(),
+            crate::room_service::BrowserAccessRequestInput {
+                display_name: "Pending guest".to_string(),
+                device_label: "Browser".to_string(),
+                host_member_did: None,
+                capabilities: vec!["room.access".to_string()],
+            },
+        )
+        .unwrap();
+        let before = room_store_snapshot(dir.path());
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/inbox/actions")
+                    .header("x-elastos-home-token", &token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"action_id": format!("{action}{}", request.request_id)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("Legacy room controls are unavailable"));
+        assert_eq!(room_store_snapshot(dir.path()), before);
+        assert_eq!(
+            crate::room_service::browser_access_status(dir.path(), &request.request_id)
+                .unwrap()
+                .status,
+            "pending"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_inbox_room_decisions_require_current_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("Guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let guest_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &guest);
+    let owner_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let app = gateway_router(test_state(dir.path()));
+    for (action, expected) in [
+        ("room-approve-request:", "approved"),
+        ("room-deny-request:", "denied"),
+    ] {
+        let request = crate::room_service::request_browser_access(
+            dir.path(),
+            crate::room_service::BrowserAccessRequestInput {
+                display_name: "Pending guest".to_string(),
+                device_label: "Browser".to_string(),
+                host_member_did: None,
+                capabilities: vec!["room.access".to_string()],
+            },
+        )
+        .unwrap();
+        let before = room_store_snapshot(dir.path());
+        for (token, status) in [
+            (&guest_token, StatusCode::FORBIDDEN),
+            (&owner_token, StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri("/api/apps/inbox/actions")
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"action_id": format!("{action}{}", request.request_id)})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            if status == StatusCode::FORBIDDEN {
+                assert_eq!(room_store_snapshot(dir.path()), before);
+                assert_eq!(
+                    crate::room_service::browser_access_status(dir.path(), &request.request_id)
+                        .unwrap()
+                        .status,
+                    "pending"
+                );
+            }
+        }
+        assert_eq!(
+            crate::room_service::browser_access_status(dir.path(), &request.request_id)
+                .unwrap()
+                .status,
+            expected
+        );
+    }
+    // The minted token does not freeze the principal's role.
+    let request = crate::room_service::request_browser_access(
+        dir.path(),
+        crate::room_service::BrowserAccessRequestInput {
+            display_name: "After demotion".to_string(),
+            device_label: "Browser".to_string(),
+            host_member_did: None,
+            capabilities: vec!["room.access".to_string()],
+        },
+    )
+    .unwrap();
+    let mut auth = crate::auth::load_auth_state(dir.path()).unwrap();
+    auth.principals
+        .iter_mut()
+        .find(|entry| entry.principal_id == authority.principal_id)
+        .unwrap()
+        .role = crate::auth::RuntimePrincipalRole::Guest;
+    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    let before = room_store_snapshot(dir.path());
+    for action in ["room-approve-request:", "room-deny-request:"] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/inbox/actions")
+                    .header("x-elastos-home-token", &owner_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"action_id": format!("{action}{}", request.request_id)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(room_store_snapshot(dir.path()), before);
+    }
+}

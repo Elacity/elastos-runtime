@@ -222,6 +222,16 @@ pub(super) async fn inbox_action(
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
+    if action.action_id.starts_with("room-approve-request:")
+        || action.action_id.starts_with("room-deny-request:")
+    {
+        if state.collaboration_chat_product_port.is_some() {
+            return super::gateway_room::configured_legacy_room_control_unsupported_response();
+        }
+        if let Err(error) = ensure_admin_context(&state.data_dir, &context) {
+            return inbox_error_response(error);
+        }
+    }
     match dispatch_inbox_action(&state, &launch, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
