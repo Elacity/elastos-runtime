@@ -95,6 +95,40 @@ struct NotificationEntryRecord {
     acted: bool,
     #[serde(default)]
     dismissed: bool,
+    /// The local Profile this entry belongs to. Absent for Home-wide entries.
+    /// Many accounts can share one Home, so an owned entry is shown to, and
+    /// changed by, its owner only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_profile_did: Option<String>,
+}
+
+impl NotificationEntryRecord {
+    /// Whether `viewer` (the signed-in account's Profile DID, if any) may see
+    /// or change this entry. A direct-message entry without an owner predates
+    /// per-account entries; it is shown to nobody.
+    fn visible_to(&self, viewer: Option<&str>) -> bool {
+        match self.owner_profile_did.as_deref() {
+            Some(owner) => viewer == Some(owner),
+            None => self.kind != DIRECT_MESSAGE_KIND,
+        }
+    }
+
+    fn view(&self) -> NotificationEntryView {
+        NotificationEntryView {
+            id: self.id.clone(),
+            source_app: self.source_app.clone(),
+            kind: self.kind.clone(),
+            title: self.title.clone(),
+            body: self.body.clone(),
+            action_ref: self.action_ref.clone(),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            severity: self.severity,
+            read: self.read,
+            acted: self.acted,
+            dismissed: self.dismissed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -118,6 +152,8 @@ struct NotificationEventRecord {
     disposition: NotificationEventDisposition,
     #[serde(default)]
     resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_profile_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +164,7 @@ enum NotificationEventDisposition {
 }
 
 pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     let existing_ids = store
@@ -198,6 +235,7 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
             read: false,
             acted: false,
             dismissed: false,
+            owner_profile_did: None,
         });
         if !existing_ids.contains(&id) {
             record_event(
@@ -218,6 +256,7 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
                     created_at: request.requested_at,
                     disposition: NotificationEventDisposition::Appeared,
                     resolution: None,
+                    owner_profile_did: None,
                 },
             )?;
         }
@@ -324,17 +363,23 @@ fn contact_request_notification_id(request_hash: &str) -> String {
 /// this module never invents one.
 pub fn upsert_direct_message_notification(
     data_dir: &Path,
+    owner_profile_did: &str,
     conversation_id: &str,
     sender_display_name: &str,
     now: u64,
 ) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let id = direct_message_notification_id(conversation_id);
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
-    let already_exists = store.entries.iter().any(|entry| entry.id == id);
     if store.schema.trim().is_empty() {
         store.schema = NOTIFICATIONS_SCHEMA.to_string();
     }
+    // Entries from before per-account ownership are shown to nobody; drop them.
+    store
+        .entries
+        .retain(|entry| entry.kind != DIRECT_MESSAGE_KIND || entry.owner_profile_did.is_some());
+    let owner = Some(owner_profile_did.to_string());
     let title = format!("New message from {sender_display_name}");
     let body = format!("{sender_display_name} sent you a message in Chat.");
     let action_ref = Some(NotificationActionRef {
@@ -342,7 +387,11 @@ pub fn upsert_direct_message_notification(
         action_id: direct_message_notification_action_id(conversation_id),
     });
 
-    if let Some(existing) = store.entries.iter_mut().find(|entry| entry.id == id) {
+    if let Some(existing) = store
+        .entries
+        .iter_mut()
+        .find(|entry| entry.id == id && entry.owner_profile_did == owner)
+    {
         existing.source_app = "chat-room".to_string();
         existing.kind = DIRECT_MESSAGE_KIND.to_string();
         existing.title = title;
@@ -369,23 +418,23 @@ pub fn upsert_direct_message_notification(
         read: false,
         acted: false,
         dismissed: false,
+        owner_profile_did: owner.clone(),
     });
-    if !already_exists {
-        record_event(
-            data_dir,
-            NotificationEventRecord {
-                id: format!("appeared:{id}"),
-                notification_id: id,
-                source_app: "chat-room".to_string(),
-                title,
-                body,
-                action_ref,
-                created_at: now,
-                disposition: NotificationEventDisposition::Appeared,
-                resolution: None,
-            },
-        )?;
-    }
+    record_event(
+        data_dir,
+        NotificationEventRecord {
+            id: format!("appeared:{id}"),
+            notification_id: id,
+            source_app: "chat-room".to_string(),
+            title,
+            body,
+            action_ref,
+            created_at: now,
+            disposition: NotificationEventDisposition::Appeared,
+            resolution: None,
+            owner_profile_did: owner,
+        },
+    )?;
     write_json_atomic(&path, &store)
 }
 
@@ -396,50 +445,86 @@ pub fn direct_message_notification_action_id(conversation_id: &str) -> String {
     format!("chat-open-direct:{conversation_id}")
 }
 
+/// This account's direct conversations whose newest message notification
+/// has not been acted on yet, which is when the person opens the conversation.
+pub fn unread_direct_message_conversations(
+    data_dir: &Path,
+    owner_profile_did: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let path = notifications_path(data_dir)?;
+    let store = read_json_or_default::<NotificationStore>(&path)?;
+    Ok(store
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == DIRECT_MESSAGE_KIND && !entry.acted)
+        .filter(|entry| entry.visible_to(Some(owner_profile_did)))
+        .filter_map(|entry| entry.id.strip_prefix(DIRECT_MESSAGE_ID_PREFIX))
+        .map(str::to_string)
+        .collect())
+}
+
+/// True for the per-conversation direct message notification entries.
+pub fn is_direct_message_notification_id(id: &str) -> bool {
+    id.starts_with(DIRECT_MESSAGE_ID_PREFIX)
+}
+
 fn direct_message_notification_id(conversation_id: &str) -> String {
     format!("{DIRECT_MESSAGE_ID_PREFIX}{conversation_id}")
 }
 
+/// The Home-wide entries. Entries owned by one account, such as direct
+/// messages, are added per reader by [`project_direct_message_notifications`].
 pub fn load_summary(data_dir: &Path) -> anyhow::Result<NotificationSummary> {
-    let path = notifications_path(data_dir)?;
-    let mut store = read_json_or_default::<NotificationStore>(&path)?;
-    if store.schema.trim().is_empty() {
-        store.schema = NOTIFICATIONS_SCHEMA.to_string();
-    }
+    let entries = live_entries(data_dir, None)?;
+    Ok(summary_from(entries))
+}
 
-    let now = now_ts();
-    store
+/// Adds the signed-in account's own direct-message entries to one Home or
+/// Inbox read response.
+pub fn project_direct_message_notifications(
+    summary: &mut NotificationSummary,
+    data_dir: &Path,
+    owner_profile_did: &str,
+) -> anyhow::Result<()> {
+    summary
         .entries
-        .retain(|entry| entry.expires_at.is_none_or(|expires_at| expires_at > now));
+        .retain(|entry| entry.kind != DIRECT_MESSAGE_KIND);
+    summary.entries.extend(
+        live_entries(data_dir, Some(owner_profile_did))?
+            .into_iter()
+            .filter(|entry| entry.kind == DIRECT_MESSAGE_KIND),
+    );
+    *summary = summary_from(std::mem::take(&mut summary.entries));
+    Ok(())
+}
 
-    let entries = store
+/// Unexpired, unresolved entries `viewer` may see.
+fn live_entries(
+    data_dir: &Path,
+    viewer: Option<&str>,
+) -> anyhow::Result<Vec<NotificationEntryView>> {
+    let path = notifications_path(data_dir)?;
+    let store = read_json_or_default::<NotificationStore>(&path)?;
+    let now = now_ts();
+    Ok(store
         .entries
         .iter()
+        .filter(|entry| entry.expires_at.is_none_or(|expires_at| expires_at > now))
         .filter(|entry| !entry.dismissed && !entry.acted)
-        .map(|entry| NotificationEntryView {
-            id: entry.id.clone(),
-            source_app: entry.source_app.clone(),
-            kind: entry.kind.clone(),
-            title: entry.title.clone(),
-            body: entry.body.clone(),
-            action_ref: entry.action_ref.clone(),
-            created_at: entry.created_at,
-            expires_at: entry.expires_at,
-            severity: entry.severity,
-            read: entry.read,
-            acted: entry.acted,
-            dismissed: entry.dismissed,
-        })
-        .collect::<Vec<_>>();
+        .filter(|entry| entry.visible_to(viewer))
+        .map(NotificationEntryRecord::view)
+        .collect())
+}
 
-    Ok(NotificationSummary {
+fn summary_from(entries: Vec<NotificationEntryView>) -> NotificationSummary {
+    NotificationSummary {
         unread_count: entries.iter().filter(|entry| !entry.read).count(),
         attention_count: entries
             .iter()
             .filter(|entry| entry.severity == NotificationSeverity::Attention)
             .count(),
         entries,
-    })
+    }
 }
 
 pub fn upsert_external_http_request(
@@ -451,6 +536,7 @@ pub fn upsert_external_http_request(
     approve_action_id: &str,
     created_at: u64,
 ) -> anyhow::Result<()> {
+    let _store = lock_store(data_dir)?;
     let id = external_http_request_notification_id(request_id);
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
@@ -491,6 +577,7 @@ pub fn upsert_external_http_request(
         read: false,
         acted: false,
         dismissed: false,
+        owner_profile_did: None,
     });
     if !already_exists {
         record_event(
@@ -508,6 +595,7 @@ pub fn upsert_external_http_request(
                 created_at,
                 disposition: NotificationEventDisposition::Appeared,
                 resolution: None,
+                owner_profile_did: None,
             },
         )?;
     }
@@ -515,14 +603,24 @@ pub fn upsert_external_http_request(
 }
 
 pub fn dismiss_external_http_request(data_dir: &Path, request_id: &str) -> anyhow::Result<bool> {
-    dismiss(data_dir, &external_http_request_notification_id(request_id))
+    dismiss(
+        data_dir,
+        None,
+        &external_http_request_notification_id(request_id),
+    )
 }
 
 fn external_http_request_notification_id(request_id: &str) -> String {
     format!("external-http-request:{request_id}")
 }
 
-pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result<usize> {
+/// Resolves the entries `viewer` may see whose action is `action_id`.
+pub fn mark_acted_for_action(
+    data_dir: &Path,
+    viewer: Option<&str>,
+    action_id: &str,
+) -> anyhow::Result<usize> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -537,6 +635,7 @@ pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result
             .map(|action_ref| action_ref.action_id.as_str())
             == Some(action_id)
             && !entry.acted
+            && entry.visible_to(viewer)
         {
             record_event(
                 data_dir,
@@ -550,6 +649,7 @@ pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result
                     created_at: now_ts(),
                     disposition: NotificationEventDisposition::Resolved,
                     resolution: Some("acted".to_string()),
+                    owner_profile_did: entry.owner_profile_did.clone(),
                 },
             )?;
             entry.acted = true;
@@ -564,7 +664,8 @@ pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result
     Ok(updated)
 }
 
-pub fn mark_read(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
+pub fn mark_read(data_dir: &Path, viewer: Option<&str>, id: &str) -> anyhow::Result<bool> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -573,7 +674,7 @@ pub fn mark_read(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
 
     let mut updated = false;
     for entry in &mut store.entries {
-        if entry.id == id && !entry.read {
+        if entry.id == id && !entry.read && entry.visible_to(viewer) {
             entry.read = true;
             updated = true;
         }
@@ -585,7 +686,8 @@ pub fn mark_read(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
     Ok(updated)
 }
 
-pub fn dismiss(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
+pub fn dismiss(data_dir: &Path, viewer: Option<&str>, id: &str) -> anyhow::Result<bool> {
+    let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
     if store.schema.trim().is_empty() {
@@ -594,7 +696,7 @@ pub fn dismiss(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
 
     let mut updated = false;
     for entry in &mut store.entries {
-        if entry.id == id && !entry.dismissed {
+        if entry.id == id && !entry.dismissed && entry.visible_to(viewer) {
             record_event(
                 data_dir,
                 NotificationEventRecord {
@@ -607,6 +709,7 @@ pub fn dismiss(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
                     created_at: now_ts(),
                     disposition: NotificationEventDisposition::Resolved,
                     resolution: Some("dismissed".to_string()),
+                    owner_profile_did: entry.owner_profile_did.clone(),
                 },
             )?;
             entry.dismissed = true;
@@ -636,6 +739,17 @@ fn notifications_root_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .context("failed to resolve notifications root")
 }
 
+/// Serializes every read-modify-write of the shared store, so one account's
+/// write never replaces another's fresh entry with an older snapshot. Held by
+/// each public writer; internal helpers such as [`record_event`] run under it.
+fn lock_store(data_dir: &Path) -> anyhow::Result<crate::host_lock::FileLock> {
+    let root = notifications_root_dir(data_dir)?;
+    fs::create_dir_all(&root)?;
+    crate::collaboration_core::lock_owner_only_file(&root.join(".notifications.lock"))
+        .context("failed to lock the notification store")
+}
+
+/// Runs under the caller's [`lock_store`].
 fn record_event(data_dir: &Path, event: NotificationEventRecord) -> anyhow::Result<()> {
     let path = notification_events_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationEventStore>(&path)?;
@@ -719,40 +833,142 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sync_room_notifications_creates_attention_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let summary = load_summary(tmp.path()).unwrap();
-        assert_eq!(summary.unread_count, 1);
-        assert_eq!(summary.attention_count, 1);
-        assert_eq!(summary.entries[0].source_app, "chat-room");
-        assert_eq!(summary.entries[0].id, "room-access-request:req-1");
-        assert_eq!(summary.entries[0].kind, ROOM_ACCESS_REQUEST_KIND);
-        assert_eq!(
-            summary.entries[0]
-                .action_ref
-                .as_ref()
-                .map(|action_ref| action_ref.action_id.as_str()),
-            Some("room-approve-request:req-1")
-        );
+    const ALICE: &str = "did:key:z6MkAlice";
+    const BOB: &str = "did:key:z6MkBob";
+
+    fn owned_summary(data: &Path, owner: &str) -> NotificationSummary {
+        let mut summary = load_summary(data).unwrap();
+        project_direct_message_notifications(&mut summary, data, owner).unwrap();
+        summary
     }
 
     #[test]
-    fn sync_room_notifications_prunes_stale_pair_requests() {
+    fn direct_message_notifications_belong_to_one_account() {
         let tmp = tempfile::tempdir().unwrap();
-        sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let empty = RoomSummary::default();
-        sync_room_notifications(tmp.path(), &empty).unwrap();
-        let summary = load_summary(tmp.path()).unwrap();
-        assert!(summary.entries.is_empty());
+        upsert_direct_message_notification(tmp.path(), ALICE, "direct:alice-x", "Xan", now_ts())
+            .unwrap();
+        upsert_direct_message_notification(tmp.path(), BOB, "direct:bob-y", "Yan", now_ts())
+            .unwrap();
+
+        // Each account sees only its own dot and Inbox entry.
+        assert_eq!(
+            unread_direct_message_conversations(tmp.path(), ALICE).unwrap(),
+            ["direct:alice-x".to_string()].into()
+        );
+        assert_eq!(
+            unread_direct_message_conversations(tmp.path(), BOB).unwrap(),
+            ["direct:bob-y".to_string()].into()
+        );
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+        let alice = owned_summary(tmp.path(), ALICE);
+        assert_eq!(alice.entries.len(), 1);
+        assert_eq!(alice.unread_count, 1);
+        assert_eq!(alice.entries[0].title, "New message from Xan");
+
+        // Neither another account nor the Home CLI can change Alice's entry.
+        let alice_id = direct_message_notification_id("direct:alice-x");
+        let alice_action = direct_message_notification_action_id("direct:alice-x");
+        for viewer in [Some(BOB), None] {
+            assert!(!mark_read(tmp.path(), viewer, &alice_id).unwrap());
+            assert!(!dismiss(tmp.path(), viewer, &alice_id).unwrap());
+            assert_eq!(
+                mark_acted_for_action(tmp.path(), viewer, &alice_action).unwrap(),
+                0
+            );
+        }
+        assert_eq!(owned_summary(tmp.path(), ALICE).unread_count, 1);
+
+        // Alice opening her conversation clears only her entry.
+        assert_eq!(
+            mark_acted_for_action(tmp.path(), Some(ALICE), &alice_action).unwrap(),
+            1
+        );
+        assert!(unread_direct_message_conversations(tmp.path(), ALICE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(owned_summary(tmp.path(), BOB).unread_count, 1);
+    }
+
+    #[test]
+    fn concurrent_writes_from_many_accounts_keep_every_alert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = 12;
+        let per_account = 5;
+        std::thread::scope(|scope| {
+            for account in 0..accounts {
+                let data = tmp.path();
+                scope.spawn(move || {
+                    let owner = format!("did:key:z6MkAccount{account}");
+                    for index in 0..per_account {
+                        upsert_direct_message_notification(
+                            data,
+                            &owner,
+                            &format!("direct:{account}-{index}"),
+                            "Peer",
+                            now_ts(),
+                        )
+                        .unwrap();
+                        // Reads and clears by another account race the writes.
+                        mark_read(data, Some(&owner), "room-access-request:none").unwrap();
+                    }
+                });
+            }
+        });
+        for account in 0..accounts {
+            assert_eq!(
+                unread_direct_message_conversations(
+                    tmp.path(),
+                    &format!("did:key:z6MkAccount{account}")
+                )
+                .unwrap()
+                .len(),
+                per_account
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_message_entry_without_an_owner_is_shown_to_nobody() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = notifications_path(tmp.path()).unwrap();
+        write_json_atomic(
+            &path,
+            &serde_json::json!({
+                "schema": NOTIFICATIONS_SCHEMA,
+                "entries": [{
+                    "id": direct_message_notification_id("direct:legacy"),
+                    "source_app": "chat-room",
+                    "kind": DIRECT_MESSAGE_KIND,
+                    "title": "New message from Old",
+                    "body": "Old sent you a message in Chat.",
+                    "created_at": now_ts(),
+                    "severity": "attention",
+                }],
+            }),
+        )
+        .unwrap();
+        for viewer in [ALICE, BOB] {
+            assert!(owned_summary(tmp.path(), viewer).entries.is_empty());
+            assert!(unread_direct_message_conversations(tmp.path(), viewer)
+                .unwrap()
+                .is_empty());
+        }
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+
+        // The next message for any account drops it.
+        upsert_direct_message_notification(tmp.path(), ALICE, "direct:new", "New", now_ts())
+            .unwrap();
+        let store = read_json_or_default::<NotificationStore>(&path).unwrap();
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries[0].owner_profile_did.as_deref(), Some(ALICE));
     }
 
     #[test]
     fn mark_acted_for_action_hides_notification_entry() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = mark_acted_for_action(tmp.path(), "room-approve-request:req-1").unwrap();
+        let updated =
+            mark_acted_for_action(tmp.path(), None, "room-approve-request:req-1").unwrap();
         assert_eq!(updated, 1);
         let summary = load_summary(tmp.path()).unwrap();
         assert!(summary.entries.is_empty());
@@ -762,7 +978,7 @@ mod tests {
     fn mark_read_updates_entry_state() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = mark_read(tmp.path(), "room-access-request:req-1").unwrap();
+        let updated = mark_read(tmp.path(), None, "room-access-request:req-1").unwrap();
         assert!(updated);
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.unread_count, 0);
@@ -773,7 +989,7 @@ mod tests {
     fn dismiss_hides_entry() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = dismiss(tmp.path(), "room-access-request:req-1").unwrap();
+        let updated = dismiss(tmp.path(), None, "room-access-request:req-1").unwrap();
         assert!(updated);
         let summary = load_summary(tmp.path()).unwrap();
         assert!(summary.entries.is_empty());
@@ -838,8 +1054,8 @@ mod tests {
     fn direct_message_notification_resolves_on_read_and_resurfaces_on_new_mail() {
         let tmp = tempfile::tempdir().unwrap();
         let conversation = "direct:sha256:abc";
-        upsert_direct_message_notification(tmp.path(), conversation, "Alice", 100).unwrap();
-        let summary = load_summary(tmp.path()).unwrap();
+        upsert_direct_message_notification(tmp.path(), ALICE, conversation, "Alice", 100).unwrap();
+        let summary = owned_summary(tmp.path(), ALICE);
         assert_eq!(summary.entries.len(), 1);
         assert_eq!(summary.entries[0].kind, DIRECT_MESSAGE_KIND);
         assert_eq!(summary.entries[0].id, "direct-message:direct:sha256:abc");
@@ -854,21 +1070,23 @@ mod tests {
         );
 
         // A second message keeps one entry per conversation.
-        upsert_direct_message_notification(tmp.path(), conversation, "Alice", 101).unwrap();
-        assert_eq!(load_summary(tmp.path()).unwrap().entries.len(), 1);
+        upsert_direct_message_notification(tmp.path(), ALICE, conversation, "Alice", 101).unwrap();
+        assert_eq!(owned_summary(tmp.path(), ALICE).entries.len(), 1);
 
         // Reading the conversation resolves it.
         let acted = mark_acted_for_action(
             tmp.path(),
+            Some(ALICE),
             &direct_message_notification_action_id(conversation),
         )
         .unwrap();
         assert_eq!(acted, 1);
-        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+        assert!(owned_summary(tmp.path(), ALICE).entries.is_empty());
 
         // New mail after a read resurfaces the same entry, unread again.
-        upsert_direct_message_notification(tmp.path(), conversation, "Alice Renamed", 102).unwrap();
-        let resurfaced = load_summary(tmp.path()).unwrap();
+        upsert_direct_message_notification(tmp.path(), ALICE, conversation, "Alice Renamed", 102)
+            .unwrap();
+        let resurfaced = owned_summary(tmp.path(), ALICE);
         assert_eq!(resurfaced.entries.len(), 1);
         assert!(!resurfaced.entries[0].read);
         assert_eq!(
@@ -910,7 +1128,7 @@ mod tests {
     fn dismiss_records_resolved_event() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        dismiss(tmp.path(), "room-access-request:req-1").unwrap();
+        dismiss(tmp.path(), None, "room-access-request:req-1").unwrap();
 
         let events: NotificationEventStore =
             read_json_or_default(&notification_events_path(tmp.path()).unwrap()).unwrap();

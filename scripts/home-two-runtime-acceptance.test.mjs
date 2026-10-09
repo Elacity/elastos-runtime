@@ -17,7 +17,9 @@ import {
   assertDistinctRuntimeEvidence,
   assertExactDirectConversation,
   assertFreshFixturePrecondition,
+  assertFreshOwnerEnrollmentPrecondition,
   assertIdentityFrame,
+  assertRecoveryBundleEvidence,
   assertRecoverySetupEvidence,
   assertRestartTransition,
   createAcceptanceReport,
@@ -158,6 +160,13 @@ test("a loopback Home without launcher-owned fixture manifests is rejected", (t)
   assert.throws(() => loadAcceptanceConfig(nonFixture), /ELASTOS_A_FIXTURE_MANIFEST is required/);
 });
 
+test("signup proof refuses a stored credential on either fixture before enrollment", () => {
+  assert.doesNotThrow(() => assertFreshOwnerEnrollmentPrecondition(0, 0));
+  for (const counts of [[1, 0], [0, 1], [1, 1], [undefined, 0], [0, "0"]]) {
+    assert.throws(() => assertFreshOwnerEnrollmentPrecondition(...counts), /reset the issue-owned fixture Homes and browser profiles/);
+  }
+});
+
 test("System evidence must prove two distinct manifest-bound Runtime instances", (t) => {
   const fixture = fixtureConfig(t);
   const config = loadAcceptanceConfig(fixture.env);
@@ -178,15 +187,27 @@ test("System evidence must prove two distinct manifest-bound Runtime instances",
   ), /two distinct fixture Runtimes/);
 });
 
-test("opaque accepted-contact projections must prove distinct Profile identities", () => {
-  assert.doesNotThrow(() => assertDistinctProfileContactEvidence(
-    "contact:opaque-a",
-    "contact:opaque-b",
-  ));
+test("opaque accepted-contact projections must bind distinct downloaded Recovery Profiles", () => {
+  const aProfileDid = "did:key:z6MkAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const bProfileDid = "did:key:z6MkBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+  const aContactId = "contact:459124a94946ce899c021a75";
+  const bContactId = "contact:b0785e1e57b39d59f45161a8";
+  assert.deepEqual(assertDistinctProfileContactEvidence(aContactId, bContactId, aProfileDid, bProfileDid), {
+    recovery_profile_binding_checked: true,
+  });
   assert.throws(
     () => assertDistinctProfileContactEvidence("contact:shared", "contact:shared"),
     /distinct Profile identities/,
   );
+  for (const [aDid, bDid] of [
+    [undefined, bProfileDid],
+    [aProfileDid, ""],
+    [aProfileDid, "foreign"],
+    [bProfileDid, aProfileDid],
+    ["did:key:z6MkCCCCCCCCCCCCCCCCCCCCCCCCCCCC", bProfileDid],
+  ]) {
+    assert.throws(() => assertDistinctProfileContactEvidence(aContactId, bContactId, aDid, bDid), /bind both Recovery Profiles/);
+  }
   assert.throws(
     () => assertDistinctProfileContactEvidence("", "contact:opaque-b"),
     /distinct Profile identities/,
@@ -249,23 +270,31 @@ test("pre-existing contact state fails the fresh-fixture precondition", () => {
   );
 });
 
-test("Recovery setup evidence requires one verified fixture-owned download per side", (t) => {
+test("Welcome Recovery evidence requires the signup Profile and one fixture-owned download per side", (t) => {
   const fixture = fixtureConfig(t);
   const config = loadAcceptanceConfig(fixture.env);
   const valid = {
     a: {
       download_count: 1,
       download_path: join(fixture.a.data_root, "recovery", "fixture-a.json"),
-      before_status: "setup_required",
-      blocked_status: "recovery_required",
-      after_status: "setup_required",
+      profile_status: "ready",
+      profile_name: `${config.a.name} Admin`,
+      before_recovery_status: "setup_required",
+      after_recovery_status: "ready",
+      principal_binding_checked: true,
+      profile_included: true,
+      archive_available: true,
     },
     b: {
       download_count: 1,
       download_path: join(fixture.b.data_root, "recovery", "fixture-b.json"),
-      before_status: "setup_required",
-      blocked_status: "recovery_required",
-      after_status: "setup_required",
+      profile_status: "ready",
+      profile_name: `${config.b.name} Admin`,
+      before_recovery_status: "setup_required",
+      after_recovery_status: "ready",
+      principal_binding_checked: true,
+      profile_included: true,
+      archive_available: true,
     },
   };
   assert.deepEqual(assertRecoverySetupEvidence(config, valid), valid);
@@ -273,34 +302,102 @@ test("Recovery setup evidence requires one verified fixture-owned download per s
     () => assertRecoverySetupEvidence(config, { a: valid.a }),
     /unsupported shape/,
   );
-  assert.throws(
-    () => assertRecoverySetupEvidence(config, {
-      ...valid,
-      a: { ...valid.a, download_count: 2 },
-    }),
-    /single verified fixture-owned Recovery setup/,
-  );
-  assert.throws(
-    () => assertRecoverySetupEvidence(config, {
-      ...valid,
-      a: { ...valid.a, blocked_status: "setup_required" },
-    }),
-    /single verified fixture-owned Recovery setup/,
-  );
-  assert.throws(
-    () => assertRecoverySetupEvidence(config, {
-      ...valid,
-      b: { ...valid.b, after_status: "unavailable" },
-    }),
-    /single verified fixture-owned Recovery setup/,
-  );
-  assert.throws(
-    () => assertRecoverySetupEvidence(config, {
-      ...valid,
-      a: { ...valid.a, download_path: join(fixture.b.data_root, "recovery", "substituted.json") },
-    }),
-    /single verified fixture-owned Recovery setup/,
-  );
+  for (const invalid of [
+    { download_count: 0 },
+    { download_count: 2 },
+    { profile_status: "unavailable" },
+    { profile_name: "Other Profile" },
+    { before_recovery_status: "ready" },
+    { after_recovery_status: "unavailable" },
+    { principal_binding_checked: false },
+    { profile_included: false },
+    { archive_available: false },
+    { download_path: join(fixture.b.data_root, "recovery", "substituted.json") },
+    { download_path: join(fixture.root, "outside.json") },
+  ]) {
+    assert.throws(
+      () => assertRecoverySetupEvidence(config, { ...valid, a: { ...valid.a, ...invalid } }),
+      /single verified fixture-owned Recovery setup/,
+    );
+  }
+});
+
+test("Recovery download must bind its data kit and signed signup Profile to the current principal", () => {
+  const expected = {
+    principalId: "principal:signup-a",
+    localhostRoot: "localhost://Users/signup-a",
+    profileName: "Alma Admin",
+  };
+  const aProfileDid = "did:key:z6MkAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const bundle = {
+    schema: "elastos.full-recovery-bundle/v1",
+    principal_id: expected.principalId,
+    localhost_root: expected.localhostRoot,
+    included: { data_kit: true, people_identity: true },
+    data_kit: {
+      schema: "elastos.recovery-kit/v1",
+      principal_id: expected.principalId,
+      localhost_root: expected.localhostRoot,
+    },
+    people_identity: {
+      schema: "elastos.people.recovery-identity/v1",
+      profile_authority_bundle: {
+        schema: "elastos.profile-authority-bundle/v1",
+        profile_signing_seed_hex: "11".repeat(32),
+        signed_profile: {
+          payload: {
+            schema: "elastos.profile-document/v1",
+            profile_did: aProfileDid,
+            display_name: expected.profileName,
+          },
+          signer_did: aProfileDid,
+          signature: "22".repeat(64),
+        },
+      },
+    },
+  };
+  assert.deepEqual(assertRecoveryBundleEvidence(bundle, expected), {
+    principal_binding_checked: true,
+    profile_included: true,
+  });
+  for (const change of [
+    (value) => { value.schema = "elastos.full-recovery-bundle.package/v1"; },
+    (value) => { value.principal_id = "principal:foreign"; },
+    (value) => { value.localhost_root = "localhost://Users/foreign"; },
+    (value) => { value.included.data_kit = false; },
+    (value) => { value.data_kit.principal_id = "principal:foreign"; },
+    (value) => { value.data_kit.localhost_root = "localhost://Users/foreign"; },
+    (value) => { value.data_kit.schema = "foreign"; },
+  ]) {
+    const invalid = structuredClone(bundle);
+    change(invalid);
+    assert.throws(() => assertRecoveryBundleEvidence(invalid, expected), /current principal's bound data kit/);
+  }
+  for (const change of [
+    (value) => { delete value.people_identity; },
+    (value) => { value.included.people_identity = false; },
+    (value) => { value.people_identity.profile_authority_bundle.profile_signing_seed_hex = ""; },
+    (value) => { value.people_identity.profile_authority_bundle.signed_profile.payload.display_name = "Foreign Profile"; },
+    (value) => { value.people_identity.profile_authority_bundle.signed_profile.signer_did = "did:key:z6MkBBBBBBBBBBBBBBBBBBBBBBBBBBBB"; },
+    (value) => { value.people_identity.profile_authority_bundle.signed_profile.signature = ""; },
+  ]) {
+    const invalid = structuredClone(bundle);
+    change(invalid);
+    assert.throws(() => assertRecoveryBundleEvidence(invalid, expected), /signed Profile created by signup/);
+  }
+  const sameNameForeignProfile = structuredClone(bundle);
+  const foreignSigned = sameNameForeignProfile.people_identity.profile_authority_bundle.signed_profile;
+  foreignSigned.payload.profile_did = "did:key:z6MkCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+  foreignSigned.signer_did = foreignSigned.payload.profile_did;
+  // A name match alone is insufficient; final acceptance binds the download to
+  // the two Runtime-accepted opaque contact projections.
+  assert.doesNotThrow(() => assertRecoveryBundleEvidence(sameNameForeignProfile, expected));
+  assert.throws(() => assertDistinctProfileContactEvidence(
+    "contact:459124a94946ce899c021a75",
+    "contact:b0785e1e57b39d59f45161a8",
+    foreignSigned.payload.profile_did,
+    "did:key:z6MkBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  ), /bind both Recovery Profiles/);
 });
 
 test("only the exact opaque direct conversation can satisfy selection", () => {
@@ -348,12 +445,24 @@ test("identity evidence rejects empty, wrong, and raw-identity frames", () => {
 });
 
 test("skipped legs and incomplete reports can never become acceptance evidence", () => {
-  const report = validReport();
-  for (const leg of REQUIRED_ACCEPTANCE_LEGS) {
-    report.results.push({ leg, status: leg === "both_runtime_restart" ? "skipped" : "passed" });
+  assert.equal(REQUIRED_ACCEPTANCE_LEGS.length, 28);
+  assert.deepEqual(REQUIRED_ACCEPTANCE_LEGS.slice(0, 2), ["provisioning_and_sign_in", "system_recovery_after_signup"]);
+  assert.ok(REQUIRED_ACCEPTANCE_LEGS.includes("shared_session_recovery"));
+  assert.ok(REQUIRED_ACCEPTANCE_LEGS.includes("direct_session_recovery"));
+  // Exercise every mandatory leg, including launch, drafts, and both recovery modes.
+  // A harness that omits or skips any one of them must retain ok=false.
+  for (const skipped of REQUIRED_ACCEPTANCE_LEGS) {
+    const report = validReport();
+    for (const leg of REQUIRED_ACCEPTANCE_LEGS) {
+      report.results.push({ leg, status: leg === skipped ? "skipped" : "passed" });
+    }
+    assert.throws(() => finalizeAcceptanceReport(report), new RegExp(`nonpassing=${skipped}`));
+    assert.equal(report.ok, false);
+
+    report.results = report.results.filter((result) => result.leg !== skipped);
+    assert.throws(() => finalizeAcceptanceReport(report), new RegExp(`missing=${skipped}`));
+    assert.equal(report.ok, false);
   }
-  assert.throws(() => finalizeAcceptanceReport(report), /nonpassing=both_runtime_restart/);
-  assert.equal(report.ok, false);
 
   const incomplete = validReport();
   recordAcceptancePass(incomplete, REQUIRED_ACCEPTANCE_LEGS[0]);

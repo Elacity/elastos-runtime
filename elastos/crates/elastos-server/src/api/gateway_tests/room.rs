@@ -1,5 +1,6 @@
 use super::*;
 
+mod contact_request;
 mod direct;
 
 struct MockPeerProvider;
@@ -2381,4 +2382,134 @@ async fn test_room_service_session_leave_appends_system_object() {
 
     let summary = crate::room_service::load_summary(dir.path()).unwrap();
     assert_eq!(summary.active_session_count, 0);
+}
+
+fn card_test_participant(member_did: &str, verified: bool) -> GatewayParticipantView {
+    GatewayParticipantView {
+        member_did: Some(member_did.to_string()),
+        card: None,
+        display_name: "Person".to_string(),
+        profile_verified: Some(verified),
+        device_label: String::new(),
+        last_seen_at: 0,
+        role: None,
+        local_session_count: 0,
+        is_current_session: false,
+    }
+}
+
+#[test]
+fn test_participant_cards_project_relationships_without_dids() {
+    let mut directory = ParticipantCardDirectory {
+        local_profile_did: Some("did:key:zSelf".to_string()),
+        ..ParticipantCardDirectory::default()
+    };
+    directory.relationships.insert(
+        "did:key:zContact".to_string(),
+        ("contact", Some("direct:abc".to_string())),
+    );
+    directory
+        .relationships
+        .insert("did:key:zRequested".to_string(), ("requested", None));
+    directory
+        .relationships
+        .insert("did:key:zPending".to_string(), ("pending", None));
+    directory
+        .discoverable
+        .insert("did:key:zVisible".to_string());
+    directory.present.insert("did:key:zContact".to_string());
+    let mut poll = GatewayRoomPollView {
+        room_slug: "community".to_string(),
+        display_name: "Community".to_string(),
+        latest_seq: 0,
+        participants: vec![
+            card_test_participant("did:key:zSelf", true),
+            card_test_participant("did:key:zContact", true),
+            card_test_participant("did:key:zRequested", true),
+            card_test_participant("did:key:zPending", true),
+            card_test_participant("did:key:zVisible", true),
+            card_test_participant("did:key:zStranger", true),
+            card_test_participant("did:key:zUnverified", false),
+        ],
+        objects: Vec::new(),
+        transport: Default::default(),
+    };
+
+    poll.apply_participant_cards(&directory);
+
+    let cards = poll
+        .participants
+        .iter()
+        .map(|participant| {
+            participant.card.as_ref().map(|card| {
+                (
+                    card.relationship,
+                    card.conversation_id.clone(),
+                    card.can_add_contact,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cards,
+        vec![
+            Some(("you", None, false)),
+            Some(("contact", Some("direct:abc".to_string()), false)),
+            Some(("requested", None, false)),
+            Some(("pending", None, false)),
+            Some(("none", None, true)),
+            Some(("none", None, false)),
+            None,
+        ]
+    );
+    let json = serde_json::to_string(&poll).unwrap();
+    assert!(
+        !json.contains("did:key:"),
+        "cards must not expose DIDs: {json}"
+    );
+    assert!(poll.participants[1].card.as_ref().unwrap().active_now);
+    assert!(!poll.participants[2].card.as_ref().unwrap().active_now);
+    assert_eq!(
+        poll.participants[1].card.as_ref().unwrap().participant_ref,
+        home_people_contact_id("did:key:zContact")
+    );
+}
+
+#[tokio::test]
+async fn test_chat_contact_request_needs_configured_contacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let launch = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"chat-room"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = test_launch_token_from_route(payload["route"].as_str().unwrap());
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/contacts/request")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"participant_ref":"contact:0"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

@@ -78,7 +78,16 @@ impl ProfileReadinessSummary {
 pub struct RecoveryReadinessSummary {
     schema: &'static str,
     status: &'static str,
+    /// Why setup is still required, so Home can greet a new account
+    /// differently from one whose Recovery Kit predates its Profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
+
+/// Recovery setup is required because no Recovery Kit was ever verified.
+pub const RECOVERY_READINESS_REASON_KIT_MISSING: &str = "recovery_kit_missing";
+/// Recovery setup is required because the verified kit does not cover the Profile.
+pub const RECOVERY_READINESS_REASON_KIT_OUTDATED: &str = "recovery_kit_outdated";
 
 impl RecoveryReadinessSummary {
     const SCHEMA: &'static str = "elastos.recovery.readiness/v1";
@@ -87,13 +96,15 @@ impl RecoveryReadinessSummary {
         Self {
             schema: Self::SCHEMA,
             status: "ready",
+            reason: None,
         }
     }
 
-    fn setup_required() -> Self {
+    fn setup_required(reason: &'static str) -> Self {
         Self {
             schema: Self::SCHEMA,
             status: "setup_required",
+            reason: Some(reason),
         }
     }
 
@@ -101,6 +112,7 @@ impl RecoveryReadinessSummary {
         Self {
             schema: Self::SCHEMA,
             status: "unavailable",
+            reason: None,
         }
     }
 }
@@ -796,6 +808,9 @@ struct HomeRoomSummary {
     pending_requests: Vec<HomePendingRequestSummary>,
     #[serde(default)]
     active_sessions: Vec<HomeActiveSessionSummary>,
+    /// Newest room object sequence; realtime signal only, never serialized.
+    #[serde(skip)]
+    latest_seq: u64,
 }
 
 impl Default for HomeRoomSummary {
@@ -817,6 +832,7 @@ impl Default for HomeRoomSummary {
             browser_access_block_reason: None,
             pending_requests: Vec::new(),
             active_sessions: Vec::new(),
+            latest_seq: 0,
         }
     }
 }
@@ -1045,6 +1061,12 @@ struct GatewayRoomPollView {
 struct GatewayConversationObjectView {
     seq: u64,
     sender: String,
+    /// Runtime-only identity used to attach `sender_ref`; never serialized.
+    #[serde(skip)]
+    sender_member_did: Option<String>,
+    /// Opaque reference to the sender's participant card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_ref: Option<String>,
     #[serde(default)]
     sender_profile_verified: Option<bool>,
     #[serde(default)]
@@ -1063,6 +1085,11 @@ struct GatewayConversationObjectView {
 
 #[derive(Debug, Clone, Serialize)]
 struct GatewayParticipantView {
+    /// Runtime-only identity used to attach the card; never serialized.
+    #[serde(skip)]
+    member_did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    card: Option<GatewayParticipantCard>,
     display_name: String,
     #[serde(default)]
     profile_verified: Option<bool>,
@@ -1074,6 +1101,87 @@ struct GatewayParticipantView {
     local_session_count: usize,
     #[serde(default)]
     is_current_session: bool,
+}
+
+/// What a person's profile card may offer in the configured Community room.
+/// It carries an opaque reference, never a Profile or device DID.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct GatewayParticipantCard {
+    participant_ref: String,
+    /// `you`, `contact`, `requested`, `pending` or `none`.
+    relationship: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+    can_add_contact: bool,
+    /// The person shares presence (Discovery on) and it has not expired.
+    active_now: bool,
+}
+
+/// Relationship facts behind the configured Community room's profile cards,
+/// keyed by Profile DID inside Runtime. Only opaque references and product
+/// states leave Runtime.
+#[derive(Debug, Default)]
+pub(super) struct ParticipantCardDirectory {
+    pub(super) local_profile_did: Option<String>,
+    /// Profile DID to (`contact` | `requested` | `pending`, direct conversation).
+    pub(super) relationships: std::collections::HashMap<String, (&'static str, Option<String>)>,
+    /// Profile DIDs visible in Discovery right now, so a request can bind to
+    /// their signed advertisement.
+    pub(super) discoverable: std::collections::HashSet<String>,
+    /// Profile DIDs with unexpired shared presence.
+    pub(super) present: std::collections::HashSet<String>,
+}
+
+impl ParticipantCardDirectory {
+    fn card_for(&self, member_did: &str) -> GatewayParticipantCard {
+        let participant_ref = home_people_contact_id(member_did);
+        if self.local_profile_did.as_deref() == Some(member_did) {
+            return GatewayParticipantCard {
+                participant_ref,
+                relationship: "you",
+                conversation_id: None,
+                can_add_contact: false,
+                active_now: true,
+            };
+        }
+        let (relationship, conversation_id) = self
+            .relationships
+            .get(member_did)
+            .map(|(relationship, conversation)| (*relationship, conversation.clone()))
+            .unwrap_or(("none", None));
+        GatewayParticipantCard {
+            participant_ref,
+            relationship,
+            conversation_id,
+            can_add_contact: relationship == "none" && self.discoverable.contains(member_did),
+            active_now: self.present.contains(member_did),
+        }
+    }
+}
+
+impl GatewayRoomPollView {
+    /// Attaches a profile card to every verified participant and an opaque
+    /// sender reference to every verified message.
+    pub(super) fn apply_participant_cards(&mut self, directory: &ParticipantCardDirectory) {
+        for participant in &mut self.participants {
+            if participant.profile_verified != Some(true) {
+                continue;
+            }
+            if let Some(member_did) = participant.member_did.as_deref() {
+                participant.card = Some(directory.card_for(member_did));
+            }
+        }
+        for object in &mut self.objects {
+            if object.sender_profile_verified != Some(true) {
+                continue;
+            }
+            if let Some(member_did) = object.sender_member_did.as_deref() {
+                object.sender_ref = Some(home_people_contact_id(
+                    member_did,
+                ));
+            }
+        }
+    }
 }
 
 impl From<crate::room_service::RoomSummary> for GatewayRoomSummary {
@@ -1189,6 +1297,8 @@ impl From<crate::room_service::ConversationObjectView> for GatewayConversationOb
         Self {
             seq: view.seq,
             sender: view.sender,
+            sender_member_did: view.sender_member_did,
+            sender_ref: None,
             sender_profile_verified: view.sender_profile_verified,
             from_current_session: view.from_current_session,
             kind: view.kind,
@@ -1204,6 +1314,8 @@ impl From<crate::room_service::ConversationObjectView> for GatewayConversationOb
 impl From<crate::room_service::ParticipantView> for GatewayParticipantView {
     fn from(view: crate::room_service::ParticipantView) -> Self {
         Self {
+            member_did: view.member_did,
+            card: None,
             display_name: view.display_name,
             profile_verified: view.profile_verified,
             device_label: view.device_label,

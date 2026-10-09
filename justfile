@@ -204,6 +204,7 @@ verify-ci: ci-test-capsules ci-test-elastos
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs
+    node scripts/home-shell-bridge-smoke.mjs
     node scripts/people-discovery-smoke.mjs
     node scripts/inbox-product-behavior-smoke.mjs
     node scripts/archive-product-behavior-smoke.mjs
@@ -212,6 +213,7 @@ product-ui-source:
     node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
+    node --test scripts/chat-room-reconnect.test.mjs
 
 product-ui-browser:
     node scripts/people-product-layout-smoke.mjs

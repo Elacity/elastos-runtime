@@ -1,11 +1,10 @@
     (function () {
       const launchParams = new URLSearchParams(window.location.search);
-      const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+      let homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
       const homeParentOrigin = launchParams.get("home_origin") || "";
       const participantToggle = document.getElementById("participant-toggle");
       const roomAccessToggle = document.getElementById("room-access-toggle");
       const conversationSelector = document.getElementById("conversation-selector");
-      const conversationJoinSection = document.getElementById("conversation-join-section");
       const composerForm = document.getElementById("composer-form");
       const composerField = composerForm?.querySelector(".composer-field") || null;
       const messageInput = document.getElementById("message-input");
@@ -59,11 +58,11 @@
       }
 
       function syncCompactConversationRail() {
-        if (!conversationSelector || !conversationJoinSection) {
+        if (!conversationSelector) {
           return;
         }
         const choiceCount = conversationSelector.querySelectorAll("[data-conversation-choice]").length;
-        const canHideCompactRail = choiceCount < 2 && conversationJoinSection.hidden;
+        const canHideCompactRail = choiceCount < 2;
         document.body.setAttribute("data-room-compact-rail", canHideCompactRail ? "hidden" : "visible");
       }
 
@@ -96,6 +95,13 @@
       announceHomeChrome();
       syncCompactConversationRail();
       syncComposerPresentation();
+
+      window.addEventListener("elastos-chat-authority-renewed", () => {
+        homeToken = globalThis.elastosChatHomeToken();
+        homeReadySent = false;
+        lastMenuManifest = "";
+        announceHomeChrome();
+      });
 
       if (messageInput) {
         messageInput.addEventListener("input", syncComposerPresentation);
@@ -147,13 +153,6 @@
         new MutationObserver(syncCompactConversationRail).observe(conversationSelector, {
           childList: true,
           subtree: true,
-        });
-      }
-
-      if (conversationJoinSection) {
-        new MutationObserver(syncCompactConversationRail).observe(conversationJoinSection, {
-          attributes: true,
-          attributeFilter: ["hidden"],
         });
       }
 

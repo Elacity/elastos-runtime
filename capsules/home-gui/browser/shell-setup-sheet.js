@@ -75,6 +75,13 @@ export function homeRecoveryStatus(summary) {
   return typedReadinessStatus(summary?.identity?.recovery_readiness, RECOVERY_READINESS_SCHEMA);
 }
 
+// Only an explicit "recovery_kit_outdated" earns the updated-kit copy; any
+// other setup_required reason reads as a first kit for a new account.
+function homeRecoveryKitOutdated(summary) {
+  const readiness = summary?.identity?.recovery_readiness;
+  return homeRecoveryStatus(summary) === "setup_required" && readiness?.reason === "recovery_kit_outdated";
+}
+
 function typedReadinessStatus(readiness, schema) {
   if (!readiness || readiness.schema !== schema) {
     return "unavailable";
@@ -204,17 +211,20 @@ function renderSetupSheet(summary) {
   const unavailable = homeSetupStatus(summary) === "unavailable" || homeRecoveryStatus(summary) === "unavailable";
   const complete = setupFinished(summary);
   const profileReady = homeSetupStatus(summary) === "ready";
+  const kitOutdated = homeRecoveryKitOutdated(summary);
   if (titleNode) titleNode.textContent = "Welcome to Home";
   if (leadNode) leadNode.textContent = complete ? "Home is set up."
     : unavailable ? "Open System to check setup."
-    : profileReady ? "Save an updated Recovery Kit that includes your Profile."
+    : profileReady && kitOutdated ? "Save an updated Recovery Kit that includes your Profile."
+    : profileReady ? "Save a Recovery Kit so you can get back into your account."
     : "Create your Profile and save a complete Recovery Kit in System.";
   recoveryStep?.classList.toggle("is-complete", complete);
   recoveryStep?.classList.toggle("is-current", !complete && !unavailable);
   if (recoveryBody) recoveryBody.textContent = unavailable
     ? "Open System to check setup."
     : complete ? "Profile and Recovery Kit are ready."
-    : profileReady ? "Your Profile stays unchanged. Save the updated kit offline."
+    : profileReady && kitOutdated ? "Your Profile stays unchanged. Save the updated kit offline."
+    : profileReady ? "Keep the kit offline. It restores your account on a new device."
     : "Confirm your name and save the kit offline.";
   if (recoveryButton) {
     recoveryButton.textContent = complete ? "Ready" : unavailable ? "Open System"

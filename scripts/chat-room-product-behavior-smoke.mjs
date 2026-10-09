@@ -81,8 +81,6 @@ function createEnvironment() {
     { dataset: { conversationChoice: "shared" } },
     { dataset: { conversationChoice: "direct:sha256:fixture-conversation" } },
   ];
-  const conversationJoinSection = new FakeElement("conversation-join-section");
-  conversationJoinSection.hidden = true;
   const composerForm = new FakeElement("composer-form");
   const composerField = new FakeElement("composer-field");
   const messageInput = new FakeTextAreaElement("message-input");
@@ -112,7 +110,6 @@ function createEnvironment() {
     ["participant-toggle", participantToggle],
     ["room-access-toggle", roomAccessToggle],
     ["conversation-selector", conversationSelector],
-    ["conversation-join-section", conversationJoinSection],
     ["composer-form", composerForm],
     ["message-input", messageInput],
   ]);
@@ -162,7 +159,6 @@ function createEnvironment() {
     body,
     composerField,
     context,
-    conversationJoinSection,
     conversationSelector,
     messageInput,
     notify(target) {
@@ -194,6 +190,13 @@ function checkChatStartup() {
   const startup = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8")
     .replace(/^[ \t]*import\b[\s\S]*?;/gm, "")
     .replaceAll("import.meta.url", JSON.stringify("http://home.example/apps/chat-room/chat-room.js"));
+  // The cache version changes with every rebuilt bundle; both asset URLs must
+  // carry the same one.
+  const startupSource = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8");
+  const assetVersions = [...startupSource.matchAll(/\?v=(chat-room-ui-[0-9a-z]+)/g)].map(match => match[1]);
+  assert.equal(assetVersions.length, 2, "Chat startup must version both browser assets");
+  assert.equal(assetVersions[0], assetVersions[1], "Chat startup assets must share one cache version");
+  const assetVersion = assetVersions[0];
   for (const token of ["", "chat-test-token"]) {
     const env = createEnvironment();
     const calls = [];
@@ -222,7 +225,7 @@ function checkChatStartup() {
     assert.equal(calls[0].options.homeToken, token);
     assert.equal(calls[1].options.homeToken, token);
     assert.equal(calls[1].options.targetId, "chat-room");
-    assert.equal(calls[3].url, "http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=chat-room-ui-20260804a");
+    assert.equal(calls[3].url, `http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=${assetVersion}`);
     env.context.elastosChatNavigation({ conversation_id: "fixture" });
     env.context.elastosChatCopyInvite("fixture-invite");
     assert.deepEqual(plainJson(calls.slice(4)), [
@@ -312,10 +315,7 @@ function main() {
   assert.equal(env.body.dataset.roomCompactRail, "visible", "Two conversations must keep the compact rail available");
   env.conversationSelector.children = [{ dataset: { conversationChoice: "shared" } }];
   env.notify(env.conversationSelector);
-  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail when no required join control is visible");
-  env.conversationJoinSection.hidden = false;
-  env.notify(env.conversationJoinSection);
-  assert.equal(env.body.dataset.roomCompactRail, "visible", "Visible join controls must keep the compact rail available");
+  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail");
 
   env.messageInput.value = "line one\nline two\nline three";
   env.messageInput.dispatchEvent({ type: "input" });

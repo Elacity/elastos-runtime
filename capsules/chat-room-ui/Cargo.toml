@@ -29,6 +29,7 @@ web-sys = { version = "=0.3.82", features = [
   "HtmlFormElement",
   "HtmlInputElement",
   "HtmlTextAreaElement",
+  "KeyboardEvent",
   "Location",
   "Node",
   "RequestCredentials",

@@ -43,6 +43,12 @@ pub struct ComponentsManifest {
     /// unchanged; catalog entries cannot supply their own trust configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_catalog: Option<ModelCatalogConfig>,
+
+    /// Release-pinned default collaboration network. Absence leaves the
+    /// Home's collaboration configuration unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_network:
+        Option<crate::collaboration_release_network::CollaborationNetworkPin>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -348,7 +354,7 @@ async fn run_with_data_dir(
     }
 
     if let Some(metadata) = &signed_setup {
-        metadata.install(&data_dir)?;
+        metadata.install(&data_dir, &manifest)?;
     }
 
     prepare_selected_component_prerequisites(
@@ -552,6 +558,7 @@ async fn run_with_data_dir(
     } else {
         let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
         install_signed_model_catalog(&data_dir, &manifest, &manifest_path)?;
+        install_release_collaboration_network(&data_dir, &manifest, &manifest_path)?;
         stamped
     };
 
@@ -577,11 +584,12 @@ const COMPONENTS_MANIFEST_ENV: &str = "ELASTOS_COMPONENTS_MANIFEST";
 struct SignedSetupMetadata {
     components: Vec<u8>,
     catalog: Option<Vec<u8>>,
+    network: Option<Vec<u8>>,
 }
 
 impl SignedSetupMetadata {
-    fn install(&self, data_dir: &Path) -> anyhow::Result<()> {
-        // Admission of both inputs precedes the first metadata or component write.
+    fn install(&self, data_dir: &Path, manifest: &ComponentsManifest) -> anyhow::Result<()> {
+        // Admission of every input precedes the first metadata or component write.
         if let Some(bytes) = &self.catalog {
             atomic_write_file(&data_dir.join(MODEL_CATALOG_FILE), bytes)?;
             #[cfg(unix)]
@@ -593,6 +601,13 @@ impl SignedSetupMetadata {
                 )?;
             }
         }
+        report_release_network(
+            crate::collaboration_release_network::install_fetched_release_network(
+                data_dir,
+                manifest.collaboration_network.as_ref(),
+                self.network.as_deref(),
+            )?,
+        );
         atomic_write_file(&data_dir.join("components.json"), &self.components)
     }
 }
@@ -651,11 +666,32 @@ async fn admit_installed_setup_metadata(
         } else {
             None
         };
+        // The pinned CID names exact bytes; the release name could serve
+        // newer ones, so setup fetches by CID as update does.
+        let network = crate::collaboration_release_network::fetch_release_network(
+            data_dir,
+            manifest.collaboration_network.as_ref(),
+            |pin| {
+                let cid = pin.head_cid.clone();
+                let client = &client;
+                async move {
+                    client
+                        .fetch_content_bounded(
+                            &cid,
+                            None,
+                            crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES,
+                        )
+                        .await
+                }
+            },
+        )
+        .await?;
         Ok::<_, anyhow::Error>((
             manifest,
             SignedSetupMetadata {
                 components,
                 catalog,
+                network,
             },
         ))
     }
@@ -2691,6 +2727,37 @@ fn resolve_model_catalog_source(manifest_path: &Path, dest: &Path) -> anyhow::Re
         "model catalog pin is present but {MODEL_CATALOG_FILE} is missing beside {} and in the data directory",
         manifest_path.display()
     );
+}
+
+/// Records the person's choice to keep this Home out of the shared
+/// Community room. Setup then leaves the release network uninstalled.
+pub fn choose_isolated_collaboration() -> anyhow::Result<()> {
+    crate::collaboration_release_network::choose_isolated(&data_dir()?)
+}
+
+/// Joins the release-pinned Community network unless this Home is isolated.
+fn install_release_collaboration_network(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    manifest_path: &Path,
+) -> anyhow::Result<()> {
+    use crate::collaboration_release_network as release_network;
+    let release_copy = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("components manifest has no parent directory"))?
+        .join(release_network::RELEASE_COLLABORATION_NETWORK_FILE);
+    report_release_network(release_network::install_release_network(
+        data_dir,
+        manifest.collaboration_network.as_ref(),
+        &release_copy,
+    )?);
+    Ok(())
+}
+
+fn report_release_network(outcome: crate::collaboration_release_network::ReleaseNetworkOutcome) {
+    if let Some(line) = outcome.summary_line() {
+        println!("{line}");
+    }
 }
 
 pub(crate) fn install_signed_model_catalog(
@@ -6154,6 +6221,7 @@ pub(crate) mod tests {
         fs::write(&binary_path, b"object-provider").unwrap();
         let manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -6243,12 +6311,14 @@ pub(crate) mod tests {
 
         let old_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -6275,12 +6345,14 @@ pub(crate) mod tests {
         old_component.capsule_metadata = None;
         let old_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -6514,6 +6586,7 @@ pub(crate) mod tests {
         };
         let manifest = ComponentsManifest {
             model_catalog: None,
+            collaboration_network: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -7395,6 +7468,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn installed_setup_fetches_the_pinned_network_by_cid_and_joins_it() {
+        signed_setup_carrier_fixture("network fresh", false).await;
+    }
+
+    #[tokio::test]
+    async fn installed_setup_of_an_isolated_home_fetches_no_network() {
+        signed_setup_carrier_fixture("network isolated", false).await;
+    }
+
+    #[tokio::test]
+    async fn installed_setup_refuses_a_mismatched_network_without_writes() {
+        for existing in [false, true] {
+            signed_setup_carrier_fixture("network hash", existing).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_setup_refuses_oversized_network_before_body_without_writes() {
+        for existing in [false, true] {
+            signed_setup_carrier_fixture("network size", existing).await;
+        }
+    }
+
+    #[tokio::test]
     async fn installed_setup_refuses_pending_or_busy_writer_before_fetch() {
         for case in ["pending journal", "writer busy"] {
             signed_setup_carrier_fixture(case, false).await;
@@ -7700,7 +7797,11 @@ pub(crate) mod tests {
             "elastos.model.catalog.v1",
             if case == "catalog signer" { 218 } else { 217 },
         );
-        let components = format!(
+        let network = case
+            .starts_with("network")
+            .then(|| crate::collaboration_release_network::tests::signed_profile_chain_config(1).1)
+            .map(|mut chain| chain.remove(0));
+        let mut components = format!(
             "{{\n \"publisher_extension\":true, \"external\":{{\"effect\":{{
             \"install_path\":\"bin/effect\",\"platforms\":{{\"*\":{{
                 \"release_path\":\"effect\", \"cid\":\"{}\", \"checksum\":\"sha256:{:x}\"
@@ -7713,6 +7814,16 @@ pub(crate) mod tests {
             publisher
         )
         .into_bytes();
+        if let Some(network) = &network {
+            let config: serde_json::Value = serde_json::from_slice(network).unwrap();
+            let mut manifest: serde_json::Value = serde_json::from_slice(&components).unwrap();
+            manifest["collaboration_network"] = serde_json::json!({
+                "head_cid": catalog_head_cid(network).unwrap(),
+                "expected_network_id": config["expected_network_id"],
+                "trusted_profile_signer_dids": config["trusted_profile_signer_dids"],
+            });
+            components = serde_json::to_vec(&manifest).unwrap();
+        }
         let descriptor = |bytes: &[u8]| {
             serde_json::json!({
                 "cid": catalog_head_cid(bytes).unwrap(),
@@ -7777,6 +7888,9 @@ pub(crate) mod tests {
             fs::write(data.join("components.json"), b"previous components").unwrap();
             fs::write(data.join(MODEL_CATALOG_FILE), b"previous catalog").unwrap();
         }
+        if case == "network isolated" {
+            crate::collaboration_release_network::choose_isolated(&data).unwrap();
+        }
         if case == "pending journal" {
             fs::write(
                 data.join(".elastos.update-journal.json"),
@@ -7799,7 +7913,7 @@ pub(crate) mod tests {
         if case == "catalog hash" {
             served_catalog.push(b'\n');
         }
-        let files = Arc::new(HashMap::from([
+        let mut files = HashMap::from([
             (
                 format!(
                     "components-{}.json",
@@ -7809,12 +7923,27 @@ pub(crate) mod tests {
             ),
             (MODEL_CATALOG_FILE.to_owned(), served_catalog),
             ("effect".to_owned(), b"Carrier component".to_vec()),
-        ]));
+        ]);
+        if let Some(network) = &network {
+            let mut served_network = network.clone();
+            if case == "network hash" {
+                served_network.push(b'\n');
+            }
+            files.insert(
+                crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE.to_owned(),
+                served_network,
+            );
+        }
+        let files = Arc::new(files);
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = requests.clone();
         let endpoint = server.clone();
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
+        let oversized_network = case == "network size";
+        let network_cid = network
+            .as_ref()
+            .map(|bytes| catalog_head_cid(bytes).unwrap());
         let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -7828,12 +7957,24 @@ pub(crate) mod tests {
                         .await
                         .unwrap();
                     let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    // The signed component CID is fetched by CID, not by its release name.
+                    // Signed component and network pins select content by CID.
                     if request["op"] == "content_fetch" {
-                        assert_eq!(request["cid"], effect_cid);
-                        request["path"] = "effect".into();
+                        if request["cid"] == effect_cid {
+                            request["path"] = "effect".into();
+                        } else {
+                            assert_eq!(request["cid"].as_str(), network_cid.as_deref());
+                            assert!(request.get("path").is_none(), "network fetch used a name");
+                            request["path"] =
+                                crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                                    .into();
+                        }
                     } else {
                         assert_ne!(request["path"], "effect", "signed CID fetched by name");
+                        assert_ne!(
+                            request["path"],
+                            crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE,
+                            "signed network CID fetched by name"
+                        );
                     }
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
@@ -7852,6 +7993,20 @@ pub(crate) mod tests {
                         let _ = send.stopped().await;
                         continue;
                     }
+                    if oversized_network
+                        && request["path"]
+                            == crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                    {
+                        // Refuse the header without waiting for an oversized body.
+                        send.write_all(
+                            &((crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES as u64) + 1)
+                                .to_be_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                        let _ = send.stopped().await;
+                        continue;
+                    }
                     let bytes = &files[request["path"].as_str().unwrap()];
                     send.write_all(&(bytes.len() as u64).to_be_bytes())
                         .await
@@ -7867,7 +8022,7 @@ pub(crate) mod tests {
         server.close().await;
         let before = serving.await.unwrap();
         drop(held);
-        if case == "fresh" {
+        if matches!(case, "fresh" | "network fresh" | "network isolated") {
             result.unwrap();
             assert_eq!(fs::read(data.join("components.json")).unwrap(), components);
             assert_eq!(fs::read(data.join(MODEL_CATALOG_FILE)).unwrap(), catalog);
@@ -7875,20 +8030,37 @@ pub(crate) mod tests {
                 fs::read(data.join("bin/effect")).unwrap(),
                 b"Carrier component"
             );
-            assert_eq!(requests.load(Ordering::SeqCst), 3);
+            let config = data.join(crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE);
+            if case == "network fresh" {
+                assert_eq!(fs::read(&config).unwrap(), network.unwrap());
+                assert_eq!(
+                    fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 4);
+            } else {
+                assert!(fs::symlink_metadata(&config).is_err(), "{case}");
+                assert_eq!(requests.load(Ordering::SeqCst), 3);
+            }
         } else {
             assert!(result.is_err(), "{case}");
             assert_eq!(signed_setup_snapshot(&data), before, "{case}");
-            if case == "catalog size" {
+            if matches!(case, "catalog size" | "network size") {
+                let bound = if case == "catalog size" {
+                    MAX_MODEL_CATALOG_BYTES
+                } else {
+                    crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES
+                };
                 let error = format!("{:#}", result.unwrap_err());
                 assert!(
-                    error.contains(&format!("exceeds its {MAX_MODEL_CATALOG_BYTES}-byte bound")),
+                    error.contains(&format!("exceeds its {bound}-byte bound")),
                     "{error}"
                 );
             }
             let expected_requests = match case {
                 "component hash" => 1,
                 "catalog hash" | "catalog signer" | "catalog size" => 2,
+                "network hash" | "network size" => 3,
                 "head signer" | "release signer" | "pending journal" | "writer busy" => 0,
                 _ => panic!("unknown refusal case"),
             };

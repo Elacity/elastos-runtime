@@ -6,7 +6,7 @@
   <title>Chat</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css" />
-  <link rel="stylesheet" href="./style.css?v=chat-room-20260812a" />
+  <link rel="stylesheet" href="./style.css?v=chat-room-20260930c" />
 </head>
 <body data-room-session-active="false">
   <script src="./chat-access.js"></script>
@@ -43,16 +43,7 @@
           <a id="chat-open-home" href="/home/" target="_self">Open Home</a>
         </section>
         <p id="error-text" class="error" hidden></p>
-        <section id="conversation-join-section" class="conversation-join" hidden>
-          <div class="conversation-join-copy">
-            <h2>Join a Conversation</h2>
-            <p>Paste a join code or link from another ElastOS user. Joining replaces this unused local conversation; conversations with messages or other members cannot be replaced.</p>
-          </div>
-          <form id="conversation-join-form" class="conversation-join-form">
-            <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite code or link" aria-label="Invite code or link" />
-            <button id="conversation-join-submit" type="submit">Join</button>
-          </form>
-        </section>
+        <button id="reconnect-button" type="button" class="secondary reconnect" hidden>Reconnect</button>
         <ol id="message-list" class="messages"></ol>
         <form id="composer-form" class="composer">
           <button id="attach-button" type="button" class="composer-icon" aria-label="Attach" title="Attach" hidden disabled>
@@ -94,6 +85,13 @@
         </div>
       </div>
       <ol id="participant-list" class="participants"></ol>
+      <section id="participant-card" class="participant-card" role="dialog" aria-labelledby="participant-card-name" hidden>
+        <button id="participant-card-close" type="button" class="participant-card-close" aria-label="Close">×</button>
+        <div id="participant-card-avatar" class="participant-avatar participant-card-avatar" aria-hidden="true"></div>
+        <h3 id="participant-card-name" class="participant-card-name"></h3>
+        <p id="participant-card-state" class="participant-card-state" role="status"></p>
+        <button id="participant-card-action" type="button" class="participant-card-action" hidden></button>
+      </section>
       <section id="browser-access-section" class="browser-access" hidden>
         <div class="browser-access-head">
           <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>

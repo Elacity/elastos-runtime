@@ -709,6 +709,27 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
   return true;
 }
 
+export function renewHomeGuiChatWindowAuthority(homeToken, launched, homeOrigin, apply = true) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  const frame = entry?.node?.querySelector(".window-frame");
+  const freshToken = homeLaunchTokenFromRoute(launched?.route || "");
+  let route;
+  try { route = new URL(launched?.route, homeOrigin); } catch { return false; }
+  if (!entry || entry.targetId !== "chat-room" || !frame?.contentWindow
+    || launched?.target !== "chat-room" || launched.attach_kind !== "iframe"
+    || (launched.launch_status && launched.launch_status !== "launched")
+    || route.origin !== homeOrigin || route.pathname !== "/apps/chat-room/"
+    || route.username || route.password
+    || !freshToken || freshToken === homeToken) return false;
+  if (!apply) return true;
+  // The existing document keeps its drafts; Home's window controls and
+  // presentation handshake follow its renewed Runtime launch authority.
+  frame.dataset.route = launched.route;
+  entry.homeNavigation = null;
+  probeHomeNavigation(entry, true);
+  return true;
+}
+
 export function attachAuthorizedHomeGuiTarget(launched) {
   if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
     return attachAuthorizedConnectorSheet(launched);

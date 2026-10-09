@@ -64,6 +64,16 @@ pub struct CollaborationStartupConfiguration {
     configuration: CollaborationNetworkConfiguration,
 }
 
+#[cfg(test)]
+impl CollaborationStartupConfiguration {
+    pub(crate) fn is_isolated_for_test(&self) -> bool {
+        matches!(
+            self.configuration,
+            CollaborationNetworkConfiguration::Isolated
+        )
+    }
+}
+
 /// Owns the one collaboration worker started for this Runtime process.
 pub struct CollaborationRuntimeService {
     shutdown: watch::Sender<bool>,
@@ -130,6 +140,27 @@ pub fn load_and_accept_collaboration_startup_configuration(
     data_root: &Path,
 ) -> anyhow::Result<CollaborationStartupConfiguration> {
     let loader = CollaborationProfileChainLoader::new(data_root);
+    // An absent file is final for this load, so it stays free of writes and
+    // never reads the path again. A present file is read and accepted only
+    // under the lock `elastos setup --isolated` takes, after rechecking the
+    // isolation choice, so a Home is never isolated and joined at once.
+    match fs::symlink_metadata(data_root.join(COLLABORATION_STARTUP_CONFIG_FILE)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CollaborationStartupConfiguration {
+                configuration: loader.load_absent()?,
+            });
+        }
+        Err(error) => {
+            return Err(error).context("failed to inspect collaboration startup configuration")
+        }
+    }
+    let _choice = crate::collaboration_release_network::lock_network_choice(data_root)?;
+    if crate::collaboration_release_network::isolation_applies_at_startup(data_root) {
+        return Ok(CollaborationStartupConfiguration {
+            configuration: loader.load_absent()?,
+        });
+    }
     let Some(config_bytes) = read_startup_config_bytes(data_root)? else {
         return Ok(CollaborationStartupConfiguration {
             configuration: loader.load_absent()?,
@@ -1199,6 +1230,7 @@ mod tests {
             temp.path().to_path_buf(),
             crate::setup::ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),

@@ -274,9 +274,13 @@ async fn dispatch_inbox_action(
 ) -> anyhow::Result<String> {
     let action_id = action.action_id.as_str();
     let data_dir = &state.data_dir;
+    // Entries one account owns, such as its direct messages, change only for
+    // that account.
+    let viewer = super::gateway_home_system::load_profile_authority_for_context(data_dir, context)?
+        .map(|profile| profile.document().profile_did.clone());
     if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
         return Ok(
-            match crate::notifications::mark_read(data_dir, notification_id)? {
+            match crate::notifications::mark_read(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Marked inbox entry read.".to_string(),
                 false => "That inbox entry was already read or is no longer present.".to_string(),
             },
@@ -284,7 +288,7 @@ async fn dispatch_inbox_action(
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
         return Ok(
-            match crate::notifications::dismiss(data_dir, notification_id)? {
+            match crate::notifications::dismiss(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Dismissed inbox entry.".to_string(),
                 false => "That inbox entry is already gone.".to_string(),
             },
@@ -318,7 +322,7 @@ async fn dispatch_inbox_action(
         };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -332,7 +336,7 @@ async fn dispatch_inbox_action(
             };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
@@ -364,7 +368,7 @@ async fn dispatch_inbox_action(
             INBOX_CAPSULE_ID,
         )
         .await?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
@@ -439,7 +443,7 @@ async fn dispatch_inbox_action(
         ensure_admin_context(data_dir, context)?;
         let approved_at = now_ts();
         store_wallet_price_http_policy(data_dir, &context.principal_id, approved_at)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         append_wallet_price_policy_audit(
             data_dir,
             &context.principal_id,
@@ -488,7 +492,7 @@ async fn dispatch_inbox_action(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
         crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(
             "Approved this hosted access. End it in Inbox when it is no longer needed.".to_string(),
         );
@@ -511,7 +515,7 @@ async fn dispatch_inbox_action(
     {
         ensure_admin_context(data_dir, context)?;
         crate::jev_approval_lens::record_human_decision(data_dir, request_id, "approve")?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok("Approved this hosted connection. Send again from Assistant.".to_string());
     }
     if let Some(request_id) =

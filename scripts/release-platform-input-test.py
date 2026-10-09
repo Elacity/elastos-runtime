@@ -485,6 +485,61 @@ printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
             self.refresh(root)
         return pin
 
+    def pin_network(self, network=b'{"expected_network_id":"fixture-network"}\n'):
+        """Pin a Community network release copy in the template and every bundle, as the candidate source does."""
+        pin = {"head_cid": inputs.catalog_head_cid(network), "expected_network_id": "fixture-network",
+               "trusted_profile_signer_dids": ["did:key:z6Mkfixture"]}
+        self.template["collaboration_network"] = pin
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        for root in self.bundles.values():
+            manifest = json.loads((root / "components.json").read_text())
+            manifest["collaboration_network"] = pin
+            self.write_json(root / "components.json", manifest)
+            self.write_json(root / "components-template.json", self.template)
+            (root / "artifacts" / inputs.RELEASE_NETWORK_FILE).write_bytes(network)
+            self.refresh(root)
+        return pin, network
+
+    def test_pinned_community_network_is_staged_and_bound_on_every_platform(self):
+        pin, network = self.pin_network()
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertIn(inputs.RELEASE_NETWORK_FILE, record["files"])
+        self.assertEqual((stage / "artifacts" / inputs.RELEASE_NETWORK_FILE).read_bytes(), network)
+        self.assertEqual(json.loads((stage / "components.json").read_text())["collaboration_network"], pin)
+        cids = self.root / "cids.json"
+        self.write_json(cids, {name: "bafy" + entry["sha256"] for name, entry in record["files"].items()})
+        inputs.attach_input_cids(stage, cids)
+        for platform in inputs.PLATFORMS:
+            final = json.loads((stage / "artifacts" / f"components-{platform}.json").read_text())
+            self.assertEqual(final["collaboration_network"], pin)
+
+    def test_community_network_file_must_match_its_source_pin(self):
+        self.pin_network()
+        root = self.bundles["aarch64-darwin"]
+        network = root / "artifacts" / inputs.RELEASE_NETWORK_FILE
+        network.write_bytes(b'{"expected_network_id":"other-network"}\n')
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "does not match pin"):
+            inputs.verify(root)
+        network.unlink()
+        self.refresh(root)
+        with self.assertRaises(FileNotFoundError):
+            inputs.verify(root)
+        manifest = json.loads((root / "components.json").read_text())
+        manifest["collaboration_network"]["expected_network_id"] = "drifted-network"
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "differs from source template"):
+            inputs.verify(root)
+
+    def test_community_network_file_without_a_pin_is_refused(self):
+        root = self.bundles["x86_64-linux"]
+        (root / "artifacts" / inputs.RELEASE_NETWORK_FILE).write_bytes(b'{"expected_network_id":"unpinned"}\n')
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "artifact inventory mismatch"):
+            inputs.verify(root)
+
     def test_default_admission_rejects_a_single_platform_input(self):
         darwin = [f"aarch64-darwin={self.bundles['aarch64-darwin']}"]
         stage = self.root / "publication"

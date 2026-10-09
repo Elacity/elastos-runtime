@@ -123,6 +123,7 @@ async function serveFile(response, pathname) {
 }
 
 function startServer(scenario) {
+  const initialDirectRecovery = scenario.startsWith("direct-initial-401");
   const holdBoundary = holdBoundaryForScenario(scenario);
   const holds = {
     "initial-conversations": holdBoundary === "initial-conversations"
@@ -143,6 +144,7 @@ function startServer(scenario) {
     current: null,
     directConversations: 0,
     directMessages: 0,
+    freshDirectRequests: 0,
     heldBoundary: holdBoundary,
     heldReleases: [],
     leaves: 0,
@@ -166,10 +168,24 @@ function startServer(scenario) {
         return;
       }
       if (url.pathname === "/fixture") {
-        const chatSrc = isDirectSwitchScenario(scenario)
-          ? "/apps/chat-room/?conversation_id=direct%3Asha256%3Afixture-conversation#home_token=test-token"
+        const homeOrigin = `http://127.0.0.1:${server.address().port}`;
+        const chatSrc = isDirectSwitchScenario(scenario) || initialDirectRecovery
+          ? `/apps/chat-room/?conversation_id=direct%3Asha256%3Afixture-conversation${initialDirectRecovery ? `&home_origin=${encodeURIComponent(homeOrigin)}` : ""}#home_token=test-token`
           : "/apps/chat-room/#home_token=test-token";
-        const body = Buffer.from(`<!doctype html><style>html,body{height:100%;margin:0}iframe{border:0;height:100%;width:100%}</style><iframe title="Chat" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${chatSrc}"></iframe>`);
+        const reconnectHost = initialDirectRecovery ? `<script>
+          window.fixtureReconnects = 0;
+          window.addEventListener("message", (event) => {
+            const data = event.data;
+            if (event.source !== document.querySelector("iframe").contentWindow || event.origin !== "null"
+              || data?.type !== "home:launch-target" || data.target !== "chat-room"
+              || data.homeToken !== "test-token" || typeof data.requestId !== "string") return;
+            window.fixtureReconnects += 1;
+            event.source.postMessage({ type: "home:shell-response", requestId: data.requestId,
+              result: { target: "chat-room", attach_kind: "iframe", launch_status: "launched",
+                route: "/apps/chat-room/?home_origin=" + encodeURIComponent(location.origin) + "#home_token=fresh-token" }, status: 0 }, "*");
+          });
+        </script>` : "";
+        const body = Buffer.from(`<!doctype html><style>html,body{height:100%;margin:0}iframe{border:0;height:100%;width:100%}</style><iframe title="Chat" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${chatSrc}"></iframe>${reconnectHost}`);
         response.writeHead(200, {
           "content-length": body.length,
           "content-type": "text/html; charset=utf-8",
@@ -262,6 +278,12 @@ function startServer(scenario) {
       }
       if (url.pathname === "/api/apps/chat-room/direct/conversations") {
         trace.directConversations += 1;
+        if (initialDirectRecovery) {
+          if (request.headers["x-elastos-home-token"] !== "fresh-token") {
+            return json(response, { error: "Home session expired" }, 401);
+          }
+          trace.freshDirectRequests += 1;
+        }
         if (scenario === "single-conversation") {
           return json(response, { conversations: [] });
         }
@@ -280,6 +302,12 @@ function startServer(scenario) {
       }
       if (url.pathname === "/api/apps/chat-room/direct/conversations/direct%3Asha256%3Afixture-conversation/messages") {
         trace.directMessages += 1;
+        if (initialDirectRecovery) {
+          if (request.headers["x-elastos-home-token"] !== "fresh-token") {
+            return json(response, { error: "Home session expired" }, 401);
+          }
+          trace.freshDirectRequests += 1;
+        }
         directMessageResponses += 1;
         const hold = directMessageResponses === 1
           ? holds["bootstrap-messages"]
@@ -375,7 +403,6 @@ async function waitForConfiguredChatWithoutLegacyFlash(frame, label) {
         "#browser-access-section",
         "#browser-access-stage",
         "#conversation-invite-create",
-        "#conversation-join-section",
         "#room-access-section",
         "#room-access-toggle",
       ];
@@ -468,6 +495,37 @@ async function runScenario(scenario) {
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
 
+    if (scenario.startsWith("direct-initial-401")) {
+      const originalFrame = frame;
+      const timeOrigin = await frame.evaluate(() => performance.timeOrigin);
+      await frame.locator("#reconnect-button").waitFor({ state: "visible" });
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 2200));
+      assert(trace.directConversations === 1 && trace.directMessages === 0 && trace.cycles[0].starts === 0,
+        "initial Direct401 performed automatic recovery work", trace);
+      assert(await page.evaluate(() => window.fixtureReconnects) === 0, "initial Direct401 reopened itself");
+      const selectedByUser = scenario === "direct-initial-401-user-selection";
+      if (selectedByUser) await clickSharedChoice(frame);
+      await frame.locator("#error-text").waitFor({ state: "visible" });
+      assert((await frame.locator("#error-text").innerText()).trim(),
+        "Reconnect lost its visible recovery explanation");
+      await frame.locator("#reconnect-button").click();
+      await frame.waitForFunction((shared) => document.body.dataset.roomSessionActive === "true"
+        && document.querySelector("#reconnect-button")?.hidden === true
+        && document.querySelector("[data-conversation-choice].active")?.dataset.conversationChoice
+          === (shared ? "shared" : "direct:sha256:fixture-conversation"), selectedByUser);
+      frame = await chatFrame(page);
+      assert(frame === originalFrame && await frame.evaluate(() => performance.timeOrigin) === timeOrigin,
+        "initial Direct401 recovery replaced its draft-owning document");
+      assert(trace.cycles.length === 1 && trace.cycles[0].starts === 1,
+        "initial Direct401 recovery did not use one explicit session start", trace);
+      assert(await page.evaluate(() => window.fixtureReconnects) === 1, "initial Direct401 did not use one Home launch");
+      if (!selectedByUser) {
+        await frame.waitForFunction(() => document.querySelector("#message-list")?.textContent.includes("hello from direct"));
+        assert(trace.freshDirectRequests >= 2, "requested Direct was not verified with fresh Home authority", trace);
+      }
+      return;
+    }
+
     if (scenario === "session-failure" || scenario === "summary-failure") {
       const expected = scenario === "session-failure"
         ? "Chat session bootstrap was not authorized. Reopen Chat from Home."
@@ -491,10 +549,6 @@ async function runScenario(scenario) {
       assert(
         await frame.evaluate(() => document.body.dataset.roomSessionActive) === "false",
         "bootstrap failure activated Chat",
-      );
-      assert(
-        await frame.evaluate(() => document.querySelector("#conversation-join-section")?.hidden),
-        "bootstrap failure exposed the legacy Join surface",
       );
       return;
     }
@@ -565,6 +619,7 @@ async function runScenario(scenario) {
           && switched.selected === "shared"
           && switched.conversationTitle === "Community"
           && switched.conversationDetail === "Shared room"
+          && switched.errorText === ""
           && switched.attachHidden,
         "direct-to-shared switch did not leave configured Chat in shared mode",
         { heldBoundary, ...switched, preClickTrace, trace },
@@ -665,7 +720,6 @@ async function runScenario(scenario) {
               browserStageHidden: hidden("#browser-access-stage"),
               browserRequestsHidden: hidden("#browser-access-section"),
               roomSettingsHidden: hidden("#room-access-toggle") && hidden("#room-access-section"),
-              joinHidden: hidden("#conversation-join-section"),
               textVisible: !hidden("#composer-form") && !!input && !input.disabled && !!send && !send.disabled,
               messageInputTag: input?.tagName || "",
               shellDisplay: shell ? getComputedStyle(shell).display : "",
@@ -691,7 +745,6 @@ async function runScenario(scenario) {
       assert(state.attachHidden, "configured Chat exposed Attach", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
       assert(state.roomSettingsHidden, "configured Chat exposed legacy room settings", state);
-      assert(state.joinHidden, "configured Chat exposed invite/join controls", state);
       assert(state.textVisible, "configured Chat text composer is unavailable", state);
       assert(state.messageInputTag === "TEXTAREA", "published Chat composer was not retained", state);
       assert(state.shellDisplay === "grid" && state.sidebarBeforeThread, "Chat is not a split conversation shell", state);
@@ -834,6 +887,8 @@ async function main() {
     "direct-switch-hold-bootstrap-messages",
     "direct-switch-hold-poll-conversations",
     "direct-switch-hold-poll-messages",
+    "direct-initial-401",
+    "direct-initial-401-user-selection",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);

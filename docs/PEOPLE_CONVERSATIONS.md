@@ -400,7 +400,10 @@ User test:
 Status: implemented. Direct conversations are Profile-scoped, Runtime-authorized
 on every read and send, and routed over the Runtime-mediated peer path. Shared
 group Chat is unchanged. Bilateral removal, shared-room Profile attribution,
-and incoming-message notifications have landed with it. Direct conversations
+and incoming-message notifications have landed with it. A message alert and its
+unread dot belong to the account that received the message: many accounts can
+share one Home, so Home, Inbox and Chat show each account only its own alerts,
+and only that account can read, dismiss or clear them. Direct conversations
 are text-only for now: attachments need object handling and a delivery path of
 their own, designed on the unified delivery layer, and until then the attach
 control is visibly unavailable in direct mode rather than silently missing.

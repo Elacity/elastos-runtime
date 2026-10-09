@@ -213,6 +213,10 @@ impl PendingIncomingContactRequest {
         &self.request_hash
     }
 
+    pub(crate) fn requester_profile_did(&self) -> &str {
+        &self.requester_profile_did
+    }
+
     pub(crate) fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -811,9 +815,15 @@ impl CollaborationContactStore {
                         .revoked_request_hashes
                         .contains(request.message().envelope_sha256())
                     && !loaded.decisions.contains_key(request.message().envelope_sha256())
+                    // The relay admits a request only while its bound
+                    // advertisement is live; after that the recipient's own
+                    // copy carries it, so resending would only be refused.
                     && loaded
                         .advertisements
-                        .contains_key(request.advertisement_envelope_sha256())
+                        .get(request.advertisement_envelope_sha256())
+                        .is_some_and(|advertisement| {
+                            advertisement.message().envelope().payload.expires_at > now
+                        })
             })
             .collect::<Vec<_>>();
         resendable.sort_by(|left, right| {
@@ -4167,6 +4177,62 @@ mod tests {
             retained_contact.remote_presence_device_did(),
             remote_did_v2.as_str()
         );
+    }
+
+    #[test]
+    fn outgoing_request_stops_resending_once_its_advertisement_expires() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .store_local_advertisement(
+                &advertisement_with_profile(&fixture.local_key, &fixture.local_profile, NOW),
+                NOW,
+            )
+            .unwrap();
+        let (remote_key, _) = generate_keypair();
+        let remote_ad = advertisement(&remote_key, "Remote", NOW);
+        let advertisement_hash = collaboration_message_envelope_sha256(&remote_ad);
+        let remote_profile_did = advertisement_profile_did(&remote_ad);
+        let request = outgoing_request_with_profile(
+            &fixture.local_key,
+            &fixture.local_profile,
+            &remote_profile_did,
+            &advertisement_hash,
+            NOW + 1,
+        );
+        fixture
+            .store
+            .record_outgoing_contact_request(&request, &remote_ad, NOW + 1)
+            .unwrap();
+        let advertisement_expires_at = NOW + COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS;
+        // The request itself outlives the advertisement it is bound to.
+        assert!(
+            advertisement_expires_at < NOW + 1 + COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .resendable_outgoing_contact_requests(advertisement_expires_at - 1, 4)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(fixture
+            .store
+            .resendable_outgoing_contact_requests(advertisement_expires_at, 4)
+            .unwrap()
+            .is_empty());
+        // The stored request stays: it is the evidence behind "Requested".
+        assert!(fixture
+            .store
+            .stored_outgoing_contact_request(
+                &advertisement_hash,
+                &remote_profile_did,
+                advertisement_expires_at
+            )
+            .unwrap()
+            .is_some());
     }
 
     #[test]

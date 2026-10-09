@@ -8,10 +8,9 @@
 // the contact, and survive a restart of both runtimes — asserting along the
 // way that normal UI never shows a raw DID.
 //
-// Each side signs in with a persisted virtual-authenticator credential
-// created by scripts/home-passkey-virtual-auth-smoke.mjs run with
-// HOME_VIRTUAL_AUTH_CLEANUP=0 and HOME_VIRTUAL_AUTH_PROFILE pointing at the
-// same directory passed here.
+// Each fresh Home enrolls its first owner passkey with a virtual authenticator.
+// Both fixture profiles must have empty credential stores before this run.
+// This run proves owner enrollment; guest account enrollment is a separate leg.
 //
 //   ELASTOS_A_BASE_URL=<fixture-a-origin> \
 //   ELASTOS_A_PROFILE=<fixture-a-browser-profile> \
@@ -24,16 +23,18 @@
 //   node scripts/home-two-runtime-acceptance.mjs
 
 import { execSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 
 import {
   assertRecoverySetupEvidence,
+  assertRecoveryBundleEvidence,
   assertDistinctProfileContactEvidence,
   assertDistinctRuntimeEvidence,
   assertExactDirectConversation,
   assertFreshFixturePrecondition,
+  assertFreshOwnerEnrollmentPrecondition,
   assertIdentityFrame,
   assertRestartTransition,
   createAcceptanceReport,
@@ -45,7 +46,13 @@ import {
 
 const CONFIG = (() => {
   try {
-    return loadAcceptanceConfig(process.env);
+    const config = loadAcceptanceConfig(process.env);
+    // Admit both sides before either browser starts or enrolls a passkey.
+    assertFreshOwnerEnrollmentPrecondition(
+      readCredentialStore(config.a.profile).length,
+      readCredentialStore(config.b.profile).length,
+    );
+    return config;
   } catch (error) {
     console.error("FAIL home-two-runtime-acceptance configuration");
     console.log(JSON.stringify({
@@ -136,9 +143,13 @@ async function persistCredentials(side) {
     { mode: 0o600 },
   );
   chmodSync(credentialStorePath(side.profile), 0o600);
+  return credentials.length;
 }
 
 async function openSide(side) {
+  const stored = readCredentialStore(side.profile);
+  // Recheck before launch if fixture state changed after configuration admission.
+  assertFreshOwnerEnrollmentPrecondition(stored.length, 0);
   const context = await chromium.launchPersistentContext(side.profile, {
     acceptDownloads: true,
     headless: true,
@@ -183,7 +194,6 @@ async function openSide(side) {
       automaticPresenceSimulation: true,
     },
   });
-  const stored = readCredentialStore(side.profile);
   for (const credential of stored) {
     await cdp.send("WebAuthn.addCredential", { authenticatorId, credential });
   }
@@ -202,7 +212,7 @@ async function openSide(side) {
 async function ensureAccount(side) {
   if (side.hasStoredCredential) {
     await signIn(side);
-    return;
+    return { enrollment: "resumed" };
   }
   // First passkey on a fresh Home becomes the admin.
   await side.page.goto(`${side.base}/apps/home/`, { waitUntil: "domcontentloaded" });
@@ -214,16 +224,23 @@ async function ensureAccount(side) {
       && response.url().endsWith("/api/auth/passkey/register/complete")
   ), { timeout: 30_000 });
   registered.catch(() => {});
-  await side.page.evaluate(() => {
-    document.querySelector("#home-unlock-primary")?.click();
-  });
+  await side.page.locator("#home-unlock-primary").click();
   const completion = await registered;
   assertOk(completion.ok(), `${side.prefix}: passkey registration failed`, {
     status: completion.status(),
   });
-  await persistCredentials(side);
+  const verified = await completion.json();
+  assertOk(verified?.schema === "elastos.auth.passkey.verify/v2"
+    && typeof verified.principal_id === "string" && verified.principal_id.length > 0
+    && verified.profile_readiness?.schema === "elastos.profile.readiness/v1"
+    && verified.profile_readiness.status === "ready",
+  `${side.prefix}: signup did not create a ready signed Profile`);
+  side.signupPrincipalId = verified.principal_id;
+  const credentials = await persistCredentials(side);
+  assertOk(credentials === 1, `${side.prefix}: fresh enrollment did not create exactly one passkey`, { credential_count: credentials });
   side.hasStoredCredential = true;
   await signIn(side);
+  return { enrollment: "enrolled", credential_count: credentials };
 }
 
 async function signIn(side) {
@@ -243,9 +260,12 @@ async function signIn(side) {
       return { done: true, value: state };
     }
     if (state.unlockVisible && /passkey/i.test(state.unlockPrimary)) {
-      await side.page.evaluate(() => {
-        document.querySelector("#home-unlock-primary")?.click();
-      }).catch(() => {});
+      const person = side.page.locator("#home-unlock-person");
+      const primary = side.page.locator("#home-unlock-primary");
+      const action = await person.isVisible() ? person : primary;
+      if (await action.isVisible() && await action.isEnabled()) {
+        await action.click();
+      }
     }
     return { done: false, value: state };
   });
@@ -281,8 +301,24 @@ async function waitForFrame(side, target, timeoutMs = 30_000) {
 }
 
 async function openAppWindow(side, target) {
-  await signIn(side);
+  // Keep existing capsule documents and their drafts alive when Home is ready.
+  const ready = await side.page.evaluate(() => (
+    document.body?.dataset?.homeAuthority === "signed"
+      && document.body?.dataset?.homeStatus === "ready"
+  )).catch(() => false);
+  if (!ready) {
+    await signIn(side);
+  }
   const homeGuiFrame = await waitForFrame(side, "home-gui");
+  if (target === "system" && await homeGuiFrame.locator("#setup-sheet:not(.is-yielded)").isVisible()) {
+    const saveRecoveryKit = homeGuiFrame.locator("#setup-sheet-recovery");
+    assertOk(
+      (await saveRecoveryKit.innerText()).trim() === "Save Recovery Kit",
+      `${side.prefix}: fresh Home Welcome did not offer Save Recovery Kit`,
+    );
+    await saveRecoveryKit.click();
+    return waitForAppWindow(side, target);
+  }
   await homeGuiFrame.locator("#launcher-toggle").click();
   const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
   await card.waitFor({ state: "visible", timeout: 10_000 });
@@ -291,6 +327,11 @@ async function openAppWindow(side, target) {
   await homeGuiFrame.evaluate((appTarget) => {
     document.querySelector(`#launcher-grid [data-target="${appTarget}"]`)?.click();
   }, target);
+  return waitForAppWindow(side, target);
+}
+
+async function waitForAppWindow(side, target) {
+  const homeGuiFrame = await waitForFrame(side, "home-gui");
   const windowFrameEl = homeGuiFrame
     .locator(`section.window[data-target="${target}"] iframe.window-frame`)
     .last();
@@ -357,114 +398,110 @@ async function peopleSnapshot(frame) {
   });
 }
 
-async function peopleReadiness(frame) {
-  return frame.evaluate(async () => {
-    const token = new URLSearchParams(window.location.hash.replace(/^#/, ""))
-      .get("home_token") || "";
-    if (!token) {
-      return { status: "", schema: "" };
-    }
-    const response = await fetch("/api/apps/people/summary", {
+async function homeRecoveryState(side, systemFrame = null) {
+  const home = await side.page.evaluate(async () => {
+    const response = await fetch("/api/apps/home/summary", { credentials: "same-origin" });
+    if (!response.ok) throw new Error(`Home Recovery acceptance read failed: HTTP ${response.status}`);
+    const home = await response.json();
+    return {
+      signedIn: home?.authority?.signed_in === true,
+      profileSchema: home?.identity?.profile_readiness?.schema || "",
+      profileStatus: home?.identity?.profile_readiness?.status || "",
+      profileName: home?.identity?.profile?.display_name || "",
+      recoverySchema: home?.identity?.recovery_readiness?.schema || "",
+      recoveryStatus: home?.identity?.recovery_readiness?.status || "",
+    };
+  });
+  if (!systemFrame) return home;
+  const recovery = await systemFrame.evaluate(async () => {
+    const token = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+    if (!token) throw new Error("Recovery acceptance requires the launched System window");
+    const response = await fetch("/api/auth/recovery/status", {
       credentials: "same-origin",
       headers: { "x-elastos-home-token": token },
     });
-    if (!response.ok) {
-      return { status: "", schema: "" };
-    }
-    const summary = await response.json();
-    const readiness = summary?.identity?.profile_readiness;
+    if (!response.ok) throw new Error(`System Recovery acceptance read failed: HTTP ${response.status}`);
+    const recovery = await response.json();
     return {
-      schema: typeof readiness?.schema === "string" ? readiness.schema.trim() : "",
-      status: typeof readiness?.status === "string" ? readiness.status.trim() : "",
+      archiveSchema: recovery?.schema || "",
+      principalId: recovery?.principal_id || "",
+      localhostRoot: recovery?.localhost_root || "",
+      rootEncrypted: recovery?.root_encrypted === true,
+      recoveryConfigured: recovery?.recovery_configured === true,
+      archiveAvailable: recovery?.recovery_download_available === true,
+      profileCovered: Array.isArray(recovery?.required_actions)
+        && !recovery.required_actions.includes("download_recovery_kit_with_profile"),
     };
   });
+  return { ...home, ...recovery };
 }
 
-async function completeRecoverySetup(side, peopleFrame) {
-  const before = await peopleReadiness(peopleFrame);
-  assertOk(
-    before.schema === "elastos.profile.readiness/v1" && before.status === "setup_required",
-    `${side.prefix}: fresh Home did not begin in setup_required Profile readiness`,
-    before,
-  );
-  await peopleFrame.locator("#profile-name").fill(side.name);
-  const blockedSave = side.page.waitForResponse((response) => (
-    response.request().method() === "POST"
-      && response.url().endsWith("/api/apps/people/profile")
-  ), { timeout: 30_000 });
-  blockedSave.catch(() => {});
-  await peopleFrame.evaluate(() => {
-    document.querySelector("#profile-submit")?.click();
-  });
-  const blockedResponse = await blockedSave;
-  const blockedBody = await blockedResponse.json().catch(() => ({}));
-  assertOk(
-    blockedResponse.status() === 409
-      && blockedBody?.schema === "elastos.people.profile-protection-required/v1"
-      && blockedBody?.status === "recovery_required"
-      && blockedBody?.action_target === "system",
-    `${side.prefix}: first Profile save did not fail with the exact Recovery-required result`,
-    {
-      status: blockedResponse.status(),
-      body: blockedBody,
-    },
-  );
-  const systemFramePromise = waitForFrame(side, "system", 30_000);
-  await peopleFrame.evaluate(() => {
-    document.querySelector("#profile-submit")?.click();
-  });
-  const systemFrame = await systemFramePromise;
-  await systemFrame.evaluate(() => {
-    const button = document.querySelector('button[data-settings="security"]');
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error("System security button is missing");
-    }
-    button.click();
-  });
-  await systemFrame.locator('button[data-settings="security"].active').waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  await systemFrame.locator('#recovery-download').waitFor({
-    state: "visible",
-    timeout: 10_000,
-  });
-  const downloadTarget = recoveryDownloadPath(side);
-  mkdirSync(join(side.fixture.dataRoot, "acceptance-recovery"), {
-    recursive: true,
-    mode: 0o700,
-  });
+async function completeRecoverySetup(side) {
+  const before = await homeRecoveryState(side);
+  assertOk(before.signedIn
+    && before.profileSchema === "elastos.profile.readiness/v1" && before.profileStatus === "ready"
+    && before.profileName === `${side.name} Admin`
+    && before.recoverySchema === "elastos.recovery.readiness/v1" && before.recoveryStatus === "setup_required",
+  `${side.prefix}: fresh signup did not create its consented Profile with Recovery still required`);
+  const homeGuiFrame = await waitForFrame(side, "home-gui");
+  await homeGuiFrame.locator("#setup-sheet:not(.is-yielded)").waitFor({ state: "visible", timeout: 30_000 });
+  let downloads = 0;
+  const countDownload = () => { downloads += 1; };
+  side.page.on("download", countDownload);
   const downloadPromise = side.page.waitForEvent("download", { timeout: 45_000 });
-  await systemFrame.evaluate(() => {
-    const button = document.querySelector("#recovery-download");
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error("System Recovery download button is missing");
-    }
-    button.click();
-  });
-  const download = await downloadPromise;
-  await download.saveAs(downloadTarget);
-  chmodSync(downloadTarget, 0o600);
-  const bundle = JSON.parse(readFileSync(downloadTarget, "utf8"));
-  assertOk(
-    bundle?.schema === "elastos.full-recovery-bundle/v1",
-    `${side.prefix}: Recovery download did not produce the expected bundle`,
-    { schema: bundle?.schema || "", suggested: download.suggestedFilename() },
-  );
-  const after = await poll(`${side.prefix}: Recovery changes Profile readiness`, 30_000, 500, async () => {
-    const current = await peopleReadiness(peopleFrame);
+  downloadPromise.catch(() => {});
+  try {
+    const [systemFrame, download] = await Promise.all([
+      openAppWindow(side, "system"),
+      downloadPromise,
+    ]);
+    await systemFrame.locator('button[data-settings="security"].active').waitFor({
+      state: "visible", timeout: 10_000,
+    });
+    const downloadTarget = recoveryDownloadPath(side);
+    mkdirSync(join(side.fixture.dataRoot, "acceptance-recovery"), { recursive: true, mode: 0o700 });
+    await download.saveAs(downloadTarget);
+    chmodSync(downloadTarget, 0o600);
+    const bytes = statSync(downloadTarget).size;
+    assertOk(bytes > 0 && bytes <= 8 * 1024 * 1024, `${side.prefix}: Recovery Kit size is invalid`);
+    let bundle;
+    try { bundle = JSON.parse(readFileSync(downloadTarget, "utf8")); }
+    catch { fail(`${side.prefix}: Recovery Kit is not valid JSON`); }
+    const after = await poll(`${side.prefix}: saved Recovery Kit is ready`, 30_000, 500, async () => {
+      const current = await homeRecoveryState(side, systemFrame);
+      return {
+        done: current.recoverySchema === "elastos.recovery.readiness/v1" && current.recoveryStatus === "ready"
+          && current.rootEncrypted && current.recoveryConfigured && current.archiveAvailable && current.profileCovered,
+        value: current,
+      };
+    });
+    assertOk(after.signedIn && after.archiveSchema === "elastos.principal.root-recovery.status/v1"
+      && after.principalId === side.signupPrincipalId && after.localhostRoot.startsWith("localhost://Users/")
+      && after.profileSchema === "elastos.profile.readiness/v1" && after.profileStatus === "ready"
+      && after.profileName === before.profileName,
+    `${side.prefix}: Recovery export changed the signup account or Profile`);
+    const proof = assertRecoveryBundleEvidence(bundle, {
+      principalId: side.signupPrincipalId,
+      localhostRoot: after.localhostRoot,
+      profileName: before.profileName,
+    });
+    // Home exposes the Profile name. Mutual accepted contacts later bind this
+    // private Recovery identity through Runtime's opaque contact projection.
+    side.recoveryProfileDid = bundle.people_identity.profile_authority_bundle.signed_profile.payload.profile_did;
+    assertOk(downloads === 1, `${side.prefix}: Welcome did not save exactly one Recovery Kit`, { download_count: downloads });
     return {
-      done: current.schema === "elastos.profile.readiness/v1" && current.status === "setup_required",
-      value: current,
+      download_count: downloads,
+      download_path: downloadTarget,
+      profile_status: after.profileStatus,
+      profile_name: after.profileName,
+      before_recovery_status: before.recoveryStatus,
+      after_recovery_status: after.recoveryStatus,
+      ...proof,
+      archive_available: after.archiveAvailable,
     };
-  });
-  return {
-    download_count: 1,
-    download_path: downloadTarget,
-    before_status: before.status,
-    blocked_status: blockedBody.status,
-    after_status: after.status,
-  };
+  } finally {
+    side.page.off("download", countDownload);
+  }
 }
 
 async function saveProfile(side, frame, name) {
@@ -543,15 +580,22 @@ async function requestContact(side, frame, peerName) {
 async function acceptContactRequest(side, frame, peerName) {
   await poll(`${side.prefix}: accepted request from ${peerName}`, 120_000, 3_000, async () => {
     const result = await frame.evaluate((name) => {
-      const entries = [...document.querySelectorAll("#entry-list article, #entry-list li, #entry-list section")];
-      const scope = entries.length > 0 ? entries : [document.querySelector("#entry-list")].filter(Boolean);
-      const matches = scope.flatMap((entry) => {
+      const entries = [...document.querySelectorAll("#entry-rows .entry-rail-card, #entry-rows .entry-row")];
+      const matches = entries.flatMap((entry) => {
         const text = (entry.textContent || "").replace(/\s+/g, " ");
         if (!text.includes(name)) {
           return [];
         }
-        const accept = [...entry.querySelectorAll("button")]
+        let accept = [...entry.querySelectorAll("button")]
           .find((button) => button.textContent?.trim() === "Accept");
+        if (!accept && entry.classList.contains("entry-row")) {
+          entry.click();
+          const detail = document.querySelector("#entry-detail");
+          if (detail?.textContent?.includes(name)) {
+            accept = [...detail.querySelectorAll("button")]
+              .find((button) => button.textContent?.trim() === "Accept");
+          }
+        }
         return accept ? [{ accept }] : [];
       });
       if (matches.length === 1) {
@@ -605,33 +649,17 @@ async function openConversation(side, peopleFrame, peerName, expectedConversatio
       .find((node) => node.dataset.conversationId === id);
     exact?.click();
   }, conversationId);
-  const homeGuiFrame = await waitForFrame(side, "home-gui");
-  const windowFrameEl = homeGuiFrame
-    .locator('section.window[data-target="chat-room"] iframe.window-frame')
-    .last();
-  try {
-    await windowFrameEl.waitFor({ state: "visible", timeout: 30_000 });
-  } catch (error) {
-    fail(`${side.prefix}: chat window never opened`, {
-      console: side.consoleTail.slice(-15),
-    });
-  }
-  const handle = await windowFrameEl.elementHandle();
-  const chatFrame = handle ? await handle.contentFrame() : null;
-  assertOk(chatFrame, `${side.prefix}: chat window had no content frame`);
-  await poll(`${side.prefix}: chat document`, 20_000, 200, async () => (
-    { done: chatFrame.url().includes("/apps/chat-room/") }
-  ));
-  await chatFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
+  const chatFrame = await waitForAppWindow(side, "chat-room");
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
+async function assertDirectSelection(side, chatFrame, conversationId) {
   await chatFrame.waitForFunction(() => {
     const input = document.querySelector("#message-input");
     return input && !input.disabled;
   }, null, { timeout: 60_000 });
-  await chatFrame.evaluate((id) => {
-    const exact = [...document.querySelectorAll("[data-conversation-choice]")]
-      .find((node) => node.dataset.conversationChoice === id);
-    exact?.click();
-  }, conversationId);
+  // A launch must select its requested contact without a corrective rail click.
   const selection = await poll(`${side.prefix}: exact direct conversation selected`, 30_000, 250, async () => {
     const state = await chatFrame.evaluate(() => ({
       availableConversationIds: [...document.querySelectorAll("[data-conversation-choice]")]
@@ -651,7 +679,16 @@ async function openConversation(side, peopleFrame, peerName, expectedConversatio
     }
   });
   assertExactDirectConversation({ expectedConversationId: conversationId, ...selection });
-  return { frame: chatFrame, conversationId };
+  return selection;
+}
+
+async function selectDirectConversation(side, chatFrame, conversationId) {
+  await chatFrame.evaluate((id) => {
+    const exact = [...document.querySelectorAll("[data-conversation-choice]")]
+      .find((node) => node.dataset.conversationChoice === id);
+    exact?.click();
+  }, conversationId);
+  await assertDirectSelection(side, chatFrame, conversationId);
 }
 
 async function selectSharedConversation(side, chatFrame) {
@@ -678,6 +715,110 @@ async function openSharedConversation(side) {
   return chatFrame;
 }
 
+async function openParticipantCard(side, chatFrame, peerName, expectedAction) {
+  if (!(await chatFrame.locator("#participant-list").isVisible())) {
+    await chatFrame.locator("#participant-toggle").click();
+  }
+  let opened = false;
+  let nextRefresh = 0;
+  await poll(`${side.prefix}: Community Profile for ${peerName}`, 120_000, 1_000, async () => {
+    const shouldOpen = !opened || Date.now() >= nextRefresh;
+    const result = await chatFrame.evaluate(({ name, action, shouldOpen }) => {
+      const peers = [...document.querySelectorAll("#participant-list [data-participant-ref]")]
+        .filter((node) => node.querySelector(".participant-name")?.textContent?.trim() === name);
+      const pending = document.querySelector("#participant-card-action")?.disabled === true;
+      if (peers.length === 1 && shouldOpen && !pending) {
+        peers[0].click();
+      }
+      const card = document.querySelector("#participant-card");
+      const button = document.querySelector("#participant-card-action");
+      return {
+        count: peers.length,
+        opened: peers.length === 1 && shouldOpen && !pending,
+        name: document.querySelector("#participant-card-name")?.textContent?.trim() || "",
+        action: button?.dataset?.cardAction || "",
+        ready: card?.hidden === false && button?.hidden === false && !button?.disabled
+          && button?.dataset?.cardAction === action,
+      };
+    }, { name: peerName, action: expectedAction, shouldOpen });
+    assertOk(result.count <= 1, `${side.prefix}: ambiguous Community Profile`, result);
+    if (result.opened) {
+      opened = true;
+      nextRefresh = Date.now() + 5_000;
+    }
+    return { done: result.count === 1 && result.name === peerName && result.ready, value: result };
+  });
+}
+
+async function requestCommunityContact(side, chatFrame, peopleFrame, peerName) {
+  await openParticipantCard(side, chatFrame, peerName, "add-contact");
+  const requestResponse = side.page.waitForResponse((response) => (
+    response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/apps/chat-room/contacts/request"
+  ), { timeout: 30_000 });
+  requestResponse.catch(() => {});
+  await chatFrame.locator("#participant-card-action").click();
+  const response = await requestResponse;
+  assertOk(response.ok(), `${side.prefix}: Community contact request failed`, { status: response.status() });
+  await poll(`${side.prefix}: one Community contact request`, 60_000, 1_000, async () => {
+    const snapshot = await peopleSnapshot(peopleFrame);
+    const requested = snapshot.contacts.filter((card) => (
+      card.text.includes(peerName) && /Request sent|Requested/i.test(card.text)
+    ));
+    assertOk(requested.length <= 1, `${side.prefix}: duplicate outgoing contact requests`, { count: requested.length });
+    return { done: requested.length === 1, value: { count: requested.length } };
+  });
+  return { count: 1, request_surface: "community_profile" };
+}
+
+async function openInboxFromCommunity(side, chatFrame, peerName) {
+  await openParticipantCard(side, chatFrame, peerName, "inbox");
+  await chatFrame.locator("#participant-card-action").click();
+  // No launcher fallback: the Profile action itself must open Inbox.
+  return waitForAppWindow(side, "inbox");
+}
+
+async function openDirectFromCommunity(side, chatFrame, peerName, conversationId) {
+  await selectSharedConversation(side, chatFrame);
+  await openParticipantCard(side, chatFrame, peerName, "message");
+  await chatFrame.locator("#participant-card-action").click();
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
+async function openDirectFromInbox(side, inboxFrame, message, conversationId) {
+  await poll(`${side.prefix}: Inbox notification opens its conversation`, 60_000, 1_000, async () => {
+    const result = await inboxFrame.evaluate((needle) => {
+      const entries = [...document.querySelectorAll("#entry-rows .entry-rail-card, #entry-rows .entry-row")]
+        .filter((node) => node.textContent?.includes(needle));
+      if (entries.length !== 1) {
+        return { count: entries.length, opened: false };
+      }
+      const row = entries[0];
+      let button = [...row.querySelectorAll("button")]
+        .find((node) => node.textContent?.trim() === "Open");
+      if (!button) {
+        row.click();
+        const detail = document.querySelector("#entry-detail");
+        if (detail?.textContent?.includes(needle)) {
+          button = [...detail.querySelectorAll("button")]
+            .find((node) => node.textContent?.trim() === "Open");
+        }
+      }
+      if (button && !button.disabled) {
+        button.click();
+        return { count: 1, opened: true };
+      }
+      return { count: 1, opened: false };
+    }, message);
+    assertOk(result.count <= 1, `${side.prefix}: ambiguous Inbox direct notification`, result);
+    return { done: result.opened, value: result };
+  });
+  const chatFrame = await waitForAppWindow(side, "chat-room");
+  await assertDirectSelection(side, chatFrame, conversationId);
+  return { frame: chatFrame, conversationId };
+}
+
 async function chatFrameState(chatFrame) {
   return chatFrame.evaluate(() => ({
     chatMode: document.body?.dataset?.chatMode || "",
@@ -699,10 +840,9 @@ async function sendMessage(side, chatFrame, text) {
   });
   try {
     await poll(`${side.prefix}: sent "${text}"`, 45_000, 1_000, async () => {
-      const listed = await chatFrame.evaluate((needle) => (
-        (document.querySelector("#message-list")?.textContent || "").includes(needle)
-      ), text);
-      return { done: listed };
+      const count = await exactMessageCount(chatFrame, text);
+      assertOk(count <= 1, `${side.prefix}: duplicate rendered message`, { count });
+      return { done: count === 1, value: { count } };
     });
     const sent = await chatFrameState(chatFrame);
     console.error(`[acceptance] ${side.prefix}: post-send tail: ${sent.messagesTail.slice(-160)}`);
@@ -718,10 +858,9 @@ async function sendMessage(side, chatFrame, text) {
 async function waitForMessage(side, chatFrame, text, timeoutMs = 300_000) {
   try {
     await poll(`${side.prefix}: received "${text}"`, timeoutMs, 2_000, async () => {
-      const listed = await chatFrame.evaluate((needle) => (
-        (document.querySelector("#message-list")?.textContent || "").includes(needle)
-      ), text);
-      return { done: listed };
+      const count = await exactMessageCount(chatFrame, text);
+      assertOk(count <= 1, `${side.prefix}: duplicate received message`, { count });
+      return { done: count === 1, value: { count } };
     });
   } catch (error) {
     fail(`${side.prefix}: message never arrived`, {
@@ -730,6 +869,273 @@ async function waitForMessage(side, chatFrame, text, timeoutMs = 300_000) {
       console: side.consoleTail.slice(-10),
       network: side.netTail.slice(-10),
     });
+  }
+}
+
+async function exactMessageCount(chatFrame, text) {
+  return chatFrame.evaluate((needle) => [...document.querySelectorAll("#message-list .message-body")]
+    .filter((node) => node.textContent === needle).length, text);
+}
+
+async function assertDraft(side, chatFrame, selected, text) {
+  const state = await chatFrameState(chatFrame);
+  assertOk(
+    state.selectedConversationId === selected && state.inputValue === text,
+    `${side.prefix}: conversation draft changed`,
+    { selected: state.selectedConversationId, expected: selected, draft_preserved: state.inputValue === text },
+  );
+}
+
+async function withHeldSendResponse(side, chatFrame, path, sentText, conversationId, operation) {
+  const matcher = (url) => url.origin === side.base && url.pathname === path;
+  let responseStatus;
+  let release;
+  let handlerCompletion;
+  let handlerError;
+  let intercepted = 0;
+  let deadlineExpired = false;
+  const handler = async (route) => {
+    try {
+      const request = route.request();
+      if (request.method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      const payload = request.postDataJSON();
+      if ((payload?.text ?? payload?.body) !== sentText) {
+        await route.continue();
+        return;
+      }
+      intercepted += 1;
+      assertOk(intercepted === 1, "held send was submitted more than once");
+      if (conversationId !== "shared") {
+        assertOk(payload.conversation_id === conversationId, "held send targeted the wrong contact");
+      }
+      const response = await route.fetch({ timeout: 10_000 });
+      responseStatus = response.status();
+      const gate = new Promise((resolve) => { release = resolve; });
+      const deadline = setTimeout(() => { deadlineExpired = true; release(); }, 20_000);
+      handlerCompletion = (async () => {
+        try {
+          await gate;
+          await route.fulfill({ response });
+        } finally {
+          clearTimeout(deadline);
+        }
+      })();
+      await handlerCompletion;
+    } catch (error) {
+      handlerError = error;
+      await route.abort().catch(() => {});
+    }
+  };
+  await side.page.route(matcher, handler);
+  try {
+    await chatFrame.locator("#message-input").fill(sentText);
+    await chatFrame.locator("#send-button").click();
+    await poll("successful send response is held", 15_000, 100, async () => {
+      assertOk(!handlerError, "held-response interception failed");
+      return { done: Boolean(release), value: { status: responseStatus } };
+    });
+    assertOk(responseStatus >= 200 && responseStatus < 300, "held send did not succeed", { status: responseStatus });
+    await operation(async () => {
+      assertOk(!deadlineExpired, "held response deadline elapsed before draft checks");
+      release();
+      await handlerCompletion;
+      assertOk(!handlerError, "held-response release failed");
+    });
+    assertOk(!handlerError && !deadlineExpired, "held-response proof did not complete within its bound");
+    return responseStatus;
+  } finally {
+    release?.();
+    await handlerCompletion?.catch(() => {});
+    await side.page.unroute(matcher, handler);
+  }
+}
+
+async function proveDraftPreservation(a, chatFrame, b, bChatFrame, conversationId) {
+  const directDraft = `Direct draft @ ${Date.now()}`;
+  const sharedDraft = `Community draft @ ${Date.now()}`;
+  await chatFrame.locator("#message-input").fill(directDraft);
+  await selectSharedConversation(a, chatFrame);
+  await assertDraft(a, chatFrame, "shared", "");
+  await chatFrame.locator("#message-input").fill(sharedDraft);
+  await selectDirectConversation(a, chatFrame, conversationId);
+  await assertDraft(a, chatFrame, conversationId, directDraft);
+
+  // An edit within the same direct selection must invalidate its old send.
+  const directText = `Held direct response @ ${Date.now()}`;
+  const newerDirectDraft = `Newer direct draft @ ${Date.now()}`;
+  const directStatus = await withHeldSendResponse(
+    a, chatFrame, "/api/apps/chat-room/direct/messages/send", directText, conversationId,
+    async (release) => {
+      await chatFrame.locator("#message-input").fill(newerDirectDraft);
+      await release();
+      await waitForMessage(a, chatFrame, directText, 30_000);
+      await delay(1_000);
+      await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+      await waitForMessage(b, bChatFrame, directText, 60_000);
+    },
+  );
+  await selectSharedConversation(a, chatFrame);
+  await assertDraft(a, chatFrame, "shared", sharedDraft);
+  await selectSharedConversation(b, bChatFrame);
+
+  // Returning to Community must still invalidate a response from its older
+  // selection, even though the conversation name is the same again.
+  const sharedText = `Held Community response @ ${Date.now()}`;
+  const newerSharedDraft = `Newer Community draft @ ${Date.now()}`;
+  const sharedStatus = await withHeldSendResponse(
+    a, chatFrame, "/api/apps/chat-room/objects/send", sharedText, "shared",
+    async (release) => {
+      await chatFrame.locator("#message-input").fill(newerSharedDraft);
+      await selectDirectConversation(a, chatFrame, conversationId);
+      await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+      await selectSharedConversation(a, chatFrame);
+      await assertDraft(a, chatFrame, "shared", newerSharedDraft);
+      await release();
+      await waitForMessage(a, chatFrame, sharedText, 30_000);
+      await delay(1_000);
+      await assertDraft(a, chatFrame, "shared", newerSharedDraft);
+      await waitForMessage(b, bChatFrame, sharedText, 60_000);
+    },
+  );
+  await chatFrame.locator("#message-input").fill("");
+  await selectDirectConversation(a, chatFrame, conversationId);
+  await assertDraft(a, chatFrame, conversationId, newerDirectDraft);
+  await chatFrame.locator("#message-input").fill("");
+  await selectDirectConversation(b, bChatFrame, conversationId);
+  return {
+    switched_drafts_preserved: true,
+    direct_newer_draft_after_response: true,
+    shared_newer_draft_after_response: true,
+    held_send_status: { direct: directStatus, shared: sharedStatus },
+    receiver_message_count: { direct: 1, shared: 1 },
+  };
+}
+
+async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
+  conversationId = "shared",
+  lossSource = "poll",
+} = {}) {
+  const direct = conversationId !== "shared";
+  assertOk(lossSource === "poll" || direct && lossSource === "send", "unsupported recovery fault");
+  if (direct) {
+    await selectDirectConversation(side, chatFrame, conversationId);
+    await selectDirectConversation(receiver, receiverFrame, conversationId);
+  } else {
+    await selectSharedConversation(side, chatFrame);
+  }
+  const documentStartedAt = await chatFrame.evaluate(() => performance.timeOrigin);
+  const oldHomeToken = await chatFrame.evaluate(() => globalThis.elastosChatHomeToken?.());
+  assertOk(typeof oldHomeToken === "string" && oldHomeToken.length > 0, "Chat had no launch authority before session loss");
+  const draft = `${direct ? "Direct" : "Community"} ${lossSource} Reconnect draft @ ${Date.now()}`;
+  await chatFrame.locator("#message-input").fill(draft);
+  assertOk(!(await chatFrame.locator("#reconnect-button").isVisible()), "Reconnect was already visible before session loss");
+  let injected = false;
+  let handlerError;
+  let starts = 0;
+  let authPosts = 0;
+  const startTokens = [];
+  const countStarts = (request) => {
+    if (request.method() === "POST") {
+      const path = new URL(request.url()).pathname;
+      if (path === "/api/apps/chat-room/session/start") {
+        starts += 1;
+        startTokens.push(request.headers()["x-elastos-home-token"] || "");
+      } else if (path.startsWith("/api/auth/")) {
+        authPosts += 1;
+      }
+    }
+  };
+  const faultPath = direct
+    ? lossSource === "send" ? "/api/apps/chat-room/direct/messages/send"
+      : `/api/apps/chat-room/direct/conversations/${encodeURIComponent(conversationId)}/messages`
+    : "/api/apps/chat-room/poll";
+  const matcher = (url) => url.origin === side.base && url.pathname === faultPath;
+  const handler = async (route) => {
+    try {
+      const request = route.request();
+      if (request.method() !== (!direct || lossSource === "send" ? "POST" : "GET") || injected) {
+        await route.continue();
+        return;
+      }
+      if (lossSource === "send") {
+        const payload = request.postDataJSON();
+        if (payload?.conversation_id !== conversationId || payload?.text !== draft) {
+          await route.continue();
+          return;
+        }
+      }
+      assertOk(request.headers()["x-elastos-home-token"] === oldHomeToken, "recovery fault targeted stale Chat authority");
+      injected = true;
+      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({
+        error: direct ? "invalid or expired launch token" : "invalid or expired session",
+      }) });
+    } catch (error) {
+      handlerError = error;
+      await route.abort().catch(() => {});
+    }
+  };
+  side.page.on("request", countStarts);
+  await side.page.route(matcher, handler);
+  try {
+    if (lossSource === "send") {
+      await chatFrame.locator("#send-button").click();
+    }
+    await chatFrame.locator("#reconnect-button").waitFor({ state: "visible", timeout: 30_000 });
+    assertOk(!handlerError, "session-loss interception failed");
+    assertOk(injected, "Reconnect appeared without the injected session loss");
+    assertOk(await chatFrame.locator("#reconnect-button").isEnabled(), "Reconnect control was disabled");
+    const explanation = chatFrame.locator("#error-text");
+    assertOk(await explanation.isVisible() && Boolean((await explanation.innerText()).trim()), "Reconnect had no visible explanation");
+    await assertDraft(side, chatFrame, conversationId, draft);
+    const lost = await chatFrameState(chatFrame);
+    assertOk(lost.sendDisabled && (direct || lost.inputDisabled), "Chat kept sending enabled after session loss");
+    await delay(1_500);
+    assertOk(starts === 0, "room session restarted before the Reconnect click", { session_starts: starts });
+    assertOk(authPosts === 0, "sign-in started before the Reconnect click", { auth_posts: authPosts });
+    if (lossSource === "send") {
+      assertOk(await exactMessageCount(receiverFrame, draft) === 0, "refused direct send reached its peer");
+    }
+    await side.page.unroute(matcher, handler);
+    await chatFrame.locator("#reconnect-button").click();
+    await poll(`${side.prefix}: user Reconnect resumes ${direct ? "Direct" : "Community"}`, 30_000, 250, async () => {
+      const state = await chatFrameState(chatFrame);
+      return {
+        done: starts > 0 && !state.inputDisabled && !(await chatFrame.locator("#reconnect-button").isVisible()),
+        value: { session_starts: starts, input_disabled: state.inputDisabled },
+      };
+    });
+    assertOk(
+      (await waitForAppWindow(side, "chat-room")) === chatFrame
+        && (await chatFrame.evaluate(() => performance.timeOrigin)) === documentStartedAt,
+      "Reconnect replaced the Chat document",
+    );
+    const freshHomeToken = await chatFrame.evaluate(() => globalThis.elastosChatHomeToken?.());
+    assertOk(typeof freshHomeToken === "string" && freshHomeToken.length > 0 && freshHomeToken !== oldHomeToken,
+      "Reconnect retained its old launch authority");
+    assertOk(startTokens.length > 0 && startTokens.every((token) => token === freshHomeToken),
+      "Reconnect started a room session with stale launch authority");
+    await assertDraft(side, chatFrame, conversationId, draft);
+    if (direct) {
+      await assertDirectSelection(side, chatFrame, conversationId);
+    }
+    await chatFrame.locator("#message-input").fill("");
+    if (!direct) {
+      await selectSharedConversation(receiver, receiverFrame);
+    }
+    const message = `${direct ? "Direct" : "Community"} after ${lossSource} Reconnect @ ${Date.now()}`;
+    await sendMessage(side, chatFrame, message);
+    await waitForMessage(receiver, receiverFrame, message, 120_000);
+    assertOk(!handlerError, "session-loss interception did not finish cleanly");
+    return { loss_source: lossSource, injected_status: 401, conversation_id: conversationId,
+      visible_reconnect: true, session_starts_before_click: 0, auth_posts_before_click: 0,
+      session_starts_after_click: starts, fresh_home_token: true, same_document: true,
+      draft_preserved: true, receiver_message_count: 1, message };
+  } finally {
+    side.page.off("request", countStarts);
+    await side.page.unroute(matcher, handler);
   }
 }
 
@@ -828,11 +1234,26 @@ async function main() {
   try {
     a = await openSide(SIDE_A);
     b = await openSide(SIDE_B);
+    report.toolchain = {
+      node: process.version,
+      playwright: require("playwright/package.json").version,
+      chromium: a.context.browser()?.version() || "",
+    };
 
     await runLeg(report, "provisioning_and_sign_in", "provision and sign in both fixture Homes", async () => {
-      await ensureAccount(a);
-      await ensureAccount(b);
-      return { a: "signed", b: "signed" };
+      const aEnrollment = await ensureAccount(a);
+      const bEnrollment = await ensureAccount(b);
+      assertOk(aEnrollment.enrollment === "enrolled" && bEnrollment.enrollment === "enrolled",
+        "signup proof requires fresh owner enrollment on both fixture Homes");
+      return { a: aEnrollment, b: bEnrollment, enrollment_surface: "home_owner_passkey" };
+    });
+
+    await runLeg(report, "system_recovery_after_signup", "save each signup Profile in a Recovery Kit from Welcome", async () => {
+      const evidence = {
+        a: await completeRecoverySetup(a),
+        b: await completeRecoverySetup(b),
+      };
+      return assertRecoverySetupEvidence(CONFIG, evidence);
     });
 
     let aDeviceDid;
@@ -855,14 +1276,6 @@ async function main() {
       ]);
       assertFreshFixturePrecondition(aSnapshot.contacts, bSnapshot.contacts);
       return { a_contacts: 0, b_contacts: 0 };
-    });
-
-    await runLeg(report, "system_recovery_before_profile", "complete System Recovery on both fresh Homes", async () => {
-      const evidence = {
-        a: await completeRecoverySetup(a, aPeople),
-        b: await completeRecoverySetup(b, bPeople),
-      };
-      return assertRecoverySetupEvidence(CONFIG, evidence);
     });
 
     await runLeg(report, "distinct_profile_names", "save two distinct Profile names", async () => {
@@ -889,20 +1302,34 @@ async function main() {
       };
     });
 
-    await runLeg(report, "exactly_one_contact_request", "A sends exactly one contact request", async () => {
+    // Enter Community through Home on both sides. Signed room messages make
+    // the peer's Profile available through the normal participant controls.
+    const [aCommunity, bCommunity] = await Promise.all([
+      openSharedConversation(a),
+      openSharedConversation(b),
+    ]);
+    const aCommunityMarker = `Community hello A @ ${Date.now()}`;
+    const bCommunityMarker = `Community hello B @ ${Date.now()}`;
+    await sendMessage(a, aCommunity, aCommunityMarker);
+    await waitForMessage(b, bCommunity, aCommunityMarker, 120_000);
+    await sendMessage(b, bCommunity, bCommunityMarker);
+    await waitForMessage(a, aCommunity, bCommunityMarker, 120_000);
+
+    await runLeg(report, "exactly_one_contact_request", "A requests the Community Profile once", async () => {
       await assertPeopleHasNoDecisionActions(b, bPeople);
-      const evidence = await requestContact(a, aPeople, SIDE_B.name);
+      const evidence = await requestCommunityContact(a, aCommunity, aPeople, SIDE_B.name);
       assertOk(evidence.count === 1, "outgoing request evidence was not exact", evidence);
       await assertPeopleHasNoDecisionActions(b, bPeople);
       return evidence;
     });
 
-    await runLeg(report, "inbox_only_accept", "B accepts only in Inbox", async () => {
-      const bInbox = await openAppWindow(b, "inbox");
+    let bInbox;
+    await runLeg(report, "inbox_only_accept", "B opens Inbox from the Community Profile and accepts", async () => {
+      bInbox = await openInboxFromCommunity(b, bCommunity, SIDE_A.name);
       await acceptContactRequest(b, bInbox, SIDE_A.name);
       bPeople = await openAppWindow(b, "people");
       await assertPeopleHasNoDecisionActions(b, bPeople);
-      return { decision_surface: "inbox" };
+      return { decision_surface: "inbox", launch_surface: "community_profile" };
     });
 
     let conversationId;
@@ -924,17 +1351,29 @@ async function main() {
     });
 
     await runLeg(report, "distinct_profile_identities", "prove distinct Profile identities through opaque contacts", async () => {
-      assertDistinctProfileContactEvidence(aContactId, bContactId);
-      return { a_contact_id: aContactId, b_contact_id: bContactId };
+      const binding = assertDistinctProfileContactEvidence(aContactId, bContactId, a.recoveryProfileDid, b.recoveryProfileDid);
+      return { a_contact_id: aContactId, b_contact_id: bContactId, ...binding };
     });
 
-    const aDirect = await openConversation(a, aPeople, SIDE_B.name, conversationId);
-    const bDirect = await openConversation(b, bPeople, SIDE_A.name, conversationId);
+    let aDirect;
+    await runLeg(report, "community_profile_launch", "Community Profile Message selects the accepted conversation", async () => {
+      aDirect = await openDirectFromCommunity(a, aCommunity, SIDE_B.name, conversationId);
+      return { conversation_id: conversationId, launch_surface: "community_profile", corrective_selection: false };
+    });
+    let bDirect = await openConversation(b, bPeople, SIDE_A.name, conversationId);
+    // Leave B in Community so Inbox Open must change its selection.
+    await selectSharedConversation(b, bDirect.frame);
     const helloFromA = `Hello from ${SIDE_A.name} @ ${Date.now()}`;
     await runLeg(report, "direct_message_a_to_b", "direct message A to B", async () => {
       await sendMessage(a, aDirect.frame, helloFromA);
+      bDirect = await openDirectFromInbox(b, bInbox, helloFromA, conversationId);
       await waitForMessage(b, bDirect.frame, helloFromA);
       return { conversation_id: conversationId, message: helloFromA };
+    });
+
+    await runLeg(report, "inbox_direct_launch", "Inbox Open selects the incoming direct conversation", async () => {
+      await assertDirectSelection(b, bDirect.frame, conversationId);
+      return { conversation_id: conversationId, launch_surface: "inbox", corrective_selection: false };
     });
 
     const helloFromB = `Hello back from ${SIDE_B.name} @ ${Date.now()}`;
@@ -943,6 +1382,19 @@ async function main() {
       await waitForMessage(a, aDirect.frame, helloFromB);
       return { conversation_id: conversationId, message: helloFromB };
     });
+
+    await runLeg(report, "conversation_draft_preservation", "preserve drafts through selection and a late send response", async () => (
+      proveDraftPreservation(a, aDirect.frame, b, bDirect.frame, conversationId)
+    ));
+
+    await runLeg(report, "shared_session_recovery", "recover the room only after visible Reconnect", async () => (
+      proveSessionRecovery(a, aDirect.frame, b, bDirect.frame)
+    ));
+
+    await runLeg(report, "direct_session_recovery", "recover Direct polling and sending only after visible Reconnect", async () => ({
+      poll: await proveSessionRecovery(a, aDirect.frame, b, bDirect.frame, { conversationId }),
+      send: await proveSessionRecovery(a, aDirect.frame, b, bDirect.frame, { conversationId, lossSource: "send" }),
+    }));
 
     await runLeg(report, "rename_propagation", "signed Profile rename propagates", async () => {
       await saveProfile(a, aPeople, RENAMED_A);

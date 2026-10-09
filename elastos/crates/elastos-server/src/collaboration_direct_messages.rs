@@ -200,6 +200,8 @@ pub(crate) struct DirectConversationSummary {
     /// True once the relationship ended. The conversation stays listed —
     /// history is readable per the declared policy — but composing stops.
     pub(crate) removed: bool,
+    /// A message arrived that this person has not opened yet.
+    pub(crate) unread: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1123,6 +1125,7 @@ impl CollaborationDirectMessageService {
                 conversation_id: contact.conversation_id().to_string(),
                 display_name: contact.remote_display_name().to_string(),
                 removed: false,
+                unread: false,
             })
             .collect::<Vec<_>>();
         match DECLARED_DIRECT_HISTORY_POLICY {
@@ -1132,6 +1135,7 @@ impl CollaborationDirectMessageService {
                         conversation_id: removed.conversation_id().to_string(),
                         display_name: removed.display_name().to_string(),
                         removed: true,
+                        unread: false,
                     }
                 }));
             }
@@ -1597,6 +1601,7 @@ impl CollaborationDirectMessageService {
         // presentation this receive just verified against.
         let _ = crate::notifications::upsert_direct_message_notification(
             context.contact_store.data_root(),
+            context.contact_store.local_profile_did(),
             contact.conversation_id(),
             contact.remote_display_name(),
             now,
