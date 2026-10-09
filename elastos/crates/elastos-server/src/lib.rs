@@ -33,6 +33,7 @@ pub(crate) mod collaboration_profile_authority;
 pub(crate) mod collaboration_profile_loader;
 mod collaboration_profile_updates;
 pub mod collaboration_protocol;
+pub(crate) mod collaboration_rate_limit;
 pub mod collaboration_release_network;
 pub mod collaboration_startup;
 pub(crate) mod collaboration_transport;

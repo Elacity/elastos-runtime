@@ -28,6 +28,11 @@ use crate::collaboration_protocol::{
     verify_stored_acceptance_receipt_envelope, verify_stored_collaboration_acceptance_receipt,
     verify_stored_collaboration_message, VerifiedCollaborationMessage,
 };
+use crate::collaboration_rate_limit::{
+    CommunitySendRateLimited, HeldFrame, HeldFrames, HoldOutcome, ProfileRateLimiter,
+    COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE, COMMUNITY_RATE_WINDOW_SECS,
+    COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW, COMMUNITY_SENDS_PER_WINDOW,
+};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding, ESP_REQUEST_BINDING_SCHEMA};
 use crate::host_lock::FileLock;
 
@@ -43,7 +48,7 @@ const MAX_CORE_STATE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_UNRESOLVED_OUTGOING: usize = 64;
 const MAX_OUTGOING_RECORDS: usize = 4_096;
 const MAX_PENDING_INCOMING: usize = 32;
-const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
+pub(crate) const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
 const MAX_ACCEPTANCE_RECEIPTS_PER_OUTGOING: usize = 32;
 const MAX_INCOMING_RECORDS_AND_TOMBSTONES: usize = 4_096;
 pub(crate) const MAX_CONVERSATION_HISTORY_MESSAGES: usize = 200;
@@ -56,6 +61,10 @@ pub(crate) struct CollaborationCore {
     data_root: PathBuf,
     state_dir: PathBuf,
     mutation_mutex: Mutex<()>,
+    /// Counted from stored outgoing messages, so only a saved message counts.
+    sends_per_window: usize,
+    receive_rate: ProfileRateLimiter,
+    held: HeldFrames,
     #[cfg(test)]
     write_fault: std::sync::atomic::AtomicU8,
 }
@@ -164,6 +173,12 @@ pub(crate) enum CollaborationTransportRejection {
     AcceptanceWithoutOutgoingMessage,
     AcceptanceBeforeProductProjection,
     AcceptanceRecipientConflict,
+    /// The sender is over the receive limit. The Home holds the frame and
+    /// retries it once the sender's window slides.
+    SenderRateLimited,
+    /// The sender already has the most messages waiting for Chat. Held and
+    /// retried like `SenderRateLimited`, so one sender never holds the batch.
+    SenderBacklogFull,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -300,6 +315,12 @@ impl CollaborationCore {
             data_root: data_root.to_path_buf(),
             state_dir,
             mutation_mutex: Mutex::new(()),
+            sends_per_window: COMMUNITY_SENDS_PER_WINDOW,
+            receive_rate: ProfileRateLimiter::new(
+                COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
+                COMMUNITY_RATE_WINDOW_SECS,
+            ),
+            held: HeldFrames::default(),
             #[cfg(test)]
             write_fault: std::sync::atomic::AtomicU8::new(0),
         })
@@ -524,6 +545,7 @@ impl CollaborationCore {
         };
         match kind {
             CollaborationTransportFrameKind::Message => self.ingest_transport_message(
+                frame,
                 verified_transport.envelope_bytes(),
                 verified_transport.source_endpoint_did(),
                 now,
@@ -539,6 +561,7 @@ impl CollaborationCore {
 
     fn ingest_transport_message(
         &self,
+        transport_frame: &[u8],
         frame: &[u8],
         source_endpoint_did: &str,
         now: u64,
@@ -604,12 +627,48 @@ impl CollaborationCore {
                 CollaborationTransportRejection::MessageIdentityConflict,
             ));
         }
+        // Count only an authorized, new message, so a forged or replayed frame
+        // cannot spend another sender's budget. A per-sender refusal lets the
+        // rest of the batch move on; this Home holds the frame and retries it,
+        // because the sender stops resending once any other Home accepts it.
+        let rate_limited_sender = (incoming.message().envelope().payload.payload_type
+            == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+            .then(|| {
+                incoming
+                    .message()
+                    .envelope()
+                    .payload
+                    .sender_profile_did
+                    .clone()
+            });
+        if let Some(sender_profile_did) = &rate_limited_sender {
+            if self.receive_rate.check(sender_profile_did, now).is_err() {
+                return self.hold_refused(
+                    transport_frame,
+                    incoming.message(),
+                    CollaborationTransportRejection::SenderRateLimited,
+                    now,
+                );
+            }
+        }
+        if self.sender_backlog_full(&state, incoming.message()) {
+            return self.hold_refused(
+                transport_frame,
+                incoming.message(),
+                CollaborationTransportRejection::SenderBacklogFull,
+                now,
+            );
+        }
+        // Home-wide limits stay retryable: the whole Home must catch up first.
         self.ensure_incoming_capacity(&state, incoming.message(), frame)
             .map_err(|_| CollaborationTransportRetryableError)?;
 
         let accepted = self
             .accept_incoming(frame, source_endpoint_did, now)
             .map_err(|_| CollaborationTransportRetryableError)?;
+        if let Some(sender_profile_did) = &rate_limited_sender {
+            self.receive_rate.record(sender_profile_did, now);
+        }
         Ok(CollaborationTransportIngestion::Incoming(
             transport_incoming_acceptance(accepted),
         ))
@@ -716,6 +775,8 @@ impl CollaborationCore {
             ttl_secs,
         )?;
 
+        let rate_limited_sender = (payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+            .then(|| sender_profile.document().profile_did.as_str());
         self.with_mutation(Some(now), |state| {
             if let Some(existing) = state
                 .outgoing
@@ -741,6 +802,10 @@ impl CollaborationCore {
                 });
             }
 
+            // A retry of a stored request_id returned above and is not counted.
+            if let Some(sender_profile_did) = rate_limited_sender {
+                self.check_community_send_window(state, sender_profile_did, now)?;
+            }
             let unresolved = state
                 .outgoing
                 .iter()
@@ -777,6 +842,42 @@ impl CollaborationCore {
                 value,
                 changed: true,
             })
+        })
+    }
+
+    /// Counts this Profile's stored Community messages created in the last
+    /// window. Stored state is the count, so an unsaved send never counts and
+    /// a saved one always does, across restarts too.
+    fn check_community_send_window(
+        &self,
+        state: &CoreState,
+        sender_profile_did: &str,
+        now: u64,
+    ) -> Result<(), CommunitySendRateLimited> {
+        let window_start = now.saturating_sub(COMMUNITY_RATE_WINDOW_SECS);
+        let recent = state
+            .outgoing
+            .iter()
+            .filter_map(|entry| {
+                serde_json::from_str::<SignedCollaborationMessage>(&entry.envelope).ok()
+            })
+            .filter(|message| {
+                message.payload.payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+                    && message.payload.sender_profile_did == sender_profile_did
+                    && message.payload.created_at > window_start
+            })
+            .map(|message| message.payload.created_at);
+        let (count, oldest) = recent.fold((0, u64::MAX), |(count, oldest), created_at| {
+            (count + 1, oldest.min(created_at))
+        });
+        if count < self.sends_per_window {
+            return Ok(());
+        }
+        Err(CommunitySendRateLimited {
+            retry_after_secs: oldest
+                .saturating_add(COMMUNITY_RATE_WINDOW_SECS)
+                .saturating_sub(now)
+                .max(1),
         })
     }
 
@@ -1117,6 +1218,70 @@ impl CollaborationCore {
         Ok(None)
     }
 
+    /// Holds a frame refused by a per-sender limit for this Home's own retry.
+    /// A sender past its held allowance is flooding and loses the frame; a
+    /// Home full of fair holders keeps it in transport instead.
+    fn hold_refused(
+        &self,
+        transport_frame: &[u8],
+        message: &VerifiedCollaborationMessage,
+        reason: CollaborationTransportRejection,
+        now: u64,
+    ) -> Result<CollaborationTransportIngestion, CollaborationTransportRetryableError> {
+        let payload = &message.envelope().payload;
+        match self.held.hold(
+            HeldFrame::new(
+                transport_frame,
+                message.envelope_sha256(),
+                &payload.sender_profile_did,
+                payload.expires_at,
+            ),
+            now,
+        ) {
+            HoldOutcome::Held => {}
+            HoldOutcome::Dropped => {
+                tracing::debug!(
+                    ?reason,
+                    "Community message dropped: sender is over its limits"
+                );
+            }
+            HoldOutcome::HomeFull => return Err(CollaborationTransportRetryableError),
+        }
+        Ok(CollaborationTransportIngestion::Rejected(reason))
+    }
+
+    /// Frames refused by a per-sender limit, oldest first, for the driver to
+    /// retry before it reads new ones.
+    pub(crate) fn take_held_frames(&self, now: u64) -> Vec<HeldFrame> {
+        self.held.take(now)
+    }
+
+    /// Returns held frames that a retry did not settle.
+    pub(crate) fn restore_held_frames(&self, held: Vec<HeldFrame>) {
+        self.held.restore(held);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_held_frame_bound_for_test(mut self, max_frames: usize) -> Self {
+        self.held = HeldFrames::with_max_frames(max_frames);
+        self
+    }
+
+    fn sender_backlog_full(
+        &self,
+        state: &CoreState,
+        message: &VerifiedCollaborationMessage,
+    ) -> bool {
+        let sender = &message.envelope().payload.sender_profile_did;
+        state
+            .incoming
+            .iter()
+            .filter_map(|entry| self.verify_incoming_record(entry).ok())
+            .filter(|entry| entry.message().envelope().payload.sender_profile_did == *sender)
+            .count()
+            >= MAX_PENDING_INCOMING_PER_SENDER
+    }
+
     fn ensure_incoming_capacity(
         &self,
         state: &CoreState,
@@ -1129,14 +1294,7 @@ impl CollaborationCore {
         {
             anyhow::bail!("collaboration incoming capacity is exhausted");
         }
-        let sender = &message.envelope().payload.sender_profile_did;
-        let per_sender = state
-            .incoming
-            .iter()
-            .filter_map(|entry| self.verify_incoming_record(entry).ok())
-            .filter(|entry| entry.message().envelope().payload.sender_profile_did == *sender)
-            .count();
-        if per_sender >= MAX_PENDING_INCOMING_PER_SENDER {
+        if self.sender_backlog_full(state, message) {
             anyhow::bail!("collaboration incoming sender capacity is exhausted");
         }
         let current_bytes = canonical_state_bytes(state)?.len();
@@ -2613,6 +2771,137 @@ mod tests {
     }
 
     #[test]
+    fn community_send_limit_refuses_a_burst_but_not_retries_or_a_later_message() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        for index in 0..COMMUNITY_SENDS_PER_WINDOW {
+            prepare(
+                &core,
+                &format!("burst-{index}"),
+                serde_json::json!({"index":index}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        }
+        let before = fs::read(core.state_path()).unwrap();
+        let error = prepare(
+            &core,
+            "burst-over",
+            serde_json::json!({"over":true}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CommunitySendRateLimited>(),
+            Some(&CommunitySendRateLimited {
+                retry_after_secs: COMMUNITY_RATE_WINDOW_SECS - 1
+            })
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+
+        // A retry of a stored message is not a new send.
+        prepare(
+            &core,
+            "burst-0",
+            serde_json::json!({"index":0}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap();
+        // The window slides.
+        prepare(
+            &core,
+            "burst-over",
+            serde_json::json!({"over":true}),
+            NOW + COMMUNITY_RATE_WINDOW_SECS,
+            TTL,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn community_send_limit_counts_exactly_the_saved_messages() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        // A send that fails before the write saves nothing and counts nothing.
+        for _ in 0..=COMMUNITY_SENDS_PER_WINDOW {
+            core.inject_write_fault(WriteFault::BeforeWrite);
+            assert!(
+                prepare(&core, "unsaved", serde_json::json!({"n":0}), NOW, TTL)
+                    .unwrap_err()
+                    .downcast_ref::<CommunitySendRateLimited>()
+                    .is_none()
+            );
+        }
+        // A send that fails after the rename is saved, and counts.
+        core.inject_write_fault(WriteFault::AfterRename);
+        assert!(prepare(
+            &core,
+            "saved-late",
+            serde_json::json!({"late":true}),
+            NOW,
+            TTL
+        )
+        .is_err());
+        for index in 1..COMMUNITY_SENDS_PER_WINDOW {
+            prepare(
+                &core,
+                &format!("saved-{index}"),
+                serde_json::json!({"index":index}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        }
+        let error = prepare(&core, "over", serde_json::json!({"over":true}), NOW, TTL).unwrap_err();
+        assert!(error.downcast_ref::<CommunitySendRateLimited>().is_some());
+        // Its retry returns the stored message without counting again.
+        prepare(
+            &core,
+            "saved-late",
+            serde_json::json!({"late":true}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn community_receive_limit_drops_a_flooding_sender_without_stalling_others() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let accept = |frame: &[u8], now: u64| {
+            transport_incoming(&core, frame, now);
+            for handoff in core.pending_product_handoffs().unwrap() {
+                core.acknowledge_product_handoff(
+                    handoff.authorized_message().message().envelope_sha256(),
+                )
+                .unwrap();
+            }
+        };
+        let (flooder, _) = generate_keypair();
+        for _ in 0..COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW {
+            let (_, frame) = remote_transport_message(&fixture, flooder.clone(), NOW);
+            accept(&frame, NOW);
+        }
+        let (_, over) = remote_transport_message(&fixture, flooder, NOW);
+        let before = fs::read(core.state_path()).unwrap();
+        assert_eq!(
+            transport_rejection(&core, &over, NOW + 1),
+            CollaborationTransportRejection::SenderRateLimited
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+
+        // Another sender in the same window is unaffected.
+        let (_, other) = remote_transport_message(&fixture, generate_keypair().0, NOW);
+        accept(&other, NOW + 1);
+        // The flooder's rebroadcast lands once its window slides.
+        accept(&over, NOW + COMMUNITY_RATE_WINDOW_SECS);
+    }
+
+    #[test]
     fn transport_dispatch_and_pure_message_rejections_are_deterministic() {
         let fixture = Fixture::new();
         let core = fixture.core();
@@ -2768,15 +3057,23 @@ mod tests {
         let capacity_fixture = Fixture::new();
         let capacity_core = capacity_fixture.core();
         let (sender_key, _) = generate_keypair();
-        for _ in 0..MAX_PENDING_INCOMING_PER_SENDER {
-            let (_, frame) = remote_transport_message(&capacity_fixture, sender_key.clone(), NOW);
-            transport_incoming(&capacity_core, &frame, NOW);
+        // Spread over receive windows, so the backlog binds before the rate.
+        let at = |index: usize| {
+            NOW + (index / COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW) as u64
+                * COMMUNITY_RATE_WINDOW_SECS
+        };
+        for index in 0..MAX_PENDING_INCOMING_PER_SENDER {
+            let (_, frame) =
+                remote_transport_message(&capacity_fixture, sender_key.clone(), at(index));
+            transport_incoming(&capacity_core, &frame, at(index));
         }
-        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, NOW);
+        let last = at(MAX_PENDING_INCOMING_PER_SENDER - 1);
+        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, last);
         let before_capacity = fs::read(capacity_core.state_path()).unwrap();
-        assert!(capacity_core
-            .ingest_transport_frame(&over_capacity, NOW)
-            .is_err());
+        assert_eq!(
+            transport_rejection(&capacity_core, &over_capacity, last),
+            CollaborationTransportRejection::SenderBacklogFull
+        );
         assert_eq!(
             fs::read(capacity_core.state_path()).unwrap(),
             before_capacity
@@ -3574,7 +3871,9 @@ mod tests {
         );
 
         let fixture = Fixture::new();
-        let core = fixture.core();
+        let mut core = fixture.core();
+        // This test fills the outbox in one second; pacing has its own test.
+        core.sends_per_window = usize::MAX;
         for index in 0..MAX_UNRESOLVED_OUTGOING {
             prepare(
                 &core,

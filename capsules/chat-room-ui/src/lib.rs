@@ -2551,7 +2551,7 @@ impl App {
                 self.handle_session_loss(self.session_loss_detail());
                 return Ok(false);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(room_send_error_text(err)),
         };
         record_own_shared_send(&mut self.state.borrow_mut(), sent);
         Ok(true)
@@ -4746,7 +4746,7 @@ mod tests {
         documents_attachment_message, extract_fragment_param, extract_query_param,
         format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
         participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, selection_guard_matches, settle_sent_draft,
+        resolve_conversation_choice, room_send_error_text, selection_guard_matches, settle_sent_draft,
         shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
         AttachmentView, ConversationObjectKind, ConversationObjectView, ParticipantView,
         PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
@@ -5265,6 +5265,25 @@ mod tests {
             "doc-1",
             &state
         ));
+    }
+
+    #[test]
+    fn room_send_rate_limit_reads_as_slow_down() {
+        assert_eq!(
+            room_send_error_text(
+                "request failed: 429 Slow down. You can send another message in 4 seconds."
+                    .to_string()
+            ),
+            "Slow down. You can send another message in 4 seconds."
+        );
+        assert_eq!(
+            room_send_error_text("request failed: 429 ".to_string()),
+            "Slow down. Try again in a few seconds."
+        );
+        assert_eq!(
+            room_send_error_text("request failed: 500 boom".to_string()),
+            "request failed: 500 boom"
+        );
     }
 
     #[test]
@@ -5947,6 +5966,16 @@ where
         body: body.to_string(),
     });
     Ok(request_id)
+}
+
+/// Shows the Home's "Slow down" refusal as written. The draft stays in the
+/// composer, so sending again later delivers it.
+fn room_send_error_text(err: String) -> String {
+    match err.strip_prefix("request failed: 429 ") {
+        Some(detail) if !detail.trim().is_empty() => detail.trim().to_string(),
+        Some(_) => "Slow down. Try again in a few seconds.".to_string(),
+        None => err,
+    }
 }
 
 fn is_session_error(err: &str) -> bool {

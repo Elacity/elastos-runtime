@@ -59,6 +59,13 @@ const MAX_DISCOVERY_TOTAL_ADVERTISEMENTS: usize = 64;
 const MAX_DISCOVERY_TOTAL_REQUESTS: usize = 64;
 const MAX_DISCOVERY_TOTAL_REQUEST_MAILBOX_ENTRIES: usize = 64;
 const MAX_DISCOVERY_TOTAL_DECISION_MAILBOX_ENTRIES: usize = 64;
+// Per-Home relay limits, so one Home cannot fill the shared Discovery list or
+// the request store. A Home's Carrier endpoint is its signing device, and the
+// relay admits a listing or request only from the device that signed it.
+// Profiles are free to mint, so the device bounds one Home.
+const MAX_DISCOVERY_ADVERTISEMENTS_PER_DEVICE: usize = 4;
+const MAX_DISCOVERY_REQUESTS_PER_SENDER: usize = 8;
+const MAX_DISCOVERY_REQUESTS_PER_DEVICE: usize = 16;
 const DISCOVERY_PROVIDER_TIMEOUT_MS: u64 = 5_000;
 const DISCOVERY_ADVERTISEMENT_RENEWAL_WINDOW_SECS: u64 = 60;
 const MAX_DISCOVERY_SYNC_CONTEXTS: usize = 32;
@@ -2353,6 +2360,70 @@ fn parse_discovery_provider_request<T: serde::de::DeserializeOwned>(
         .map_err(|err| ProviderError::Provider(format!("invalid {label}: {err}")))
 }
 
+/// The Carrier endpoint the provider plane authenticated for this call. Read
+/// before `parse_discovery_provider_request` drops the Runtime metadata.
+fn relay_source_endpoint(request: &serde_json::Value) -> Result<String, ProviderError> {
+    crate::collaboration_protocol::authenticated_carrier_source_endpoint(
+        request
+            .get("_runtime_invocation")
+            .and_then(|runtime| runtime.get("carrier")),
+    )
+    .map_err(|err| ProviderError::Provider(err.to_string()))
+}
+
+/// Refuses a listing or request sent by any endpoint other than the device
+/// that signed it, so a replay from another Home spends nobody's limit.
+fn require_signing_endpoint(
+    source_endpoint_did: &str,
+    signer_did: &str,
+) -> Result<(), ProviderError> {
+    if source_endpoint_did != signer_did {
+        return Err(ProviderError::Provider(
+            "discovery relay accepts only the signing device's own submissions".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stores or renews one listing within the total and per-device limits. A
+/// renewal of a stored Profile never counts against its own limit.
+fn store_relay_advertisement(
+    state: &mut DiscoveryRelayState,
+    advertisement: CachedAdvertisement,
+    source_endpoint_did: &str,
+) -> Result<(), ProviderError> {
+    let signer_did = advertisement
+        .verified
+        .message()
+        .envelope()
+        .signer_did
+        .clone();
+    require_signing_endpoint(source_endpoint_did, &signer_did)?;
+    let profile_did = advertisement.verified.profile_did().to_string();
+    if !state.advertisements.contains_key(&profile_did)
+        && state.advertisements.len() >= MAX_DISCOVERY_TOTAL_ADVERTISEMENTS
+    {
+        return Err(ProviderError::Provider(
+            "discovery relay advertisement capacity is full".to_string(),
+        ));
+    }
+    let same_device = state
+        .advertisements
+        .iter()
+        .filter(|(stored_profile_did, stored)| {
+            **stored_profile_did != profile_did
+                && stored.verified.message().envelope().signer_did == signer_did
+        })
+        .count();
+    if same_device >= MAX_DISCOVERY_ADVERTISEMENTS_PER_DEVICE {
+        return Err(ProviderError::Provider(
+            "discovery relay listing limit reached for this Home".to_string(),
+        ));
+    }
+    merge_profile_scoped_advertisement(&mut state.advertisements, advertisement)
+        .map_err(|err| ProviderError::Provider(err.to_string()))
+}
+
 #[async_trait::async_trait]
 impl Provider for CollaborationDiscoveryRelayProvider {
     async fn handle(
@@ -2387,6 +2458,7 @@ impl Provider for CollaborationDiscoveryRelayProvider {
         self.prune(now, &mut state);
         match op {
             "advertise" => {
+                let source_endpoint_did = relay_source_endpoint(request)?;
                 let request: DiscoveryProviderAdvertisementRequest =
                     parse_discovery_provider_request(request, "discovery advertise request")?;
                 let envelope_bytes =
@@ -2398,24 +2470,18 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                     now,
                 )
                 .map_err(|err| ProviderError::Provider(err.to_string()))?;
-                if !state.advertisements.contains_key(verified.profile_did())
-                    && state.advertisements.len() >= MAX_DISCOVERY_TOTAL_ADVERTISEMENTS
-                {
-                    return Err(ProviderError::Provider(
-                        "discovery relay advertisement capacity is full".to_string(),
-                    ));
-                }
-                merge_profile_scoped_advertisement(
-                    &mut state.advertisements,
+                store_relay_advertisement(
+                    &mut state,
                     CachedAdvertisement {
                         envelope_bytes,
                         verified,
                     },
-                )
-                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                    &source_endpoint_did,
+                )?;
                 Ok(serde_json::json!({"status":"ok","data":{}}))
             }
             "query" => {
+                let source_endpoint_did = relay_source_endpoint(request)?;
                 let request: DiscoveryProviderQueryRequest =
                     parse_discovery_provider_request(request, "discovery query request")?;
                 let envelope_bytes =
@@ -2428,21 +2494,14 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                 )
                 .map_err(|err| ProviderError::Provider(err.to_string()))?;
                 let caller_profile_did = verified.profile_did().to_string();
-                if !state.advertisements.contains_key(&caller_profile_did)
-                    && state.advertisements.len() >= MAX_DISCOVERY_TOTAL_ADVERTISEMENTS
-                {
-                    return Err(ProviderError::Provider(
-                        "discovery relay advertisement capacity is full".to_string(),
-                    ));
-                }
-                merge_profile_scoped_advertisement(
-                    &mut state.advertisements,
+                store_relay_advertisement(
+                    &mut state,
                     CachedAdvertisement {
                         envelope_bytes,
                         verified,
                     },
-                )
-                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                    &source_endpoint_did,
+                )?;
                 let mut advertisements = state
                     .advertisements
                     .values()
@@ -2512,6 +2571,7 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                 Ok(serde_json::json!({"status":"ok","data":{}}))
             }
             "send_contact_request" => {
+                let source_endpoint_did = relay_source_endpoint(request)?;
                 let request: DiscoveryProviderContactRequest =
                     parse_discovery_provider_request(request, "contact request submission")?;
                 let envelope_bytes = decode_bytes(&request.request, "contact request")
@@ -2545,6 +2605,10 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                     now,
                 )
                 .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                require_signing_endpoint(
+                    &source_endpoint_did,
+                    &verified.message().envelope().signer_did,
+                )?;
                 let request_hash = verified.message().envelope_sha256().to_string();
                 let recipient_profile_did = advertisement.verified.profile_did().to_string();
                 let request_exists = state.requests.contains_key(&request_hash);
@@ -2560,6 +2624,32 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                     return Err(ProviderError::Provider(
                         "discovery relay request capacity is full".to_string(),
                     ));
+                }
+                if !request_exists {
+                    let payload = &verified.message().envelope().payload;
+                    let signer_did = &verified.message().envelope().signer_did;
+                    let (same_sender, same_device) =
+                        state
+                            .requests
+                            .values()
+                            .fold((0, 0), |(senders, devices), stored| {
+                                let stored = stored.verified.message().envelope();
+                                (
+                                    senders
+                                        + usize::from(
+                                            stored.payload.sender_profile_did
+                                                == payload.sender_profile_did,
+                                        ),
+                                    devices + usize::from(stored.signer_did == *signer_did),
+                                )
+                            });
+                    if same_sender >= MAX_DISCOVERY_REQUESTS_PER_SENDER
+                        || same_device >= MAX_DISCOVERY_REQUESTS_PER_DEVICE
+                    {
+                        return Err(ProviderError::Provider(
+                            "discovery relay request limit reached for this sender".to_string(),
+                        ));
+                    }
                 }
                 if !mailbox_contains {
                     if mailbox_len >= MAX_DISCOVERY_REQUESTS_PER_RECIPIENT {
@@ -3159,6 +3249,36 @@ pub(crate) mod tests {
     };
 
     const NETWORK: &str = "elastos.community.test";
+    /// A fresh authenticated Carrier source endpoint, as the provider plane
+    /// stamps it on a remote call.
+    fn test_relay_source() -> String {
+        crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(
+            &generate_keypair().0.to_bytes(),
+        ))
+    }
+
+    fn from_source(mut request: serde_json::Value, source_endpoint_did: &str) -> serde_json::Value {
+        request["_runtime_invocation"] =
+            serde_json::json!({ "carrier": { "source_endpoint_did": source_endpoint_did } });
+        request
+    }
+
+    /// A relay call from the device that signed the listing or request, as a
+    /// Home sends it over its own Carrier endpoint.
+    fn from_signer(request: serde_json::Value) -> serde_json::Value {
+        let envelope = ["advertisement", "request"]
+            .into_iter()
+            .find_map(|field| request[field].as_str())
+            .expect("relay test call carries a signed envelope");
+        let envelope = decode_bytes(envelope, "relay test envelope").unwrap();
+        let signer_did = serde_json::from_slice::<
+            elastos_common::collaboration_protocol::SignedCollaborationMessage,
+        >(&envelope)
+        .unwrap()
+        .signer_did;
+        from_source(request, &signer_did)
+    }
+
     const TEST_MAX_REQUESTS_PER_SENDER: usize = 14;
     const TEST_MAX_DECISIONS_PER_SENDER: usize = 16;
 
@@ -7042,10 +7162,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&caller_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -7062,19 +7182,19 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             relay
-                .send_raw(&serde_json::json!({
+                .send_raw(&from_signer(serde_json::json!({
                     "op": "advertise",
                     "advertisement": encode_bytes(&advertisement),
-                }))
+                })))
                 .await
                 .unwrap();
         }
 
         let response = relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "query",
                 "advertisement": encode_bytes(&caller_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         let response: DiscoveryProviderAdvertisementResponse =
@@ -7112,10 +7232,10 @@ pub(crate) mod tests {
             .prepare_advertisement(&first_profile, now)
             .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&first_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -7132,10 +7252,10 @@ pub(crate) mod tests {
             .prepare_advertisement(&conflicting_profile, now + 1)
             .unwrap();
         let error = relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&conflicting_advertisement),
-            }))
+            })))
             .await
             .unwrap_err();
         assert!(error
@@ -7162,10 +7282,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         let response = relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "query",
                 "advertisement": encode_bytes(&caller_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         let response: DiscoveryProviderAdvertisementResponse =
@@ -7632,17 +7752,17 @@ pub(crate) mod tests {
                 .unwrap();
 
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&first_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&second_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -7743,10 +7863,10 @@ pub(crate) mod tests {
         .unwrap();
         for advertisement in [&profile_b_advertisement, &requester_advertisement] {
             relay
-                .send_raw(&serde_json::json!({
+                .send_raw(&from_signer(serde_json::json!({
                     "op": "advertise",
                     "advertisement": encode_bytes(advertisement),
-                }))
+                })))
                 .await
                 .unwrap();
         }
@@ -7759,10 +7879,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "send_contact_request",
                 "request": encode_bytes(&inbound_request),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -7878,10 +7998,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "send_contact_request",
                 "request": encode_bytes(&outgoing_request),
-            }))
+            })))
             .await
             .unwrap();
         let decision = requester_authority
@@ -7995,10 +8115,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&admitted_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         {
@@ -8014,10 +8134,10 @@ pub(crate) mod tests {
         }
 
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&admitted_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -8033,10 +8153,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         let error = relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&rejected_advertisement),
-            }))
+            })))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("advertisement capacity is full"));
@@ -8074,10 +8194,10 @@ pub(crate) mod tests {
             verify_collaboration_discovery_advertisement(&local_advertisement, &profile, now)
                 .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&local_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -8099,10 +8219,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&secondary_local_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         let primary_recipient_profile_did = verified_local_advertisement.profile_did().to_string();
@@ -8127,10 +8247,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&tertiary_local_advertisement),
-            }))
+            })))
             .await
             .unwrap();
         let tertiary_recipient_profile_did = verified_tertiary_local_advertisement
@@ -8213,10 +8333,10 @@ pub(crate) mod tests {
         let recipient_profile_did = primary_recipient_profile_did;
 
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "send_contact_request",
                 "request": encode_bytes(replay_request.as_ref().unwrap()),
-            }))
+            })))
             .await
             .unwrap();
 
@@ -8234,10 +8354,10 @@ pub(crate) mod tests {
             .unwrap();
         let overflow_hash = collaboration_message_envelope_sha256(&overflow_request);
         let error = relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "send_contact_request",
                 "request": encode_bytes(&overflow_request),
-            }))
+            })))
             .await
             .unwrap_err();
         assert!(
@@ -8265,6 +8385,272 @@ pub(crate) mod tests {
             .contains(replay_hash.as_ref().unwrap()));
     }
 
+    /// One device's listing for a fresh Profile.
+    fn listing_for(
+        network: &VerifiedCollaborationNetworkProfile,
+        device: &SigningKey,
+        display_name: &str,
+        now: u64,
+    ) -> Vec<u8> {
+        let profile_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device.to_bytes()),
+            network.clone(),
+        )
+        .prepare_advertisement(
+            &verified_discovery_profile_with(&profile_key, device, display_name, None, 1, None, 1),
+            now,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relay_limits_listings_per_home_and_refuses_replays_from_other_homes() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(profile.clone());
+        let now = current_timestamp();
+        let advertise = |listing: &[u8], source: &str| {
+            let relay = &relay;
+            let request = from_source(
+                serde_json::json!({ "op": "advertise", "advertisement": encode_bytes(listing) }),
+                source,
+            );
+            async move { relay.send_raw(&request).await }
+        };
+        let stored = |listing: &[u8]| {
+            let verified =
+                verify_collaboration_discovery_advertisement(listing, &profile, now).unwrap();
+            relay
+                .state
+                .lock()
+                .unwrap()
+                .advertisements
+                .contains_key(verified.profile_did())
+        };
+        let new_device = || SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+
+        // One Home lists up to the limit, then is refused one more.
+        let device = new_device();
+        let home = crate::crypto::encode_signing_key_did(&device);
+        let listed = (0..MAX_DISCOVERY_ADVERTISEMENTS_PER_DEVICE)
+            .map(|index| listing_for(&profile, &device, &format!("Person {index}"), now))
+            .collect::<Vec<_>>();
+        for listing in &listed {
+            advertise(listing, &home).await.unwrap();
+        }
+        let over = listing_for(&profile, &device, "Over", now);
+        let error = advertise(&over, &home).await.unwrap_err();
+        assert!(error.to_string().contains("listing limit"), "{error}");
+        assert!(!stored(&over));
+
+        // Renewing a stored listing is not a new one.
+        advertise(&listed[0], &home).await.unwrap();
+        // A query carries the caller's listing and meets the same limit.
+        let error = relay
+            .send_raw(&from_source(
+                serde_json::json!({ "op": "query", "advertisement": encode_bytes(&over) }),
+                &home,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("listing limit"), "{error}");
+        assert!(!stored(&over));
+
+        // Another Home is unaffected.
+        let other = listing_for(&profile, &new_device(), "Other", now);
+        relay
+            .send_raw(&from_signer(serde_json::json!({
+                "op": "advertise",
+                "advertisement": encode_bytes(&other),
+            })))
+            .await
+            .unwrap();
+        assert!(stored(&other));
+
+        // The Home withdraws a listing. Another Home replays the public bytes
+        // to take the freed slot; the relay refuses it, and the owner's
+        // replacement still fits.
+        let withdrawn = verify_collaboration_discovery_advertisement(&listed[1], &profile, now)
+            .unwrap()
+            .profile_did()
+            .to_string();
+        relay
+            .state
+            .lock()
+            .unwrap()
+            .advertisements
+            .remove(&withdrawn);
+        let attacker = test_relay_source();
+        let error = advertise(&listed[1], &attacker).await.unwrap_err();
+        assert!(error.to_string().contains("signing device"), "{error}");
+        assert!(!stored(&listed[1]));
+        let error = relay
+            .send_raw(&from_source(
+                serde_json::json!({ "op": "query", "advertisement": encode_bytes(&listed[1]) }),
+                &attacker,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("signing device"), "{error}");
+        advertise(&listing_for(&profile, &device, "Replacement", now), &home)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_limits_contact_requests_per_sender_and_per_home() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(profile.clone());
+        let now = current_timestamp();
+        let new_key = || SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let mut recipients = Vec::new();
+        for index in 0..=MAX_DISCOVERY_REQUESTS_PER_SENDER {
+            let listing = listing_for(&profile, &new_key(), &format!("Recipient {index}"), now);
+            relay
+                .send_raw(&from_signer(serde_json::json!({
+                    "op": "advertise",
+                    "advertisement": encode_bytes(&listing),
+                })))
+                .await
+                .unwrap();
+            recipients.push(
+                verify_collaboration_discovery_advertisement(&listing, &profile, now).unwrap(),
+            );
+        }
+        let send = |request: &[u8], source: &str| {
+            let relay = &relay;
+            let request = from_source(
+                serde_json::json!({ "op": "send_contact_request", "request": encode_bytes(request) }),
+                source,
+            );
+            async move { relay.send_raw(&request).await }
+        };
+        let request_count = || relay.state.lock().unwrap().requests.len();
+
+        // One person reaches the per-sender limit.
+        let sender_key = new_key();
+        let sender_home = crate::crypto::encode_signing_key_did(&sender_key);
+        let sender = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&sender_key.to_bytes()),
+            profile.clone(),
+        );
+        let sender_profile = verified_discovery_profile(&sender_key, "Sender", Some("sender"));
+        let mut first_request = None;
+        for recipient in &recipients[..MAX_DISCOVERY_REQUESTS_PER_SENDER] {
+            let request = sender
+                .prepare_contact_request(recipient, &sender_profile, now)
+                .unwrap();
+            send(&request, &sender_home).await.unwrap();
+            first_request.get_or_insert(request);
+        }
+        let over = sender
+            .prepare_contact_request(
+                &recipients[MAX_DISCOVERY_REQUESTS_PER_SENDER],
+                &sender_profile,
+                now,
+            )
+            .unwrap();
+        let error = send(&over, &sender_home).await.unwrap_err();
+        assert!(error.to_string().contains("request limit"), "{error}");
+        assert_eq!(request_count(), MAX_DISCOVERY_REQUESTS_PER_SENDER);
+        // Resending a stored request still succeeds and stores nothing new.
+        send(first_request.as_ref().unwrap(), &sender_home)
+            .await
+            .unwrap();
+        assert_eq!(request_count(), MAX_DISCOVERY_REQUESTS_PER_SENDER);
+
+        // One Home reaches the per-Home limit even with fresh Profiles.
+        let device = new_key();
+        let home = crate::crypto::encode_signing_key_did(&device);
+        let authority = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device.to_bytes()),
+            profile.clone(),
+        );
+        let fresh_request = || {
+            authority
+                .prepare_contact_request(
+                    &recipients[0],
+                    &verified_discovery_profile_with(
+                        &new_key(),
+                        &device,
+                        "Fresh",
+                        None,
+                        1,
+                        None,
+                        1,
+                    ),
+                    now,
+                )
+                .unwrap()
+        };
+        for _ in 0..MAX_DISCOVERY_REQUESTS_PER_DEVICE {
+            send(&fresh_request(), &home).await.unwrap();
+        }
+        let error = send(&fresh_request(), &home).await.unwrap_err();
+        assert!(error.to_string().contains("request limit"), "{error}");
+        assert_eq!(
+            request_count(),
+            MAX_DISCOVERY_REQUESTS_PER_SENDER + MAX_DISCOVERY_REQUESTS_PER_DEVICE
+        );
+
+        // Another Home cannot submit a request it did not sign.
+        let unsent = sender
+            .prepare_contact_request(
+                &recipients[MAX_DISCOVERY_REQUESTS_PER_SENDER],
+                &sender_profile,
+                now,
+            )
+            .unwrap();
+        let error = send(&unsent, &test_relay_source()).await.unwrap_err();
+        assert!(error.to_string().contains("signing device"), "{error}");
+        assert_eq!(
+            request_count(),
+            MAX_DISCOVERY_REQUESTS_PER_SENDER + MAX_DISCOVERY_REQUESTS_PER_DEVICE
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_refuses_listings_and_requests_without_an_authenticated_source() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(profile.clone());
+        let now = current_timestamp();
+        let listing = listing_for(
+            &profile,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            "Local",
+            now,
+        );
+        for op in ["advertise", "query"] {
+            for request in [
+                serde_json::json!({ "op": op, "advertisement": encode_bytes(&listing) }),
+                from_source(
+                    serde_json::json!({ "op": op, "advertisement": encode_bytes(&listing) }),
+                    "not-a-did",
+                ),
+            ] {
+                let error = relay.send_raw(&request).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("Carrier source endpoint"),
+                    "{error}"
+                );
+            }
+        }
+        let error = relay
+            .send_raw(&serde_json::json!({ "op": "send_contact_request", "request": "" }))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Carrier source endpoint"),
+            "{error}"
+        );
+        let state = relay.state.lock().unwrap();
+        assert!(state.advertisements.is_empty());
+        assert!(state.requests.is_empty());
+    }
+
     #[tokio::test]
     async fn relay_decision_mailbox_capacity_replay_and_rejection_are_atomic() {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
@@ -8284,10 +8670,10 @@ pub(crate) mod tests {
             verify_collaboration_discovery_advertisement(&local_advertisement, &profile, now)
                 .unwrap();
         relay
-            .send_raw(&serde_json::json!({
+            .send_raw(&from_signer(serde_json::json!({
                 "op": "advertise",
                 "advertisement": encode_bytes(&local_advertisement),
-            }))
+            })))
             .await
             .unwrap();
 
