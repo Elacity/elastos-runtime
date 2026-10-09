@@ -3667,9 +3667,12 @@ mod tests {
             .conversation_poll(&fixture.data_root, &session.token, 0)
             .unwrap();
         assert_eq!(before_poll.objects.len(), 1);
-        let room_path = fixture
-            .data_root
-            .join("Local/Shared/AppCapsules/chat-room/objects.json");
+        let room_path = elastos_common::localhost::rooted_localhost_fs_path(
+            &fixture.data_root,
+            crate::room_service::room_root_uri(),
+        )
+        .unwrap()
+        .join("room/objects.json");
         let before_room = fs::read(&room_path).unwrap();
         let before_live = fs::read(core.state_path()).unwrap();
         let before_history = fs::read(core.history_path()).unwrap();

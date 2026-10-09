@@ -693,11 +693,12 @@ mod tests {
             .apply_response(too_many, &b.product.local_device_did(), now)
             .is_err());
         assert!(a.product.retained_history(now).unwrap().is_empty());
-        assert!(!a
-            .root
-            .path()
-            .join("Local/Shared/AppCapsules/chat-room/objects.json")
-            .exists());
+        let room_root = elastos_common::localhost::rooted_localhost_fs_path(
+            a.root.path(),
+            crate::room_service::room_root_uri(),
+        )
+        .unwrap();
+        assert!(!room_root.join("room/objects.json").exists());
     }
 
     #[tokio::test]
