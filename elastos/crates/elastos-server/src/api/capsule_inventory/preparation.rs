@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{
@@ -1880,25 +1881,20 @@ fn require_runtime_capacity(
     inventory.require_space(required)
 }
 
-// A bounded model read is not an effect. While it is in flight, cancel ends
+// A bounded model read is not an effect. While reads are in flight, cancel ends
 // the local wait within one poll. The worker then uses the existing backend
 // drain and settle_failure path. A provider subprocess still completes its own
 // bounded answer before that drain takes the bridge.
-async fn fetch_model_part_unless_cancelled(
+async fn unless_cancelled<T>(
     data_dir: &Path,
-    registry: &elastos_runtime::provider::ProviderRegistry,
     id: &str,
-    reads: &mut crate::content::ModelPartReads,
-    cid: &str,
-    path: &str,
-    range: Option<(u64, u64)>,
-) -> anyhow::Result<Vec<u8>> {
-    let fetch = reads.fetch(registry, cid, path, range);
-    tokio::pin!(fetch);
+    read: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(read);
     loop {
         tokio::select! {
             biased;
-            result = &mut fetch => return result,
+            result = &mut read => return result,
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
                 if load_operation(data_dir, id)?.cancel_requested {
                     anyhow::bail!("preparation stopped");
@@ -1906,6 +1902,99 @@ async fn fetch_model_part_unless_cancelled(
             }
         }
     }
+}
+
+/// Each 64 KiB part pays one network round trip, so one preparation keeps this
+/// many part reads in flight across its package.
+const MODEL_PARTS_IN_FLIGHT: usize = 8;
+
+/// Outer result: the part's authority/capacity checks. Inner: its read.
+type PartOutcome = anyhow::Result<anyhow::Result<Vec<u8>>>;
+
+type ModelPartRead<'a> = std::pin::Pin<Box<dyn Future<Output = PartOutcome> + Send + 'a>>;
+
+struct InFlightPart<'a> {
+    length: u64,
+    read: ModelPartRead<'a>,
+    done: Option<PartOutcome>,
+}
+
+/// Checks that run right before each part read is sent, one part at a time in
+/// package order. A refused check refuses every later part, so no read is
+/// sent after authority, policy or capacity is lost.
+struct PartChecks {
+    backend_volume: u64,
+    refused: bool,
+}
+
+/// The serial preparation's checks for one part. `delivered` is the byte count
+/// of every earlier part, so capacity sees the same progress it did when parts
+/// were read one at a time.
+#[allow(clippy::too_many_arguments)]
+async fn check_part(
+    checks: &tokio::sync::Mutex<PartChecks>,
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    id: &str,
+    stop: &AtomicBool,
+    revalidate: &Revalidate,
+    delivered: u64,
+    backend_check: bool,
+) -> anyhow::Result<()> {
+    let mut checks = checks.lock().await;
+    ensure!(!checks.refused, "preparation stopped");
+    let checked = async {
+        let mut record = require_active(data_dir, id, stop, revalidate)?;
+        record.completed_bytes = delivered;
+        if backend_check {
+            let volume = require_capacity(data_dir, registry, &record)
+                .await
+                .context(PreparationFailurePhase::Capacity)?;
+            require_active(data_dir, id, stop, revalidate)?;
+            anyhow::Ok(Some(volume))
+        } else {
+            require_runtime_capacity(data_dir, &record, checks.backend_volume)
+                .context(PreparationFailurePhase::Capacity)?;
+            Ok(None)
+        }
+    }
+    .await;
+    match checked {
+        Ok(volume) => {
+            if let Some(volume) = volume {
+                checks.backend_volume = volume;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            checks.refused = true;
+            Err(error)
+        }
+    }
+}
+
+/// Drive every in-flight read and yield the oldest one once it completes, so
+/// parts are written and hashed in package order. Later parts that finish
+/// first wait in the window, which never holds more than `MODEL_PARTS_IN_FLIGHT`.
+async fn next_part_in_order(
+    window: &mut VecDeque<InFlightPart<'_>>,
+) -> anyhow::Result<(u64, PartOutcome)> {
+    ensure!(!window.is_empty(), "no model part in flight");
+    std::future::poll_fn(|cx| {
+        for part in window.iter_mut().filter(|part| part.done.is_none()) {
+            if let std::task::Poll::Ready(result) = part.read.as_mut().poll(cx) {
+                part.done = Some(result);
+            }
+        }
+        if window.front().is_some_and(|part| part.done.is_some()) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    let part = window.pop_front().context("no model part in flight")?;
+    Ok((part.length, part.done.context("model part incomplete")?))
 }
 
 async fn prepare(
@@ -1943,20 +2032,16 @@ async fn prepare(
     if record.index_bytes > 0 || record.completed_bytes > 0 {
         anyhow::bail!("interrupted partial preparation requires settled cleanup");
     }
-    let mut backend_volume = require_capacity(data_dir, registry, &record)
+    let backend_volume = require_capacity(data_dir, registry, &record)
         .await
         .context(PreparationFailurePhase::Capacity)?;
     require_active(data_dir, id, stop, revalidate)?;
     // One route per package: after a local miss, later parts skip the local backend.
-    let mut reads = crate::content::ModelPartReads::default();
-    let index = fetch_model_part_unless_cancelled(
+    let reads = crate::content::ModelPartReads::default();
+    let index = unless_cancelled(
         data_dir,
-        registry,
         id,
-        &mut reads,
-        &entry.cid,
-        "_elastos_object.json",
-        None,
+        reads.fetch(registry, &entry.cid, "_elastos_object.json", None),
     )
     .await
     .context(PreparationFailurePhase::MetadataRead)?;
@@ -1984,44 +2069,73 @@ async fn prepare(
     // Backend identity/pressure is observed per byte window. Runtime space and
     // authority remain per read; the outstanding charge is not an OS reservation.
     let mut window_bytes = index.len() as u64;
+    // Parts of every file in package order; the in-flight window runs across
+    // file boundaries so small files do not each pay a lone round trip.
+    let mut parts = closure.files.iter().flat_map(|file| {
+        (0..file.size)
+            .step_by(65536)
+            .map(move |offset| (file, offset, (file.size - offset).min(65536)))
+    });
+    let checks = tokio::sync::Mutex::new(PartChecks {
+        backend_volume,
+        refused: false,
+    });
+    let mut requested = 0u64;
+    let mut in_flight = VecDeque::with_capacity(MODEL_PARTS_IN_FLIGHT);
     for expected in &closure.files {
         let weights = expected.path == entry.manifest.entrypoint;
-        let write_phase = if weights {
-            PreparationFailurePhase::WeightsWrite
+        let (read_phase, write_phase) = if weights {
+            (
+                PreparationFailurePhase::WeightsRead,
+                PreparationFailurePhase::WeightsWrite,
+            )
         } else {
-            PreparationFailurePhase::MetadataWrite
+            (
+                PreparationFailurePhase::MetadataRead,
+                PreparationFailurePhase::MetadataWrite,
+            )
         };
         let mut file = stage.create_file(&expected.path).context(write_phase)?;
         let mut digest = Sha256::new();
         let mut offset = 0u64;
         while offset < expected.size {
-            let record = require_active(data_dir, id, stop, revalidate)?;
-            let length = (expected.size - offset).min(65536);
-            if window_bytes + length > CAPACITY_WINDOW_BYTES {
-                backend_volume = require_capacity(data_dir, registry, &record)
-                    .await
-                    .context(PreparationFailurePhase::Capacity)?;
-                window_bytes = 0;
-            } else {
-                require_runtime_capacity(data_dir, &record, backend_volume)
-                    .context(PreparationFailurePhase::Capacity)?;
+            while in_flight.len() < MODEL_PARTS_IN_FLIGHT {
+                let Some((part_file, part_offset, length)) = parts.next() else {
+                    break;
+                };
+                let backend_check = window_bytes + length > CAPACITY_WINDOW_BYTES;
+                if backend_check {
+                    window_bytes = 0;
+                }
+                window_bytes += length;
+                let (checks, reads, cid, delivered) = (&checks, &reads, &entry.cid, requested);
+                in_flight.push_back(InFlightPart {
+                    length,
+                    read: Box::pin(async move {
+                        check_part(
+                            checks,
+                            data_dir,
+                            registry,
+                            id,
+                            stop,
+                            revalidate,
+                            delivered,
+                            backend_check,
+                        )
+                        .await?;
+                        Ok(reads
+                            .fetch(registry, cid, &part_file.path, Some((part_offset, length)))
+                            .await)
+                    }),
+                    done: None,
+                });
+                requested += length;
             }
-            require_active(data_dir, id, stop, revalidate)?;
-            let bytes = fetch_model_part_unless_cancelled(
-                data_dir,
-                registry,
-                id,
-                &mut reads,
-                &entry.cid,
-                &expected.path,
-                Some((offset, length)),
-            )
-            .await
-            .context(if weights {
-                PreparationFailurePhase::WeightsRead
-            } else {
-                PreparationFailurePhase::MetadataRead
-            })?;
+            let (length, checked) =
+                unless_cancelled(data_dir, id, next_part_in_order(&mut in_flight))
+                    .await
+                    .context(read_phase)?;
+            let bytes = checked?.context(read_phase)?;
             require_active(data_dir, id, stop, revalidate)?;
             if weights && offset == 0 {
                 ensure!(
@@ -2039,7 +2153,6 @@ async fn prepare(
             digest.update(&bytes);
             offset += length;
             update_operation(data_dir, id, |record| record.completed_bytes += length)?;
-            window_bytes += length;
         }
         file.sync_all().context(if weights {
             PreparationFailurePhase::WeightsSync
@@ -9736,6 +9849,290 @@ server.serve_forever()
         carrier_fixture::shutdown_test_carrier_node(consumer).await;
     }
 
+    /// A consumer whose own cache is empty and one holder that answers every
+    /// bounded read after `delay`, so each part costs one simulated round trip.
+    struct SlowHolderPreparation {
+        root: tempfile::TempDir,
+        registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+        cid: String,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        served: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        consumer: crate::carrier::CarrierNode,
+        holder: crate::carrier::tests::HolderRuntime,
+    }
+
+    impl SlowHolderPreparation {
+        async fn start(
+            seed: u8,
+            delay: std::time::Duration,
+            serialized: bool,
+            serve: impl FnOnce(&mut std::collections::BTreeMap<String, Vec<u8>>),
+        ) -> Self {
+            use crate::carrier::tests as carrier_fixture;
+            let root = tempfile::tempdir().unwrap();
+            // 44 weight parts of 64 KiB (the last one short) and four one-part
+            // files: 48 parts, six full windows.
+            let mut weights = b"GGUF\x03\0\0\0".to_vec();
+            weights.extend(
+                (0..43 * 65536 + 100u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8),
+            );
+            let (payload, files) = package_fixture(weights);
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+            let backend = Arc::new(PreparationBackend::new(files.clone(), cid.clone()));
+            backend.missing_cache.store(true, Ordering::Release);
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", backend)
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+            let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[seed; 32]);
+            let consumer = crate::carrier::start_isolated_carrier_node_with_registry(
+                &consumer_sk,
+                &consumer_did,
+                root.path().join("carrier"),
+                Some(Arc::downgrade(&registry)),
+            )
+            .await
+            .unwrap();
+            registry
+                .set_carrier_invoker(Arc::new(
+                    crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                        consumer.endpoint.clone(),
+                        Arc::downgrade(&registry),
+                    ),
+                ))
+                .await;
+            registry
+                .register(Arc::new(
+                    crate::carrier::CarrierAvailabilityProvider::with_provider_registry(
+                        consumer.gossip_state.clone(),
+                        Arc::downgrade(&registry),
+                    ),
+                ))
+                .await;
+            let mut served_files = files.clone();
+            serve(&mut served_files);
+            let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let holder_seed = seed + 1;
+            let holder = carrier_fixture::start_slow_content_holder_runtime(
+                holder_seed,
+                served_files,
+                served.clone(),
+                delay,
+                serialized,
+            )
+            .await;
+            consumer
+                .memory_lookup
+                .add_endpoint_info(holder.addr.clone());
+            carrier_fixture::seed_content_availability_announcements(
+                &consumer,
+                &cid,
+                &[(
+                    holder.ticket.clone(),
+                    [holder_seed; 32],
+                    holder.did.clone(),
+                    now().unwrap(),
+                )],
+            )
+            .await;
+            Self {
+                root,
+                registry,
+                cid,
+                files,
+                served,
+                consumer,
+                holder,
+            }
+        }
+
+        fn invoke(
+            &self,
+            owner: &PreparationOwner,
+            method_name: &str,
+            key: &str,
+            input: serde_json::Value,
+        ) -> serde_json::Value {
+            owner
+                .invoke(
+                    self.root.path(),
+                    Some(self.registry.clone()),
+                    caller(&context(), &method(method_name)),
+                    key,
+                    &input,
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap()
+        }
+
+        /// Run one preparation to settlement; returns its record and wall time.
+        async fn prepare(&self, key: &str) -> (PreparationRecord, std::time::Duration) {
+            let owner = PreparationOwner::default();
+            let started = std::time::Instant::now();
+            let reply = self.invoke(&owner, "use", key, serde_json::json!({"cid": self.cid}));
+            let task = owner.worker.lock().unwrap().take().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(120), task)
+                .await
+                .expect("preparation settles")
+                .unwrap();
+            let elapsed = started.elapsed();
+            let id = reply["operation_id"].as_str().unwrap();
+            (load_operation(self.root.path(), id).unwrap(), elapsed)
+        }
+
+        fn part_reads(&self) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.get("max_bytes").is_none())
+                .count()
+        }
+
+        async fn shutdown(self) {
+            use crate::carrier::tests as carrier_fixture;
+            carrier_fixture::shutdown_test_carrier_node(self.holder.node).await;
+            carrier_fixture::shutdown_test_carrier_node(self.consumer).await;
+        }
+    }
+
+    /// Admit the package from a holder answering each read after ~one
+    /// public-seed round trip (~0.24 s measured on Linux); returns the
+    /// transfer speedup over reading one part at a time.
+    async fn slow_holder_transfer_speedup(seed: u8, serialized: bool) -> f64 {
+        let delay = std::time::Duration::from_millis(250);
+        let fixture = SlowHolderPreparation::start(seed, delay, serialized, |_| {}).await;
+        let (record, elapsed) = fixture.prepare("slow-holder").await;
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        assert_eq!(record.completed_bytes, record.total_bytes);
+        // Admitted bytes are exactly the signed package, every part read once.
+        let expected_parts: usize = fixture
+            .files
+            .iter()
+            .filter(|(path, _)| path.as_str() != crate::content::CONTENT_OBJECT_MANIFEST_PATH)
+            .map(|(_, bytes)| bytes.len().div_ceil(65536))
+            .sum();
+        assert_eq!(fixture.part_reads(), expected_parts);
+        for (path, bytes) in &fixture.files {
+            let admitted = fixture.root.path().join(format!(
+                "model-preparation/admitted-{}/{path}",
+                record.admission_id
+            ));
+            assert_eq!(&std::fs::read(&admitted).unwrap(), bytes, "{path}");
+        }
+        // One part at a time pays the holder delay once per part. The transfer
+        // span runs from the first part served to the last part answered.
+        let served: Vec<u64> = fixture
+            .served
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.get("max_bytes").is_none())
+            .map(|request| request["_fixture_served_at_ms"].as_u64().unwrap())
+            .collect();
+        let span = std::time::Duration::from_millis(
+            served.iter().max().unwrap() - served.iter().min().unwrap(),
+        ) + delay;
+        let serial = delay * expected_parts as u32;
+        let speedup = serial.as_secs_f64() / span.as_secs_f64();
+        eprintln!(
+            "preparation (serialized holder: {serialized}): {expected_parts} parts at {delay:?} each; serial transfer floor {serial:?}, measured transfer {span:?} ({speedup:.1}x), whole preparation {elapsed:?}"
+        );
+        fixture.shutdown().await;
+        speedup
+    }
+
+    #[tokio::test]
+    async fn model_preparation_keeps_parts_in_flight_against_a_slow_holder() {
+        let speedup = slow_holder_transfer_speedup(95, false).await;
+        // ~6.4x alone; the full suite's CPU load slows the per-part checks.
+        assert!(
+            speedup > 3.0,
+            "{MODEL_PARTS_IN_FLIGHT} parts in flight cut transfer time: {speedup:.1}x"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_preparation_parts_in_flight_cost_nothing_against_a_serializing_holder() {
+        let speedup = slow_holder_transfer_speedup(101, true).await;
+        assert!(
+            speedup > 0.8,
+            "a holder that answers one read at a time is not slowed: {speedup:.1}x"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_preparation_rejects_a_corrupted_part_read_in_parallel() {
+        let fixture = SlowHolderPreparation::start(
+            97,
+            std::time::Duration::from_millis(20),
+            false,
+            |files| files.get_mut("weights.gguf").unwrap()[5 * 65536 + 17] ^= 0xff,
+        )
+        .await;
+        let (record, _) = fixture.prepare("corrupt-part").await;
+        assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+        assert_eq!(
+            record.failure_phase,
+            Some(PreparationFailurePhase::WeightsIntegrity)
+        );
+        assert_eq!(record.reserved_bytes, 0);
+        assert!(!fixture
+            .root
+            .path()
+            .join(format!(
+                "model-preparation/admitted-{}",
+                record.admission_id
+            ))
+            .exists());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_with_parts_in_flight_admits_nothing() {
+        let fixture =
+            SlowHolderPreparation::start(99, std::time::Duration::from_millis(100), false, |_| {})
+                .await;
+        let owner = PreparationOwner::default();
+        let reply = fixture.invoke(
+            &owner,
+            "use",
+            "cancel-mid",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        for _ in 0..200 {
+            if fixture.part_reads() >= 12 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(fixture.part_reads() >= 12, "download is under way");
+        let cancelled = fixture.invoke(
+            &owner,
+            "cancel",
+            "cancel-mid-request",
+            serde_json::json!({"operation_id": id}),
+        );
+        assert_eq!(cancelled["cancel_requested"], true);
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("cancellation settles")
+            .unwrap();
+        let record = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(record.state, PreparationState::Cancelled, "{record:?}");
+        assert!(record.completed_bytes < record.total_bytes);
+        assert_eq!(record.reserved_bytes, 0);
+        let prepared = fixture.root.path().join("model-preparation");
+        assert!(!prepared.join("stage").exists());
+        assert!(!prepared.join(format!("admitted-{id}")).exists());
+        fixture.shutdown().await;
+    }
+
     #[test]
     fn model_use_atomically_retains_and_replay_preserves_explicit_release() {
         let (root, cid) = fixture();
@@ -11039,11 +11436,13 @@ server.serve_forever()
                 .is_err(),
                 "{fault}"
             );
+            // Parts already sent when the fault lands may finish; every later
+            // part fails its check before it is sent, so at most one window is read.
             let reads = backend.read_sizes.lock().unwrap();
-            assert_eq!(
-                reads.iter().filter(|&&length| length == 65536).count(),
-                1,
-                "{fault}"
+            let parts = reads.iter().filter(|&&length| length == 65536).count();
+            assert!(
+                (1..=MODEL_PARTS_IN_FLIGHT).contains(&parts),
+                "{fault}: {parts}"
             );
             assert_eq!(
                 backend.capacity_requests.lock().unwrap().len(),

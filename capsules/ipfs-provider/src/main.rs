@@ -20,8 +20,15 @@ mod directory_hash;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const KUBO_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// Tests shorten the idle stop so it can be observed.
+#[cfg(not(test))]
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+#[cfg(test)]
+const IDLE_TIMEOUT_SECS: u64 = 2;
+#[cfg(not(test))]
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -555,7 +562,11 @@ impl IpfsProvider {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     match directory_hash::check_capacity(self, required_bytes) {
-                        Ok(observation) => Response::ok(serde_json::json!(observation)),
+                        Ok(observation) => {
+                            // A model download reaches Kubo only through these checks.
+                            update_coord_last_used(&self.data_dir);
+                            Response::ok(serde_json::json!(observation))
+                        }
                         Err(error) => {
                             eprintln!(
                                 "ipfs-provider: private capacity observation failed: {error}"
@@ -576,7 +587,10 @@ impl IpfsProvider {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     match directory_hash::hash_directory(self, &directory) {
-                        Ok(cid) => Response::ok(serde_json::json!({"cid":cid})),
+                        Ok(cid) => {
+                            update_coord_last_used(&self.data_dir);
+                            Response::ok(serde_json::json!({"cid":cid}))
+                        }
                         Err(error) => {
                             eprintln!("ipfs-provider: private directory hash failed: {error}");
                             private_preparation_error()
@@ -3453,9 +3467,10 @@ mod tests {
             HostRole::from_init(&serde_json::json!({"extra":{"runtime_host_role":"gateway"}})),
             Ok(HostRole::Gateway)
         );
-        assert!(!HostRole::User.idle_stop_due(100, 700));
-        assert!(HostRole::User.idle_stop_due(100, 701));
-        assert!(!HostRole::User.idle_stop_due(700, 100));
+        let limit = IDLE_TIMEOUT_SECS;
+        assert!(!HostRole::User.idle_stop_due(100, 100 + limit));
+        assert!(HostRole::User.idle_stop_due(100, 101 + limit));
+        assert!(!HostRole::User.idle_stop_due(100 + limit, 100));
         assert!(!HostRole::Gateway.idle_stop_due(0, u64::MAX));
         for role in [
             serde_json::Value::Null,

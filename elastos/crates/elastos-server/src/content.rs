@@ -2685,18 +2685,19 @@ const MODEL_PREPARATION_SOURCE: &str = "runtime-model-preparation";
 /// One preparation's read route for its package parts. Parts come from the
 /// local backend until it misses once; every later part of that package goes
 /// straight to Carrier holders, so a package this Home lacks pays one local
-/// miss instead of one per 64 KiB part. Preparation still checks each file's
-/// SHA-256 and the package CID, whichever route served the bytes.
+/// miss instead of one per 64 KiB part. Reads take `&self` so preparation can
+/// keep several parts in flight. Preparation still checks each file's SHA-256
+/// and the package CID, whichever route served the bytes.
 #[derive(Debug, Default)]
 pub(crate) struct ModelPartReads {
-    holders_only: bool,
+    holders_only: std::sync::atomic::AtomicBool,
 }
 
 impl ModelPartReads {
     /// Complete one bounded model read. Preparation owns aggregate accounting,
     /// ordering, integrity and settlement.
     pub(crate) async fn fetch(
-        &mut self,
+        &self,
         registry: &ProviderRegistry,
         cid: &str,
         path: &str,
@@ -2726,10 +2727,12 @@ impl ModelPartReads {
             (65536, None)
         };
         let index_read = range.is_none();
-        if !self.holders_only {
+        if !self.holders_only.load(std::sync::atomic::Ordering::Acquire) {
             match read_local_model_part(registry, request).await {
                 Ok(bytes) => return checked_model_part(bytes, limit, range.is_some(), index_read),
-                Err(_) => self.holders_only = true,
+                Err(_) => self
+                    .holders_only
+                    .store(true, std::sync::atomic::Ordering::Release),
             }
         }
         let transfer = ContentFetchTransfer {
