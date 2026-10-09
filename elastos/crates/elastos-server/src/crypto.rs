@@ -10,7 +10,10 @@ use std::sync::{Mutex, OnceLock};
 // of truth for collaboration Profile identities.
 pub use elastos_identity::{decode_did_key, encode_did_key, encode_signing_key_did};
 
-const VERIFIED_SIGNATURE_CACHE_CAPACITY: usize = 64;
+// A retained 200-message history plus its receipts and current authority
+// evidence can exceed 64 immutable mathematical inputs. This positive-only
+// bound uses about 64 KiB for public key/signature/digest tuples.
+const VERIFIED_SIGNATURE_CACHE_CAPACITY: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VerifiedSignatureMath {
@@ -37,6 +40,25 @@ fn verify_signature_digest_with_cache(
     digest: &[u8; 32],
     signature: &ed25519_dalek::Signature,
 ) -> Result<(), ed25519_dalek::SignatureError> {
+    verify_signature_digest_with_cache_capacity(
+        cache,
+        key,
+        digest,
+        signature,
+        VERIFIED_SIGNATURE_CACHE_CAPACITY,
+    )
+    .map(|_| ())
+}
+
+// Returns whether exact successful mathematics was reused. The private
+// capacity argument lets isolated tests retain a small eviction working set.
+fn verify_signature_digest_with_cache_capacity(
+    cache: &Mutex<VecDeque<VerifiedSignatureMath>>,
+    key: &ed25519_dalek::VerifyingKey,
+    digest: &[u8; 32],
+    signature: &ed25519_dalek::Signature,
+    capacity: usize,
+) -> Result<bool, ed25519_dalek::SignatureError> {
     // Only successful deterministic signature mathematics is reused. Callers
     // still parse each input and check current trust, grants, expiry, Profile
     // authority, contacts and revocations. No message or authority is retained.
@@ -47,20 +69,20 @@ fn verify_signature_digest_with_cache(
     };
     if let Ok(entries) = cache.lock() {
         if entries.contains(&verified) {
-            return Ok(());
+            return Ok(true);
         }
     }
     // Verification runs outside the lock; poisoning only repeats this check.
     key.verify(digest, signature)?;
     if let Ok(mut entries) = cache.lock() {
         if !entries.contains(&verified) {
-            if entries.len() == VERIFIED_SIGNATURE_CACHE_CAPACITY {
+            if entries.len() == capacity {
                 entries.pop_front();
             }
             entries.push_back(verified);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Sign arbitrary payload bytes with a domain separator.
@@ -341,23 +363,38 @@ mod tests {
     }
 
     #[test]
-    fn signature_math_cache_keeps_only_64_positive_exact_inputs_in_fifo_order() {
+    fn signature_math_cache_keeps_only_positive_exact_inputs_in_fifo_order() {
         use sha2::Digest;
+        const TEST_CAPACITY: usize = 4;
         let cache = Mutex::new(VecDeque::new());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[45; 32]);
         let key = decode_did_key(&encode_signing_key_did(&signing_key)).unwrap();
         let mut originals = Vec::new();
-        for index in 0..=VERIFIED_SIGNATURE_CACHE_CAPACITY {
+        for index in 0..=TEST_CAPACITY {
             let digest: [u8; 32] = sha2::Sha256::digest(index.to_le_bytes()).into();
             let signature = signing_key.sign(&digest);
-            verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
-            verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
+            verify_signature_digest_with_cache_capacity(
+                &cache,
+                &key,
+                &digest,
+                &signature,
+                TEST_CAPACITY,
+            )
+            .unwrap();
+            verify_signature_digest_with_cache_capacity(
+                &cache,
+                &key,
+                &digest,
+                &signature,
+                TEST_CAPACITY,
+            )
+            .unwrap();
             originals.push(VerifiedSignatureMath {
                 public_key: key.to_bytes(),
                 signature: signature.to_bytes(),
                 digest,
             });
-            assert_eq!(cache.lock().unwrap().len(), (index + 1).min(64));
+            assert_eq!(cache.lock().unwrap().len(), (index + 1).min(TEST_CAPACITY));
         }
         assert_eq!(
             cache.lock().unwrap().iter().copied().collect::<Vec<_>>(),
@@ -367,13 +404,25 @@ mod tests {
         let signature = ed25519_dalek::Signature::from_bytes(&first.signature);
         let mut changed_digest = first.digest;
         changed_digest[0] ^= 1;
-        assert!(
-            verify_signature_digest_with_cache(&cache, &key, &changed_digest, &signature).is_err()
-        );
-        assert_eq!(cache.lock().unwrap().len(), 64);
-        verify_signature_digest_with_cache(&cache, &key, &first.digest, &signature).unwrap();
+        assert!(verify_signature_digest_with_cache_capacity(
+            &cache,
+            &key,
+            &changed_digest,
+            &signature,
+            TEST_CAPACITY
+        )
+        .is_err());
+        assert_eq!(cache.lock().unwrap().len(), TEST_CAPACITY);
+        verify_signature_digest_with_cache_capacity(
+            &cache,
+            &key,
+            &first.digest,
+            &signature,
+            TEST_CAPACITY,
+        )
+        .unwrap();
         let entries = cache.lock().unwrap();
-        assert_eq!(entries.len(), 64);
+        assert_eq!(entries.len(), TEST_CAPACITY);
         assert_eq!(entries.back(), Some(&first));
         assert!(!entries.contains(&originals[1]));
     }
@@ -381,6 +430,7 @@ mod tests {
     #[test]
     fn concurrent_signature_cache_eviction_preserves_exact_positive_verification() {
         use sha2::Digest;
+        const TEST_CAPACITY: usize = 64;
         let cache = std::sync::Arc::new(Mutex::new(VecDeque::new()));
         std::thread::scope(|scope| {
             for worker in 0u8..8 {
@@ -392,16 +442,23 @@ mod tests {
                         let digest: [u8; 32] = sha2::Sha256::digest([worker, index]).into();
                         let signature = signing_key.sign(&digest);
                         for _ in 0..2 {
-                            verify_signature_digest_with_cache(&cache, &key, &digest, &signature)
-                                .unwrap();
+                            verify_signature_digest_with_cache_capacity(
+                                &cache,
+                                &key,
+                                &digest,
+                                &signature,
+                                TEST_CAPACITY,
+                            )
+                            .unwrap();
                         }
                         let mut changed_digest = digest;
                         changed_digest[0] ^= 1;
-                        assert!(verify_signature_digest_with_cache(
+                        assert!(verify_signature_digest_with_cache_capacity(
                             &cache,
                             &key,
                             &changed_digest,
                             &signature,
+                            TEST_CAPACITY,
                         )
                         .is_err());
                     }
@@ -409,7 +466,7 @@ mod tests {
             }
         });
         let entries = cache.lock().unwrap();
-        assert_eq!(entries.len(), VERIFIED_SIGNATURE_CACHE_CAPACITY);
+        assert_eq!(entries.len(), TEST_CAPACITY);
         for entry in entries.iter() {
             let key = ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key).unwrap();
             key.verify(
@@ -417,6 +474,110 @@ mod tests {
                 &ed25519_dalek::Signature::from_bytes(&entry.signature),
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_retained_receipt_sweeps_reuse_math_with_authority_headroom() {
+        use elastos_common::collaboration_protocol::{
+            canonical_collaboration_acceptance_receipt_bytes,
+            canonical_signed_collaboration_acceptance_receipt_bytes,
+            CollaborationAcceptanceReceipt, SignedCollaborationAcceptanceReceipt,
+            COLLABORATION_ACCEPTANCE_RECEIPT_SCHEMA_V1,
+            COLLABORATION_ACCEPTANCE_RECEIPT_SIGNATURE_DOMAIN_V1,
+        };
+        use sha2::Digest;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[57; 32]);
+        let did = encode_signing_key_did(&signer);
+        let key = decode_did_key(&did).unwrap();
+        let mut inputs = Vec::new();
+        // These are protocol-validated canonical tombstone receipts, with the
+        // same 106 distinct immutable inputs measured in the retained fixture.
+        for index in 0u64..106 {
+            let payload = CollaborationAcceptanceReceipt {
+                schema: COLLABORATION_ACCEPTANCE_RECEIPT_SCHEMA_V1.to_string(),
+                network_id: "cached-signature-test".to_string(),
+                message_envelope_sha256: format!("sha256:{:064x}", index + 1),
+                conversation_id: "default".to_string(),
+                sender_profile_did: did.clone(),
+                message_id: format!("{:032x}", index + 1),
+                message_nonce: format!("{:032x}", index + 107),
+                recipient_endpoint_did: did.clone(),
+                accepted_at: 1_800_000_000 + index,
+            };
+            let canonical = canonical_collaboration_acceptance_receipt_bytes(&payload).unwrap();
+            let (signature_hex, signer_did) = domain_separated_sign(
+                &signer,
+                COLLABORATION_ACCEPTANCE_RECEIPT_SIGNATURE_DOMAIN_V1,
+                &canonical,
+            );
+            let envelope = SignedCollaborationAcceptanceReceipt {
+                payload,
+                signature: signature_hex.clone(),
+                signer_did,
+            };
+            let bytes = canonical_signed_collaboration_acceptance_receipt_bytes(&envelope).unwrap();
+            crate::collaboration_protocol::verify_stored_acceptance_receipt_envelope(&bytes)
+                .unwrap();
+            let mut hash = sha2::Sha256::new();
+            hash.update(COLLABORATION_ACCEPTANCE_RECEIPT_SIGNATURE_DOMAIN_V1.as_bytes());
+            hash.update(b"\0");
+            hash.update(&canonical);
+            let digest: [u8; 32] = hash.finalize().into();
+            let signature = ed25519_dalek::Signature::from_bytes(
+                &hex::decode(signature_hex).unwrap().try_into().unwrap(),
+            );
+            inputs.push((digest, signature));
+        }
+        // Ordinary signed authority domains consume the same math cache;
+        // their callers retain all current trust/expiry/revocation checks.
+        for domain in ["test.profile.authority.v1", "test.launch.authority.v1"] {
+            let payload = b"immutable canonical authority evidence";
+            let (signature_hex, _) = domain_separated_sign(&signer, domain, payload);
+            let mut hash = sha2::Sha256::new();
+            hash.update(domain.as_bytes());
+            hash.update(b"\0");
+            hash.update(payload);
+            let digest: [u8; 32] = hash.finalize().into();
+            let signature = ed25519_dalek::Signature::from_bytes(
+                &hex::decode(signature_hex).unwrap().try_into().unwrap(),
+            );
+            inputs.push((digest, signature));
+        }
+        assert!(
+            VERIFIED_SIGNATURE_CACHE_CAPACITY * std::mem::size_of::<VerifiedSignatureMath>()
+                < 100 * 1024
+        );
+        for capacity in [64, VERIFIED_SIGNATURE_CACHE_CAPACITY] {
+            let cache = Mutex::new(VecDeque::new());
+            for (digest, signature) in &inputs {
+                assert!(!verify_signature_digest_with_cache_capacity(
+                    &cache, &key, digest, signature, capacity
+                )
+                .unwrap());
+            }
+            let hits = inputs
+                .iter()
+                .filter(|(digest, signature)| {
+                    verify_signature_digest_with_cache_capacity(
+                        &cache, &key, digest, signature, capacity,
+                    )
+                    .unwrap()
+                })
+                .count();
+            assert_eq!(hits, if capacity == 64 { 0 } else { inputs.len() });
+            let before = cache.lock().unwrap().len();
+            let mut changed = inputs[0].0;
+            changed[0] ^= 1;
+            assert!(verify_signature_digest_with_cache_capacity(
+                &cache,
+                &key,
+                &changed,
+                &inputs[0].1,
+                capacity
+            )
+            .is_err());
+            assert_eq!(cache.lock().unwrap().len(), before);
         }
     }
 
