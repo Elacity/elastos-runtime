@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::room_service::RoomSummary;
 
@@ -20,6 +21,8 @@ const CONTACT_REQUEST_KIND: &str = "contact_request";
 const CONTACT_REQUEST_ID_PREFIX: &str = "contact-request:";
 const DIRECT_MESSAGE_KIND: &str = "direct_message";
 const DIRECT_MESSAGE_ID_PREFIX: &str = "direct-message:";
+const COMMUNITY_MESSAGE_KIND: &str = "community_message";
+const COMMUNITY_MESSAGE_ID_PREFIX: &str = "community-message:";
 const NOTIFICATION_EVENTS_SCHEMA: &str = "elastos.notification-events/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,6 +103,10 @@ struct NotificationEntryRecord {
     /// changed by, its owner only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_profile_did: Option<String>,
+    /// The newest scoped Community projection this account has observed.
+    /// Older readers accept this optional field and keep the existing flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_seq: Option<u64>,
 }
 
 impl NotificationEntryRecord {
@@ -109,7 +116,10 @@ impl NotificationEntryRecord {
     fn visible_to(&self, viewer: Option<&str>) -> bool {
         match self.owner_profile_did.as_deref() {
             Some(owner) => viewer == Some(owner),
-            None => self.kind != DIRECT_MESSAGE_KIND,
+            None => !matches!(
+                self.kind.as_str(),
+                DIRECT_MESSAGE_KIND | COMMUNITY_MESSAGE_KIND
+            ),
         }
     }
 
@@ -236,6 +246,7 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
             acted: false,
             dismissed: false,
             owner_profile_did: None,
+            message_seq: None,
         });
         if !existing_ids.contains(&id) {
             record_event(
@@ -419,6 +430,7 @@ pub fn upsert_direct_message_notification(
         acted: false,
         dismissed: false,
         owner_profile_did: owner.clone(),
+        message_seq: None,
     });
     record_event(
         data_dir,
@@ -472,6 +484,95 @@ fn direct_message_notification_id(conversation_id: &str) -> String {
     format!("{DIRECT_MESSAGE_ID_PREFIX}{conversation_id}")
 }
 
+fn community_message_notification_id(scope: (&str, &str)) -> String {
+    let mut digest = Sha256::new();
+    for field in [
+        b"elastos.notifications.community.v1".as_slice(),
+        scope.0.as_bytes(),
+        scope.1.as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    format!(
+        "{COMMUNITY_MESSAGE_ID_PREFIX}{}",
+        hex::encode(digest.finalize())
+    )
+}
+
+/// Sync a verified scoped projection and optionally acknowledge only returned
+/// remote rows. One account's read cannot acknowledge another account or a
+/// message projected after its read snapshot.
+pub(crate) fn sync_community_message_notification(
+    data_dir: &Path,
+    owner_profile_did: &str,
+    scope: (&str, &str),
+    latest_remote_seq: u64,
+    read_through: Option<u64>,
+    now: u64,
+) -> anyhow::Result<bool> {
+    let _lock = lock_store(data_dir)?;
+    let path = notifications_path(data_dir)?;
+    let mut store = read_json_or_default::<NotificationStore>(&path)?;
+    let id = community_message_notification_id(scope);
+    let owner = Some(owner_profile_did.to_string());
+    let index = store
+        .entries
+        .iter()
+        .position(|entry| entry.id == id && entry.owner_profile_did == owner);
+    let index = match index {
+        Some(index) => index,
+        None if latest_remote_seq == 0 => return Ok(false),
+        None => {
+            store.entries.push(NotificationEntryRecord {
+                id,
+                source_app: "chat-room".to_string(),
+                kind: COMMUNITY_MESSAGE_KIND.to_string(),
+                title: "New Community messages".to_string(),
+                body: "New messages are available in Community.".to_string(),
+                action_ref: Some(NotificationActionRef {
+                    app: "chat-room".to_string(),
+                    action_id: "chat-open-community".to_string(),
+                }),
+                created_at: now,
+                expires_at: None,
+                severity: NotificationSeverity::Attention,
+                read: false,
+                acted: false,
+                dismissed: false,
+                owner_profile_did: owner,
+                message_seq: None,
+            });
+            store.entries.len() - 1
+        }
+    };
+    let entry = &mut store.entries[index];
+    let mut changed = false;
+    if latest_remote_seq > entry.message_seq.unwrap_or(0) {
+        entry.message_seq = Some(latest_remote_seq);
+        entry.created_at = now;
+        entry.read = false;
+        entry.acted = false;
+        entry.dismissed = false;
+        changed = true;
+    }
+    if read_through
+        .is_some_and(|through| entry.message_seq.is_some_and(|seq| seq <= through) && !entry.acted)
+    {
+        entry.read = true;
+        entry.acted = true;
+        changed = true;
+    }
+    let unread = !entry.acted;
+    if changed {
+        if store.schema.trim().is_empty() {
+            store.schema = NOTIFICATIONS_SCHEMA.to_string();
+        }
+        write_json_atomic(&path, &store)?;
+    }
+    Ok(unread)
+}
+
 /// The Home-wide entries. Entries owned by one account, such as direct
 /// messages, are added per reader by [`project_direct_message_notifications`].
 pub fn load_summary(data_dir: &Path) -> anyhow::Result<NotificationSummary> {
@@ -486,13 +587,33 @@ pub fn project_direct_message_notifications(
     data_dir: &Path,
     owner_profile_did: &str,
 ) -> anyhow::Result<()> {
-    summary
-        .entries
-        .retain(|entry| entry.kind != DIRECT_MESSAGE_KIND);
+    project_owned_message_notifications(summary, data_dir, owner_profile_did, DIRECT_MESSAGE_KIND)
+}
+
+pub(crate) fn project_community_message_notifications(
+    summary: &mut NotificationSummary,
+    data_dir: &Path,
+    owner_profile_did: &str,
+) -> anyhow::Result<()> {
+    project_owned_message_notifications(
+        summary,
+        data_dir,
+        owner_profile_did,
+        COMMUNITY_MESSAGE_KIND,
+    )
+}
+
+fn project_owned_message_notifications(
+    summary: &mut NotificationSummary,
+    data_dir: &Path,
+    owner_profile_did: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
+    summary.entries.retain(|entry| entry.kind != kind);
     summary.entries.extend(
         live_entries(data_dir, Some(owner_profile_did))?
             .into_iter()
-            .filter(|entry| entry.kind == DIRECT_MESSAGE_KIND),
+            .filter(|entry| entry.kind == kind),
     );
     *summary = summary_from(std::mem::take(&mut summary.entries));
     Ok(())
@@ -578,6 +699,7 @@ pub fn upsert_external_http_request(
         acted: false,
         dismissed: false,
         owner_profile_did: None,
+        message_seq: None,
     });
     if !already_exists {
         record_event(
@@ -840,6 +962,102 @@ mod tests {
         let mut summary = load_summary(data).unwrap();
         project_direct_message_notifications(&mut summary, data, owner).unwrap();
         summary
+    }
+
+    #[test]
+    fn community_unread_is_account_scoped_monotonic_and_snapshot_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = ("network-one", "community-one");
+        let foreign_scope = ("network-two", "community-two");
+        let sync = |owner, scope, latest, read| {
+            sync_community_message_notification(tmp.path(), owner, scope, latest, read, now_ts())
+                .unwrap()
+        };
+        assert!(!sync(ALICE, scope, 0, None));
+        assert!(sync(ALICE, scope, 7, None));
+        assert!(sync(BOB, scope, 7, None));
+        assert!(sync(ALICE, foreign_scope, 31, None));
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+        let mut alice = load_summary(tmp.path()).unwrap();
+        project_community_message_notifications(&mut alice, tmp.path(), ALICE).unwrap();
+        assert_eq!(alice.unread_count, 2);
+        assert!(alice.entries.iter().all(|entry| {
+            entry.title == "New Community messages"
+                && entry.body == "New messages are available in Community."
+                && entry.action_ref.as_ref().is_some_and(|action| {
+                    action.app == "chat-room" && action.action_id == "chat-open-community"
+                })
+        }));
+        // Bob's read and the other network's read leave Alice's entry alone.
+        assert!(!sync(BOB, scope, 7, Some(7)));
+        assert!(!sync(ALICE, foreign_scope, 31, Some(31)));
+        assert!(sync(ALICE, scope, 7, None));
+        assert!(!mark_read(
+            tmp.path(),
+            Some(BOB),
+            &community_message_notification_id(scope)
+        )
+        .unwrap());
+        assert!(!sync(ALICE, scope, 7, Some(7)));
+        let read_bytes = fs::read(notifications_path(tmp.path()).unwrap()).unwrap();
+        // A repeated or older metadata projection cannot resurface read rows.
+        assert!(!sync(ALICE, scope, 7, None));
+        assert!(!sync(ALICE, scope, 6, None));
+        assert_eq!(
+            fs::read(notifications_path(tmp.path()).unwrap()).unwrap(),
+            read_bytes
+        );
+        assert!(sync(ALICE, scope, 8, None));
+        // A stale response cannot acknowledge the later row, including when
+        // its metadata lookup ran before the newer notification was saved.
+        assert!(sync(ALICE, scope, 7, Some(7)));
+        assert!(sync(ALICE, scope, 8, Some(7)));
+        assert!(!sync(ALICE, scope, 8, Some(8)));
+        assert!(!sync(BOB, scope, 7, None));
+    }
+
+    #[test]
+    fn community_watermark_is_optional_private_and_preserves_old_notification_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        upsert_direct_message_notification(tmp.path(), ALICE, "direct:old", "Pat", now_ts())
+            .unwrap();
+        let path = notifications_path(tmp.path()).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(before["entries"][0].get("message_seq").is_none());
+        sync_community_message_notification(
+            tmp.path(),
+            ALICE,
+            ("network", "community"),
+            4,
+            Some(4),
+            now_ts(),
+        )
+        .unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["entries"][0], before["entries"][0]);
+        assert_eq!(after["entries"][1]["message_seq"], 4);
+        // The old record shape admits unknown optional fields and retains
+        // the same action and flags during Undo. Watermarks stay private.
+        #[derive(Deserialize)]
+        struct OldRecord {
+            id: String,
+            read: bool,
+            acted: bool,
+        }
+        let old: OldRecord = serde_json::from_value(after["entries"][1].clone()).unwrap();
+        assert_eq!(
+            old.id,
+            community_message_notification_id(("network", "community"))
+        );
+        assert!(old.read && old.acted);
+        let record: NotificationEntryRecord =
+            serde_json::from_value(after["entries"][1].clone()).unwrap();
+        assert!(serde_json::to_value(record.view())
+            .unwrap()
+            .get("message_seq")
+            .is_none());
+        let legacy: NotificationStore = serde_json::from_value(before).unwrap();
+        assert!(legacy.entries[0].message_seq.is_none());
     }
 
     #[test]

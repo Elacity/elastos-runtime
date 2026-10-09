@@ -2515,6 +2515,112 @@ async fn test_chat_contact_request_needs_configured_contacts() {
 }
 
 #[tokio::test]
+async fn test_configured_community_read_requires_authority_and_returned_visible_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &authority.principal_id,
+        &crate::auth::principal_localhost_root(&authority.principal_id),
+    )
+    .unwrap()
+    .unwrap();
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "unread-network",
+        "unread-community",
+    );
+    let other = port.test_person_profile("Other account", None);
+    let prepared = port
+        .prepare_message(
+            crate::collaboration_product::chat_message_request_binding(
+                "unread-message",
+                "other",
+                "remote text",
+                &other,
+            )
+            .unwrap(),
+            "remote text",
+            &other,
+            now_ts(),
+        )
+        .unwrap();
+    port.project_prepared_message(dir.path(), &prepared, None)
+        .unwrap();
+    assert!(port
+        .community_unread(dir.path(), &profile, now_ts())
+        .unwrap());
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let token =
+        projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
+    let poll_request = |token: &str, body: serde_json::Value| {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/poll")
+            .header("x-elastos-home-token", token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let refused = app
+        .clone()
+        .oneshot(poll_request("forged", json!({"since":0,"mark_read":true})))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert!(port
+        .community_unread(dir.path(), &profile, now_ts())
+        .unwrap());
+    let start = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/session/start")
+                .header("x-elastos-home-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    assert!(port
+        .community_unread(dir.path(), &profile, now_ts())
+        .unwrap());
+    for body in [
+        json!({"since":0}),
+        json!({"since":0,"mark_read":false}),
+        json!({"since":u64::MAX,"mark_read":true}),
+    ] {
+        let poll = app
+            .clone()
+            .oneshot(poll_request(&token, body))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        assert!(port
+            .community_unread(dir.path(), &profile, now_ts())
+            .unwrap());
+    }
+    let visible = app
+        .oneshot(poll_request(&token, json!({"since":0,"mark_read":true})))
+        .await
+        .unwrap();
+    assert_eq!(visible.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(visible.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let poll: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(poll["objects"].as_array().unwrap().len(), 1);
+    assert_eq!(poll["objects"][0]["body"], "remote text");
+    assert!(!port
+        .community_unread(dir.path(), &profile, now_ts())
+        .unwrap());
+}
+
+#[tokio::test]
 async fn test_chat_room_configured_send_asks_a_fast_sender_to_slow_down() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_profile(dir.path(), "owner");

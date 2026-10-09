@@ -24,7 +24,8 @@ pub(super) async fn inbox_summary(
         };
     if let Err(err) = super::gateway_home_system::apply_contact_request_notification_projection(
         &state.data_dir,
-        contact_authority.as_ref().map(|authority| &authority.store),
+        contact_authority.as_ref(),
+        state.collaboration_chat_product_port.as_ref(),
         &mut notifications,
     ) {
         return inbox_error_response(err);

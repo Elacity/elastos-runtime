@@ -6,6 +6,50 @@ pub(super) struct ChatDirectMessageSendRequest {
     request_id: String,
     conversation_id: String,
     text: String,
+    #[serde(default)]
+    retry_existing: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatDirectMessageReadOptions {
+    #[serde(default)]
+    retry_details: bool,
+    #[serde(default)]
+    mark_read: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatDirectConversationReadOptions {
+    #[serde(default)]
+    community_status: bool,
+}
+
+fn direct_conversation_read_payload(
+    conversations: Vec<crate::collaboration_direct_messages::DirectConversationSummary>,
+    community_unread: Option<bool>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({"conversations": conversations});
+    if let Some(unread) = community_unread {
+        payload["community_unread"] = serde_json::json!(unread);
+    }
+    payload
+}
+
+fn direct_message_read_payload(
+    mut messages: Vec<crate::collaboration_direct_messages::DirectMessageSummary>,
+    conversation_id: &str,
+    retry_details: bool,
+) -> serde_json::Value {
+    // Older Chat bundles reject unknown message fields. Retry identity is
+    // opt-in on this same authenticated read endpoint.
+    if !retry_details {
+        for message in &mut messages {
+            message.request_id = None;
+        }
+    }
+    serde_json::json!({"conversation_id": conversation_id, "messages": messages})
 }
 
 fn direct_api_error_response(
@@ -16,14 +60,199 @@ fn direct_api_error_response(
         DirectApiError::InvalidRequest => StatusCode::BAD_REQUEST,
         DirectApiError::ForbiddenConversation => StatusCode::FORBIDDEN,
         DirectApiError::IntentConflict => StatusCode::CONFLICT,
+        DirectApiError::RetryExpired | DirectApiError::RetryUnavailable => StatusCode::GONE,
         DirectApiError::Authority => StatusCode::UNAUTHORIZED,
         DirectApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (
-        status,
-        Json(serde_json::json!({"error": error.to_string()})),
-    )
-        .into_response()
+    let mut body = serde_json::json!({"error": error.to_string()});
+    match error {
+        DirectApiError::RetryExpired => body["code"] = serde_json::json!("retry_expired"),
+        DirectApiError::RetryUnavailable => body["code"] = serde_json::json!("retry_unavailable"),
+        _ => {}
+    }
+    (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod direct_retry_wire_tests {
+    use super::*;
+
+    #[test]
+    fn direct_retry_wire_modes_are_explicit_and_old_requests_keep_their_behavior() {
+        let old = serde_json::json!({"request_id":"message:one", "conversation_id":"direct:one", "text":"hello"});
+        assert!(
+            !serde_json::from_value::<ChatDirectMessageSendRequest>(old.clone())
+                .unwrap()
+                .retry_existing
+        );
+        let mut retry = old.clone();
+        retry["retry_existing"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ChatDirectMessageSendRequest>(retry.clone())
+                .unwrap()
+                .retry_existing
+        );
+        retry["retry_existing"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<ChatDirectMessageSendRequest>(retry).is_err());
+        assert!(
+            !Query::<ChatDirectMessageReadOptions>::try_from_uri(&"/messages".parse().unwrap())
+                .unwrap()
+                .0
+                .retry_details
+        );
+        assert!(
+            Query::<ChatDirectMessageReadOptions>::try_from_uri(
+                &"/messages?retry_details=true".parse().unwrap()
+            )
+            .unwrap()
+            .0
+            .retry_details
+        );
+        assert!(Query::<ChatDirectMessageReadOptions>::try_from_uri(
+            &"/messages?retry_details=yes".parse().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chat_read_intent_and_community_status_are_explicit_without_changing_old_wire_shapes() {
+        let old =
+            Query::<ChatDirectMessageReadOptions>::try_from_uri(&"/messages".parse().unwrap())
+                .unwrap()
+                .0;
+        assert!(old.mark_read.unwrap_or(true));
+        for (query, expected) in [("false", false), ("true", true)] {
+            let options = Query::<ChatDirectMessageReadOptions>::try_from_uri(
+                &format!("/messages?retry_details=true&mark_read={query}")
+                    .parse()
+                    .unwrap(),
+            )
+            .unwrap()
+            .0;
+            assert!(options.retry_details);
+            assert_eq!(options.mark_read, Some(expected));
+        }
+        assert!(Query::<ChatDirectMessageReadOptions>::try_from_uri(
+            &"/messages?mark_read=yes".parse().unwrap()
+        )
+        .is_err());
+        let old_poll: RoomPollBody =
+            serde_json::from_value(serde_json::json!({"since": 7})).unwrap();
+        assert!(!old_poll.mark_read);
+        assert!(
+            serde_json::from_value::<RoomPollBody>(serde_json::json!({"since":7,"mark_read":true}))
+                .unwrap()
+                .mark_read
+        );
+        assert!(
+            serde_json::from_value::<RoomPollBody>(serde_json::json!({"mark_read":"true"}))
+                .is_err()
+        );
+        let old_list = Query::<ChatDirectConversationReadOptions>::try_from_uri(
+            &"/conversations".parse().unwrap(),
+        )
+        .unwrap()
+        .0;
+        assert!(!old_list.community_status);
+        assert!(
+            Query::<ChatDirectConversationReadOptions>::try_from_uri(
+                &"/conversations?community_status=true".parse().unwrap()
+            )
+            .unwrap()
+            .0
+            .community_status
+        );
+        assert!(Query::<ChatDirectConversationReadOptions>::try_from_uri(
+            &"/conversations?community_status=yes".parse().unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            direct_conversation_read_payload(Vec::new(), None),
+            serde_json::json!({"conversations":[]})
+        );
+        assert_eq!(
+            direct_conversation_read_payload(Vec::new(), Some(true)),
+            serde_json::json!({"conversations":[],"community_unread":true})
+        );
+    }
+
+    #[test]
+    fn old_direct_reads_omit_retry_identity_and_opt_in_reads_expose_only_outgoing_identity() {
+        use crate::collaboration_direct_messages::DirectMessageSummary;
+        let messages = vec![
+            DirectMessageSummary {
+                message_id: "message:out".into(),
+                request_id: Some("request:out".into()),
+                direction: "outgoing",
+                text: "hello".into(),
+                created_at: 10,
+                delivery_state: "pending",
+            },
+            DirectMessageSummary {
+                message_id: "message:in".into(),
+                request_id: None,
+                direction: "incoming",
+                text: "hi".into(),
+                created_at: 11,
+                delivery_state: "received",
+            },
+        ];
+        let legacy = direct_message_read_payload(messages.clone(), "direct:one", false);
+        for message in legacy["messages"].as_array().unwrap() {
+            assert_eq!(
+                message
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                [
+                    "created_at",
+                    "delivery_state",
+                    "direction",
+                    "message_id",
+                    "text"
+                ]
+            );
+        }
+        let retry = direct_message_read_payload(messages, "direct:one", true);
+        assert_eq!(retry["messages"][0]["request_id"], "request:out");
+        assert!(retry["messages"][1].get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_retry_refusals_are_typed_gone_without_changing_other_errors() {
+        use crate::collaboration_direct_messages::DirectApiError;
+        for (error, code) in [
+            (DirectApiError::RetryExpired, "retry_expired"),
+            (DirectApiError::RetryUnavailable, "retry_unavailable"),
+        ] {
+            let response = direct_api_error_response(error);
+            assert_eq!(response.status(), StatusCode::GONE);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"error":error.to_string(), "code":code})
+            );
+        }
+        assert_eq!(
+            direct_api_error_response(DirectApiError::IntentConflict).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            direct_api_error_response(DirectApiError::Authority).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            direct_api_error_response(DirectApiError::ForbiddenConversation).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 }
 
 struct DirectAuthorityContext {
@@ -67,6 +296,7 @@ fn direct_authority(
 pub(super) async fn chat_direct_conversations(
     State(state): State<GatewayState>,
     headers: HeaderMap,
+    Query(options): Query<ChatDirectConversationReadOptions>,
 ) -> Response {
     let DirectAuthorityContext {
         service, authority, ..
@@ -87,7 +317,24 @@ pub(super) async fn chat_direct_conversations(
             for conversation in &mut conversations {
                 conversation.unread = unread.contains(&conversation.conversation_id);
             }
-            Json(serde_json::json!({"conversations": conversations})).into_response()
+            let community_unread = if options.community_status {
+                match state.collaboration_chat_product_port.as_ref() {
+                    Some(port) => {
+                        match port.community_unread(&state.data_dir, &authority.profile, now_ts()) {
+                            Ok(unread) => Some(unread),
+                            Err(error) => return room_service_error_response(error),
+                        }
+                    }
+                    None => Some(false),
+                }
+            } else {
+                None
+            };
+            Json(direct_conversation_read_payload(
+                conversations,
+                community_unread,
+            ))
+            .into_response()
         }
         Err(error) => direct_api_error_response(error),
     }
@@ -97,6 +344,7 @@ pub(super) async fn chat_direct_conversation_messages(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Path(conversation_id): Path<String>,
+    Query(options): Query<ChatDirectMessageReadOptions>,
 ) -> Response {
     let DirectAuthorityContext {
         service, authority, ..
@@ -113,15 +361,18 @@ pub(super) async fn chat_direct_conversation_messages(
         Ok(messages) => {
             // Reading the conversation is what resolves its message
             // notification; the next incoming message resurfaces it.
-            let _ = crate::notifications::mark_acted_for_action(
-                &state.data_dir,
-                Some(authority.store.local_profile_did()),
-                &crate::notifications::direct_message_notification_action_id(&conversation_id),
-            );
-            Json(serde_json::json!({
-                "conversation_id": conversation_id,
-                "messages": messages,
-            }))
+            if options.mark_read.unwrap_or(true) {
+                let _ = crate::notifications::mark_acted_for_action(
+                    &state.data_dir,
+                    Some(authority.store.local_profile_did()),
+                    &crate::notifications::direct_message_notification_action_id(&conversation_id),
+                );
+            }
+            Json(direct_message_read_payload(
+                messages,
+                &conversation_id,
+                options.retry_details,
+            ))
             .into_response()
         }
         Err(error) => direct_api_error_response(error),
@@ -166,6 +417,7 @@ pub(super) async fn chat_direct_message_send(
                 request_id: &request.request_id,
                 conversation_id: &request.conversation_id,
                 text: &request.text,
+                retry_existing: request.retry_existing,
                 now,
             },
         )
@@ -188,6 +440,8 @@ pub(super) async fn chat_direct_message_send(
 pub(super) struct RoomPollBody {
     #[serde(default)]
     since: u64,
+    #[serde(default)]
+    mark_read: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1556,6 +1810,7 @@ pub(super) async fn room_service_poll(
     let discovery_service = state.collaboration_discovery_service.clone();
     let presence_port = state.collaboration_presence_product_port.clone();
     let mut launch_context = None;
+    let mut reader_profile = None;
     let token = match port.as_ref() {
         Some(_) => {
             let context = match require_home_launch_token_context(
@@ -1567,10 +1822,12 @@ pub(super) async fn room_service_poll(
                 Err(err) => return room_service_error_response(err),
             };
             launch_context = Some(context.clone());
-            let (did, _) = match trusted_configured_chat_profile(&data_dir, &context) {
-                Ok(principal) => principal,
+            let profile = match trusted_chat_room_profile_authority(&data_dir, &context) {
+                Ok(profile) => profile,
                 Err(err) => return room_service_error_response(err),
             };
+            let did = profile.document().profile_did.clone();
+            reader_profile = Some(profile);
             let session =
                 match crate::room_service::resolve_configured_collaboration_principal_session(
                     &data_dir,
@@ -1597,7 +1854,16 @@ pub(super) async fn room_service_poll(
     };
     match tokio::task::spawn_blocking(move || {
         let mut poll = match port {
-            Some(port) => port.conversation_poll(&data_dir, &token, body.since)?,
+            Some(port) => port.conversation_poll_with_read_intent(
+                &data_dir,
+                &token,
+                body.since,
+                reader_profile
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Chat reader Profile is unavailable"))?,
+                body.mark_read,
+                now_ts(),
+            )?,
             None => crate::room_service::room_poll(&data_dir, &token, body.since)?,
         };
         let mut cards = None;

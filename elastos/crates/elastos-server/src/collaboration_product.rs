@@ -335,6 +335,65 @@ impl CollaborationChatProductPort {
         )
     }
 
+    pub(crate) fn community_unread(
+        &self,
+        data_dir: &Path,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        self.sync_community_read(data_dir, reader, None, now)
+    }
+
+    /// A visible read acknowledges through the returned verified scoped rows,
+    /// including own rows after an older unread remote row has been evicted.
+    /// The caller's cursor and latest_seq are not read evidence.
+    pub(crate) fn conversation_poll_with_read_intent(
+        &self,
+        data_dir: &Path,
+        token: &str,
+        since: u64,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        mark_read: bool,
+        now: u64,
+    ) -> anyhow::Result<crate::room_service::RoomPollView> {
+        let poll = self.conversation_poll(data_dir, token, since)?;
+        if mark_read {
+            let read_through = poll
+                .objects
+                .iter()
+                .filter(|object| object.sender_profile_verified == Some(true))
+                .map(|object| object.seq)
+                .max();
+            self.sync_community_read(data_dir, reader, read_through, now)?;
+        }
+        Ok(poll)
+    }
+
+    fn sync_community_read(
+        &self,
+        data_dir: &Path,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        read_through: Option<u64>,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let (network_id, conversation_id) = self.core.conversation_scope();
+        let reader_did = reader.document().profile_did.as_str();
+        let seq = crate::room_service::collaboration_latest_remote_message_seq(
+            data_dir,
+            network_id,
+            conversation_id,
+            reader_did,
+        )?;
+        crate::notifications::sync_community_message_notification(
+            data_dir,
+            reader_did,
+            (network_id, conversation_id),
+            seq,
+            read_through,
+            now,
+        )
+    }
+
     fn require_prepared_message(
         &self,
         prepared: &PreparedCollaborationChatMessage,
@@ -811,6 +870,171 @@ mod tests {
         )
         .unwrap();
         (authority, person_profile)
+    }
+
+    #[test]
+    fn community_unread_uses_scoped_other_authors_and_only_visible_returned_rows() {
+        let fixture = fixture();
+        let now = now_secs();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &fixture.person_profile.document().profile_did,
+            "Reader",
+            "Community unread test",
+        )
+        .unwrap();
+        let own = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "community-own", "own text"),
+                "own text",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &own, Some(&session.token))
+            .unwrap();
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let (remote, remote_profile) = remote_authority(&fixture);
+        crate::room_service::project_collaboration_text(
+            &fixture.data_root,
+            ("foreign-network", "foreign-conversation"),
+            &format!("sha256:{}", "f".repeat(64)),
+            &room_profile_card(&remote_profile),
+            "foreign text",
+            now,
+            None,
+        )
+        .unwrap();
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let incoming = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                CHAT_PAYLOAD_TYPE,
+                serde_json::json!({"body":"remote text"}),
+                now,
+                CHAT_MESSAGE_TTL_SECS,
+            )
+            .unwrap();
+        fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(incoming.envelope_bytes(), now)
+            .unwrap();
+        let handoff = fixture.port.pending_messages().unwrap().remove(0);
+        fixture
+            .port
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        // For the remote account, the first author's text is also unread.
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &remote_profile, now)
+            .unwrap());
+        let background = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                0,
+                &fixture.person_profile,
+                false,
+                now,
+            )
+            .unwrap();
+        assert_eq!(background.objects.len(), 2);
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        // A client cannot turn its invented high cursor into read evidence.
+        let empty = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                u64::MAX,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert_eq!(empty.latest_seq, u64::MAX);
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        assert!(fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                "invalid-session",
+                0,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .is_err());
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let visible = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                0,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), 2);
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &remote_profile, now)
+            .unwrap());
+        let next = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                CHAT_PAYLOAD_TYPE,
+                serde_json::json!({"body":"next remote text"}),
+                now + 1,
+                CHAT_MESSAGE_TTL_SECS,
+            )
+            .unwrap();
+        fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(next.envelope_bytes(), now + 1)
+            .unwrap();
+        let handoff = fixture.port.pending_messages().unwrap().remove(0);
+        fixture
+            .port
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now + 1)
+            .unwrap());
     }
 
     #[test]

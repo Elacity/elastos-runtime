@@ -161,6 +161,8 @@ pub(crate) enum DirectApiError {
     InvalidRequest,
     ForbiddenConversation,
     IntentConflict,
+    RetryExpired,
+    RetryUnavailable,
     Authority,
     Internal,
 }
@@ -171,6 +173,8 @@ impl std::fmt::Display for DirectApiError {
             Self::InvalidRequest => "invalid direct message request",
             Self::ForbiddenConversation => "direct conversation is unavailable",
             Self::IntentConflict => "direct message request_id conflicts with durable intent",
+            Self::RetryExpired => "the direct message delivery window has ended",
+            Self::RetryUnavailable => "the original direct message is no longer available to retry",
             Self::Authority => "direct message authority is unavailable",
             Self::Internal => "direct message operation failed",
         })
@@ -208,6 +212,8 @@ pub(crate) struct DirectConversationSummary {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct DirectMessageSummary {
     pub(crate) message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_id: Option<String>,
     pub(crate) direction: &'static str,
     pub(crate) text: String,
     pub(crate) created_at: u64,
@@ -230,6 +236,7 @@ pub(crate) struct DirectSendIntent<'a> {
     pub(crate) request_id: &'a str,
     pub(crate) conversation_id: &'a str,
     pub(crate) text: &'a str,
+    pub(crate) retry_existing: bool,
     pub(crate) now: u64,
 }
 
@@ -388,13 +395,17 @@ impl DirectMessageStore {
     /// lookup proves this request has no existing claim.
     fn claim_outgoing_intent(
         &self,
-        request_id: &str,
-        conversation_id: &str,
-        recipient_profile_did: &str,
-        text: &str,
+        intent: DirectMessageIntent<'_>,
+        retry_existing: bool,
         now: u64,
         prepare: impl FnOnce() -> anyhow::Result<Vec<u8>>,
     ) -> Result<Vec<u8>, DirectApiError> {
+        let DirectMessageIntent {
+            request_id,
+            conversation_id,
+            recipient_profile_did,
+            text,
+        } = intent;
         self.mutate(|state| {
             for entry in state.messages.iter().filter(|entry| !entry.incoming) {
                 let bytes = decode(&entry.envelope, "direct message")?;
@@ -410,7 +421,19 @@ impl DirectMessageStore {
                 {
                     return Err(DirectApiError::IntentConflict.into());
                 }
+                let hash = collaboration_message_envelope_sha256(&bytes);
+                if envelope.payload.expires_at <= now
+                    && !state
+                        .receipts
+                        .iter()
+                        .any(|receipt| receipt.message_envelope_sha256 == hash)
+                {
+                    return Err(DirectApiError::RetryExpired.into());
+                }
                 return Ok(bytes);
+            }
+            if retry_existing {
+                return Err(DirectApiError::RetryUnavailable.into());
             }
             let bytes = prepare()?;
             self.validate_persisted_message(&bytes, false)?;
@@ -1002,7 +1025,7 @@ impl CollaborationDirectMessageService {
         let context = self
             .context(local_profile_did, now)
             .map_err(|_| DirectApiError::Authority)?;
-        self.send_text_with_context(&context, request_id, conversation_id, text, now)
+        self.send_text_with_context(&context, request_id, conversation_id, text, false, now)
             .await
     }
 
@@ -1049,6 +1072,7 @@ impl CollaborationDirectMessageService {
             intent.request_id,
             intent.conversation_id,
             intent.text,
+            intent.retry_existing,
             intent.now,
         )
         .await
@@ -1060,6 +1084,7 @@ impl CollaborationDirectMessageService {
         request_id: &str,
         conversation_id: &str,
         text: &str,
+        retry_existing: bool,
         now: u64,
     ) -> Result<DirectDeliveryStatus, DirectApiError> {
         let contact = context
@@ -1072,10 +1097,13 @@ impl CollaborationDirectMessageService {
             .cloned()
             .ok_or(DirectApiError::ForbiddenConversation)?;
         let bytes = context.message_store.claim_outgoing_intent(
-            request_id,
-            conversation_id,
-            contact.remote_profile_did(),
-            text,
+            DirectMessageIntent {
+                request_id,
+                conversation_id,
+                recipient_profile_did: contact.remote_profile_did(),
+                text,
+            },
+            retry_existing,
             now,
             || {
                 prepare_direct_message(
@@ -1177,6 +1205,7 @@ impl CollaborationDirectMessageService {
             }
             messages.push(DirectMessageSummary {
                 message_id: envelope.payload.message_id,
+                request_id: (!record.incoming).then_some(payload.request_id),
                 direction: if record.incoming {
                     "incoming"
                 } else {
@@ -1368,6 +1397,21 @@ impl CollaborationDirectMessageService {
         if recipient_profile.sole_endpoint_did()? != recipient_endpoint_did {
             anyhow::bail!("direct message route does not match the recipient Profile");
         }
+        let message_hash = collaboration_message_envelope_sha256(message);
+        if context.message_store.has_receipt(&message_hash)? {
+            let stored = crate::collaboration_protocol::verify_stored_collaboration_message(
+                message,
+                &self.inner.network,
+                "chat",
+            )?;
+            validate_direct_message_authority(
+                stored,
+                &raw.payload.conversation_id,
+                &context.profile,
+                &recipient_profile,
+            )?;
+            return Ok(DirectDeliveryStatus::ReceiptSettled);
+        }
         let verified = verify_direct_message(
             message,
             &self.inner.network,
@@ -1376,10 +1420,6 @@ impl CollaborationDirectMessageService {
             &recipient_profile,
             now,
         )?;
-        let message_hash = verified.envelope_sha256().to_string();
-        if context.message_store.has_receipt(&message_hash)? {
-            return Ok(DirectDeliveryStatus::ReceiptSettled);
-        }
         let response = match self
             .inner
             .registry
@@ -1846,6 +1886,15 @@ pub(crate) fn verify_direct_message(
     now: u64,
 ) -> anyhow::Result<VerifiedCollaborationMessage> {
     let message = verify_collaboration_message(bytes, network, "chat", now)?;
+    validate_direct_message_authority(message, conversation_id, sender_profile, recipient_profile)
+}
+
+fn validate_direct_message_authority(
+    message: VerifiedCollaborationMessage,
+    conversation_id: &str,
+    sender_profile: &VerifiedCollaborationProfileDocument,
+    recipient_profile: &VerifiedCollaborationProfileDocument,
+) -> anyhow::Result<VerifiedCollaborationMessage> {
     let payload = &message.envelope().payload;
     if payload.conversation_id != conversation_id
         || payload.sender_profile_did != sender_profile.document().profile_did

@@ -2917,6 +2917,31 @@ pub(crate) fn project_collaboration_text(
     })
 }
 
+/// Internal metadata reads use the exact Runtime-owned collaboration scope
+/// and verified Profile attribution. They leave the account's read state alone.
+pub(crate) fn collaboration_latest_remote_message_seq(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    reader_profile_did: &str,
+) -> anyhow::Result<u64> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.sender_member_did.as_deref() != Some(reader.as_str())
+                    && verified_collaboration_sender_profile(item).is_some()
+            })
+            .map(|item| item.seq)
+            .max()
+            .unwrap_or(0))
+    })
+}
+
 pub(crate) fn collaboration_room_poll(
     data_dir: &Path,
     token: &str,
@@ -7313,6 +7338,130 @@ mod tests {
 
         let meta: RoomMeta = read_json_or_default(&paths.room_meta_path).unwrap();
         assert_eq!(meta.next_seq, 1);
+    }
+
+    #[test]
+    fn visible_community_read_clears_an_evicted_remote_row_without_own_send_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = room_test_profile(tmp.path(), 121, "Local", None);
+        let remote = room_test_profile(tmp.path(), 122, "Remote", None);
+        let port = crate::collaboration_product::test_chat_product_port(
+            tmp.path(),
+            "unread-network",
+            "unread-conversation",
+        );
+        let session =
+            start_local_runtime_session(tmp.path(), &local.profile_did, "Local", "Unread test")
+                .unwrap();
+        let card = |actor: &RoomTestActor| RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: actor.profile_did.clone(),
+            display_name: actor.profile.document().display_name.clone(),
+            handle: None,
+            updated_at: actor.profile.document().updated_at,
+        };
+        project_collaboration_text(
+            tmp.path(),
+            ("unread-network", "unread-conversation"),
+            &format!("sha256:{}", "e".repeat(64)),
+            &card(&remote),
+            "remote",
+            now_ts(),
+            None,
+        )
+        .unwrap();
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let scope = collaboration_object_scope("unread-network", "unread-conversation").unwrap();
+        // Run the real bounded projection policy once, without 500 disk writes
+        // or relaxing the separate live send limit.
+        with_locked_state(tmp.path(), |_, state| {
+            for index in 0..MAX_OBJECTS {
+                push_object(
+                    state,
+                    ConversationObjectRecord {
+                        seq: 0,
+                        event_id: format!("sha256:{index:064x}"),
+                        collaboration_scope: Some(scope.clone()),
+                        sender: "Local".to_string(),
+                        sender_member_did: Some(local.profile_did.clone()),
+                        sender_profile: Some(card(&local)),
+                        sender_actor_id: String::new(),
+                        kind: ConversationObjectKind::Text,
+                        body: Some(format!("own {index}")),
+                        emoji: None,
+                        link: None,
+                        attachment: None,
+                        created_at: now_ts(),
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            collaboration_latest_remote_message_seq(
+                tmp.path(),
+                "unread-network",
+                "unread-conversation",
+                &local.profile_did
+            )
+            .unwrap(),
+            0
+        );
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let hidden = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                false,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(hidden.objects.len(), MAX_OBJECTS);
+        assert!(hidden
+            .objects
+            .iter()
+            .all(|object| object.sender_member_did.as_deref() == Some(local.profile_did.as_str())));
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let empty = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                u64::MAX,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let visible = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), MAX_OBJECTS);
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
     }
 
     #[test]

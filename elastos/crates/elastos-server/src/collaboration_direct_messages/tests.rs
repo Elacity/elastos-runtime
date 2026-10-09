@@ -699,6 +699,7 @@ async fn runtime_receiving_survives_browser_signout_and_expiry_while_sending_sto
                         request_id: "refused-send",
                         conversation_id: &pair.conversation_id,
                         text: "sending still needs a session",
+                        retry_existing: false,
                         now: lost_at,
                     },
                 )
@@ -1043,6 +1044,7 @@ async fn abandoned_message_reads_expired_never_pending_and_a_receipt_still_wins(
         .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].delivery_state, "pending");
+    assert_eq!(live[0].request_id.as_deref(), Some("expiry-request"));
 
     // One second past the TTL the Runtime has stopped retrying
     // (retry_pending skips expired envelopes), so the read model must say
@@ -1092,6 +1094,297 @@ async fn abandoned_message_reads_expired_never_pending_and_a_receipt_still_wins(
         )
         .unwrap();
     assert_eq!(settled[0].delivery_state, "receipt_settled");
+}
+
+struct LostDirectReceiptOnce {
+    inner: RecordingDirectCarrierInvoker,
+    lost: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl elastos_runtime::provider::ProviderCarrierInvoker for LostDirectReceiptOnce {
+    async fn invoke_carrier_provider(
+        &self,
+        route: &ProviderCarrierRoute,
+        invocation: &ProviderInvocation,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let receipt = elastos_runtime::provider::ProviderCarrierInvoker::invoke_carrier_provider(
+            &self.inner,
+            route,
+            invocation,
+            request,
+        )
+        .await?;
+        if !self.lost.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProviderError::Unavailable(
+                "signed receipt response lost".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+#[tokio::test]
+async fn explicit_retry_reconciles_lost_receipt_with_original_bytes_and_settlement_wins_after_expiry(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
+    let direct = pair.service_a.direct_message_service();
+    let now = now_ts();
+    let context = direct
+        .context(&pair.profile_a.document().profile_did, now)
+        .unwrap();
+    let invoker = Arc::new(LostDirectReceiptOnce {
+        inner: RecordingDirectCarrierInvoker {
+            source_endpoint_did: crate::crypto::encode_signing_key_did(&pair.key_a),
+            remote: pair.service_b.direct_message_service(),
+            calls: tokio::sync::Mutex::new(Vec::new()),
+        },
+        lost: std::sync::atomic::AtomicBool::new(false),
+    });
+    pair.registry_a.set_carrier_invoker(invoker.clone()).await;
+    assert_eq!(
+        direct
+            .send_text_with_context(
+                &context,
+                "lost-receipt-retry",
+                &pair.conversation_id,
+                "same durable text",
+                false,
+                now
+            )
+            .await,
+        Ok(DirectDeliveryStatus::Pending),
+    );
+    let original = context.message_store.records().unwrap()[0]
+        .envelope_bytes
+        .clone();
+    assert!(!context.message_store.records().unwrap()[0].receipt_settled);
+    // The recipient already stored the exact message; its signed response alone
+    // was lost. Explicit Retry must reconcile it, rather than send a new identity.
+    assert_eq!(
+        direct
+            .send_text_with_context(
+                &context,
+                "lost-receipt-retry",
+                &pair.conversation_id,
+                "same durable text",
+                true,
+                now + 1
+            )
+            .await,
+        Ok(DirectDeliveryStatus::ReceiptSettled),
+    );
+    let after = context.message_store.records().unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].envelope_bytes, original);
+    assert!(after[0].receipt_settled);
+    let calls = invoker.inner.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].request["message"], encode(&original));
+    assert_eq!(calls[0].request["message"], calls[1].request["message"]);
+    drop(calls);
+    let recipient = pair
+        .service_b
+        .direct_message_service()
+        .context(&pair.profile_b.document().profile_did, now)
+        .unwrap();
+    assert_eq!(
+        recipient
+            .message_store
+            .records()
+            .unwrap()
+            .iter()
+            .filter(|record| record.incoming)
+            .count(),
+        1
+    );
+    assert!(pair
+        .service_b
+        .direct_message_service()
+        .message_summaries(
+            pair.store_b.as_ref(),
+            &pair.profile_b,
+            &pair.conversation_id,
+            now
+        )
+        .unwrap()
+        .iter()
+        .all(|message| message.request_id.is_none()));
+    let protected_before = protected_store_bytes(&context.message_store).unwrap();
+    assert_eq!(
+        direct
+            .send_text_with_context(
+                &context,
+                "lost-receipt-retry",
+                &pair.conversation_id,
+                "same durable text",
+                true,
+                now + DIRECT_MESSAGE_TTL_SECS + 1
+            )
+            .await,
+        Ok(DirectDeliveryStatus::ReceiptSettled),
+    );
+    assert_eq!(
+        invoker.inner.calls.lock().await.len(),
+        2,
+        "settlement needs no new network dispatch"
+    );
+    assert_eq!(
+        protected_store_bytes(&context.message_store).unwrap(),
+        protected_before
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_refuses_missing_expired_and_pruned_intents_without_preparing_replacements()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
+    let now = now_ts();
+    let direct = pair.service_a.direct_message_service();
+    let context = direct
+        .context(&pair.profile_a.document().profile_did, now)
+        .unwrap();
+    let store = context.message_store;
+    let intent = || DirectMessageIntent {
+        request_id: "explicit-only",
+        conversation_id: &pair.conversation_id,
+        recipient_profile_did: &pair.profile_b.document().profile_did,
+        text: "original uncertain delivery",
+    };
+    assert_eq!(
+        store.claim_outgoing_intent(intent(), true, now, || panic!(
+            "missing Retry cannot create an intent"
+        )),
+        Err(DirectApiError::RetryUnavailable)
+    );
+    assert!(protected_store_bytes(&store).is_none());
+    let original = store
+        .claim_outgoing_intent(intent(), false, now, || {
+            Ok(test_message(
+                &pair,
+                "explicit-only",
+                &pair.conversation_id,
+                &pair.profile_b.document().profile_did,
+                "original uncertain delivery",
+                now,
+            ))
+        })
+        .unwrap();
+    let restarted = DirectMessageStore::new(
+        &store.data_root,
+        &store.principal_id,
+        &store.localhost_root,
+        store.network.clone(),
+        store.local_profile.clone(),
+        pair.store_a.local_device_did(),
+    )
+    .unwrap();
+    let before = protected_store_bytes(&store).unwrap();
+    assert_eq!(
+        restarted.claim_outgoing_intent(intent(), true, now + 1, || panic!(
+            "live Retry reuses original bytes"
+        )),
+        Ok(original.clone())
+    );
+    let expired = now + DIRECT_MESSAGE_TTL_SECS + MAX_COLLABORATION_CLOCK_SKEW_SECS + 1;
+    assert_eq!(
+        restarted.claim_outgoing_intent(intent(), true, expired, || panic!(
+            "expired Retry cannot extend its lifetime"
+        )),
+        Err(DirectApiError::RetryExpired)
+    );
+    assert_eq!(protected_store_bytes(&store).unwrap(), before);
+    let replacement = test_message(
+        &pair,
+        "later-intent",
+        &pair.conversation_id,
+        &pair.profile_b.document().profile_did,
+        "different message",
+        expired,
+    );
+    store
+        .persist_message_with_limits(
+            &replacement,
+            false,
+            expired,
+            1,
+            MAX_DIRECT_MESSAGE_STATE_BYTES,
+        )
+        .unwrap();
+    let pruned = protected_store_bytes(&store).unwrap();
+    assert_eq!(store.records().unwrap().len(), 1);
+    assert_eq!(store.records().unwrap()[0].envelope_bytes, replacement);
+    assert_eq!(
+        restarted.claim_outgoing_intent(intent(), true, expired, || panic!(
+            "pruned Retry cannot mint a replacement"
+        )),
+        Err(DirectApiError::RetryUnavailable)
+    );
+    assert_eq!(protected_store_bytes(&store).unwrap(), pruned);
+}
+
+#[tokio::test]
+async fn explicit_fresh_send_keeps_old_uncertain_delivery_as_a_separate_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
+    let now = now_ts();
+    let direct = pair.service_a.direct_message_service();
+    let context = direct
+        .context(&pair.profile_a.document().profile_did, now)
+        .unwrap();
+    let store = context.message_store;
+    let old = test_message(
+        &pair,
+        "old-uncertain",
+        &pair.conversation_id,
+        &pair.profile_b.document().profile_did,
+        "send this text again",
+        now,
+    );
+    store.persist_message(&old, false, now).unwrap();
+    let expired = now + DIRECT_MESSAGE_TTL_SECS + 1;
+    let fresh = store
+        .claim_outgoing_intent(
+            DirectMessageIntent {
+                request_id: "explicit-fresh",
+                conversation_id: &pair.conversation_id,
+                recipient_profile_did: &pair.profile_b.document().profile_did,
+                text: "send this text again",
+            },
+            false,
+            expired,
+            || {
+                Ok(test_message(
+                    &pair,
+                    "explicit-fresh",
+                    &pair.conversation_id,
+                    &pair.profile_b.document().profile_did,
+                    "send this text again",
+                    expired,
+                ))
+            },
+        )
+        .unwrap();
+    let records = store.records().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].envelope_bytes, old);
+    assert!(!records[0].receipt_settled);
+    assert_ne!(fresh, old);
+    let messages = direct
+        .message_summaries(
+            pair.store_a.as_ref(),
+            &pair.profile_a,
+            &pair.conversation_id,
+            expired,
+        )
+        .unwrap();
+    assert_eq!(messages[0].request_id.as_deref(), Some("old-uncertain"));
+    assert_eq!(messages[0].delivery_state, "expired");
+    assert_eq!(messages[1].request_id.as_deref(), Some("explicit-fresh"));
+    assert_eq!(messages[1].delivery_state, "pending");
 }
 
 #[tokio::test]
@@ -1508,10 +1801,13 @@ async fn concurrent_send_intents_claim_one_envelope_and_conflicts_leave_the_stor
                 barrier.wait();
                 store
                     .claim_outgoing_intent(
-                        "concurrent-intent",
-                        &pair.conversation_id,
-                        &pair.profile_b.document().profile_did,
-                        "same text",
+                        DirectMessageIntent {
+                            request_id: "concurrent-intent",
+                            conversation_id: &pair.conversation_id,
+                            recipient_profile_did: &pair.profile_b.document().profile_did,
+                            text: "same text",
+                        },
+                        false,
                         now,
                         || {
                             prepared.fetch_add(1, Ordering::SeqCst);
@@ -1551,10 +1847,13 @@ async fn concurrent_send_intents_claim_one_envelope_and_conflicts_leave_the_stor
     assert_eq!(
         restarted
             .claim_outgoing_intent(
-                "concurrent-intent",
-                &pair.conversation_id,
-                &pair.profile_b.document().profile_did,
-                "same text",
+                DirectMessageIntent {
+                    request_id: "concurrent-intent",
+                    conversation_id: &pair.conversation_id,
+                    recipient_profile_did: &pair.profile_b.document().profile_did,
+                    text: "same text",
+                },
+                false,
                 now + 1,
                 || panic!("a restarted retry must reuse the original signed envelope"),
             )
@@ -1580,10 +1879,13 @@ async fn concurrent_send_intents_claim_one_envelope_and_conflicts_leave_the_stor
     ] {
         assert_eq!(
             restarted.claim_outgoing_intent(
-                "concurrent-intent",
-                conversation_id,
-                recipient,
-                text,
+                DirectMessageIntent {
+                    request_id: "concurrent-intent",
+                    conversation_id,
+                    recipient_profile_did: recipient,
+                    text,
+                },
+                false,
                 now + 1,
                 || panic!("a conflicting intent must be refused before signing"),
             ),
@@ -1602,10 +1904,13 @@ async fn concurrent_send_intents_claim_one_envelope_and_conflicts_leave_the_stor
                 scope.spawn(move || {
                     barrier.wait();
                     store.claim_outgoing_intent(
-                        "conflicting-intent",
-                        &pair.conversation_id,
-                        &pair.profile_b.document().profile_did,
-                        text,
+                        DirectMessageIntent {
+                            request_id: "conflicting-intent",
+                            conversation_id: &pair.conversation_id,
+                            recipient_profile_did: &pair.profile_b.document().profile_did,
+                            text,
+                        },
+                        false,
                         now,
                         || {
                             Ok(test_message(

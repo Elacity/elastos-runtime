@@ -412,7 +412,8 @@ pub(super) async fn home_summary(
             }
             if let Err(err) = apply_contact_request_notification_projection(
                 &state.data_dir,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_authority.as_ref(),
+                state.collaboration_chat_product_port.as_ref(),
                 &mut home_state.notifications,
             ) {
                 return home_error_response(err);
@@ -862,11 +863,11 @@ pub(super) struct ConfiguredContactAuthority {
 /// read response. The contact store remains the only persistent truth.
 pub(super) fn apply_contact_request_notification_projection(
     data_dir: &std::path::Path,
-    contact_store: Option<
-        &std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
-    >,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
     notifications: &mut HomeNotificationsSummary,
 ) -> anyhow::Result<()> {
+    let contact_store = contact_authority.map(|authority| &authority.store);
     let pending = match contact_store {
         Some(store) => store
             .pending_incoming_requests()?
@@ -889,6 +890,16 @@ pub(super) fn apply_contact_request_notification_projection(
             &mut summary,
             data_dir,
             store.local_profile_did(),
+        )?;
+    }
+    if let Some(authority) = contact_authority {
+        if let Some(port) = community {
+            port.community_unread(data_dir, &authority.profile, now_ts())?;
+        }
+        crate::notifications::project_community_message_notifications(
+            &mut summary,
+            data_dir,
+            authority.profile.document().profile_did.as_str(),
         )?;
     }
     crate::notifications::project_contact_request_notifications(&mut summary, &pending);
@@ -5188,8 +5199,8 @@ async fn home_realtime_snapshot(
         contact_authority
             .as_ref()
             .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+            .and_then(|authority| authority.as_ref()),
+        state.collaboration_chat_product_port.as_ref(),
         &mut home_state.notifications,
     )
     .is_err()
