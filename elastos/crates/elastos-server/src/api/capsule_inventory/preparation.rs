@@ -24,6 +24,9 @@ const SCHEMA: &str = "elastos.model.preparation-inventory/v1";
 const RESOURCE: &str = "elastos://capsules/*";
 const MAX_RECORDS: usize = 64;
 const RESERVATION_SECONDS: u64 = 3600;
+/// A finished attempt stays (status, request replay) at least this long
+/// before it may make room under `MAX_RECORDS`.
+const TERMINAL_HISTORY_SECONDS: u64 = 3600;
 const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CAPACITY_WINDOW_BYTES: u64 = 1024 * 1024;
 const ADMITTED_MODEL_CONTEXT_SIZE: u32 = 4096;
@@ -109,6 +112,9 @@ struct PreparationRecord {
     activation: Option<ModelActivation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure_phase: Option<PreparationFailurePhase>,
+    /// When the attempt became Failed, Expired or Cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_at: Option<u64>,
     created_at: u64,
     expires_at: u64,
 }
@@ -499,6 +505,7 @@ impl PreparationInventory {
             {
                 record.state = PreparationState::Expired;
                 record.reserved_bytes = 0;
+                record.settled_at = Some(now);
                 changed = true;
             }
         }
@@ -649,10 +656,11 @@ fn reserve_at(
         }),
         "model retirement pending"
     );
-    // The record cap bounds live work, not history: the oldest finished
-    // attempts that own nothing make room for this one.
+    // The record cap bounds live work, not history: finished attempts that own
+    // nothing and settled over an hour ago make room for this one. Until then
+    // their status and request replay still answer.
     while state.records.len() >= MAX_RECORDS {
-        let Some(oldest) = prunable_record(&state) else {
+        let Some(oldest) = prunable_record(&state, now) else {
             break;
         };
         state.records.remove(oldest);
@@ -712,6 +720,7 @@ fn reserve_at(
         admission_id: String::new(),
         activation: None,
         failure_phase: None,
+        settled_at: None,
         created_at: now,
         expires_at: now
             .checked_add(RESERVATION_SECONDS)
@@ -733,10 +742,14 @@ fn reserve_at(
     Ok(record)
 }
 
-/// The oldest Failed, Expired or Cancelled record that owns nothing: no kept
+/// The longest-settled Failed, Expired or Cancelled record that settled at
+/// least `TERMINAL_HISTORY_SECONDS` before `now` and owns nothing: no kept
 /// stage, no retirement, no other record's admission and no reclaimed history
-/// (which keeps a reclaimed request from becoming a fresh preparation).
-fn prunable_record(state: &PreparationInventory) -> Option<usize> {
+/// (which keeps a reclaimed request from becoming a fresh preparation). A
+/// pruned request id that is replayed starts a new reservation.
+fn prunable_record(state: &PreparationInventory, now: u64) -> Option<usize> {
+    // Records written before `settled_at` existed ended by their deadline.
+    let settled = |record: &PreparationRecord| record.settled_at.unwrap_or(record.expires_at);
     state
         .records
         .iter()
@@ -745,10 +758,11 @@ fn prunable_record(state: &PreparationInventory) -> Option<usize> {
             matches!(
                 record.state,
                 PreparationState::Failed | PreparationState::Expired | PreparationState::Cancelled
-            ) && state
-                .kept_stage
-                .as_ref()
-                .is_none_or(|kept| kept.operation_id != record.operation_id)
+            ) && now.saturating_sub(settled(record)) >= TERMINAL_HISTORY_SECONDS
+                && state
+                    .kept_stage
+                    .as_ref()
+                    .is_none_or(|kept| kept.operation_id != record.operation_id)
                 && state.retirement.as_ref().is_none_or(|retirement| {
                     retirement.operation_id != record.operation_id
                         && retirement.admission_id != record.operation_id
@@ -760,7 +774,7 @@ fn prunable_record(state: &PreparationInventory) -> Option<usize> {
                                 && other.state == PreparationState::Reclaimed))
                 })
         })
-        .min_by_key(|(_, record)| record.created_at)
+        .min_by_key(|(_, record)| settled(record))
         .map(|(index, _)| index)
 }
 
@@ -881,6 +895,7 @@ fn manage(
     if cancel && record.pre_dispatch() && !retiring {
         record.state = PreparationState::Cancelled;
         record.reserved_bytes = 0;
+        record.settled_at = Some(now);
         changed = true;
     } else if cancel && (record.active() || retiring) {
         record.cancel_requested = true;
@@ -1566,6 +1581,7 @@ fn finish_model_retirement(data_dir: &Path) -> anyhow::Result<()> {
     {
         if record.cancel_requested {
             record.state = PreparationState::Cancelled;
+            record.settled_at = Some(now()?);
         }
     }
     state.expire(now()?);
@@ -3545,14 +3561,16 @@ fn settle_failure(
                 inventory.remove_stage()?;
             }
         }
+        let now = now()?;
         record.state = if record.cancel_requested {
             PreparationState::Cancelled
-        } else if now()? >= record.expires_at {
+        } else if now >= record.expires_at {
             PreparationState::Expired
         } else {
             PreparationState::Failed
         };
         record.reserved_bytes = 0;
+        record.settled_at = Some(now);
         if record.admission_id == id {
             snapshot.kept_stage = kept;
         }
@@ -12091,8 +12109,89 @@ server.serve_forever()
         }
     }
 
-    /// The record cap bounds live work, not history: after 100 retries a Use
-    /// still starts, and a record owning admitted bytes or a kept stage stays.
+    /// A finished attempt keeps answering status and replay for an hour; only
+    /// then may it make room under the record cap.
+    #[test]
+    fn model_preparation_record_cap_keeps_an_hour_of_finished_attempts() {
+        let (root, cid) = fixture();
+        let context = context();
+        let (use_method, cancel_method, status_method) =
+            (method("use"), method("cancel"), method("status"));
+        let t0 = now().unwrap();
+        let mut ids = Vec::new();
+        // 63 cancelled attempts and one that just failed fill the cap.
+        for cycle in 0..MAX_RECORDS {
+            let attempt = reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                &format!("retry-{cycle}"),
+                &cid,
+                t0,
+            )
+            .unwrap();
+            if cycle + 1 < MAX_RECORDS {
+                let caller = caller(&context, &cancel_method);
+                manage(root.path(), &caller, &attempt.operation_id, true, t0).unwrap();
+            } else {
+                settle_failure(root.path(), &attempt.operation_id, true, false).unwrap();
+            }
+            ids.push(attempt.operation_id);
+        }
+        let late = |seconds: u64| t0 + TERMINAL_HISTORY_SECONDS + seconds;
+        assert!(
+            reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                "too-soon",
+                &cid,
+                late(0) - 120,
+            )
+            .is_err(),
+            "nothing settled an hour ago, so the cap refuses as before"
+        );
+        let just_failed = ids.last().unwrap();
+        let polled = status(root.path(), &caller(&context, &status_method), just_failed).unwrap();
+        assert_eq!(polled.state, PreparationState::Failed);
+        // An hour later the longest-settled attempt makes room.
+        let next = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "after-an-hour",
+            &cid,
+            late(60),
+        )
+        .unwrap();
+        assert_eq!(next.state, PreparationState::Reserved);
+        assert!(load_operation(root.path(), &ids[0]).is_err());
+        assert_eq!(
+            load_operation(root.path(), just_failed).unwrap().state,
+            PreparationState::Failed
+        );
+        // A replay of the pruned request id starts a new reservation.
+        let caller_cancel = caller(&context, &cancel_method);
+        manage(
+            root.path(),
+            &caller_cancel,
+            &next.operation_id,
+            true,
+            late(60),
+        )
+        .unwrap();
+        let replay = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "retry-0",
+            &cid,
+            late(120),
+        )
+        .unwrap();
+        assert_eq!(replay.state, PreparationState::Reserved);
+        assert_eq!(replay.created_at, late(120));
+        assert_ne!(replay.operation_id, ids[0]);
+    }
+
+    /// After 100 retries spread over more than an hour a Use still starts, and
+    /// a record owning admitted bytes or a kept stage is never pruned.
     #[tokio::test]
     async fn model_preparation_record_cap_prunes_only_ownerless_finished_attempts() {
         for owner_kind in ["kept_stage", "admitted"] {
@@ -12111,32 +12210,32 @@ server.serve_forever()
             };
             let context = context();
             let (use_method, cancel_method) = (method("use"), method("cancel"));
+            let t0 = now().unwrap();
+            let at = |cycle: u64| t0 + cycle * 90;
             for cycle in 0..100 {
-                let attempt = reserve(
+                let attempt = reserve_at(
                     root.path(),
                     &caller(&context, &use_method),
                     &format!("retry-{cycle}"),
                     &owner.package_cid,
+                    at(cycle),
                 )
                 .unwrap();
                 // A failed successor would replace the kept stage, so that
                 // case cycles through Cancel only.
                 if owner_kind == "kept_stage" || cycle % 2 == 0 {
-                    cancel(
-                        root.path(),
-                        &caller(&context, &cancel_method),
-                        &attempt.operation_id,
-                    )
-                    .unwrap();
+                    let caller = caller(&context, &cancel_method);
+                    manage(root.path(), &caller, &attempt.operation_id, true, at(cycle)).unwrap();
                 } else {
                     settle_failure(root.path(), &attempt.operation_id, true, false).unwrap();
                 }
             }
-            let next = reserve(
+            let next = reserve_at(
                 root.path(),
                 &caller(&context, &use_method),
                 "after-100-retries",
                 &owner.package_cid,
+                at(100),
             )
             .unwrap();
             assert_eq!(next.state, PreparationState::Reserved, "{owner_kind}");

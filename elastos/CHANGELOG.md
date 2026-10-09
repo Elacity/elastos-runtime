@@ -55,9 +55,13 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Cancel on the failed attempt removes it, or model-provider startup removes
   it after 7 days or when the current trusted catalogue no longer offers it.
 - Model preparation's 64-record cap now bounds live work only: before refusing
-  a reservation, `reserve_at` prunes the oldest Failed, Expired or Cancelled
-  records that own nothing (no kept stage, no retirement, no other record's
-  admission, no reclaimed history). Admitted, Reclaimed and live records are
+  a reservation, `reserve_at` prunes the longest-settled Failed, Expired or
+  Cancelled records that settled at least an hour ago (new record field
+  `settled_at`; older records count from their deadline) and own nothing (no
+  kept stage, no retirement, no other record's admission, no reclaimed
+  history). Within that hour status and request replay still answer; a pruned
+  request id that is replayed starts a new reservation. If nothing is old
+  enough the cap refuses as before. Admitted, Reclaimed and live records are
   never pruned.
 
 ## [0.8.0-alpha.12]
