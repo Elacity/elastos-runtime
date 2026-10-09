@@ -441,7 +441,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       name: publicTitle(capsule),
       developer: String(model ? capsule.publisher_did : capsule.author || "").trim(),
       category: appCategory(capsule, role),
-      description: model ? "Language model for Assistant." : publicDescription(capsule),
+      description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
@@ -463,6 +463,13 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Published app" : "Local app",
       sourceSummary: capsule.cid ? "SmartWeb" : "Local",
     };
+  }
+
+  // A signed catalogue entry may carry its own one-line description; without
+  // one, Runtime's generic capsule text is replaced by the model's purpose.
+  function modelDescription(capsule) {
+    const description = String(capsule.description || "").trim();
+    return description && !/\bruntime\b/i.test(description) ? description : "Language model for Assistant.";
   }
 
   function appCategory(capsule, role) {

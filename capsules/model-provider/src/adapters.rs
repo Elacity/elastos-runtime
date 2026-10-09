@@ -1753,6 +1753,9 @@ async fn run_local_text_worker_with_timing(
     )
     .then(HostedBackendReport::default);
     let mut local_socket = None;
+    // Holds the local execution slot until this run ends; dropping it arms
+    // the engine's idle release.
+    let mut _local_run = None;
     let (api_url, api_key, body, private_endpoint, context_window_tokens) = match &task.backend {
         LocalTextBackend::OpenRouterDecisions {
             api_url,
@@ -1816,6 +1819,19 @@ async fn run_local_text_worker_with_timing(
             settings,
             requested_output_tokens,
         } => {
+            let run = tokio::select! {
+                biased;
+                _ = task.cancel_rx.wait_for(|cancelled| *cancelled) => {
+                    return Ok(queued_local_cancelled());
+                }
+                run = tokio::time::timeout(
+                    remaining_run_timeout(task.deadline_ms)?,
+                    engines.begin_run(),
+                ) => run
+                    .map_err(|_| map_local_llama_fault(LocalLlamaFault::Timeout))?
+                    .map_err(map_local_llama_fault)?,
+            };
+            _local_run = Some(run);
             let endpoint = engines
                 .endpoint_with_timeout(
                     offer_id,
@@ -2205,6 +2221,16 @@ async fn run_decision_worker(
 
 fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
     match fault {
+        LocalLlamaFault::MemoryUnavailable => AdapterFault {
+            error: RunError {
+                class: ErrorClass::ContextRejected,
+                code: "model_memory_unavailable".into(),
+                message:
+                    "Not enough free memory for this model. Close other apps or choose a smaller model."
+                        .into(),
+            },
+            detail: None,
+        },
         LocalLlamaFault::Timeout => AdapterFault::timeout(
             "model backend timed out",
             "local llama engine health deadline expired",
@@ -2213,6 +2239,20 @@ fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
             "model backend failed",
             "local llama engine was unavailable",
         ),
+    }
+}
+
+fn queued_local_cancelled() -> ReconcileResult {
+    ReconcileResult::Terminal {
+        events: Vec::new(),
+        status: RunStatus::Cancelled,
+        output: None,
+        error: Some(RunError {
+            class: ErrorClass::Cancelled,
+            code: "cancelled".into(),
+            message: "Model run was cancelled before execution.".into(),
+        }),
+        backend_report: None,
     }
 }
 
