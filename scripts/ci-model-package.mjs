@@ -37,14 +37,32 @@ export const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55,
 
 // A fixture pins one model's bytes, license and catalogue capsule manifest.
 // The producer and build-only input proof share SmolLM2's fixture independently
-// of any production catalog.
+// of any production catalog. Every field that reaches a path, URL or
+// PROVENANCE.md is checked against a fixed charset before any download.
+const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+const APACHE_LICENSE_URL = "https://www.apache.org/licenses/LICENSE-2.0.txt";
 export function loadFixture(path) {
   const fixture = JSON.parse(readFileSync(path, "utf8"));
-  const manifest = fixture.capsule_manifest, provenance = manifest?.model_content?.provenance;
+  const manifest = fixture.capsule_manifest, model = manifest?.model_content, provenance = model?.provenance;
   assert(provenance, "fixture requires capsule_manifest.model_content.provenance");
   for (const revision of [provenance.base_revision, provenance.quantized_revision]) assert.match(revision, /^[0-9a-f]{40}$/, "fixture revisions must be full commit hashes");
-  assert.equal(fixture.model.url, `https://huggingface.co/${provenance.quantized_repository}/resolve/${provenance.quantized_revision}/${fixture.model.name}`,
-    "fixture weights must come from the pinned quantized repository revision");
+  for (const repository of [provenance.base_repository, provenance.quantized_repository]) {
+    assert(REPOSITORY.test(repository) && !repository.includes(".."), "fixture repositories must be owner/name identifiers");
+  }
+  assert(FILE_NAME.test(fixture.model.name) && !fixture.model.name.includes("..") && fixture.model.name.endsWith(".gguf"), "fixture weights must be one plain .gguf file name");
+  assert.equal(fixture.license.name, "LICENSE", "fixture license is the package LICENSE file");
+  for (const pin of [fixture.model, fixture.license]) {
+    assert(Number.isSafeInteger(pin.size) && pin.size > 0 && /^[0-9a-f]{64}$/.test(pin.sha256), "fixture pins need a size and SHA-256");
+  }
+  const pinned = `https://huggingface.co/${provenance.quantized_repository}/resolve/${provenance.quantized_revision}/`;
+  assert.equal(fixture.model.url, pinned + fixture.model.name, "fixture weights must come from the pinned quantized repository revision");
+  assert([pinned + "LICENSE", APACHE_LICENSE_URL].includes(fixture.license.url), "fixture license must come from the pinned revision or apache.org");
+  assert(["Q1_0", "Q4_K_M", "Q8_0"].includes(model.quantization), "fixture quantization is unsupported");
+  assert(model.license.spdx_id === "Apache-2.0" && provenance.base_license.spdx_id === "Apache-2.0", "fixture licenses must be Apache-2.0");
+  assert(/^[a-z0-9][a-z0-9._-]{0,127}$/.test(manifest.name), "fixture capsule name must be a plain identifier");
+  assert(manifest.description === undefined || (typeof manifest.description === "string" && Buffer.byteLength(manifest.description) <= 1024
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(manifest.description)), "fixture description must be one bounded line");
   // Runtime titles a catalogue model by its base repository name (read_model.rs).
   assert.equal(provenance.base_repository.split("/").at(-1).replaceAll("-", " "), fixture.display_name,
     "fixture display_name must be the title Runtime derives from base_repository");
@@ -213,8 +231,19 @@ export function producePackage({ inputs, output, publisher, add, fixture }) {
   return { cid: entry.cid, bytes, packageDir, entry };
 }
 
-export function writeCatalogPayload({ output, entries, publishedAt }) {
+// release-signer.py's own pre-signing check (the Runtime's catalogue rules), so
+// the producer never writes a payload the signer would refuse.
+const SIGNER_CHECK = "import importlib.util, json, sys, time\n"
+  + "spec = importlib.util.spec_from_file_location('release_signer', sys.argv[1]); signer = importlib.util.module_from_spec(spec); spec.loader.exec_module(signer)\n"
+  + "signer.check_model_catalog(json.load(sys.stdin), sys.argv[2], int(time.time()))\n";
+export function checkCatalogWithSigner(payload, publisher) {
+  execFileSync("python3", ["-I", "-S", "-c", SIGNER_CHECK, join(root, "scripts/release-signer.py"), publisher],
+    { input: canonical(payload), stdio: ["pipe", "ignore", "pipe"], timeout: 60000 });
+}
+
+export function writeCatalogPayload({ output, publisher, entries, publishedAt }) {
   const payload = catalogPayload(entries, publishedAt);
+  checkCatalogWithSigner(payload, publisher);
   writeFileSync(join(output, "payload.json"), canonical(payload) + "\n", { mode: 0o600, flag: "wx" });
   return payload;
 }
@@ -267,8 +296,9 @@ async function produce(args) {
   const entrypoint = receipt.object_manifest.files.find(file => file.path === receipt.capsule_manifest.entrypoint);
   const kubo = join(data, "bin/kubo");
   assert.deepEqual(fileRecord(kubo, entrypoint.path), entrypoint, "Kubo binary matches its pinned recipe build");
-  const inputs = ownedDirectory(join(ownedDirectory(output), "inputs"));
-  await download(fixture.model, join(inputs, fixture.model.name));
+  const inputs = ownedDirectory(join(ownedDirectory(output), "inputs")), weights = join(inputs, fixture.model.name);
+  assert.equal(dirname(weights), inputs, "fixture weights stay inside OUT/inputs");
+  await download(fixture.model, weights);
   await download(fixture.license, join(inputs, "LICENSE"));
   const repo = mkdtempSync(join(output, ".ipfs-repo-"));
   try {
@@ -277,18 +307,18 @@ async function produce(args) {
   } finally { rmSync(repo, { recursive: true, force: true }); }
 }
 
-// usage: catalog <output-dir> <entry.json>... (catalogue order)
+// usage: catalog <output-dir> <publisher-did> <entry.json>... (catalogue order)
 function catalogCommand(args) {
-  assert(args.length >= 2, "usage: ci-model-package.mjs catalog <output-dir> <entry.json>...");
+  assert(args.length >= 3, "usage: ci-model-package.mjs catalog <output-dir> <publisher-did> <entry.json>...");
   const output = ownedDirectory(resolve(args[0]));
-  writeCatalogPayload({ output, entries: args.slice(1).map(path => JSON.parse(readFileSync(resolve(path), "utf8"))) });
+  writeCatalogPayload({ output, publisher: args[1], entries: args.slice(2).map(path => JSON.parse(readFileSync(resolve(path), "utf8"))) });
   console.log(`payload ${join(output, "payload.json")}`);
 }
 
 function main(args) {
   if (args[0] === "produce") return produce(args.slice(1));
   if (args[0] === "catalog") return catalogCommand(args.slice(1));
-  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <fixture.json> <output-dir> <publisher-did> <kubo-data> | catalog <output-dir> <entry.json>...");
+  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <fixture.json> <output-dir> <publisher-did> <kubo-data> | catalog <output-dir> <publisher-did> <entry.json>...");
   // The package Home's Kubo holds the package; the consumer receives the signed catalogue.
   // A separate package Home is a Carrier holder, so the consumer's Get crosses Carrier.
   const [data, consumer, inputs, output] = args.map(arg => resolve(arg));

@@ -19,15 +19,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - `ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` builds one package
   from a pinned fixture and writes `OUT/entry.json`; PROVENANCE.md takes its
-  license, quantization and repositories from the fixture. The new `catalog CAT
-  ENTRY...` step writes one unsigned payload with 1-8 entries for
-  `release-signer.py --model-catalog`. Rebuilding SmolLM2 still gives
+  license, quantization and repositories from the fixture, whose names, repos,
+  revisions and URLs are checked before any download. The new `catalog CAT DID
+  ENTRY...` step writes one unsigned payload with 1-8 entries only after
+  `release-signer.py`'s own catalogue check accepts it. Rebuilding SmolLM2 still gives
   `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky`.
 - New fixture `scripts/pinned-qwen2.5-1.5b-fixture.json`: Qwen2.5 1.5B Instruct
   Q4_K_M (`Qwen/Qwen2.5-1.5B-Instruct-GGUF` at `91cad511…`, 1,117,320,736 B,
   Apache-2.0, `minimum_memory_mb` 2048).
 - The model projection reports `dispatch_unavailable_reason: "catalog_updated"`
-  for an admission bound to an earlier catalogue head.
+  only for an admission bound to an earlier catalogue head whose package the
+  current trusted catalogue still offers under a current local-use grant.
 
 ## [0.8.0-alpha.12]
 
