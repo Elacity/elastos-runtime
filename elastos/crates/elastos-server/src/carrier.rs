@@ -11251,6 +11251,9 @@ pub(crate) mod tests {
         pub(crate) stall_once: std::collections::BTreeSet<u64>,
         /// Range starts whose every read fails.
         pub(crate) fail_always: std::collections::BTreeSet<u64>,
+        /// While it holds a value below `u64::MAX`, every read of a range
+        /// starting at or after that offset fails.
+        pub(crate) fail_from: Option<Arc<std::sync::atomic::AtomicU64>>,
     }
 
     /// A holder's local IPFS backend for one synthetic closure. It answers only
@@ -11262,6 +11265,7 @@ pub(crate) mod tests {
         pub(crate) serial: Option<tokio::sync::Mutex<()>>,
         pub(crate) stall_once: StdMutex<std::collections::BTreeSet<u64>>,
         pub(crate) fail_always: std::collections::BTreeSet<u64>,
+        pub(crate) fail_from: Option<Arc<std::sync::atomic::AtomicU64>>,
     }
 
     #[async_trait::async_trait]
@@ -11298,7 +11302,13 @@ pub(crate) mod tests {
             if start.is_some_and(|start| self.stall_once.lock().unwrap().remove(&start)) {
                 tokio::time::sleep(Duration::from_secs(7)).await;
             }
-            if start.is_some_and(|start| self.fail_always.contains(&start)) {
+            let failing_from = self
+                .fail_from
+                .as_ref()
+                .map(|from| from.load(std::sync::atomic::Ordering::Acquire));
+            if start.is_some_and(|start| {
+                self.fail_always.contains(&start) || failing_from.is_some_and(|from| start >= from)
+            }) {
                 return Err(ProviderError::Provider("fixture holder read failed".into()));
             }
             if request["op"] != "cat" || request["bounded_read"] != true {
@@ -11491,6 +11501,7 @@ pub(crate) mod tests {
                     serial: behavior.serialized.then(|| tokio::sync::Mutex::new(())),
                     stall_once: StdMutex::new(behavior.stall_once),
                     fail_always: behavior.fail_always,
+                    fail_from: behavior.fail_from,
                 }),
             )
             .await

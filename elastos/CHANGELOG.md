@@ -6,6 +6,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Changed
+
+- A model download that stops because the network failed, or because Home
+  restarted, now continues from where it stopped the next time you press Use,
+  instead of starting over. Progress starts at the part already downloaded.
+
 ### Fixed
 
 - A brief network stall no longer stops a model download. Home tries a part
@@ -22,6 +28,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   `ipfs-provider` bridge holds one I/O lock per request until the answer arrives,
   so one slow read there (or one stalled connection) runs every queued read's
   5 s budget out together, as the alpha.12 Jetson burst of 8 showed (#84).
+- Download resume: `settle_failure` keeps the preparation stage (inventory
+  field `kept_stage`, owned by the Failed/Expired record) after a read or
+  transport failure, a stopping Home, a passed deadline, or restart
+  reconciliation. It removes the stage on cancel and on any integrity, header,
+  authority, policy or storage failure. The next Use takes over the stage only
+  if its `_elastos_object.json` equals the signed `object_manifest`. It
+  re-hashes complete files, cuts a partial file to a 64 KiB boundary, hashes
+  that prefix into the running digest, and fetches only the remaining parts.
+  Progress (`completed_bytes`) comes from disk, not the record, because the
+  record is bumped before fsync. The per-file SHA-256 and package CID checks are
+  unchanged, and any mismatch removes the stage. Reopened files keep the stage
+  checks: owner-only 0600, one link, no symlinks. Free-space checks for the next
+  preparation count the kept bytes already on disk.
 
 ## [0.8.0-alpha.12]
 
