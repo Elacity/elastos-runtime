@@ -913,6 +913,18 @@ button.secondary {
   font-weight: 650;
 }
 
+/* Home's phone stage keeps the composer easy to tap in either orientation. */
+:root[data-el-form-factor="phone"] .composer-icon,
+:root[data-el-form-factor="phone"] .composer-field .composer-emoji-toggle {
+  width: 44px;
+  height: 44px;
+}
+
+:root[data-el-form-factor="phone"] .composer-field #message-input,
+:root[data-el-form-factor="phone"] #send-button {
+  min-height: 44px;
+}
+
 .emoji-popover {
   position: absolute;
   bottom: calc(100% + 0.45rem);
