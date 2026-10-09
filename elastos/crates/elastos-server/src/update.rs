@@ -1425,7 +1425,13 @@ async fn run_upgrade_with_restart(
     match version_order {
         Ordering::Equal if !force && !repair_version => {
             if !check_only && apply_mode == ApplyMode::Normal {
-                repair_current_release(data_dir, source, fetch_fn, carrier_context).await?;
+                Box::pin(repair_current_release(
+                    data_dir,
+                    source,
+                    fetch_fn,
+                    carrier_context,
+                ))
+                .await?;
             }
             println!();
             println!("  Installed release is up to date.");
@@ -1619,14 +1625,14 @@ async fn run_upgrade_with_restart(
             transaction.uses_consumed_layout(),
             "Legacy recovery finished. Run the update again before preparing its new release."
         );
-        crate::setup::repair_installed_support(
+        Box::pin(crate::setup::repair_installed_support(
             transaction.data_dir(),
             transaction.binary_path(),
             source,
             repair_version,
             crate::setup::CatalogueRepair::Required(fetch_fn),
             carrier_context,
-        )
+        ))
         .await?;
         let previous = crate::installed_release::read_without_migration_for_update(
             transaction.data_dir(),
@@ -1813,14 +1819,14 @@ async fn run_upgrade_with_restart(
         transaction.uses_consumed_layout(),
         "Legacy recovery finished. Run the update again before preparing its new release."
     );
-    crate::setup::repair_installed_support(
+    Box::pin(crate::setup::repair_installed_support(
         transaction.data_dir(),
         transaction.binary_path(),
         source,
         repair_version,
         crate::setup::CatalogueRepair::Required(fetch_fn),
         carrier_context,
-    )
+    ))
     .await?;
     let previous = crate::installed_release::read_without_migration_for_update(
         transaction.data_dir(),
@@ -2026,12 +2032,11 @@ async fn repair_current_release(
     fetch_fn: &FetchFn,
     carrier_context: crate::setup::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
-    let bin_path = if source.install_path.is_empty() {
-        default_install_path()
-    } else {
-        PathBuf::from(&source.install_path)
-    };
-    let transaction = InstallTransaction::acquire(data_dir, &bin_path)?;
+    // Only an installed signed release has support to complete.
+    if source.install_path.is_empty() {
+        return Ok(());
+    }
+    let transaction = InstallTransaction::acquire(data_dir, Path::new(&source.install_path))?;
     transaction.recover()?;
     crate::setup::repair_installed_support(
         transaction.data_dir(),

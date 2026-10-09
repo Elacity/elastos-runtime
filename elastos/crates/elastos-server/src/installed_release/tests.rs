@@ -596,9 +596,6 @@ fn setup_reader_admits_binary_only_installation_without_support_reads_or_writes(
         "components changed",
         "components directory",
         "components symlink",
-        "catalogue missing",
-        "catalogue changed",
-        "catalogue symlink",
         "support missing",
         "support changed",
         "support directory",
@@ -631,7 +628,6 @@ fn setup_reader_admits_binary_only_installation_without_support_reads_or_writes(
         let (input, mutation) = case.split_once(' ').unwrap();
         let path = fixture.data.join(match input {
             "components" => "components.json",
-            "catalogue" => "model-catalog.json",
             "support" => "bin/kubo",
             _ => unreachable!(),
         });

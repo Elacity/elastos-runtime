@@ -3633,9 +3633,10 @@ async fn system_update_and_undo_repair_the_installed_release_before_admission() 
 }
 
 #[tokio::test]
-async fn home_starts_offline_without_its_catalogue_and_local_ai_reports_it() {
+async fn home_starts_offline_without_its_catalogue_and_restores_it_once_reachable() {
     let fixture = PrivateFixture::new();
-    let (source, provider, _, _) = release_with_provider_and_catalogue(&fixture);
+    let (source, provider, catalogue_cid, catalogue) =
+        release_with_provider_and_catalogue(&fixture);
     fixture.file(&fixture.data.join("bin/fixture-provider"), &provider, 0o755);
     // The fixture source has no reachable Carrier address.
     repair_installed_support(&fixture.data, &fixture.binary, &source)
@@ -3652,6 +3653,30 @@ async fn home_starts_offline_without_its_catalogue_and_local_ai_reports_it() {
         "{error:#}"
     );
     assert!(crate::api::capsule_inventory::model_catalog_entries(&fixture.data).is_err());
+
+    // The next start reaches the source and restores the pinned catalogue.
+    let (source, server, serving) = crate::setup::tests::carrier_cid_source(
+        &fixture.data,
+        &source,
+        std::collections::HashMap::from([(catalogue_cid.clone(), catalogue.clone())]),
+    )
+    .await;
+    repair_installed_support(&fixture.data, &fixture.binary, &source)
+        .await
+        .unwrap();
+    server.close().await;
+    assert_eq!(serving.await.unwrap(), [catalogue_cid]);
+    assert_eq!(
+        fs::read(fixture.data.join("model-catalog.json")).unwrap(),
+        catalogue
+    );
+    assert_eq!(
+        fs::metadata(fixture.data.join("model-catalog.json"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[tokio::test]
