@@ -319,6 +319,18 @@ async function openAppWindow(side, target) {
     await saveRecoveryKit.click();
     return waitForAppWindow(side, target);
   }
+  const activeWindow = homeGuiFrame.locator(
+    `section.window.window-active[data-target="${target}"] iframe.window-frame`,
+  ).last();
+  if (await activeWindow.isVisible()) return waitForAppWindow(side, target);
+  const dock = homeGuiFrame.locator(
+    `#taskbar-targets .taskbar-item[data-target="${target}"]`,
+  ).first();
+  if (await dock.isVisible()) {
+    await dock.click();
+    await activeWindow.waitFor({ state: "visible", timeout: 20_000 });
+    return waitForAppWindow(side, target);
+  }
   await homeGuiFrame.locator("#launcher-toggle").click();
   const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
   await card.waitFor({ state: "visible", timeout: 10_000 });
@@ -330,18 +342,38 @@ async function openAppWindow(side, target) {
   return waitForAppWindow(side, target);
 }
 
-async function waitForAppWindow(side, target) {
+async function waitForAppWindow(side, target, expectedConversationId = null) {
   const homeGuiFrame = await waitForFrame(side, "home-gui");
-  const windowFrameEl = homeGuiFrame
-    .locator(`section.window[data-target="${target}"] iframe.window-frame`)
-    .last();
-  await windowFrameEl.waitFor({ state: "visible", timeout: 20_000 });
-  const handle = await windowFrameEl.elementHandle();
-  const appFrame = handle ? await handle.contentFrame() : null;
-  assertOk(appFrame, `${side.prefix}: desktop window for ${target} had no content frame`);
-  await poll(`${side.prefix}: ${target} document`, 20_000, 100, async () => (
-    { done: appFrame.url().includes(`/apps/${target}/`) }
-  ));
+  const appFrame = await poll(`${side.prefix}: active ${target} window`, 20_000, 100, async () => {
+    const windowFrameEl = homeGuiFrame
+      .locator(`section.window.window-active[data-target="${target}"] iframe.window-frame`).last();
+    if (!(await windowFrameEl.isVisible())) return { done: false };
+    if (expectedConversationId) {
+      const route = await windowFrameEl.getAttribute("data-route");
+      if (!route) return { done: false };
+      const url = new URL(route, side.base);
+      const ids = [...url.searchParams.getAll("conversation_id"),
+        ...new URLSearchParams(url.hash.replace(/^#/, "")).getAll("conversation_id")];
+      if (url.origin !== new URL(side.base).origin || !url.pathname.startsWith(`/apps/${target}/`)
+        || ids.length !== 1 || ids[0] !== expectedConversationId) return { done: false };
+    }
+    const handle = await windowFrameEl.elementHandle();
+    const frame = handle ? await handle.contentFrame() : null;
+    if (!frame || !frame.url().includes(`/apps/${target}/`)) return { done: false };
+    if (expectedConversationId) {
+      const state = await frame.evaluate(() => ({
+        availableConversationIds: [...document.querySelectorAll("[data-conversation-choice]")]
+          .map(node => node.dataset.conversationChoice || ""),
+        selectedConversationId: document.querySelector("[data-conversation-choice].active")?.dataset?.conversationChoice || "",
+        chatMode: document.body?.dataset?.chatMode || "",
+      })).catch(() => null);
+      try { assertExactDirectConversation({ expectedConversationId, ...state }); }
+      catch { return { done: false }; }
+    }
+    if (!(await handle.evaluate(node => node.closest("section.window")?.classList.contains("window-active"))))
+      return { done: false };
+    return { done: true, value: frame };
+  });
   await appFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
   return appFrame;
 }
@@ -649,7 +681,7 @@ async function openConversation(side, peopleFrame, peerName, expectedConversatio
       .find((node) => node.dataset.conversationId === id);
     exact?.click();
   }, conversationId);
-  const chatFrame = await waitForAppWindow(side, "chat-room");
+  const chatFrame = await waitForAppWindow(side, "chat-room", conversationId);
   await assertDirectSelection(side, chatFrame, conversationId);
   return { frame: chatFrame, conversationId };
 }
@@ -707,6 +739,12 @@ async function selectSharedConversation(side, chatFrame) {
       value: state,
     };
   });
+  // Close the remembered People drawer through its visible user control.
+  const peopleDrawer = chatFrame.locator("#presence-card");
+  if (await peopleDrawer.isVisible()) {
+    await chatFrame.locator("#participant-close").click();
+    await peopleDrawer.waitFor({ state: "hidden", timeout: 10_000 });
+  }
 }
 
 async function openSharedConversation(side) {
@@ -726,7 +764,8 @@ async function openParticipantCard(side, chatFrame, peerName, expectedAction) {
     const result = await chatFrame.evaluate(({ name, action, shouldOpen }) => {
       const peers = [...document.querySelectorAll("#participant-list [data-participant-ref]")]
         .filter((node) => node.querySelector(".participant-name")?.textContent?.trim() === name);
-      const pending = document.querySelector("#participant-card-action")?.disabled === true;
+      const actionButton = document.querySelector("#participant-card-action");
+      const pending = actionButton?.hidden === false && actionButton.disabled === true;
       if (peers.length === 1 && shouldOpen && !pending) {
         peers[0].click();
       }
@@ -786,11 +825,18 @@ async function openDirectFromCommunity(side, chatFrame, peerName, conversationId
   return { frame: chatFrame, conversationId };
 }
 
-async function openDirectFromInbox(side, inboxFrame, message, conversationId) {
+async function openDirectFromInbox(side, inboxFrame, senderName, conversationId) {
+  // Open the actual Inbox through Home before reading its visible notification.
+  inboxFrame = await openAppWindow(side, "inbox");
   await poll(`${side.prefix}: Inbox notification opens its conversation`, 60_000, 1_000, async () => {
-    const result = await inboxFrame.evaluate((needle) => {
+    const result = await inboxFrame.evaluate((name) => {
+      const title = `New message from ${name}`;
+      const body = `${name} sent you a message in Chat.`;
       const entries = [...document.querySelectorAll("#entry-rows .entry-rail-card, #entry-rows .entry-row")]
-        .filter((node) => node.textContent?.includes(needle));
+        .filter((node) => (
+          node.querySelector(".entry-row-title")?.textContent?.trim() === title
+          && node.querySelector(".entry-row-snippet")?.textContent?.trim() === body
+        ));
       if (entries.length !== 1) {
         return { count: entries.length, opened: false };
       }
@@ -800,7 +846,8 @@ async function openDirectFromInbox(side, inboxFrame, message, conversationId) {
       if (!button) {
         row.click();
         const detail = document.querySelector("#entry-detail");
-        if (detail?.textContent?.includes(needle)) {
+        if (detail?.querySelector(".entry-title")?.textContent?.trim() === title
+          && detail?.querySelector(".entry-body")?.textContent?.trim() === body) {
           button = [...detail.querySelectorAll("button")]
             .find((node) => node.textContent?.trim() === "Open");
         }
@@ -810,11 +857,11 @@ async function openDirectFromInbox(side, inboxFrame, message, conversationId) {
         return { count: 1, opened: true };
       }
       return { count: 1, opened: false };
-    }, message);
+    }, senderName);
     assertOk(result.count <= 1, `${side.prefix}: ambiguous Inbox direct notification`, result);
     return { done: result.opened, value: result };
   });
-  const chatFrame = await waitForAppWindow(side, "chat-room");
+  const chatFrame = await waitForAppWindow(side, "chat-room", conversationId);
   await assertDirectSelection(side, chatFrame, conversationId);
   return { frame: chatFrame, conversationId };
 }
@@ -1366,7 +1413,7 @@ async function main() {
     const helloFromA = `Hello from ${SIDE_A.name} @ ${Date.now()}`;
     await runLeg(report, "direct_message_a_to_b", "direct message A to B", async () => {
       await sendMessage(a, aDirect.frame, helloFromA);
-      bDirect = await openDirectFromInbox(b, bInbox, helloFromA, conversationId);
+      bDirect = await openDirectFromInbox(b, bInbox, SIDE_A.name, conversationId);
       await waitForMessage(b, bDirect.frame, helloFromA);
       return { conversation_id: conversationId, message: helloFromA };
     });
