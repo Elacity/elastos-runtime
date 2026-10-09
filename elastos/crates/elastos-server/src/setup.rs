@@ -5,11 +5,12 @@
 //! bounded preparation path, not this archive installer.
 
 use crate::api::capsule_inventory::MAX_MODEL_CATALOG_BYTES;
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -266,6 +267,16 @@ async fn run_with_data_dir(
     } else {
         crate::install_transaction::acquire_installed_writer(&data_dir)?
     };
+    // A setup with no installed release still excludes other writers of its data
+    // root while it removes leftovers and replaces support.
+    let _fresh = if list || _writer.is_some() {
+        None
+    } else {
+        fs::create_dir_all(&data_dir)?;
+        Some(crate::install_transaction::InstallationGuard::acquire(
+            &fs::canonicalize(&data_dir)?,
+        )?)
+    };
     let signed_setup = if list {
         None
     } else {
@@ -290,6 +301,7 @@ async fn run_with_data_dir(
         list_components(&manifest, &data_dir, &platform);
         return Ok(());
     }
+    remove_replacement_leftovers(&data_dir, &manifest, &platform)?;
 
     // Local Elastos pin path only. Trusted source fetch happens over Carrier.
     let ipfs_gateways = build_gateway_list(&data_dir);
@@ -581,15 +593,7 @@ impl SignedSetupMetadata {
     fn install(&self, data_dir: &Path) -> anyhow::Result<()> {
         // Admission of both inputs precedes the first metadata or component write.
         if let Some(bytes) = &self.catalog {
-            atomic_write_file(&data_dir.join(MODEL_CATALOG_FILE), bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    data_dir.join(MODEL_CATALOG_FILE),
-                    fs::Permissions::from_mode(0o600),
-                )?;
-            }
+            write_model_catalog_file(&data_dir.join(MODEL_CATALOG_FILE), bytes)?;
         }
         atomic_write_file(&data_dir.join("components.json"), &self.components)
     }
@@ -621,16 +625,13 @@ async fn admit_installed_setup_metadata(
         .as_u64()
         .filter(|size| (1..=4 * 1024 * 1024).contains(size))
         .ok_or_else(|| anyhow::anyhow!("signed components size is missing or exceeds its bound"))?;
-    let path = format!(
-        "components-{}.json",
-        crate::update::detect_release_platform()
-    );
+    let cid = descriptor["cid"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("signed components CID is missing"))?;
+    // The live source names only its newest release; a signed CID names this one.
     let client = crate::carrier::CarrierClient::connect_trusted_source(source, 15).await?;
     let result = async {
-        let mut components = Vec::with_capacity(size as usize);
-        client
-            .fetch_file_to(&path, &mut components, size, &mut |_, _| Ok(()))
-            .await?;
+        let components = client.fetch_content_bounded(cid, size as usize).await?;
         crate::installed_release::admit_descriptor(
             descriptor,
             &hex::encode(sha2::Sha256::digest(&components)),
@@ -639,12 +640,9 @@ async fn admit_installed_setup_metadata(
         let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
         let catalog = if let Some(trust) = &manifest.model_catalog {
             let bytes = client
-                .fetch_file_bounded(MODEL_CATALOG_FILE, MAX_MODEL_CATALOG_BYTES)
+                .fetch_content_bounded(&trust.head_cid, MAX_MODEL_CATALOG_BYTES)
                 .await?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            crate::api::capsule_inventory::verify_model_catalog(trust, &bytes, now)?;
+            verify_pinned_model_catalog(trust, &bytes)?;
             Some(bytes)
         } else {
             None
@@ -2754,6 +2752,198 @@ pub(crate) fn install_signed_model_catalog(
     Ok(())
 }
 
+const MODEL_CATALOG_UNAVAILABLE: &str = "The signed model catalogue for this release could not be fetched from the trusted source over Carrier. Nothing was changed. Connect to the internet and try again.";
+
+/// Installed custody keeps the pinned signed snapshot; offer discovery checks expiry
+/// at the current time.
+pub(crate) fn verify_pinned_model_catalog(
+    trust: &ModelCatalogConfig,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let envelope: serde_json::Value = serde_json::from_slice(bytes)?;
+    let published_at = envelope["payload"]["published_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("model catalog publication time is missing"))?;
+    crate::api::capsule_inventory::verify_model_catalog(trust, bytes, published_at)?;
+    Ok(())
+}
+
+fn installed_model_catalog_matches(path: &Path, trust: &ModelCatalogConfig) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_MODEL_CATALOG_BYTES as u64)
+        && fs::read(path).is_ok_and(|bytes| verify_catalog_head(&trust.head_cid, &bytes).is_ok())
+}
+
+fn write_model_catalog_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_file(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+async fn fetch_pinned_model_catalog(
+    trust: &ModelCatalogConfig,
+    fetch: &crate::update::FetchFn,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = fetch(trust.head_cid.clone(), Vec::new())
+        .await
+        .map_err(|error| error.context(MODEL_CATALOG_UNAVAILABLE))?;
+    verify_pinned_model_catalog(trust, &bytes)?;
+    Ok(bytes)
+}
+
+/// How repair obtains a missing or mismatched pinned catalogue.
+pub(crate) enum CatalogueRepair<'a> {
+    /// Update and Undo require it, from their own fetch.
+    Required(&'a crate::update::FetchFn),
+    /// Home starts without it; Local AI reports it unavailable until a fetch succeeds.
+    Optional,
+}
+
+const MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI: &str = "The signed model catalogue for Local AI could not be fetched from the trusted source over Carrier. Home starts without it. Connect to the internet and try again.";
+
+/// The pinned catalogue by CID, verified and written owner-only. The caller holds
+/// the installation writer.
+async fn restore_model_catalog(data_dir: &Path, trust: &ModelCatalogConfig) -> anyhow::Result<()> {
+    let bytes = fetch_model_catalog_via_carrier(data_dir, &trust.head_cid).await?;
+    verify_pinned_model_catalog(trust, &bytes)?;
+    write_model_catalog_file(&data_dir.join(MODEL_CATALOG_FILE), &bytes)
+}
+
+/// Local AI retries an unavailable pinned catalogue at most this often.
+const MODEL_CATALOG_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Local AI's retry after Home started without the pinned catalogue. A busy
+/// installation writer, such as a running update, defers the retry.
+pub(crate) async fn retry_model_catalog(data_dir: &Path) -> anyhow::Result<()> {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(components) = crate::api::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    ) else {
+        return Ok(());
+    };
+    let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    let Some(trust) = &manifest.model_catalog else {
+        return Ok(());
+    };
+    if installed_model_catalog_matches(&data_dir.join(MODEL_CATALOG_FILE), trust) {
+        return Ok(());
+    }
+    {
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|at| at.elapsed() < MODEL_CATALOG_RETRY) {
+            anyhow::bail!(MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI);
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let Some(_writer) = crate::install_transaction::acquire_installed_writer(data_dir)? else {
+        return Ok(());
+    };
+    // The writer now excludes updates; the pin is re-read under it.
+    if crate::api::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    )? != components
+    {
+        return Ok(());
+    }
+    restore_model_catalog(data_dir, trust)
+        .await
+        .map_err(|error| error.context(MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI))
+}
+
+/// Completes the installed release's own support before admission: an older updater
+/// left out its pinned catalogue or kept the previous one, or an interrupted Undo or
+/// replacement left another release's component, or none. Only the signed components
+/// name what is fetched, by CID from the trusted source. The caller holds the
+/// installation writer.
+pub(crate) async fn repair_installed_support(
+    data_dir: &Path,
+    binary: &Path,
+    source: &crate::sources::TrustedSource,
+    repair_version: bool,
+    catalogue: CatalogueRepair<'_>,
+    carrier_context: FirstPartyCarrierContext,
+) -> anyhow::Result<()> {
+    let components =
+        crate::installed_release::read_signed_components(data_dir, binary, source, repair_version)?;
+    let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    remove_replacement_leftovers(data_dir, &manifest, &detect_platform())?;
+    if let Some(trust) = &manifest.model_catalog {
+        let dest = data_dir.join(MODEL_CATALOG_FILE);
+        if !installed_model_catalog_matches(&dest, trust) {
+            let restored = match catalogue {
+                CatalogueRepair::Required(fetch) => {
+                    let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
+                    write_model_catalog_file(&dest, &bytes)?;
+                    true
+                }
+                CatalogueRepair::Optional => match restore_model_catalog(data_dir, trust).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("  {MODEL_CATALOG_UNAVAILABLE_FOR_LOCAL_AI} ({error:#})");
+                        false
+                    }
+                },
+            };
+            if restored {
+                println!(
+                    "  Restored the signed model catalogue for this release: {}",
+                    dest.display()
+                );
+            }
+        }
+    }
+    // Admission requires the Home profile on every installation, so repair does too.
+    // Boxed: the update state machine already carries the target's own refresh.
+    let repaired = Box::pin(refresh_support(
+        data_dir,
+        &manifest,
+        &manifest,
+        &detect_platform(),
+        true,
+        carrier_context,
+    ))
+    .await?;
+    if !repaired.is_empty() {
+        println!(
+            "  Repaired installed support from this release: {}",
+            repaired.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The target release's catalogue joins its staged support, so Undo restores the
+/// previous file. A target without a pin removes a present file.
+pub(crate) async fn stage_model_catalog(
+    data_dir: &Path,
+    new: &ComponentsManifest,
+    stage: &Path,
+    fetch: &crate::update::FetchFn,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let relative = PathBuf::from(MODEL_CATALOG_FILE);
+    let installed = data_dir.join(MODEL_CATALOG_FILE);
+    let Some(trust) = &new.model_catalog else {
+        return Ok(fs::symlink_metadata(&installed)
+            .is_ok()
+            .then(|| (relative, PathBuf::new())));
+    };
+    if installed_model_catalog_matches(&installed, trust) {
+        return Ok(None);
+    }
+    let bytes = fetch_pinned_model_catalog(trust, fetch).await?;
+    let dest = stage.join(MODEL_CATALOG_FILE);
+    write_model_catalog_file(&dest, &bytes)?;
+    Ok(Some((relative, dest)))
+}
+
 // ── List mode ───────────────────────────────────────────────────────
 
 fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &str) {
@@ -3103,6 +3293,7 @@ pub(crate) fn admit_release_components(
     manifest: &ComponentsManifest,
     platform: &str,
 ) -> anyhow::Result<()> {
+    refuse_reserved_install_targets(manifest, platform)?;
     for (name, component) in &manifest.external {
         let assets = [
             resolve_platform_info(component, platform),
@@ -3155,20 +3346,19 @@ fn plan_update_support<'a>(
                 .profiles
                 .get("home")
                 .is_some_and(|profile| profile.components.contains(name));
-        let installed = !matches!(
-            component_install_state_for_name(
-                old,
-                data_dir,
-                name,
-                old_component.unwrap_or(component),
-                old_component.and_then(|old| resolve_platform_info(old, platform))
-            ),
-            InstallState::Missing
+        let state = component_install_state_for_name(
+            old,
+            data_dir,
+            name,
+            old_component.unwrap_or(component),
+            old_component.and_then(|old| resolve_platform_info(old, platform)),
         );
-        if !installed && !required {
+        if matches!(state, InstallState::Missing) && !required {
             continue;
         }
-        let artifact = !installed
+        // An interrupted Undo can leave another release's bytes under an unchanged
+        // description; those are replaced like a changed component.
+        let artifact = !matches!(state, InstallState::Installed)
             || component_signature(old_component, platform)
                 != component_signature(Some(component), platform);
         let metadata = component.capsule_metadata.is_some()
@@ -3219,12 +3409,30 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
         return Ok(Vec::new());
     };
     let old_manifest: ComponentsManifest = serde_json::from_slice(old_bytes)?;
-
-    let gateways = build_gateway_list(data_dir);
     // An operator or bootstrap-only installation has no Home to complete.
     let home = crate::api::browser_capsules::installed_home_document(data_dir).is_some();
+    refresh_support(
+        data_dir,
+        &old_manifest,
+        &new_manifest,
+        platform,
+        home,
+        carrier_context,
+    )
+    .await
+}
+
+async fn refresh_support(
+    data_dir: &Path,
+    old_manifest: &ComponentsManifest,
+    new_manifest: &ComponentsManifest,
+    platform: &str,
+    home: bool,
+    carrier_context: FirstPartyCarrierContext,
+) -> anyhow::Result<Vec<String>> {
+    let gateways = build_gateway_list(data_dir);
     let mut refreshed = Vec::new();
-    for item in plan_update_support(data_dir, &old_manifest, &new_manifest, platform, home) {
+    for item in plan_update_support(data_dir, old_manifest, new_manifest, platform, home) {
         let SupportUpdate {
             name,
             component,
@@ -3264,7 +3472,7 @@ pub(crate) async fn refresh_installed_components_for_update_in_context(
                     carrier_context,
                 )
                 .await?;
-                write_cache_metadata(&new_manifest, Some(info), platform, name, &dest)?;
+                write_cache_metadata(new_manifest, Some(info), platform, name, &dest)?;
             }
             refreshed.push(name.to_string());
         }
@@ -3483,6 +3691,11 @@ pub(crate) async fn stage_update_support(
         write_artifact_sha256_receipt(&dest, &entry.sha256)?;
         paths.insert(relative, dest);
     }
+    if let Some((relative, source)) =
+        stage_model_catalog(data_dir, &new, stage.path(), fetch).await?
+    {
+        paths.insert(relative, source);
+    }
     // Journal the first absent parent as one tree. Recovery then removes a new
     // bundle's directories as well as its files, preserving the old support set.
     let mut complete = std::collections::BTreeMap::new();
@@ -3617,8 +3830,44 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    crate::carrier::fetch_file_from_trusted_source_bound(&source, cid, release_path, 15, bind_addr)
-        .await
+    crate::carrier::fetch_file_from_trusted_source_bound(
+        &source,
+        cid,
+        release_path,
+        15,
+        bind_addr,
+        crate::carrier::MAX_DOWNLOAD_BYTES,
+    )
+    .await
+}
+
+/// The whole catalogue fetch, every transport attempt included.
+const MODEL_CATALOG_FETCH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 2 } else { 30 });
+
+/// The pinned catalogue by CID from the trusted source: 128 KiB and one total deadline.
+pub(crate) async fn fetch_model_catalog_via_carrier(
+    data_dir: &Path,
+    cid: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let source = crate::sources::load_trusted_sources(data_dir)?
+        .default_source()
+        .cloned()
+        .ok_or_else(missing_trusted_source_error)?;
+    let bind_addr = first_party_carrier_bind_addr(data_dir, FirstPartyCarrierContext::Runtime)?;
+    tokio::time::timeout(
+        MODEL_CATALOG_FETCH_DEADLINE,
+        crate::carrier::fetch_file_from_trusted_source_bound(
+            &source,
+            Some(cid),
+            MODEL_CATALOG_FILE,
+            15,
+            bind_addr,
+            MAX_MODEL_CATALOG_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("model catalogue fetch exceeded its deadline"))?
 }
 
 fn require_component_not_model(name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -4123,12 +4372,12 @@ fn ensure_bundle_executable_link(
     anyhow::bail!("component '{name}' bundle executable links are unsupported on this platform")
 }
 
-fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
+/// A scratch name beside `dest`, so the final rename stays on one filesystem.
+fn sibling_scratch(dest: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let parent = dest
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
     fs::create_dir_all(parent)?;
-
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
         dest.file_name()
@@ -4136,54 +4385,241 @@ fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
             .unwrap_or("elastos"),
         std::process::id()
     ));
+    Ok((parent.to_path_buf(), tmp))
+}
 
-    fs::write(&tmp, data)?;
+fn sync_path(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+/// Flushes a staged tree, files before their directories, before it is published.
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            sync_tree(&entry?.path())?;
+        }
+        sync_path(path)
+    } else if metadata.is_file() {
+        sync_path(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let (parent, tmp) = sibling_scratch(dest)?;
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, dest)?;
+    sync_path(&parent)?;
     Ok(())
 }
 
 fn atomic_copy_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
-    fs::create_dir_all(parent)?;
-
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("elastos"),
-        std::process::id()
-    ));
-
+    let (parent, tmp) = sibling_scratch(dest)?;
     fs::copy(src, &tmp)?;
+    sync_path(&tmp)?;
     fs::rename(&tmp, dest)?;
+    sync_path(&parent)?;
     Ok(())
 }
 
+const REPLACEMENT_SUFFIX: &str = ".elastos-replace";
+
+/// Beside an installed tree: its staged copy before the exchange, the previous tree
+/// after it. One fixed name per target, so any later writer finds what a crash left.
+fn replacement_scratch(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let mut scratch = std::ffi::OsString::from(".");
+    scratch.push(name);
+    scratch.push(REPLACEMENT_SUFFIX);
+    parent.join(scratch)
+}
+
+/// Removes a leftover replacement only when it is a real directory owned by `owner`.
+/// Anything else under that name is left in place and reported; returns whether the
+/// name is free.
+fn remove_replacement_leftover(path: &Path, owner: u32) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.is_dir() && metadata.uid() == owner => {
+            fs::remove_dir_all(path)?;
+            Ok(true)
+        }
+        Ok(_) => {
+            eprintln!(
+                "Left in place: {} is not an interrupted replacement of this installation.",
+                path.display()
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Publishes a complete copy of `src` at `dest`. The previous tree stays in place
+/// until one atomic exchange, so an interruption leaves either tree, never neither.
 fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Destination has no parent: {}", dest.display()))?;
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        anyhow::bail!("Destination has no parent: {}", dest.display());
+    };
     fs::create_dir_all(parent)?;
+    let scratch = replacement_scratch(parent, name);
+    anyhow::ensure!(
+        remove_replacement_leftover(&scratch, unsafe { libc::geteuid() })?,
+        "cannot stage {}: its replacement name is taken",
+        dest.display()
+    );
+    let swapped = (|| {
+        copy_dir_recursive(src, &scratch)?;
+        sync_tree(&scratch)?;
+        sync_path(parent)?;
+        replace_directory(&scratch, dest)?;
+        sync_path(parent)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    // Before the exchange the scratch holds the staged copy, after it the previous tree.
+    let removed = remove_path(&scratch);
+    swapped.and(removed)
+}
 
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("elastos"),
-        std::process::id()
-    ));
+/// Every installed path this manifest names on `platform`.
+fn manifest_install_targets<'a>(manifest: &'a ComponentsManifest, platform: &str) -> Vec<&'a str> {
+    let mut targets = Vec::new();
+    for component in manifest.external.values() {
+        targets.extend(resolve_install_path(
+            component,
+            resolve_platform_info(component, platform),
+        ));
+        targets.extend(component.capsule_metadata.as_ref().and_then(|metadata| {
+            resolve_component_capsule_metadata_install_path(
+                metadata,
+                resolve_component_capsule_metadata_platform_info(metadata, platform),
+            )
+        }));
+    }
+    targets
+}
 
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp)?;
+/// Replacement scratch names are reserved; no installed target may take one.
+fn refuse_reserved_install_targets(
+    manifest: &ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<()> {
+    for target in manifest_install_targets(manifest, platform) {
+        anyhow::ensure!(
+            !Path::new(target).components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .ends_with(REPLACEMENT_SUFFIX)
+            }),
+            "install path {target} uses the reserved replacement suffix {REPLACEMENT_SUFFIX}"
+        );
     }
-    copy_dir_recursive(src, &tmp)?;
-    if dest.exists() {
-        fs::remove_dir_all(dest)?;
-    }
-    fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// Removes what an interrupted replacement left beside the installed trees this
+/// manifest names. Only owned real directories under the data root are visited
+/// or removed, and never a path the manifest names or one that holds such a path.
+/// The caller holds the installation writer.
+fn remove_replacement_leftovers(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<()> {
+    refuse_reserved_install_targets(manifest, platform)?;
+    let targets = manifest_install_targets(manifest, platform);
+    let named: std::collections::BTreeSet<_> =
+        targets.iter().map(|target| data_dir.join(target)).collect();
+    let owner = unsafe { libc::geteuid() };
+    for relative in targets {
+        let relative = Path::new(relative);
+        let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
+            continue;
+        };
+        let mut directory = data_dir.to_path_buf();
+        let mut real = true;
+        for part in parent.components() {
+            let std::path::Component::Normal(part) = part else {
+                real = false;
+                break;
+            };
+            directory.push(part);
+            // Owned real directories only; a symlinked or foreign parent is left alone.
+            if !fs::symlink_metadata(&directory).is_ok_and(|meta| {
+                use std::os::unix::fs::MetadataExt;
+                meta.is_dir() && meta.uid() == owner
+            }) {
+                real = false;
+                break;
+            }
+        }
+        let leftover = replacement_scratch(&directory, name);
+        if real && !named.iter().any(|target| target.starts_with(&leftover)) {
+            remove_replacement_leftover(&leftover, owner)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Moves `staged` to `dest` in one step: a rename when `dest` is absent, else an
+/// exchange that leaves the previous entry at `staged`.
+fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
+    if fs::symlink_metadata(dest).is_err() {
+        fs::rename(staged, dest)?;
+        return Ok(());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
+        let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
+        // Both paths name owned entries on the same filesystem. An unsupported
+        // exchange fails with the previous installation still in place.
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                staged.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                staged.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("atomic replacement failed; previous files preserved");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("atomic replacement is unsupported on this host")
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -4244,6 +4680,91 @@ pub(crate) mod tests {
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
     use elastos_common::{CapsuleManifest, CapsuleRole};
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn replacement_manifest(targets: &[(&str, &str)]) -> ComponentsManifest {
+        let external: serde_json::Map<_, _> = targets
+            .iter()
+            .map(|(name, path)| {
+                (
+                    name.to_string(),
+                    serde_json::json!({"install_path":path, "platforms":{"*":{}}}),
+                )
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "external":external, "capsules":{}, "profiles":{}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn replacement_leftovers_remove_only_owned_real_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let outside = root.path().join("owner-files");
+        fs::create_dir_all(data.join("tools")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"owner data").unwrap();
+        let manifest = replacement_manifest(&[
+            ("staged", "tools/staged"),
+            ("linked", "tools/linked"),
+            ("file", "tools/file"),
+        ]);
+        let staged = data.join("tools/.staged.elastos-replace");
+        let linked = data.join("tools/.linked.elastos-replace");
+        let file = data.join("tools/.file.elastos-replace");
+        fs::create_dir_all(staged.join("partial")).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        fs::write(&file, b"not a staged tree").unwrap();
+
+        remove_replacement_leftovers(&data, &manifest, &detect_platform()).unwrap();
+
+        assert!(!staged.exists());
+        assert!(fs::symlink_metadata(&linked).unwrap().is_symlink());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"owner data");
+        assert_eq!(fs::read(&file).unwrap(), b"not a staged tree");
+
+        // A tree another account owns stays where it is.
+        fs::create_dir_all(staged.join("partial")).unwrap();
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(1);
+        assert!(!remove_replacement_leftover(&staged, foreign).unwrap());
+        assert!(staged.join("partial").is_dir());
+        // Staging refuses a replacement name it cannot reclaim.
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        assert!(atomic_copy_dir(&source, &data.join("tools/linked")).is_err());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"owner data");
+    }
+
+    #[test]
+    fn replacement_suffix_is_reserved_for_scratch() {
+        for collides in [
+            "tools/.bundle.elastos-replace",
+            "tools/.bundle.elastos-replace/bar",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            let manifest =
+                replacement_manifest(&[("bundle", "tools/bundle"), ("collides", collides)]);
+            let installed = data.join(collides).join("installed");
+            fs::create_dir_all(&installed).unwrap();
+
+            let error =
+                remove_replacement_leftovers(data, &manifest, &detect_platform()).unwrap_err();
+            assert!(
+                error.to_string().contains("reserved"),
+                "{collides}: {error:#}"
+            );
+            assert!(installed.is_dir(), "{collides}");
+            assert!(
+                admit_release_components(&manifest, &detect_platform())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reserved"),
+                "{collides}"
+            );
+        }
+    }
 
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
@@ -7865,7 +8386,24 @@ pub(crate) mod tests {
         let endpoint = server.clone();
         let writer_parent = data.clone();
         let oversized_catalog = case == "catalog size";
-        let effect_cid = catalog_head_cid(b"Carrier component").unwrap();
+        // Every signed input is fetched by its CID; the source's newest names never apply.
+        let names = HashMap::from([
+            (
+                catalog_head_cid(b"Carrier component").unwrap(),
+                "effect".to_owned(),
+            ),
+            (
+                catalog_head_cid(&components).unwrap(),
+                format!(
+                    "components-{}.json",
+                    crate::update::detect_release_platform()
+                ),
+            ),
+            (
+                catalog_head_cid(&catalog).unwrap(),
+                MODEL_CATALOG_FILE.to_owned(),
+            ),
+        ]);
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -7878,13 +8416,11 @@ pub(crate) mod tests {
                         .await
                         .unwrap();
                     let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    // The signed component CID is fetched by CID, not by its release name.
-                    if request["op"] == "content_fetch" {
-                        assert_eq!(request["cid"], effect_cid);
-                        request["path"] = "effect".into();
-                    } else {
-                        assert_ne!(request["path"], "effect", "signed CID fetched by name");
-                    }
+                    assert_eq!(
+                        request["op"], "content_fetch",
+                        "signed input fetched by name"
+                    );
+                    request["path"] = names[request["cid"].as_str().unwrap()].clone().into();
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
                             .is_err(),
@@ -7944,6 +8480,75 @@ pub(crate) mod tests {
             };
             assert_eq!(requests.load(Ordering::SeqCst), expected_requests, "{case}");
         }
+    }
+
+    /// `source` reachable over Carrier, serving exactly `items` by CID, never by
+    /// name. Returns the saved source and the CIDs requested once the server closes.
+    pub(crate) async fn carrier_cid_source(
+        data_dir: &Path,
+        source: &TrustedSource,
+        items: HashMap<String, Vec<u8>>,
+    ) -> (
+        TrustedSource,
+        iroh::Endpoint,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![b"elastos/carrier/1".to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = crate::carrier::tests::wait_for_direct_endpoint_addr(&server).await;
+        let mut reachable = source.clone();
+        reachable.connect_ticket = crate::carrier::tests::encode_ticket_for(address);
+        reachable.publisher_node_id = server.id().to_string();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(reachable.clone());
+        save_trusted_sources(data_dir, &sources).unwrap();
+        fs::write(
+            data_dir.join("config.toml"),
+            "carrier_bind_addr = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            let mut requested = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(connection) = incoming.await else {
+                    break;
+                };
+                while let Ok((mut send, recv)) = connection.accept_bi().await {
+                    let mut request = String::new();
+                    tokio::io::BufReader::new(recv)
+                        .read_line(&mut request)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    assert_eq!(
+                        request["op"], "content_fetch",
+                        "signed input fetched by name"
+                    );
+                    let cid = request["cid"].as_str().unwrap().to_owned();
+                    requested.push(cid.clone());
+                    let Some(bytes) = items.get(&cid) else {
+                        continue;
+                    };
+                    send.write_all(&(bytes.len() as u64).to_be_bytes())
+                        .await
+                        .unwrap();
+                    send.write_all(bytes).await.unwrap();
+                    send.finish().unwrap();
+                }
+            }
+            requested
+        });
+        (reachable, server, serving)
     }
 
     pub(crate) async fn carrier_component_download_fixture(
