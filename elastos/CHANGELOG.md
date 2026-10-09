@@ -23,9 +23,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 ### Developer detail
 
 - `model-provider` admits a local engine right before spawn when free memory
-  (Linux `MemAvailable`, macOS free + inactive pages) covers GGUF weights once,
-  the f16 KV cache at the configured context, batch scratch, and headroom of
-  max(10% RAM, 1 GiB). Refusal is `model_memory_unavailable`.
+  covers GGUF weights once, the f16 KV cache at the configured context, batch
+  scratch, and headroom of max(10% RAM, 1 GiB). Free memory is Linux
+  `MemAvailable` capped by every cgroup v2 ancestor's `memory.max -
+  memory.current` (cgroup v1: `MemAvailable` only), or macOS free (minus
+  speculative) + purgeable + file-backed pages, never inactive anonymous pages.
+  Refusal is `model_memory_unavailable`.
 - Local runs share one execution slot; an engine idle for 60 s is stopped and
   opening another model closes the previous engine. llama-server now gets
   `--batch-size 128 --ubatch-size 128 --cache-ram 0` (all accepted by b10516).

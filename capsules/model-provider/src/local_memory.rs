@@ -291,13 +291,39 @@ fn metadata(reader: impl Read) -> std::io::Result<Metadata> {
     })
 }
 
-/// Reads the live host memory: Linux `MemAvailable`, macOS free + inactive
-/// pages.
+/// Reads the live host memory. Linux: `MemAvailable`, lowered by any cgroup v2
+/// ancestor limit. macOS: free, purgeable and file-backed pages only.
 pub(crate) fn host_memory() -> Result<HostMemory, LocalLlamaFault> {
+    // Debug builds only, for the process tests that run this binary: a fixed
+    // reading keeps them independent of the host's load. Release ignores it.
+    #[cfg(debug_assertions)]
+    if let Some(bytes) = std::env::var("ELASTOS_MODEL_PROVIDER_TEST_FREE_MEMORY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Ok(HostMemory {
+            total: bytes,
+            available: bytes,
+        });
+    }
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").map_err(|_| LocalLlamaFault::Failed)?;
-        parse_meminfo(&text)
+        let host = parse_meminfo(&text)?;
+        // cgroup v1 hosts have no `0::` line; they keep plain MemAvailable.
+        let available = match std::fs::read_to_string("/proc/self/cgroup") {
+            Ok(groups) => cgroup_available(
+                &groups,
+                Path::new("/sys/fs/cgroup"),
+                host.available,
+                |path| std::fs::read_to_string(path).ok(),
+            ),
+            Err(_) => host.available,
+        };
+        Ok(HostMemory {
+            total: host.total,
+            available,
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -325,6 +351,36 @@ fn parse_meminfo(text: &str) -> Result<HostMemory, LocalLlamaFault> {
         return Err(LocalLlamaFault::Failed);
     }
     Ok(HostMemory { total, available })
+}
+
+/// Lowers `available` to the tightest `memory.max - memory.current` among the
+/// process's cgroup v2 ancestors. A missing or unreadable level has no limit.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_available(
+    groups: &str,
+    root: &Path,
+    mut available: u64,
+    read: impl Fn(&Path) -> Option<String>,
+) -> u64 {
+    let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return available;
+    };
+    let mut path = root.to_path_buf();
+    for part in Path::new(group).components() {
+        if let std::path::Component::Normal(name) = part {
+            path.push(name);
+        }
+    }
+    while path.starts_with(root) {
+        let number = |file: &str| read(&path.join(file))?.trim().parse::<u64>().ok();
+        if let (Some(limit), Some(used)) = (number("memory.max"), number("memory.current")) {
+            available = available.min(limit.saturating_sub(used));
+        }
+        if path == root || !path.pop() {
+            break;
+        }
+    }
+    available
 }
 
 #[cfg(target_os = "macos")]
@@ -372,12 +428,44 @@ fn macos_host_memory() -> Result<HostMemory, LocalLlamaFault> {
     }
     // SAFETY: host_statistics64 succeeded.
     let stats = unsafe { stats.assume_init() };
-    let available = (u64::from(stats.free_count) + u64::from(stats.inactive_count))
-        .checked_mul(page as u64)
-        .ok_or(fail)?;
+    let available = macos_available(
+        u64::from(stats.free_count),
+        u64::from(stats.speculative_count),
+        u64::from(stats.purgeable_count),
+        u64::from(stats.external_page_count),
+        page as u64,
+    )
+    .ok_or(fail)?;
     Ok(HostMemory {
         total,
         available: available.min(total),
+    })
+}
+
+/// Pages macOS can hand out without compressing or swapping: free pages
+/// (whose count includes speculative read-ahead), purgeable pages, and
+/// file-backed pages (speculative pages are file-backed, so counted once).
+/// Inactive anonymous memory is excluded: reclaiming it needs the compressor.
+#[cfg(any(target_os = "macos", test))]
+fn macos_available(
+    free: u64,
+    speculative: u64,
+    purgeable: u64,
+    file_backed: u64,
+    page: u64,
+) -> Option<u64> {
+    free.saturating_sub(speculative)
+        .checked_add(purgeable)?
+        .checked_add(file_backed)?
+        .checked_mul(page)
+}
+
+/// Ample fixed memory, so test engines never depend on the host's load.
+#[cfg(test)]
+pub(crate) fn test_host_memory() -> Result<HostMemory, LocalLlamaFault> {
+    Ok(HostMemory {
+        total: 8 * 1024 * MIB,
+        available: 6 * 1024 * MIB,
     })
 }
 
@@ -436,6 +524,38 @@ mod tests {
         assert_eq!(
             parse_meminfo("MemTotal: 8000000 kB\n"),
             Err(LocalLlamaFault::Failed)
+        );
+    }
+
+    #[test]
+    fn macos_estimate_excludes_inactive_anonymous_pages() {
+        // vm_statistics64 fixture: 100 free (20 of them speculative), 5
+        // purgeable, 300 file-backed; inactive anonymous pages are not an input.
+        assert_eq!(macos_available(100, 20, 5, 300, 16384), Some(385 * 16384));
+        assert_eq!(macos_available(10, 20, 0, 0, 16384), Some(0));
+    }
+
+    #[test]
+    fn cgroup_v2_ancestor_limit_lowers_available() {
+        let root = crate::test_support::temp_root_path("model-provider-memory", "cgroup");
+        let leaf = root.join("system.slice/home.service");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let groups = "0::/system.slice/home.service\n";
+        // No limit files anywhere: MemAvailable stands.
+        assert_eq!(cgroup_available(groups, &root, 6 * GIB, read), 6 * GIB);
+        // The leaf is unlimited; its parent caps at 2 GiB with 1.5 GiB used.
+        std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        std::fs::write(leaf.join("memory.current"), "100\n").unwrap();
+        let parent = root.join("system.slice");
+        std::fs::write(parent.join("memory.max"), format!("{}\n", 2 * GIB)).unwrap();
+        std::fs::write(parent.join("memory.current"), format!("{}\n", 3 * GIB / 2)).unwrap();
+        assert_eq!(cgroup_available(groups, &root, 6 * GIB, read), GIB / 2);
+        // A tighter MemAvailable still wins; cgroup v1 (no 0:: line) is unchanged.
+        assert_eq!(cgroup_available(groups, &root, MIB, read), MIB);
+        assert_eq!(
+            cgroup_available("4:memory:/home\n", &root, 6 * GIB, read),
+            6 * GIB
         );
     }
 

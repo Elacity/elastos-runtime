@@ -180,7 +180,10 @@ impl LocalLlamaEngines {
             execution: Arc::new(Semaphore::new(1)),
             idle_release: Arc::new(std::sync::Mutex::new(None)),
             idle_delay: IDLE_RELEASE_DELAY,
+            #[cfg(not(test))]
             read_host_memory: crate::local_memory::host_memory,
+            #[cfg(test)]
+            read_host_memory: crate::local_memory::test_host_memory,
         }
     }
 
@@ -1118,12 +1121,8 @@ mod tests {
             sha256: sha256_file(&model_path),
             path: model_path.to_string_lossy().into_owned(),
         };
-        let engines = LocalLlamaEngines {
-            read_host_memory: plenty_of_memory,
-            ..LocalLlamaEngines::default()
-        };
         (
-            engines,
+            LocalLlamaEngines::default(),
             engine,
             model,
             LocalLlamaSettings {
@@ -1222,13 +1221,6 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    fn plenty_of_memory() -> Result<crate::local_memory::HostMemory, LocalLlamaFault> {
-        Ok(crate::local_memory::HostMemory {
-            total: 8 * GIB,
-            available: 6 * GIB,
-        })
-    }
-
     fn scarce_memory() -> Result<crate::local_memory::HostMemory, LocalLlamaFault> {
         Ok(crate::local_memory::HostMemory {
             total: 8 * GIB,
@@ -1247,7 +1239,7 @@ mod tests {
         assert_eq!(event_count(&events, "start:"), 0);
         assert!(!engines.retains_artifacts().await);
 
-        engines.read_host_memory = plenty_of_memory;
+        engines.read_host_memory = crate::local_memory::test_host_memory;
         engines
             .endpoint("offer", &engine, &model, &settings)
             .await
