@@ -30,6 +30,79 @@ pub(crate) enum LocalLlamaFault {
     Timeout,
 }
 
+pub(crate) enum LocalTimingStage {
+    ArtifactValidationStarted,
+    ArtifactValidationCompleted,
+    GuardStarted,
+    GuardInitialized,
+    EngineReady,
+    EngineTimeout,
+    EngineFailed,
+    RunStarted,
+    InputTokensStarted,
+    InputTokensCompleted,
+    GenerationStarted,
+    FirstDelta,
+    StreamCompleted,
+    GenerationCompleted,
+    TerminalApplied,
+    RunTimeout,
+    RunFailed,
+}
+
+pub(crate) struct LocalTiming(Instant);
+
+impl LocalTiming {
+    fn enabled() -> bool {
+        std::env::var_os("ELASTOS_MODEL_TIMING_DIAGNOSTICS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    }
+
+    pub(crate) fn acknowledgement(&self, terminal: bool, outcome: &str, started: Instant) {
+        if Self::enabled() {
+            let kind = if terminal { "terminal" } else { "delta" };
+            let duration_ms = started.elapsed().as_millis();
+            let elapsed_ms = self.0.elapsed().as_millis();
+            eprintln!(
+                "[model-provider] local acknowledgement kind={kind} outcome={outcome} elapsed_ms={elapsed_ms} duration_ms={duration_ms}"
+            );
+        }
+    }
+
+    pub(crate) fn start() -> Self {
+        Self(Instant::now())
+    }
+
+    pub(crate) fn record(&self, stage: LocalTimingStage) {
+        if !Self::enabled() {
+            return;
+        }
+        let name = match stage {
+            LocalTimingStage::ArtifactValidationStarted => "artifact_validation_started",
+            LocalTimingStage::ArtifactValidationCompleted => "artifact_validation_completed",
+            LocalTimingStage::GuardStarted => "guard_started",
+            LocalTimingStage::GuardInitialized => "guard_initialized",
+            LocalTimingStage::EngineReady => "engine_ready",
+            LocalTimingStage::EngineTimeout => "engine_timeout",
+            LocalTimingStage::EngineFailed => "engine_failed",
+            LocalTimingStage::RunStarted => "run_started",
+            LocalTimingStage::InputTokensStarted => "input_tokens_started",
+            LocalTimingStage::InputTokensCompleted => "input_tokens_completed",
+            LocalTimingStage::GenerationStarted => "generation_started",
+            LocalTimingStage::FirstDelta => "first_delta",
+            LocalTimingStage::StreamCompleted => "stream_completed",
+            LocalTimingStage::GenerationCompleted => "generation_completed",
+            LocalTimingStage::TerminalApplied => "terminal_applied",
+            LocalTimingStage::RunTimeout => "run_timeout",
+            LocalTimingStage::RunFailed => "run_failed",
+        };
+        eprintln!(
+            "[model-provider] local timing stage={name} elapsed_ms={}",
+            self.0.elapsed().as_millis()
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
@@ -109,6 +182,27 @@ impl LocalLlamaEngines {
         settings: &LocalLlamaSettings,
         timeout: Duration,
     ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
+        let timing = LocalTiming::start();
+        let result = self
+            .endpoint_with_timing(offer_id, engine, model, settings, timeout, &timing)
+            .await;
+        timing.record(match &result {
+            Ok(_) => LocalTimingStage::EngineReady,
+            Err(LocalLlamaFault::Timeout) => LocalTimingStage::EngineTimeout,
+            Err(LocalLlamaFault::Failed) => LocalTimingStage::EngineFailed,
+        });
+        result
+    }
+
+    async fn endpoint_with_timing(
+        &self,
+        offer_id: &str,
+        engine: &LocalArtifactConfig,
+        model: &LocalArtifactConfig,
+        settings: &LocalLlamaSettings,
+        timeout: Duration,
+        timing: &LocalTiming,
+    ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
         let deadline = Instant::now() + timeout;
         let mut engines = tokio::time::timeout(timeout, self.engines.lock())
             .await
@@ -125,8 +219,10 @@ impl LocalLlamaEngines {
             close_engine(&mut engines, offer_id).await?;
         }
 
+        timing.record(LocalTimingStage::ArtifactValidationStarted);
         revalidate_local_artifact(engine, true, deadline).map_err(|_| deadline_fault(deadline))?;
         revalidate_local_artifact(model, false, deadline).map_err(|_| deadline_fault(deadline))?;
+        timing.record(LocalTimingStage::ArtifactValidationCompleted);
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
@@ -161,6 +257,7 @@ impl LocalLlamaEngines {
         let models_url = format!("{base_url}/v1/models");
         let (child, liveness, guard_group) =
             spawn_managed_engine(engine, model, settings, &target, &alias).await?;
+        timing.record(LocalTimingStage::GuardStarted);
         let health_timeout = Duration::from_millis(settings.health_timeout_ms)
             .min(deadline.saturating_duration_since(Instant::now()));
         let shutdown_timeout = Duration::from_millis(settings.shutdown_timeout_ms);
@@ -187,6 +284,7 @@ impl LocalLlamaEngines {
                 match initialized {
                     Err(fault) => Err(fault),
                     Ok(()) => {
+                        timing.record(LocalTimingStage::GuardInitialized);
                         wait_until_healthy(
                             &mut running.child,
                             running.guard_group,
@@ -351,6 +449,27 @@ fn engine_arguments(
     target: &EngineTarget,
     alias: &str,
 ) -> Vec<OsString> {
+    engine_arguments_with_cpu_budget(
+        model_path,
+        settings,
+        target,
+        alias,
+        std::thread::available_parallelism().ok(),
+    )
+}
+
+fn engine_arguments_with_cpu_budget(
+    model_path: &str,
+    settings: &LocalLlamaSettings,
+    target: &EngineTarget,
+    alias: &str,
+    available_parallelism: Option<std::num::NonZeroUsize>,
+) -> Vec<OsString> {
+    // Runtime owns the saved thread ceilings. Reduce the actual worker count
+    // to this host's CPU budget without changing the activation binding.
+    let available_threads = available_parallelism
+        .map(|count| u32::try_from(count.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1);
     let mut args: Vec<OsString> = [
         "-m".into(),
         model_path.into(),
@@ -371,9 +490,13 @@ fn engine_arguments(
         "--parallel".into(),
         settings.parallel.to_string().into(),
         "--threads".into(),
-        settings.threads.to_string().into(),
+        settings.threads.min(available_threads).to_string().into(),
         "--threads-batch".into(),
-        settings.batch_threads.to_string().into(),
+        settings
+            .batch_threads
+            .min(available_threads)
+            .to_string()
+            .into(),
         "--gpu-layers".into(),
         settings.gpu_layers.to_string().into(),
         "--alias".into(),
@@ -1020,22 +1143,60 @@ mod tests {
         .collect();
 
         assert_eq!(
-            engine_arguments(
+            engine_arguments_with_cpu_budget(
                 "/models/model.gguf",
                 &settings,
                 &EngineTarget::Tcp(11434),
-                "private-alias"
+                "private-alias",
+                std::num::NonZeroUsize::new(8),
             ),
             expected
         );
-        let unix_args = engine_arguments(
+        let unix_args = engine_arguments_with_cpu_budget(
             "/models/model.gguf",
             &settings,
             &EngineTarget::Unix("/tmp/private-model.sock".into()),
             "private-alias",
+            std::num::NonZeroUsize::new(8),
         );
         assert_eq!(unix_args[3], OsString::from("/tmp/private-model.sock"));
         assert!(!unix_args.contains(&OsString::from("--port")));
+    }
+
+    #[test]
+    fn engine_threads_stay_within_host_budget_and_runtime_ceilings() {
+        let mut settings = LocalLlamaSettings {
+            context_size: 256,
+            parallel: 1,
+            threads: 8,
+            batch_threads: 8,
+            gpu_layers: 99,
+            health_timeout_ms: 120_000,
+            shutdown_timeout_ms: 5_000,
+            enable_thinking: false,
+        };
+        for (requested, available, expected) in [
+            ((8, 8), Some(3), (3, 3)),
+            ((4, 4), Some(2), (2, 2)),
+            ((8, 8), Some(16), (8, 8)),
+            ((3, 4), Some(16), (3, 4)),
+            ((8, 8), None, (1, 1)),
+        ] {
+            (settings.threads, settings.batch_threads) = requested;
+            let args = engine_arguments_with_cpu_budget(
+                "/models/model.gguf",
+                &settings,
+                &EngineTarget::Tcp(11434),
+                "private-alias",
+                available.and_then(std::num::NonZeroUsize::new),
+            );
+            let value = |flag: &str| &args[args.iter().position(|arg| arg == flag).unwrap() + 1];
+            assert_eq!(value("--threads"), &OsString::from(expected.0.to_string()));
+            assert_eq!(
+                value("--threads-batch"),
+                &OsString::from(expected.1.to_string())
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

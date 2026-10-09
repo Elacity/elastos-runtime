@@ -340,6 +340,13 @@ hashes, and the provider verifies payloads before each new engine start.
 Dispatch readiness describes the current binding; an actual run proves
 inference.
 
+When admitted content cannot run, the same projection can report a fixed
+`dispatch_unavailable_reason`: `unsupported_host` or `source_engine_required`.
+Runtime derives this current fact from its host profile and engine acquisition
+policy. The UI explains the next action while retaining the admitted content.
+Other failures keep the general service-unavailable state. The projection
+stores no failure cause and exposes no provider error text or host path.
+
 ## Content-to-consumer review
 
 The existing viewer relationship is identity and handoff metadata, not a grant

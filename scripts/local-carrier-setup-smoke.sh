@@ -525,6 +525,10 @@ DATA_DIR="${XDG_DATA_HOME}/elastos"
 [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
 mkdir -p "${DATA_DIR}/bin"
 cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
+# A source setup reads the pinned signed model catalogue beside its manifest.
+if [[ -f "${REPO_ROOT}/model-catalog.json" ]]; then
+    install -m 600 "${REPO_ROOT}/model-catalog.json" "${DATA_DIR}/model-catalog.json"
+fi
 install -m 700 "$(cargo_release_binary elastos localhost-provider)" \
     "${DATA_DIR}/bin/localhost-provider"
 [[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]

@@ -13,6 +13,10 @@
     preparation_unavailable: "Preparation failed.",
   });
   const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
+  const DISPATCH_UNAVAILABLE_TEXT = Object.freeze({
+    unsupported_host: "Keep this model on this device. To run it, use a supported device.",
+    source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
+  });
   // One phase per Runtime projection. The full view (System) and the compact
   // Marketplace detail read their copy from the same phase.
   function phaseOf(r, p, message) {
@@ -43,6 +47,8 @@
   function parseRuntime(r, cid) {
     check(r && [r.admitted, r.kept, r.dispatch_ready].every(v => typeof v === "boolean"));
     check(r.dispatch_ready ? r.admitted && /^model:[0-9a-f]{64}$/.test(r.offer_id) : r.offer_id === null);
+    check(r.dispatch_unavailable_reason == null || (r.admitted && !r.dispatch_ready &&
+      typeof r.dispatch_unavailable_reason === "string" && Object.hasOwn(DISPATCH_UNAVAILABLE_TEXT, r.dispatch_unavailable_reason)));
     const p = r.preparation;
     if (p !== null) {
       check(p && p.cid === cid && text(p.operation_id, 160) && STATES.has(p.state));
@@ -97,7 +103,8 @@
       "operation_id", "cid", "state", "total_bytes", "completed_bytes", "cancel_requested", "admitted", "activation_pending", "failure_class",
     ].map(key => [key, output[key]]));
     return parseRuntime({ admitted: output.admitted, kept: output.kept,
-      dispatch_ready: output.dispatch_ready, offer_id: output.offer_id, preparation }, cid);
+      dispatch_ready: output.dispatch_ready, dispatch_unavailable_reason: output.dispatch_unavailable_reason,
+      offer_id: output.offer_id, preparation }, cid);
   }
   window.ElastosModelManagement = {
     create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
@@ -316,7 +323,8 @@
           row.append(identity);
         }
         const phase = phaseOf(r, p, message);
-        const label = phase === "failed" ? failureText(p) : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
+        const label = phase === "failed" ? failureText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
+          ? DISPATCH_UNAVAILABLE_TEXT[r.dispatch_unavailable_reason] : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
         row.append(element("p", label));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
