@@ -310,6 +310,23 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
     }
     assert_eq!(room_store_snapshot(fixture.dir.path()), group_before);
 
+    wait_for_direct_peer_ready(&fixture.peer, &fixture.peer._remote_node).await;
+    let settled_send = json!({
+        "request_id": "read-model-settled",
+        "conversation_id": fixture.peer.conversation_id,
+        "text": "verified delivery"
+    });
+    let (status, body) = direct_send(&fixture, settled_send.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"status":"receipt_settled"}));
+    let retained_records = direct
+        .records_for_test(&local_profile_did, crate::auth::now_ts())
+        .unwrap();
+    assert_eq!(retained_records.len(), 202);
+    assert!(retained_records
+        .iter()
+        .any(|record| !record.incoming && record.receipt_settled));
+
     crate::auth::revoke_session_grant(
         &home_launch_auth_data_dir(fixture.dir.path()),
         &fixture.session_id,
@@ -328,18 +345,51 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-    // The chat window shares the person's real session, so revoking it also
-    // retires the registered delivery context — background direct-message
-    // authority fails closed with the session instead of outliving it.
-    assert!(fixture
-        .peer
-        .service
-        .direct_message_service()
-        .records_for_test(
-            fixture.peer.store.local_profile_did(),
-            crate::auth::now_ts(),
+    let revoked_messages = fixture
+        .app
+        .clone()
+        .oneshot(direct_api_request(
+            Some(&fixture.chat_token),
+            "GET",
+            &format!(
+                "/api/apps/chat-room/direct/conversations/{}/messages?retry_details=true&mark_read=false",
+                fixture.peer.conversation_id
+            ),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_messages.status(), StatusCode::FORBIDDEN);
+    let revoked_messages = json_response(revoked_messages).await;
+    assert!(revoked_messages.get("messages").is_none());
+    assert_eq!(
+        direct_send(
+            &fixture,
+            json!({
+                "request_id": "revoked-fresh-send",
+                "conversation_id": fixture.peer.conversation_id,
+                "text": "new delivery"
+            })
         )
-        .is_err());
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let mut settled_retry = settled_send;
+    settled_retry["retry_existing"] = json!(true);
+    assert_eq!(
+        direct_send(&fixture, settled_retry).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // Runtime retains the person's signed delivery history and verified
+    // receipt. The revoked Home session cannot read, send or retry it.
+    assert_eq!(
+        direct
+            .records_for_test(&local_profile_did, crate::auth::now_ts())
+            .unwrap(),
+        retained_records
+    );
+    assert_eq!(room_store_snapshot(fixture.dir.path()), group_before);
 }
 
 #[tokio::test]
