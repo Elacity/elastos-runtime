@@ -28,6 +28,9 @@ const SECTION_TITLES = {
 let refreshGeneration = 0;
 let profileDraftDirty = false;
 let profileDraftValue = "";
+let currentContacts = [];
+let pendingRemoveId = "";
+let removingContactId = "";
 
 announceReady();
 
@@ -148,18 +151,42 @@ function bindActions() {
 
 async function handleAction(button) {
   const action = readText(button.dataset.action);
-  if (action === "remove") {
+  if (action === "remove" || action === "cancel-remove" || action === "confirm-remove") {
     const contactId = readText(button.dataset.contactId);
-    const label = readText(button.dataset.contactName) || "this person";
-    if (!contactId || !window.confirm(`Remove ${label} from People?`)) {
+    if (removingContactId || !contactId) {
       return;
     }
-    await mutatePeople(
-      "/api/apps/people/contacts/remove",
-      { contact_id: contactId },
-      "Removed from People.",
-      button,
-    );
+    if (action === "cancel-remove") {
+      if (contactId !== pendingRemoveId) return;
+      pendingRemoveId = "";
+      renderPeople({ contacts: currentContacts });
+      focusContactAction("remove", contactId);
+      return;
+    }
+    const contact = currentContacts.find((item) => readText(item.contact_id) === contactId
+      && readText(item.relationship) === "connected");
+    if (!contact || (action === "confirm-remove" && contactId !== pendingRemoveId)) {
+      return;
+    }
+    if (action === "remove") {
+      pendingRemoveId = contactId;
+      renderPeople({ contacts: currentContacts });
+      focusContactAction("cancel-remove", contactId);
+      return;
+    }
+    removingContactId = contactId;
+    renderPeople({ contacts: currentContacts });
+    try {
+      await mutatePeople(
+        "/api/apps/people/contacts/remove",
+        { contact_id: contactId },
+        "Removed from People.",
+        button,
+      );
+    } finally {
+      removingContactId = "";
+      renderPeople({ contacts: currentContacts });
+    }
     return;
   }
   if (action === "chat") {
@@ -280,6 +307,11 @@ function renderProfile(identity) {
 
 function renderPeople(people) {
   const contacts = arrayValue(people?.contacts).filter(isValidContact);
+  currentContacts = contacts;
+  if (!contacts.some((contact) => readText(contact.contact_id) === pendingRemoveId
+    && readText(contact.relationship) === "connected")) {
+    pendingRemoveId = "";
+  }
   if (peopleCountNode) {
     peopleCountNode.textContent = `${contacts.length} contact${contacts.length === 1 ? "" : "s"}`;
   }
@@ -489,13 +521,25 @@ function contactMarkup(contact) {
   // Remove ends an accepted relationship; the other states have nothing to
   // end. Removed pairs stay visible read-only until a fresh request through
   // Inbox reopens them.
-  const remove = readText(contact?.relationship) === "connected"
-    ? `<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(readText(contact?.contact_id))}" data-contact-name="${escapeHtml(name)}">Remove</button>`
+  const contactId = readText(contact.contact_id);
+  const disabled = removingContactId ? " disabled" : "";
+  const confirming = pendingRemoveId === contactId;
+  const remove = readText(contact?.relationship) === "connected" && !confirming
+    ? `<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Remove</button>`
     : "";
+  const confirmation = confirming ? `
+    <div class="person-confirm" role="group" aria-label="Remove contact">
+      <p>Remove ${escapeHtml(name)} from People?</p>
+      <div class="person-confirm-actions">
+        <button type="button" data-action="cancel-remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Cancel</button>
+        <button class="danger" type="button" data-action="confirm-remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Remove</button>
+      </div>
+    </div>` : "";
   return personCard({
     name,
     details,
-    actions: `${chat}${remove}`,
+    actions: confirming ? "" : `${chat}${remove}`,
+    confirmation,
   });
 }
 
@@ -513,19 +557,26 @@ function discoveryPeerMarkup(person) {
   });
 }
 
-function personCard({ name, details, actions }) {
+function focusContactAction(action, contactId) {
+  const buttons = peopleList?.querySelectorAll("[data-action][data-contact-id]") || [];
+  [...buttons].find((button) => button.dataset.action === action
+    && button.dataset.contactId === contactId)?.focus();
+}
+
+function personCard({ name, details, actions, confirmation = "" }) {
   const displayName = readText(name);
   if (!displayName) {
     return "";
   }
   return `
-    <article class="person-card">
+    <article class="person-card${confirmation ? " is-confirming" : ""}">
       <div class="person-avatar" aria-hidden="true">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</div>
       <div class="person-copy">
         <h4>${escapeHtml(displayName)}</h4>
         <p class="person-details">${details}</p>
       </div>
       <div class="person-actions">${actions}</div>
+      ${confirmation}
     </article>
   `;
 }

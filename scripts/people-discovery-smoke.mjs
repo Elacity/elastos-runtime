@@ -26,6 +26,10 @@ class FakeElement {
     return null;
   }
 
+  querySelectorAll() {
+    return [];
+  }
+
   closest() {
     return this;
   }
@@ -180,7 +184,7 @@ function setupEnvironment(name, replies) {
       origin: "http://localhost:61180",
     },
     confirm() {
-      return false;
+      throw new Error("Native confirmation is blocked by the app sandbox");
     },
     top: parentFrame,
     parent: parentFrame,
@@ -282,6 +286,64 @@ async function triggerMenuCommand(environment, cmd, {
 }
 
 async function runScenario(name) {
+  if (name === "remove_confirmation") {
+    const connected = summary("Exact Contact");
+    const removedBody = JSON.parse(await summary("Exact Contact").text());
+    removedBody.people.contacts[0].relationship = "removed";
+    removedBody.people.contacts[0].can_message = false;
+    const environment = setupEnvironment(name, [connected]);
+    await import("../capsules/people/browser/people.js");
+    await settle();
+    const markup = () => environment.nodes.get("people-list").innerHTML;
+    const removals = () => environment.calls.filter(({ path }) => path === "/api/apps/people/contacts/remove");
+    await triggerAction(environment, "remove", { contactId: "contact:foreign" });
+    assert.doesNotMatch(markup(), /person-confirm/);
+    await triggerAction(environment, "remove", { contactId: "contact:remote" });
+    assert.match(markup(), /Remove Exact Contact from People\?/);
+    assert.match(markup(), /data-action="cancel-remove" data-contact-id="contact:remote"/);
+    assert.equal(removals().length, 0, "Opening confirmation must not remove the contact");
+    await triggerAction(environment, "cancel-remove", { contactId: "contact:foreign" });
+    assert.match(markup(), /person-confirm/);
+    await triggerAction(environment, "cancel-remove", { contactId: "contact:remote" });
+    assert.doesNotMatch(markup(), /person-confirm/);
+    assert.equal(removals().length, 0, "Cancel must not send a removal POST");
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:remote" });
+    assert.equal(removals().length, 0, "An unopened confirmation cannot remove a contact");
+    await triggerAction(environment, "remove", { contactId: "contact:remote" });
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:foreign" });
+    assert.equal(removals().length, 0, "Confirmation must keep its exact target");
+    let release;
+    environment.replies.push(() => new Promise((resolve) => { release = resolve; }));
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:remote" });
+    assert.equal(removals().length, 1);
+    assert.match(markup(), /data-action="confirm-remove" data-contact-id="contact:remote" disabled/);
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:remote" });
+    await triggerAction(environment, "cancel-remove", { contactId: "contact:remote" });
+    assert.equal(removals().length, 1, "A pending removal must dispatch once");
+    release(response(401, { error: "unauthorized" }));
+    await settle();
+    assert.equal(environment.nodes.get("people-status").dataset.tone, "error");
+    assert.equal(environment.nodes.get("people-status").textContent, "Could not complete that action.");
+    assert.match(markup(), /data-action="confirm-remove" data-contact-id="contact:remote">Remove/);
+    environment.replies.push(response(200, {}), response(200, removedBody));
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:remote" });
+    assert.equal(removals().length, 2);
+    assert.deepEqual(removals().map(({ options }) => JSON.parse(options.body)), [
+      { contact_id: "contact:remote" }, { contact_id: "contact:remote" },
+    ], "A retry must preserve the original target");
+    assert.doesNotMatch(markup(), /data-action="(?:remove|confirm-remove|cancel-remove)"/);
+    assert.match(markup(), /Removed/);
+    environment.replies.push(summary("Exact Contact"));
+    await triggerMenuCommand(environment, "refresh");
+    await triggerAction(environment, "remove", { contactId: "contact:remote" });
+    environment.replies.push(response(200, removedBody));
+    await triggerMenuCommand(environment, "refresh");
+    await triggerAction(environment, "confirm-remove", { contactId: "contact:remote" });
+    assert.equal(removals().length, 2, "A stale removed target must not send another POST");
+    assertRequestAuthority(environment);
+    assert.equal(environment.replies.length, 0);
+    return;
+  }
   if (name === "configured") {
     const initialDiscovery = discoverySummary({
       configured: true,
@@ -761,6 +823,7 @@ if (!scenario) {
   assert.doesNotMatch(peopleUi, /function normalizeDiscoveryStatus\(/);
   assert.doesNotMatch(peopleUi, /Visibility expired/);
   assert.doesNotMatch(peopleUi, /last visible window expired/);
+  assert.doesNotMatch(peopleUi, /window\.confirm\(/);
   assert.match(peopleUi, /function isValidContact/);
   assert.match(peopleUi, /Add contact/);
   assert.match(peopleUi, /data-conversation-id/);
@@ -770,6 +833,7 @@ if (!scenario) {
   assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
     "configured",
+    "remove_confirmation",
     "setup_suggestion_confirmed",
     "unavailable",
     "create_retry",

@@ -1187,13 +1187,19 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
 }
 
 async function removeContact(side, frame, peerName) {
+  frame = await openAppWindow(side, "people");
   const snapshot = await peopleSnapshot(frame);
   const contact = snapshot.contacts.find((card) => card.text.includes(peerName));
   const remove = contact?.actions.find((action) => action.action === "remove");
   assertOk(remove?.contactId, `${side.prefix}: no removable contact for ${peerName}`, snapshot.contacts);
-  await frame.evaluate((contactId) => {
-    document.querySelector(`[data-action="remove"][data-contact-id="${contactId}"]`)?.click();
-  }, remove.contactId);
+  const removeButton = frame.locator(`[data-action="remove"][data-contact-id="${remove.contactId}"]`);
+  assertOk(await removeButton.count() === 1, `${side.prefix}: ambiguous Remove control`);
+  await removeButton.click();
+  const confirmation = frame.locator(`[data-action="confirm-remove"][data-contact-id="${remove.contactId}"]`);
+  await confirmation.waitFor({ state: "visible", timeout: 10_000 });
+  assertOk((await confirmation.locator("xpath=../..").innerText()).includes(`Remove ${peerName} from People?`),
+    `${side.prefix}: Remove confirmation named the wrong person`);
+  await confirmation.click();
   await poll(`${side.prefix}: contact ${peerName} removed`, 30_000, 1_000, async () => {
     const current = await peopleSnapshot(frame);
     const still = current.contacts.find((card) => card.text.includes(peerName));
