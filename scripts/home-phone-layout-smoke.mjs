@@ -50,6 +50,7 @@ const FIRST_PARTY_APPS = [
   ["marketplace", "Marketplace", "Find and install apps"],
   ["system", "System", "Runtime, updates and devices"],
   ["people", "People", "Contacts and trusted peers"],
+  ["chat-room", "Chat", "Community and direct messages"],
   ["services", "Services", "Offers this Home can use"],
   ["wallet", "Wallet", "Keys, chains and approvals"],
   ["inbox", "Inbox", "Requests that need a look"],
@@ -1957,27 +1958,34 @@ const CAPSULE_TARGET_BASELINE = {
   "phone-portrait": {
     library: 0, documents: 0, marketplace: 0, system: 0, people: 0, services: 0,
     wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 0,
-    assistant: 0,
+    assistant: 0, "chat-room": 0,
   },
   "phone-landscape": {
     library: 0, documents: 0, marketplace: 0, system: 0, people: 0, services: 0,
     wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 0,
-    assistant: 0,
+    assistant: 0, "chat-room": 0,
   },
 };
 
 function shellFailures(run) {
   const failures = [];
   const baseline = BASELINE[run.profile] || {};
+  const capsuleBaseline = CAPSULE_TARGET_BASELINE[run.profile] || {};
+  const observedCapsules = new Set();
   for (const surface of run.surfaces) {
     const layout = surface.capsuleLayout;
     if (layout?.sharedTheme && layout.formFactor !== EXPECTED_CAPSULE_FORM_FACTOR[run.profile]) {
       failures.push(`${run.engine}/${run.profile}/window:${surface.target}: capsule frame form factor ${layout.formFactor} (expected ${EXPECTED_CAPSULE_FORM_FACTOR[run.profile]})`);
     }
-    const capsuleLimit = CAPSULE_TARGET_BASELINE[run.profile]?.[surface.target];
-    const capsuleSmall = surface.capsule?.smallTargets.length ?? 0;
-    if (capsuleLimit !== undefined && capsuleSmall > capsuleLimit) {
-      failures.push(`${run.engine}/${run.profile}/window:${surface.target}: ${capsuleSmall} capsule targets < ${MIN_TARGET_PX}px (baseline ${capsuleLimit})`);
+    const capsuleLimit = capsuleBaseline[surface.target];
+    if (capsuleLimit !== undefined) {
+      observedCapsules.add(surface.target);
+      const label = `${run.engine}/${run.profile}/window:${surface.target}`;
+      if (!Array.isArray(surface.capsule?.smallTargets) || !layout || typeof layout.sharedTheme !== "boolean") {
+        failures.push(`${label}: capsule measurement unavailable`);
+      } else if (surface.capsule.smallTargets.length > capsuleLimit) {
+        failures.push(`${label}: ${surface.capsule.smallTargets.length} capsule targets < ${MIN_TARGET_PX}px (baseline ${capsuleLimit})`);
+      }
     }
     const limits = baseline[surface.surface];
     if (!limits) continue;
@@ -1990,6 +1998,11 @@ function shellFailures(run) {
     }
     if (limits.text !== null && surface.smallText.length > limits.text) {
       failures.push(`${label}: ${surface.smallText.length} texts < ${MIN_TEXT_PX}px (baseline ${limits.text})`);
+    }
+  }
+  for (const target of Object.keys(capsuleBaseline)) {
+    if (!observedCapsules.has(target)) {
+      failures.push(`${run.engine}/${run.profile}/window:${target}: capsule measurement missing`);
     }
   }
   return failures;
