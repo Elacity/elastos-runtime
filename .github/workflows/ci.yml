@@ -92,9 +92,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
-      - name: JavaScript behavior tests
+      - name: install explicit Browser test inputs
+        timeout-minutes: 5
         env:
           DEBUG: pw:install
+        run: ./scripts/test-behaviour.sh inputs
+      - name: JavaScript behavior tests
         run: |
           python3 scripts/browser-vm-linux-network.test.py
           ./scripts/test-behaviour.sh

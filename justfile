@@ -76,10 +76,14 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
-# Capsule units and script behavior fixtures, as CI runs them; the script
-# installs the pinned Playwright/Chromium inputs on first use.
+# Capsule units and script behavior fixtures, as CI and the pre-push gate run
+# them; offline, after `just test-behaviour-inputs` installed the pinned
+# Playwright/Chromium inputs once.
 test-behaviour:
     ./scripts/test-behaviour.sh
+
+test-behaviour-inputs:
+    ./scripts/test-behaviour.sh inputs
 
 # Disposable Linux fixture; host namespace privileges belong to this test.
 test-native-browser-isolation:

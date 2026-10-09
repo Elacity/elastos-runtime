@@ -10,8 +10,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - The local pre-push gate now runs the CI behaviour suite before Cargo work.
   CI, `just test-behaviour` and the gate share `scripts/test-behaviour.sh`,
-  which also installs the pinned Playwright inputs, so a failing Node test
-  stops the push locally and names the test.
+  so a failing Node test stops the push locally and names the test. Run
+  `just test-behaviour-inputs` once to install the pinned Playwright inputs.
 
 ## [0.8.0-alpha.13]
 
