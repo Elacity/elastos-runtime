@@ -58,6 +58,26 @@ else:
         struct.pack_into("<I", header, 12, 2)
     output.write_bytes(bytes(header) + os.environ["ELASTOS_RELEASE_VERSION"].encode())
     output.chmod(0o755)
+    if name == "elastos" and os.environ.get("MOCK_CID_IMAGE"):
+        # The fake native producer emits a runnable CLI until fetch completes,
+        # then leaves the same native header used by ordinary worker fixtures.
+        cli = """#!/usr/bin/env python3
+import json,os,pathlib,shutil,sys
+args=sys.argv[1:]
+with open(os.environ['MOCK_CID_LOG'],'a') as log:
+ log.write(json.dumps({'args':args,'home':os.environ['HOME'],'data':os.environ['XDG_DATA_HOME'],'runtime':sys.argv[0]})+'\\n')
+if args[:2]==['source','add']:
+ root=pathlib.Path(os.environ['XDG_DATA_HOME'])/'elastos'; root.mkdir(parents=True)
+ (root/'sources.json').write_text('isolated source fixture')
+elif args[:2]==['source','fetch-file']:
+ assert args[args.index('--source')+1]=='browser-image'
+ assert (pathlib.Path(os.environ['XDG_DATA_HOME'])/'elastos/sources.json').is_file()
+ destination=pathlib.Path(args[args.index('--output')+1]); shutil.copyfile(os.environ['MOCK_CID_IMAGE'],destination)
+ if os.environ.get('FAIL_CID_FETCH'): sys.exit(19)
+ pathlib.Path(sys.argv[0]).write_bytes(bytes.fromhex('NATIVE_BYTES'))
+else: raise AssertionError(args)
+""".replace('NATIVE_BYTES', (bytes(header)+os.environ['ELASTOS_RELEASE_VERSION'].encode()).hex())
+        output.write_text(cli); output.chmod(0o755)
 '''
 MOCK_MEDIA_BUILD = r'''#!/usr/bin/env python3
 import argparse, hashlib, json, os, pathlib, struct
@@ -134,7 +154,7 @@ class PrepareWorkerTest(unittest.TestCase):
             "publish-release.sh", "prepare-release-platform.sh", "release-platform-input.py",
             "components-release-integrity-check.py", "check-versioning.sh", "build-media-tools.sh",
             "release-upstream-assets.py", "release-upstream-input.py", "browser-host-release.py",
-            "browser-vm-image-inputs.py",
+            "browser-vm-image-inputs.py", "browser-image-cid-input.py",
         ):
             (scripts / name).write_bytes((SOURCE / "scripts" / name).read_bytes())
             (scripts / name).chmod(0o755)
@@ -405,6 +425,50 @@ class PrepareWorkerTest(unittest.TestCase):
         reused, result = self.prepare("image-reused", version="0.7.2", reuse_support=output)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((reused / "artifacts" / descriptor["release_path"]).read_bytes(), image.read_bytes())
+
+    def test_cid_image_uses_built_runtime_and_failure_cleans_owned_stage(self):
+        template_path = self.repo / "components.json"
+        template = json.loads(template_path.read_bytes())
+        template["external"]["browser-vm-image"] = {"install_path": "browser-vm/image-set", "platforms": {
+            "darwin-arm64": {"strategy": "browser-vm-image", "release_path": "browser-vm-image-arm64.tar.gz",
+                             "extract_path": "browser-vm-image", "install_path": "browser-vm/image-set"}}}
+        template_path.write_text(json.dumps(template))
+        self.commit("CID image fixture")
+        files = {"rootfs.ext4": b"rootfs", "vmlinux": b"browser kernel", "initrd": b"initrd"}
+        record = lambda data: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        identity = self.guest_inputs.identity()
+        files["browser-vm-rootfs-manifest.json"] = json.dumps({
+            "schema": "elastos.browser.vm-rootfs-build/v1", "ok": True, "target_platform": "linux-arm64",
+            "inputs_sha256": identity["sha256"], "recipe_options": identity["options"],
+            **record(files["rootfs.ext4"]), "kernel": record(files["vmlinux"]), "initrd": record(files["initrd"]),
+            "preflight": {"ok": True, "audio_default_ready": True}}).encode()
+        image = self.root / "cid-image.tar.gz"
+        with tarfile.open(image, "w:gz") as archive:
+            for name, payload in files.items():
+                member = tarfile.TarInfo("browser-vm-image/" + name); member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+        cid, checksum, size = "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", hashlib.sha256(image.read_bytes()).hexdigest(), str(image.stat().st_size)
+        env = {**self.env, "MOCK_CID_IMAGE": str(image), "MOCK_CID_LOG": str(self.root / 'cid.log'),
+               "BROWSER_IMAGE_PUBLISHER_DID": "did:key:fixture", "BROWSER_IMAGE_PUBLISHER_NODE_ID": "ab" * 32}
+        for failed in [False, True]:
+            output = self.root / ('cid-failed' if failed else 'cid-ready')
+            active_env = {**env, **({"FAIL_CID_FETCH": "1"} if failed else {})}
+            result = self.command("/bin/bash", "scripts/prepare-release-platform.sh", "--version", "0.7.1",
+                                  "--output", str(output), "--browser-vm-image-cid", cid,
+                                  "--browser-vm-image-sha256", checksum, "--browser-vm-image-size", size, env=active_env)
+            self.assertEqual(result.returncode != 0, failed, result.stdout + result.stderr)
+            self.assertEqual(output.exists(), not failed)
+            self.assertEqual(list(self.root.glob('.release-platform.*')), [])
+            if not failed:
+                self.assertEqual((output / 'artifacts/browser-vm-image-arm64.tar.gz').read_bytes(), image.read_bytes())
+        calls = [json.loads(line) for line in (self.root / 'cid.log').read_text().splitlines()]
+        for call in calls:
+            self.assertIn('.release-platform.', call['home'])
+            self.assertEqual(call['data'], call['home'] + '/data')
+            self.assertTrue(call['runtime'].startswith(self.env['CARGO_TARGET_DIR']))
+            if call['args'][:2] == ['source', 'fetch-file']:
+                for flag, value in [('--cid', cid), ('--sha256', checksum), ('--size', size)]:
+                    self.assertEqual(call['args'][call['args'].index(flag) + 1], value)
 
     def qualified_support_input(self, name="m1", env=None):
         catalog = b'{"payload":{"schema":"elastos.model.catalog/v1","entries":[]}}\n'

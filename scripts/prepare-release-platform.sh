@@ -11,6 +11,7 @@ usage() {
 Usage: scripts/prepare-release-platform.sh --version X.Y.Z --output DIR [--reuse-support M1_DIR]
        [--browser-vm-image PATH --browser-vm-image-sha256 HEX]
        [--browser-vm-image-set DIR]
+       [--browser-vm-image-cid CID --browser-vm-image-sha256 HEX --browser-vm-image-size BYTES]
 
 Build local release inputs on Linux x86_64/ARM64 or macOS ARM64 from a clean
 checkout. DIR must be absent. Use a directory outside the checkout, or one
@@ -40,9 +41,11 @@ REUSE_SUPPORT=""
 BROWSER_VM_IMAGE=""
 BROWSER_VM_IMAGE_SHA256=""
 BROWSER_VM_IMAGE_SET=""
+BROWSER_VM_IMAGE_CID=""
+BROWSER_VM_IMAGE_SIZE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version|--output|--reuse-support|--browser-vm-image|--browser-vm-image-sha256|--browser-vm-image-set)
+        --version|--output|--reuse-support|--browser-vm-image|--browser-vm-image-sha256|--browser-vm-image-set|--browser-vm-image-cid|--browser-vm-image-size)
             [[ $# -ge 2 && -n "$2" ]] || die "Missing value for $1"
             case "$1" in
                 --version) VERSION="$2" ;;
@@ -51,6 +54,8 @@ while [[ $# -gt 0 ]]; do
                 --browser-vm-image) BROWSER_VM_IMAGE="$2" ;;
                 --browser-vm-image-sha256) BROWSER_VM_IMAGE_SHA256="$2" ;;
                 --browser-vm-image-set) BROWSER_VM_IMAGE_SET="$2" ;;
+                --browser-vm-image-cid) BROWSER_VM_IMAGE_CID="$2" ;;
+                --browser-vm-image-size) BROWSER_VM_IMAGE_SIZE="$2" ;;
             esac
             shift 2
             ;;
@@ -80,7 +85,6 @@ PYTHON
 )
 fi
 if [[ -n "$BROWSER_VM_IMAGE_SET" ]]; then
-    [[ "$SETUP_PLATFORM" != linux-amd64 ]] || die "This host uses a remote Browser Engine; ARM64 guest inputs belong to Mac/Jetson"
     BROWSER_VM_IMAGE_SET=$(python3 - "$CALLER_DIR" "$BROWSER_VM_IMAGE_SET" <<'PYTHON'
 import os, sys
 print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
@@ -105,6 +109,9 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64; TARGET=aarch64-apple-darwin ;;
     *) die "Native preparation supports Linux x86_64/ARM64 and macOS ARM64" ;;
 esac
+if [[ -n "$BROWSER_VM_IMAGE_SET" && "$SETUP_PLATFORM" == linux-amd64 ]]; then
+    die "This host uses a remote Browser Engine; ARM64 guest inputs belong to Mac/Jetson"
+fi
 if [[ -z "$REUSE_SUPPORT" && "$SETUP_PLATFORM" == linux-arm64 ]]; then
     [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || die "ELASTOS_LLAMA_ARM64_BUNDLE is required for Linux ARM64"
     python3 - "$ELASTOS_LLAMA_ARM64_BUNDLE" <<'PY'
@@ -119,8 +126,14 @@ if "sha256:" + digest != info["checksum"]:
     raise SystemExit("ARM64 llama-server bundle checksum differs from components.json")
 PY
 fi
-if [[ -n "$REUSE_SUPPORT" && ( -n "$BROWSER_VM_IMAGE" || -n "$BROWSER_VM_IMAGE_SHA256" || -n "$BROWSER_VM_IMAGE_SET" ) ]]; then
+if [[ -n "$REUSE_SUPPORT" && ( -n "$BROWSER_VM_IMAGE" || -n "$BROWSER_VM_IMAGE_SHA256" || -n "$BROWSER_VM_IMAGE_SET" || -n "$BROWSER_VM_IMAGE_CID" || -n "$BROWSER_VM_IMAGE_SIZE" ) ]]; then
     die "--reuse-support retains its image; supply Browser image inputs only for fresh support"
+fi
+if [[ -n "$BROWSER_VM_IMAGE_CID" || -n "$BROWSER_VM_IMAGE_SIZE" ]]; then
+    [[ -z "$BROWSER_VM_IMAGE" && -z "$BROWSER_VM_IMAGE_SET" && -n "$BROWSER_VM_IMAGE_CID" && -n "$BROWSER_VM_IMAGE_SIZE" ]] || die "Supply one complete CID image input"
+    [[ "$SETUP_PLATFORM" != linux-amd64 ]] || die "This host selects a remote Engine"
+    python3 scripts/browser-image-cid-input.py "$BROWSER_VM_IMAGE_CID" "$BROWSER_VM_IMAGE_SHA256" "$BROWSER_VM_IMAGE_SIZE"
+    [[ -n "${BROWSER_IMAGE_PUBLISHER_DID:-}" && -n "${BROWSER_IMAGE_PUBLISHER_NODE_ID:-}" ]] || die "CID image input requires an explicit trusted publisher DID and Carrier node ID"
 fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 case "$CARGO_BUILD_JOBS" in 1|2|3|4) ;; *) die "CARGO_BUILD_JOBS must be between 1 and 4" ;; esac
@@ -171,7 +184,7 @@ SUPPORT_BINARY_ASSETS=()
 while IFS= read -r name; do SUPPORT_BINARY_ASSETS+=("$name"); done < "$WORK_DIR/native-assets.txt"
 fi
 
-if [[ -z "$REUSE_SUPPORT" ]]; then
+if [[ -z "$REUSE_SUPPORT" && -z "$BROWSER_VM_IMAGE_CID" ]]; then
     if [[ -n "$BROWSER_VM_IMAGE_SET" ]]; then
         [[ -z "$BROWSER_VM_IMAGE" && -z "$BROWSER_VM_IMAGE_SHA256" ]] || die "Select an image set or a pinned image package"
         BROWSER_VM_IMAGE="$WORK_DIR/browser-image.tar.gz"
@@ -250,6 +263,24 @@ info "Preparing ${PLATFORM} from ${SOURCE_COMMIT} (native cache: ${CARGO_TARGET_
 (cd elastos && cargo build --locked --release ${BUILD_TARGET_ARGS[@]+"${BUILD_TARGET_ARGS[@]}"} -p elastos-server --bin elastos)
 RUNTIME="$CARGO_TARGET_DIR/${BUILD_TARGET:+$BUILD_TARGET/}release/elastos"
 [[ -x "$RUNTIME" ]] || die "Built Runtime is missing: $RUNTIME"
+if [[ -n "$BROWSER_VM_IMAGE_CID" ]]; then
+    # The candidate Runtime already produced above supplies the existing Carrier
+    # file stream. Its isolated source configuration belongs to this build.
+    fetch_home="$WORK_DIR/carrier-home"
+    mkdir -p "$fetch_home" "$fetch_home/data"
+    fetch_env=(env HOME="$fetch_home" XDG_DATA_HOME="$fetch_home/data")
+    source_args=(source add --name browser-image --publisher "$BROWSER_IMAGE_PUBLISHER_DID" --publisher-node-id "$BROWSER_IMAGE_PUBLISHER_NODE_ID")
+    [[ -z "${BROWSER_IMAGE_CONNECT_TICKET:-}" ]] || source_args+=(--connect-ticket "$BROWSER_IMAGE_CONNECT_TICKET")
+    "${fetch_env[@]}" "$RUNTIME" "${source_args[@]}"
+    BROWSER_VM_IMAGE="$WORK_DIR/browser-image.tar.gz"
+    "${fetch_env[@]}" "$RUNTIME" source fetch-file --source browser-image \
+        --cid "$BROWSER_VM_IMAGE_CID" --sha256 "$BROWSER_VM_IMAGE_SHA256" \
+        --size "$BROWSER_VM_IMAGE_SIZE" --output "$BROWSER_VM_IMAGE"
+    python3 scripts/release-platform-input.py stage-browser-image \
+        --root "$STAGING" --platform "$PLATFORM" --package "$BROWSER_VM_IMAGE" \
+        --sha256 "$BROWSER_VM_IMAGE_SHA256" --output "$WORK_DIR/browser-image.json"
+    rm "$BROWSER_VM_IMAGE"
+fi
 if [[ "$PLATFORM" == *-linux ]]; then
     scripts/audit-linux-runtime-portability.sh --platform "$PLATFORM" --binary "$RUNTIME" --label "prepared native Runtime"
 fi

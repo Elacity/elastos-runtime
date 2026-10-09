@@ -172,6 +172,17 @@ Keep that head stable across releases: a new head means every admitted model nee
 1. **Build.** Run the `Release package` workflow
    ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
    with the source commit, the install version N and the update version N+1.
+   Supply the qualified common ARM64 Browser archive's CID, independent SHA-256
+   and exact byte size. The operator builds that guest outside CI from the
+   committed Debian and Python locks, packages it once, and retains it in the
+   publisher artifact store under its canonical CID filename. Configure the
+   repository variables `BROWSER_IMAGE_PUBLISHER_DID` and
+   `BROWSER_IMAGE_PUBLISHER_NODE_ID`; an optional
+   `BROWSER_IMAGE_CONNECT_TICKET` secret supplies the direct bootstrap route.
+   The candidate Runtime downloads this input with `source fetch-file` through
+   the existing Carrier file stream. It checks the pinned peer, length and hash
+   before image admission. Mac and Linux ARM64 consume the same archive; x86-64
+   selects a remote Engine. Guest images remain outside CI builds.
    The source is a commit on `develop`, or the head of an open pull request into
    `develop` that already contains `develop`. The run builds native pairs for
    `aarch64-darwin`, `x86_64-linux` and `aarch64-linux` (Jetson). N+1 reuses

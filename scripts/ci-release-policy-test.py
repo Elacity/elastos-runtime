@@ -447,7 +447,10 @@ class ReleasePolicyTests(unittest.TestCase):
                     env = {**os.environ, "PATH": str(root / "shims") + os.pathsep + os.environ["PATH"],
                            "RUNNER_TEMP": str(root), "RELEASE_ROOT": str(release),
                            "CARGO_HOME": str(root / "cargo-home"), "RUSTUP_HOME": str(root / "rustup-home"),
-                           "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls)}
+                           "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls),
+                           "BROWSER_IMAGE_CID": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                           "BROWSER_IMAGE_SHA256": "ab" * 32, "BROWSER_IMAGE_SIZE": "1024",
+                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "aarch64-linux"}
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
@@ -457,9 +460,17 @@ class ReleasePolicyTests(unittest.TestCase):
                     else:
                         built = [json.loads(line) for line in calls.read_text().splitlines()]
                         self.assertEqual(len(built), 2)
+                        for flag, value in [("--browser-vm-image-cid", env["BROWSER_IMAGE_CID"]),
+                                            ("--browser-vm-image-sha256", env["BROWSER_IMAGE_SHA256"]),
+                                            ("--browser-vm-image-size", env["BROWSER_IMAGE_SIZE"])]:
+                            self.assertEqual(built[0]["args"][built[0]["args"].index(flag) + 1], value)
+                            self.assertNotIn(flag, built[1]["args"])
                         self.assertEqual({item['target'] for item in built}, {str(target)})
                         self.assertEqual({item['build'] for item in built}, {str(build_dir)})
-                        self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N')])
+                        self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N'),
+                                                          '--browser-vm-image-cid', env['BROWSER_IMAGE_CID'],
+                                                          '--browser-vm-image-sha256', env['BROWSER_IMAGE_SHA256'],
+                                                          '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']])
                         self.assertEqual(built[1]['args'], ['--version', '1.2.4', '--output', str(release / 'inputs/N1'),
                                                           '--reuse-support', str(release / 'inputs/N')])
                         self.assertFalse(target.exists() or target.is_symlink())

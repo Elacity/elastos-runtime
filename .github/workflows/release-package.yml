@@ -19,6 +19,18 @@ on:
         description: Update version N+1, built with N's support
         required: true
         type: string
+      browser_image_cid:
+        description: Qualified common ARM64 guest archive CID (served as its immutable filename)
+        required: true
+        type: string
+      browser_image_sha256:
+        description: Independent SHA-256 of that guest archive
+        required: true
+        type: string
+      browser_image_size:
+        description: Exact archive bytes
+        required: true
+        type: string
       seed_package:
         description: Also build the Linux seed package (only to upgrade the seed Runtime)
         type: boolean
@@ -35,6 +47,12 @@ env:
   SOURCE_COMMIT: ${{ inputs.source_commit }}
   INSTALL_VERSION: ${{ inputs.install_version }}
   UPDATE_VERSION: ${{ inputs.update_version }}
+  BROWSER_IMAGE_CID: ${{ inputs.browser_image_cid }}
+  BROWSER_IMAGE_SHA256: ${{ inputs.browser_image_sha256 }}
+  BROWSER_IMAGE_SIZE: ${{ inputs.browser_image_size }}
+  BROWSER_IMAGE_PUBLISHER_DID: ${{ vars.BROWSER_IMAGE_PUBLISHER_DID }}
+  BROWSER_IMAGE_PUBLISHER_NODE_ID: ${{ vars.BROWSER_IMAGE_PUBLISHER_NODE_ID }}
+  BROWSER_IMAGE_CONNECT_TICKET: ${{ secrets.BROWSER_IMAGE_CONNECT_TICKET }}
   CARGO_BUILD_JOBS: '4'
   PYTHONDONTWRITEBYTECODE: '1'
   # Shipped release builds stay hermetic: no compiler wrapper or cache.
@@ -65,6 +83,16 @@ jobs:
           # Preparation may run beside CI. Publication still requires green CI
           # for this exact source and the release acceptance gate.
           echo "source_tree=$tree" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: admit the common immutable image selector
+        run: |
+          set -euo pipefail
+          python3 -I -S scripts/browser-image-cid-input.py "$BROWSER_IMAGE_CID" "$BROWSER_IMAGE_SHA256" "$BROWSER_IMAGE_SIZE"
+          [[ "$BROWSER_IMAGE_PUBLISHER_DID" == did:key:* && "$BROWSER_IMAGE_PUBLISHER_NODE_ID" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo 'Configure the explicit Browser image publisher DID and Carrier node ID' >&2; exit 1; }
 
   mac:
     name: Apple silicon N and N+1
@@ -131,8 +159,10 @@ jobs:
             [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
+            image=()
+            [[ "$name" != N ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
-              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
             rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
           done
@@ -319,8 +349,10 @@ jobs:
             [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
+            image=()
+            [[ "$name" != N || "$RELEASE_PLATFORM" != aarch64-linux ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
-              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
             rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
           done
