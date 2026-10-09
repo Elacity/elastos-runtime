@@ -882,6 +882,31 @@ struct GuestRegistrationTerminal {
     expires_at: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct GuestRegistrationCapacityExceeded {
+    pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Display for GuestRegistrationCapacityExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Guest sign-up is full. Use an existing account or try again later.")
+    }
+}
+
+impl std::error::Error for GuestRegistrationCapacityExceeded {}
+
+fn guest_registration_capacity_error(state: &AuthState, now: u64) -> anyhow::Error {
+    GuestRegistrationCapacityExceeded {
+        retry_after_secs: state
+            .guest_registrations
+            .iter()
+            .filter_map(|record| record.terminal.as_ref())
+            .map(|terminal| terminal.expires_at.saturating_sub(now).max(1))
+            .min(),
+    }
+    .into()
+}
+
 pub(crate) struct GuestRegistrationClient<'a> {
     pub origin: &'a str,
     pub rp_id: &'a str,
@@ -939,14 +964,15 @@ pub(crate) fn begin_guest_registration(
     }
     mutate_auth_state(data_dir, |state| {
         require_guest_registration_policy(state)?;
+        let now = now_ts();
         state.guest_registrations.retain(|record| {
             record
                 .terminal
                 .as_ref()
-                .is_none_or(|terminal| terminal.expires_at > now_ts())
+                .is_none_or(|terminal| terminal.expires_at > now)
         });
         if state.guest_registrations.len() >= MAX_GUEST_REGISTRATIONS {
-            return enrollment_denied();
+            return Err(guest_registration_capacity_error(state, now));
         }
         identity.begin_bound_principal_registration(
             ceremony_id,
@@ -996,7 +1022,7 @@ pub(crate) fn complete_guest_registration(
                     .is_none_or(|terminal| terminal.expires_at > now)
             });
             if state.guest_registrations.len() >= MAX_GUEST_REGISTRATIONS {
-                return enrollment_denied();
+                return Err(guest_registration_capacity_error(state, now));
             }
             let candidate = identity.verify_bound_registration(
                 ceremony_id,
@@ -1853,6 +1879,150 @@ mod guest_registration_tests {
             client(claim).origin,
             id.as_bytes(),
         )
+    }
+
+    #[test]
+    fn full_guest_store_refuses_new_records_but_keeps_completion_replay() {
+        let (root, mut identity) = fixture();
+        let claim = random_secret_hex();
+        let intent = PasskeyEnrollmentIntent::Recover {};
+        // Begin one valid ceremony before the retained-record pool fills.
+        let pending = begin(root.path(), &mut identity, &claim, "pending");
+        let mut first = None;
+        for index in 0..MAX_GUEST_REGISTRATIONS {
+            let id = format!("guest-{index}");
+            let response = begin(root.path(), &mut identity, &claim, &id);
+            let grant = complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                &id,
+                &response,
+                &intent,
+            )
+            .unwrap();
+            if first.is_none() {
+                first = Some((id, response, grant));
+            }
+        }
+        let before = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+        let credentials = identity.credentials().len();
+        for result in [
+            begin_guest_registration(root.path(), &mut identity, &client(&claim), "new", &intent)
+                .map(|_| ()),
+            complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                "pending",
+                &pending,
+                &intent,
+            )
+            .map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            let capacity = error
+                .downcast_ref::<GuestRegistrationCapacityExceeded>()
+                .unwrap();
+            assert!(capacity
+                .retry_after_secs
+                .is_some_and(|seconds| { seconds > 0 && seconds <= AUTH_SESSION_TTL_SECS }));
+        }
+        assert_eq!(
+            std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(identity.credentials().len(), credentials);
+        let (id, response, grant) = first.unwrap();
+        let replay = complete_guest_registration(
+            root.path(),
+            &mut identity,
+            &client(&claim),
+            &id,
+            &response,
+            &intent,
+        )
+        .unwrap();
+        assert_eq!(replay.session_id, grant.session_id);
+
+        // Capacity cannot override an owner's registration policy.
+        set_guest_registration_enabled(root.path(), false, now_ts()).unwrap();
+        assert!(begin_guest_registration(
+            root.path(),
+            &mut identity,
+            &client(&claim),
+            "new",
+            &intent,
+        )
+        .unwrap_err()
+        .is::<OwnerEnrollmentDenied>());
+        set_guest_registration_enabled(root.path(), true, now_ts()).unwrap();
+        mutate_auth_state(root.path(), |state| {
+            state.guest_registrations[0]
+                .terminal
+                .as_mut()
+                .unwrap()
+                .expires_at = now_ts() - 1;
+            Ok(())
+        })
+        .unwrap();
+        // The denied valid completion can fill the expired slot without a new begin.
+        complete_guest_registration(
+            root.path(),
+            &mut identity,
+            &client(&claim),
+            "pending",
+            &pending,
+            &intent,
+        )
+        .unwrap();
+        assert_eq!(
+            load_auth_state(root.path())
+                .unwrap()
+                .guest_registrations
+                .len(),
+            MAX_GUEST_REGISTRATIONS
+        );
+    }
+
+    #[test]
+    fn guest_capacity_retry_uses_only_known_terminal_expiry() {
+        let (root, mut identity) = fixture();
+        let claim = random_secret_hex();
+        let response = begin(root.path(), &mut identity, &claim, "guest");
+        complete_guest_registration(
+            root.path(),
+            &mut identity,
+            &client(&claim),
+            "guest",
+            &response,
+            &PasskeyEnrollmentIntent::Recover {},
+        )
+        .unwrap();
+        let mut state = load_auth_state(root.path()).unwrap();
+        let expiry = state.guest_registrations[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .expires_at;
+        let error = guest_registration_capacity_error(&state, expiry - 90);
+        assert_eq!(
+            error
+                .downcast_ref::<GuestRegistrationCapacityExceeded>()
+                .unwrap()
+                .retry_after_secs,
+            Some(90)
+        );
+        // Interrupted records have no guaranteed expiry; advertise no deadline.
+        state.guest_registrations[0].terminal = None;
+        let error = guest_registration_capacity_error(&state, expiry - 90);
+        assert_eq!(
+            error
+                .downcast_ref::<GuestRegistrationCapacityExceeded>()
+                .unwrap()
+                .retry_after_secs,
+            None
+        );
     }
 
     #[test]

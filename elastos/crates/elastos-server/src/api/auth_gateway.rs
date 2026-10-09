@@ -4189,6 +4189,16 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
 }
 
 pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
+    if let Some(capacity) = err.downcast_ref::<crate::auth::GuestRegistrationCapacityExceeded>() {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, capacity.to_string()).into_response();
+        if let Some(seconds) = capacity.retry_after_secs {
+            response.headers_mut().insert(
+                "retry-after",
+                seconds.to_string().parse().expect("numeric retry time"),
+            );
+        }
+        return response;
+    }
     if err.is::<elastos_identity::webauthn::CeremonyCapacityExceeded>() {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -4579,6 +4589,32 @@ mod tests {
         let response = auth_error_response(error);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()["retry-after"], "60");
+    }
+
+    #[tokio::test]
+    async fn guest_record_capacity_has_its_own_retryable_response() {
+        use axum::body::to_bytes;
+
+        for retry_after_secs in [Some(3600), None] {
+            let error = anyhow::Error::new(crate::auth::GuestRegistrationCapacityExceeded {
+                retry_after_secs,
+            })
+            .context("registration refused");
+            let response = auth_error_response(error);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .map(|value| value.to_str().unwrap()),
+                retry_after_secs.map(|_| "3600")
+            );
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                "Guest sign-up is full. Use an existing account or try again later."
+            );
+        }
     }
 
     async fn did_recovery_test_gateway_state(
