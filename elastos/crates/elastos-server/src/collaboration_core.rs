@@ -421,6 +421,7 @@ impl CollaborationCore {
         for envelope in envelopes {
             self.authorize_stored_product_message(envelope)?;
         }
+        self.validate_history_live_identities(envelopes)?;
         let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
         let known = state
             .envelopes
@@ -467,6 +468,7 @@ impl CollaborationCore {
             .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
         self.ensure_state_directory()?;
         let _file = lock_owner_only_file(&self.lock_path())?;
+        self.validate_history_live_identities(envelopes)?;
         let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
         let before = canonical_history_bytes(&state)?;
         append_history_envelopes(&mut state, envelopes)?;
@@ -1480,6 +1482,50 @@ impl CollaborationCore {
         }
         self.validate_history(&state)?;
         Ok(Some(state))
+    }
+
+    /// The bounded original cache can evict a message while its verified live
+    /// acceptance remains. Historical admission preserves that sender identity;
+    /// only the exact accepted hash can replay it.
+    fn validate_history_live_identities(&self, envelopes: &[Vec<u8>]) -> anyhow::Result<()> {
+        let live = self.load_state()?.unwrap_or_else(|| self.empty_state());
+        let mut ids = HashMap::new();
+        let mut nonces = HashMap::new();
+        for entry in &live.incoming {
+            let authorized = self.verify_incoming_record(entry)?;
+            let message = authorized.message();
+            insert_incoming_identity(
+                &mut ids,
+                &mut nonces,
+                &message.envelope().payload,
+                message.envelope_sha256(),
+            )?;
+        }
+        for entry in &live.incoming_tombstones {
+            let receipt =
+                verify_stored_acceptance_receipt_envelope(entry.acceptance_receipt.as_bytes())?;
+            insert_receipt_identity(&mut ids, &mut nonces, &receipt.envelope().payload)?;
+        }
+        for envelope in envelopes {
+            let authorized = self.authorize_stored_product_message(envelope)?;
+            let message = authorized.message();
+            let payload = &message.envelope().payload;
+            for accepted_hash in [
+                ids.get(&(
+                    payload.sender_profile_did.clone(),
+                    payload.message_id.clone(),
+                )),
+                nonces.get(&(payload.sender_profile_did.clone(), payload.nonce.clone())),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if accepted_hash != message.envelope_sha256() {
+                    anyhow::bail!("collaboration history sender reused a live message ID or nonce");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_history_identities(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
@@ -3508,6 +3554,149 @@ mod tests {
         core.validate_history(&state).unwrap();
         prune_history(&mut state, NOW + 230 + CONVERSATION_HISTORY_RETENTION_SECS).unwrap();
         assert!(state.envelopes.is_empty());
+    }
+
+    #[test]
+    fn history_refuses_live_identity_conflicts_after_original_cache_eviction_before_product_writes()
+    {
+        let fixture = Fixture::new();
+        let core = std::sync::Arc::new(fixture.core());
+        let product =
+            crate::collaboration_product::CollaborationChatProductPort::new(core.clone()).unwrap();
+        let now = now_secs();
+        let (remote_key, _) = generate_keypair();
+        let authority = fixture.authority(remote_key.clone());
+        let original = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"original live message"}),
+                now - 1_000,
+                TTL,
+            )
+            .unwrap();
+        core.accept_incoming_from_signed_source_for_test(original.envelope_bytes(), now - 999)
+            .unwrap();
+
+        // Both a reused ID and a reused nonce have valid current signatures,
+        // but refer to different originals from the same Profile.
+        let mut conflicts = Vec::new();
+        for reuse_id in [true, false] {
+            let mut altered: SignedCollaborationMessage =
+                serde_json::from_slice(original.envelope_bytes()).unwrap();
+            altered.payload.created_at = now;
+            altered.payload.expires_at = now + TTL;
+            altered.payload.payload["product"]["body"] = serde_json::json!("conflicting original");
+            if reuse_id {
+                altered.payload.nonce = random_hex_128().unwrap();
+            } else {
+                altered.payload.message_id = random_hex_128().unwrap();
+            }
+            let (signature, signer_did) = crate::crypto::domain_separated_sign(
+                &remote_key,
+                COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+                &canonical_collaboration_message_bytes(&altered.payload).unwrap(),
+            );
+            altered.signature = signature;
+            altered.signer_did = signer_did;
+            let bytes = canonical_signed_collaboration_message_bytes(&altered).unwrap();
+            assert!(core.authorize_history_message(&bytes, now).is_ok());
+            // A still-pending live envelope also owns its identity.
+            assert!(core
+                .history_projection_candidates(&[bytes.clone()], now)
+                .is_err());
+            conflicts.push(bytes);
+        }
+        assert_eq!(
+            core.history_projection_candidates(&[original.envelope_bytes().to_vec()], now)
+                .unwrap(),
+            vec![original.envelope_bytes().to_vec()]
+        );
+        let handoff = product.pending_messages().unwrap().remove(0);
+        product
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert_eq!(core.summary().unwrap().replay_tombstones, 1);
+
+        // These signed originals model a participant cache, rather than new
+        // local sends. Retention does not change the five-send live policy.
+        let replacements = (0..MAX_CONVERSATION_HISTORY_MESSAGES)
+            .map(|offset| {
+                authority
+                    .prepare_outgoing(
+                        SERVICE,
+                        "elastos.chat.message/v1",
+                        serde_json::json!({"body":format!("cached history {offset}")}),
+                        now - 999 + offset as u64,
+                        TTL,
+                    )
+                    .unwrap()
+                    .envelope_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        core.retain_history_messages(&replacements, now).unwrap();
+        let retained = core.conversation_history(now).unwrap();
+        assert_eq!(retained.len(), MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert!(!retained.contains(&original.envelope_bytes().to_vec()));
+        // Exact accepted originals remain valid replays even after eviction.
+        assert!(core
+            .history_projection_candidates(&[original.envelope_bytes().to_vec()], now)
+            .unwrap()
+            .is_empty());
+        core.retain_history_message(original.envelope_bytes(), now)
+            .unwrap();
+
+        let new_original = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"otherwise valid catch-up"}),
+                now,
+                TTL,
+            )
+            .unwrap();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &core.local_device_did(),
+            "Reader",
+            "history identity test",
+        )
+        .unwrap();
+        let before_poll = product
+            .conversation_poll(&fixture.data_root, &session.token, 0)
+            .unwrap();
+        assert_eq!(before_poll.objects.len(), 1);
+        let room_path = fixture
+            .data_root
+            .join("Local/Shared/AppCapsules/chat-room/objects.json");
+        let before_room = fs::read(&room_path).unwrap();
+        let before_live = fs::read(core.state_path()).unwrap();
+        let before_history = fs::read(core.history_path()).unwrap();
+        for conflict in conflicts {
+            assert!(core
+                .accept_incoming_from_signed_source_for_test(&conflict, now)
+                .is_err());
+            assert!(product
+                .project_history(
+                    &fixture.data_root,
+                    &[new_original.envelope_bytes().to_vec(), conflict.clone()],
+                    now,
+                )
+                .is_err());
+            assert!(core.retain_history_message(&conflict, now).is_err());
+            assert_eq!(fs::read(&room_path).unwrap(), before_room);
+            assert_eq!(fs::read(core.state_path()).unwrap(), before_live);
+            assert_eq!(fs::read(core.history_path()).unwrap(), before_history);
+            let after_poll = product
+                .conversation_poll(&fixture.data_root, &session.token, 0)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after_poll.objects).unwrap(),
+                serde_json::to_value(&before_poll.objects).unwrap()
+            );
+            assert_eq!(after_poll.latest_seq, before_poll.latest_seq);
+        }
     }
 
     #[test]
