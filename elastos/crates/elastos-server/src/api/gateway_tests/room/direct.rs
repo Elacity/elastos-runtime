@@ -379,10 +379,14 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::FORBIDDEN, "{method} {uri}");
-        assert!(axum::body::to_bytes(revoked.into_body(), 8 * 1024)
+        let revoked_body = axum::body::to_bytes(revoked.into_body(), 8 * 1024)
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(
+            revoked_body.as_ref(),
+            b"Gateway request requires an admitted host and caller",
+            "{method} {uri}"
+        );
     }
     // Runtime retains the person's signed delivery history and verified
     // receipt. The revoked Home session cannot read, send or retry it.
