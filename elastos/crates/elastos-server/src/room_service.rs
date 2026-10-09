@@ -332,6 +332,12 @@ pub struct RoomPollView {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoomHistoryView {
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomTransportView {
     #[serde(default)]
     pub configured: bool,
@@ -339,6 +345,8 @@ pub struct RoomTransportView {
     pub available: bool,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<RoomHistoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

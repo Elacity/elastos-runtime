@@ -35,6 +35,8 @@ const CORE_STATE_SCHEMA: &str = "elastos.collaboration.default-conversation-stat
 const CORE_STATE_DIR: &str = "collaboration/default-conversation";
 const CORE_STATE_FILE: &str = "state-v1.json";
 const CORE_LOCK_FILE: &str = "state-v1.lock";
+const HISTORY_STATE_FILE: &str = "history-v1.json";
+const HISTORY_STATE_SCHEMA: &str = "elastos.collaboration.conversation-history/v1";
 const CORE_NAMESPACE_DOMAIN: &[u8] = b"elastos.collaboration.default-conversation-state.v1";
 pub(crate) const DEFAULT_CONVERSATION_SEND_METHOD: &str = "message.send";
 const MAX_CORE_STATE_BYTES: usize = 24 * 1024 * 1024;
@@ -44,6 +46,9 @@ const MAX_PENDING_INCOMING: usize = 32;
 const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
 const MAX_ACCEPTANCE_RECEIPTS_PER_OUTGOING: usize = 32;
 const MAX_INCOMING_RECORDS_AND_TOMBSTONES: usize = 4_096;
+pub(crate) const MAX_CONVERSATION_HISTORY_MESSAGES: usize = 200;
+pub(crate) const MAX_CONVERSATION_HISTORY_BYTES: usize = 1024 * 1024;
+pub(crate) const CONVERSATION_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 pub(crate) struct CollaborationCore {
     authority: DefaultConversationDeviceAuthority,
@@ -197,6 +202,14 @@ struct CoreState {
     incoming_tombstones: Vec<IncomingTombstone>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationHistoryState {
+    schema: String,
+    binding: CoreStateBinding,
+    envelopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CoreStateBinding {
@@ -322,6 +335,131 @@ impl CollaborationCore {
             self.authority.sender_service(),
         )?;
         authorize_default_conversation_message(self.authority.grant(), &verified)
+    }
+
+    /// Historical admission checks original authorship and the exact grant,
+    /// independently of the short live-delivery lifetime and replay path.
+    pub(crate) fn authorize_history_message(
+        &self,
+        envelope_bytes: &[u8],
+        now: u64,
+    ) -> anyhow::Result<AuthorizedDefaultConversationMessage> {
+        let authorized = self.authorize_stored_product_message(envelope_bytes)?;
+        let message = &authorized.message().envelope().payload;
+        if message.created_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            || message
+                .created_at
+                .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+                <= now
+        {
+            anyhow::bail!("collaboration history message is outside its retention window");
+        }
+        Ok(authorized)
+    }
+
+    /// Read bounded canonical originals without changing the live replay state.
+    pub(crate) fn conversation_history(&self, now: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        state
+            .envelopes
+            .iter()
+            .filter_map(|envelope| {
+                let authorized = self.authorize_stored_product_message(envelope.as_bytes());
+                match authorized {
+                    Ok(message)
+                        if message
+                            .message()
+                            .envelope()
+                            .payload
+                            .created_at
+                            .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+                            > now =>
+                    {
+                        Some(
+                            self.authorize_history_message(envelope.as_bytes(), now)
+                                .map(|_| envelope.as_bytes().to_vec()),
+                        )
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    /// Return only newly retained originals in the same age/count/byte window.
+    /// An older peer cache cannot repeatedly reinsert rows the product evicted.
+    pub(crate) fn history_projection_candidates(
+        &self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        if envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES {
+            anyhow::bail!("collaboration history batch exceeds its message bound");
+        }
+        for envelope in envelopes {
+            self.authorize_stored_product_message(envelope)?;
+        }
+        let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        let known = state
+            .envelopes
+            .iter()
+            .map(|entry| collaboration_message_envelope_sha256(entry.as_bytes()))
+            .collect::<HashSet<_>>();
+        append_history_envelopes(&mut state, envelopes)?;
+        self.validate_history_identities(&state)?;
+        prune_history(&mut state, now)?;
+        Ok(state
+            .envelopes
+            .into_iter()
+            .filter(|envelope| {
+                !known.contains(&collaboration_message_envelope_sha256(envelope.as_bytes()))
+            })
+            .map(String::into_bytes)
+            .collect())
+    }
+
+    /// Called by a product only after its durable projection succeeds. Old
+    /// projections can finish normally while their originals age out of history.
+    pub(crate) fn retain_history_message(
+        &self,
+        envelope_bytes: &[u8],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.retain_history_messages(&[envelope_bytes.to_vec()], now)
+    }
+
+    pub(crate) fn retain_history_messages(
+        &self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        if envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES {
+            anyhow::bail!("collaboration history batch exceeds its message bound");
+        }
+        for envelope in envelopes {
+            self.authorize_stored_product_message(envelope)?;
+        }
+        let _process = self
+            .mutation_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
+        self.ensure_state_directory()?;
+        let _file = lock_owner_only_file(&self.lock_path())?;
+        let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        let before = canonical_history_bytes(&state)?;
+        append_history_envelopes(&mut state, envelopes)?;
+        self.validate_history_identities(&state)?;
+        prune_history(&mut state, now)?;
+        self.validate_history(&state)?;
+        if canonical_history_bytes(&state)? != before {
+            self.write_history(&state)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn local_device_did(&self) -> String {
+        self.authority.local_device_did()
     }
 
     pub(crate) fn prepare_transport_frame(&self, envelope_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -1136,6 +1274,116 @@ impl CollaborationCore {
         Ok(Some(state))
     }
 
+    fn empty_history(&self) -> ConversationHistoryState {
+        ConversationHistoryState {
+            schema: HISTORY_STATE_SCHEMA.to_string(),
+            binding: self.state_binding(),
+            envelopes: Vec::new(),
+        }
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.state_dir.join(HISTORY_STATE_FILE)
+    }
+
+    fn load_history(&self) -> anyhow::Result<Option<ConversationHistoryState>> {
+        if !self.validate_existing_state_ancestors()? {
+            return Ok(None);
+        }
+        let path = self.history_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        validate_owner_only_regular_file(&path, &metadata)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        validate_owner_only_regular_file(&path, &metadata)?;
+        if metadata.len() as usize > MAX_CONVERSATION_HISTORY_BYTES {
+            anyhow::bail!("collaboration retained history exceeds its byte limit");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_CONVERSATION_HISTORY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_CONVERSATION_HISTORY_BYTES {
+            anyhow::bail!("collaboration retained history exceeds its byte limit");
+        }
+        let state: ConversationHistoryState = serde_json::from_slice(&bytes)?;
+        if canonical_history_bytes(&state)? != bytes {
+            anyhow::bail!("collaboration retained history is not canonical JSON");
+        }
+        self.validate_history(&state)?;
+        Ok(Some(state))
+    }
+
+    fn validate_history_identities(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        let mut ids = HashMap::new();
+        let mut nonces = HashMap::new();
+        for envelope in &state.envelopes {
+            let authorized = self.authorize_stored_product_message(envelope.as_bytes())?;
+            let message = authorized.message();
+            insert_incoming_identity(
+                &mut ids,
+                &mut nonces,
+                &message.envelope().payload,
+                message.envelope_sha256(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_history(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        if state.schema != HISTORY_STATE_SCHEMA
+            || state.binding != self.state_binding()
+            || state.envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES
+            || canonical_history_bytes(state)?.len() > MAX_CONVERSATION_HISTORY_BYTES
+        {
+            anyhow::bail!("collaboration retained history has an invalid binding or bounds");
+        }
+        self.validate_history_identities(state)
+    }
+
+    fn write_history(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        self.validate_history(state)?;
+        let bytes = canonical_history_bytes(state)?;
+        let temp = self
+            .state_dir
+            .join(format!(".{HISTORY_STATE_FILE}.{}.tmp", random_hex_128()?));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut renamed = false;
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = options.open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            validate_owner_only_regular_file(&temp, &file.metadata()?)?;
+            if let Ok(metadata) = fs::symlink_metadata(self.history_path()) {
+                validate_owner_only_regular_file(&self.history_path(), &metadata)?;
+            }
+            fs::rename(&temp, self.history_path())?;
+            renamed = true;
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() && !renamed {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
     fn validate_existing_state_ancestors(&self) -> anyhow::Result<bool> {
         let data_root = self.data_root.as_path();
         match fs::symlink_metadata(data_root) {
@@ -1590,6 +1838,62 @@ fn prune_terminal_state(state: &mut CoreState, now: u64) -> anyhow::Result<bool>
         .retain(|entry| entry.retain_until >= now);
     Ok(state.outgoing.len() != outgoing_before
         || state.incoming_tombstones.len() != tombstones_before)
+}
+
+fn canonical_history_bytes(state: &ConversationHistoryState) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::to_value(state)?)?)
+}
+
+fn append_history_envelopes(
+    state: &mut ConversationHistoryState,
+    envelopes: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let mut hashes = state
+        .envelopes
+        .iter()
+        .map(|entry| collaboration_message_envelope_sha256(entry.as_bytes()))
+        .collect::<HashSet<_>>();
+    for envelope in envelopes {
+        if hashes.insert(collaboration_message_envelope_sha256(envelope)) {
+            state
+                .envelopes
+                .push(std::str::from_utf8(envelope)?.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn prune_history(state: &mut ConversationHistoryState, now: u64) -> anyhow::Result<()> {
+    let mut retained = Vec::with_capacity(state.envelopes.len());
+    for envelope in state.envelopes.drain(..) {
+        let message: SignedCollaborationMessage = serde_json::from_str(&envelope)?;
+        if message
+            .payload
+            .created_at
+            .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+            > now
+        {
+            retained.push((
+                message.payload.created_at,
+                collaboration_message_envelope_sha256(envelope.as_bytes()),
+                envelope,
+            ));
+        }
+    }
+    retained.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    state.envelopes = retained
+        .into_iter()
+        .map(|(_, _, envelope)| envelope)
+        .collect();
+    while state.envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES
+        || canonical_history_bytes(state)?.len() > MAX_CONVERSATION_HISTORY_BYTES
+    {
+        if state.envelopes.is_empty() {
+            anyhow::bail!("collaboration history binding exceeds its byte limit");
+        }
+        state.envelopes.remove(0);
+    }
+    Ok(())
 }
 
 fn stored_message_expiry(envelope: &str) -> anyhow::Result<u64> {
@@ -2742,6 +3046,171 @@ mod tests {
             .is_none());
         write_owner_only(&restarted.state_path(), &inconsistent_bytes);
         assert!(fixture.core().load_state().is_err());
+    }
+
+    #[test]
+    fn history_sidecar_keeps_originals_without_changing_live_state_format() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let outgoing = prepare(
+            &core,
+            "history-outgoing",
+            serde_json::json!({"body":"local"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        assert!(core.conversation_history(NOW).unwrap().is_empty());
+        complete_projection(&core, &outgoing);
+        assert!(!core.history_path().exists());
+        core.retain_history_message(outgoing.envelope_bytes(), NOW)
+            .unwrap();
+        let live_before = fs::read(core.state_path()).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&live_before)
+            .unwrap()
+            .get("history")
+            .is_none());
+        let (remote, _) = generate_keypair();
+        let (_, incoming) = remote_message(&fixture, remote, NOW + 1);
+        let accepted = core
+            .accept_incoming_from_signed_source_for_test(&incoming, NOW + 1)
+            .unwrap();
+        core.acknowledge_product_handoff(accepted.authorized_message().message().envelope_sha256())
+            .unwrap();
+        assert_eq!(core.conversation_history(NOW + 1).unwrap().len(), 1);
+        let live_before = fs::read(core.state_path()).unwrap();
+        core.retain_history_message(&incoming, NOW + 1).unwrap();
+        assert_eq!(fs::read(core.state_path()).unwrap(), live_before);
+        assert_eq!(
+            fixture.core().conversation_history(NOW + TTL + 1).unwrap(),
+            vec![outgoing.envelope_bytes().to_vec(), incoming.clone()]
+        );
+        core.retain_history_message(&incoming, NOW + TTL + 1)
+            .unwrap();
+        assert_eq!(core.conversation_history(NOW + TTL + 1).unwrap().len(), 2);
+        assert!(core
+            .conversation_history(NOW + CONVERSATION_HISTORY_RETENTION_SECS + 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn history_admission_preserves_live_expiry_and_refuses_foreign_or_altered_messages() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (remote, _) = generate_keypair();
+        let (_, original) = remote_message(&fixture, remote, NOW);
+        assert!(core
+            .authorize_history_message(&original, NOW + TTL + 1)
+            .is_ok());
+        assert!(core
+            .accept_incoming_from_signed_source_for_test(
+                &original,
+                NOW + TTL + MAX_COLLABORATION_CLOCK_SKEW_SECS + 1
+            )
+            .is_err());
+        assert!(core
+            .authorize_history_message(&original, NOW + CONVERSATION_HISTORY_RETENTION_SECS)
+            .is_err());
+        assert!(core
+            .authorize_history_message(&original, NOW - MAX_COLLABORATION_CLOCK_SKEW_SECS - 1)
+            .is_err());
+        let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        altered["payload"]["payload"]["product"]["content"] = serde_json::json!("altered");
+        assert!(core
+            .authorize_history_message(&serde_json::to_vec(&altered).unwrap(), NOW)
+            .is_err());
+        let foreign =
+            alternate_grant_core(&fixture, fixture.device_key.clone(), "foreign-conversation");
+        assert!(foreign.authorize_history_message(&original, NOW).is_err());
+    }
+
+    #[test]
+    fn history_retention_enforces_age_count_and_serialized_byte_bounds() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (remote, _) = generate_keypair();
+        let authority = fixture.authority(remote);
+        let mut state = core.empty_history();
+        for offset in 0..205 {
+            let outgoing = authority
+                .prepare_outgoing(
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    serde_json::json!({"body":format!("history {offset}")}),
+                    NOW + offset,
+                    TTL,
+                )
+                .unwrap();
+            state
+                .envelopes
+                .push(String::from_utf8(outgoing.envelope_bytes().to_vec()).unwrap());
+            prune_history(&mut state, NOW + 205).unwrap();
+        }
+        assert_eq!(state.envelopes.len(), MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert_eq!(
+            serde_json::from_str::<SignedCollaborationMessage>(&state.envelopes[0])
+                .unwrap()
+                .payload
+                .created_at,
+            NOW + 5
+        );
+        core.write_history(&state).unwrap();
+        let before = fs::read(core.history_path()).unwrap();
+        let older = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"older than the retained window"}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        assert!(core
+            .history_projection_candidates(&[older.envelope_bytes().to_vec()], NOW + 205)
+            .unwrap()
+            .is_empty());
+        let newest = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"new retained original"}),
+                NOW + 205,
+                TTL,
+            )
+            .unwrap();
+        assert_eq!(
+            core.history_projection_candidates(
+                &[
+                    state.envelopes[0].as_bytes().to_vec(),
+                    newest.envelope_bytes().to_vec()
+                ],
+                NOW + 205
+            )
+            .unwrap(),
+            vec![newest.envelope_bytes().to_vec()]
+        );
+        assert_eq!(fs::read(core.history_path()).unwrap(), before);
+        for offset in 205..230 {
+            let outgoing = authority
+                .prepare_outgoing(
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    serde_json::json!({"body":"x".repeat(48 * 1024)}),
+                    NOW + offset,
+                    TTL,
+                )
+                .unwrap();
+            state
+                .envelopes
+                .push(String::from_utf8(outgoing.envelope_bytes().to_vec()).unwrap());
+            prune_history(&mut state, NOW + 230).unwrap();
+        }
+        assert!(state.envelopes.len() < MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert!(canonical_history_bytes(&state).unwrap().len() <= MAX_CONVERSATION_HISTORY_BYTES);
+        core.validate_history(&state).unwrap();
+        prune_history(&mut state, NOW + 230 + CONVERSATION_HISTORY_RETENTION_SECS).unwrap();
+        assert!(state.envelopes.is_empty());
     }
 
     #[test]

@@ -2398,7 +2398,8 @@ async fn carrier_provider_invoke_registry(
         }),
     );
 
-    let result = if target == "custody" {
+    let result = if target == "custody" || target == crate::collaboration_history::HISTORY_PROVIDER
+    {
         registry
             .send_runtime_provider_target_raw(target, &request)
             .await
@@ -2432,6 +2433,7 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
             | "collaboration"
             | "collaboration-direct"
             | "collaboration-profile"
+            | "collaboration.history"
     )
 }
 
@@ -8388,14 +8390,24 @@ impl CarrierClient {
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
-        if bounded {
-            // A bounded read holds at most 64 KiB of base64 plus its envelope;
-            // a holder that sends more is refused before it is buffered.
-            let mut limited = (&mut reader).take(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES);
+        let reply_bound = if invocation.target == crate::collaboration_history::HISTORY_PROVIDER
+            && invocation.op == "read"
+            && invocation.transfer == ProviderTransfer::Json
+        {
+            Some(crate::collaboration_history::MAX_HISTORY_CARRIER_REPLY_BYTES as u64)
+        } else if bounded {
+            Some(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES)
+        } else {
+            None
+        };
+        if let Some(limit) = reply_bound {
+            // Refuse an oversized read reply before buffering it. Other
+            // provider operations keep their existing response contract.
+            let mut limited = (&mut reader).take(limit);
             limited.read_line(&mut line).await?;
             anyhow::ensure!(
                 line.ends_with('\n'),
-                "bounded Carrier provider response exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
+                "bounded Carrier provider response exceeds {limit} bytes"
             );
         } else {
             reader.read_line(&mut line).await?;
@@ -12120,6 +12132,108 @@ pub(crate) mod tests {
             _local_dir: local_dir,
             _remote_dir: remote_dir,
         }
+    }
+
+    struct HistoryWireProbe {
+        bytes: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for HistoryWireProbe {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("history is Runtime-owned".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+        fn name(&self) -> &'static str {
+            "history-wire-probe"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(
+                serde_json::json!({"body":"x".repeat(self.bytes.load(std::sync::atomic::Ordering::SeqCst))}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn private_history_carrier_read_authenticates_source_and_bounds_the_wire_reply() {
+        use crate::collaboration_history::{HISTORY_PROVIDER, MAX_HISTORY_CARRIER_REPLY_BYTES};
+        let fixture = peer_did_route_fixture(181, 182).await;
+        let size = Arc::new(std::sync::atomic::AtomicUsize::new(32));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            ._remote_registry
+            .register_runtime_provider_target(
+                HISTORY_PROVIDER,
+                Arc::new(HistoryWireProbe {
+                    bytes: size.clone(),
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(fixture
+            ._remote_registry
+            .send_raw(HISTORY_PROVIDER, &serde_json::json!({"op":"read"}))
+            .await
+            .is_err());
+        let invocation = ProviderInvocation {
+            source: HISTORY_PROVIDER.into(),
+            target: HISTORY_PROVIDER.into(),
+            op: "read".into(),
+            request: serde_json::json!({"op":"read"}),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: fixture.remote_did.clone(),
+                timeout_ms: Some(5_000),
+            }),
+        };
+        let response = fixture
+            .local_registry
+            .invoke_provider(invocation.clone())
+            .await
+            .unwrap();
+        assert_eq!(response["body"], "x".repeat(32));
+        let mut request = requests.lock().unwrap()[0].clone();
+        assert_eq!(
+            request["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&fixture.local_node.endpoint.id()).unwrap()
+        );
+        // The receiving Runtime owns this metadata; wire callers supply null.
+        request["_runtime_invocation"]["carrier"] = serde_json::Value::Null;
+        size.store(
+            MAX_HISTORY_CARRIER_REPLY_BYTES + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let client = CarrierClient::connect_known_endpoint(
+            &fixture.local_node.endpoint,
+            fixture.remote_addr.clone(),
+            5,
+        )
+        .await
+        .unwrap();
+        let error = client
+            .invoke_provider(&invocation, request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("exceeds {MAX_HISTORY_CARRIER_REPLY_BYTES} bytes")),
+            "{error}"
+        );
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
     }
 
     fn peer_did_invocation(peer_did: &str) -> ProviderInvocation {

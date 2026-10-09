@@ -1187,6 +1187,7 @@ fn room_transport_view(state: &GatewayState) -> crate::room_service::RoomTranspo
             configured: false,
             available: false,
             status: Some("Collaboration is isolated on this Runtime.".to_string()),
+            history: None,
         })
 }
 

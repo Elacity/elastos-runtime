@@ -25,6 +25,7 @@ pub(crate) mod collaboration_device_authority;
 pub(crate) mod collaboration_direct_messages;
 pub(crate) mod collaboration_discovery;
 pub(crate) mod collaboration_discovery_runtime;
+pub(crate) mod collaboration_history;
 pub mod collaboration_network;
 pub mod collaboration_presence;
 pub mod collaboration_product;

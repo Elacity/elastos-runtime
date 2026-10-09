@@ -86,6 +86,14 @@ pub struct CollaborationPresenceSnapshotRecord {
     expires_at: u64,
 }
 
+/// Internal route evidence. The signed original still owns all Profile and
+/// conversation authority; capsule projections expose neither it nor routes.
+#[derive(Clone)]
+pub(crate) struct HistoryParticipant {
+    pub(crate) endpoint_did: String,
+    pub(crate) presence_envelope: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PresencePayload {}
@@ -216,6 +224,58 @@ impl CollaborationPresenceProductPort {
 
     pub fn snapshot(&self, now: u64) -> anyhow::Result<CollaborationPresenceSnapshot> {
         self.read_model.snapshot(now)
+    }
+
+    pub(crate) fn history_participants(&self, now: u64) -> anyhow::Result<Vec<HistoryParticipant>> {
+        let state = self
+            .read_model
+            .load_state()?
+            .unwrap_or_else(|| self.read_model.empty_state());
+        let mut peers = Vec::new();
+        for record in state.records {
+            let presence = self.read_model.verify_record(&record)?;
+            if presence.expires_at <= now
+                || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            {
+                continue;
+            }
+            let authorized = self
+                .core
+                .authorize_stored_product_message(record.envelope.as_bytes())?;
+            if let Ok(endpoint) = authorized.sender_profile().sole_endpoint_did() {
+                peers.push(HistoryParticipant {
+                    endpoint_did: endpoint.to_string(),
+                    presence_envelope: record.envelope,
+                });
+            }
+        }
+        peers.sort_by(|left, right| left.endpoint_did.cmp(&right.endpoint_did));
+        peers.dedup_by(|left, right| left.endpoint_did == right.endpoint_did);
+        Ok(peers)
+    }
+
+    /// The request carries its own live signed presence, avoiding a race with
+    /// the receiver's next gossip projection. Carrier owns the source fact.
+    pub(crate) fn authorize_history_requester(
+        &self,
+        envelope_bytes: &[u8],
+        source_endpoint_did: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let presence = self.read_model.verify_envelope(envelope_bytes)?;
+        if presence.expires_at <= now
+            || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+        {
+            anyhow::bail!("history requester presence is unavailable");
+        }
+        let authorized = self.core.authorize_stored_product_message(envelope_bytes)?;
+        if !authorized
+            .sender_profile()
+            .authorizes_endpoint(source_endpoint_did)
+        {
+            anyhow::bail!("history requester source is outside its signed Profile");
+        }
+        Ok(())
     }
 
     fn require_prepared(&self, prepared: &PreparedCollaborationPresence) -> anyhow::Result<()> {

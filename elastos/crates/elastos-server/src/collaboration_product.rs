@@ -1,7 +1,7 @@
 //! Typed product boundary for the verified default collaboration conversation.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ const CHAT_MESSAGE_TTL_SECS: u64 = 300;
 #[derive(Clone)]
 pub struct CollaborationChatProductPort {
     core: Arc<CollaborationCore>,
+    history_status: Arc<Mutex<crate::room_service::RoomHistoryView>>,
 }
 
 /// Read-only result of durably preparing one outgoing Chat message.
@@ -32,6 +33,7 @@ pub struct PreparedCollaborationChatMessage {
     network_id: String,
     conversation_id: String,
     envelope_sha256: String,
+    envelope_bytes: Vec<u8>,
     sender_profile_did: String,
     sender_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     body: String,
@@ -45,6 +47,7 @@ pub struct CollaborationChatHandoff {
     network_id: String,
     conversation_id: String,
     envelope_sha256: String,
+    envelope_bytes: Vec<u8>,
     sender_profile_did: String,
     sender_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     body: String,
@@ -63,7 +66,13 @@ impl CollaborationChatProductPort {
         if core.sender_service() != CHAT_SERVICE {
             anyhow::bail!("default collaboration conversation is not owned by Chat");
         }
-        Ok(Self { core })
+        Ok(Self {
+            core,
+            history_status: Arc::new(Mutex::new(crate::room_service::RoomHistoryView {
+                status: "searching".to_string(),
+                detail: "Checking recent Community history from online participants.".to_string(),
+            })),
+        })
     }
 
     #[cfg(test)]
@@ -100,6 +109,7 @@ impl CollaborationChatProductPort {
             configured: true,
             available: true,
             status: Some("Collaboration is configured.".to_string()),
+            history: self.history_status.lock().ok().map(|status| status.clone()),
         }
     }
 
@@ -180,6 +190,8 @@ impl CollaborationChatProductPort {
             local_session_token,
         )?;
         self.core
+            .retain_history_message(&prepared.envelope_bytes, now_secs())?;
+        self.core
             .acknowledge_outgoing_product_projection(&prepared.envelope_sha256)?;
         Ok(object)
     }
@@ -201,8 +213,109 @@ impl CollaborationChatProductPort {
             None,
         )?;
         self.core
+            .retain_history_message(&handoff.envelope_bytes, now_secs())?;
+        self.core
             .acknowledge_product_handoff(&handoff.envelope_sha256)?;
         Ok(object)
+    }
+
+    pub(crate) fn history_scope(&self) -> (&str, &str) {
+        self.core.conversation_scope()
+    }
+
+    pub(crate) fn local_device_did(&self) -> String {
+        self.core.local_device_did()
+    }
+
+    pub(crate) fn retained_history(&self, now: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let messages = self.core.conversation_history(now)?;
+        for bytes in &messages {
+            self.history_handoff(bytes, now)?;
+        }
+        Ok(messages)
+    }
+
+    /// Verify the entire bounded batch before any product write. Projection and
+    /// retention both use the original message hash, so interrupted/repeated
+    /// catch-up resumes through the existing idempotent room projection.
+    pub(crate) fn project_history(
+        &self,
+        data_dir: &Path,
+        messages: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let handoffs = messages
+            .iter()
+            .map(|bytes| self.history_handoff(bytes, now))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let candidates = self.core.history_projection_candidates(messages, now)?;
+        let hashes = candidates
+            .iter()
+            .map(|bytes| {
+                elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(bytes)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for handoff in handoffs
+            .into_iter()
+            .filter(|handoff| hashes.contains(&handoff.envelope_sha256))
+        {
+            crate::room_service::project_collaboration_text(
+                data_dir,
+                (&handoff.network_id, &handoff.conversation_id),
+                &handoff.envelope_sha256,
+                &room_profile_card(&handoff.sender_profile),
+                &handoff.body,
+                handoff.issued_at,
+                None,
+            )?;
+        }
+        self.core.retain_history_messages(&candidates, now)
+    }
+
+    fn history_handoff(&self, bytes: &[u8], now: u64) -> anyhow::Result<CollaborationChatHandoff> {
+        let authorized = self.core.authorize_history_message(bytes, now)?;
+        let message = &authorized.message().envelope().payload;
+        if message.payload_type != CHAT_PAYLOAD_TYPE {
+            anyhow::bail!("collaboration history is not the current Chat product");
+        }
+        let payload = exact_chat_payload(authorized.product_payload())?;
+        let profile = authorized.sender_profile().clone();
+        Ok(CollaborationChatHandoff {
+            core: self.core.clone(),
+            network_id: message.network_id.clone(),
+            conversation_id: message.conversation_id.clone(),
+            envelope_sha256: authorized.message().envelope_sha256().to_string(),
+            envelope_bytes: bytes.to_vec(),
+            sender_profile_did: profile.document().profile_did.clone(),
+            sender_profile: profile,
+            body: payload.body,
+            issued_at: message.created_at,
+            expires_at: message.expires_at,
+        })
+    }
+
+    pub(crate) fn set_history_searching(&self) {
+        if let Ok(mut status) = self.history_status.lock() {
+            status.status = "searching".to_string();
+            status.detail =
+                "Checking recent Community history from online participants.".to_string();
+        }
+    }
+
+    pub(crate) fn set_history_status(&self, available: bool) {
+        if let Ok(mut status) = self.history_status.lock() {
+            status.status = if available {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .to_string();
+            status.detail = if available {
+                "Recent Community history is available from an online participant."
+            } else {
+                "Recent Community history is unavailable. Another participant must be online to catch up."
+            }.to_string();
+        }
     }
 
     /// Read only this port's verified collaboration namespace from Chat's store.
@@ -447,6 +560,7 @@ fn prepared_chat_message(
         network_id: message.network_id.clone(),
         conversation_id: message.conversation_id.clone(),
         envelope_sha256: prepared.envelope_sha256().to_string(),
+        envelope_bytes: prepared.envelope_bytes().to_vec(),
         sender_profile_did,
         sender_profile,
         body: payload.body,
@@ -472,6 +586,11 @@ fn chat_handoff(
         network_id: payload.network_id.clone(),
         conversation_id: payload.conversation_id.clone(),
         envelope_sha256: message.envelope_sha256().to_string(),
+        envelope_bytes:
+            elastos_common::collaboration_protocol::canonical_signed_collaboration_message_bytes(
+                message.envelope(),
+            )
+            .ok()?,
         sender_profile_did,
         sender_profile,
         body: chat.body,
@@ -514,6 +633,13 @@ fn normalize_chat_body(body: &str) -> anyhow::Result<String> {
         );
     }
     Ok(body.to_string())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -685,6 +811,75 @@ mod tests {
         )
         .unwrap();
         (authority, person_profile)
+    }
+
+    #[test]
+    fn product_retains_original_after_durable_projection_and_retries_a_failed_sidecar_write() {
+        let fixture = fixture();
+        let now = now_secs();
+        let prepared = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "history-product", "retained text"),
+                "retained text",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        assert!(fixture.port.retained_history(now).unwrap().is_empty());
+        let namespace =
+            std::fs::read_dir(fixture.data_root.join("collaboration/default-conversation"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+        let history_path = namespace.join("history-v1.json");
+        // A storage refusal after the room write leaves the live projection
+        // pending. Repairing storage lets the same exact request finish once.
+        std::fs::create_dir(&history_path).unwrap();
+        assert!(fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .is_err());
+        assert_eq!(
+            fixture.port.pending_outgoing_messages(now).unwrap().len(),
+            1
+        );
+        std::fs::remove_dir(&history_path).unwrap();
+        let object = fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .unwrap();
+        let retry = fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .unwrap();
+        assert_eq!(object.seq, retry.seq);
+        assert!(fixture
+            .port
+            .pending_outgoing_messages(now)
+            .unwrap()
+            .is_empty());
+        let bytes = fixture.port.retained_history(now).unwrap();
+        assert_eq!(bytes, vec![prepared.envelope_bytes.clone()]);
+        let restarted = Arc::new(
+            CollaborationCore::new(
+                &fixture.data_root,
+                fixture.device_key.clone(),
+                fixture.profile.clone(),
+                fixture.grant.clone(),
+                CHAT_ROOM_CAPSULE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            CollaborationChatProductPort::new(restarted)
+                .unwrap()
+                .retained_history(now)
+                .unwrap(),
+            bytes
+        );
     }
 
     #[test]

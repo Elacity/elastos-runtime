@@ -17,6 +17,7 @@ use crate::collaboration_carrier::join_collaboration_network;
 use crate::collaboration_core::CollaborationCore;
 use crate::collaboration_default_conversation::MAX_DEFAULT_CONVERSATION_GRANT_BYTES;
 use crate::collaboration_discovery_runtime::CollaborationDiscoveryService;
+use crate::collaboration_history::CollaborationHistoryService;
 use crate::collaboration_network::{MAX_PROFILE_BYTES, MAX_TRUSTED_SIGNERS};
 use crate::collaboration_presence::CollaborationPresenceProductPort;
 use crate::collaboration_product::{CollaborationChatProductPort, CHAT_ROOM_CAPSULE};
@@ -80,6 +81,7 @@ pub struct CollaborationRuntimeService {
     task: Option<tokio::task::JoinHandle<()>>,
     discovery_task: Option<tokio::task::JoinHandle<()>>,
     presence_task: Option<tokio::task::JoinHandle<()>>,
+    history_task: Option<tokio::task::JoinHandle<()>>,
     product_port: Option<CollaborationChatProductPort>,
     presence_port: Option<CollaborationPresenceProductPort>,
     discovery_service: Option<CollaborationDiscoveryService>,
@@ -253,11 +255,18 @@ pub async fn start_collaboration_runtime_service(
     let discovery_service = CollaborationDiscoveryService::new(
         discovery_signing_key,
         (*profile).clone(),
-        provider_registry,
+        provider_registry.clone(),
     )
     .await?;
     let product_port = CollaborationChatProductPort::new(core.clone())?;
     let presence_port = CollaborationPresenceProductPort::new(core.clone())?;
+    let history_service = CollaborationHistoryService::new(
+        product_port.clone(),
+        presence_port.clone(),
+        provider_registry,
+        data_root.to_path_buf(),
+    )
+    .await?;
     let registered = discovery_service.register_runtime_owned_contexts(data_root)?;
     if registered > 0 {
         tracing::info!("collaboration ready for {registered} Profile(s)");
@@ -267,6 +276,7 @@ pub async fn start_collaboration_runtime_service(
     let (shutdown, shutdown_rx) = watch::channel(false);
     let discovery_shutdown_rx = shutdown_rx.clone();
     let presence_shutdown_rx = shutdown_rx.clone();
+    let history_shutdown_rx = shutdown_rx.clone();
     let task = tokio::spawn(run_collaboration_worker(
         driver,
         product_port.clone(),
@@ -285,11 +295,16 @@ pub async fn start_collaboration_runtime_service(
         discovery_service.clone(),
         presence_shutdown_rx,
     ));
+    let history_task = tokio::spawn(run_collaboration_history_worker(
+        history_service,
+        history_shutdown_rx,
+    ));
     Ok(Some(CollaborationRuntimeService {
         shutdown,
         task: Some(task),
         discovery_task: Some(discovery_task),
         presence_task: Some(presence_task),
+        history_task: Some(history_task),
         product_port: Some(product_port.clone()),
         presence_port: Some(presence_port.clone()),
         discovery_service: Some(discovery_service),
@@ -362,7 +377,12 @@ impl CollaborationRuntimeService {
         let presence_result =
             join_collaboration_task(self.presence_task.take(), "collaboration presence worker")
                 .await;
-        chat_result.and(discovery_result).and(presence_result)
+        let history_result =
+            join_collaboration_task(self.history_task.take(), "collaboration history worker").await;
+        chat_result
+            .and(discovery_result)
+            .and(presence_result)
+            .and(history_result)
     }
 
     #[cfg(test)]
@@ -377,6 +397,7 @@ impl CollaborationRuntimeService {
             task: Some(task),
             discovery_task: None,
             presence_task: None,
+            history_task: None,
             product_port: None,
             presence_port: None,
             discovery_service: None,
@@ -396,6 +417,9 @@ impl Drop for CollaborationRuntimeService {
             task.abort();
         }
         if let Some(task) = &self.presence_task {
+            task.abort();
+        }
+        if let Some(task) = &self.history_task {
             task.abort();
         }
     }
@@ -525,6 +549,33 @@ async fn run_runtime_owned_presence_worker(
             now_secs(),
         ) {
             tracing::debug!(error = %err, "runtime presence refresh failed");
+        }
+    }
+}
+
+async fn run_collaboration_history_worker(
+    service: CollaborationHistoryService,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
+            result = service.fetch_once(now_secs()) => {
+                if result.is_err() { tracing::debug!("Community history refresh is unavailable"); }
+            }
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {}
         }
     }
 }
@@ -1892,6 +1943,176 @@ mod tests {
             request_ops(&restart_carrier),
             ["gossip_join_exact", "gossip_peek", "gossip_ack"]
         );
+    }
+
+    struct StalledHistoryInvoker {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::ProviderCarrierInvoker for StalledHistoryInvoker {
+        async fn invoke_carrier_provider(
+            &self,
+            _route: &elastos_runtime::provider::ProviderCarrierRoute,
+            invocation: &elastos_runtime::provider::ProviderInvocation,
+            _request: serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            assert_eq!(
+                invocation.target,
+                crate::collaboration_history::HISTORY_PROVIDER
+            );
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_history_does_not_block_live_gossip_and_shutdown_joins_it() {
+        let (temp, _) = configured_root(true);
+        let configuration =
+            load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
+        let CollaborationNetworkConfiguration::Configured {
+            profile,
+            grant: Some(grant),
+        } = configuration.configuration
+        else {
+            panic!("expected configured conversation");
+        };
+        let now = now_secs();
+        let (key, _) = generate_keypair();
+        let core = Arc::new(
+            CollaborationCore::new(
+                temp.path(),
+                key.clone(),
+                (*profile).clone(),
+                grant.clone(),
+                CHAT_ROOM_CAPSULE,
+            )
+            .unwrap(),
+        );
+        let chat = CollaborationChatProductPort::new(core.clone()).unwrap();
+        let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+        let local_profile = profile_for_endpoint(&key, "Local");
+        let prepared = presence
+            .prepare_presence(
+                presence_request_binding(
+                    "local-history-presence",
+                    "test-principal",
+                    &local_profile,
+                )
+                .unwrap(),
+                &local_profile,
+                now,
+            )
+            .unwrap();
+        presence.project_prepared_presence(&prepared, now).unwrap();
+        let (remote_key, _) = generate_keypair();
+        let remote_profile = profile_for_endpoint(&remote_key, "Remote");
+        let remote =
+            DefaultConversationDeviceAuthority::new(remote_key, (*profile).clone(), grant).unwrap();
+        let announcement = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                SERVICE,
+                "elastos.chat.presence/v1",
+                serde_json::json!({}),
+                now,
+                45,
+            )
+            .unwrap();
+        core.accept_incoming_from_signed_source_for_test(announcement.envelope_bytes(), now)
+            .unwrap();
+        for handoff in presence.pending_presences().unwrap() {
+            presence.project_handoff(&handoff, now).unwrap();
+        }
+        let registry = Arc::new(ProviderRegistry::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        registry
+            .set_carrier_invoker(Arc::new(StalledHistoryInvoker {
+                entered: entered.clone(),
+            }))
+            .await;
+        let history = CollaborationHistoryService::new(
+            chat.clone(),
+            presence.clone(),
+            registry,
+            temp.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let history_task = tokio::spawn(run_collaboration_history_worker(history, shutdown_rx));
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        let live = chat
+            .prepare_message(
+                chat_message_request_binding(
+                    "live-during-history",
+                    "test-principal",
+                    "live progress",
+                    &local_profile,
+                )
+                .unwrap(),
+                "live progress",
+                &local_profile,
+                now,
+            )
+            .unwrap();
+        let carrier = FakeCarrier::new([
+            FakeReply::JoinEcho,
+            send_remote(),
+            send_remote(),
+            peek(0, 0, Vec::new()),
+            ack(0, 0, false),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        let driver = CollaborationTransportDriver::new(core, joined);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_collaboration_worker_cycle_with_presence(
+                &driver,
+                &chat,
+                &presence,
+                temp.path(),
+                now,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(chat.pending_outgoing_messages(now).unwrap().is_empty());
+        assert_eq!(
+            carrier
+                .requests()
+                .iter()
+                .filter(|request| request["op"] == "gossip_send")
+                .count(),
+            2
+        );
+        assert!(chat
+            .retained_history(now)
+            .unwrap()
+            .iter()
+            .any(|bytes| collaboration_message_envelope_sha256(bytes) == live.envelope_sha256()));
+        let mut service = CollaborationRuntimeService {
+            shutdown,
+            task: None,
+            discovery_task: None,
+            presence_task: None,
+            history_task: Some(history_task),
+            product_port: Some(chat),
+            presence_port: Some(presence),
+            discovery_service: None,
+            worker_product_port: None,
+            worker_presence_port: None,
+        };
+        tokio::time::timeout(Duration::from_millis(500), service.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(service.history_task.is_none());
     }
 
     #[tokio::test]
