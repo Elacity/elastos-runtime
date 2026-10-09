@@ -3498,7 +3498,15 @@ mod tests {
                 .created_at,
             NOW + 5
         );
-        core.write_history(&state).unwrap();
+        let retained = state
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        // The product retention port owns directory creation and the write lock.
+        // Seed this fresh root through that port, as durable projections do.
+        core.retain_history_messages(&retained, NOW + 205).unwrap();
+        assert_eq!(core.conversation_history(NOW + 205).unwrap(), retained);
         let before = fs::read(core.history_path()).unwrap();
         let older = authority
             .prepare_outgoing(
