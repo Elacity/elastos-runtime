@@ -1188,6 +1188,8 @@ async function proveSessionRecovery(side, chatFrame, receiver, receiverFrame, {
 
 async function removeContact(side, frame, peerName) {
   frame = await openAppWindow(side, "people");
+  await frame.locator('[data-section-target="people"]').click();
+  await frame.locator("#people").waitFor({ state: "visible", timeout: 10_000 });
   const snapshot = await peopleSnapshot(frame);
   const contact = snapshot.contacts.find((card) => card.text.includes(peerName));
   const remove = contact?.actions.find((action) => action.action === "remove");
