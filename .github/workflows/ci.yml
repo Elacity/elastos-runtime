@@ -250,15 +250,6 @@ jobs:
           cargo test --workspace -- --list | tee "${RUNNER_TEMP}/elastos-test-list.txt"
           total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/elastos-test-list.txt")
           echo "Workspace listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
-      - name: native network isolation and loopback proxy
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
-          cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
-          git rev-parse HEAD HEAD^{tree}
-          sha256sum elastos/tools/browser-engine-supervisor/target/debug/browser-engine-supervisor elastos/tools/browser-native-proxy-engine/target/debug/browser-native-proxy-engine
-          sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'

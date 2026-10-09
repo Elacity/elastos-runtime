@@ -303,8 +303,7 @@ first line to the private `relay_ipc` socket before relaying bytes.
 The guest uses `elastos/tools/browser-native-proxy-engine` as its network
 wrapper. Its loopback proxy forwards Chromium destination streams through the
 guest Runtime relay and selected Exit. The wrapper source remains a guest build
-input. The retired host `browser-engine-supervisor` namespace path is absent
-from normal delivery.
+input. Runtime delivers the guest wrapper with the shared VM Engine.
 
 The retained native/hosted and Playwright smokes are isolated test tools. Their
 receipts prove the tested contracts and identify their test engine build; they

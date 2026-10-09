@@ -982,4 +982,9 @@ if [[ "$product_audit_status" -eq 0 ]]; then
   exit 1
 fi
 
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
+  --vm-proof "$tmp_dir/mac-valid.json" --manual-ux "$tmp_dir/manual-mac-matched.json" \
+  > "$tmp_dir/mac-objective-accepted.json"
+"$node_bin" -e 'const result = require(process.argv[1]); if (!result.ok || !result.product_provider_accepted) process.exit(1);' "$tmp_dir/mac-objective-accepted.json"
+
 printf '{"schema":"elastos.browser.mac-vm-manual-ux-smoke/v1","ok":true,"mac_template_prefilled":true,"shallow_mac_artifact_rejected":true,"aggregate_only_mac_artifact_rejected":true,"url_unchanged_rejected":true,"missing_runtime_media_relay_rejected":true,"missing_edit_profile_diagnostic_rejected":true,"missing_profile_reset_rejected":true,"reset_without_removal_rejected":true,"leaky_profile_reset_rejected":true,"stale_restart_rejected":true,"stale_review_rejected":true,"edit_profile_evidence_required":true,"generic_edit_profile_evidence_rejected":true,"review_artifact_required":true,"review_artifact_hash_mismatch_rejected":true,"review_artifact_redaction_required":true,"review_artifact_secret_leak_rejected":true,"matched_mac_manual_ux_accepted":true,"resized_mac_artifact_accepted":true,"mac_manual_does_not_satisfy_product_audio_audit":true}\n'
