@@ -550,7 +550,7 @@ def changed_paths(before, after):
 
 
 class CompletionTests(unittest.TestCase):
-    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False):
+    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux"):
         with tempfile.TemporaryDirectory(prefix="installer-completion-") as directory:
             root = Path(directory)
             # Spaces catch accidental reliance on PATH or unquoted install paths.
@@ -570,7 +570,14 @@ class CompletionTests(unittest.TestCase):
             script = root / "completion.sh"
             script.write_text(command)
             calls = root / "calls"
+            mocks = root / "mocks"
+            mocks.mkdir()
+            uname = mocks / "uname"
+            uname.write_text('#!/bin/sh\nprintf "%s\\n" "$MOCK_SYSTEM"\n')
+            uname.chmod(0o755)
             env = dict(os.environ, INSTALL_DIR=str(install_dir), INSTALL_ONLY=install_only,
+                       DATA_DIR=str(root / "data"), MOCK_SYSTEM=system,
+                       PATH=str(mocks) + os.pathsep + os.environ["PATH"],
                        CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit))
             argv = [OPTIONS.bash, "--noprofile", "--norc", str(script)]
             if terminal:
@@ -608,11 +615,13 @@ class CompletionTests(unittest.TestCase):
             return status, calls.read_text().splitlines() if calls.exists() else [], output
 
     def test_headless_setup_does_not_consume_script_pipe_or_open_renderer(self):
-        status, calls, output = self.run_completion()
-        self.assertEqual((status, calls), (0, ["setup"]))
-        self.assertIn("Home is installed", output)
-        self.assertIn("installed\\ runtime/elastos", output)
-        self.assertIn("home --browser", output)
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                status, calls, output = self.run_completion(system=system)
+                self.assertEqual((status, calls), (0, ["setup"]), output)
+                self.assertIn("Home is installed", output)
+                self.assertIn("installed\\ runtime/elastos", output)
+                self.assertIn("home --browser", output)
 
     def test_setup_failure_stops_before_home_and_success_message(self):
         status, calls, output = self.run_completion(setup_exit=23)
