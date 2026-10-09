@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Public-data/fake-backend refusal tests. No private keys or real signing."""
+"""Public-data/fake-backend refusal tests. One model catalogue round trip signs
+with a throwaway OpenSSL key; no other private keys or real signing."""
 
 import base64
 import copy
@@ -9,6 +10,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -482,9 +485,9 @@ class SignerTests(unittest.TestCase):
         prepared = self.prepare()
         backend = mock.Mock()
         for response in ("", "\n", "yes\n", "did:key:wrong\n"):
-            self.assertFalse(S.confirmed(prepared, io.StringIO(response), io.StringIO()))
+            self.assertFalse(S.confirmed(prepared.publisher_did, "approved release", io.StringIO(response), io.StringIO()))
             backend.assert_not_called()
-        self.assertTrue(S.confirmed(prepared, io.StringIO(DID + "\n"), io.StringIO()))
+        self.assertTrue(S.confirmed(prepared.publisher_did, "approved release", io.StringIO(DID + "\n"), io.StringIO()))
 
     def test_cli_cancellation_precedes_backend_and_preserves_output_absence(self):
         policy_path = self.base / "operator-policy.json"
@@ -717,6 +720,199 @@ class SignerTests(unittest.TestCase):
         for value in (b"", b"x" * (256 * 1024 + 1)):
             with self.assertRaises(ValueError):
                 S.unixfs_metadata_cid(value)
+
+# Signed by the --model-catalog mode with a disposable key; the Runtime verifies
+# these exact bytes in capsule_inventory.rs.
+CATALOG_FIXTURE = SOURCE.parent.parent / "elastos/crates/elastos-server/tests/fixtures/model-catalog.json"
+CATALOG_HEAD = "bafkreifmbqk5trnjxqfjiop5bzmml6vl5ybrpoujssrmfqce4wrodn4x4y"
+NOW = 1_760_000_000
+
+
+def did_public(did):
+    number = 0
+    for char in did[len("did:key:z"):]:
+        number = number * 58 + S.BASE58.index(char)
+    return number.to_bytes(34, "big")[2:]
+
+
+def catalog_entry(name, seed, **extra):
+    capsule = {"schema": "elastos.capsule/v1", "version": "0.1.0", "name": name, "role": "content", "type": "data",
+               "entrypoint": "weights.gguf", "projections": ["content"],
+               "model_content": {"format": "gguf", "quantization": "Q4_K_M", "engine": "llama.cpp",
+                                 "consumer_interface": "elastos.provider.model", "consumer_interface_version": "0.1.0",
+                                 "minimum_memory_mb": 8192, "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                                 "provenance": {"base_repository": "fixture/base", "base_revision": "a" * 40,
+                                                "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE.base"},
+                                                "quantized_repository": "fixture/quantized", "quantized_revision": "b" * 40,
+                                                "path": "PROVENANCE.md"}}}
+    capsule.update(extra)
+    contents = (("LICENSE", b"fixture license"), ("LICENSE.base", b"fixture base license"), ("PROVENANCE.md", b"fixture provenance"),
+                ("capsule.json", S.json_bytes(capsule)), ("weights.gguf", b"GGUF fixture metadata only"))
+    files = [{"path": path, "size": len(data), "sha256": S.sha256(data)} for path, data in contents]
+    digest = hashlib.sha256("".join(f"{f['path']}\0{f['sha256']}\0{f['size']}\0" for f in files).encode()).hexdigest()
+    cid = "b" + base64.b32encode(b"\x01\x70\x12\x20" + hashlib.sha256(seed.encode()).digest()).decode().lower().rstrip("=")
+    return {"cid": cid, "capsule_manifest": capsule,
+            "object_manifest": {"schema": "elastos.content.object.manifest/v1", "kind": "capsule",
+                                "content_digest": "sha256:" + digest, "files": files}}
+
+
+class ModelCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = CATALOG_FIXTURE.read_bytes()
+        envelope = json.loads(self.fixture)
+        self.did, self.payload = envelope["signer_did"], envelope["payload"]
+        self.backend = FakeBackend()
+        self.backend.public = did_public(self.did)
+        self.backend.signature = bytes.fromhex(envelope["signature"])
+
+    def test_signs_runtime_verified_fixture_byte_for_byte(self):
+        catalog = S.sign_model_catalog(self.payload, self.did, self.backend, NOW)
+        self.assertEqual(catalog, self.fixture)
+        self.assertEqual(S.raw_cid(catalog), CATALOG_HEAD)
+        digest = hashlib.sha256(b"elastos.model.catalog.v1\0" + S.json_bytes(self.payload)).digest()
+        self.assertEqual(self.backend.calls[1:], [("sign", digest), ("verify", digest, self.backend.signature)])
+
+    def test_refuses_payloads_the_runtime_refuses_before_any_key_use(self):
+        def entry(payload):
+            return payload["entries"][0]
+        def capsule(payload):
+            return entry(payload)["capsule_manifest"]
+        def model(payload):
+            return capsule(payload)["model_content"]
+        cases = (
+            ("schema refused", lambda p: p.update(schema="elastos.model.catalog/v2")),
+            ("1 to 8", lambda p: p.update(entries=[])),
+            ("1 to 8", lambda p: p.update(entries=[catalog_entry(f"model-{i}", str(i)) for i in range(9)])),
+            ("expires_at", lambda p: p.update(expires_at=NOW)),
+            ("published_at", lambda p: p.update(published_at=NOW + 1)),
+            ("unique canonical", lambda p: p["entries"].append(copy.deepcopy(entry(p)))),
+            ("unique capsule names", lambda p: p["entries"].append(dict(copy.deepcopy(entry(p)), cid=catalog_entry("x", "x")["cid"]))),
+            ("entry fields", lambda p: entry(p).update(extra=True)),
+            ("DAG-PB", lambda p: entry(p).update(cid=S.raw_cid(b"raw"))),
+            ("model capsule schema", lambda p: capsule(p).update(schema="elastos.capsule/v2")),
+            ("model capsule manifest fields", lambda p: capsule(p).update(extra=True)),
+            ("model capsule manifest fields", lambda p: capsule(p).update(execution="data")),
+            ("model capsule manifest fields", lambda p: capsule(p).update(runtime_abi="data")),
+            ("model capsule manifest fields", lambda p: capsule(p).pop("model_content")),
+            ("execution authority", lambda p: capsule(p).update(role="app")),
+            ("execution authority", lambda p: capsule(p).update(capabilities=["elastos://peer/*"])),
+            ("execution authority", lambda p: capsule(p).update(projections=["web"])),
+            ("name refused", lambda p: capsule(p).update(name="model fixture")),
+            ("display facts", lambda p: capsule(p).update(description="bell\x07")),
+            ("display facts", lambda p: capsule(p).update(author="x" * 129)),
+            ("display facts", lambda p: capsule(p).update(version="0.1.0\n")),
+            ("version must not be empty", lambda p: capsule(p).update(version=" ")),
+            ("GGUF", lambda p: capsule(p).update(entrypoint="weights.bin")),
+            ("model_content fields", lambda p: model(p).pop("quantization")),
+            ("model_content fields", lambda p: model(p).update(extra=True)),
+            ("unsupported model_content", lambda p: model(p).update(quantization="Q5_K_M")),
+            ("unsupported model_content", lambda p: model(p).update(minimum_memory_mb=0)),
+            ("Apache-2.0", lambda p: model(p)["license"].update(spdx_id="MIT")),
+            ("canonical relative path", lambda p: model(p)["license"].update(path="../LICENSE")),
+            ("owner/repository", lambda p: model(p)["provenance"].update(base_repository="base")),
+            ("lowercase Git revision", lambda p: model(p)["provenance"].update(base_revision="A" * 40)),
+            ("digest", lambda p: entry(p)["object_manifest"].update(content_digest="sha256:" + "0" * 64)),
+            ("self-contained", lambda p: entry(p)["object_manifest"].update(object_did=DID)),
+            ("capsule.json", lambda p: capsule(p).update(version="0.1.1")),
+            ("publisher must match", lambda p: entry(p)["object_manifest"].update(publisher_did=DID)),
+        )
+        for reason, edit in cases:
+            payload = copy.deepcopy(self.payload)
+            edit(payload)
+            backend = FakeBackend()
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                S.sign_model_catalog(payload, self.did, backend, NOW)
+            self.assertEqual(backend.calls, [])
+
+    def test_passive_optional_fields_and_eight_entries_sign(self):
+        payload = dict(self.payload, entries=[catalog_entry(f"model-{i}", str(i)) for i in range(7)])
+        payload["entries"].append(catalog_entry("model-7", "7", description="Small model", author="Elastos",
+                                                projections=["content"], requires=[]))
+        catalog = S.sign_model_catalog(payload, self.did, self.backend, NOW)
+        self.assertEqual(json.loads(catalog)["payload"], payload)
+
+    def test_signed_size_bound_is_enforced_before_key_use(self):
+        with mock.patch.object(S, "MAX_MODEL_CATALOG", len(self.fixture)):
+            self.assertEqual(S.sign_model_catalog(self.payload, self.did, self.backend, NOW), self.fixture)
+        backend = FakeBackend()
+        with mock.patch.object(S, "MAX_MODEL_CATALOG", len(self.fixture) - 1), self.assertRaisesRegex(ValueError, "128 KiB"):
+            S.sign_model_catalog(self.payload, self.did, backend, NOW)
+        self.assertEqual(backend.calls, [])
+
+    def cli(self, base, policy, typed):
+        (base / "policy.json").write_bytes(S.json_bytes(policy))
+        argv = [str(SOURCE), "--policy", str(base / "policy.json"), "--input-root", str(base / "input"),
+                "--model-catalog", "payload.json", "--output-root", str(base / "catalog")]
+        prompt = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(S, "pinned_tools"), \
+             mock.patch.object(sys, "stdin", io.StringIO(typed)), mock.patch.object(sys, "stderr", prompt), \
+             mock.patch.object(S, "OpenSSLBackend") as backend, self.assertRaises(ValueError) as refused:
+            S.main()
+        backend.assert_not_called()
+        self.assertFalse((base / "catalog").exists())
+        return str(refused.exception), prompt.getvalue()
+
+    def test_cli_requires_policy_approved_payload_and_typed_did_before_key_use(self):
+        temp = tempfile.TemporaryDirectory(dir=SOURCE.parent.parent)
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name).resolve()
+        (base / "input").mkdir()
+        data = S.json_bytes(self.payload)
+        (base / "input" / "payload.json").write_bytes(data)
+        policy = {"publisher_did": self.did, "key_path": "/custodian/unopened-signing.pem"}
+        for approval in (None, S.sha256(data + b" ")):
+            policy["model_catalog_sha256"] = approval
+            error, prompt = self.cli(base, policy, self.did + "\n")
+            self.assertRegex(error, "SHA-256 required|policy approval")
+            self.assertEqual(prompt, "")
+        policy["model_catalog_sha256"] = S.sha256(data)
+        for typed in ("\n", "did:key:wrong\n", DID + "\n"):
+            error, prompt = self.cli(base, policy, typed)
+            self.assertIn("cancelled", error)
+            self.assertIn(S.sha256(data), prompt)
+
+    def test_real_openssl_cli_round_trip_verifies_against_the_did(self):
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("openssl not installed")
+        openssl = str(Path(openssl).resolve())
+        if not subprocess.run([openssl, "version"], capture_output=True, text=True).stdout.startswith("OpenSSL 3."):
+            self.skipTest("OpenSSL 3 required")
+        temp = tempfile.TemporaryDirectory(dir=SOURCE.parent.parent)
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name).resolve()
+        (base / "key").mkdir(mode=0o700)
+        (base / "input").mkdir()
+        key = base / "key" / "throwaway.pem"
+        subprocess.run([openssl, "genpkey", "-algorithm", "ed25519", "-out", str(key)], check=True, capture_output=True)
+        key.chmod(0o600)
+        der = subprocess.run([openssl, "pkey", "-in", str(key), "-pubout", "-outform", "DER"], check=True, capture_output=True).stdout
+        did = S.public_did(der[12:])
+        data = S.json_bytes(self.payload)
+        (base / "input" / "payload.json").write_bytes(data)
+        python = Path(sys.executable).resolve()
+        pin = lambda path: {"path": str(path), "sha256": S.sha256(Path(path).read_bytes())}
+        (base / "policy.json").write_bytes(S.json_bytes({
+            "publisher_did": did, "model_catalog_sha256": S.sha256(data), "key_path": str(key),
+            "tool": pin(SOURCE), "python": pin(python), "openssl": pin(openssl)}))
+        result = subprocess.run([str(python), "-I", "-S", str(SOURCE), "--policy", str(base / "policy.json"),
+                                 "--input-root", str(base / "input"), "--model-catalog", "payload.json",
+                                 "--output-root", str(base / "catalog")],
+                                input=did + "\n", env={}, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        catalog = (base / "catalog" / "model-catalog.json").read_bytes()
+        self.assertIn(S.raw_cid(catalog), result.stdout)
+        envelope = json.loads(catalog)
+        self.assertEqual((S.json_bytes(envelope), envelope["payload"], envelope["signer_did"]), (catalog, self.payload, did))
+        # Verify with the key decoded from the signer DID alone, not the PEM.
+        (base / "did.der").write_bytes(bytes.fromhex("302a300506032b6570032100") + did_public(did))
+        (base / "digest").write_bytes(hashlib.sha256(b"elastos.model.catalog.v1\0" + S.json_bytes(self.payload)).digest())
+        signature = bytes.fromhex(envelope["signature"])
+        for candidate, expected in ((signature, 0), (bytes([signature[0] ^ 1]) + signature[1:], 1)):
+            (base / "signature").write_bytes(candidate)
+            verify = subprocess.run([openssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", "did.der",
+                                     "-in", "digest", "-sigfile", "signature"], cwd=base, capture_output=True)
+            self.assertEqual(verify.returncode != 0, bool(expected))
 
 
 if __name__ == "__main__":

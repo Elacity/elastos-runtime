@@ -1285,7 +1285,7 @@
     },
     "gba-nonogram": {
       "install_path": "capsules/gba-nonogram",
-      "description": "Nonogram Advance \u2014 MIT homebrew cartridge for the browser GBA viewer",
+      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
       "platforms": {
         "*": {
           "cid": "",
@@ -1934,6 +1934,16 @@
         "debugfs",
         "crosvm"
       ]
+    }
+  },
+  "model_catalog": {
+    "head_cid": "bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4",
+    "publisher_dids": [
+      "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
+    ],
+    "local_use": {
+      "max_cache_bytes": 8589934592,
+      "max_model_memory_bytes": 4294967296
     }
   }
 }

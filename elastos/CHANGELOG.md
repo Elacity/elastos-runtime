@@ -6,12 +6,69 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.12]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Models download several times faster: Home now fetches up to eight parts at
+  once instead of one after another.
+
+### Fixed
+
+- Getting a model on a slower connection no longer stops after about ten minutes
+  with "Storage capacity is unavailable". Home was shutting down its storage
+  service as idle while the model was still downloading.
+
 ### Developer detail
 
+- Model preparation keeps up to 8 part reads in flight across the package; each
+  part's authority and capacity checks run in package order just before its read,
+  results arriving after a revocation are discarded, and per-file SHA-256 and the
+  package CID check are unchanged. Real installs spent ~200-600 ms per part on
+  round trips while the seed's own read takes ~2.5 ms (#84).
+- `ipfs-provider` counts a successful private capacity check (run once per MiB of
+  model download) and staged-directory hash as Kubo use, refreshing
+  `ipfs-coords.json` `last_used` like bounded reads do, so the 600 s idle stop no
+  longer ends Kubo during a long model download (#97).
+
+## [0.8.0-alpha.11]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a local AI model, SmolLM2 135M (145 MB, Apache-2.0). Press
+  Get and Assistant can answer with it on this device; the AI engine downloads
+  the first time a model needs it. Answers from this small model are basic; larger
+  models follow.
+
+### Changed
+
+- Models download several times faster: after the first piece, a Home reads the
+  rest straight from the Homes that hold it.
+
+### Developer detail
+
+- The first production model catalogue is signed offline with the maintainer key
+  (`release-signer.py --model-catalog`, policy field `model_catalog_sha256`) and
+  pinned in `components.json` (`model_catalog`, head
+  `bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`); the package
+  `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky` is built by
+  `ci-model-package.mjs produce` and pinned on the seed (#84).
+- CI proves Marketplace Get and an Assistant reply on Mac, Linux x86-64 and
+  ARM64; on x86-64 the package lives only on a separate holder Home, so Get
+  crosses Carrier (#150).
+- Model preparation tries the local store only until its first miss, then reads
+  remaining parts from Carrier holders with unchanged per-file SHA-256 and
+  package CID checks (145 MB: 332 s to 42 s locally).
+- CI retries apt with backoff and cancels a pull-request run at its first failed
+  job (#194).
 - `publish-release` no longer sends a release gossip announcement that no Home
   received. Seeds on an older Runtime still print the old announcement error after
-  the commit (#174). INSTALL.md describes how updates
-  reach a Home, and VERSIONING.md describes the seed's role.
+  the commit (#174). INSTALL.md describes how updates reach a Home, and
+  VERSIONING.md describes the seed's role.
 
 ## [0.8.0-alpha.10]
 

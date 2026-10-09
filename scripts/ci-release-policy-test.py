@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Check CI release/cache decisions without builds, Docker, or publication."""
+import base64
 import os
 import hashlib
 import io
 import json
 from pathlib import Path
 import re
+import runpy
+import signal
 import subprocess
 import sys
 import tarfile
@@ -334,7 +337,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("branches: [main, develop]", triggers)
         context = {"github.event_name": "merge_group", "github.ref": "refs/heads/gh-readonly-queue/develop/pr-1"}
         for job in JOBS:
-            if job == "release":
+            if job in ("release", "cancel-on-failure"):
                 continue
             guard = re.search(r"(?m)^    if: (.*)$", JOBS[job])
             if guard:
@@ -1130,6 +1133,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
             "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
+            "cancel-on-failure": ("cancel-on-failure", "ubuntu-24.04"),
             "release": ("publish-github-release", "ubuntu-24.04"),
         }
         self.assertEqual(set(JOBS), set(expected))
@@ -1145,6 +1149,59 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(re.findall(r"- ([\w-]+)", needs),
                          ["lint", "test-elastos", "test-behaviour", "test-capsules", "source-home-linux", "source-home-linux-arm64", "source-home-macos"])
         self.assertIn("python3 scripts/ci-release-policy-test.py", JOBS["source-gate"])
+
+    def run_cancel_watcher(self, polls):
+        """Run the watcher shell against successive job lists; return (status, cancels, polls used)."""
+        step, = steps("cancel-on-failure")
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shims, queue = root / "shims", root / "polls"
+            shims.mkdir()
+            queue.mkdir()
+            for index, poll in enumerate(polls):
+                (queue / f"{index:03}").write_text(json.dumps({"jobs": [
+                    {"name": name, "status": status, "conclusion": conclusion}
+                    for name, status, conclusion in poll]}))
+            (shims / "sleep").write_text("#!/bin/bash\n")
+            (shims / "gh").write_text(textwrap.dedent("""\
+                #!/bin/bash
+                if [ "$2" = -X ]; then echo "$4" >> "$CANCEL_LOG"; exit 0; fi
+                next="$(ls "$POLL_DIR" | sort | sed -n 1p)"
+                [ -n "$next" ] || exit 9
+                jq -r "$4" "$POLL_DIR/$next" && rm "$POLL_DIR/$next"
+                """))
+            for shim in shims.iterdir():
+                shim.chmod(0o700)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                                    env={**os.environ, "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}",
+                                         "GITHUB_REPOSITORY": "Elacity/elastos-runtime", "GITHUB_RUN_ID": "7",
+                                         "GITHUB_RUN_ATTEMPT": "1", "POLL_DIR": str(queue),
+                                         "CANCEL_LOG": str(root / "cancels")})
+            cancels = (root / "cancels").read_text().splitlines() if (root / "cancels").exists() else []
+            return result.returncode, cancels, len(polls) - len(list(queue.iterdir()))
+
+    def test_pull_request_runs_cancel_at_the_first_failed_job(self):
+        watcher = JOBS["cancel-on-failure"]
+        self.assertNotIn("actions/checkout@", watcher)
+        self.assertEqual(watcher.split("    permissions:\n", 1)[1].split("    steps:\n", 1)[0], "      actions: write\n")
+        for event, ref, ref_type, override, _, _ in CASES:
+            for head in ("Elacity/elastos-runtime", "someone/fork"):
+                context = {"github.event_name": event, "github.ref": ref, "github.repository": "Elacity/elastos-runtime",
+                           "github.event.pull_request.head.repo.full_name": head}
+                self.assertEqual(job_runs("cancel-on-failure", context),
+                                 event == "pull_request" and head == "Elacity/elastos-runtime", (event, head))
+        watch = ("cancel-on-failure", "in_progress", None)
+        gate = ("source-gate", "completed", "success")
+        macos = ("source-home-macos", "in_progress", None)
+        for conclusion in ("failure", "timed_out"):
+            status, cancels, used = self.run_cancel_watcher(
+                [[watch, gate, macos], [watch, gate, ("lint", "completed", conclusion), macos]])
+            self.assertEqual((status, cancels, used), (0, ["repos/Elacity/elastos-runtime/actions/runs/7/cancel"], 2))
+        # A completed gate before dependent jobs appear is not the end of the run.
+        done = [watch, gate, ("source-home-macos", "completed", "success"), ("lint", "completed", "cancelled")]
+        status, cancels, used = self.run_cancel_watcher([[watch, gate], [watch, gate, macos], done, done])
+        self.assertEqual((status, cancels, used), (0, [], 4))
 
     def test_disposable_refusals_run_on_mac_build_without_operator_inputs(self):
         mac_steps = steps("source-home-macos")
@@ -1443,6 +1500,664 @@ class CustodyKuboDownloadTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertIsNone(installed)
         self.assertFalse(stripped)
+
+
+class InstalledJourneyTests(unittest.TestCase):
+    def fixture(self, root, platform):
+        root = root.resolve()
+        home = root / "home"
+        host = "darwin-arm64" if platform == "macos" else "linux-amd64"
+        data = home / ("Library/Application Support/elastos" if platform == "macos"
+                       else ".local/share/elastos")
+        evidence = root / "evidence"
+        (data / "bin").mkdir(parents=True)
+        (data / "receipts").mkdir()
+        (home / "model-inputs/inputs").mkdir(parents=True)
+        evidence.mkdir()
+        runtime = data / "bin/elastos"
+        runtime.write_bytes(b"installed fixture Runtime")
+        provider = data / "bin/model-provider"
+        provider.write_bytes(b"installed fixture model provider")
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        recipe, = [row for row in json.loads((WORKFLOW.parents[2] / "scripts/release-upstream-recipes.json").read_text())["recipes"]
+                   if row["component"] == "llama-server" and row["platform"] == host]
+        engine_version = json.loads((WORKFLOW.parents[2] / "components.json").read_text())["external"]["llama-server"]["version"]
+        bundle = data / recipe["install_path"]
+        bundle.mkdir(parents=True)
+        binary = bundle / recipe["binary_path"]
+        binary.write_bytes(b"synthetic engine bytes; never executed")
+        binary.chmod(0o700)
+        provenance = {"recipe_sha256": hashlib.sha256(journey["UPSTREAM"]["canonical"](journey["UPSTREAM"]["public_recipe"](recipe))).hexdigest(),
+                      "upstream": journey["UPSTREAM"]["source_record"](recipe["source"])}
+        (bundle / "PROVENANCE.json").write_text(json.dumps(provenance))
+        entries = [{"path": path.relative_to(bundle).as_posix(), "type": "file",
+                    "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
+                   for path in (binary, bundle / "PROVENANCE.json")]
+        archive = "sha256:" + "a" * 64
+        (bundle / ".elastos-engine.json").write_text(json.dumps({
+            "schema": "elastos.local-model-engine/v2", "platform": host, "version": engine_version,
+            "archive_sha256": archive, "entries": entries}))
+        (data / "bin/llama-server").symlink_to(binary)
+        manifest = {"external": {
+            "model-provider": {"platforms": {host: {"checksum": "sha256:" + hashlib.sha256(provider.read_bytes()).hexdigest()}}},
+            "llama-server": {"version": engine_version, "platforms": {host: {
+                "install_path": recipe["install_path"], "binary_path": recipe["binary_path"], "checksum": archive}}}}}
+        (data / "components.json").write_text(json.dumps(manifest))
+        runtime_sha = "sha256:" + hashlib.sha256(runtime.read_bytes()).hexdigest()
+        receipt = {"platform": host, "source": {"commit": "c" * 40, "tree": "d" * 40, "clean": True},
+                   "runtime": {"built_sha256": runtime_sha, "installed_sha256": runtime_sha, "parity": True},
+                   "components_sha256": "sha256:" + hashlib.sha256((data / "components.json").read_bytes()).hexdigest()}
+        (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+        return home, data, evidence, receipt
+
+    PACKAGE_MULTIHASH = b"\x12\x20" + hashlib.sha256(b"fixture package root").digest()
+    PACKAGE_CID = "b" + base64.b32encode(b"\x01\x70" + PACKAGE_MULTIHASH).decode().lower().rstrip("=")
+
+    def consumer_kubo(self, data, holds_root=False):
+        # Kubo's flatfs layout: blocks/<next-to-last 2>/<base32 multihash>.data.
+        blocks = data / "ipfs-repo/blocks"
+        blocks.mkdir(parents=True)
+        (blocks / "SHARDING").write_text("/repo/flatfs/shard/v1/next-to-last/2\n")
+        if holds_root:
+            key = base64.b32encode(self.PACKAGE_MULTIHASH).decode().rstrip("=")
+            (blocks / key[-3:-1]).mkdir()
+            (blocks / key[-3:-1] / f"{key}.data").write_bytes(b"package root")
+
+    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        child = mock.Mock(pid=12345)
+        child.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        self.holder = mock.Mock(return_value=(mock.Mock(pid=23456), {"holder_did": "did:key:holder"}))
+
+        def node_journey(*args, **kwargs):
+            if args[0][1] == "scripts/ci-model-package.mjs":
+                (evidence / "package.json").write_text(json.dumps({"cid": self.PACKAGE_CID}))
+                return
+            self.consumer_kubo(data, consumer_holds_root)
+            stages = [("run_started", 2), ("engine_ready", 400), ("generation_started", 500),
+                      ("first_delta", 600), ("stream_completed", 1000),
+                      ("generation_completed", 1020), ("terminal_applied", 1030)]
+            (home / "journey-runtime.private.log").write_text("".join(
+                f"[model-provider] local timing stage={name} elapsed_ms={value}\n" for name, value in stages)
+                + "[model-provider] local acknowledgement kind=delta outcome=applied elapsed_ms=1020 duration_ms=20\n"
+                + "[model-provider] local acknowledgement kind=terminal outcome=applied elapsed_ms=1030 duration_ms=10\n")
+            (evidence / "home-journey.json").write_text(json.dumps({"results": {
+                "home_screenshots": "passed", "model_package_admission": "passed",
+                "installed_runtime_reply": "passed"}}))
+
+        with mock.patch.dict(os.environ, {"PATH": "/fixture-tools"}, clear=True), \
+                mock.patch.object(subprocess, "check_output", side_effect=lambda args, **_: (
+                    ("c" if args[-1] == "HEAD" else "d") * 40 + "\n" if args[0] == "git" else "")), \
+                mock.patch.object(subprocess, "Popen", return_value=child) as gateway, \
+                mock.patch.object(subprocess, "run", side_effect=node_journey) as node, \
+                mock.patch("urllib.request.urlopen", return_value=response), \
+                mock.patch.object(os, "killpg") as stop, \
+                mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
+                    "capacity_bytes": 100 * 1024 ** 3, "available_bytes": available},
+                    "process_rows": lambda: {},
+                    "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {}, "after": {}},
+                    "start_holder": self.holder}):
+            try:
+                journey["run"](home, data, evidence, carrier=carrier)
+            finally:
+                self.gateway, self.node, self.stop = gateway, node, stop
+        return child
+
+    def test_stale_ui_receipt_is_refused_before_fixture_or_runtime_start(self):
+        for kind in ("receipt", "dangling_link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "linux")
+                old = json.dumps({"results": {"installed_runtime_reply": "passed"}})
+                path = evidence / "home-journey.json"
+                if kind == "receipt":
+                    path.write_text(old)
+                else:
+                    path.symlink_to("never-created.json")
+                with self.assertRaisesRegex(RuntimeError, "requires fresh UI evidence"):
+                    self.execute(home, data, evidence)
+                self.gateway.assert_not_called()
+                self.node.assert_not_called()
+                if kind == "receipt":
+                    self.assertEqual(path.read_text(), old)
+                else:
+                    self.assertTrue(path.is_symlink())
+                    self.assertFalse(path.exists())
+
+    def test_gateway_and_node_share_the_installed_fixture_root(self):
+        for platform in ("macos", "linux"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), platform)
+                child = self.execute(home, data, evidence)
+                self.assertEqual(self.gateway.call_args.args[0][:2],
+                                 [str(data / "bin/elastos"), "gateway"])
+                self.assertEqual(self.node.call_args.args[0][:2],
+                                 ["node", "scripts/ci-installed-home-journey.mjs"])
+                for process in (self.gateway, self.node):
+                    env = process.call_args.kwargs["env"]
+                    self.assertEqual(env["HOME"], str(home))
+                    self.assertEqual(Path(env["XDG_DATA_HOME"]) / "elastos", data)
+                    self.assertEqual(env["PATH"], "/fixture-tools")
+                    self.assertEqual(env["ELASTOS_MODEL_TIMING_DIAGNOSTICS"], "1")
+                self.assertEqual(self.node.call_count, 2)
+                package = self.node.call_args_list[0].args[0]
+                self.assertEqual(package[1], "scripts/ci-model-package.mjs")
+                self.assertEqual(package[2:4], [str(data), str(data)])
+                self.holder.assert_not_called()
+                record = json.loads((evidence / "installed-journeys.json").read_text())
+                self.assertEqual(record["installed_model_provider_sha256"],
+                                 hashlib.sha256((data / "bin/model-provider").read_bytes()).hexdigest())
+                self.assertNotIn("carrier_get", record["results"])
+
+    def test_carrier_get_places_the_package_only_on_a_separate_holder_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            self.execute(home, data, evidence, carrier=True)
+            package = self.node.call_args_list[0].args[0]
+            # The package goes only to the separate holder Home; the consumer gets the catalogue.
+            holder_home = home.parent / "home-holder"
+            holder_data = holder_home / data.relative_to(home)
+            self.assertEqual(package[2:4], [str(holder_data), str(data)])
+            self.assertEqual(self.holder.call_args.args[:3], (holder_home, holder_data, data))
+            self.assertEqual(self.gateway.call_args.args[0][:2], [str(data / "bin/elastos"), "gateway"])
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["results"]["carrier_get"], "passed")
+            self.assertEqual(record["package_holder"], {"holder_did": "did:key:holder"})
+
+    def test_get_refuses_a_package_present_in_the_consumer_kubo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            with self.assertRaisesRegex(RuntimeError, "Carrier-only package delivery"):
+                self.execute(home, data, evidence, carrier=True, consumer_holds_root=True)
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["consumer_package_root_block"], "present")
+            self.assertEqual(record["results"]["carrier_get"], "failed")
+
+    def test_get_refuses_a_consumer_that_already_holds_a_kubo_repository(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, evidence, _ = self.fixture(Path(temp), "linux")
+            (data / "ipfs-repo").mkdir()
+            with self.assertRaisesRegex(AssertionError, "starts without the package"):
+                self.execute(home, data, evidence, carrier=True)
+            self.holder.assert_not_called()
+            self.gateway.assert_not_called()
+
+    def test_receipt_hash_and_disk_refuse_launch(self):
+        for failure in ("receipt", "tree", "dirty", "parity", "built", "components", "hash", "provider", "disk"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, receipt = self.fixture(Path(temp), "macos")
+                if failure == "receipt":
+                    receipt["source"]["commit"] = "d" * 40
+                elif failure == "tree":
+                    receipt["source"]["tree"] = "e" * 40
+                elif failure == "dirty":
+                    receipt["source"]["clean"] = False
+                elif failure == "parity":
+                    receipt["runtime"]["parity"] = False
+                elif failure == "built":
+                    receipt["runtime"]["built_sha256"] = "sha256:" + "e" * 64
+                elif failure == "components":
+                    (data / "components.json").write_text("{}")
+                elif failure == "hash":
+                    (data / "bin/elastos").write_bytes(b"changed fixture Runtime")
+                elif failure == "provider":
+                    (data / "bin/model-provider").unlink()
+                (data / "receipts/source-home-installation.json").write_text(json.dumps(receipt))
+                expected = (RuntimeError if failure == "disk" else
+                            FileNotFoundError if failure == "provider" else AssertionError)
+                with self.assertRaises(expected):
+                    self.execute(home, data, evidence, available=(1 if failure == "disk" else 20) * 1024 ** 3)
+                self.gateway.assert_not_called()
+                self.node.assert_not_called()
+                self.stop.assert_not_called()
+
+    def test_fresh_fixture_preserves_artifacts_and_refuses_existing_home(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        with tempfile.TemporaryDirectory() as temp:
+            home, data, _, _ = self.fixture(Path(temp), "macos")
+            (data / "passkeys.json").write_text("private fixture identity")
+            (data / "model-provider").mkdir()
+            (data / "model-provider/journal").write_text("old run")
+            target_home = Path(temp) / "fresh"
+            target = journey["fresh_fixture"](home, data, target_home)
+            self.assertEqual((target / "bin/model-provider").read_bytes(), (data / "bin/model-provider").read_bytes())
+            self.assertEqual((target / "receipts/source-home-installation.json").read_bytes(),
+                             (data / "receipts/source-home-installation.json").read_bytes())
+            self.assertFalse((target / "passkeys.json").exists())
+            self.assertFalse((target / "model-provider").exists())
+            _, _, info, source_bundle = journey["engine_paths"](data)
+            self.assertEqual((target / "bin/llama-server").resolve(),
+                             (target / info["install_path"] / info["binary_path"]).resolve())
+            absent = journey["fresh_fixture"](home, data, Path(temp) / "absent", include_engine=False)
+            for path in (absent / "bin/llama-server", absent / info["install_path"], absent / "capsules/llama-server"):
+                self.assertFalse(path.exists() or path.is_symlink())
+            self.assertTrue(source_bundle.exists())
+            with self.assertRaises(FileExistsError):
+                journey["fresh_fixture"](home, data, target_home)
+            with mock.patch.dict(journey["fresh_fixture"].__globals__, {"disk_observation": lambda _: {
+                    "capacity_bytes": 100 * 1024 ** 3, "available_bytes": 1024 ** 3}}):
+                low_disk_home = Path(temp) / "low-disk"
+                with self.assertRaisesRegex(RuntimeError, "2 GiB free disk reserve"):
+                    journey["fresh_fixture"](home, data, low_disk_home)
+                self.assertFalse(low_disk_home.exists())
+
+    def test_engine_absence_receipt_preserves_post_ui_filesystem_failure(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        for appeared in (None, "alias", "bundle", "capsule", "ui_missing", "reason", "refusal", "engine_process"):
+            with self.subTest(appeared=appeared), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "linux")
+                target_home = Path(temp) / "absent"
+                target = journey["fresh_fixture"](home, data, target_home, include_engine=False)
+                _, _, _, bundle = journey["engine_paths"](target)
+                (target_home / "model-inputs/inputs").mkdir(parents=True)
+                child = mock.Mock(pid=12345)
+                child.poll.return_value = None
+                response = mock.MagicMock()
+                response.__enter__.return_value.status = 200
+
+                def node_journey(command, **_):
+                    if command[1] == "scripts/ci-model-package.mjs":
+                        (evidence / "package.json").write_text(json.dumps({"cid": self.PACKAGE_CID}))
+                        return
+                    self.assertEqual(command[-1], "--home-only")
+                    if appeared == "ui_missing":
+                        raise subprocess.CalledProcessError(1, command)
+                    (evidence / "home-journey.json").write_text(json.dumps({
+                        "dispatch_unavailable_reason": "unknown_reason" if appeared == "reason" else "source_engine_required", "results": {
+                        "home_screenshots": "passed", "engine_absent_home": "passed",
+                        "engine_absent_refusal": "failed" if appeared == "refusal" else "passed"}}))
+                    if appeared == "alias":
+                        (target / "bin/llama-server").write_text("engine appeared during UI")
+                    elif appeared == "bundle":
+                        bundle.mkdir(parents=True)
+                    elif appeared == "capsule":
+                        (target / "capsules/llama-server").mkdir(parents=True)
+
+                with mock.patch.object(subprocess, "check_output", side_effect=lambda args, **_: (
+                        ("c" if args[-1] == "HEAD" else "d") * 40 + "\n")), \
+                        mock.patch.object(subprocess, "Popen", return_value=child), \
+                        mock.patch.object(subprocess, "run", side_effect=node_journey), \
+                        mock.patch("urllib.request.urlopen", return_value=response), \
+                        mock.patch.dict(journey["run"].__globals__, {"disk_observation": lambda _: {
+                            "capacity_bytes": 100 * 1024 ** 3, "available_bytes": 20 * 1024 ** 3},
+                            "process_rows": lambda: {},
+                            "cleanup_runtime": lambda *_, **__: {"status": "passed", "before": {"llama_server": 1 if appeared == "engine_process" else 0}, "after": {"llama_server": 0}}}):
+                    if appeared:
+                        with self.assertRaises((AssertionError, RuntimeError, subprocess.CalledProcessError)):
+                            journey["run"](target_home, target, evidence, model=False)
+                    else:
+                        journey["run"](target_home, target, evidence, model=False)
+                record = json.loads((evidence / "installed-journeys.json").read_text())
+                self.assertTrue(record["engine_absent"])
+                self.assertEqual(record["engine_absent_after_ui"], appeared in (None, "engine_process"))
+                self.assertEqual(record["results"]["engine_absent_home"], "passed" if appeared in (None, "engine_process") else "failed")
+                self.assertEqual(record["results"]["engine_absent_refusal"], "failed" if appeared else "passed")
+                self.assertNotIn("unknown_reason", json.dumps(record))
+                self.assertEqual(record["results"]["process_cleanup"], "passed")
+
+    def test_engine_receipt_refuses_changed_bytes_and_build_provenance(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        for fault in ("bytes", "recipe", "duplicate"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                _, data, _, _ = self.fixture(Path(temp), "macos")
+                self.assertEqual(journey["engine_receipt"](data)["platform"], "darwin-arm64")
+                _, _, info, bundle = journey["engine_paths"](data)
+                if fault == "bytes":
+                    (bundle / info["binary_path"]).write_bytes(b"changed executable")
+                elif fault == "recipe":
+                    path = bundle / "PROVENANCE.json"
+                    value = json.loads(path.read_text())
+                    value["recipe_sha256"] = "f" * 64
+                    path.write_text(json.dumps(value))
+                    # Even a matching local file record cannot change the pinned recipe.
+                    receipt_path = bundle / ".elastos-engine.json"
+                    receipt = json.loads(receipt_path.read_text())
+                    next(row for row in receipt["entries"] if row["path"] == "PROVENANCE.json")["sha256"] = "sha256:" + journey["digest"](path)
+                    receipt_path.write_text(json.dumps(receipt))
+                else:
+                    path = bundle / ".elastos-engine.json"
+                    value = json.loads(path.read_text())
+                    value["entries"].append(value["entries"][0])
+                    path.write_text(json.dumps(value))
+                with self.assertRaises(AssertionError):
+                    journey["engine_receipt"](data)
+
+    def test_cleanup_reaps_detached_engine_and_preserves_reused_or_foreign_pids(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        data = Path("/isolated/owned/data")
+        row = lambda parent, command, start="original": {"ppid": parent, "command": command, "start": start}
+        initial = {10: row(1, str(data / "bin/elastos") + " gateway"),
+                   11: row(10, str(data / "bin/model-provider")),
+                   12: row(11, str(data / "libexec/llama-server") + " -m model"),
+                   13: row(1, "/foreign/engine")}
+        detached = {12: row(1, initial[12]["command"]), 13: initial[13]}
+        gone = {13: initial[13]}
+        child = mock.Mock(pid=10)
+        child.poll.return_value = None
+        with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
+                "process_rows": mock.Mock(side_effect=[initial, initial, detached, detached, gone])}), \
+                mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
+            result = journey["cleanup_runtime"](child, data)
+        self.assertEqual(result["status"], "passed")
+        groups.assert_called_once_with(10, signal.SIGTERM)
+        kill.assert_called_once_with(12, signal.SIGTERM)
+        # ps start time has one-second precision; command identity also protects reuse.
+        reused = {12: row(1, "/foreign/new-process", start="original")}
+        child.poll.return_value = 0
+        with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
+                "process_rows": mock.Mock(side_effect=[initial, reused])}), \
+                mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
+            self.assertEqual(journey["cleanup_runtime"](child, data)["status"], "passed")
+            groups.assert_not_called()
+            kill.assert_not_called()
+        child.poll.return_value = None
+        replacement = {10: row(1, "/foreign/replacement-runtime-group")}
+        with mock.patch.dict(journey["cleanup_runtime"].__globals__, {
+                "process_rows": mock.Mock(side_effect=[initial, replacement, replacement])}), \
+                mock.patch.object(os, "killpg") as groups, mock.patch.object(os, "kill") as kill:
+            self.assertEqual(journey["cleanup_runtime"](child, data)["status"], "passed")
+            groups.assert_not_called()
+            kill.assert_not_called()
+
+    def test_three_runs_use_distinct_fresh_state_and_continue_after_one_failed_run(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        for first_fails in (False, True):
+            with self.subTest(first_fails=first_fails), tempfile.TemporaryDirectory() as temp:
+                home, data, evidence, _ = self.fixture(Path(temp), "macos")
+                calls = []
+                def one_run(run_home, run_data, run_evidence):
+                    calls.append((run_home, run_data, run_evidence))
+                    (run_data / "passkeys.json").write_text("owned run state")
+                    if first_fails and len(calls) == 1:
+                        raise RuntimeError("fixture reply failed")
+                with mock.patch.dict(journey["repeat"].__globals__, {"run": one_run}), \
+                        mock.patch.object(subprocess, "run") as prepare:
+                    if first_fails:
+                        with self.assertRaisesRegex(RuntimeError, "1 installed Mac timing journeys failed"):
+                            journey["repeat"](home, data, evidence, 3)
+                    else:
+                        journey["repeat"](home, data, evidence, 3)
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(len({row[0] for row in calls}), 3)
+                self.assertEqual(len({row[1] for row in calls}), 3)
+                self.assertEqual(len({row[2] for row in calls}), 3)
+                prepare.assert_not_called()
+                self.assertFalse((data / "passkeys.json").exists())
+
+    def test_mac_workflow_runs_three_fresh_journeys_and_uploads_their_receipts(self):
+        mac_steps = steps("source-home-macos")
+        journey, = [step for step in mac_steps
+                    if step.startswith("name: installed Marketplace Get and Assistant reply\n")]
+        self.assertEqual(field(journey, "run"), "scripts/ci-installed-journeys.sh home-repeat")
+        upload, = [step for step in mac_steps if step.startswith("name: upload installed model journey\n")]
+        self.assertIn("source-home-journeys/**/*.json", upload)
+        self.assertIn("source-home-journeys/**/*.png", upload)
+
+
+class InstalledModelTimingTests(unittest.TestCase):
+    def setUp(self):
+        self.timing = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-model-timing.py"))
+
+    def test_public_receipt_refuses_private_text_unknown_stages_and_invalid_times(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "private.log"
+            log.write_text("\n".join([
+                "[model-provider] local timing stage=engine_ready elapsed_ms=123",
+                "[model-provider] local timing stage=run_timeout elapsed_ms=120000",
+                "[model-provider] local timing stage=operator_secret elapsed_ms=1",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=1 private=/operator/key",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=3600001",
+                "[model-provider] local timing stage=engine_ready elapsed_ms=-1",
+                "private model text and credentials",
+            ]))
+            self.assertEqual(self.timing["stage_timings"](log), [
+                {"stage": "engine_ready", "elapsed_ms": 123},
+                {"stage": "run_timeout", "elapsed_ms": 120000},
+            ])
+
+    def timing_fixture(self):
+        stages = [{"stage": name, "elapsed_ms": value} for name, value in [
+            ("run_started", 2), ("engine_ready", 400), ("generation_started", 500),
+            ("first_delta", 600), ("stream_completed", 1000),
+            ("generation_completed", 1020), ("terminal_applied", 1030)]]
+        acknowledgements = [
+            {"kind": "delta", "outcome": "applied", "elapsed_ms": 800, "duration_ms": 50},
+            {"kind": "delta", "outcome": "applied", "elapsed_ms": 1020, "duration_ms": 20},
+            {"kind": "terminal", "outcome": "applied", "elapsed_ms": 1030, "duration_ms": 10}]
+        return stages, acknowledgements
+
+    def test_generation_excludes_only_delta_waits_before_stream_terminal(self):
+        result = self.timing["run_metrics"](*self.timing_fixture())
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["generation_wall_ms"], 500)
+        self.assertEqual(result["generation_excluding_acknowledgement_ms"], 450)
+        self.assertEqual(result["delta_acknowledgement_count"], 2)
+        self.assertEqual(result["delta_acknowledgement_ms"], 70)
+        self.assertEqual(result["delta_acknowledgement_max_ms"], 50)
+        self.assertEqual(result["terminal_acknowledgement_ms"], 10)
+        self.assertEqual(result["acknowledgement_total_ms"], 80)
+
+    def test_incomplete_rejected_duplicate_reversed_and_timeout_timings_are_refused(self):
+        for failure in ("missing", "rejected", "duplicate", "reversed", "timeout", "terminal", "overlap"):
+            stages, ack = self.timing_fixture()
+            if failure == "missing":
+                stages.pop()
+            elif failure == "rejected":
+                ack[0]["outcome"] = "rejected"
+            elif failure == "duplicate":
+                stages.append(stages[0])
+            elif failure == "reversed":
+                stages[3]["elapsed_ms"] = 1100
+            elif failure == "timeout":
+                stages.append({"stage": "run_timeout", "elapsed_ms": 120000})
+            elif failure == "terminal":
+                ack.pop()
+            else:
+                ack[-1]["duration_ms"] = 100
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["run_metrics"](stages, ack)["status"], "incomplete")
+
+    def test_ack_receipt_refuses_private_fields_unknown_outcomes_and_invalid_durations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "private.log"
+            valid = "[model-provider] local acknowledgement kind=delta outcome=applied elapsed_ms=800 duration_ms=50"
+            log.write_text("\n".join([valid, valid + " private=/operator/key",
+                valid.replace("applied", "private_outcome"), valid.replace("duration_ms=50", "duration_ms=801"),
+                valid.replace("elapsed_ms=800", "elapsed_ms=3600001"),
+                valid.replace("duration_ms=50", "duration_ms=-1")]))
+            self.assertEqual(self.timing["acknowledgement_timings"](log), [
+                {"kind": "delta", "outcome": "applied", "elapsed_ms": 800, "duration_ms": 50}])
+
+    def test_acknowledgements_outside_generation_or_in_wrong_order_are_refused(self):
+        for failure in ("after_terminal", "before_generation", "overlap", "reversed", "across_stream"):
+            stages, ack = self.timing_fixture()
+            if failure == "after_terminal":
+                ack.insert(2, {"kind": "delta", "outcome": "applied",
+                               "elapsed_ms": 300000, "duration_ms": 200000})
+            elif failure == "before_generation":
+                ack[0].update(elapsed_ms=100, duration_ms=50)
+            elif failure == "overlap":
+                ack[1].update(elapsed_ms=1010, duration_ms=250)
+            elif failure == "reversed":
+                ack[0], ack[1] = ack[1], ack[0]
+            else:
+                ack[1].update(elapsed_ms=1020, duration_ms=30)
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["run_metrics"](stages, ack)["status"], "incomplete")
+
+    def test_spread_requires_three_same_candidate_installed_passes(self):
+        row = {"candidate": "c" * 40, "source_tree": "d" * 40,
+               "installed_runtime_sha256": "a" * 64, "installed_model_provider_sha256": "b" * 64,
+               "results": {"installed_runtime_reply": "passed"},
+               "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
+        rows = [json.loads(json.dumps(row)) for _ in range(3)]
+        rows[1]["model_timing"]["durations"]["engine_ready_ms"] = 300
+        rows[2]["model_timing"]["durations"]["engine_ready_ms"] = 450
+        spread = self.timing["timing_spread"](rows, 3)
+        self.assertEqual(spread["durations_ms"]["engine_ready_ms"],
+                         {"values": [400, 300, 450], "min": 300, "max": 450, "spread": 150})
+        self.assertEqual(self.timing["timing_spread"](rows[:2], 3)["status"], "incomplete")
+        for failure in ("candidate", "reply", "timing"):
+            altered = json.loads(json.dumps(rows))
+            if failure == "candidate":
+                altered[1]["installed_model_provider_sha256"] = "different"
+            elif failure == "reply":
+                altered[1]["results"]["installed_runtime_reply"] = "failed"
+            else:
+                altered[1]["model_timing"]["durations"]["status"] = "incomplete"
+            with self.subTest(failure=failure):
+                self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+
+        for field in ("candidate", "source_tree", "installed_runtime_sha256", "installed_model_provider_sha256"):
+            for value in (None, "", "not-a-digest"):
+                altered = json.loads(json.dumps(rows))
+                for record in altered:
+                    record[field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+        for value in (None, -1, "500", True, 3600001):
+            altered = json.loads(json.dumps(rows))
+            altered[1]["model_timing"]["durations"]["generation_wall_ms"] = value
+            with self.subTest(value=value):
+                self.assertEqual(self.timing["timing_spread"](altered, 3)["status"], "incomplete")
+
+    def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
+        shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
+        source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+        for failure in (None, "missing", "candidate", "reply", "absence", "refusal", "refusal_reason", "engine_process"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                _, data, _, _ = InstalledJourneyTests().fixture(root, "macos")
+                runtime = data / "bin/elastos"
+                journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+                identities = {"installed_model_provider_sha256": journey["digest"](data / "bin/model-provider"),
+                              "source_components_sha256": journey["digest"](data / "components.json")}
+                row = {**identities, "candidate": "c" * 40, "source_tree": "d" * 40, "installed_engine": journey["engine_receipt"](data),
+                       "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                       "results": {name: "passed" for name in ["home_screenshots", "model_package_admission", "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve"]},
+                       "model_timing": {"durations": self.timing["run_metrics"](*self.timing_fixture())}}
+                for index in range(1, 4):
+                    if failure == "missing" and index == 3:
+                        continue
+                    value = json.loads(json.dumps(row))
+                    if failure == "candidate":
+                        value["candidate"] = "a" * 40
+                    if failure == "reply" and index == 1:
+                        value["results"]["installed_runtime_reply"] = "failed"
+                    evidence = root / f"run-{index}"
+                    evidence.mkdir()
+                    (evidence / "installed-journeys.json").write_text(json.dumps(value))
+                absent = root / "engine-absent-home"
+                absent.mkdir()
+                (absent / "installed-journeys.json").write_text(json.dumps({
+                    **identities, "candidate": "c" * 40, "source_tree": "d" * 40, "engine_absent": True,
+                    "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                    "dispatch_unavailable_reason": None if failure == "refusal_reason" else "source_engine_required",
+                    "process_cleanup": {"before": {"llama_server": 1 if failure == "engine_process" else 0}},
+                    "results": {name: "failed" if (failure == "absence" and name == "engine_absent_home") or (failure == "refusal" and name == "engine_absent_refusal") else "passed"
+                                for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve")}}))
+                with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
+                        mock.patch.object(sys, "platform", "darwin"), \
+                        mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), \
+                        mock.patch.object(subprocess, "check_output", side_effect=["c" * 40 + "\n", "d" * 40 + "\n"]):
+                    if failure:
+                        with self.assertRaises(SystemExit):
+                            exec(compile(source, "installed-summary", "exec"), {})
+                    else:
+                        exec(compile(source, "installed-summary", "exec"), {})
+                result = json.loads((root / "core-summary.json").read_text())
+                self.assertEqual(result["model_timing_spread"]["status"],
+                                 "incomplete" if failure in ("missing", "candidate", "reply") else "complete")
+                if failure == "reply":
+                    self.assertEqual(result["results"]["installed_runtime_reply"], "failed or not run")
+                if failure in ("absence", "refusal", "refusal_reason", "engine_process"):
+                    self.assertEqual(result["results"]["engine_absent_home"], "failed or not run")
+                summary = (root / "summary.md").read_text()
+                self.assertIn(f"Source tree: `{'d' * 40}`", summary)
+                self.assertIn("OS file cache can warm", summary)
+                if not failure:
+                    self.assertIn("acknowledgement_total_ms", summary)
+                    self.assertIn("Delta Applied count", summary)
+
+    def test_linux_summary_requires_carrier_get_only_where_the_workflow_names_it(self):
+        shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
+        source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+        for carrier, carrier_get in (("true", "passed"), ("true", None), ("false", None)):
+            with self.subTest(carrier=carrier, carrier_get=carrier_get), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                _, data, _, _ = InstalledJourneyTests().fixture(root, "linux")
+                journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+                identities = {"candidate": "c" * 40, "source_tree": "d" * 40,
+                              "installed_runtime_sha256": journey["digest"](data / "bin/elastos"),
+                              "installed_model_provider_sha256": journey["digest"](data / "bin/model-provider"),
+                              "source_components_sha256": journey["digest"](data / "components.json")}
+                results = {name: "passed" for name in ("home_screenshots", "model_package_admission", "installed_runtime_reply",
+                                                       "model_timing_observer", "process_cleanup", "disk_reserve")}
+                if carrier_get:
+                    results["carrier_get"] = carrier_get
+                (root / "installed-journeys.json").write_text(json.dumps({
+                    **identities, "installed_engine": journey["engine_receipt"](data), "results": results}))
+                (root / "engine-absent-home").mkdir()
+                (root / "engine-absent-home/installed-journeys.json").write_text(json.dumps({
+                    **identities, "engine_absent": True, "dispatch_unavailable_reason": "source_engine_required",
+                    "process_cleanup": {"before": {"llama_server": 0}},
+                    "results": {name: "passed" for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots",
+                                                            "process_cleanup", "disk_reserve")}}))
+                with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
+                        mock.patch.object(sys, "platform", "linux"), \
+                        mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md"), "CI_CARRIER_GET": carrier}), \
+                        mock.patch.object(subprocess, "check_output", side_effect=["c" * 40 + "\n", "d" * 40 + "\n"]):
+                    if carrier == "true" and not carrier_get:
+                        with self.assertRaises(SystemExit):
+                            exec(compile(source, "installed-summary", "exec"), {})
+                    else:
+                        exec(compile(source, "installed-summary", "exec"), {})
+                summary = json.loads((root / "core-summary.json").read_text())["results"]
+                if carrier == "true":
+                    self.assertEqual(summary["carrier_get"], "passed" if carrier_get else "failed or not run")
+                else:
+                    self.assertNotIn("carrier_get", summary)
+
+    def test_only_the_linux_x86_job_gets_the_reply_package_from_a_holder(self):
+        for job in ("source-home-linux", "source-home-macos"):
+            for name in ("installed Marketplace Get and Assistant reply", "summarize installed model journey"):
+                step, = [step for step in steps(job) if step.startswith(f"name: {name}\n")]
+                if job == "source-home-linux":
+                    self.assertEqual(field(step, "CI_CARRIER_GET"), "${{ matrix.os == 'ubuntu-24.04' }}")
+                else:
+                    self.assertNotIn("CI_CARRIER_GET", step)
+        self.assertEqual(re.search(r"(?m)^        os: \[([^\]]+)\]$", JOBS["source-home-linux"])[1], "ubuntu-24.04")
+
+    def test_probe_refuses_wrong_alias_malformed_and_oversize_responses(self):
+        alias = "a" * 32
+        cases = [(json.dumps({"data": [{"id": alias}]}).encode(), "matching_alias"),
+                 (json.dumps({"data": [{"id": "b" * 32}]}).encode(), "wrong_alias"),
+                 (b"private malformed response", "unavailable"),
+                 (b"x" * 16385, "oversize")]
+        for body, expected in cases:
+            with self.subTest(expected=expected), mock.patch("socket.socket") as connect:
+                wire = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                connect.return_value.__enter__.return_value.recv.side_effect = [wire, b""]
+                self.assertEqual(self.timing["matching_alias"]("/owned.engine.sock", alias), expected)
+
+    def test_observer_refuses_unrelated_processes_and_foreign_engine_paths(self):
+        data = Path("/isolated/data/elastos")
+        engine = (f"{data}/libexec/llama-server -m /model --host /owned.engine.sock "
+                  f"--ctx-size 4096 --alias {'a' * 32}")
+        rows = {2: (1, str(data / "bin/model-provider")),
+                3: (2, str(data / "bin/model-provider") + " --internal-local-llama-guard"),
+                4: (3, engine)}
+        observe = self.timing["owned_engine"]
+        self.assertEqual(list(observe(rows, 1, data)), [(4, "/owned.engine.sock", "a" * 32)])
+        self.assertEqual(list(observe(rows, 9, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (3, engine.replace(str(data), "/foreign"))}, 1, data)), [])
+        self.assertEqual(list(observe({**rows, 4: (2, engine)}, 1, data)), [])
+        for guard in ("/foreign/guard --internal-local-llama-guard",
+                      str(data / "bin/model-provider") + " --internal-local-llama-guard extra"):
+            with self.subTest(guard=guard):
+                self.assertEqual(list(observe({**rows, 3: (2, guard)}, 1, data)), [])
+
 
 if __name__ == "__main__":
     unittest.main()
