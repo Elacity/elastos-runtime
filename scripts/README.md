@@ -19,9 +19,6 @@ automatically a stable end-user command.
   Runtime imports frozen signed output through `--signed-publication`.
 - `release-signer.py` is the separately installed custodian tool. The operator
   pins its interpreter, OpenSSL and source, and owns all release-key access.
-  Its explicit `community-profile` operation prepares a signed initial Community
-  startup file and pin before release preparation; see
-  [operator provisioning](../docs/COLLABORATION_NETWORK_PROFILE.md#initial-production-profile).
   The existing release-input CI suite runs its refused-case tests.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
   manifest exports, native/guest target selection and the staged artifact gate
