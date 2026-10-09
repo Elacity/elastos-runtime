@@ -10,9 +10,6 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 Test-channel release. Signed releases show these notes in System before you update.
 
-If your Home is on 0.8.0-alpha.12 or older, update to 0.8.0-alpha.13 first, or
-update from Terminal with `elastos update`.
-
 ### Added
 
 - Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
@@ -23,6 +20,10 @@ update from Terminal with `elastos update`.
 
 - This release updates the model list. If SmolLM2 is already on this device,
   press Use once; it keeps the downloaded files.
+- If this Home is on 0.8.0-alpha.12 or older, Update here stops with "The update
+  could not start" and keeps your current release. Run the installer again
+  instead (`curl -fsSL https://elastos.elacitylabs.com/install.sh | bash`); it
+  keeps your identity and data.
 
 ### Developer detail
 
