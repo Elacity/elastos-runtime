@@ -3,10 +3,65 @@
 use ed25519_dalek::Signer;
 use ed25519_dalek::Verifier as Ed25519Verifier;
 use elastos_runtime::signature;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 
 // DID key encoding and strict decoding live in elastos-identity — one source
 // of truth for collaboration Profile identities.
 pub use elastos_identity::{decode_did_key, encode_did_key, encode_signing_key_did};
+
+const VERIFIED_SIGNATURE_CACHE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedSignatureMath {
+    public_key: [u8; 32],
+    signature: [u8; 64],
+    digest: [u8; 32],
+}
+
+static VERIFIED_SIGNATURES: OnceLock<Mutex<VecDeque<VerifiedSignatureMath>>> = OnceLock::new();
+
+fn verify_signature_digest(
+    key: &ed25519_dalek::VerifyingKey,
+    digest: &[u8; 32],
+    signature: &ed25519_dalek::Signature,
+) -> Result<(), ed25519_dalek::SignatureError> {
+    let cache = VERIFIED_SIGNATURES
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(VERIFIED_SIGNATURE_CACHE_CAPACITY)));
+    verify_signature_digest_with_cache(cache, key, digest, signature)
+}
+
+fn verify_signature_digest_with_cache(
+    cache: &Mutex<VecDeque<VerifiedSignatureMath>>,
+    key: &ed25519_dalek::VerifyingKey,
+    digest: &[u8; 32],
+    signature: &ed25519_dalek::Signature,
+) -> Result<(), ed25519_dalek::SignatureError> {
+    // Only successful deterministic signature mathematics is reused. Callers
+    // still parse each input and check current trust, grants, expiry, Profile
+    // authority, contacts and revocations. No message or authority is retained.
+    let verified = VerifiedSignatureMath {
+        public_key: key.to_bytes(),
+        signature: signature.to_bytes(),
+        digest: *digest,
+    };
+    if let Ok(entries) = cache.lock() {
+        if entries.contains(&verified) {
+            return Ok(());
+        }
+    }
+    // Verification runs outside the lock; poisoning only repeats this check.
+    key.verify(digest, signature)?;
+    if let Ok(mut entries) = cache.lock() {
+        if !entries.contains(&verified) {
+            if entries.len() == VERIFIED_SIGNATURE_CACHE_CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back(verified);
+        }
+    }
+    Ok(())
+}
 
 /// Sign arbitrary payload bytes with a domain separator.
 /// Returns `(signature_hex, signer_did)`.
@@ -40,14 +95,13 @@ pub fn verify_domain_separated_signature(
     hasher.update(domain.as_bytes());
     hasher.update(b"\0");
     hasher.update(payload);
-    let digest = hasher.finalize();
+    let digest: [u8; 32] = hasher.finalize().into();
     let verifying_key = decode_did_key(signer_did)?;
     let signature = hex::decode(signature_hex)
         .map_err(|err| anyhow::anyhow!("Invalid signature hex: {err}"))?;
     let signature = ed25519_dalek::Signature::from_slice(&signature)
         .map_err(|err| anyhow::anyhow!("Invalid Ed25519 signature: {err}"))?;
-    verifying_key
-        .verify(&digest, &signature)
+    verify_signature_digest(&verifying_key, &digest, &signature)
         .map_err(|_| anyhow::anyhow!("Domain-separated signature verification failed"))
 }
 
@@ -90,7 +144,7 @@ pub fn verify_signed_json_envelope_against_dids(
     hasher.update(domain.as_bytes());
     hasher.update(b"\0");
     hasher.update(canonical.as_bytes());
-    let digest = hasher.finalize();
+    let digest: [u8; 32] = hasher.finalize().into();
 
     let verifying_key = decode_did_key(&signer_did)?;
     let sig_bytes =
@@ -98,8 +152,7 @@ pub fn verify_signed_json_envelope_against_dids(
     let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
         .map_err(|e| anyhow::anyhow!("Invalid Ed25519 signature: {}", e))?;
 
-    verifying_key
-        .verify(&digest, &sig)
+    verify_signature_digest(&verifying_key, &digest, &sig)
         .map_err(|_| anyhow::anyhow!("Signed envelope signature verification failed"))?;
 
     Ok((envelope, signer_did))
@@ -196,5 +249,192 @@ mod tests {
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let result = verify_release_envelope(&envelope_bytes, "test", &signer_did);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn warmed_signature_math_rejects_changed_payload_domain_signature_and_key() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let domain = "test.cached.signature.v1";
+        let payload = b"one immutable signed payload";
+        let (signature, did) = domain_separated_sign(&key, domain, payload);
+        for _ in 0..3 {
+            verify_domain_separated_signature(&did, domain, payload, &signature).unwrap();
+        }
+        assert!(verify_domain_separated_signature(&did, domain, b"changed", &signature).is_err());
+        assert!(
+            verify_domain_separated_signature(&did, "different.domain", payload, &signature)
+                .is_err()
+        );
+        let mut changed_signature = hex::decode(&signature).unwrap();
+        changed_signature[0] ^= 1;
+        assert!(verify_domain_separated_signature(
+            &did,
+            domain,
+            payload,
+            &hex::encode(changed_signature),
+        )
+        .is_err());
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        assert!(verify_domain_separated_signature(
+            &encode_signing_key_did(&other_key),
+            domain,
+            payload,
+            &signature,
+        )
+        .is_err());
+        for invalid_did in [format!("{did}x"), did.to_ascii_uppercase()] {
+            assert!(
+                verify_domain_separated_signature(&invalid_did, domain, payload, &signature)
+                    .is_err()
+            );
+        }
+        assert!(verify_domain_separated_signature(&did, domain, payload, "invalid").is_err());
+        assert!(verify_domain_separated_signature(&did, domain, payload, "00").is_err());
+        verify_domain_separated_signature(&did, domain, payload, &signature).unwrap();
+    }
+
+    #[test]
+    fn warmed_signature_math_keeps_envelope_trust_and_input_validation_fresh() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let domain = "test.cached.envelope.v1";
+        let payload = serde_json::json!({"body": "original", "revision": 1});
+        let canonical = serde_json::to_vec(&payload).unwrap();
+        let (signature, did) = domain_separated_sign(&key, domain, &canonical);
+        let envelope = serde_json::json!({
+            "payload": payload, "signature": signature, "signer_did": did,
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        // Both public entry points share exactly the same mathematical input.
+        verify_domain_separated_signature(&did, domain, &canonical, &signature).unwrap();
+        for _ in 0..3 {
+            verify_signed_json_envelope_against_dids(&bytes, domain, std::slice::from_ref(&did))
+                .unwrap();
+        }
+        let other = encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[44; 32]));
+        assert!(verify_signed_json_envelope_against_dids(
+            &bytes,
+            domain,
+            std::slice::from_ref(&other)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Signer DID mismatch"));
+        assert!(verify_signed_json_envelope_against_dids(&bytes, "changed.domain", &[]).is_err());
+        for altered in [
+            serde_json::json!({"payload": {"body": "changed", "revision": 1}, "signature": signature, "signer_did": did}),
+            serde_json::json!({"payload": payload, "signature": signature, "signer_did": other}),
+            serde_json::json!({"payload": payload, "signature": signature, "signer_did": format!("{did}x")}),
+            serde_json::json!({"payload": payload, "signature": "00", "signer_did": did}),
+            serde_json::json!({"payload": null, "signature": signature, "signer_did": did}),
+            serde_json::json!({"payload": payload, "signer_did": did}),
+        ] {
+            assert!(verify_signed_json_envelope_against_dids(
+                &serde_json::to_vec(&altered).unwrap(),
+                domain,
+                &[],
+            )
+            .is_err());
+        }
+        assert!(verify_signed_json_envelope_against_dids(b"invalid JSON", domain, &[]).is_err());
+        verify_signed_json_envelope_against_dids(&bytes, domain, std::slice::from_ref(&did))
+            .unwrap();
+    }
+
+    #[test]
+    fn signature_math_cache_keeps_only_64_positive_exact_inputs_in_fifo_order() {
+        use sha2::Digest;
+        let cache = Mutex::new(VecDeque::new());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[45; 32]);
+        let key = decode_did_key(&encode_signing_key_did(&signing_key)).unwrap();
+        let mut originals = Vec::new();
+        for index in 0..=VERIFIED_SIGNATURE_CACHE_CAPACITY {
+            let digest: [u8; 32] = sha2::Sha256::digest(index.to_le_bytes()).into();
+            let signature = signing_key.sign(&digest);
+            verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
+            verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
+            originals.push(VerifiedSignatureMath {
+                public_key: key.to_bytes(),
+                signature: signature.to_bytes(),
+                digest,
+            });
+            assert_eq!(cache.lock().unwrap().len(), (index + 1).min(64));
+        }
+        assert_eq!(
+            cache.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            originals[1..],
+        );
+        let first = originals[0];
+        let signature = ed25519_dalek::Signature::from_bytes(&first.signature);
+        let mut changed_digest = first.digest;
+        changed_digest[0] ^= 1;
+        assert!(
+            verify_signature_digest_with_cache(&cache, &key, &changed_digest, &signature).is_err()
+        );
+        assert_eq!(cache.lock().unwrap().len(), 64);
+        verify_signature_digest_with_cache(&cache, &key, &first.digest, &signature).unwrap();
+        let entries = cache.lock().unwrap();
+        assert_eq!(entries.len(), 64);
+        assert_eq!(entries.back(), Some(&first));
+        assert!(!entries.contains(&originals[1]));
+    }
+
+    #[test]
+    fn concurrent_signature_cache_eviction_preserves_exact_positive_verification() {
+        use sha2::Digest;
+        let cache = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        std::thread::scope(|scope| {
+            for worker in 0u8..8 {
+                let cache = std::sync::Arc::clone(&cache);
+                scope.spawn(move || {
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[worker + 46; 32]);
+                    let key = decode_did_key(&encode_signing_key_did(&signing_key)).unwrap();
+                    for index in 0u8..10 {
+                        let digest: [u8; 32] = sha2::Sha256::digest([worker, index]).into();
+                        let signature = signing_key.sign(&digest);
+                        for _ in 0..2 {
+                            verify_signature_digest_with_cache(&cache, &key, &digest, &signature)
+                                .unwrap();
+                        }
+                        let mut changed_digest = digest;
+                        changed_digest[0] ^= 1;
+                        assert!(verify_signature_digest_with_cache(
+                            &cache,
+                            &key,
+                            &changed_digest,
+                            &signature,
+                        )
+                        .is_err());
+                    }
+                });
+            }
+        });
+        let entries = cache.lock().unwrap();
+        assert_eq!(entries.len(), VERIFIED_SIGNATURE_CACHE_CAPACITY);
+        for entry in entries.iter() {
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key).unwrap();
+            key.verify(
+                &entry.digest,
+                &ed25519_dalek::Signature::from_bytes(&entry.signature),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn poisoned_signature_cache_repeats_full_verification() {
+        let cache = Mutex::new(VecDeque::new());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[54; 32]);
+        let key = decode_did_key(&encode_signing_key_did(&signing_key)).unwrap();
+        let digest = [55; 32];
+        let signature = signing_key.sign(&digest);
+        verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _lock = cache.lock().unwrap();
+            panic!("poison the isolated test cache");
+        })
+        .is_err());
+        assert!(cache.is_poisoned());
+        verify_signature_digest_with_cache(&cache, &key, &digest, &signature).unwrap();
+        assert!(verify_signature_digest_with_cache(&cache, &key, &[56; 32], &signature).is_err());
     }
 }
