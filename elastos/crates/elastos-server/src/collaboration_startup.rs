@@ -34,6 +34,8 @@ pub const COLLABORATION_STARTUP_CONFIG_SCHEMA: &str =
 
 pub(crate) const MAX_STARTUP_CONFIG_BYTES: usize = 3 * 1024 * 1024;
 const COLLABORATION_WORKER_CADENCE: Duration = Duration::from_secs(5);
+const COLLABORATION_LIVE_CADENCE: Duration = Duration::from_millis(500);
+const COLLABORATION_BOOTSTRAP_CADENCE: Duration = Duration::from_secs(30);
 const COLLABORATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_OWNED_PRESENCE_CADENCE: Duration = Duration::from_secs(15);
 const MAX_COLLABORATION_DIAGNOSTIC_CHARS: usize = 160;
@@ -447,36 +449,61 @@ async fn run_collaboration_worker(
     product_port: CollaborationChatProductPort,
     presence_port: CollaborationPresenceProductPort,
     data_root: PathBuf,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) {
+    // These futures share one Runtime task and one consumer. Outgoing work or
+    // receipt broadcasts can wait while accepted rows still reach the product.
+    tokio::join!(
+        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
+            let now = now_secs();
+            project_collaboration_outgoing(&product_port, &presence_port, &data_root, now);
+            if driver.retry_outgoing_once(now).await.is_err() {
+                tracing::warn!("collaboration outgoing retry cycle failed");
+            }
+        }),
+        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
+            if driver.process_incoming_once(now_secs()).await.is_err() {
+                tracing::warn!("collaboration incoming cycle failed");
+            }
+        }),
+        run_collaboration_periodic(shutdown.clone(), COLLABORATION_LIVE_CADENCE, || async {
+            project_collaboration_handoffs(&product_port, &presence_port, &data_root, now_secs());
+        }),
+        run_collaboration_periodic(shutdown, COLLABORATION_BOOTSTRAP_CADENCE, || async {
+            if driver.restore_missing_bootstrap_peers().await.is_err() {
+                tracing::warn!("collaboration bootstrap recovery cycle failed");
+            }
+        }),
+    );
+}
+
+async fn run_collaboration_periodic<F, Fut>(
+    mut shutdown: watch::Receiver<bool>,
+    cadence: Duration,
+    mut cycle: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(cadence);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if *shutdown.borrow() {
             return;
         }
-        let cycle = run_collaboration_worker_cycle_with_presence(
-            &driver,
-            &product_port,
-            &presence_port,
-            &data_root,
-            now_secs(),
-        );
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
+                if changed.is_err() || *shutdown.borrow() { return; }
             }
-            _ = cycle => {}
+            _ = ticker.tick() => {}
         }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
+                if changed.is_err() || *shutdown.borrow() { return; }
             }
-            _ = tokio::time::sleep(COLLABORATION_WORKER_CADENCE) => {}
+            _ = cycle() => {}
         }
     }
 }
@@ -580,8 +607,7 @@ async fn run_collaboration_history_worker(
     }
 }
 
-async fn run_collaboration_worker_cycle_with_presence(
-    driver: &CollaborationTransportDriver,
+fn project_collaboration_outgoing(
     product_port: &CollaborationChatProductPort,
     presence_port: &CollaborationPresenceProductPort,
     data_root: &Path,
@@ -618,12 +644,14 @@ async fn run_collaboration_worker_cycle_with_presence(
             "collaboration presence outgoing projection cycle failed"
         ),
     }
-    if driver.retry_outgoing_once(now).await.is_err() {
-        tracing::warn!("collaboration outgoing retry cycle failed");
-    }
-    if driver.process_incoming_once(now).await.is_err() {
-        tracing::warn!("collaboration incoming cycle failed");
-    }
+}
+
+fn project_collaboration_handoffs(
+    product_port: &CollaborationChatProductPort,
+    presence_port: &CollaborationPresenceProductPort,
+    data_root: &Path,
+    now: u64,
+) {
     match product_port.pending_messages() {
         Ok(handoffs) => {
             for handoff in &handoffs {
@@ -646,6 +674,24 @@ async fn run_collaboration_worker_cycle_with_presence(
         }
         Err(_) => tracing::warn!("collaboration presence projection cycle failed"),
     }
+}
+
+#[cfg(test)]
+async fn run_collaboration_worker_cycle_with_presence(
+    driver: &CollaborationTransportDriver,
+    product_port: &CollaborationChatProductPort,
+    presence_port: &CollaborationPresenceProductPort,
+    data_root: &Path,
+    now: u64,
+) {
+    project_collaboration_outgoing(product_port, presence_port, data_root, now);
+    if driver.retry_outgoing_once(now).await.is_err() {
+        tracing::warn!("collaboration outgoing retry cycle failed");
+    }
+    if driver.process_incoming_once(now).await.is_err() {
+        tracing::warn!("collaboration incoming cycle failed");
+    }
+    project_collaboration_handoffs(product_port, presence_port, data_root, now);
 }
 
 #[cfg(test)]
@@ -2113,6 +2159,197 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(service.history_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_projects_received_chat_while_outgoing_or_receipt_send_is_blocked() {
+        for blocked_outgoing in [true, false] {
+            let (temp, _) = configured_root(true);
+            let configuration =
+                load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
+            let CollaborationNetworkConfiguration::Configured {
+                profile,
+                grant: Some(grant),
+            } = configuration.configuration
+            else {
+                panic!("expected configured default conversation");
+            };
+            let now = now_secs();
+            let (device_key, _) = generate_keypair();
+            let local_profile = profile_for_endpoint(&device_key, "Local");
+            let local_did = local_profile.document().profile_did.clone();
+            crate::room_service::seed_room_owner(
+                temp.path(),
+                &local_profile,
+                crate::room_service::RoomOwnerSeedInput {
+                    title: "Chat".to_string(),
+                },
+            )
+            .unwrap();
+            let core = Arc::new(
+                CollaborationCore::new(
+                    temp.path(),
+                    device_key,
+                    (*profile).clone(),
+                    grant.clone(),
+                    CHAT_ROOM_CAPSULE,
+                )
+                .unwrap(),
+            );
+            let chat = CollaborationChatProductPort::new(core.clone()).unwrap();
+            let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+            if blocked_outgoing {
+                chat.prepare_message(
+                    chat_message_request_binding(
+                        "blocked-outgoing",
+                        "principal",
+                        "local waiting",
+                        &local_profile,
+                    )
+                    .unwrap(),
+                    "local waiting",
+                    &local_profile,
+                    now,
+                )
+                .unwrap();
+            }
+            let (remote_key, _) = generate_keypair();
+            let remote_profile = profile_for_endpoint(&remote_key, "Remote");
+            let remote =
+                DefaultConversationDeviceAuthority::new(remote_key, (*profile).clone(), grant)
+                    .unwrap();
+            let incoming = remote
+                .prepare_profile_outgoing(
+                    &remote_profile,
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    serde_json::json!({"body":"received while send waits"}),
+                    now,
+                    TTL,
+                )
+                .unwrap();
+            let carrier = FakeCarrier::new([FakeReply::JoinEcho]);
+            let joined = join_collaboration_network(carrier.clone(), &profile)
+                .await
+                .unwrap();
+            if blocked_outgoing {
+                carrier.push([FakeReply::Pending]);
+            }
+            carrier.push([peek(
+                0,
+                1,
+                vec![gossip_frame(&remote, incoming.envelope_bytes())],
+            )]);
+            if blocked_outgoing {
+                carrier.push([send_remote(), ack(0, 1, true)]);
+            } else {
+                carrier.push([FakeReply::Pending]);
+            }
+            let driver = CollaborationTransportDriver::new(core.clone(), joined);
+            let session = crate::room_service::start_local_runtime_session(
+                temp.path(),
+                &local_did,
+                "Local runtime",
+                "ElastOS shell",
+            )
+            .unwrap();
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let worker = tokio::spawn(run_collaboration_worker(
+                driver,
+                chat.clone(),
+                presence,
+                temp.path().to_path_buf(),
+                shutdown_rx,
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let feed = chat
+                        .conversation_poll(temp.path(), &session.token, 0)
+                        .unwrap();
+                    if feed
+                        .objects
+                        .iter()
+                        .filter(|object| {
+                            object.body.as_deref() == Some("received while send waits")
+                        })
+                        .count()
+                        == 1
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("received row waited for a blocked transport send");
+            assert!(!worker.is_finished());
+            assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
+            assert_eq!(core.summary().unwrap().replay_tombstones, 1);
+            let requests = carrier.requests();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["op"] == "gossip_send")
+                    .count(),
+                if blocked_outgoing { 2 } else { 1 }
+            );
+            shutdown.send(true).unwrap();
+            tokio::time::timeout(Duration::from_millis(500), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            let count = carrier.requests().len();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(carrier.requests().len(), count);
+            assert_eq!(
+                chat.conversation_poll(temp.path(), &session.token, 0)
+                    .unwrap()
+                    .objects
+                    .iter()
+                    .filter(|object| object.body.as_deref() == Some("received while send waits"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_maintenance_waits_its_cadence_and_cancels_pending_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let cycles = count.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_collaboration_periodic(
+            shutdown_rx,
+            COLLABORATION_BOOTSTRAP_CADENCE,
+            move || {
+                cycles.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        shutdown.send(true).unwrap();
+        worker.await.unwrap();
+
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_collaboration_periodic(
+            shutdown_rx,
+            COLLABORATION_BOOTSTRAP_CADENCE,
+            || std::future::pending::<()>(),
+        ));
+        tokio::task::yield_now().await;
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), worker)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

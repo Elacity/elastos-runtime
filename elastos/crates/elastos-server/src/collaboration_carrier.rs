@@ -8,7 +8,10 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::collaboration_network::VerifiedCollaborationNetworkProfile;
+use crate::collaboration_network::{
+    validate_collaboration_bootstrap_peer, CollaborationBootstrapPeer,
+    VerifiedCollaborationNetworkProfile,
+};
 use crate::collaboration_protocol::{
     verify_collaboration_transport_frame, MAX_COLLABORATION_TRANSPORT_FRAME_BYTES,
 };
@@ -27,6 +30,7 @@ pub struct JoinedCollaborationNetwork {
     carrier: Arc<dyn Provider>,
     topic: String,
     consumer_id: String,
+    bootstrap_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,20 @@ struct RememberPeerData {
 #[serde(deny_unknown_fields)]
 struct JoinExactData {
     topic: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalTicketData {
+    node_id: String,
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicPeersData {
+    topic: String,
+    peers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,10 +200,67 @@ pub async fn join_collaboration_network(
         carrier,
         topic,
         consumer_id,
+        bootstrap_node_ids: peers,
     })
 }
 
 impl JoinedCollaborationNetwork {
+    /// Repair only missing peers from the verified profile. The Runtime owns
+    /// the retry cadence; a healthy mesh never receives another Join here.
+    pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
+        if self.bootstrap_node_ids.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "get_ticket" }))
+            .await
+            .context("Carrier local endpoint lookup failed for collaboration recovery")?;
+        require_bounded_response(&response)?;
+        let local: LocalTicketData = require_ok_response(response, "get_ticket")?;
+        validate_collaboration_bootstrap_peer(&CollaborationBootstrapPeer {
+            node_id: local.node_id.clone(),
+            connect_ticket: local.ticket,
+        })
+        .context("Carrier local endpoint identity is inconsistent")?;
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "list_topic_peers",
+                "topic": self.topic,
+            }))
+            .await
+            .context("Carrier peer lookup failed for collaboration recovery")?;
+        require_bounded_response(&response)?;
+        let connected: TopicPeersData = require_ok_response(response, "list_topic_peers")?;
+        if connected.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration recovery topic");
+        }
+        let missing = self
+            .bootstrap_node_ids
+            .iter()
+            .filter(|node_id| *node_id != &local.node_id && !connected.peers.contains(node_id))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join_peers",
+                "topic": self.topic,
+                "peers": missing,
+            }))
+            .await
+            .context("Carrier missing bootstrap join failed for collaboration recovery")?;
+        require_bounded_response(&response)?;
+        let joined: JoinExactData = require_ok_response(response, "gossip_join_peers")?;
+        if joined.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration recovery join");
+        }
+        Ok(())
+    }
+
     pub async fn send(&self, frame: &[u8]) -> anyhow::Result<CollaborationCarrierSendOutcome> {
         let message =
             std::str::from_utf8(frame).context("collaboration Carrier frame is not UTF-8")?;
@@ -509,6 +584,20 @@ mod tests {
         }))
     }
 
+    fn local_ticket(peer: &CollaborationBootstrapPeer) -> FakeReply {
+        FakeReply::Value(serde_json::json!({
+            "status": "ok",
+            "data": {"node_id": peer.node_id, "ticket": peer.connect_ticket},
+        }))
+    }
+
+    fn topic_peers(topic: &str, peers: &[&str]) -> FakeReply {
+        FakeReply::Value(serde_json::json!({
+            "status": "ok",
+            "data": {"topic": topic, "peers": peers},
+        }))
+    }
+
     fn signed_frame(envelope: &[u8]) -> Vec<u8> {
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
         sign_collaboration_transport_frame(&signing_key, envelope).unwrap()
@@ -621,6 +710,143 @@ mod tests {
                 "peers": [],
             })]
         );
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_repairs_only_missing_verified_bootstraps() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(20);
+        let connected = ticket_for(21);
+        let missing = ticket_for(22);
+        let unrelated = ticket_for(23);
+        let profile = verified_profile(
+            &signer,
+            "bootstrap-recovery",
+            1,
+            None,
+            vec![own.clone(), connected.clone(), missing.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&own.node_id),
+            remember_ok(&connected.node_id),
+            remember_ok(&missing.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&connected.node_id, &unrelated.node_id]),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&connected.node_id, &missing.node_id]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        let repair = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] == "gossip_join_peers")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repair,
+            [serde_json::json!({
+                "op": "gossip_join_peers", "topic": topic, "peers": [missing.node_id],
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_retries_missing_bootstrap_after_a_failed_join() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(24);
+        let bootstrap = ticket_for(25);
+        let profile = verified_profile(&signer, "late-bootstrap", 1, None, vec![bootstrap.clone()]);
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            FakeReply::Error("offline"),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&bootstrap.node_id]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        let repairs = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] == "gossip_join_peers")
+            .collect::<Vec<_>>();
+        assert_eq!(repairs.len(), 2);
+        assert!(repairs.iter().all(|request| request["topic"] == topic
+            && request["peers"] == serde_json::json!([bootstrap.node_id])));
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_recovery_refuses_mismatched_local_identity_or_topic() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(26);
+        let other = ticket_for(27);
+        let bootstrap = ticket_for(28);
+        let profile = verified_profile(
+            &signer,
+            "bootstrap-refusal",
+            1,
+            None,
+            vec![bootstrap.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        for reply in [
+            FakeReply::Value(serde_json::json!({"status": "ok", "data": {
+                "node_id": other.node_id, "ticket": own.connect_ticket,
+            }})),
+            FakeReply::Value(serde_json::json!({"status": "ok", "data": {
+                "node_id": crate::crypto::encode_signing_key_did(&signer), "ticket": own.connect_ticket,
+            }})),
+        ] {
+            let carrier =
+                FakeCarrier::new([remember_ok(&bootstrap.node_id), join_ok(&topic), reply]);
+            let joined = join_collaboration_network(carrier.clone(), &profile)
+                .await
+                .unwrap();
+            assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+            assert!(!carrier
+                .requests()
+                .iter()
+                .any(|request| request["op"] == "gossip_join_peers"));
+        }
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers("other-topic", &[]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+        assert!(!carrier
+            .requests()
+            .iter()
+            .any(|request| request["op"] == "gossip_join_peers"));
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            join_ok("other-topic"),
+        ]);
+        let joined = join_collaboration_network(carrier, &profile).await.unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
     }
 
     #[test]

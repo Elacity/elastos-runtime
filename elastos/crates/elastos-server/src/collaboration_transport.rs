@@ -38,6 +38,10 @@ impl CollaborationTransportDriver {
         Self { core, network }
     }
 
+    pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
+        self.network.restore_missing_bootstrap_peers().await
+    }
+
     pub(crate) async fn retry_outgoing_once(
         &self,
         now: u64,
@@ -664,10 +668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_batch_waits_for_retryable_core_work_but_consumes_deterministic_rejections() {
-        let fixture = Fixture::new();
-        let core = fixture.core();
-    #[tokio::test]
     async fn emitted_receipts_round_trip_through_carrier_and_settle_once_after_ack_retry() {
         use crate::collaboration_product::{
             chat_message_request_binding, CollaborationChatProductPort,
@@ -829,6 +829,10 @@ mod tests {
         assert_eq!(poll.objects[0].seq, first_row.seq);
     }
 
+    #[tokio::test]
+    async fn mixed_batch_waits_for_retryable_core_work_but_consumes_deterministic_rejections() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
         let (conflict_key, _) = generate_keypair();
         let (conflict_key, original) = remote_message(&fixture, conflict_key, "original");
         let original_frame = transport_frame(&conflict_key, &original);
