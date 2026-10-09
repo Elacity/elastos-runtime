@@ -16,7 +16,8 @@ use bindings::{
     resolve_capsule_method_binding, static_capsule_method_binding, RuntimeCapsuleAffordanceBinding,
 };
 pub(super) use read_model::{
-    capsule_catalog_summary, capsule_interface_registry_summary, CapsuleCatalogResponse,
+    capsule_catalog_summary, capsule_interface_registry_summary,
+    capsule_interface_registry_summary_from_catalog, CapsuleCatalogResponse,
     CapsuleInterfaceRegistryResponse,
 };
 
@@ -144,7 +145,18 @@ pub(super) async fn capsule_interface_registry_summary_with_bindings(
     data_dir: &std::path::Path,
     registry: Option<&elastos_runtime::provider::ProviderRegistry>,
 ) -> read_model::CapsuleInterfaceRegistryResponse {
-    let mut summary = capsule_interface_registry_summary(data_dir);
+    capsule_interface_registry_summary_with_bindings_from_catalog(
+        &capsule_catalog_summary(data_dir),
+        registry,
+    )
+    .await
+}
+
+pub(super) async fn capsule_interface_registry_summary_with_bindings_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+) -> read_model::CapsuleInterfaceRegistryResponse {
+    let mut summary = capsule_interface_registry_summary_from_catalog(catalog);
     for entry in &mut summary.interfaces {
         let mut bindings = Vec::with_capacity(entry.interface.methods.len());
         for method in &entry.interface.methods {

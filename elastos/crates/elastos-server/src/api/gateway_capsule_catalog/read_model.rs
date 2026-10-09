@@ -142,10 +142,15 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 pub(in crate::api::gateway) fn capsule_interface_registry_summary(
     data_dir: &std::path::Path,
 ) -> CapsuleInterfaceRegistryResponse {
-    let catalog = capsule_catalog_summary(data_dir);
+    capsule_interface_registry_summary_from_catalog(&capsule_catalog_summary(data_dir))
+}
+
+pub(in crate::api::gateway) fn capsule_interface_registry_summary_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> CapsuleInterfaceRegistryResponse {
     let mut interfaces = Vec::new();
-    for capsule in catalog.capsules {
-        for interface in capsule.interfaces {
+    for capsule in &catalog.capsules {
+        for interface in &capsule.interfaces {
             let bindings = interface
                 .methods
                 .iter()
@@ -164,7 +169,7 @@ pub(in crate::api::gateway) fn capsule_interface_registry_summary(
                 projections: capsule.projections.clone(),
                 cid: capsule.cid.clone(),
                 trust_state: capsule.trust_state.clone(),
-                interface,
+                interface: interface.clone(),
                 bindings,
             });
         }

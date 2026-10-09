@@ -467,7 +467,12 @@ pub(super) async fn home_summary(
         };
 
     let mut notifications = home_state.notifications;
-    let active_shell = match home_active_shell_summary(&state.data_dir, context.as_ref()) {
+    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
+    let active_shell = match home_active_shell_summary_from_catalog(
+        &state.data_dir,
+        context.as_ref(),
+        &capsule_catalog,
+    ) {
         Ok(shell) => shell,
         Err(err) => return home_error_response(err),
     };
@@ -488,10 +493,9 @@ pub(super) async fn home_summary(
         }
         append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
     }
-    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
     let targets = home_targets_from_catalog(&capsule_catalog);
-    let capsule_interfaces = capsule_interface_registry_summary_with_bindings(
-        &state.data_dir,
+    let capsule_interfaces = capsule_interface_registry_summary_with_bindings_from_catalog(
+        &capsule_catalog,
         state.provider_registry.as_deref(),
     )
     .await;
@@ -6077,7 +6081,15 @@ fn home_active_shell_summary(
     data_dir: &std::path::Path,
     context: Option<&HomeLaunchTokenContext>,
 ) -> anyhow::Result<HomeActiveShellSummary> {
-    let candidates = home_active_shell_candidates(data_dir);
+    home_active_shell_summary_from_catalog(data_dir, context, &capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_summary_from_catalog(
+    data_dir: &std::path::Path,
+    context: Option<&HomeLaunchTokenContext>,
+    catalog: &CapsuleCatalogResponse,
+) -> anyhow::Result<HomeActiveShellSummary> {
+    let candidates = home_active_shell_candidates_from_catalog(catalog);
     let saved = match context {
         Some(context) => home_active_shell_state(data_dir, context)?.map(|state| state.active),
         None => None,
@@ -6130,18 +6142,24 @@ pub(super) fn home_active_shell_snapshot_value(
 }
 
 fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShellCandidate> {
+    home_active_shell_candidates_from_catalog(&capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_candidates_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> Vec<HomeActiveShellCandidate> {
     let mut candidates = BTreeMap::<String, HomeActiveShellCandidate>::new();
-    for capsule in capsule_catalog_summary(data_dir)
+    for capsule in catalog
         .capsules
-        .into_iter()
+        .iter()
         .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
         .filter(|capsule| capsule.name != HOME_CAPSULE_ID)
         .filter(|capsule| is_trusted_home_shell_id(&capsule.name))
     {
-        let Some(catalog_route) = capsule.route else {
+        let Some(catalog_route) = capsule.route.clone() else {
             continue;
         };
-        let capsule_name = capsule.name;
+        let capsule_name = capsule.name.clone();
         let is_home_gui = capsule_name == HOME_GUI_SHELL_ID;
         let name = capsule_name.clone();
         let candidate = HomeActiveShellCandidate {
@@ -6149,17 +6167,17 @@ fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShe
             title: if is_home_gui {
                 "Home GUI".to_string()
             } else {
-                capsule.title
+                capsule.title.clone()
             },
-            description: capsule.description,
+            description: capsule.description.clone(),
             route: if is_home_gui {
                 HOME_ROUTE.to_string()
             } else {
                 catalog_route
             },
-            role: capsule.role,
+            role: capsule.role.clone(),
             launchable: capsule.launchable,
-            trust_state: capsule.trust_state,
+            trust_state: capsule.trust_state.clone(),
         };
         candidates.insert(name, candidate);
     }
@@ -8451,5 +8469,110 @@ mod services_kind_tests {
             ..Default::default()
         };
         assert!(!remote_offer_request_expired(&denied, 100));
+    }
+}
+
+#[cfg(test)]
+mod home_catalogue_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn home_catalogue_projections_share_one_snapshot_and_next_read_sees_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../capsules/home-gui/capsule.json"
+        ))
+        .unwrap();
+        for name in ["home-gui", "fixture-app"] {
+            let dir = root.path().join("capsules").join(name);
+            std::fs::create_dir_all(dir.join("browser")).unwrap();
+            let mut manifest = original.clone();
+            manifest["name"] = name.into();
+            if name == "fixture-app" {
+                manifest["role"] = "app".into();
+                manifest["description"] = "Before".into();
+            }
+            std::fs::write(
+                dir.join("capsule.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("browser/index.html"), "Home fixture").unwrap();
+        }
+        let registry = root.path().join("components.json");
+        let mut components = serde_json::json!({"external": {
+            "home-gui": {"install_path": "capsules/home-gui", "platforms": {}},
+            "fixture-app": {"install_path": "capsules/fixture-app", "platforms": {}}
+        }, "capsules": {}, "profiles": {}});
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let catalog = capsule_catalog_summary(root.path());
+        let shells = home_active_shell_summary_from_catalog(root.path(), None, &catalog).unwrap();
+        assert_eq!(shells.active, HOME_GUI_SHELL_ID);
+        assert_eq!(shells.candidates.len(), 1);
+        let targets = serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap();
+        let interfaces = serde_json::to_value(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await,
+        )
+        .unwrap();
+        assert!(interfaces["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["capsule"] == "fixture-app"));
+
+        components["external"]
+            .as_object_mut()
+            .unwrap()
+            .remove("home-gui");
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let path = root.path().join("capsules/fixture-app/capsule.json");
+        let mut updated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        updated["description"] = "After".into();
+        updated["interfaces"] = serde_json::json!([]);
+        std::fs::write(path, serde_json::to_vec(&updated).unwrap()).unwrap();
+        assert_eq!(
+            home_active_shell_summary_from_catalog(root.path(), None, &catalog)
+                .unwrap()
+                .active,
+            HOME_GUI_SHELL_ID
+        );
+        assert_eq!(
+            serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap(),
+            targets
+        );
+        assert_eq!(
+            serde_json::to_value(
+                capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await
+            )
+            .unwrap(),
+            interfaces
+        );
+
+        let next = capsule_catalog_summary(root.path());
+        assert!(
+            home_active_shell_summary_from_catalog(root.path(), None, &next)
+                .unwrap()
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            next.capsules
+                .iter()
+                .find(|row| row.name == "fixture-app")
+                .unwrap()
+                .description,
+            "After"
+        );
+        assert!(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&next, None)
+                .await
+                .interfaces
+                .is_empty()
+        );
+        assert!(home_active_shell_summary(root.path(), None)
+            .unwrap()
+            .active
+            .is_empty());
     }
 }

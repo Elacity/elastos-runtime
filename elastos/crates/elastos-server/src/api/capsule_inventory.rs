@@ -261,26 +261,32 @@ fn installed_external_component_names_from_manifest(
     manifest
         .external
         .iter()
-        .filter_map(|(name, component)| {
-            let platform_info = crate::setup::resolve_platform_info(component, &platform);
-            let install_path = crate::setup::resolve_install_path(component, platform_info)?;
-            let install_path = Path::new(install_path);
-            if install_path.is_absolute()
-                || install_path
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
-                || !data_dir.join(install_path).exists()
-            {
-                return None;
-            }
-            Some(name.clone())
-        })
+        .filter(|(_, component)| component_is_installed(data_dir, component, &platform))
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
+fn component_is_installed(
+    data_dir: &Path,
+    component: &crate::setup::Component,
+    platform: &str,
+) -> bool {
+    let platform_info = crate::setup::resolve_platform_info(component, platform);
+    let Some(install_path) = crate::setup::resolve_install_path(component, platform_info) else {
+        return false;
+    };
+    let install_path = Path::new(install_path);
+    !install_path.is_absolute()
+        && !install_path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        && data_dir.join(install_path).exists()
+}
+
 pub(crate) fn installed_active_capsule_dir(data_dir: &Path, name: &str) -> Option<PathBuf> {
-    let active_capsules = active_capsule_names(data_dir)?;
-    if !active_capsules.contains(name) {
+    let manifest = components_manifest(data_dir)?;
+    let component = manifest.external.get(name)?;
+    if !component_is_installed(data_dir, component, &crate::setup::detect_platform()) {
         return None;
     }
     let dir = installed_capsules_root(data_dir).join(name);
