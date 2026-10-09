@@ -1,7 +1,7 @@
 //! Receipt-bound image acquisition through the existing first-party installer.
 //! This prepares image bytes; Engine host admission still owns launch readiness.
 
-use super::{ComponentsManifest, PlatformInfo};
+use super::{replace_directory, ComponentsManifest, PlatformInfo};
 use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -720,49 +720,6 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
-}
-
-fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
-    if !dest.exists() {
-        fs::rename(staged, dest)?;
-        return Ok(());
-    }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
-        let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
-        // Both paths name owned directories on the same filesystem. An unsupported
-        // exchange fails with the previous installation still in place.
-        #[cfg(target_os = "macos")]
-        let result = unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                staged.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::RENAME_SWAP,
-            )
-        };
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                staged.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Browser image atomic replacement failed; previous set preserved");
-        }
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    bail!("Browser image atomic replacement is unsupported on this host")
 }
 
 #[cfg(test)]

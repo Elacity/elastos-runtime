@@ -770,7 +770,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const shared = state.sharedModels.filter(matches);
     const access = state.modelAccess.filter(matches);
     const localStatus = state.appLoading ? "Loading verified models…" : state.appLoadError
-      || (state.modelCatalogState === "unavailable" ? "The model catalog could not be verified." : "");
+      || (state.modelCatalogState === "unavailable" ? "The signed model list could not be fetched or verified. Connect to the internet and try again." : "");
     const unavailable = state.remoteAvailability.filter(service => service.status !== "reachable").length;
     els.storeSections.innerHTML = `${modelsSettingsChrome()}
       <section class="store-section"><h2 class="store-section-title">On this Home</h2>
