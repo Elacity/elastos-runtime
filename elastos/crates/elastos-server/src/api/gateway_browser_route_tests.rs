@@ -867,7 +867,7 @@ async fn test_browser_compatibility_auto_selects_a_compatible_engine() {
 }
 
 #[tokio::test]
-async fn test_browser_readiness_auto_selects_an_approved_ready_remote_engine() {
+async fn test_browser_readiness_requires_explicit_approved_remote_engine_selection() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
@@ -920,6 +920,36 @@ async fn test_browser_readiness_auto_selects_an_approved_ready_remote_engine() {
                     json!({"url":"https://ela.city/",
                 "display_mode":"webrtc_remote_display", "guarantee_level":"operator_rbi",
                 "viewport":{"width":900,"height":520}})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let opened: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{opened}");
+    assert_eq!(opened["reason"], "artifact_invalid");
+    assert_eq!(opened["outcome"]["state"], "terminal_pre_effect_failure");
+    assert!(calls.lock().await.iter().all(|call| call["op"] != "launch"));
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"url":"https://ela.city/", "adapter_id":"mock-jetson-engine",
+                        "display_mode":"webrtc_remote_display", "guarantee_level":"operator_rbi",
+                        "viewport":{"width":900,"height":520}})
                     .to_string(),
                 ))
                 .unwrap(),

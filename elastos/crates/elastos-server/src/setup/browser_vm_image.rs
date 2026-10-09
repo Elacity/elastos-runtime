@@ -800,6 +800,10 @@ mod tests {
     fn fixture(rootfs: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut receipt = json!({
             "schema":"elastos.browser.vm-rootfs-build/v1", "ok":true, "target_platform":"linux-arm64",
+            "inputs_sha256":"c".repeat(64),
+            "recipe_options":{"target_platform":"linux-arm64", "rootfs_size":"8192M",
+                "debian_suite":"bookworm", "debian_mirror":"https://deb.debian.org/debian",
+                "cdp_timeout_ms":"20000"},
             "size":rootfs.len(), "sha256":sha(rootfs),
             "kernel":{"size":6,"sha256":sha(b"kernel")},
             "initrd":{"size":6,"sha256":sha(b"initrd")},

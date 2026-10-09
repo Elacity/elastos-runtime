@@ -9580,6 +9580,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_execution_gr
     assert!(!left.path().join("config/exit-provider.json").exists());
     assert!(alice.exit_provider.requests.lock().await.is_empty());
     let grant = grant.clone();
+    super::remote_engine::config(right.path());
     let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
         .await
         .unwrap();

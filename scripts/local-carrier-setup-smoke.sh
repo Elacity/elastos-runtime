@@ -136,9 +136,6 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/protected-content-protect-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/protected-content-decrypt-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
-(cd "${REPO_ROOT}/elastos/tools/browser-engine-supervisor" && cargo build --release)
-(cd "${REPO_ROOT}/elastos/tools/browser-native-proxy-engine" && cargo build --release)
-(cd "${REPO_ROOT}/elastos/tools/browser-stream-bridge" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/tools/browser-local-exit" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
@@ -217,9 +214,6 @@ MODEL_PROVIDER_BIN="$(cargo_release_binary capsules/model-provider model-provide
 PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-protect-provider protected-content-protect-provider)" \
 PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-decrypt-provider protected-content-decrypt-provider)" \
 BROWSER_ENGINE_ADAPTER_BIN="$(cargo_release_binary capsules/browser-engine-adapter browser-engine-adapter)" \
-BROWSER_ENGINE_SUPERVISOR_BIN="$(cargo_release_binary elastos/tools/browser-engine-supervisor browser-engine-supervisor)" \
-BROWSER_NATIVE_PROXY_ENGINE_BIN="$(cargo_release_binary elastos/tools/browser-native-proxy-engine browser-native-proxy-engine)" \
-BROWSER_STREAM_BRIDGE_BIN="$(cargo_release_binary elastos/tools/browser-stream-bridge browser-stream-bridge)" \
 BROWSER_LOCAL_EXIT_BIN="$(cargo_release_binary elastos/tools/browser-local-exit browser-local-exit)" \
 WEBSPACE_PROVIDER_BIN="$(cargo_release_binary capsules/webspace-provider webspace-provider)" \
 WALLET_PROVIDER_BIN="$(cargo_release_binary capsules/wallet-provider wallet-provider)" \
@@ -293,9 +287,6 @@ mapping = {
         os.environ["PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN"]
     ),
     "browser-engine-adapter": pathlib.Path(os.environ["BROWSER_ENGINE_ADAPTER_BIN"]),
-    "browser-engine-supervisor": pathlib.Path(os.environ["BROWSER_ENGINE_SUPERVISOR_BIN"]),
-    "browser-native-proxy-engine": pathlib.Path(os.environ["BROWSER_NATIVE_PROXY_ENGINE_BIN"]),
-    "browser-stream-bridge": pathlib.Path(os.environ["BROWSER_STREAM_BRIDGE_BIN"]),
     "browser-local-exit": pathlib.Path(os.environ["BROWSER_LOCAL_EXIT_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
     "wallet-provider": pathlib.Path(os.environ["WALLET_PROVIDER_BIN"]),
@@ -587,9 +578,6 @@ for installed in \
     "${DATA_DIR}/bin/net-provider" \
     "${DATA_DIR}/bin/exit-provider" \
     "${DATA_DIR}/bin/browser-engine-adapter" \
-    "${DATA_DIR}/bin/browser-engine-supervisor" \
-    "${DATA_DIR}/bin/browser-native-proxy-engine" \
-    "${DATA_DIR}/bin/browser-stream-bridge" \
     "${DATA_DIR}/bin/browser-local-exit" \
     "${DATA_DIR}/bin/webspace-provider" \
     "${DATA_DIR}/bin/wallet-provider" \

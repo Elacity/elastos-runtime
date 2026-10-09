@@ -7281,14 +7281,16 @@ pub(crate) mod tests {
             admit_release_components(&manifest, platform)
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }
-        // This release publishes the microVM pieces for no platform: the
-        // profiles that name them still resolve, setup skips them, and Home
-        // never selects them.
+        // Home obtains Browser VM helpers when it prepares the local Engine.
+        // ARM Linux receives crosvm; the guest archive owns its kernel.
         let home = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
         for name in ["crosvm", "vmlinux"] {
             assert!(!home.iter().any(|selected| selected == name));
             for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
-                assert!(resolve_platform_info(&manifest.external[name], platform).is_none());
+                assert_eq!(
+                    resolve_platform_info(&manifest.external[name], platform).is_some(),
+                    name == "crosvm" && platform == "linux-arm64"
+                );
             }
         }
         for profile in ["minimal", "full"] {
