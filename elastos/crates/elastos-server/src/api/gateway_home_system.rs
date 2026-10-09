@@ -7487,7 +7487,7 @@ pub(super) async fn system_community_membership_update(
         )
             .into_response();
     };
-    match port.community_membership().set_joined(body.joined) {
+    match port.set_community_joined(body.joined) {
         Ok(()) => Json(system_community_membership_summary(&state)).into_response(),
         Err(error) => system_error_response(error),
     }

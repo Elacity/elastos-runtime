@@ -125,6 +125,10 @@ impl CollaborationChatProductPort {
         self.core.community_membership()
     }
 
+    pub(crate) fn set_community_joined(&self, joined: bool) -> anyhow::Result<()> {
+        self.core.set_community_joined(joined)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_live_unresolved_outgoing(&self) -> anyhow::Result<usize> {
         Ok(self.core.summary()?.live_unresolved_outgoing)

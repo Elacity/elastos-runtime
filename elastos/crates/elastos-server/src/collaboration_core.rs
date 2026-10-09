@@ -344,6 +344,16 @@ impl CollaborationCore {
         &self.community_membership
     }
 
+    /// Serialize the Home-wide choice with durable Community admission. A send
+    /// accepted before Leave may remain queued; a send cannot commit across it.
+    pub(crate) fn set_community_joined(&self, joined: bool) -> anyhow::Result<()> {
+        let _guard = self
+            .mutation_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
+        self.community_membership.set_joined(joined)
+    }
+
     pub(crate) fn conversation_scope(&self) -> (&str, &str) {
         (
             self.authority.network_id(),
@@ -2449,6 +2459,74 @@ mod tests {
             now,
             ttl_secs,
         )
+    }
+
+    #[test]
+    fn community_leave_serializes_with_durable_admission_and_refuses_left_intents() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let fixture = Fixture::new();
+        let core = Arc::new(fixture.core());
+        prepare(
+            &core,
+            "accepted-before-leave",
+            serde_json::json!({"content":"before"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        let original = fs::read(core.state_path()).unwrap();
+        let mutation = core.mutation_mutex.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (left_tx, left_rx) = mpsc::sync_channel(0);
+        let leaving = core.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = leaving.set_community_joined(false);
+            left_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            left_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(core.community_membership().joined());
+        drop(mutation);
+        left_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!core.community_membership().joined());
+        assert!(!fixture.core().community_membership().joined());
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        assert!(prepare(
+            &core,
+            "refused-while-left",
+            serde_json::json!({"content":"left"}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL));
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        core.set_community_joined(true).unwrap();
+        prepare(
+            &core,
+            "accepted-after-rejoin",
+            serde_json::json!({"content":"rejoined"}),
+            NOW + 2,
+            TTL,
+        )
+        .unwrap();
+        let state = core.load_state().unwrap().unwrap();
+        assert_eq!(state.outgoing.len(), 2);
+        assert!(state
+            .outgoing
+            .iter()
+            .all(|record| record.operation.request_id != "refused-while-left"));
     }
 
     fn complete_projection(core: &CollaborationCore, outgoing: &DurableOutgoingMessage) {
