@@ -50,7 +50,7 @@ test("existing Browser CI step runs the Linux network tests", () => {
   const ci = fs.readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
   const step = ci.slice(ci.indexOf("- name: JavaScript behavior tests"), ci.indexOf("\n  # One input for every ARM consumer"));
   assert.match(step, /python3 scripts\/browser-vm-linux-network\.test\.py/);
-  assert.match(step, /node --test/);
+  assert.match(step, /\.\/scripts\/test-behaviour\.sh/);
 });
 
 test("crosvm command consumes the prepared TAP and addresses", () => {

@@ -498,7 +498,8 @@ def crate_units(root, workspace, package, paths, lease):
 def gates(root, paths, lease):
     run(["git", "diff", "--check", "origin/develop...HEAD"], root)
     run(["node", "scripts/check-product-data.mjs"], root)
-    run(["node", "--test", "scripts/check-product-data.test.mjs"], root)
+    # The CI test-behaviour suite (about a minute); its last lines name failures.
+    run(["./scripts/test-behaviour.sh"], root)
     if any(path in {".githooks/pre-push", "scripts/ci-local-prepush.sh",
                     "scripts/ci-local-prepush.py", "scripts/ci-local-prepush-test.py"}
            for path in paths):

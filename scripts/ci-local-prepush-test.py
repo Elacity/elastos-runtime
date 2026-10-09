@@ -69,6 +69,8 @@ class PrepushTests(unittest.TestCase):
                           "capsules/protected-content-decrypt-provider", "capsules/custody-provider"):
             self.write(workspace + "/Cargo.lock", "version = 4\n# committed fixture lock\n")
         self.write("README.md", "Fixture\n")
+        self.write("scripts/test-behaviour.sh", "#!/bin/sh\nexec node --test --test-timeout=60000\n")
+        (self.root / "scripts/test-behaviour.sh").chmod(0o755)
         self.write(".gitignore", "**/target/\n/target-build/\n")
         self.commit()
         self.git("remote", "add", "origin", str(self.origin))
@@ -91,6 +93,9 @@ class PrepushTests(unittest.TestCase):
                                       "git_env": [k for k in os.environ if k.startswith("GIT_")],
                                       "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
             if pathlib.Path(sys.argv[0]).name == "node":
+                if "--test" in args and os.environ.get("PREPUSH_BEHAVIOUR_FAIL"):
+                    print("✖ failing tests:\\n✖ fixture behaviour")
+                    sys.exit(1)
                 sys.exit(0)
             if args[0] == "metadata":
                 if os.environ.get("PREPUSH_IGNORE_TERM"):
@@ -333,6 +338,15 @@ class PrepushTests(unittest.TestCase):
                 self.assert_stopped(self.invoke(extra=extra), message)
                 if "PREPUSH_FAIL" in extra:
                     self.assertFalse(any(c["args"][0] in {"clippy", "test"} for c in self.commands()))
+
+    def test_behaviour_suite_failure_stops_before_cargo(self):
+        result = self.invoke(extra={"PREPUSH_BEHAVIOUR_FAIL": "1"})
+        self.assert_stopped(result, "scripts/test-behaviour.sh")
+        self.assertIn("✖ fixture behaviour", result.stdout)
+        suite, = [c for c in self.commands() if c["tool"] == "node" and "--test" in c["args"]]
+        self.assertIn("--test-timeout=60000", suite["args"])
+        self.assertEqual(suite["cwd"], str(self.root))
+        self.assertFalse(any(c["tool"] == "cargo" for c in self.commands()))
 
     def test_empty_touched_binary_cannot_use_library_tests_as_proof(self):
         self.write("elastos/crates/server/src/lib.rs", "// changed library\n")

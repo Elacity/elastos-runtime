@@ -76,11 +76,10 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
-# Capsule units and script behavior fixtures. Browser fixtures use the explicit
-# Playwright/Chromium inputs installed by CI; NODE_PATH and
-# BROWSER_OPERATOR_PLAYWRIGHT_CORE select the unchanged pinned packages.
+# Capsule units and script behavior fixtures, as CI runs them; the script
+# installs the pinned Playwright/Chromium inputs on first use.
 test-behaviour:
-    node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+    ./scripts/test-behaviour.sh
 
 # Disposable Linux fixture; host namespace privileges belong to this test.
 test-native-browser-isolation:
